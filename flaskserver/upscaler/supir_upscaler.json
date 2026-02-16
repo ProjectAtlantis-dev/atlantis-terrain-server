@@ -1,0 +1,148 @@
+{
+  "last_node_id": 8,
+  "last_link_id": 12,
+  "nodes": [
+    {
+      "id": 1,
+      "type": "LoadImage",
+      "pos": [50, 100],
+      "size": {"0": 315, "1": 314},
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "outputs": [
+        {"name": "IMAGE", "type": "IMAGE", "links": [1], "slot_index": 0},
+        {"name": "MASK", "type": "MASK", "links": null, "slot_index": 1}
+      ],
+      "properties": {"Node name for S&R": "LoadImage"},
+      "widgets_values": ["test_texture_10_344_196.png", "image"]
+    },
+    {
+      "id": 2,
+      "type": "ImageScale",
+      "pos": [400, 100],
+      "size": {"0": 315, "1": 130},
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [{"name": "image", "type": "IMAGE", "link": 1}],
+      "outputs": [{"name": "IMAGE", "type": "IMAGE", "links": [2], "slot_index": 0}],
+      "properties": {},
+      "widgets_values": ["bicubic", 1024, 1024, "disabled"]
+    },
+    {
+      "id": 3,
+      "type": "SUPIR_model_loader",
+      "pos": [50, 500],
+      "size": {"0": 400, "1": 150},
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "outputs": [
+        {"name": "SUPIR_model", "type": "SUPIRMODEL", "links": [4, 6], "slot_index": 0},
+        {"name": "SUPIR_VAE", "type": "SUPIRVAE", "links": [3, 10], "slot_index": 1}
+      ],
+      "properties": {},
+      "widgets_values": ["SUPIR-v0F_fp16.safetensors", "zavychromaxl_v40.safetensors", false, "fp32"]
+    },
+    {
+      "id": 4,
+      "type": "SUPIR_encode",
+      "pos": [750, 100],
+      "size": {"0": 315, "1": 130},
+      "flags": {},
+      "order": 3,
+      "mode": 0,
+      "inputs": [
+        {"name": "SUPIR_VAE", "type": "SUPIRVAE", "link": 3},
+        {"name": "image", "type": "IMAGE", "link": 2}
+      ],
+      "outputs": [{"name": "latent", "type": "LATENT", "links": [5, 7], "slot_index": 0}],
+      "properties": {},
+      "widgets_values": [true, 512, "fp32"]
+    },
+    {
+      "id": 5,
+      "type": "SUPIR_conditioner",
+      "pos": [1100, 100],
+      "size": {"0": 400, "1": 200},
+      "flags": {},
+      "order": 4,
+      "mode": 0,
+      "inputs": [
+        {"name": "SUPIR_model", "type": "SUPIRMODEL", "link": 4},
+        {"name": "latents", "type": "LATENT", "link": 5}
+      ],
+      "outputs": [
+        {"name": "positive", "type": "SUPIR_cond_pos", "links": [8], "slot_index": 0},
+        {"name": "negative", "type": "SUPIR_cond_neg", "links": [9], "slot_index": 1}
+      ],
+      "properties": {},
+      "widgets_values": ["sharpen details on this satellite photo of some mountaineous terrain, high resolution aerial orthophoto", "bad quality, blurry, messy, lowres, artifacts, flat, oversaturated, boring, trees, haze"]
+    },
+    {
+      "id": 6,
+      "type": "SUPIR_sample",
+      "pos": [1550, 100],
+      "size": {"0": 400, "1": 400},
+      "flags": {},
+      "order": 5,
+      "mode": 0,
+      "inputs": [
+        {"name": "SUPIR_model", "type": "SUPIRMODEL", "link": 6},
+        {"name": "latents", "type": "LATENT", "link": 7},
+        {"name": "positive", "type": "SUPIR_cond_pos", "link": 8},
+        {"name": "negative", "type": "SUPIR_cond_neg", "link": 9}
+      ],
+      "outputs": [{"name": "latent", "type": "LATENT", "links": [11], "slot_index": 0}],
+      "properties": {},
+      "widgets_values": [987654321, 45, 4.0, 4.0, 5, 1.003, 1.0, 1.0, 1.0, -1.0, false, "RestoreEDMSampler"]
+    },
+    {
+      "id": 7,
+      "type": "SUPIR_decode",
+      "pos": [2000, 100],
+      "size": {"0": 315, "1": 100},
+      "flags": {},
+      "order": 6,
+      "mode": 0,
+      "inputs": [
+        {"name": "SUPIR_VAE", "type": "SUPIRVAE", "link": 10},
+        {"name": "latents", "type": "LATENT", "link": 11}
+      ],
+      "outputs": [{"name": "image", "type": "IMAGE", "links": [12], "slot_index": 0}],
+      "properties": {},
+      "widgets_values": [true, 512]
+    },
+    {
+      "id": 8,
+      "type": "SaveImage",
+      "pos": [2400, 100],
+      "size": {"0": 315, "1": 58},
+      "flags": {},
+      "order": 7,
+      "mode": 0,
+      "inputs": [{"name": "images", "type": "IMAGE", "link": 12}],
+      "properties": {},
+      "widgets_values": ["supir_upscaled_terrain"]
+    }
+  ],
+  "links": [
+    [1,  1, 0, 2, 0, "IMAGE"],
+    [2,  2, 0, 4, 1, "IMAGE"],
+    [3,  3, 1, 4, 0, "SUPIRVAE"],
+    [4,  3, 0, 5, 0, "SUPIRMODEL"],
+    [5,  4, 0, 5, 1, "LATENT"],
+    [6,  3, 0, 6, 0, "SUPIRMODEL"],
+    [7,  4, 0, 6, 1, "LATENT"],
+    [8,  5, 0, 6, 2, "SUPIR_cond_pos"],
+    [9,  5, 1, 6, 3, "SUPIR_cond_neg"],
+    [10, 3, 1, 7, 0, "SUPIRVAE"],
+    [11, 6, 0, 7, 1, "LATENT"],
+    [12, 7, 0, 8, 0, "IMAGE"]
+  ],
+  "groups": [],
+  "config": {},
+  "extra": {},
+  "version": 0.4
+}

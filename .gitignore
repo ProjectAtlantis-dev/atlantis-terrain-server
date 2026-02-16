@@ -1,0 +1,45 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+webserver/node_modules
+webserver/dist
+webserver/dist-ssr
+*.local
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# Secrets
+.env
+
+# Local workspace artifacts
+three-geospatial/
+debug-storybook.log
+*.pid
+venv/
+__pycache__/
+pipeline/database/data/
+flaskserver/greenland.db
+flaskserver/terrain.db
+flaskserver/terrain.db-wal
+flaskserver/terrain.db-shm
+samples/
+_metadata.json
+
+*.OLD
+kitty
+new_upscaler.md
