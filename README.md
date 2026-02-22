@@ -84,14 +84,13 @@ npm install
 ### Running
 ```bash
 # Terminal 1 — backend (terrain DB)
-cd flaskserver
-source venv/bin/activate
-python serve_flask.py
+./flaskserver/runFlaskServer
 
 # Terminal 2 — frontend (snazzy 3d ux)
-cd webserver
-npx vite
+./webserver/runViteServer
 ```
+
+Both scripts log output to their respective directories (`runFlaskServer.log`, `runViteServer.log`).
 
 ## Data Attribution
 
