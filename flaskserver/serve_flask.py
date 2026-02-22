@@ -1506,10 +1506,11 @@ def static_files(path: str):
 
 
 if __name__ == "__main__":
-  if not DIST_DIR.exists():
-    raise SystemExit("dist/ not found. Run `npm run build` first.")
   logging.getLogger("werkzeug").setLevel(logging.WARNING)
-  log.info(f"Serving static dist from: {DIST_DIR}")
+  if DIST_DIR.exists():
+    log.info(f"Serving static dist from: {DIST_DIR}")
+  else:
+    log.info("No dist/ found — running API-only (use Vite dev server for frontend)")
   log.info(f"Terrain DB path: {DB_PATH}")
   log.info(f"Client debug log path: {CLIENT_LOG_PATH}")
   _bootstrap_backend()
