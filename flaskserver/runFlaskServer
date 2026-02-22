@@ -14,5 +14,11 @@ if [ ! -x "$PYTHON_BIN" ]; then
   exit 1
 fi
 
+if [ -f "$SCRIPT_DIR/.env" ]; then
+  set -a
+  source "$SCRIPT_DIR/.env"
+  set +a
+fi
+
 cd "$ROOT_DIR"
 "$PYTHON_BIN" flaskserver/serve_flask.py 2>&1 | tee "$SCRIPT_DIR/runFlaskServer.log"

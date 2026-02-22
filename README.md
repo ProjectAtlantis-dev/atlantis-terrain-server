@@ -43,6 +43,10 @@ Textures follow a strict upgrade chain. Each stage only feeds the next. Do not s
 4. **enhance** (SUPIR upscaler via ComfyUI) ONLY processes `dataforsyningen` tiles. It never fetches from the internet. The output is `dataforsyningen_enhanced`.
 5. Upscaling (SUPIR) only kicks in at **depth 12 and above**. Lower LOD tiles don't need it — the base Dataforsyningen imagery is sharp enough at those scales.
 
+## Default Camera
+
+The camera starts facing north at Nuuk (64.18°N, 51.72°W). You can override this via URL params, e.g. `?lat=66.5&lon=-53.2`. Press **R** to reset the view if shit gets crazy (e.g. the world suddenly turns into a blue ball).
+
 ## Map Mode
 
 Press **M** to toggle a 2D map view (no clouds/atmosphere) for navigation and tile debugging. Right-click on a tile to inspect its metadata and submit an enhance request to the SUPIR upscaler. (WIP — enhance-on-click is still being hooked up.)
