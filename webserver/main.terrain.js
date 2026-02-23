@@ -939,6 +939,7 @@ const REFETCH_DIST = 5000;
 let originX = 0, originY = 0;        // stereo scene origin from server
 let camStereoX = 0, camStereoY = 0;  // current cam position in stereo
 let lastFetchX = 0, lastFetchY = 0;
+let _lastFetchTriggerMs = 0;
 let fetching = false;
 let isFirstLoad = true;
 let bootFetchLogged = false;
@@ -2347,11 +2348,9 @@ function buildMesh(tile) {
   const col = new Float32Array(res * res * 3);
   const uv = new Float32Array(res * res * 2);
 
-  let oceanCount = 0;
   for (let r = 0; r < res; r++) for (let c = 0; c < res; c++) {
     const i = r * res + c, e = hm[i];
     const isOcean = e <= 1;
-    if (isOcean) oceanCount++;
     pos[i * 3]     = xMin + (c / (res - 1)) * (xMax - xMin);
     pos[i * 3 + 1] = yMin + (r / (res - 1)) * (yMax - yMin);
     pos[i * 3 + 2] = isOcean ? 0 : e * EXAG;
@@ -2360,7 +2359,6 @@ function buildMesh(tile) {
     if (isOcean) { col[i * 3] = 0.04; col[i * 3 + 1] = 0.15; col[i * 3 + 2] = 0.30; }
     else { const cl = eColor(e); col[i * 3] = cl.r; col[i * 3 + 1] = cl.g; col[i * 3 + 2] = cl.b; }
   }
-  const allOcean = oceanCount >= res * res * 0.98;
   const idx = [];
   for (let r = 0; r < res - 1; r++) for (let c = 0; c < res - 1; c++) {
     const a = r * res + c, b = a + 1, d = a + res, f = d + 1;
@@ -2379,7 +2377,7 @@ function buildMesh(tile) {
   const mesh = new THREE.Mesh(g, mat);
   mesh.userData.tileId = tile.id;
   mesh.userData.bbox = tile.bbox;
-  mesh.userData.isWater = allOcean;
+  mesh.userData.isWater = false;
   mesh.userData.waterMaskUrl = `/api/watermask/${tile.id}.png`;
   mesh.userData.waterMask = null;
   return mesh;
@@ -2433,12 +2431,6 @@ function materializeTile(tileId, tex) {
   tileLog(tileId, `materialize tex=${tex.image.width}x${tex.image.height}`);
   const mesh = buildMesh(tileData);
   if (!mesh) return;
-  if (mesh.userData.isWater) {
-    mesh.material.vertexColors = true;
-    mesh.material.needsUpdate = true;
-    terrainRoot.add(mesh);
-    return;
-  }
   mesh.material.map = tex;
   mesh.material.color.set(0xffffff);
   mesh.userData.waterMask = waterMaskCache.get(tileId) || null;
@@ -2594,7 +2586,6 @@ function updateTextures(tiles) {
     requestWaterMask(t.id);
     const mesh = meshMap.get(t.id);
     if (!mesh) continue;
-    if (mesh.userData.isWater) continue;
     if (mesh.material.map !== tex) {
       tileLog(t.id, `apply cached tex (src=${texSource.get(t.id) || '?'})`);
       mesh.material.map = tex;
@@ -2643,7 +2634,7 @@ function updateTextures(tiles) {
               for (const child of terrainRoot.children) {
                 if (child.userData.tileId === tid) { mesh = child; break; }
               }
-              if (mesh && !mesh.userData.isWater) {
+              if (mesh) {
                 mesh.material.map = tex;
                 mesh.material.color.set(0xffffff);
                 mesh.material.needsUpdate = true;
@@ -3838,7 +3829,8 @@ function render() {
     const fdx = camStereoX - lastFetchX;
     const fdy = camStereoY - lastFetchY;
     const fetchDist = Math.sqrt(fdx * fdx + fdy * fdy);
-    if (fetchDist > REFETCH_DIST) {
+    if (fetchDist > REFETCH_DIST && nowMs - _lastFetchTriggerMs > 500) {
+      _lastFetchTriggerMs = nowMs;
       fetchTiles();
     }
   }
