@@ -3013,6 +3013,7 @@ async function fetchTiles(lat, lon) {
       }
       const addedSet = new Set(added);
       let built = 0, deferred = 0;
+      const MESH_BUILD_BUDGET = 30; // max meshes to build per fetch (spread the rest across frames)
       for (const tile of data.tiles) {
         if (!addedSet.has(tile.id) || !tile.heightmap) continue;
         if (existingIds.has(tile.id)) continue;
@@ -3023,10 +3024,16 @@ async function fetchTiles(lat, lon) {
         }
         const cachedTex = texCache.get(tile.id);
         if (cachedTex) {
-          tileLog(tile.id, 'added — immediate build (cached tex)');
-          deferredTiles.set(tile.id, tile);
-          materializeTile(tile.id, cachedTex);
-          built++;
+          if (built < MESH_BUILD_BUDGET) {
+            tileLog(tile.id, 'added — immediate build (cached tex)');
+            deferredTiles.set(tile.id, tile);
+            materializeTile(tile.id, cachedTex);
+            built++;
+          } else {
+            // Over budget — defer to next frame cycle
+            deferredTiles.set(tile.id, tile);
+            deferred++;
+          }
         } else {
           // No texture yet — defer until texture arrives.
           deferredTiles.set(tile.id, tile);
@@ -3047,7 +3054,7 @@ async function fetchTiles(lat, lon) {
           if (hasCoverage) {
             tileLog(tile.id, 'added — deferred (stale coverage exists)');
             deferred++;
-          } else {
+          } else if (built < MESH_BUILD_BUDGET) {
             tileLog(tile.id, 'added — untextured fallback (no stale coverage)');
             const mesh = buildMesh(tile);
             if (mesh) {
@@ -3058,6 +3065,9 @@ async function fetchTiles(lat, lon) {
               terrainRoot.add(mesh);
             }
             built++;
+          } else {
+            deferredTiles.set(tile.id, tile);
+            deferred++;
           }
         }
       }
@@ -3105,6 +3115,8 @@ async function fetchTiles(lat, lon) {
     console.error('Fetch error:', err);
   }
   fetching = false;
+  // Drain accumulated dt so the next render frame doesn't lurch the camera
+  clock.getDelta();
 }
 
 // --- Save/restore camera position ---
