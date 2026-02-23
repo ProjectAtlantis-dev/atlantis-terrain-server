@@ -19,8 +19,8 @@ The 4 EXR LUTs (`transmittance.exr`, `scattering.exr`, `irradiance.exr`, `higher
 
 ## 4. Procedural 3D textures for cloud shapes
 
-Four separate procedural texture generators (`LocalWeather`, `CloudShape`, `CloudShapeDetail`, `Turbulence`) all need to be instantiated and assigned. The library also bundles STBN loaders, 3D EXR loaders, and procedural texture generators that live in the local `three-geospatial/` fork.
+Four separate procedural texture generators (`LocalWeather`, `CloudShape`, `CloudShapeDetail`, `Turbulence`) all need to be instantiated and assigned. The library also bundles STBN loaders, 3D EXR loaders, and procedural texture generators that live in the local `three-geospatial/` clone.
 
-## 5. The "not React" problem
+## 5. No R3F, no problem
 
-Takram's library is designed for R3F (React Three Fiber). This project is vanilla Three.js, which means manually wiring up everything that R3F components handle declaratively: effect composition, texture prop syncing, lifecycle management, etc. This is why there's a local fork of the entire `three-geospatial` repo and Vite aliases in `vite.config.js` pointing `@takram/*` imports to the local source.
+Takram's library ships with R3F (React Three Fiber) wrappers, but the actual 3D code underneath is plain Three.js. R3F only helps with postprocessing wiring (effect pass setup, event listener plumbing) — it does nothing for loading meshes, textures, heightmaps, or any of the real 3D work. Not worth the dependency. We use an unmodified clone of `three-geospatial/` pinned to commit `ab3d1cf5` and point Vite aliases at the source to skip the React dependencies in the npm builds. Pain points 1–4 above are just the manual postprocessing plumbing we took on instead.

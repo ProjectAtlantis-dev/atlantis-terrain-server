@@ -108,3 +108,7 @@ This project uses the following external data sources:
 - **Heightmaps (primary)**: [ArcticDEM v4.1](https://www.pgc.umn.edu/data/arcticdem/) 10m mosaic, provided by the Polar Geospatial Center under NSF-OPP awards 1043681, 1559691, and 1542736. CC-BY-4.0, free for commercial use with attribution. Fetched on demand via S3. [Acknowledgement policy](https://www.pgc.umn.edu/guides/stereo-derived-elevation-models/pgc-dem-products-arcticdem-rema-and-earthdem/).
 - **Heightmaps (fallback)**: [Copernicus GLO-30 DEM](https://spacedata.copernicus.eu/collections/copernicus-digital-elevation-model), provided by the European Space Agency. Free for commercial use with attribution. Fetched on demand via S3.
 - **Atmosphere & clouds**: [three-geospatial](https://github.com/takram-design-engineering/three-geospatial) by Takram.
+
+## About
+
+This project exists to promote the development of Greenland. Its incredibly harsh and remote terrain is almost like another planet — perfect for autonomous machinery, robotics, drones, and infrastructure like tunnels. A high-fidelity 3D terrain navigator is a first step toward making that landscape explorable and plannable for all Greenland enthusiasts!
