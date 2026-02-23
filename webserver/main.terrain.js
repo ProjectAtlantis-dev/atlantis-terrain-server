@@ -228,6 +228,7 @@ Ellipsoid.WGS84.getEastNorthUpVectors(anchorPosition, east, north, up);
 
 // --- View distance constants ---
 const MAX_VIEW_DIST = 50000;       // 50km — camera far, fog, map extents
+let _terrainRange = 20000;         // terrain tile fetch range (meters), slider-controlled
 const MAP_CAM_ALT = MAX_VIEW_DIST; // map camera altitude above target
 
 const camera = new THREE.PerspectiveCamera(
@@ -767,6 +768,13 @@ function buildTuningControls(ap, ce) {
     format: v => `${v}°`,
     onChange: v => { _driftAngle = v; _updateDrift(); }
   });
+  tuningSectionLabel('Terrain');
+  tuningSlider('terrain range', {
+    min: 10000, max: 50000, step: 1000, value: _terrainRange,
+    decimals: 0,
+    format: v => `${(v/1000).toFixed(0)}km`,
+    onChange: v => { _terrainRange = v; fetchTiles(); }
+  });
   tuningSectionLabel('Atmosphere');
   tuningSlider('fog strength', {
     min: 1, max: 10, step: 0.5, value: 4.5,
@@ -774,12 +782,10 @@ function buildTuningControls(ap, ce) {
     onChange: v => { controls._fogStrength = v; }
   });
   tuningSlider('cloud distance', {
-    min: 5000, max: 50000, step: 1000, value: MAX_VIEW_DIST,
+    min: 5000, max: 200000, step: 5000, value: ce.clouds.maxRayDistance,
     decimals: 0,
     format: v => `${(v/1000).toFixed(0)}km`,
-    // Only update projection matrix on slider change, NOT per-frame.
-    // Per-frame updateProjectionMatrix() desyncs cloud shadows from clouds.
-    onChange: v => { camera.far = v; camera.updateProjectionMatrix(); }
+    onChange: v => { ce.clouds.maxRayDistance = v; }
   });
   tuningSlider('scattering', {
     min: 0, max: 5, step: 0.1, value: ce.scatteringCoefficient ?? 0,
@@ -2893,9 +2899,9 @@ async function fetchTiles(lat, lon) {
     const fetchAlt = camLL.alt;
     let url;
     if (isFirstLoad) {
-      url = `/api/tiles?lat=${fetchLat}&lon=${fetchLon}&alt=${fetchAlt}&heading=${heading}&maxDepth=${PREVIEW_MAX_DEPTH}`;
+      url = `/api/tiles?lat=${fetchLat}&lon=${fetchLon}&alt=${fetchAlt}&heading=${heading}&maxDepth=${PREVIEW_MAX_DEPTH}&range=${_terrainRange}`;
     } else {
-      url = `/api/tiles?lat=${fetchLat}&lon=${fetchLon}&ox=${originX}&oy=${originY}&alt=${fetchAlt}&heading=${heading}`;
+      url = `/api/tiles?lat=${fetchLat}&lon=${fetchLon}&ox=${originX}&oy=${originY}&alt=${fetchAlt}&heading=${heading}&range=${_terrainRange}`;
     }
     const resp = await fetch(url);
     const data = await resp.json();
