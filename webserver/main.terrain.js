@@ -700,11 +700,6 @@ function buildTuningControls(ap, ce) {
     value: ap.inscatter,
     onChange: v => { ap.inscatter = v; }
   });
-  tuningToggle('transmittance', {
-    value: ap.transmittance,
-    onChange: v => { ap.transmittance = v; }
-  });
-
   tuningSectionLabel('Clouds');
   const defaultAltitudes = ce.cloudLayers.map(l => l.altitude);
   tuningSlider('cloud altitude', {
@@ -786,6 +781,11 @@ function buildTuningControls(ap, ce) {
     decimals: 0,
     format: v => `${(v/1000).toFixed(0)}km`,
     onChange: v => { ce.clouds.maxRayDistance = v; }
+  });
+  tuningSlider('turbulence', {
+    min: 0, max: 2000, step: 50, value: ce.turbulenceDisplacement,
+    decimals: 0,
+    onChange: v => { ce.turbulenceDisplacement = v; }
   });
   tuningSlider('scattering', {
     min: 0, max: 5, step: 0.1, value: ce.scatteringCoefficient ?? 0,
@@ -2127,7 +2127,11 @@ function applyDate(date) {
   cloudsEffect.sunDirection.copy(sunDirection);
 }
 buildTuningControls(aerialPerspective, cloudsEffect);
-applyDate(referenceDate);
+// Only apply the default referenceDate if no saved tuning overrides month/hour.
+// buildTuningControls already calls applyDate() when restoring saved values.
+if (!_tuningState['month'] && !_tuningState['hour (UTC)']) {
+  applyDate(referenceDate);
+}
 
 function syncCloudComposition() {
   aerialPerspective.overlay = cloudsEffect.atmosphereOverlay;
