@@ -959,7 +959,7 @@ const HOUSE_MODEL = {
   url: '/models/house_test.glb',
   altOffsetM: paramNumber('houseAltOffset', 0.4),
   hotReloadMs: Math.max(500, paramNumber('houseReloadMs', 2000)),
-  enabled: params.get('house') !== '0'
+  enabled: params.get('house') === '1'
 };
 const HOUSE_SHADOW_MODE_RAW = (params.get('houseShadowMode') || 'shadowmap').toLowerCase();
 const HOUSE_SHADOW_MODE = HOUSE_SHADOW_MODE_RAW === 'local' ? 'local' : 'shadowmap';
@@ -3550,7 +3550,7 @@ function updateHud() {
     texLine,
     'WASD or Arrows move, Q/Z altitude, drag look',
     'map: left-drag rotate, right-drag pan, wheel zoom',
-    `M map mode, R reset, H houses:${housesRuntimeVisible ? 'on' : 'off'}, Shift+H reload  shadow:${HOUSE_SHADOW_MODE}${HOUSE_LOCAL_SHADOW_DEBUG ? '+dbg' : ''}`
+    'M map mode, R reset'
   ].join('<br>');
   alt.textContent =
     `${altM.toFixed(0)}m / ${(altM * 3.28084).toFixed(0)}ft  ${deg.toFixed(0)}° ${compass}` +
