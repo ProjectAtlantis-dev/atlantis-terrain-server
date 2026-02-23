@@ -231,6 +231,9 @@ ENHANCE_MAX_QUEUED = 4  # max tiles in ComfyUI queue at once
 
 _cog_fetch_lock = threading.Lock()
 _cog_fetching_tiles: set[str] = set()
+_cog_fetched_total = 0      # lifetime count of COG tiles fetched from S3
+_cog_skipped_total = 0      # lifetime count of tiles skipped (already had data)
+_cog_already_fetched: set[str] = set()  # tile IDs we've already fetched this session
 
 _SUPIR_TILE_RE = re.compile(r"\b(?:supir|upscaled)_(\d+-\d+-\d+)\b")
 _INPUT_TILE_RE = re.compile(r"\btile_(\d+-\d+-\d+)_(?:texture|heightmap)\.png\b")
@@ -918,81 +921,97 @@ def api_tiles():
 
   # Background COG fetch for missing heightmap tiles
   if missing and _cog_fetch_lock.acquire(blocking=False):
-    def _bg_cog_fetch(missing_list):
-      try:
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-        from ingest import _read_cog_heightmap, _resample_from_parent
-        from database import CONFIDENCE, write_tile
-        from serve import mark_no_data
+    # Dedup: skip tiles we've already fetched or attempted this session
+    deduped = [(tid, bbox) for tid, bbox in missing if tid not in _cog_already_fetched]
+    skipped = len(missing) - len(deduped)
+    if skipped:
+      log_cog.info(f"[COG dedup] {skipped} already fetched this session, {len(deduped)} new")
+    if not deduped:
+      _cog_fetch_lock.release()
+    else:
+      # Mark all as attempted before spawning thread
+      for tid, _ in deduped:
+        _cog_already_fetched.add(tid)
 
-        db = sqlite3.connect(str(DB_PATH), check_same_thread=False)
-        db.execute("PRAGMA journal_mode=WAL")
-        log_cog.info(f"Starting {len(missing_list)} tiles from S3...")
+      def _bg_cog_fetch(missing_list):
+        global _cog_fetched_total, _cog_skipped_total
+        try:
+          from concurrent.futures import ThreadPoolExecutor, as_completed
+          from ingest import _read_cog_heightmap, _resample_from_parent
+          from database import CONFIDENCE, write_tile
+          from serve import mark_no_data
 
-        def _worker(tile_id, bbox):
-          log_cog.debug(f"[cog-worker] {tile_id}: reading bbox=[{bbox[0]:.0f},{bbox[1]:.0f},{bbox[2]:.0f},{bbox[3]:.0f}]")
-          return tile_id, _read_cog_heightmap(bbox, _GRID_N)
+          db = sqlite3.connect(str(DB_PATH), check_same_thread=False)
+          db.execute("PRAGMA journal_mode=WAL")
+          log_cog.info(f"Starting {len(missing_list)} tiles from S3... (session: {_cog_fetched_total} fetched, {_cog_skipped_total} skipped)")
 
-        fetched, no_data_count, parent_resampled_count = 0, 0, 0
-        # Collect tiles that COG couldn't resolve for a second-pass parent resample
-        cog_failed = []
-        with ThreadPoolExecutor(max_workers=6) as pool:
-          futs = {pool.submit(_worker, tid, bbox): tid for tid, bbox in missing_list}
-          for fut in as_completed(futs):
-            tid = futs[fut]
-            try:
-              tile_id, (data, src_name) = fut.result()
-              if data is None:
-                cog_failed.append(tile_id)
-                continue
-              conf = CONFIDENCE.get(src_name, CONFIDENCE['arcticdem'])
-              cm = _np.where(_np.isnan(data), _np.uint8(0), _np.uint8(conf))
-              hm = _np.where(_np.isnan(data), 0.0, data).astype(_np.float32)
-              write_tile(db, tile_id, hm, cm, src_name, reconcile=False)
-              fetched += 1
-            except Exception:
-              cog_failed.append(tid)
-            finally:
-              _cog_fetching_tiles.discard(tid)
+          def _worker(tile_id, bbox):
+            log_cog.debug(f"[cog-worker] {tile_id}: reading bbox=[{bbox[0]:.0f},{bbox[1]:.0f},{bbox[2]:.0f},{bbox[3]:.0f}]")
+            return tile_id, _read_cog_heightmap(bbox, _GRID_N)
 
-        # Second pass: try parent resampling for tiles that had no COG data.
-        # Sort by depth (shallowest first) so parent tiles get written before
-        # their children try to resample from them — enables chaining
-        # (depth-10 → depth-11 → depth-12 in one pass).
-        cog_failed.sort(key=lambda tid: int(tid.split('-')[0]))
-        for tile_id in cog_failed:
-          try:
-            data, src_name = _resample_from_parent(db, tile_id, bbox=None, resolution=_GRID_N)
-            if data is not None:
-              conf = CONFIDENCE.get(src_name, CONFIDENCE['arcticdem'])
-              cm = _np.where(_np.isnan(data), _np.uint8(0), _np.uint8(conf))
-              hm = _np.where(_np.isnan(data), 0.0, data).astype(_np.float32)
-              from database import TileClobberError
+          fetched, no_data_count, parent_resampled_count = 0, 0, 0
+          # Collect tiles that COG couldn't resolve for a second-pass parent resample
+          cog_failed = []
+          with ThreadPoolExecutor(max_workers=6) as pool:
+            futs = {pool.submit(_worker, tid, bbox): tid for tid, bbox in missing_list}
+            for fut in as_completed(futs):
+              tid = futs[fut]
               try:
+                tile_id, (data, src_name) = fut.result()
+                if data is None:
+                  cog_failed.append(tile_id)
+                  continue
+                conf = CONFIDENCE.get(src_name, CONFIDENCE['arcticdem'])
+                cm = _np.where(_np.isnan(data), _np.uint8(0), _np.uint8(conf))
+                hm = _np.where(_np.isnan(data), 0.0, data).astype(_np.float32)
                 write_tile(db, tile_id, hm, cm, src_name, reconcile=False)
-                parent_resampled_count += 1
-                log_cog.info(f"  [PARENT RESAMPLE] {tile_id}: filled from parent")
-              except TileClobberError:
-                # Already has data (e.g. from a previous request) — that's fine
-                parent_resampled_count += 1
-            else:
+                fetched += 1
+                _cog_fetched_total += 1
+              except Exception:
+                cog_failed.append(tid)
+              finally:
+                _cog_fetching_tiles.discard(tid)
+
+          # Second pass: try parent resampling for tiles that had no COG data.
+          # Sort by depth (shallowest first) so parent tiles get written before
+          # their children try to resample from them — enables chaining
+          # (depth-10 → depth-11 → depth-12 in one pass).
+          cog_failed.sort(key=lambda tid: int(tid.split('-')[0]))
+          for tile_id in cog_failed:
+            try:
+              data, src_name = _resample_from_parent(db, tile_id, bbox=None, resolution=_GRID_N)
+              if data is not None:
+                conf = CONFIDENCE.get(src_name, CONFIDENCE['arcticdem'])
+                cm = _np.where(_np.isnan(data), _np.uint8(0), _np.uint8(conf))
+                hm = _np.where(_np.isnan(data), 0.0, data).astype(_np.float32)
+                from database import TileClobberError
+                try:
+                  write_tile(db, tile_id, hm, cm, src_name, reconcile=False)
+                  parent_resampled_count += 1
+                  _cog_fetched_total += 1
+                  log_cog.info(f"  [PARENT RESAMPLE] {tile_id}: filled from parent")
+                except TileClobberError:
+                  # Already has data (e.g. from a previous request) — that's fine
+                  parent_resampled_count += 1
+                  _cog_skipped_total += 1
+              else:
+                mark_no_data(db, tile_id)
+                no_data_count += 1
+            except Exception as exc:
+              log_cog.warning(f"  [PARENT RESAMPLE] {tile_id}: failed: {exc}")
               mark_no_data(db, tile_id)
               no_data_count += 1
-          except Exception as exc:
-            log_cog.warning(f"  [PARENT RESAMPLE] {tile_id}: failed: {exc}")
-            mark_no_data(db, tile_id)
-            no_data_count += 1
 
-        log_cog.info(f"Done: {fetched} fetched, {parent_resampled_count} parent-resampled, {no_data_count} no data")
-        db.close()
-      finally:
-        _cog_fetching_tiles.clear()
-        _cog_fetch_lock.release()
+          log_cog.info(f"Done: {fetched} fetched, {parent_resampled_count} parent-resampled, {no_data_count} no data (session totals: {_cog_fetched_total} fetched, {_cog_skipped_total} skipped)")
+          db.close()
+        finally:
+          _cog_fetching_tiles.clear()
+          _cog_fetch_lock.release()
 
-    _cog_fetching_tiles.clear()
-    for tid, _ in missing:
-      _cog_fetching_tiles.add(tid)
-    threading.Thread(target=_bg_cog_fetch, args=(missing,), daemon=True).start()
+      _cog_fetching_tiles.clear()
+      for tid, _ in deduped:
+        _cog_fetching_tiles.add(tid)
+      threading.Thread(target=_bg_cog_fetch, args=(deduped,), daemon=True).start()
 
   downloading = list(_cog_fetching_tiles)
 
