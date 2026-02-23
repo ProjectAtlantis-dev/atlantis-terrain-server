@@ -2347,9 +2347,11 @@ function buildMesh(tile) {
   const col = new Float32Array(res * res * 3);
   const uv = new Float32Array(res * res * 2);
 
+  let oceanCount = 0;
   for (let r = 0; r < res; r++) for (let c = 0; c < res; c++) {
     const i = r * res + c, e = hm[i];
-    const isOcean = e <= 5;
+    const isOcean = e <= 1;
+    if (isOcean) oceanCount++;
     pos[i * 3]     = xMin + (c / (res - 1)) * (xMax - xMin);
     pos[i * 3 + 1] = yMin + (r / (res - 1)) * (yMax - yMin);
     pos[i * 3 + 2] = isOcean ? 0 : e * EXAG;
@@ -2358,6 +2360,7 @@ function buildMesh(tile) {
     if (isOcean) { col[i * 3] = 0.04; col[i * 3 + 1] = 0.15; col[i * 3 + 2] = 0.30; }
     else { const cl = eColor(e); col[i * 3] = cl.r; col[i * 3 + 1] = cl.g; col[i * 3 + 2] = cl.b; }
   }
+  const allOcean = oceanCount >= res * res * 0.98;
   const idx = [];
   for (let r = 0; r < res - 1; r++) for (let c = 0; c < res - 1; c++) {
     const a = r * res + c, b = a + 1, d = a + res, f = d + 1;
@@ -2376,7 +2379,7 @@ function buildMesh(tile) {
   const mesh = new THREE.Mesh(g, mat);
   mesh.userData.tileId = tile.id;
   mesh.userData.bbox = tile.bbox;
-  mesh.userData.isWater = false;
+  mesh.userData.isWater = allOcean;
   mesh.userData.waterMaskUrl = `/api/watermask/${tile.id}.png`;
   mesh.userData.waterMask = null;
   return mesh;
@@ -2430,6 +2433,12 @@ function materializeTile(tileId, tex) {
   tileLog(tileId, `materialize tex=${tex.image.width}x${tex.image.height}`);
   const mesh = buildMesh(tileData);
   if (!mesh) return;
+  if (mesh.userData.isWater) {
+    mesh.material.vertexColors = true;
+    mesh.material.needsUpdate = true;
+    terrainRoot.add(mesh);
+    return;
+  }
   mesh.material.map = tex;
   mesh.material.color.set(0xffffff);
   mesh.userData.waterMask = waterMaskCache.get(tileId) || null;
@@ -2585,6 +2594,7 @@ function updateTextures(tiles) {
     requestWaterMask(t.id);
     const mesh = meshMap.get(t.id);
     if (!mesh) continue;
+    if (mesh.userData.isWater) continue;
     if (mesh.material.map !== tex) {
       tileLog(t.id, `apply cached tex (src=${texSource.get(t.id) || '?'})`);
       mesh.material.map = tex;

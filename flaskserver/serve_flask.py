@@ -1474,6 +1474,15 @@ def api_tile_inspect():
   else:
     log_tex.info(f"  texture: NOT IN DB")
 
+  # --- auto-fix stale ancestor_crop: delete and re-queue ---
+  if row and row[0] == "ancestor_crop":
+    db.execute("DELETE FROM textures WHERE tile_id = ?", (tid,))
+    db.commit()
+    log_tex.warning(f"  AUTO-FIX: deleted stale ancestor_crop, re-queuing fetch")
+    if parsed:
+      d, c, r = parsed
+      _queue_texture_fetch(tid, _tile_bbox(d, c, r))
+
   # --- texture ancestry ---
   if parsed and not row:
     ancestor = _nearest_ancestor_texture(tid, _texture_ids_in(db, [tid]))
