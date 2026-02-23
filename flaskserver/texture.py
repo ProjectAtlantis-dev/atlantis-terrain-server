@@ -20,6 +20,18 @@ TEXTURE SOURCE STATES:
   It never fetches from the internet. Never enhance sentinel2.
 - write_texture() has an expected_upgrades whitelist. If you add a new source,
   update that whitelist or you'll get TEX CLOBBER warnings.
+
+SEA / OCEAN TILES:
+- Sea detection is per-PIXEL in the frontend (elevation ≤ 1m → blue vertex color,
+  flattened to 0). This keeps ocean areas from rendering as white voids when
+  no texture is available (e.g. east Greenland with no Dataforsyningen coverage).
+- There is NO whole-tile "sea" skip. Every tile goes through the normal texture
+  upgrade chain regardless of how much ocean it contains. When a texture arrives
+  it is applied on top — the blue vertex colors only show through for untextured
+  tiles or pixels not covered by the texture.
+- Never early-return or skip texture application just because a tile is mostly
+  ocean. The parent's texture (or ancestor crop) is always preferable to a blank
+  blue square.
 """
 
 import datetime

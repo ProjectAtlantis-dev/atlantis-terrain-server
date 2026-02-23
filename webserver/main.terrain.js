@@ -2879,6 +2879,8 @@ function getCameraLatLon() {
 
 let pollTimer = null;
 
+const PREVIEW_MAX_DEPTH = 8;
+
 async function fetchTiles(lat, lon) {
   if (fetching) return;
   fetching = true;
@@ -2891,7 +2893,7 @@ async function fetchTiles(lat, lon) {
     const fetchAlt = camLL.alt;
     let url;
     if (isFirstLoad) {
-      url = `/api/tiles?lat=${fetchLat}&lon=${fetchLon}&alt=${fetchAlt}&heading=${heading}`;
+      url = `/api/tiles?lat=${fetchLat}&lon=${fetchLon}&alt=${fetchAlt}&heading=${heading}&maxDepth=${PREVIEW_MAX_DEPTH}`;
     } else {
       url = `/api/tiles?lat=${fetchLat}&lon=${fetchLon}&ox=${originX}&oy=${originY}&alt=${fetchAlt}&heading=${heading}`;
     }
@@ -2905,6 +2907,7 @@ async function fetchTiles(lat, lon) {
       });
     }
 
+    const wasFirstLoad = isFirstLoad;
     if (isFirstLoad) {
       originX = data.ox;
       originY = data.oy;
@@ -3076,7 +3079,18 @@ async function fetchTiles(lat, lon) {
     const texInFlight = (data.texFetching || 0);
 
     if (pollTimer) clearTimeout(pollTimer);
-    if (nd > 0 || nm > 0 || texInFlight > 0) {
+    if (wasFirstLoad) {
+      // Preview pass done — immediately fetch full-depth tiles.
+      // The normal eviction/replacement logic will upgrade the low-LOD
+      // preview tiles as higher-detail children arrive with textures.
+      bootLog('tiles.preview-done', {
+        previewTiles: data.tiles.length,
+        elapsedMs: Number((performance.now() - t0).toFixed(1))
+      });
+      fetching = false;
+      fetchTiles();
+      return;
+    } else if (nd > 0 || nm > 0 || texInFlight > 0) {
       pollTimer = setTimeout(() => fetchTiles(), 3000);
     }
 
