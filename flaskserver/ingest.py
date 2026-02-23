@@ -196,6 +196,33 @@ def _read_cog_heightmap(bbox, resolution=GRID_N):
     except Exception as exc:
         log_cog.warning(f"  Copernicus FAILED: {type(exc).__name__}: {exc}")
 
+    # --- Copernicus expanded bbox retry ---
+    if cop is None:
+        try:
+            dx = (bbox[2] - bbox[0]) * 0.10
+            dy = (bbox[3] - bbox[1]) * 0.10
+            exp_bbox = (bbox[0] - dx, bbox[1] - dy, bbox[2] + dx, bbox[3] + dy)
+            cop_url2, cop_lon2, cop_lat2 = _copernicus_url(exp_bbox)
+            log_cog.info(f"  Copernicus retry (expanded bbox +10%): URL={cop_url2}")
+            dst_transform2 = transform_from_bounds(*bbox, resolution, resolution)
+            cop_data2 = np.empty((resolution, resolution), dtype=np.float32)
+            with rasterio.open(cop_url2) as src:
+                reproject(
+                    source=rasterio.band(src, 1),
+                    destination=cop_data2,
+                    dst_transform=dst_transform2,
+                    dst_crs=CRS.from_epsg(3413),
+                    resampling=WarpResampling.bilinear,
+                )
+            cop_data2 = np.flipud(cop_data2)
+            if np.any(~np.isnan(cop_data2)) and np.any(cop_data2 != 0):
+                cop = cop_data2
+                log_cog.info(f"  Copernicus expanded bbox: got data!")
+            else:
+                log_cog.info(f"  Copernicus expanded bbox: still no valid data")
+        except Exception as exc:
+            log_cog.warning(f"  Copernicus expanded FAILED: {type(exc).__name__}: {exc}")
+
     cop_ok = cop is not None
 
     # --- Compare and log ---
@@ -251,3 +278,104 @@ def _read_cog_heightmap(bbox, resolution=GRID_N):
 
     log_cog.info(f"  No data from any source for bbox=[{bbox[0]:.0f},{bbox[1]:.0f},{bbox[2]:.0f},{bbox[3]:.0f}]")
     return None, None
+
+
+# ---------------------------------------------------------------------------
+# Parent-tile resampling fallback
+# ---------------------------------------------------------------------------
+
+def _resample_from_parent(db, tile_id, bbox, resolution=GRID_N):
+    """Resample a parent tile's heightmap into this child's quadrant.
+
+    Parses tile_id to find the parent, reads the parent heightmap from DB,
+    extracts the relevant quadrant (~33x33 sub-grid), and bilinear-interpolates
+    it up to the full resolution (65x65).
+
+    Returns (float32 array, 'parent_resampled') or (None, None) if parent
+    has no data.
+    """
+    from database import _decompress_float32, _decompress_uint8
+
+    parts = tile_id.split('-')
+    depth, col, row = int(parts[0]), int(parts[1]), int(parts[2])
+
+    if depth == 0:
+        log_cog.info(f"  Parent resample: depth=0, no parent")
+        return None, None
+
+    parent_depth = depth - 1
+    parent_col = col // 2
+    parent_row = row // 2
+    parent_id = f"{parent_depth}-{parent_col}-{parent_row}"
+
+    # Read parent heightmap + confidence map from DB
+    parent_row_db = db.execute(
+        "SELECT heightmap, source, confidence_map FROM tiles WHERE tile_id = ?",
+        (parent_id,)
+    ).fetchone()
+
+    if parent_row_db is None or parent_row_db[0] is None:
+        log_cog.info(f"  Parent resample: parent {parent_id} has no heightmap")
+        return None, None
+
+    parent_source = parent_row_db[1]
+    if parent_source in ('empty', 'pending', 'no_data'):
+        log_cog.info(f"  Parent resample: parent {parent_id} source={parent_source}, skipping")
+        return None, None
+
+    parent_hm = _decompress_float32(parent_row_db[0], (resolution, resolution))
+    parent_cm = _decompress_uint8(parent_row_db[2], (resolution, resolution)) if parent_row_db[2] else None
+
+    # Determine which quadrant this child occupies
+    # col%2: 0=left half, 1=right half
+    # row%2: 0=bottom half, 1=top half
+    qx = col % 2  # 0=left, 1=right
+    qy = row % 2  # 0=bottom, 1=top
+
+    # The parent grid is resolution x resolution (65x65).
+    # Each child covers half the parent, so we extract from the midpoint.
+    mid = resolution // 2  # 32
+
+    if qx == 0:
+        c_start, c_end = 0, mid + 1  # columns 0..32 (33 values)
+    else:
+        c_start, c_end = mid, resolution  # columns 32..64 (33 values)
+
+    if qy == 0:
+        r_start, r_end = 0, mid + 1  # rows 0..32
+    else:
+        r_start, r_end = mid, resolution  # rows 32..64
+
+    sub_grid = parent_hm[r_start:r_end, c_start:c_end]
+
+    # Check confidence map — if the quadrant has no confident pixels,
+    # it's genuinely empty (not just sea level at 0m)
+    if parent_cm is not None:
+        sub_cm = parent_cm[r_start:r_end, c_start:c_end]
+        if np.all(sub_cm == 0):
+            log_cog.info(f"  Parent resample: parent {parent_id} quadrant ({qx},{qy}) has no confident pixels")
+            return None, None
+
+    # Bilinear interpolate sub-grid up to full resolution
+    sh, sw = sub_grid.shape
+    row_idx = np.linspace(0, sh - 1, resolution)
+    col_idx = np.linspace(0, sw - 1, resolution)
+
+    r0 = np.floor(row_idx).astype(int)
+    c0 = np.floor(col_idx).astype(int)
+    r1 = np.minimum(r0 + 1, sh - 1)
+    c1 = np.minimum(c0 + 1, sw - 1)
+    rf = (row_idx - r0).astype(np.float32)
+    cf = (col_idx - c0).astype(np.float32)
+
+    result = (
+        sub_grid[np.ix_(r0, c0)] * (1 - rf[:, None]) * (1 - cf[None, :]) +
+        sub_grid[np.ix_(r0, c1)] * (1 - rf[:, None]) * cf[None, :] +
+        sub_grid[np.ix_(r1, c0)] * rf[:, None] * (1 - cf[None, :]) +
+        sub_grid[np.ix_(r1, c1)] * rf[:, None] * cf[None, :]
+    ).astype(np.float32)
+
+    log_cog.info(f"  Parent resample: {parent_id} quadrant ({qx},{qy}) → {tile_id} "
+                 f"sub={sub_grid.shape} → {result.shape}")
+
+    return result, 'parent_resampled'

@@ -32,10 +32,12 @@ GRID_N = 65
 CONFIDENCE = {
     'empty':      0,
     'procedural': 1,
-    'etopo':      2,
-    'external':   3,
-    'arcticdem':  4,
-    'arcticdem_10m': 5,
+    'parent_resampled': 2,
+    'etopo':      3,
+    'copernicus': 4,
+    'external':   4,
+    'arcticdem':  5,
+    'arcticdem_10m': 6,
 }
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")

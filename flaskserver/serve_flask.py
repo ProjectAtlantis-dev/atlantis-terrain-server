@@ -761,7 +761,7 @@ def api_tiles():
     def _bg_cog_fetch(missing_list):
       try:
         from concurrent.futures import ThreadPoolExecutor, as_completed
-        from ingest import _read_cog_heightmap
+        from ingest import _read_cog_heightmap, _resample_from_parent
         from database import CONFIDENCE, write_tile
         from serve import mark_no_data
 
@@ -773,7 +773,9 @@ def api_tiles():
           log_cog.debug(f"[cog-worker] {tile_id}: reading bbox=[{bbox[0]:.0f},{bbox[1]:.0f},{bbox[2]:.0f},{bbox[3]:.0f}]")
           return tile_id, _read_cog_heightmap(bbox, _GRID_N)
 
-        fetched, no_data_count = 0, 0
+        fetched, no_data_count, parent_resampled_count = 0, 0, 0
+        # Collect tiles that COG couldn't resolve for a second-pass parent resample
+        cog_failed = []
         with ThreadPoolExecutor(max_workers=6) as pool:
           futs = {pool.submit(_worker, tid, bbox): tid for tid, bbox in missing_list}
           for fut in as_completed(futs):
@@ -781,20 +783,47 @@ def api_tiles():
             try:
               tile_id, (data, src_name) = fut.result()
               if data is None:
-                mark_no_data(db, tile_id)
-                no_data_count += 1
+                cog_failed.append(tile_id)
                 continue
-              cm = _np.where(_np.isnan(data), _np.uint8(0), _np.uint8(CONFIDENCE['arcticdem']))
+              conf = CONFIDENCE.get(src_name, CONFIDENCE['arcticdem'])
+              cm = _np.where(_np.isnan(data), _np.uint8(0), _np.uint8(conf))
               hm = _np.where(_np.isnan(data), 0.0, data).astype(_np.float32)
               write_tile(db, tile_id, hm, cm, src_name, reconcile=False)
               fetched += 1
             except Exception:
-              mark_no_data(db, tid)
-              no_data_count += 1
+              cog_failed.append(tid)
             finally:
               _cog_fetching_tiles.discard(tid)
 
-        log_cog.info(f"Done: {fetched} fetched, {no_data_count} no data")
+        # Second pass: try parent resampling for tiles that had no COG data.
+        # Sort by depth (shallowest first) so parent tiles get written before
+        # their children try to resample from them — enables chaining
+        # (depth-10 → depth-11 → depth-12 in one pass).
+        cog_failed.sort(key=lambda tid: int(tid.split('-')[0]))
+        for tile_id in cog_failed:
+          try:
+            data, src_name = _resample_from_parent(db, tile_id, bbox=None, resolution=_GRID_N)
+            if data is not None:
+              conf = CONFIDENCE.get(src_name, CONFIDENCE['arcticdem'])
+              cm = _np.where(_np.isnan(data), _np.uint8(0), _np.uint8(conf))
+              hm = _np.where(_np.isnan(data), 0.0, data).astype(_np.float32)
+              from database import TileClobberError
+              try:
+                write_tile(db, tile_id, hm, cm, src_name, reconcile=False)
+                parent_resampled_count += 1
+                log_cog.info(f"  [PARENT RESAMPLE] {tile_id}: filled from parent")
+              except TileClobberError:
+                # Already has data (e.g. from a previous request) — that's fine
+                parent_resampled_count += 1
+            else:
+              mark_no_data(db, tile_id)
+              no_data_count += 1
+          except Exception as exc:
+            log_cog.warning(f"  [PARENT RESAMPLE] {tile_id}: failed: {exc}")
+            mark_no_data(db, tile_id)
+            no_data_count += 1
+
+        log_cog.info(f"Done: {fetched} fetched, {parent_resampled_count} parent-resampled, {no_data_count} no data")
         db.close()
       finally:
         _cog_fetching_tiles.clear()

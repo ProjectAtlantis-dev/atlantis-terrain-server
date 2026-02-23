@@ -29,7 +29,7 @@ from database import (
 from terrain_config import ENHANCE_DEPTH
 
 
-REAL_SOURCES = ('arcticdem', 'arcticdem_10m', 'copernicus', 'upscaled', 'supir_upscaled')
+REAL_SOURCES = ('arcticdem', 'arcticdem_10m', 'copernicus', 'upscaled', 'supir_upscaled', 'parent_resampled')
 
 # Sources that should be refetched at higher DEM resolution
 _UPGRADEABLE_SOURCES = {'arcticdem'}  # old 32m data
@@ -66,9 +66,14 @@ def _fetch_tile(db, tile_id, bbox, allow_overwrite=False):
     if tile_id in _no_data_cache:
         return False
 
-    from ingest import _read_cog_heightmap
+    from ingest import _read_cog_heightmap, _resample_from_parent
 
     data, src_name = _read_cog_heightmap(bbox, GRID_N)
+
+    # Fallback: resample from parent tile if COG returned nothing
+    if data is None:
+        data, src_name = _resample_from_parent(db, tile_id, bbox, GRID_N)
+
     if data is None:
         mark_no_data(db, tile_id)
         return False
@@ -141,6 +146,7 @@ def _traverse(db, depth, col, row, qx, qy, max_depth, error_threshold,
         return
 
     has_real_data = meta['source'] in REAL_SOURCES
+    is_placeholder = meta['source'] == 'parent_resampled'
 
     # Unfetched tiles have geometric_error=0 from seeding — assume high
     # error so the traversal subdivides through them to find smaller tiles
@@ -161,6 +167,13 @@ def _traverse(db, depth, col, row, qx, qy, max_depth, error_threshold,
             log_trav.debug(f"{tid}: beyond max_range ({dist_to_tile:.0f} > {max_range:.0f}), real={has_real_data}")
         if has_real_data:
             results.append(tid)
+        return
+
+    # Parent-resampled tiles are terminal — don't subdivide further.
+    # They're interpolated placeholders; children would also lack COG data
+    # and just create texture-less holes.
+    if is_placeholder:
+        results.append(tid)
         return
 
     # Check if we should subdivide
@@ -412,7 +425,7 @@ def fetch_missing_tiles(db, missing, max_workers=6, log=print):
     """
     import time
     from concurrent.futures import ThreadPoolExecutor, as_completed
-    from ingest import _read_cog_heightmap
+    from ingest import _read_cog_heightmap, _resample_from_parent
 
     if not missing:
         return 0
@@ -444,6 +457,12 @@ def fetch_missing_tiles(db, missing, max_workers=6, log=print):
             tid = futures[future]
             try:
                 tile_id, (data, src_name) = future.result()
+
+                # Fallback: resample from parent if COG returned nothing
+                if data is None:
+                    data, src_name = _resample_from_parent(db, tile_id, bbox=None, resolution=GRID_N)
+                    # bbox not needed — _resample_from_parent uses tile_id to find parent
+
                 if data is None:
                     if tid not in upgrade_tids:
                         mark_no_data(db, tile_id)
