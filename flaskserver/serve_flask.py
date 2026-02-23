@@ -145,6 +145,85 @@ _tex_pool = ThreadPoolExecutor(max_workers=4)
 _tex_fetching: set[str] = set()
 _tex_fetching_lock = threading.Lock()
 
+# --- Texture retry queue (transient Dataforsyningen failures) ---
+_TEX_RETRY_MAX = 3
+_TEX_RETRY_DELAYS = [30, 60, 120]  # seconds between retries
+_tex_retry_queue: list[tuple[str, tuple, int]] = []  # (tile_id, bbox, attempt)
+_tex_retry_lock = threading.Lock()
+_tex_retry_thread: threading.Thread | None = None
+
+
+def _tex_retry_enqueue(tile_id: str, bbox: tuple, attempt: int = 0) -> None:
+  with _tex_retry_lock:
+    # Don't double-queue
+    for tid, _, _ in _tex_retry_queue:
+      if tid == tile_id:
+        return
+    _tex_retry_queue.append((tile_id, bbox, attempt))
+    log_tex.debug(f"[tex-retry] enqueued {tile_id} attempt={attempt}")
+  _ensure_tex_retry_thread()
+
+
+def _ensure_tex_retry_thread() -> None:
+  global _tex_retry_thread
+  if _tex_retry_thread is not None and _tex_retry_thread.is_alive():
+    return
+  _tex_retry_thread = threading.Thread(target=_tex_retry_worker, daemon=True)
+  _tex_retry_thread.start()
+
+
+def _tex_retry_worker() -> None:
+  """Background thread that retries rate-limited Dataforsyningen fetches."""
+  while True:
+    with _tex_retry_lock:
+      if not _tex_retry_queue:
+        return  # thread exits, will be restarted when new items enqueue
+      tile_id, bbox, attempt = _tex_retry_queue.pop(0)
+
+    delay = _TEX_RETRY_DELAYS[min(attempt, len(_TEX_RETRY_DELAYS) - 1)]
+    log_tex.debug(f"[tex-retry] {tile_id}: waiting {delay}s (attempt {attempt + 1}/{_TEX_RETRY_MAX})")
+    time.sleep(delay)
+
+    db = None
+    try:
+      db = sqlite3.connect(str(DB_PATH), check_same_thread=False)
+      db.execute("PRAGMA journal_mode=WAL")
+      if _init_textures is not None:
+        _init_textures(db)
+
+      # Check tile hasn't been upgraded while we waited
+      cur_row = db.execute(
+        "SELECT source, texture FROM textures WHERE tile_id = ?", (tile_id,)
+      ).fetchone()
+      if cur_row and cur_row[0] not in ("ancestor_crop", "ancestor_crop_ratelimit"):
+        log_tex.debug(f"[tex-retry] {tile_id}: already upgraded to {cur_row[0]}, skipping")
+        continue
+
+      jpeg, fail_reason = _fetch_dataforsyningen_texture(list(bbox), resolution=256)
+      if jpeg is not None:
+        _write_texture(db, tile_id, jpeg, "dataforsyningen")
+        _update_water_mask_for_tile(db, tile_id, jpeg, "dataforsyningen")
+        log_tex.info(f"[tex-retry] {tile_id}: SUCCESS on attempt {attempt + 1}")
+      elif fail_reason == 'no_coverage':
+        if cur_row and cur_row[1]:
+          _write_texture(db, tile_id, cur_row[1], "ancestor_crop_nodata")
+        log_tex.info(f"[tex-retry] {tile_id}: no coverage → ancestor_crop_nodata")
+      else:
+        # Still transient
+        if attempt + 1 < _TEX_RETRY_MAX:
+          _tex_retry_enqueue(tile_id, bbox, attempt + 1)
+          log_tex.debug(f"[tex-retry] {tile_id}: still transient, re-queued attempt {attempt + 2}")
+        else:
+          if cur_row and cur_row[1]:
+            _write_texture(db, tile_id, cur_row[1], "ancestor_crop_nodata")
+          log_tex.warning(f"[tex-retry] {tile_id}: max retries exhausted → ancestor_crop_nodata")
+    except Exception as exc:
+      log_tex.error(f"[tex-retry] {tile_id}: FAILED: {type(exc).__name__}: {exc}")
+    finally:
+      if db is not None:
+        db.close()
+
+
 _enhance_pool = ThreadPoolExecutor(max_workers=2)
 _enhancing: set[str] = set()
 _enhancing_lock = threading.Lock()
@@ -657,6 +736,8 @@ def _queue_texture_fetch(tile_id: str, bbox: tuple[float, float, float, float]) 
       return
     _tex_fetching.add(tile_id)
 
+  _RE_FETCHABLE = {"sentinel2_crop", "ancestor_crop"}
+
   def _worker() -> None:
     db = None
     try:
@@ -665,12 +746,11 @@ def _queue_texture_fetch(tile_id: str, bbox: tuple[float, float, float, float]) 
       if _init_textures is not None:
         _init_textures(db)
 
-      # Skip if already cached with a real source. Only sentinel2_crop
-      # is re-fetchable. ancestor_crop is final (batch cleanup later).
+      # Skip if already in a non-refetchable state.
       existing = db.execute(
         "SELECT source FROM textures WHERE tile_id = ?", (tile_id,)
       ).fetchone()
-      if existing and existing[0] != "sentinel2_crop":
+      if existing and existing[0] not in _RE_FETCHABLE:
         log_tex.debug(f"[tex-worker] {tile_id}: already cached ({existing[0]}), skipping")
         return
 
@@ -687,23 +767,26 @@ def _queue_texture_fetch(tile_id: str, bbox: tuple[float, float, float, float]) 
       log_tex.debug(f"[tex-worker] {tile_id}: fetching texture bbox={bbox}")
       jpeg, fail_reason = _fetch_dataforsyningen_texture(list(bbox), resolution=256)
       if jpeg is not None:
-        log_tex.debug(f"[tex-worker] {tile_id}: got {len(jpeg)} bytes from dataforsyningen, writing to DB")
+        log_tex.debug(f"[tex-worker] {tile_id}: got {len(jpeg)} bytes from dataforsyningen")
         _write_texture(db, tile_id, jpeg, "dataforsyningen")
         _update_water_mask_for_tile(db, tile_id, jpeg, "dataforsyningen")
       elif fail_reason == 'no_coverage':
-        # Permanent failure — write ancestor_crop so we stop retrying.
-        # Batch cleanup can re-attempt these later.
-        log_tex.debug(f"[tex-worker] {tile_id}: no coverage, ancestor_crop is final")
-      else:
-        # Transient failure (rate limit / timeout). Delete any ancestor_crop
-        # we just seeded so the tile stays uncached and retries next request.
+        # Permanent — mark so we never retry automatically.
         existing = db.execute(
-          "SELECT source FROM textures WHERE tile_id = ?", (tile_id,)
+          "SELECT texture FROM textures WHERE tile_id = ?", (tile_id,)
         ).fetchone()
-        if existing and existing[0] == "ancestor_crop":
-          db.execute("DELETE FROM textures WHERE tile_id = ?", (tile_id,))
-          db.commit()
-          log_tex.debug(f"[tex-worker] {tile_id}: transient failure, removed ancestor_crop for retry")
+        if existing and existing[0]:
+          _write_texture(db, tile_id, existing[0], "ancestor_crop_nodata")
+        log_tex.debug(f"[tex-worker] {tile_id}: no coverage → ancestor_crop_nodata")
+      else:
+        # Transient (rate limit / timeout). Mark and enqueue for retry.
+        existing = db.execute(
+          "SELECT texture FROM textures WHERE tile_id = ?", (tile_id,)
+        ).fetchone()
+        if existing and existing[0]:
+          _write_texture(db, tile_id, existing[0], "ancestor_crop_ratelimit")
+        _tex_retry_enqueue(tile_id, bbox, attempt=0)
+        log_tex.debug(f"[tex-worker] {tile_id}: transient → ancestor_crop_ratelimit, queued for retry")
     except Exception as exc:  # pragma: no cover - runtime fetch path
       log_tex.error(f"[tex-worker] {tile_id} FAILED: {type(exc).__name__}: {exc}")
     finally:
@@ -946,19 +1029,21 @@ def api_texture(tile_id: str):
   ).fetchone()
 
   cached_crop = None
+  # Sources that are temporary placeholders — serve them but let client re-fetch
+  _TEX_TEMPORARY = {"sentinel2_crop", "ancestor_crop", "ancestor_crop_ratelimit"}
   if row is not None:
     cached, source = row[0], row[1]
     log_tex.debug(f"[/api/texture] {tile_id}: cache HIT source={source} size={len(cached)} bytes")
-    if source not in ("sentinel2_crop",):
-      quality = "ancestor_crop" if source == "ancestor_crop" else "full"
+    if source not in _TEX_TEMPORARY:
+      is_crop = source == "ancestor_crop_nodata"
       return Response(
         cached,
         mimetype="image/jpeg",
         headers={
-          "Cache-Control": "public, max-age=86400",
+          "Cache-Control": "public, max-age=86400" if not is_crop else "public, max-age=3600",
           "X-Tex-Source": source,
           "X-Tex-Status": "ready",
-          "X-Tex-Quality": quality,
+          "X-Tex-Quality": "ancestor_crop" if is_crop else "full",
           "X-Tex-Temporary": "0",
         },
       )
@@ -973,7 +1058,11 @@ def api_texture(tile_id: str):
   if row is None:
     log_tex.debug(f"[/api/texture] {tile_id}: cache MISS, queuing fetch (depth={d} col={c} row={r})")
 
-  _queue_texture_fetch(tile_id, _tile_bbox(d, c, r))
+  # Queue a fetch for cache misses and re-fetchable sources.
+  # Skip for ancestor_crop_ratelimit — the retry queue already handles those.
+  source = row[1] if row else None
+  if source != "ancestor_crop_ratelimit":
+    _queue_texture_fetch(tile_id, _tile_bbox(d, c, r))
 
   if cached_crop is not None:
     return Response(
@@ -1474,11 +1563,12 @@ def api_tile_inspect():
   else:
     log_tex.info(f"  texture: NOT IN DB")
 
-  # --- auto-fix stale ancestor_crop: delete and re-queue ---
-  if row and row[0] == "ancestor_crop":
+  # --- auto-fix: reset terminal ancestor_crop states and re-queue ---
+  if row and row[0] in ("ancestor_crop_nodata", "ancestor_crop_ratelimit", "ancestor_crop"):
+    state = row[0]
     db.execute("DELETE FROM textures WHERE tile_id = ?", (tid,))
     db.commit()
-    log_tex.warning(f"  AUTO-FIX: deleted stale ancestor_crop, re-queuing fetch")
+    log_tex.warning(f"  AUTO-FIX: deleted {state}, re-queuing fetch")
     if parsed:
       d, c, r = parsed
       _queue_texture_fetch(tid, _tile_bbox(d, c, r))

@@ -2638,6 +2638,16 @@ function updateTextures(tiles) {
             if (isAncestorCrop) {
               tileLog(tid, `ancestor crop from ${ancestorHeader} — not caching, will retry`);
               _ancestorLogged.add(tid);
+              // Apply ancestor texture as placeholder (don't cache — will re-fetch for sharp version)
+              let mesh = null;
+              for (const child of terrainRoot.children) {
+                if (child.userData.tileId === tid) { mesh = child; break; }
+              }
+              if (mesh && !mesh.userData.isWater) {
+                mesh.material.map = tex;
+                mesh.material.color.set(0xffffff);
+                mesh.material.needsUpdate = true;
+              }
             } else {
               _ancestorLogged.delete(tid);
               texCache.set(tid, tex);

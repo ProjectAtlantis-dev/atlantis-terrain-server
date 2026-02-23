@@ -4,15 +4,18 @@ TEXTURE UPGRADE CHAIN — DO NOT FUCK WITH THE ORDER:
 
     ancestor_crop → dataforsyningen → dataforsyningen_enhanced → upscaled
 
-- Dataforsyningen (SPOT 6/7, 1.6m/0.2m) is the PRIMARY source. It requires
-  EPSG:3184 — we reproject from 3413→3184 for the WMS request, then warp
-  the result back to 3413 with Lanczos.
-- ancestor_crop is a parent texture cropped to the child quadrant. It is
-  written at subdivision time (all 4 children seeded at once) and is NOT
-  automatically retried. Use batch cleanup to upgrade to dataforsyningen.
-- Sentinel-2 (EOX, 10m) is ONLY used as a temporary placeholder (sentinel2_crop)
-  when Dataforsyningen fails. sentinel2_crop is the only source that allows
-  automatic re-fetching so the tile gets retried.
+TEXTURE SOURCE STATES:
+- ancestor_crop:            Cropped from parent at subdivision time. Fresh, untried.
+                            Re-fetchable — tex-worker will attempt Dataforsyningen.
+- ancestor_crop_ratelimit:  Dataforsyningen returned transient error (429/timeout).
+                            Managed by background retry queue with exponential backoff.
+- ancestor_crop_nodata:     Dataforsyningen confirmed no coverage. Terminal.
+                            Only manual inspect auto-fix can reset it.
+- sentinel2_crop:           Legacy Sentinel-2 placeholder. Re-fetchable.
+- dataforsyningen:          Primary source (SPOT 6/7, 1.6m/0.2m via EPSG:3184).
+- dataforsyningen_enhanced: SUPIR upscale of dataforsyningen via ComfyUI.
+- upscaled:                 Final upscaled output.
+
 - The enhance path (SUPIR via ComfyUI) ONLY processes dataforsyningen tiles.
   It never fetches from the internet. Never enhance sentinel2.
 - write_texture() has an expected_upgrades whitelist. If you add a new source,
@@ -192,10 +195,15 @@ def write_texture(db, tile_id, jpeg_bytes, source):
             ("sentinel2_crop", "sentinel2"),
             ("sentinel2_crop", "dataforsyningen"),
             ("ancestor_crop", "dataforsyningen"),
-            ("ancestor_crop", "sentinel2_crop"),
+            ("ancestor_crop", "ancestor_crop_ratelimit"),
+            ("ancestor_crop", "ancestor_crop_nodata"),
+            ("ancestor_crop_ratelimit", "dataforsyningen"),
+            ("ancestor_crop_ratelimit", "ancestor_crop_nodata"),
+            ("ancestor_crop_nodata", "ancestor_crop"),
             ("sentinel2", "dataforsyningen"),
             ("dataforsyningen", "dataforsyningen_enhanced"),
             ("dataforsyningen_enhanced", "upscaled"),
+            ("sentinel2_enhanced", "upscaled"),
         }
         msg = (
             f"{tile_id}: replacing {ex_source} "
