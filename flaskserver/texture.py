@@ -2,14 +2,17 @@
 
 TEXTURE UPGRADE CHAIN — DO NOT FUCK WITH THE ORDER:
 
-    sentinel2_crop → dataforsyningen → dataforsyningen_enhanced → upscaled
+    ancestor_crop → dataforsyningen → dataforsyningen_enhanced → upscaled
 
 - Dataforsyningen (SPOT 6/7, 1.6m/0.2m) is the PRIMARY source. It requires
   EPSG:3184 — we reproject from 3413→3184 for the WMS request, then warp
   the result back to 3413 with Lanczos.
+- ancestor_crop is a parent texture cropped to the child quadrant. It is
+  written at subdivision time (all 4 children seeded at once) and is NOT
+  automatically retried. Use batch cleanup to upgrade to dataforsyningen.
 - Sentinel-2 (EOX, 10m) is ONLY used as a temporary placeholder (sentinel2_crop)
   when Dataforsyningen fails. sentinel2_crop is the only source that allows
-  re-fetching so the tile gets retried.
+  automatic re-fetching so the tile gets retried.
 - The enhance path (SUPIR via ComfyUI) ONLY processes dataforsyningen tiles.
   It never fetches from the internet. Never enhance sentinel2.
 - write_texture() has an expected_upgrades whitelist. If you add a new source,
@@ -59,6 +62,10 @@ def fetch_dataforsyningen_texture(bbox, resolution=256):
 
     The WMS only supports EPSG:3184, so we transform the bbox from 3413→3184,
     fetch the image, then reproject the result back to 3413.
+
+    Returns (jpeg_bytes, None) on success,
+            (None, 'transient') on rate limit / timeout / HTTP error,
+            (None, 'no_coverage') when the tile has no imagery.
     """
     # Transform bbox from EPSG:3413 to EPSG:3184
     min_x, min_y, max_x, max_y = bbox
@@ -86,15 +93,15 @@ def fetch_dataforsyningen_texture(bbox, resolution=256):
     log_tex.info(f"[DFORSYNINGEN] fetching {fetch_res}x{fetch_res} bbox={bbox_str} (EPSG:3184)")
     data = _fetch_url(url, timeout=30)
     if data is None:
-        log_tex.warning("[DFORSYNINGEN] fetch returned None")
-        return None
+        log_tex.warning("[DFORSYNINGEN] fetch returned None (transient)")
+        return None, 'transient'
     try:
         img = Image.open(io.BytesIO(data)).convert("RGB")
         src_arr = np.array(img)
     except Exception as e:
         snippet = data[:1000].decode("utf-8", errors="replace") if data else ""
         log_tex.warning(f"[DFORSYNINGEN] decode error: {e} | response: {snippet}")
-        return None
+        return None, 'no_coverage'
 
     # Reproject from EPSG:3184 to EPSG:3413
     src_h, src_w = src_arr.shape[:2]
@@ -117,14 +124,14 @@ def fetch_dataforsyningen_texture(bbox, resolution=256):
     # Reject if mostly black/empty
     zero_pct = np.mean(dst_arr.max(axis=2) == 0) * 100
     if zero_pct > 50:
-        log_tex.warning(f"[DFORSYNINGEN] rejecting {zero_pct:.0f}% zero-fill result")
-        return None
+        log_tex.warning(f"[DFORSYNINGEN] rejecting {zero_pct:.0f}% zero-fill result (no coverage)")
+        return None, 'no_coverage'
     # Re-encode as JPEG
     img = Image.fromarray(dst_arr)
     buf = io.BytesIO()
     img.save(buf, format="JPEG", quality=85)
     log_tex.info(f"[DFORSYNINGEN] OK: {len(buf.getvalue())} bytes, {zero_pct:.0f}% zero")
-    return buf.getvalue()
+    return buf.getvalue(), None
 
 
 # Sentinel-2 Cloudless 2024 (EPSG:3857 / Web Mercator)
@@ -184,6 +191,8 @@ def write_texture(db, tile_id, jpeg_bytes, source):
         expected_upgrades = {
             ("sentinel2_crop", "sentinel2"),
             ("sentinel2_crop", "dataforsyningen"),
+            ("ancestor_crop", "dataforsyningen"),
+            ("ancestor_crop", "sentinel2_crop"),
             ("sentinel2", "dataforsyningen"),
             ("dataforsyningen", "dataforsyningen_enhanced"),
             ("dataforsyningen_enhanced", "upscaled"),

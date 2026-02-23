@@ -13,10 +13,32 @@ from rasterio.transform import from_bounds as transform_from_bounds
 from rasterio.warp import Resampling as WarpResampling, reproject
 from rasterio.windows import from_bounds as window_from_bounds, Window
 
+from pyproj import Transformer
+
 from colored_log import get_logger
 from database import GRID_N
 
 log_cog = get_logger("terrain.cog")
+
+# ---------------------------------------------------------------------------
+# EGM2008 geoid correction for ArcticDEM (ellipsoidal → orthometric heights)
+# ---------------------------------------------------------------------------
+# ArcticDEM uses WGS84 ellipsoidal heights. Sea level != 0m — it varies by
+# the local geoid undulation (e.g. ~28m near Nuuk, ~49m near Tasiilaq).
+# We subtract the geoid height N so that sea level ≈ 0m.
+# Requires the us_nga_egm08_25.tif grid (install via: projsync --file us_nga_egm08_25.tif)
+
+_to_wgs84_3d = Transformer.from_crs(3413, 4979, always_xy=True)
+_to_egm2008 = Transformer.from_crs(4979, 9518, always_xy=True)
+
+
+def _geoid_undulation(bbox):
+    """Return EGM2008 geoid undulation (meters) at the bbox center."""
+    cx = (bbox[0] + bbox[2]) / 2
+    cy = (bbox[1] + bbox[3]) / 2
+    lon, lat, _ = _to_wgs84_3d.transform(cx, cy, 0)
+    _, _, ortho_at_zero = _to_egm2008.transform(lon, lat, 0)
+    return -ortho_at_zero
 
 # ---------------------------------------------------------------------------
 # ArcticDEM tile grid constants
@@ -55,7 +77,6 @@ def _tile_url(row, col):
 # ---------------------------------------------------------------------------
 
 def _copernicus_url(bbox):
-    from pyproj import Transformer
     t = Transformer.from_crs("EPSG:3413", "EPSG:4326", always_xy=True)
     cx, cy = (bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2
     lon, lat = t.transform(cx, cy)
@@ -172,6 +193,12 @@ def _read_cog_heightmap(bbox, resolution=GRID_N):
                         arctic[fill] = resampled[fill]
                 except Exception as exc:
                     log_cog.warning(f"    ArcticDEM FAILED row={row} col={col}: {type(exc).__name__}: {exc}")
+
+    # --- EGM2008 geoid correction (ellipsoidal → orthometric) ---
+    if arctic is not None and np.any(~np.isnan(arctic)):
+        geoid_n = _geoid_undulation(bbox)
+        arctic -= np.float32(geoid_n)
+        log_cog.info(f"  ArcticDEM geoid correction: N={geoid_n:.2f}m subtracted")
 
     arctic_ok = arctic is not None and np.any(~np.isnan(arctic))
 

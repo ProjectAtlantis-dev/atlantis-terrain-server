@@ -732,13 +732,13 @@ function buildTuningControls(ap, ce) {
     onChange: v => { ce.cloudLayers[3].weatherExponent = v; }
   });
   const _cirrusDefaults = {
-    densityScale: ce.cloudLayers[3].densityScale,
+    densityScale: 0.004,  // design value (startup is 0 / off)
     coverageFilterWidth: ce.cloudLayers[3].coverageFilterWidth,
     shapeAmount: ce.cloudLayers[3].shapeAmount,
     weatherExponent: ce.cloudLayers[3].weatherExponent,
   };
   controls._cirrusCheckbox = tuningToggle('cirrus', {
-    value: true,
+    value: false,
     onChange: v => {
       ce.cloudLayers[3].densityScale = v ? _cirrusDefaults.densityScale : 0;
     }
@@ -2072,10 +2072,14 @@ const normalPass = new NormalPass(scene, camera);
 const cloudsEffect = new CloudsEffect(camera, { resolutionScale: 1 });
 cloudsEffect.qualityPreset = 'high';
 cloudsEffect.coverage = 0.28;
-// High thin cirrus-like layer (~30k ft)
+// Raise main cloud layers to ~800m above Takram defaults
+cloudsEffect.cloudLayers[0].altitude = 1550;  // default 750 + 800
+cloudsEffect.cloudLayers[1].altitude = 1800;  // default 1000 + 800
+cloudsEffect.cloudLayers[2].altitude = 8300;  // default 7500 + 800
+// Cirrus layer — configured but OFF at startup (toggle in tuning panel)
 cloudsEffect.cloudLayers[3].altitude = 9100;
 cloudsEffect.cloudLayers[3].height = 400;
-cloudsEffect.cloudLayers[3].densityScale = 0.004;
+cloudsEffect.cloudLayers[3].densityScale = 0;
 cloudsEffect.cloudLayers[3].shapeAmount = 0.3;
 cloudsEffect.cloudLayers[3].shapeDetailAmount = 0;
 cloudsEffect.cloudLayers[3].weatherExponent = 1;
@@ -3780,6 +3784,8 @@ window.addEventListener('resize', () => {
 });
 
 applyCameraOrientation();
+camera.updateProjectionMatrix();
+camera.updateMatrixWorld(true);
 updateMapCamera();
 updateHud();
 

@@ -536,6 +536,67 @@ def _nearest_ancestor_texture(tile_id: str, texture_ids: set[str]) -> str | None
   return None
 
 
+def _crop_child_from_parent(parent_img, parent_depth, child_d, child_c, child_r):
+  """Crop a single child tile's quadrant from a parent/ancestor image.
+
+  Returns JPEG bytes.
+  """
+  w, h = parent_img.size
+  depth_diff = child_d - parent_depth
+  sub_c = child_c % (1 << depth_diff)
+  sub_r = child_r % (1 << depth_diff)
+  n = 1 << depth_diff
+
+  x0 = sub_c * w // n
+  x1 = (sub_c + 1) * w // n
+  y0 = (n - 1 - sub_r) * h // n
+  y1 = (n - sub_r) * h // n
+
+  cropped = parent_img.crop((x0, y0, x1, y1)).resize((256, 256), _Image.Resampling.BILINEAR)
+  buf = io.BytesIO()
+  cropped.save(buf, format="JPEG", quality=85)
+  return buf.getvalue()
+
+
+def _seed_children_from_parent(db, parent_id: str) -> int:
+  """Crop a parent texture into 4 child quadrants and write as ancestor_crop.
+
+  Only writes children that have no texture yet. Returns count of children seeded.
+  """
+  parent_tex = _read_texture(db, parent_id)
+  if parent_tex is None:
+    return 0
+
+  parsed = _parse_tile_id(parent_id)
+  if parsed is None:
+    return 0
+  p_d, p_c, p_r = parsed
+
+  parent_img = _Image.open(io.BytesIO(parent_tex))
+  child_depth = p_d + 1
+  seeded = 0
+
+  for dc in range(2):
+    for dr in range(2):
+      child_c = p_c * 2 + dc
+      child_r = p_r * 2 + dr
+      child_id = f"{child_depth}-{child_c}-{child_r}"
+
+      existing = db.execute(
+        "SELECT source FROM textures WHERE tile_id = ?", (child_id,)
+      ).fetchone()
+      if existing:
+        continue
+
+      jpeg = _crop_child_from_parent(parent_img, p_d, child_depth, child_c, child_r)
+      _write_texture(db, child_id, jpeg, "ancestor_crop")
+      seeded += 1
+
+  if seeded:
+    log_tex.debug(f"[tex-seed] {parent_id}: seeded {seeded}/4 children with ancestor_crop")
+  return seeded
+
+
 
 def _texture_flags(
   tile_id: str,
@@ -603,30 +664,46 @@ def _queue_texture_fetch(tile_id: str, bbox: tuple[float, float, float, float]) 
       db.execute("PRAGMA journal_mode=WAL")
       if _init_textures is not None:
         _init_textures(db)
+
       # Skip if already cached with a real source. Only sentinel2_crop
-      # is re-fetchable — everything else is considered final.
-      # See texture.py docstring for the full upgrade chain.
+      # is re-fetchable. ancestor_crop is final (batch cleanup later).
       existing = db.execute(
         "SELECT source FROM textures WHERE tile_id = ?", (tile_id,)
       ).fetchone()
       if existing and existing[0] != "sentinel2_crop":
         log_tex.debug(f"[tex-worker] {tile_id}: already cached ({existing[0]}), skipping")
         return
+
+      # Step 1: seed this tile + siblings from parent texture so all 4
+      # children get an immediate ancestor_crop baseline.
+      parsed = _parse_tile_id(tile_id)
+      if parsed is not None:
+        d, c, r = parsed
+        if d > 0:
+          parent_id = f"{d - 1}-{c // 2}-{r // 2}"
+          _seed_children_from_parent(db, parent_id)
+
+      # Step 2: try Dataforsyningen. If it succeeds, overwrite ancestor_crop.
       log_tex.debug(f"[tex-worker] {tile_id}: fetching texture bbox={bbox}")
-      # Dataforsyningen is the PRIMARY source. Do not reorder this.
-      # Sentinel-2 is ONLY a temporary placeholder — see upgrade chain.
-      jpeg = _fetch_dataforsyningen_texture(list(bbox), resolution=256)
+      jpeg, fail_reason = _fetch_dataforsyningen_texture(list(bbox), resolution=256)
       if jpeg is not None:
         log_tex.debug(f"[tex-worker] {tile_id}: got {len(jpeg)} bytes from dataforsyningen, writing to DB")
         _write_texture(db, tile_id, jpeg, "dataforsyningen")
         _update_water_mask_for_tile(db, tile_id, jpeg, "dataforsyningen")
+      elif fail_reason == 'no_coverage':
+        # Permanent failure — write ancestor_crop so we stop retrying.
+        # Batch cleanup can re-attempt these later.
+        log_tex.debug(f"[tex-worker] {tile_id}: no coverage, ancestor_crop is final")
       else:
-        # Dataforsyningen failed (rate limit / timeout / no coverage).
-        # Don't write anything — the ancestor crop keeps showing and the
-        # tile stays uncached so Dataforsyningen gets retried next request.
-        # Writing sentinel2_crop here would cause a visible flash when the
-        # real dataforsyningen texture arrives later.
-        log_tex.debug(f"[tex-worker] {tile_id}: dataforsyningen failed, leaving uncached for retry")
+        # Transient failure (rate limit / timeout). Delete any ancestor_crop
+        # we just seeded so the tile stays uncached and retries next request.
+        existing = db.execute(
+          "SELECT source FROM textures WHERE tile_id = ?", (tile_id,)
+        ).fetchone()
+        if existing and existing[0] == "ancestor_crop":
+          db.execute("DELETE FROM textures WHERE tile_id = ?", (tile_id,))
+          db.commit()
+          log_tex.debug(f"[tex-worker] {tile_id}: transient failure, removed ancestor_crop for retry")
     except Exception as exc:  # pragma: no cover - runtime fetch path
       log_tex.error(f"[tex-worker] {tile_id} FAILED: {type(exc).__name__}: {exc}")
     finally:
@@ -872,7 +949,8 @@ def api_texture(tile_id: str):
   if row is not None:
     cached, source = row[0], row[1]
     log_tex.debug(f"[/api/texture] {tile_id}: cache HIT source={source} size={len(cached)} bytes")
-    if source != "sentinel2_crop":
+    if source not in ("sentinel2_crop",):
+      quality = "ancestor_crop" if source == "ancestor_crop" else "full"
       return Response(
         cached,
         mimetype="image/jpeg",
@@ -880,7 +958,7 @@ def api_texture(tile_id: str):
           "Cache-Control": "public, max-age=86400",
           "X-Tex-Source": source,
           "X-Tex-Status": "ready",
-          "X-Tex-Quality": "full",
+          "X-Tex-Quality": quality,
           "X-Tex-Temporary": "0",
         },
       )

@@ -38,6 +38,7 @@ flaskserver/terrain.db
 flaskserver/terrain.db-wal
 flaskserver/terrain.db-shm
 samples/
+sample/
 _metadata.json
 
 *.OLD
