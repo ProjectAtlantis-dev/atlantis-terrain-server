@@ -32,8 +32,12 @@ class ColoredFormatter(logging.Formatter):
     }
 
     def format(self, record):
+        message = record.getMessage()
+        # Vehicle category should always stand out in amber.
+        if record.name == "terrain.vehicle" or "[VEHICLE" in message:
+            log_fmt = ORANGE + "%(asctime)s [%(levelname)s] %(name)s: %(message)s" + RESET
         # DB messages in cyan
-        if record.name == "terrain.db" and record.levelno == logging.INFO:
+        elif record.name == "terrain.db" and record.levelno == logging.INFO:
             log_fmt = CYAN + "%(asctime)s [%(levelname)s] %(name)s: %(message)s" + RESET
         # Texture fetch messages in magenta
         elif record.name == "terrain.tex" and record.levelno == logging.INFO:
@@ -44,6 +48,9 @@ class ColoredFormatter(logging.Formatter):
         # Traversal messages in grey (debug-level spam)
         elif record.name == "terrain.trav":
             log_fmt = GREY + "%(asctime)s [%(levelname)s] %(name)s: %(message)s" + RESET
+        # Base terrain stream in spring green for easier separation from vehicle.
+        elif record.name == "terrain" and record.levelno == logging.INFO:
+            log_fmt = SPRING_GREEN + "%(asctime)s [%(levelname)s] %(name)s: %(message)s" + RESET
         else:
             log_fmt = self.FORMATS.get(record.levelno, logging.BASIC_FORMAT)
         formatter = logging.Formatter(log_fmt, datefmt='%Y-%m-%d %H:%M:%S')
@@ -59,7 +66,7 @@ def get_logger(name="terrain"):
         logger.addHandler(handler)
         logger.setLevel(
             logging.INFO
-            if name in ("terrain.trav", "terrain", "terrain.tex", "terrain.cog")
+            if name in ("terrain.trav", "terrain", "terrain.tex", "terrain.cog", "terrain.vehicle")
             else logging.DEBUG
         )
         logger.propagate = False

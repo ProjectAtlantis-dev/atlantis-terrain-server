@@ -25,6 +25,7 @@ log = get_logger("terrain")
 log_db = get_logger("terrain.db")
 log_tex = get_logger("terrain.tex")
 log_cog = get_logger("terrain.cog")
+log_vehicle = get_logger("terrain.vehicle")
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -1638,7 +1639,7 @@ def api_vehicle_state_get():
   try:
     state = json.loads(raw)
   except Exception as exc:
-    log.warning(
+    log_vehicle.warning(
       f"[VEHICLE STATE] invalid JSON in metadata key={VEHICLE_STATE_METADATA_KEY}: "
       f"{type(exc).__name__}: {exc}"
     )
@@ -1671,6 +1672,22 @@ def api_vehicle_state_post():
         return jsonify({"error": "z must be a finite number when provided"}), 400
     except (TypeError, ValueError):
       return jsonify({"error": "z must be a finite number when provided"}), 400
+  raw_terrain_depth = data.get("terrainDepth")
+  terrain_depth = None
+  if raw_terrain_depth is not None:
+    try:
+      terrain_depth_val = int(raw_terrain_depth)
+      if terrain_depth_val < 0:
+        return jsonify({"error": "terrainDepth must be >= 0 when provided"}), 400
+      terrain_depth = terrain_depth_val
+    except (TypeError, ValueError):
+      return jsonify({"error": "terrainDepth must be an integer when provided"}), 400
+  raw_terrain_tile_id = data.get("terrainTileId")
+  terrain_tile_id = None
+  if raw_terrain_tile_id is not None:
+    terrain_tile_id = str(raw_terrain_tile_id).strip()
+    if not terrain_tile_id:
+      terrain_tile_id = None
 
   if not math.isfinite(lat) or not math.isfinite(lon) or not math.isfinite(heading_deg):
     return jsonify({"error": "lat/lon/headingDeg must be finite numbers"}), 400
@@ -1688,6 +1705,10 @@ def api_vehicle_state_post():
   }
   if z is not None:
     state["z"] = z
+  if terrain_depth is not None:
+    state["terrainDepth"] = terrain_depth
+  if terrain_tile_id is not None:
+    state["terrainTileId"] = terrain_tile_id
   raw_state = json.dumps(state, separators=(",", ":"))
 
   db = _get_db()
@@ -1697,13 +1718,18 @@ def api_vehicle_state_post():
   )
   db.commit()
 
+  depth_log = (
+    f" terrainDepth={terrain_depth}"
+    if terrain_depth is not None
+    else ""
+  )
   if z is None:
-    log.info(
-      f"[VEHICLE STATE] saved lat={lat:.6f} lon={lon:.6f} headingDeg={heading_deg:.2f}"
+    log_vehicle.info(
+      f"[VEHICLE STATE] saved lat={lat:.6f} lon={lon:.6f} headingDeg={heading_deg:.2f}{depth_log}"
     )
   else:
-    log.info(
-      f"[VEHICLE STATE] saved lat={lat:.6f} lon={lon:.6f} headingDeg={heading_deg:.2f} z={z:.3f}"
+    log_vehicle.info(
+      f"[VEHICLE STATE] saved lat={lat:.6f} lon={lon:.6f} headingDeg={heading_deg:.2f} z={z:.3f}{depth_log}"
     )
   return jsonify({"ok": True, "state": state})
 
