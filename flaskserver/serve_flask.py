@@ -16,12 +16,15 @@ import zlib
 from concurrent.futures import ThreadPoolExecutor
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from colored_log import get_logger
 from structure import get_assets_bootstrap_response
 from terrain_config import BOOTSTRAP_SEED_DEPTH, ENHANCE_DEPTH
-from vehicle import get_vehicle_state_response, save_vehicle_state_response
+from vehicle import (
+  get_vehicle_state_response,
+  save_vehicle_state_response,
+)
 
 log = get_logger("terrain")
 log_db = get_logger("terrain.db")
@@ -603,18 +606,19 @@ def _terrain_unavailable_response(status: int = 503):
 
 
 def _get_db() -> sqlite3.Connection:
-  if "terrain_db" not in g:
+  db = cast(sqlite3.Connection | None, g.get("terrain_db"))
+  if db is None:
     db = sqlite3.connect(str(DB_PATH), check_same_thread=False)
     db.execute("PRAGMA journal_mode=WAL")
     if _init_textures is not None:
       _init_textures(db)
     g.terrain_db = db
-  return g.terrain_db
+  return db
 
 
 @app.teardown_appcontext
-def _close_db(exc):
-  db = g.pop("terrain_db", None)
+def _close_db(exc: BaseException | None) -> None:
+  db = cast(sqlite3.Connection | None, g.pop("terrain_db", None))
   if db is not None:
     db.close()
 
@@ -1032,12 +1036,13 @@ def api_tiles():
             try:
               data, src_name = _resample_from_parent(db, tile_id, bbox=None, resolution=_GRID_N)
               if data is not None:
-                conf = CONFIDENCE.get(src_name, CONFIDENCE['arcticdem'])
+                source_name = src_name if isinstance(src_name, str) else "parent_resampled"
+                conf = CONFIDENCE.get(source_name, CONFIDENCE['arcticdem'])
                 cm = _np.where(_np.isnan(data), _np.uint8(0), _np.uint8(conf))
                 hm = _np.where(_np.isnan(data), 0.0, data).astype(_np.float32)
                 from database import TileClobberError
                 try:
-                  write_tile(db, tile_id, hm, cm, src_name, reconcile=False)
+                  write_tile(db, tile_id, hm, cm, source_name, reconcile=False)
                   parent_resampled_count += 1
                   _cog_fetched_total += 1
                   log_cog.info(f"  [PARENT RESAMPLE] {tile_id}: filled from parent")

@@ -197,6 +197,7 @@ bootLog('script.start', {
 
 // Use summer daytime in Nuuk so textured ground is clearly visible.
 const referenceDate = new Date('2025-07-01T12:00:00Z');
+const currentDate = new Date(referenceDate);
 const GAME_HOURS_PER_REAL_HOUR = 24;
 const GAME_TIME_SCALE = GAME_HOURS_PER_REAL_HOUR;
 const browserTimeStartMs = Date.now();
@@ -285,6 +286,7 @@ async function loadStartupAssets() {
 
 const startupAssetsBootstrap = await loadStartupAssets();
 const startupAssets = startupAssetsBootstrap.assets;
+let VEHICLE_HEADLIGHTS = null;
 bootLog('assets.bootstrap.loaded', {
   source: startupAssetsBootstrap.source,
   corrupt: startupAssetsBootstrap.corrupt,
@@ -420,6 +422,21 @@ alt.style.cssText = [
   'z-index:5'
 ].join(';');
 document.body.appendChild(alt);
+
+const gameClockEl = document.createElement('div');
+gameClockEl.style.cssText = [
+  'position:absolute',
+  'left:12px',
+  'bottom:12px',
+  'padding:8px 10px',
+  'background:rgba(0,0,0,0.7)',
+  'color:#5af',
+  'font:13px/1.35 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace',
+  'border-radius:6px',
+  'pointer-events:none',
+  'z-index:5'
+].join(';');
+document.body.appendChild(gameClockEl);
 
 const tileInfoEl = document.createElement('div');
 tileInfoEl.style.cssText = [
@@ -746,7 +763,6 @@ function tuningSectionLabel(text) {
 // We'll call this after aerialPerspective + cloudsEffect are created.
 function buildTuningControls(ap, ce) {
   tuningSectionLabel('Date / Time');
-  const currentDate = new Date(referenceDate);
   const monthNames = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
   const fmtHour = h => {
     const hh = Math.floor(h) % 24;
@@ -2011,6 +2027,17 @@ async function loadVehicleState() {
       throw new Error(`vehicle_state load status ${response.status}`);
     }
     const payload = await response.json();
+    VEHICLE_HEADLIGHTS = (
+      payload?.headlights != null &&
+      typeof payload.headlights === 'object' &&
+      payload.headlights.enabled === true
+    )
+      ? payload.headlights
+      : null;
+    bootLog('vehicle.headlights.loaded', {
+      source: 'vehicle_state',
+      enabled: VEHICLE_HEADLIGHTS?.enabled === true,
+    });
     const state = payload?.state ?? null;
     if (state == null) {
       bootLog('vehicle.state.load.empty');
@@ -2091,6 +2118,31 @@ function loadVehicleModel() {
       model.position.z -= bbox.min.z;
       vehicleConsoleLog(`model bbox: ${modelSize.x.toFixed(2)} x ${modelSize.y.toFixed(2)} x ${modelSize.z.toFixed(2)}, longest=${modelLength.toFixed(2)}, scale=${vehicleScale.toFixed(4)}, bottomOffset=${bbox.min.z.toFixed(2)}`);
       vehicleGroup.add(model);
+      // ── Headlights ──────────────────────────────────────────────────
+      if (VEHICLE_HEADLIGHTS?.enabled === true) {
+        const localScale = vehicleScale !== 0 ? vehicleScale : 1;
+        const hlColor = VEHICLE_HEADLIGHTS.color;
+        const hlIntensity = VEHICLE_HEADLIGHTS.intensity;
+        const hlAngle = THREE.MathUtils.degToRad(VEHICLE_HEADLIGHTS.angleDeg);
+        const hlPenumbra = VEHICLE_HEADLIGHTS.penumbra;
+        const hlDistance = VEHICLE_HEADLIGHTS.distanceM;
+        const hlDecay = VEHICLE_HEADLIGHTS.decay;
+        const hlFrontY = (vehicleBodyLengthM * VEHICLE_HEADLIGHTS.mountFrontRatio) / localScale;
+        const hlHeight = VEHICLE_HEADLIGHTS.mountHeightM / localScale;
+        const hlSpacing = VEHICLE_HEADLIGHTS.mountSpacingM / localScale;
+        const hlTargetY = hlFrontY + (VEHICLE_HEADLIGHTS.targetForwardM / localScale);
+        const hlTargetZ = VEHICLE_HEADLIGHTS.targetHeightM / localScale;
+        for (const side of [-1, 1]) {
+          const hl = new THREE.SpotLight(hlColor, hlIntensity, hlDistance, hlAngle, hlPenumbra, hlDecay);
+          hl.position.set(side * hlSpacing, hlFrontY, hlHeight);
+          hl.castShadow = false;
+          const target = new THREE.Object3D();
+          target.position.set(side * hlSpacing * VEHICLE_HEADLIGHTS.targetXScale, hlTargetY, hlTargetZ);
+          vehicleGroup.add(target);
+          hl.target = target;
+          vehicleGroup.add(hl);
+        }
+      }
       // Collect vehicle meshes for upward raycast collision
       vehicleMeshes = [];
       model.traverse(obj => { if (obj.isMesh) vehicleMeshes.push(obj); });
@@ -3590,8 +3642,8 @@ function buildMesh(tile) {
   g.setAttribute('uv', new THREE.BufferAttribute(uv, 2));
   g.setIndex(idx);
   g.computeVertexNormals();
-  const mat = new THREE.MeshBasicMaterial({
-    color: 0x0a2650, side: THREE.FrontSide
+  const mat = new THREE.MeshStandardMaterial({
+    color: 0x0a2650, side: THREE.FrontSide, roughness: 0.9, metalness: 0.0
   });
   const mesh = new THREE.Mesh(g, mat);
   mesh.userData.tileId = tile.id;
@@ -4106,6 +4158,7 @@ function getCameraLatLon() {
 let pollTimer = null;
 
 const PREVIEW_MAX_DEPTH = 8;
+const clock = new THREE.Clock();
 
 async function fetchTiles(lat, lon) {
   if (fetching) return;
@@ -4861,6 +4914,17 @@ function updateHud() {
   const modeHtml = vehicleControlActive
     ? '<span style="color:#ff3b30">VEHICLE</span>'
     : modeLabel;
+
+  // Game clock display (bottom-left)
+  const gameDate = useRealtimeGameClock ? getGameDateFromBrowserTime() : currentDate;
+  const _mn3 = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  const gdMon = _mn3[gameDate.getUTCMonth()];
+  const gdDay = gameDate.getUTCDate();
+  const gdHH = String(gameDate.getUTCHours()).padStart(2, '0');
+  const gdMM = String(gameDate.getUTCMinutes()).padStart(2, '0');
+  const clockLabel = useRealtimeGameClock ? `${GAME_TIME_SCALE}x` : 'manual';
+  gameClockEl.innerHTML = `<b>${gdDay} ${gdMon} ${gdHH}:${gdMM} UTC</b> <span style="color:#888">(${clockLabel})</span>`;
+
   hud.innerHTML = [
     '<b>Clouds Terrain Managed Flask UX WIP</b>',
     `mode: <b>${modeHtml}</b>`,
@@ -5180,7 +5244,6 @@ camera.updateMatrixWorld(true);
 updateMapCamera();
 updateHud();
 
-const clock = new THREE.Clock();
 let lastTexRefresh = 0;
 function render() {
   const dt = Math.min(0.05, clock.getDelta());

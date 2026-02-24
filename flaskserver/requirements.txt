@@ -1,4 +1,5 @@
 Flask
+pydantic>=2,<3
 numpy
 pyproj
 rasterio
