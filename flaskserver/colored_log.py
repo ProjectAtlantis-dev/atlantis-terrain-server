@@ -33,8 +33,12 @@ class ColoredFormatter(logging.Formatter):
 
     def format(self, record):
         message = record.getMessage()
-        # Vehicle category should always stand out in amber.
-        if record.name == "terrain.vehicle" or "[VEHICLE" in message:
+        # Vehicle and assets categories should always stand out in amber.
+        if (
+            record.name in ("terrain.vehicle", "terrain.assets")
+            or "[VEHICLE" in message
+            or "[ASSETS" in message
+        ):
             log_fmt = ORANGE + "%(asctime)s [%(levelname)s] %(name)s: %(message)s" + RESET
         # DB messages in cyan
         elif record.name == "terrain.db" and record.levelno == logging.INFO:
@@ -66,7 +70,7 @@ def get_logger(name="terrain"):
         logger.addHandler(handler)
         logger.setLevel(
             logging.INFO
-            if name in ("terrain.trav", "terrain", "terrain.tex", "terrain.cog", "terrain.vehicle")
+            if name in ("terrain.trav", "terrain", "terrain.tex", "terrain.cog", "terrain.vehicle", "terrain.assets")
             else logging.DEBUG
         )
         logger.propagate = False

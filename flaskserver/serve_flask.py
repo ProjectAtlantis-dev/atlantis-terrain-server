@@ -19,13 +19,16 @@ from pathlib import Path
 from typing import Any
 
 from colored_log import get_logger
+from structure import get_assets_bootstrap_response
 from terrain_config import BOOTSTRAP_SEED_DEPTH, ENHANCE_DEPTH
+from vehicle import get_vehicle_state_response, save_vehicle_state_response
 
 log = get_logger("terrain")
 log_db = get_logger("terrain.db")
 log_tex = get_logger("terrain.tex")
 log_cog = get_logger("terrain.cog")
 log_vehicle = get_logger("terrain.vehicle")
+log_assets = get_logger("terrain.assets")
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -445,6 +448,44 @@ def _bootstrap_backend() -> None:
       db.commit()
       log_db.info(f"Updated max_depth metadata to {ENHANCE_DEPTH}")
 
+    # Ensure startup asset metadata + structure sites exist so frontend can
+    # always load world placements from backend tables at app startup.
+    assets_bootstrap = get_assets_bootstrap_response(db, log_assets)
+    seeded = assets_bootstrap.get("seeded") or {}
+    seeded_metadata = bool(seeded.get("metadata"))
+    seeded_structure_sites = bool(seeded.get("structureSites"))
+    assets_payload = assets_bootstrap.get("assets") or {}
+    structure_sites = assets_payload.get("structureSites") or []
+    structure_model = assets_payload.get("structureModel") or {}
+    vehicle_model = assets_payload.get("vehicleModel") or {}
+    structure_model_url = structure_model.get("url")
+    vehicle_model_url = vehicle_model.get("url")
+    if seeded_metadata or seeded_structure_sites:
+      seeded_parts = []
+      if seeded_metadata:
+        seeded_parts.append("metadata")
+      if seeded_structure_sites:
+        seeded_parts.append("structure_sites")
+      log_assets.info(
+        "[ASSETS] prepopulated startup data: "
+        + ", ".join(seeded_parts)
+      )
+    else:
+      log_assets.info("[ASSETS] found existing startup data (no prepopulation needed)")
+    log_assets.info(
+      "[ASSETS] bootstrap "
+      f"source={assets_bootstrap.get('source')} "
+      f"metadataKey={assets_bootstrap.get('metadataKey')} "
+      f"version={assets_bootstrap.get('version')} "
+      f"corrupt={bool(assets_bootstrap.get('corrupt'))} "
+      f"structureSitesSource={assets_bootstrap.get('structureSitesSource')} "
+      f"structureSiteCount={len(structure_sites)} "
+      f"structureModelUrl={structure_model_url} "
+      f"vehicleModelUrl={vehicle_model_url}"
+    )
+    if len(structure_sites) == 0:
+      log_assets.warning("[ASSETS] no enabled structure sites in DB")
+
     try:
       no_data_count = load_no_data_cache(db)
     except Exception:
@@ -803,7 +844,15 @@ def _queue_texture_fetch(tile_id: str, bbox: tuple[float, float, float, float]) 
 
 
 _api_tiles_state: dict[str, str | None] = {"last_result": None}
-VEHICLE_STATE_METADATA_KEY = "vehicle_state_v1"
+
+
+@app.get("/api/assets_bootstrap")
+def api_assets_bootstrap():
+  unavailable = _terrain_unavailable_response()
+  if unavailable is not None:
+    return unavailable
+
+  return jsonify(get_assets_bootstrap_response(_get_db(), log_assets))
 
 @app.get("/api/tiles")
 def api_tiles():
@@ -1627,25 +1676,7 @@ def api_vehicle_state_get():
   if unavailable is not None:
     return unavailable
 
-  db = _get_db()
-  row = db.execute(
-    "SELECT value FROM metadata WHERE key = ?",
-    (VEHICLE_STATE_METADATA_KEY,),
-  ).fetchone()
-  if row is None or row[0] is None:
-    return jsonify({"ok": True, "state": None})
-
-  raw = row[0]
-  try:
-    state = json.loads(raw)
-  except Exception as exc:
-    log_vehicle.warning(
-      f"[VEHICLE STATE] invalid JSON in metadata key={VEHICLE_STATE_METADATA_KEY}: "
-      f"{type(exc).__name__}: {exc}"
-    )
-    return jsonify({"ok": True, "state": None, "corrupt": True})
-
-  return jsonify({"ok": True, "state": state})
+  return jsonify(get_vehicle_state_response(_get_db(), log_vehicle))
 
 
 @app.post("/api/vehicle_state")
@@ -1654,95 +1685,12 @@ def api_vehicle_state_post():
   if unavailable is not None:
     return unavailable
 
-  data = request.get_json(silent=True) or {}
-  try:
-    lat = float(data.get("lat"))
-    lon = float(data.get("lon"))
-    heading_deg = float(data.get("headingDeg"))
-  except (TypeError, ValueError):
-    return jsonify({"error": "lat/lon/headingDeg must be finite numbers"}), 400
-  raw_z = data.get("z")
-  z = None
-  if raw_z is not None:
-    try:
-      z_val = float(raw_z)
-      if math.isfinite(z_val):
-        z = z_val
-      else:
-        return jsonify({"error": "z must be a finite number when provided"}), 400
-    except (TypeError, ValueError):
-      return jsonify({"error": "z must be a finite number when provided"}), 400
-  raw_terrain_depth = data.get("terrainDepth")
-  terrain_depth = None
-  if raw_terrain_depth is not None:
-    try:
-      terrain_depth_val = int(raw_terrain_depth)
-      if terrain_depth_val < 0:
-        return jsonify({"error": "terrainDepth must be >= 0 when provided"}), 400
-      terrain_depth = terrain_depth_val
-    except (TypeError, ValueError):
-      return jsonify({"error": "terrainDepth must be an integer when provided"}), 400
-  raw_terrain_tile_id = data.get("terrainTileId")
-  terrain_tile_id = None
-  if raw_terrain_tile_id is not None:
-    terrain_tile_id = str(raw_terrain_tile_id).strip()
-    if not terrain_tile_id:
-      terrain_tile_id = None
-  raw_reason = data.get("reason")
-  reason = None
-  if raw_reason is not None:
-    reason = str(raw_reason).strip()
-    if not reason:
-      reason = None
-
-  if not math.isfinite(lat) or not math.isfinite(lon) or not math.isfinite(heading_deg):
-    return jsonify({"error": "lat/lon/headingDeg must be finite numbers"}), 400
-  if lat < -90 or lat > 90:
-    return jsonify({"error": "lat out of range [-90, 90]"}), 400
-  if lon < -180 or lon > 180:
-    return jsonify({"error": "lon out of range [-180, 180]"}), 400
-
-  heading_deg = heading_deg % 360.0
-  state = {
-    "lat": lat,
-    "lon": lon,
-    "headingDeg": heading_deg,
-    "savedAt": time.time(),
-  }
-  if z is not None:
-    state["z"] = z
-  if terrain_depth is not None:
-    state["terrainDepth"] = terrain_depth
-  if terrain_tile_id is not None:
-    state["terrainTileId"] = terrain_tile_id
-  raw_state = json.dumps(state, separators=(",", ":"))
-
-  db = _get_db()
-  db.execute(
-    "INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)",
-    (VEHICLE_STATE_METADATA_KEY, raw_state),
+  payload, status = save_vehicle_state_response(
+    _get_db(),
+    request.get_json(silent=True) or {},
+    log_vehicle,
   )
-  db.commit()
-
-  depth_log = (
-    f" terrainDepth={terrain_depth}"
-    if terrain_depth is not None
-    else ""
-  )
-  reason_log = (
-    f" reason={reason}"
-    if reason is not None
-    else ""
-  )
-  if z is None:
-    log_vehicle.info(
-      f"[VEHICLE STATE] saved lat={lat:.6f} lon={lon:.6f} headingDeg={heading_deg:.2f}{depth_log}{reason_log}"
-    )
-  else:
-    log_vehicle.info(
-      f"[VEHICLE STATE] saved lat={lat:.6f} lon={lon:.6f} headingDeg={heading_deg:.2f} z={z:.3f}{depth_log}{reason_log}"
-    )
-  return jsonify({"ok": True, "state": state})
+  return jsonify(payload), status
 
 
 def _client_log_level(raw_level: Any) -> int:

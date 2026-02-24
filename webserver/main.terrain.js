@@ -28,6 +28,7 @@ import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 const params = new URLSearchParams(window.location.search);
 const CLIENT_LOG_ENDPOINT = '/api/client_log';
 const VEHICLE_STATE_ENDPOINT = '/api/vehicle_state';
+const ASSETS_BOOTSTRAP_ENDPOINT = '/api/assets_bootstrap';
 const CLIENT_LOG_ENABLED = params.get('clientLog') !== '0';
 const CLIENT_LOG_BATCH_SIZE = 40;
 const CLIENT_LOG_MAX_QUEUE = 600;
@@ -196,6 +197,9 @@ bootLog('script.start', {
 
 // Use summer daytime in Nuuk so textured ground is clearly visible.
 const referenceDate = new Date('2025-07-01T12:00:00Z');
+const GAME_HOURS_PER_REAL_HOUR = 24;
+const GAME_TIME_SCALE = GAME_HOURS_PER_REAL_HOUR;
+const browserTimeStartMs = Date.now();
 
 const DEFAULT_CENTER = {
   // Nuuk, Greenland
@@ -212,6 +216,85 @@ const ATMOSPHERE_TEXTURE_FILES = [
 
 const centerLon = Number(params.get('lon') ?? DEFAULT_CENTER.lon);
 const centerLat = Number(params.get('lat') ?? DEFAULT_CENTER.lat);
+
+function cloneFallbackStartupAssets() {
+  return {
+    structureModel: {},
+    structureSites: [],
+    vehicleModel: {},
+  };
+}
+
+function normalizeStartupAssetsPayload(payload) {
+  const fallback = cloneFallbackStartupAssets();
+  if (payload == null || typeof payload !== 'object') {
+    return fallback;
+  }
+  const { structureModel, structureSites, vehicleModel } = payload;
+  if (structureModel != null && typeof structureModel === 'object') {
+    fallback.structureModel = { ...fallback.structureModel, ...structureModel };
+  }
+  if (Array.isArray(structureSites)) {
+    fallback.structureSites = structureSites
+      .filter(site => site != null && typeof site === 'object')
+      .map(site => ({ ...site }));
+  }
+  if (vehicleModel != null && typeof vehicleModel === 'object') {
+    fallback.vehicleModel = { ...fallback.vehicleModel, ...vehicleModel };
+  }
+  return fallback;
+}
+
+async function loadStartupAssets() {
+  const fallback = {
+    source: 'defaults',
+    corrupt: false,
+    metadataKey: null,
+    version: 1,
+    schemaVersion: 1,
+    structureSitesSource: 'unavailable',
+    seeded: null,
+    assets: cloneFallbackStartupAssets(),
+  };
+  try {
+    const response = await fetch(ASSETS_BOOTSTRAP_ENDPOINT, { cache: 'no-store' });
+    if (!response.ok) {
+      throw new Error(`assets bootstrap status ${response.status}`);
+    }
+    const payload = await response.json();
+    return {
+      source: typeof payload?.source === 'string' ? payload.source : 'metadata',
+      corrupt: Boolean(payload?.corrupt),
+      metadataKey: typeof payload?.metadataKey === 'string' ? payload.metadataKey : null,
+      version: Number.isFinite(payload?.version) ? payload.version : 1,
+      schemaVersion: Number.isFinite(payload?.schemaVersion) ? payload.schemaVersion : 1,
+      structureSitesSource: typeof payload?.structureSitesSource === 'string'
+        ? payload.structureSitesSource
+        : 'unknown',
+      seeded: payload?.seeded ?? null,
+      assets: normalizeStartupAssetsPayload(payload?.assets),
+    };
+  } catch (error) {
+    console.warn('[BOOT] startup assets fallback', {
+      endpoint: ASSETS_BOOTSTRAP_ENDPOINT,
+      error: error?.message ?? String(error),
+    });
+    return fallback;
+  }
+}
+
+const startupAssetsBootstrap = await loadStartupAssets();
+const startupAssets = startupAssetsBootstrap.assets;
+bootLog('assets.bootstrap.loaded', {
+  source: startupAssetsBootstrap.source,
+  corrupt: startupAssetsBootstrap.corrupt,
+  metadataKey: startupAssetsBootstrap.metadataKey,
+  version: startupAssetsBootstrap.version,
+  schemaVersion: startupAssetsBootstrap.schemaVersion,
+  structureSitesSource: startupAssetsBootstrap.structureSitesSource,
+  seeded: startupAssetsBootstrap.seeded,
+  structureCount: startupAssets.structureSites.length,
+});
 
 const scene = new THREE.Scene();
 // Black fog — aerial perspective inscatter fills in the natural sky color at distance.
@@ -577,6 +660,9 @@ const _tuningState = JSON.parse(localStorage.getItem(TUNING_STORAGE_KEY) || '{}'
 function saveTuning() {
   localStorage.setItem(TUNING_STORAGE_KEY, JSON.stringify(_tuningState));
 }
+const hasSavedMonth = Object.prototype.hasOwnProperty.call(_tuningState, 'month');
+const hasSavedHour = Object.prototype.hasOwnProperty.call(_tuningState, 'hour (UTC)');
+let useRealtimeGameClock = !(hasSavedMonth || hasSavedHour);
 
 // Deferred binding: controls reference aerialPerspective/cloudsEffect which are created later.
 // We define the panel structure now and wire it up after effects exist.
@@ -672,6 +758,7 @@ function buildTuningControls(ap, ce) {
     decimals: 0,
     format: v => monthNames[v - 1],
     onChange: v => {
+      useRealtimeGameClock = false;
       currentDate.setUTCMonth(v - 1);
       applyDate(currentDate);
     }
@@ -681,6 +768,7 @@ function buildTuningControls(ap, ce) {
     decimals: 1,
     format: fmtHour,
     onChange: v => {
+      useRealtimeGameClock = false;
       currentDate.setUTCHours(Math.floor(v), (v % 1) * 60, 0, 0);
       applyDate(currentDate);
     }
@@ -968,12 +1056,46 @@ function paramNumber(name, fallback) {
   return Number.isFinite(value) ? value : fallback;
 }
 
+const BOOTSTRAP_STRUCTURE_MODEL = (
+  startupAssets.structureModel != null && typeof startupAssets.structureModel === 'object'
+)
+  ? startupAssets.structureModel
+  : {};
+const BOOTSTRAP_STRUCTURE_SITES = Array.isArray(startupAssets.structureSites)
+  ? startupAssets.structureSites
+  : [];
+const BOOTSTRAP_VEHICLE_MODEL = (
+  startupAssets.vehicleModel != null && typeof startupAssets.vehicleModel === 'object'
+)
+  ? startupAssets.vehicleModel
+  : {};
+const houseEnabledParam = params.get('house');
 const HOUSE_MODEL = {
-  url: '/models/house_test.glb',
-  altOffsetM: paramNumber('houseAltOffset', 0.4),
-  hotReloadMs: Math.max(500, paramNumber('houseReloadMs', 2000)),
-  enabled: params.get('house') === '1'
+  url: (typeof BOOTSTRAP_STRUCTURE_MODEL.url === 'string' && BOOTSTRAP_STRUCTURE_MODEL.url.trim() !== '')
+    ? BOOTSTRAP_STRUCTURE_MODEL.url
+    : '',
+  altOffsetM: paramNumber(
+    'houseAltOffset',
+    Number.isFinite(BOOTSTRAP_STRUCTURE_MODEL.altOffsetM) ? BOOTSTRAP_STRUCTURE_MODEL.altOffsetM : 0.4
+  ),
+  hotReloadMs: Math.max(
+    500,
+    paramNumber(
+      'houseReloadMs',
+      Number.isFinite(BOOTSTRAP_STRUCTURE_MODEL.hotReloadMs) ? BOOTSTRAP_STRUCTURE_MODEL.hotReloadMs : 2000
+    )
+  ),
+  enabled: houseEnabledParam == null
+    ? Boolean(BOOTSTRAP_STRUCTURE_MODEL.enabled)
+    : houseEnabledParam === '1'
 };
+if (!HOUSE_MODEL.url) {
+  HOUSE_MODEL.enabled = false;
+  bootLog('house.config.missing_model_url', {
+    source: startupAssetsBootstrap.source,
+    metadataKey: startupAssetsBootstrap.metadataKey,
+  }, 'warn');
+}
 const HOUSE_SHADOW_MODE_RAW = (params.get('houseShadowMode') || 'shadowmap').toLowerCase();
 const HOUSE_SHADOW_MODE = HOUSE_SHADOW_MODE_RAW === 'local' ? 'local' : 'shadowmap';
 const HOUSE_USE_LOCAL_SHADOWS = HOUSE_SHADOW_MODE === 'local';
@@ -981,22 +1103,15 @@ const HOUSE_USE_SHADOW_MAP = HOUSE_SHADOW_MODE === 'shadowmap';
 const HOUSE_LOCAL_SHADOW_DEBUG = params.get('houseLocalShadowDebug') !== '0';
 const HOUSE_SHADOW_SNAPSHOT_ENABLED = params.get('houseShadowSnapshot') === '1';
 const HOUSE_PROBE_CONSOLE = params.get('houseProbeConsole') === '1';
-// Candidate sites selected from depth-12 Nuuk tiles in flaskserver/terrain.db
-// using dataforsyningen texture features + water-mask exclusion (wm=0 at each point).
-const DEFAULT_NUUK_HOUSE_SITES = [
-  { id: 'nuuk-01', lat: 64.179102, lon: -51.712988, headingDeg: 22, scale: 1.00, tileId: '12-1375-791' },
-  { id: 'nuuk-02', lat: 64.174556, lon: -51.703948, headingDeg: 58, scale: 0.96, tileId: '12-1376-791' },
-  { id: 'nuuk-03', lat: 64.185330, lon: -51.703495, headingDeg: 96, scale: 1.08, tileId: '12-1376-792' },
-  { id: 'nuuk-04', lat: 64.182984, lon: -51.726468, headingDeg: 144, scale: 1.03, tileId: '12-1374-792' },
-  { id: 'nuuk-05', lat: 64.173514, lon: -51.718454, headingDeg: 210, scale: 0.98, tileId: '12-1374-791' },
-  { id: 'nuuk-06', lat: 64.178473, lon: -51.724776, headingDeg: 288, scale: 1.04, tileId: '12-1374-791' },
-];
+const DEFAULT_NUUK_HOUSE_SITES = BOOTSTRAP_STRUCTURE_SITES;
 const singleHouseLat = paramNumber('houseLat', NaN);
 const singleHouseLon = paramNumber('houseLon', NaN);
 const houseCountParam = paramNumber('houseCount', DEFAULT_NUUK_HOUSE_SITES.length);
-const houseCount = Number.isFinite(houseCountParam)
-  ? Math.max(1, Math.min(DEFAULT_NUUK_HOUSE_SITES.length, Math.floor(houseCountParam)))
-  : DEFAULT_NUUK_HOUSE_SITES.length;
+const houseCount = DEFAULT_NUUK_HOUSE_SITES.length === 0
+  ? 0
+  : Number.isFinite(houseCountParam)
+    ? Math.max(1, Math.min(DEFAULT_NUUK_HOUSE_SITES.length, Math.floor(houseCountParam)))
+    : DEFAULT_NUUK_HOUSE_SITES.length;
 const houseSites = (Number.isFinite(singleHouseLat) && Number.isFinite(singleHouseLon))
   ? [{
       id: 'nuuk-single',
@@ -1347,14 +1462,21 @@ houseLayer.visible = housesRuntimeVisible;
 
 // ── Patria AMV vehicle ──────────────────────────────────────────────────
 const VEHICLE_MODEL = {
-  url: '/models/patria_amv.glb',
-  lat: 64.18423381,
-  lon: -51.70139232,
-  headingDeg: 234.341,
-  z: 16.279,
-  realLengthM: 7.7, // Patria AMV real-world length in meters
-  tireDiameterM: paramNumber('vehicleTireDiameterM', 1.27),
-  altOffsetM: 0.05,
+  url: (typeof BOOTSTRAP_VEHICLE_MODEL.url === 'string' && BOOTSTRAP_VEHICLE_MODEL.url.trim() !== '')
+    ? BOOTSTRAP_VEHICLE_MODEL.url
+    : '/models/patria_amv.glb',
+  lat: Number.isFinite(BOOTSTRAP_VEHICLE_MODEL.lat) ? BOOTSTRAP_VEHICLE_MODEL.lat : centerLat,
+  lon: Number.isFinite(BOOTSTRAP_VEHICLE_MODEL.lon) ? BOOTSTRAP_VEHICLE_MODEL.lon : centerLon,
+  headingDeg: Number.isFinite(BOOTSTRAP_VEHICLE_MODEL.headingDeg) ? BOOTSTRAP_VEHICLE_MODEL.headingDeg : 0,
+  z: Number.isFinite(BOOTSTRAP_VEHICLE_MODEL.z) ? BOOTSTRAP_VEHICLE_MODEL.z : 0,
+  realLengthM: Number.isFinite(BOOTSTRAP_VEHICLE_MODEL.realLengthM) ? BOOTSTRAP_VEHICLE_MODEL.realLengthM : 7.7,
+  tireDiameterM: paramNumber(
+    'vehicleTireDiameterM',
+    Number.isFinite(BOOTSTRAP_VEHICLE_MODEL.tireDiameterM)
+      ? BOOTSTRAP_VEHICLE_MODEL.tireDiameterM
+      : 1.27
+  ),
+  altOffsetM: Number.isFinite(BOOTSTRAP_VEHICLE_MODEL.altOffsetM) ? BOOTSTRAP_VEHICLE_MODEL.altOffsetM : 0.05,
 };
 const VEHICLE_TIRE_RADIUS_M = Math.max(
   0,
@@ -1502,7 +1624,10 @@ const vehicleUpRaycaster = new THREE.Raycaster();
 const vehicleUpDirection = up.clone().normalize();
 let vehicleMeshes = [];
 const VEHICLE_DRIVE_SPEED = paramNumber('vehicleDriveSpeed', 24);
+const VEHICLE_ACCEL = paramNumber('vehicleAccel', 24);      // m/s² throttle
+const VEHICLE_BRAKE = paramNumber('vehicleBrake', 36);      // m/s² engine brake
 const VEHICLE_STEER_SPEED = paramNumber('vehicleSteerSpeed', 1.5);
+let vehicleSpeed = 0; // current vehicle speed in m/s
 const VEHICLE_CAMERA_FOLLOW_DISTANCE = paramNumber('vehicleCamDistance', 38);
 const VEHICLE_CAMERA_FOLLOW_HEIGHT = paramNumber('vehicleCamHeight', 12);
 const VEHICLE_CAMERA_LOOK_HEIGHT = paramNumber('vehicleCamLookHeight', 2.2);
@@ -2303,6 +2428,9 @@ function setVehicleControlActive(nextActive, reason = 'manual', options = {}) {
     controls.yaw = vehicleHeadingRad;
     updateVehicleFollowCamera();
   }
+  if (wasActive && !vehicleControlActive) {
+    controls.speed = 0; // stop camera drift when exiting vehicle mode
+  }
   if (wasActive && !vehicleControlActive && vehicleLoaded && !skipExitSave) {
     saveVehicleState(`exit-${reason}`, {
       snapToGround: true,
@@ -2330,6 +2458,50 @@ function tryEnterVehicleControlFromPointer(event) {
   }
   return setVehicleControlActive(true, 'right-click-vehicle');
 }
+// ── Patria AMV diesel audio ─────────────────────────────────────────────
+// Non-positional audio with manual distance-based volume (avoids ECEF panner issues)
+const audioListener = new THREE.AudioListener();
+camera.add(audioListener);
+const dieselSound = new THREE.Audio(audioListener);
+dieselSound.setLoop(true);
+dieselSound.setVolume(0);
+const DIESEL_MAX_VOL = 0;
+const DIESEL_FULL_DIST = 15;   // full volume within 15m
+const DIESEL_ZERO_DIST = 150;  // silent beyond 150m
+
+function updateDieselVolume() {
+  if (!dieselSound.isPlaying) return;
+  const camWorld = new THREE.Vector3();
+  const vehWorld = new THREE.Vector3();
+  camera.getWorldPosition(camWorld);
+  vehicleGroup.getWorldPosition(vehWorld);
+  const dist = camWorld.distanceTo(vehWorld);
+  if (dist <= DIESEL_FULL_DIST) {
+    dieselSound.setVolume(DIESEL_MAX_VOL);
+  } else if (dist >= DIESEL_ZERO_DIST) {
+    dieselSound.setVolume(0);
+  } else {
+    const t = (dist - DIESEL_FULL_DIST) / (DIESEL_ZERO_DIST - DIESEL_FULL_DIST);
+    dieselSound.setVolume(DIESEL_MAX_VOL * (1 - t * t));
+  }
+}
+
+const audioLoader = new THREE.AudioLoader();
+audioLoader.load('/audio/diesel_idle.mp3', buffer => {
+  dieselSound.setBuffer(buffer);
+  const startAudio = () => {
+    if (!dieselSound.isPlaying) {
+      dieselSound.play();
+    }
+    window.removeEventListener('click', startAudio);
+    window.removeEventListener('keydown', startAudio);
+  };
+  window.addEventListener('click', startAudio);
+  window.addEventListener('keydown', startAudio);
+  bootLog('vehicle.audio.loaded', { duration: buffer.duration.toFixed(1) });
+}, undefined, error => {
+  console.warn('[VEHICLE] audio load failed:', error);
+});
 // ── end Patria AMV ──────────────────────────────────────────────────────
 
 function setHousesRuntimeVisible(nextVisible, reason = 'manual') {
@@ -3129,11 +3301,15 @@ function applyDate(date) {
   aerialPerspective.sunDirection.copy(sunDirection);
   cloudsEffect.sunDirection.copy(sunDirection);
 }
+function getGameDateFromBrowserTime(nowMs = Date.now()) {
+  const elapsedMs = nowMs - browserTimeStartMs;
+  return new Date(browserTimeStartMs + elapsedMs * GAME_TIME_SCALE);
+}
 buildTuningControls(aerialPerspective, cloudsEffect);
 // Only apply the default referenceDate if no saved tuning overrides month/hour.
 // buildTuningControls already calls applyDate() when restoring saved values.
-if (!_tuningState['month'] && !_tuningState['hour (UTC)']) {
-  applyDate(referenceDate);
+if (useRealtimeGameClock) {
+  applyDate(getGameDateFromBrowserTime());
 }
 
 function syncCloudComposition() {
@@ -4497,11 +4673,23 @@ function updateMovement(dt) {
       vehicleHeadingRad += steer * VEHICLE_STEER_SPEED * dt;
     }
     const drive = (forwardPressed ? 1 : 0) + (backPressed ? -1 : 0);
-    if (drive !== 0 || steer !== 0) {
+    // Momentum: accelerate toward VEHICLE_DRIVE_SPEED, brake when released
+    if (drive !== 0) {
+      vehicleSpeed += drive * VEHICLE_ACCEL * dt;
+      vehicleSpeed = Math.max(-VEHICLE_DRIVE_SPEED, Math.min(VEHICLE_DRIVE_SPEED, vehicleSpeed));
+    } else {
+      // Engine brake: decelerate toward zero
+      if (vehicleSpeed > 0) {
+        vehicleSpeed = Math.max(vehicleSpeed - VEHICLE_BRAKE * dt, 0);
+      } else if (vehicleSpeed < 0) {
+        vehicleSpeed = Math.min(vehicleSpeed + VEHICLE_BRAKE * dt, 0);
+      }
+    }
+    if (vehicleSpeed !== 0 || steer !== 0) {
       const heading = vehicleHeadingRad;
       const forwardX = -Math.sin(heading);
       const forwardY = Math.cos(heading);
-      const driveDist = VEHICLE_DRIVE_SPEED * dt * drive;
+      const driveDist = vehicleSpeed * dt;
       vehicleGroup.position.x += forwardX * driveDist;
       vehicleGroup.position.y += forwardY * driveDist;
       vehicleMarker.position.x = vehicleGroup.position.x;
@@ -4948,6 +5136,9 @@ let lastTexRefresh = 0;
 function render() {
   const dt = Math.min(0.05, clock.getDelta());
   const nowMs = performance.now();
+  if (useRealtimeGameClock) {
+    applyDate(getGameDateFromBrowserTime());
+  }
   updateMovement(dt);
   applyCameraOrientation();
   updateHud();
@@ -4984,6 +5175,7 @@ function render() {
     updateEnhancement();
   }
   snapVehicleToTerrain();
+  updateDieselVolume();
   updateVehicleSuspension(dt);
   if (vehicleControlActive && !controls.mapMode) {
     updateVehicleFollowCamera();
