@@ -6,55 +6,10 @@ import sqlite3
 import time
 from typing import Any
 
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+
 VEHICLE_STATE_METADATA_KEY = "vehicle_state_v1"
 VEHICLE_HEADLIGHTS_METADATA_KEY = "vehicle_headlights_v1"
-
-_DEFAULT_VEHICLE_HEADLIGHTS = {
-  "enabled": True,
-  "color": 0xFFF4E0,
-  "intensity": 800.0,
-  "distanceM": 120.0,
-  "angleDeg": 39.6,
-  "penumbra": 0.4,
-  "decay": 2.0,
-  "mountFrontRatio": 0.48,
-  "mountHeightM": 1.4,
-  "mountSpacingM": 0.95,
-  "targetForwardM": 60.0,
-  "targetHeightM": -0.5,
-  "targetXScale": 0.3,
-}
-
-
-def _copy_default_vehicle_headlights() -> dict[str, Any]:
-  return dict(_DEFAULT_VEHICLE_HEADLIGHTS)
-
-
-def _coerce_finite_number(value: Any) -> float | None:
-  try:
-    number = float(value)
-  except (TypeError, ValueError):
-    return None
-  if not math.isfinite(number):
-    return None
-  return number
-
-
-def _coerce_bool(value: Any) -> bool | None:
-  if isinstance(value, bool):
-    return value
-  if isinstance(value, (int, float)):
-    if value == 1:
-      return True
-    if value == 0:
-      return False
-  if isinstance(value, str):
-    text = value.strip().lower()
-    if text in {"1", "true", "yes", "on"}:
-      return True
-    if text in {"0", "false", "no", "off"}:
-      return False
-  return None
 
 
 def _coerce_color(value: Any) -> int | None:
@@ -93,64 +48,160 @@ def _coerce_color(value: Any) -> int | None:
   return None
 
 
-def _sanitize_vehicle_headlights(raw: Any) -> dict[str, Any]:
-  out = _copy_default_vehicle_headlights()
-  if not isinstance(raw, dict):
-    return out
+def _validation_error_detail(exc: ValidationError) -> str:
+  errors = exc.errors(include_url=False)
+  if not errors:
+    return "invalid payload"
+  first = errors[0]
+  loc = ".".join(str(part) for part in first.get("loc", ()))
+  msg = str(first.get("msg", "invalid value"))
+  if loc:
+    return f"{loc}: {msg}"
+  return msg
 
-  enabled = _coerce_bool(raw.get("enabled"))
-  if enabled is not None:
-    out["enabled"] = enabled
 
-  color = _coerce_color(raw.get("color"))
-  if color is not None:
-    out["color"] = color
+class VehicleHeadlightsModel(BaseModel):
+  model_config = ConfigDict(extra="ignore")
 
-  intensity = _coerce_finite_number(raw.get("intensity"))
-  if intensity is not None:
-    out["intensity"] = max(0.0, intensity)
+  enabled: bool = True
+  color: int = Field(default=0xFFF4E0, ge=0, le=0xFFFFFF)
+  intensity: float = Field(default=800.0, ge=0)
+  distanceM: float = Field(default=120.0, ge=0)
+  angleDeg: float = Field(default=39.6, ge=1, le=85)
+  penumbra: float = Field(default=0.4, ge=0, le=1)
+  decay: float = Field(default=2.0, ge=0)
+  mountFrontRatio: float = Field(default=0.48, ge=0, le=1)
+  mountHeightM: float = 1.4
+  mountSpacingM: float = Field(default=0.95, ge=0)
+  targetForwardM: float = Field(default=60.0, ge=0)
+  targetHeightM: float = -0.5
+  targetXScale: float = Field(default=0.3, ge=0, le=1)
 
-  distance_m = _coerce_finite_number(raw.get("distanceM"))
-  if distance_m is not None:
-    out["distanceM"] = max(0.0, distance_m)
+  @field_validator("color", mode="before")
+  @classmethod
+  def parse_color(cls, value: Any) -> int:
+    color = _coerce_color(value)
+    if color is None:
+      raise ValueError(
+        "must be a valid color in [0, 16777215] (supports #RRGGBB and 0xRRGGBB)"
+      )
+    return color
 
-  angle_deg = _coerce_finite_number(raw.get("angleDeg"))
-  if angle_deg is not None:
-    out["angleDeg"] = max(1.0, min(85.0, angle_deg))
+  @field_validator(
+    "intensity",
+    "distanceM",
+    "angleDeg",
+    "penumbra",
+    "decay",
+    "mountFrontRatio",
+    "mountHeightM",
+    "mountSpacingM",
+    "targetForwardM",
+    "targetHeightM",
+    "targetXScale",
+  )
+  @classmethod
+  def finite_headlight_number(cls, value: float) -> float:
+    if not math.isfinite(value):
+      raise ValueError("must be finite")
+    return value
 
-  penumbra = _coerce_finite_number(raw.get("penumbra"))
-  if penumbra is not None:
-    out["penumbra"] = max(0.0, min(1.0, penumbra))
 
-  decay = _coerce_finite_number(raw.get("decay"))
-  if decay is not None:
-    out["decay"] = max(0.0, decay)
+class VehicleStateCommonModel(BaseModel):
+  model_config = ConfigDict(extra="ignore")
 
-  mount_front_ratio = _coerce_finite_number(raw.get("mountFrontRatio"))
-  if mount_front_ratio is not None:
-    out["mountFrontRatio"] = max(0.0, min(1.0, mount_front_ratio))
+  lat: float
+  lon: float
+  headingDeg: float
+  z: float | None = None
+  terrainDepth: int | None = Field(default=None, ge=0)
+  terrainTileId: str | None = None
 
-  mount_height_m = _coerce_finite_number(raw.get("mountHeightM"))
-  if mount_height_m is not None:
-    out["mountHeightM"] = mount_height_m
+  @field_validator("lat")
+  @classmethod
+  def validate_lat(cls, value: float) -> float:
+    if not math.isfinite(value):
+      raise ValueError("must be finite")
+    if value < -90 or value > 90:
+      raise ValueError("must be in [-90, 90]")
+    return value
 
-  mount_spacing_m = _coerce_finite_number(raw.get("mountSpacingM"))
-  if mount_spacing_m is not None:
-    out["mountSpacingM"] = max(0.0, mount_spacing_m)
+  @field_validator("lon")
+  @classmethod
+  def validate_lon(cls, value: float) -> float:
+    if not math.isfinite(value):
+      raise ValueError("must be finite")
+    if value < -180 or value > 180:
+      raise ValueError("must be in [-180, 180]")
+    return value
 
-  target_forward_m = _coerce_finite_number(raw.get("targetForwardM"))
-  if target_forward_m is not None:
-    out["targetForwardM"] = max(0.0, target_forward_m)
+  @field_validator("headingDeg")
+  @classmethod
+  def normalize_heading(cls, value: float) -> float:
+    if not math.isfinite(value):
+      raise ValueError("must be finite")
+    return value % 360.0
 
-  target_height_m = _coerce_finite_number(raw.get("targetHeightM"))
-  if target_height_m is not None:
-    out["targetHeightM"] = target_height_m
+  @field_validator("z")
+  @classmethod
+  def finite_optional_z(cls, value: float | None) -> float | None:
+    if value is None:
+      return None
+    if not math.isfinite(value):
+      raise ValueError("must be finite")
+    return value
 
-  target_x_scale = _coerce_finite_number(raw.get("targetXScale"))
-  if target_x_scale is not None:
-    out["targetXScale"] = max(0.0, min(1.0, target_x_scale))
+  @field_validator("terrainTileId", mode="before")
+  @classmethod
+  def normalize_tile_id(cls, value: Any) -> str | None:
+    if value is None:
+      return None
+    text = str(value).strip()
+    return text or None
 
-  return out
+
+class VehicleStateRecordModel(VehicleStateCommonModel):
+  savedAt: float
+
+  @field_validator("savedAt")
+  @classmethod
+  def validate_saved_at(cls, value: float) -> float:
+    if not math.isfinite(value):
+      raise ValueError("must be finite")
+    return value
+
+
+class SaveVehicleStateRequestModel(VehicleStateCommonModel):
+  reason: str | None = None
+
+  @field_validator("reason", mode="before")
+  @classmethod
+  def normalize_reason(cls, value: Any) -> str | None:
+    if value is None:
+      return None
+    text = str(value).strip()
+    return text or None
+
+
+def _default_vehicle_headlights() -> dict[str, Any]:
+  return VehicleHeadlightsModel().model_dump()
+
+
+def _sanitize_vehicle_headlights(
+  raw: Any,
+  logger: Any | None = None,
+) -> dict[str, Any]:
+  if raw is None:
+    return _default_vehicle_headlights()
+  try:
+    model = VehicleHeadlightsModel.model_validate(raw)
+  except ValidationError as exc:
+    if logger is not None:
+      logger.warning(
+        f"[VEHICLE HEADLIGHTS] invalid payload schema: {_validation_error_detail(exc)}"
+      )
+    return _default_vehicle_headlights()
+  return model.model_dump()
 
 
 def _ensure_default_vehicle_headlights_metadata(db: sqlite3.Connection) -> bool:
@@ -160,10 +211,12 @@ def _ensure_default_vehicle_headlights_metadata(db: sqlite3.Connection) -> bool:
   ).fetchone()
   if row is not None and row[0] is not None:
     return False
-  payload = _copy_default_vehicle_headlights()
   db.execute(
     "INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)",
-    (VEHICLE_HEADLIGHTS_METADATA_KEY, json.dumps(payload, separators=(",", ":"))),
+    (
+      VEHICLE_HEADLIGHTS_METADATA_KEY,
+      json.dumps(_default_vehicle_headlights(), separators=(",", ":")),
+    ),
   )
   db.commit()
   return True
@@ -181,7 +234,7 @@ def get_vehicle_headlights_response(db: sqlite3.Connection, logger: Any) -> dict
       "source": "defaults",
       "metadataKey": VEHICLE_HEADLIGHTS_METADATA_KEY,
       "seeded": seeded,
-      "headlights": _copy_default_vehicle_headlights(),
+      "headlights": _default_vehicle_headlights(),
     }
 
   try:
@@ -197,22 +250,23 @@ def get_vehicle_headlights_response(db: sqlite3.Connection, logger: Any) -> dict
       "metadataKey": VEHICLE_HEADLIGHTS_METADATA_KEY,
       "seeded": seeded,
       "corrupt": True,
-      "headlights": _copy_default_vehicle_headlights(),
+      "headlights": _default_vehicle_headlights(),
     }
 
+  headlights = _sanitize_vehicle_headlights(payload, logger)
   return {
     "ok": True,
     "source": "metadata",
     "metadataKey": VEHICLE_HEADLIGHTS_METADATA_KEY,
     "seeded": seeded,
     "corrupt": False,
-    "headlights": _sanitize_vehicle_headlights(payload),
+    "headlights": headlights,
   }
 
 
 def get_vehicle_state_response(db: sqlite3.Connection, logger: Any) -> dict[str, Any]:
   headlights_payload = get_vehicle_headlights_response(db, logger)
-  headlights = _sanitize_vehicle_headlights(headlights_payload.get("headlights"))
+  headlights = _sanitize_vehicle_headlights(headlights_payload.get("headlights"), logger)
   row = db.execute(
     "SELECT value FROM metadata WHERE key = ?",
     (VEHICLE_STATE_METADATA_KEY,),
@@ -222,7 +276,7 @@ def get_vehicle_state_response(db: sqlite3.Connection, logger: Any) -> dict[str,
 
   raw = row[0]
   try:
-    state = json.loads(raw)
+    payload = json.loads(raw)
   except Exception as exc:
     logger.warning(
       f"[VEHICLE STATE] invalid JSON in metadata key={VEHICLE_STATE_METADATA_KEY}: "
@@ -230,7 +284,20 @@ def get_vehicle_state_response(db: sqlite3.Connection, logger: Any) -> dict[str,
     )
     return {"ok": True, "state": None, "corrupt": True, "headlights": headlights}
 
-  return {"ok": True, "state": state, "headlights": headlights}
+  try:
+    state_model = VehicleStateRecordModel.model_validate(payload)
+  except ValidationError as exc:
+    logger.warning(
+      f"[VEHICLE STATE] invalid schema key={VEHICLE_STATE_METADATA_KEY}: "
+      f"{_validation_error_detail(exc)}"
+    )
+    return {"ok": True, "state": None, "corrupt": True, "headlights": headlights}
+
+  return {
+    "ok": True,
+    "state": state_model.model_dump(exclude_none=True),
+    "headlights": headlights,
+  }
 
 
 def save_vehicle_state_response(
@@ -239,89 +306,47 @@ def save_vehicle_state_response(
   logger: Any,
 ) -> tuple[dict[str, Any], int]:
   try:
-    lat = float(data.get("lat"))
-    lon = float(data.get("lon"))
-    heading_deg = float(data.get("headingDeg"))
-  except (TypeError, ValueError):
-    return {"error": "lat/lon/headingDeg must be finite numbers"}, 400
-  raw_z = data.get("z")
-  z = None
-  if raw_z is not None:
-    try:
-      z_val = float(raw_z)
-      if math.isfinite(z_val):
-        z = z_val
-      else:
-        return {"error": "z must be a finite number when provided"}, 400
-    except (TypeError, ValueError):
-      return {"error": "z must be a finite number when provided"}, 400
-  raw_terrain_depth = data.get("terrainDepth")
-  terrain_depth = None
-  if raw_terrain_depth is not None:
-    try:
-      terrain_depth_val = int(raw_terrain_depth)
-      if terrain_depth_val < 0:
-        return {"error": "terrainDepth must be >= 0 when provided"}, 400
-      terrain_depth = terrain_depth_val
-    except (TypeError, ValueError):
-      return {"error": "terrainDepth must be an integer when provided"}, 400
-  raw_terrain_tile_id = data.get("terrainTileId")
-  terrain_tile_id = None
-  if raw_terrain_tile_id is not None:
-    terrain_tile_id = str(raw_terrain_tile_id).strip()
-    if not terrain_tile_id:
-      terrain_tile_id = None
-  raw_reason = data.get("reason")
-  reason = None
-  if raw_reason is not None:
-    reason = str(raw_reason).strip()
-    if not reason:
-      reason = None
+    request = SaveVehicleStateRequestModel.model_validate(data)
+  except ValidationError as exc:
+    return {"error": f"invalid vehicle state payload: {_validation_error_detail(exc)}"}, 400
 
-  if not math.isfinite(lat) or not math.isfinite(lon) or not math.isfinite(heading_deg):
-    return {"error": "lat/lon/headingDeg must be finite numbers"}, 400
-  if lat < -90 or lat > 90:
-    return {"error": "lat out of range [-90, 90]"}, 400
-  if lon < -180 or lon > 180:
-    return {"error": "lon out of range [-180, 180]"}, 400
-
-  heading_deg = heading_deg % 360.0
-  state = {
-    "lat": lat,
-    "lon": lon,
-    "headingDeg": heading_deg,
-    "savedAt": time.time(),
-  }
-  if z is not None:
-    state["z"] = z
-  if terrain_depth is not None:
-    state["terrainDepth"] = terrain_depth
-  if terrain_tile_id is not None:
-    state["terrainTileId"] = terrain_tile_id
-  raw_state = json.dumps(state, separators=(",", ":"))
+  state_model = VehicleStateRecordModel(
+    lat=request.lat,
+    lon=request.lon,
+    headingDeg=request.headingDeg,
+    savedAt=time.time(),
+    z=request.z,
+    terrainDepth=request.terrainDepth,
+    terrainTileId=request.terrainTileId,
+  )
 
   db.execute(
     "INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)",
-    (VEHICLE_STATE_METADATA_KEY, raw_state),
+    (
+      VEHICLE_STATE_METADATA_KEY,
+      state_model.model_dump_json(exclude_none=True),
+    ),
   )
   db.commit()
 
   depth_log = (
-    f" terrainDepth={terrain_depth}"
-    if terrain_depth is not None
+    f" terrainDepth={request.terrainDepth}"
+    if request.terrainDepth is not None
     else ""
   )
   reason_log = (
-    f" reason={reason}"
-    if reason is not None
+    f" reason={request.reason}"
+    if request.reason is not None
     else ""
   )
-  if z is None:
+  if request.z is None:
     logger.info(
-      f"[VEHICLE STATE] saved lat={lat:.6f} lon={lon:.6f} headingDeg={heading_deg:.2f}{depth_log}{reason_log}"
+      f"[VEHICLE STATE] saved lat={request.lat:.6f} lon={request.lon:.6f} "
+      f"headingDeg={state_model.headingDeg:.2f}{depth_log}{reason_log}"
     )
   else:
     logger.info(
-      f"[VEHICLE STATE] saved lat={lat:.6f} lon={lon:.6f} headingDeg={heading_deg:.2f} z={z:.3f}{depth_log}{reason_log}"
+      f"[VEHICLE STATE] saved lat={request.lat:.6f} lon={request.lon:.6f} "
+      f"headingDeg={state_model.headingDeg:.2f} z={request.z:.3f}{depth_log}{reason_log}"
     )
-  return {"ok": True, "state": state}, 200
+  return {"ok": True, "state": state_model.model_dump(exclude_none=True)}, 200

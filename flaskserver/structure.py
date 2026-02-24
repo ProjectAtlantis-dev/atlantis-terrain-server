@@ -3,20 +3,22 @@ from __future__ import annotations
 import json
 import math
 import sqlite3
+from pathlib import Path
 from typing import Any
 
-ASSETS_BOOTSTRAP_METADATA_KEY = "assets_bootstrap"
-ASSETS_BOOTSTRAP_LEGACY_METADATA_KEY = "assets_bootstrap_v1"
-ASSETS_BOOTSTRAP_SCHEMA_VERSION = 1
-STRUCTURE_SITES_TABLE = "structure_sites"
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
-_DEFAULT_STRUCTURE_MODEL = {
+ASSETS_RESPONSE_SCHEMA_VERSION = 3
+STRUCTURE_SITES_TABLE = "structure_sites"
+ASSETS_METADATA_PATH = Path(__file__).with_name("assets_metadata.json")
+
+_FALLBACK_STRUCTURE_MODEL = {
   "url": "/models/house_test.glb",
   "altOffsetM": 0.4,
   "hotReloadMs": 2000,
   "enabled": False,
 }
-_DEFAULT_STRUCTURE_SITES = [
+_FALLBACK_STRUCTURE_SEED_INSTANCES = [
   {"id": "nuuk-01", "lat": 64.179102, "lon": -51.712988, "headingDeg": 22, "scale": 1.00, "tileId": "12-1375-791"},
   {"id": "nuuk-02", "lat": 64.174556, "lon": -51.703948, "headingDeg": 58, "scale": 0.96, "tileId": "12-1376-791"},
   {"id": "nuuk-03", "lat": 64.185330, "lon": -51.703495, "headingDeg": 96, "scale": 1.08, "tileId": "12-1376-792"},
@@ -24,7 +26,7 @@ _DEFAULT_STRUCTURE_SITES = [
   {"id": "nuuk-05", "lat": 64.173514, "lon": -51.718454, "headingDeg": 210, "scale": 0.98, "tileId": "12-1374-791"},
   {"id": "nuuk-06", "lat": 64.178473, "lon": -51.724776, "headingDeg": 288, "scale": 1.04, "tileId": "12-1374-791"},
 ]
-_DEFAULT_VEHICLE_MODEL = {
+_FALLBACK_VEHICLE_MODEL = {
   "url": "/models/patria_amv.glb",
   "lat": 64.18423381,
   "lon": -51.70139232,
@@ -34,42 +36,95 @@ _DEFAULT_VEHICLE_MODEL = {
   "tireDiameterM": 1.27,
   "altOffsetM": 0.05,
 }
+_FALLBACK_ASSETS_METADATA = {
+  "metadataVersion": 1,
+  "structure_metadata": {
+    "model": dict(_FALLBACK_STRUCTURE_MODEL),
+  },
+  "vehicle_metadata": {
+    "model": dict(_FALLBACK_VEHICLE_MODEL),
+  },
+  "seed_structure_instances": [dict(site) for site in _FALLBACK_STRUCTURE_SEED_INSTANCES],
+}
 
 
-def _copy_default_assets_bootstrap() -> dict[str, Any]:
-  return {
-    "structureModel": dict(_DEFAULT_STRUCTURE_MODEL),
-    "structureSites": [],
-    "vehicleModel": dict(_DEFAULT_VEHICLE_MODEL),
-  }
+def _validation_error_detail(exc: ValidationError) -> str:
+  errors = exc.errors(include_url=False)
+  if not errors:
+    return "invalid payload"
+  first = errors[0]
+  loc = ".".join(str(part) for part in first.get("loc", ()))
+  msg = str(first.get("msg", "invalid value"))
+  if loc:
+    return f"{loc}: {msg}"
+  return msg
 
 
-def _default_assets_bootstrap_metadata_payload() -> dict[str, Any]:
-  return {
-    "version": ASSETS_BOOTSTRAP_SCHEMA_VERSION,
-    "structureModel": dict(_DEFAULT_STRUCTURE_MODEL),
-    "vehicleModel": dict(_DEFAULT_VEHICLE_MODEL),
-  }
+def _validation_error_fields(exc: ValidationError) -> set[str]:
+  fields: set[str] = set()
+  for err in exc.errors(include_url=False):
+    loc = err.get("loc", ())
+    if not loc:
+      continue
+    field_name = loc[0]
+    if isinstance(field_name, str):
+      fields.add(field_name)
+  return fields
 
 
-def _metadata_json_value(
-  db: sqlite3.Connection,
-  key: str,
-  logger: Any,
-) -> tuple[Any | None, bool]:
-  row = db.execute(
-    "SELECT value FROM metadata WHERE key = ?",
-    (key,),
-  ).fetchone()
-  if row is None or row[0] is None:
-    return None, False
-  try:
-    return json.loads(row[0]), False
-  except Exception as exc:
-    logger.warning(
-      f"[METADATA] invalid JSON key={key}: {type(exc).__name__}: {exc}"
-    )
-    return None, True
+class VehicleModelConfig(BaseModel):
+  model_config = ConfigDict(extra="ignore")
+
+  url: str = str(_FALLBACK_VEHICLE_MODEL["url"])
+  lat: float = float(_FALLBACK_VEHICLE_MODEL["lat"])
+  lon: float = float(_FALLBACK_VEHICLE_MODEL["lon"])
+  headingDeg: float = float(_FALLBACK_VEHICLE_MODEL["headingDeg"])
+  z: float = float(_FALLBACK_VEHICLE_MODEL["z"])
+  realLengthM: float = Field(default=float(_FALLBACK_VEHICLE_MODEL["realLengthM"]), gt=0)
+  tireDiameterM: float = Field(default=float(_FALLBACK_VEHICLE_MODEL["tireDiameterM"]), gt=0)
+  altOffsetM: float = float(_FALLBACK_VEHICLE_MODEL["altOffsetM"])
+
+  @field_validator("url", mode="before")
+  @classmethod
+  def normalize_url(cls, value: Any) -> str:
+    if not isinstance(value, str):
+      raise ValueError("must be a string")
+    text = value.strip()
+    if not text:
+      raise ValueError("must be a non-empty string")
+    return text
+
+  @field_validator("lat")
+  @classmethod
+  def validate_lat(cls, value: float) -> float:
+    if not math.isfinite(value):
+      raise ValueError("must be finite")
+    if value < -90 or value > 90:
+      raise ValueError("must be in [-90, 90]")
+    return value
+
+  @field_validator("lon")
+  @classmethod
+  def validate_lon(cls, value: float) -> float:
+    if not math.isfinite(value):
+      raise ValueError("must be finite")
+    if value < -180 or value > 180:
+      raise ValueError("must be in [-180, 180]")
+    return value
+
+  @field_validator("headingDeg")
+  @classmethod
+  def normalize_heading(cls, value: float) -> float:
+    if not math.isfinite(value):
+      raise ValueError("must be finite")
+    return value % 360.0
+
+  @field_validator("z", "realLengthM", "tireDiameterM", "altOffsetM")
+  @classmethod
+  def validate_finite_number(cls, value: float) -> float:
+    if not math.isfinite(value):
+      raise ValueError("must be finite")
+    return value
 
 
 def _coerce_finite_number(value: Any) -> float | None:
@@ -99,8 +154,18 @@ def _coerce_bool(value: Any) -> bool | None:
   return None
 
 
+def _coerce_schema_version(value: Any) -> int | None:
+  number = _coerce_finite_number(value)
+  if number is None:
+    return None
+  int_value = int(number)
+  if int_value == number and int_value >= 0:
+    return int_value
+  return None
+
+
 def _sanitize_structure_model(raw: Any) -> dict[str, Any]:
-  out = dict(_DEFAULT_STRUCTURE_MODEL)
+  out = dict(_FALLBACK_STRUCTURE_MODEL)
   if not isinstance(raw, dict):
     return out
   url = raw.get("url")
@@ -172,6 +237,102 @@ def _sanitize_structure_sites(raw: Any) -> list[dict[str, Any]]:
   return out
 
 
+def _sanitize_vehicle_model(raw: Any, logger: Any | None = None) -> dict[str, Any]:
+  defaults = VehicleModelConfig.model_validate(_FALLBACK_VEHICLE_MODEL).model_dump()
+  if not isinstance(raw, dict):
+    return defaults
+
+  candidate = dict(defaults)
+  candidate.update(raw)
+  try:
+    return VehicleModelConfig.model_validate(candidate).model_dump()
+  except ValidationError as exc:
+    invalid_fields = _validation_error_fields(exc)
+    if not invalid_fields:
+      if logger is not None:
+        logger.warning(
+          f"[ASSETS METADATA] invalid vehicle_metadata.model schema: {_validation_error_detail(exc)}"
+        )
+      return defaults
+
+    recovered_raw = dict(raw)
+    for key in invalid_fields:
+      recovered_raw.pop(key, None)
+
+    recovered_candidate = dict(defaults)
+    recovered_candidate.update(recovered_raw)
+    try:
+      model = VehicleModelConfig.model_validate(recovered_candidate)
+    except ValidationError as recovered_exc:
+      if logger is not None:
+        logger.warning(
+          f"[ASSETS METADATA] invalid vehicle_metadata.model schema: {_validation_error_detail(recovered_exc)}"
+        )
+      return defaults
+
+    if logger is not None:
+      dropped_keys = ",".join(sorted(invalid_fields))
+      logger.warning(
+        f"[ASSETS METADATA] dropped invalid vehicle_metadata.model keys: {dropped_keys}"
+      )
+    return model.model_dump()
+
+
+def _load_assets_metadata(
+  logger: Any,
+) -> tuple[str, bool, int, dict[str, Any], dict[str, Any], list[dict[str, Any]]]:
+  source = "metadata_file"
+  corrupt = False
+  raw_payload: Any = None
+
+  try:
+    raw_payload = json.loads(ASSETS_METADATA_PATH.read_text(encoding="utf-8"))
+  except Exception as exc:
+    logger.warning(
+      f"[ASSETS METADATA] failed to load {ASSETS_METADATA_PATH.name}: "
+      f"{type(exc).__name__}: {exc}"
+    )
+    raw_payload = dict(_FALLBACK_ASSETS_METADATA)
+    source = "metadata_fallback"
+    corrupt = True
+
+  if not isinstance(raw_payload, dict):
+    logger.warning("[ASSETS METADATA] root payload must be an object")
+    raw_payload = dict(_FALLBACK_ASSETS_METADATA)
+    source = "metadata_fallback"
+    corrupt = True
+
+  metadata_version = _coerce_schema_version(raw_payload.get("metadataVersion"))
+  if metadata_version is None:
+    metadata_version = int(_FALLBACK_ASSETS_METADATA["metadataVersion"])
+
+  raw_structure_metadata = raw_payload.get("structure_metadata")
+  raw_vehicle_metadata = raw_payload.get("vehicle_metadata")
+  raw_seed_instances = raw_payload.get("seed_structure_instances")
+
+  structure_model_raw = (
+    raw_structure_metadata.get("model")
+    if isinstance(raw_structure_metadata, dict)
+    else _FALLBACK_ASSETS_METADATA["structure_metadata"]["model"]
+  )
+  vehicle_model_raw = (
+    raw_vehicle_metadata.get("model")
+    if isinstance(raw_vehicle_metadata, dict)
+    else _FALLBACK_ASSETS_METADATA["vehicle_metadata"]["model"]
+  )
+
+  if raw_seed_instances is None:
+    raw_seed_instances = _FALLBACK_ASSETS_METADATA["seed_structure_instances"]
+  seed_instances = _sanitize_structure_sites(raw_seed_instances)
+  if not seed_instances:
+    seed_instances = _sanitize_structure_sites(_FALLBACK_ASSETS_METADATA["seed_structure_instances"])
+
+  structure_model = _sanitize_structure_model(structure_model_raw)
+  vehicle_model = _sanitize_vehicle_model(vehicle_model_raw, logger)
+
+  return source, corrupt, metadata_version, structure_model, vehicle_model, seed_instances
+
+
 def _ensure_structure_sites_table(db: sqlite3.Connection) -> None:
   db.execute(
     f"""
@@ -189,9 +350,10 @@ def _ensure_structure_sites_table(db: sqlite3.Connection) -> None:
   )
 
 
-def _seed_default_structure_sites_if_empty(
+def _seed_structure_instances_if_empty(
   db: sqlite3.Connection,
   logger: Any,
+  seed_instances: list[dict[str, Any]],
 ) -> bool:
   row = db.execute(
     f"SELECT COUNT(*) FROM {STRUCTURE_SITES_TABLE}"
@@ -199,7 +361,8 @@ def _seed_default_structure_sites_if_empty(
   count = int(row[0]) if row is not None else 0
   if count > 0:
     return False
-  for site in _DEFAULT_STRUCTURE_SITES:
+
+  for site in seed_instances:
     db.execute(
       f"""
       INSERT OR REPLACE INTO {STRUCTURE_SITES_TABLE}
@@ -217,17 +380,14 @@ def _seed_default_structure_sites_if_empty(
     )
   db.commit()
   logger.info(
-    f"[STRUCTURE] seeded {len(_DEFAULT_STRUCTURE_SITES)} default structure sites"
+    f"[STRUCTURE] seeded {len(seed_instances)} default structure instances"
   )
   return True
 
 
-def _load_structure_sites_from_db(
+def _load_structure_instances_from_db(
   db: sqlite3.Connection,
-  logger: Any,
-) -> tuple[list[dict[str, Any]], bool]:
-  _ensure_structure_sites_table(db)
-  seeded = _seed_default_structure_sites_if_empty(db, logger)
+) -> list[dict[str, Any]]:
   rows = db.execute(
     f"""
     SELECT id, lat, lon, heading_deg, scale, tile_id
@@ -252,152 +412,43 @@ def _load_structure_sites_from_db(
     if site is None:
       continue
     out.append(site)
-  return out, seeded
-
-
-def _sanitize_vehicle_model(raw: Any) -> dict[str, Any]:
-  out = dict(_DEFAULT_VEHICLE_MODEL)
-  if not isinstance(raw, dict):
-    return out
-  url = raw.get("url")
-  if isinstance(url, str):
-    stripped = url.strip()
-    if stripped:
-      out["url"] = stripped
-  lat = _coerce_finite_number(raw.get("lat"))
-  if lat is not None and -90 <= lat <= 90:
-    out["lat"] = lat
-  lon = _coerce_finite_number(raw.get("lon"))
-  if lon is not None and -180 <= lon <= 180:
-    out["lon"] = lon
-  heading_deg = _coerce_finite_number(raw.get("headingDeg"))
-  if heading_deg is not None:
-    out["headingDeg"] = heading_deg % 360.0
-  z = _coerce_finite_number(raw.get("z"))
-  if z is not None:
-    out["z"] = z
-  real_length_m = _coerce_finite_number(raw.get("realLengthM"))
-  if real_length_m is not None and real_length_m > 0:
-    out["realLengthM"] = real_length_m
-  tire_diameter_m = _coerce_finite_number(raw.get("tireDiameterM"))
-  if tire_diameter_m is not None and tire_diameter_m > 0:
-    out["tireDiameterM"] = tire_diameter_m
-  alt_offset_m = _coerce_finite_number(raw.get("altOffsetM"))
-  if alt_offset_m is not None:
-    out["altOffsetM"] = alt_offset_m
   return out
 
 
-def _sanitize_assets_bootstrap(raw: Any) -> dict[str, Any]:
-  if not isinstance(raw, dict):
-    return _copy_default_assets_bootstrap()
-  return {
-    "structureModel": _sanitize_structure_model(raw.get("structureModel")),
-    "structureSites": _sanitize_structure_sites(raw.get("structureSites")),
-    "vehicleModel": _sanitize_vehicle_model(raw.get("vehicleModel")),
-  }
-
-
-def _coerce_schema_version(value: Any) -> int | None:
-  number = _coerce_finite_number(value)
-  if number is None:
-    return None
-  int_value = int(number)
-  if int_value == number and int_value >= 0:
-    return int_value
-  return None
-
-
-def _read_assets_bootstrap_payload(
-  db: sqlite3.Connection,
-  logger: Any,
-) -> tuple[Any | None, str | None, bool]:
-  corrupt = False
-  payload, payload_corrupt = _metadata_json_value(
-    db,
-    ASSETS_BOOTSTRAP_METADATA_KEY,
-    logger,
-  )
-  corrupt = corrupt or payload_corrupt
-  if payload is not None:
-    return payload, ASSETS_BOOTSTRAP_METADATA_KEY, corrupt
-
-  legacy_payload, legacy_corrupt = _metadata_json_value(
-    db,
-    ASSETS_BOOTSTRAP_LEGACY_METADATA_KEY,
-    logger,
-  )
-  corrupt = corrupt or legacy_corrupt
-  if legacy_payload is not None:
-    return legacy_payload, ASSETS_BOOTSTRAP_LEGACY_METADATA_KEY, corrupt
-  return None, None, corrupt
-
-
-def _ensure_default_assets_bootstrap_metadata(db: sqlite3.Connection) -> bool:
-  existing = db.execute(
-    "SELECT key FROM metadata WHERE key IN (?, ?) LIMIT 1",
-    (ASSETS_BOOTSTRAP_METADATA_KEY, ASSETS_BOOTSTRAP_LEGACY_METADATA_KEY),
-  ).fetchone()
-  if existing is not None:
-    return False
-  payload = _default_assets_bootstrap_metadata_payload()
-  db.execute(
-    "INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)",
-    (ASSETS_BOOTSTRAP_METADATA_KEY, json.dumps(payload, separators=(",", ":"))),
-  )
-  db.commit()
-  return True
-
-
-def _decode_assets_bootstrap_payload(
-  raw_payload: Any,
-  source_key: str | None,
-  logger: Any,
-) -> tuple[int, dict[str, Any], bool]:
-  if source_key == ASSETS_BOOTSTRAP_LEGACY_METADATA_KEY:
-    return ASSETS_BOOTSTRAP_SCHEMA_VERSION, _sanitize_assets_bootstrap(raw_payload), False
-  if not isinstance(raw_payload, dict):
-    return ASSETS_BOOTSTRAP_SCHEMA_VERSION, _copy_default_assets_bootstrap(), False
-
-  raw_version = _coerce_schema_version(raw_payload.get("version"))
-  if raw_version is None:
-    return ASSETS_BOOTSTRAP_SCHEMA_VERSION, _sanitize_assets_bootstrap(raw_payload), False
-  if raw_version != ASSETS_BOOTSTRAP_SCHEMA_VERSION:
-    logger.warning(
-      f"[ASSETS BOOTSTRAP] unsupported version={raw_version} "
-      f"(expected {ASSETS_BOOTSTRAP_SCHEMA_VERSION})"
-    )
-    return raw_version, _copy_default_assets_bootstrap(), True
-  return raw_version, _sanitize_assets_bootstrap(raw_payload), False
-
-
 def get_assets_bootstrap_response(db: sqlite3.Connection, logger: Any) -> dict[str, Any]:
-  metadata_seeded = _ensure_default_assets_bootstrap_metadata(db)
+  (
+    metadata_source,
+    metadata_corrupt,
+    metadata_version,
+    structure_model,
+    vehicle_model,
+    seed_instances,
+  ) = _load_assets_metadata(logger)
+
   _ensure_structure_sites_table(db)
-  payload, source_key, corrupt = _read_assets_bootstrap_payload(db, logger)
-  version, assets, version_error = _decode_assets_bootstrap_payload(payload, source_key, logger)
-  corrupt = corrupt or version_error
-  structure_sites, structure_seeded = _load_structure_sites_from_db(db, logger)
-  assets["structureSites"] = structure_sites
-  structure_sites_source = "db"
-  if payload is None:
-    source = "defaults"
-    metadata_key = ASSETS_BOOTSTRAP_METADATA_KEY
-  else:
-    source = "metadata"
-    metadata_key = source_key
+  seeded_structure_instances = _seed_structure_instances_if_empty(db, logger, seed_instances)
+  structure_instances = _load_structure_instances_from_db(db)
+
+  source = "defaults" if seeded_structure_instances else metadata_source
 
   return {
     "ok": True,
     "source": source,
-    "metadataKey": metadata_key,
-    "schemaVersion": ASSETS_BOOTSTRAP_SCHEMA_VERSION,
-    "version": version,
-    "corrupt": corrupt,
-    "structureSitesSource": structure_sites_source,
+    "metadataKey": None,
+    "schemaVersion": ASSETS_RESPONSE_SCHEMA_VERSION,
+    "version": metadata_version,
+    "corrupt": metadata_corrupt,
+    "structureInstancesSource": "db",
     "seeded": {
-      "metadata": metadata_seeded,
-      "structureSites": structure_seeded,
+      "structureInstances": seeded_structure_instances,
     },
-    "assets": assets,
+    "assets": {
+      "structure_metadata": {
+        "model": structure_model,
+      },
+      "vehicle_metadata": {
+        "model": vehicle_model,
+      },
+      "structure_instances": structure_instances,
+    },
   }

@@ -200,7 +200,11 @@ const referenceDate = new Date('2025-07-01T12:00:00Z');
 const currentDate = new Date(referenceDate);
 const GAME_HOURS_PER_REAL_HOUR = 24;
 const GAME_TIME_SCALE = GAME_HOURS_PER_REAL_HOUR;
+const GAME_CLOCK_STORAGE_KEY = 'game-clock-ms';
+const _savedGameClockMs = Number(localStorage.getItem(GAME_CLOCK_STORAGE_KEY));
+const gameClockStartMs = _savedGameClockMs || referenceDate.getTime();
 const browserTimeStartMs = Date.now();
+let _lastGameClockSave = 0;
 
 const DEFAULT_CENTER = {
   // Nuuk, Greenland
@@ -220,9 +224,13 @@ const centerLat = Number(params.get('lat') ?? DEFAULT_CENTER.lat);
 
 function cloneFallbackStartupAssets() {
   return {
-    structureModel: {},
-    structureSites: [],
-    vehicleModel: {},
+    structure_metadata: {
+      model: {},
+    },
+    vehicle_metadata: {
+      model: {},
+    },
+    structure_instances: [],
   };
 }
 
@@ -231,18 +239,46 @@ function normalizeStartupAssetsPayload(payload) {
   if (payload == null || typeof payload !== 'object') {
     return fallback;
   }
-  const { structureModel, structureSites, vehicleModel } = payload;
-  if (structureModel != null && typeof structureModel === 'object') {
-    fallback.structureModel = { ...fallback.structureModel, ...structureModel };
+  const rawStructureMetadata = payload.structure_metadata;
+  const rawVehicleMetadata = payload.vehicle_metadata;
+  const rawStructureInstances = payload.structure_instances;
+
+  const structureModelSource = (
+    rawStructureMetadata != null &&
+    typeof rawStructureMetadata === 'object' &&
+    rawStructureMetadata.model != null &&
+    typeof rawStructureMetadata.model === 'object'
+  )
+    ? rawStructureMetadata.model
+    : null;
+  if (structureModelSource != null && typeof structureModelSource === 'object') {
+    fallback.structure_metadata.model = {
+      ...fallback.structure_metadata.model,
+      ...structureModelSource,
+    };
   }
-  if (Array.isArray(structureSites)) {
-    fallback.structureSites = structureSites
+
+  if (Array.isArray(rawStructureInstances)) {
+    fallback.structure_instances = rawStructureInstances
       .filter(site => site != null && typeof site === 'object')
       .map(site => ({ ...site }));
   }
-  if (vehicleModel != null && typeof vehicleModel === 'object') {
-    fallback.vehicleModel = { ...fallback.vehicleModel, ...vehicleModel };
+
+  const vehicleModelSource = (
+    rawVehicleMetadata != null &&
+    typeof rawVehicleMetadata === 'object' &&
+    rawVehicleMetadata.model != null &&
+    typeof rawVehicleMetadata.model === 'object'
+  )
+    ? rawVehicleMetadata.model
+    : null;
+  if (vehicleModelSource != null && typeof vehicleModelSource === 'object') {
+    fallback.vehicle_metadata.model = {
+      ...fallback.vehicle_metadata.model,
+      ...vehicleModelSource,
+    };
   }
+
   return fallback;
 }
 
@@ -252,8 +288,8 @@ async function loadStartupAssets() {
     corrupt: false,
     metadataKey: null,
     version: 1,
-    schemaVersion: 1,
-    structureSitesSource: 'unavailable',
+    schemaVersion: 3,
+    structureInstancesSource: 'unavailable',
     seeded: null,
     assets: cloneFallbackStartupAssets(),
   };
@@ -268,9 +304,9 @@ async function loadStartupAssets() {
       corrupt: Boolean(payload?.corrupt),
       metadataKey: typeof payload?.metadataKey === 'string' ? payload.metadataKey : null,
       version: Number.isFinite(payload?.version) ? payload.version : 1,
-      schemaVersion: Number.isFinite(payload?.schemaVersion) ? payload.schemaVersion : 1,
-      structureSitesSource: typeof payload?.structureSitesSource === 'string'
-        ? payload.structureSitesSource
+      schemaVersion: Number.isFinite(payload?.schemaVersion) ? payload.schemaVersion : 3,
+      structureInstancesSource: typeof payload?.structureInstancesSource === 'string'
+        ? payload.structureInstancesSource
         : 'unknown',
       seeded: payload?.seeded ?? null,
       assets: normalizeStartupAssetsPayload(payload?.assets),
@@ -293,9 +329,11 @@ bootLog('assets.bootstrap.loaded', {
   metadataKey: startupAssetsBootstrap.metadataKey,
   version: startupAssetsBootstrap.version,
   schemaVersion: startupAssetsBootstrap.schemaVersion,
-  structureSitesSource: startupAssetsBootstrap.structureSitesSource,
+  structureInstancesSource: startupAssetsBootstrap.structureInstancesSource,
   seeded: startupAssetsBootstrap.seeded,
-  structureCount: startupAssets.structureSites.length,
+  structureCount: Array.isArray(startupAssets.structure_instances)
+    ? startupAssets.structure_instances.length
+    : 0,
 });
 
 const scene = new THREE.Scene();
@@ -1072,37 +1110,47 @@ function paramNumber(name, fallback) {
   return Number.isFinite(value) ? value : fallback;
 }
 
-const BOOTSTRAP_STRUCTURE_MODEL = (
-  startupAssets.structureModel != null && typeof startupAssets.structureModel === 'object'
+const ASSET_STRUCTURE_METADATA = (
+  startupAssets.structure_metadata != null && typeof startupAssets.structure_metadata === 'object'
 )
-  ? startupAssets.structureModel
+  ? startupAssets.structure_metadata
   : {};
-const BOOTSTRAP_STRUCTURE_SITES = Array.isArray(startupAssets.structureSites)
-  ? startupAssets.structureSites
-  : [];
-const BOOTSTRAP_VEHICLE_MODEL = (
-  startupAssets.vehicleModel != null && typeof startupAssets.vehicleModel === 'object'
+const ASSET_STRUCTURE_MODEL = (
+  ASSET_STRUCTURE_METADATA.model != null && typeof ASSET_STRUCTURE_METADATA.model === 'object'
 )
-  ? startupAssets.vehicleModel
+  ? ASSET_STRUCTURE_METADATA.model
+  : {};
+const ASSET_STRUCTURE_INSTANCES = Array.isArray(startupAssets.structure_instances)
+  ? startupAssets.structure_instances
+  : [];
+const ASSET_VEHICLE_METADATA = (
+  startupAssets.vehicle_metadata != null && typeof startupAssets.vehicle_metadata === 'object'
+)
+  ? startupAssets.vehicle_metadata
+  : {};
+const ASSET_VEHICLE_MODEL = (
+  ASSET_VEHICLE_METADATA.model != null && typeof ASSET_VEHICLE_METADATA.model === 'object'
+)
+  ? ASSET_VEHICLE_METADATA.model
   : {};
 const houseEnabledParam = params.get('house');
 const HOUSE_MODEL = {
-  url: (typeof BOOTSTRAP_STRUCTURE_MODEL.url === 'string' && BOOTSTRAP_STRUCTURE_MODEL.url.trim() !== '')
-    ? BOOTSTRAP_STRUCTURE_MODEL.url
+  url: (typeof ASSET_STRUCTURE_MODEL.url === 'string' && ASSET_STRUCTURE_MODEL.url.trim() !== '')
+    ? ASSET_STRUCTURE_MODEL.url
     : '',
   altOffsetM: paramNumber(
     'houseAltOffset',
-    Number.isFinite(BOOTSTRAP_STRUCTURE_MODEL.altOffsetM) ? BOOTSTRAP_STRUCTURE_MODEL.altOffsetM : 0.4
+    Number.isFinite(ASSET_STRUCTURE_MODEL.altOffsetM) ? ASSET_STRUCTURE_MODEL.altOffsetM : 0.4
   ),
   hotReloadMs: Math.max(
     500,
     paramNumber(
       'houseReloadMs',
-      Number.isFinite(BOOTSTRAP_STRUCTURE_MODEL.hotReloadMs) ? BOOTSTRAP_STRUCTURE_MODEL.hotReloadMs : 2000
+      Number.isFinite(ASSET_STRUCTURE_MODEL.hotReloadMs) ? ASSET_STRUCTURE_MODEL.hotReloadMs : 2000
     )
   ),
   enabled: houseEnabledParam == null
-    ? Boolean(BOOTSTRAP_STRUCTURE_MODEL.enabled)
+    ? Boolean(ASSET_STRUCTURE_MODEL.enabled)
     : houseEnabledParam === '1'
 };
 if (!HOUSE_MODEL.url) {
@@ -1119,7 +1167,7 @@ const HOUSE_USE_SHADOW_MAP = HOUSE_SHADOW_MODE === 'shadowmap';
 const HOUSE_LOCAL_SHADOW_DEBUG = params.get('houseLocalShadowDebug') !== '0';
 const HOUSE_SHADOW_SNAPSHOT_ENABLED = params.get('houseShadowSnapshot') === '1';
 const HOUSE_PROBE_CONSOLE = params.get('houseProbeConsole') === '1';
-const DEFAULT_NUUK_HOUSE_SITES = BOOTSTRAP_STRUCTURE_SITES;
+const DEFAULT_NUUK_HOUSE_SITES = ASSET_STRUCTURE_INSTANCES;
 const singleHouseLat = paramNumber('houseLat', NaN);
 const singleHouseLon = paramNumber('houseLon', NaN);
 const houseCountParam = paramNumber('houseCount', DEFAULT_NUUK_HOUSE_SITES.length);
@@ -1482,21 +1530,21 @@ houseLayer.visible = housesRuntimeVisible;
 
 // ── Patria AMV vehicle ──────────────────────────────────────────────────
 const VEHICLE_MODEL = {
-  url: (typeof BOOTSTRAP_VEHICLE_MODEL.url === 'string' && BOOTSTRAP_VEHICLE_MODEL.url.trim() !== '')
-    ? BOOTSTRAP_VEHICLE_MODEL.url
+  url: (typeof ASSET_VEHICLE_MODEL.url === 'string' && ASSET_VEHICLE_MODEL.url.trim() !== '')
+    ? ASSET_VEHICLE_MODEL.url
     : '/models/patria_amv.glb',
-  lat: Number.isFinite(BOOTSTRAP_VEHICLE_MODEL.lat) ? BOOTSTRAP_VEHICLE_MODEL.lat : centerLat,
-  lon: Number.isFinite(BOOTSTRAP_VEHICLE_MODEL.lon) ? BOOTSTRAP_VEHICLE_MODEL.lon : centerLon,
-  headingDeg: Number.isFinite(BOOTSTRAP_VEHICLE_MODEL.headingDeg) ? BOOTSTRAP_VEHICLE_MODEL.headingDeg : 0,
-  z: Number.isFinite(BOOTSTRAP_VEHICLE_MODEL.z) ? BOOTSTRAP_VEHICLE_MODEL.z : 0,
-  realLengthM: Number.isFinite(BOOTSTRAP_VEHICLE_MODEL.realLengthM) ? BOOTSTRAP_VEHICLE_MODEL.realLengthM : 7.7,
+  lat: Number.isFinite(ASSET_VEHICLE_MODEL.lat) ? ASSET_VEHICLE_MODEL.lat : centerLat,
+  lon: Number.isFinite(ASSET_VEHICLE_MODEL.lon) ? ASSET_VEHICLE_MODEL.lon : centerLon,
+  headingDeg: Number.isFinite(ASSET_VEHICLE_MODEL.headingDeg) ? ASSET_VEHICLE_MODEL.headingDeg : 0,
+  z: Number.isFinite(ASSET_VEHICLE_MODEL.z) ? ASSET_VEHICLE_MODEL.z : 0,
+  realLengthM: Number.isFinite(ASSET_VEHICLE_MODEL.realLengthM) ? ASSET_VEHICLE_MODEL.realLengthM : 7.7,
   tireDiameterM: paramNumber(
     'vehicleTireDiameterM',
-    Number.isFinite(BOOTSTRAP_VEHICLE_MODEL.tireDiameterM)
-      ? BOOTSTRAP_VEHICLE_MODEL.tireDiameterM
+    Number.isFinite(ASSET_VEHICLE_MODEL.tireDiameterM)
+      ? ASSET_VEHICLE_MODEL.tireDiameterM
       : 1.27
   ),
-  altOffsetM: Number.isFinite(BOOTSTRAP_VEHICLE_MODEL.altOffsetM) ? BOOTSTRAP_VEHICLE_MODEL.altOffsetM : 0.05,
+  altOffsetM: Number.isFinite(ASSET_VEHICLE_MODEL.altOffsetM) ? ASSET_VEHICLE_MODEL.altOffsetM : 0.05,
 };
 const VEHICLE_TIRE_RADIUS_M = Math.max(
   0,
@@ -3385,7 +3433,7 @@ function applyDate(date) {
 }
 function getGameDateFromBrowserTime(nowMs = Date.now()) {
   const elapsedMs = nowMs - browserTimeStartMs;
-  return new Date(browserTimeStartMs + elapsedMs * GAME_TIME_SCALE);
+  return new Date(gameClockStartMs + elapsedMs * GAME_TIME_SCALE);
 }
 buildTuningControls(aerialPerspective, cloudsEffect);
 // Only apply the default referenceDate if no saved tuning overrides month/hour.
@@ -4917,6 +4965,12 @@ function updateHud() {
 
   // Game clock display (bottom-left)
   const gameDate = useRealtimeGameClock ? getGameDateFromBrowserTime() : currentDate;
+  // Persist game clock to localStorage ~every 5s
+  const _now = performance.now();
+  if (_now - _lastGameClockSave > 5000) {
+    _lastGameClockSave = _now;
+    localStorage.setItem(GAME_CLOCK_STORAGE_KEY, String(gameDate.getTime()));
+  }
   const _mn3 = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
   const gdMon = _mn3[gameDate.getUTCMonth()];
   const gdDay = gameDate.getUTCDate();
@@ -4946,6 +5000,7 @@ function updateHud() {
 function resetView() {
   localStorage.removeItem('clouds-cam');
   localStorage.removeItem(TUNING_STORAGE_KEY);
+  localStorage.removeItem(GAME_CLOCK_STORAGE_KEY);
   for (const k of Object.keys(_tuningState)) delete _tuningState[k];
   controls.yaw = defaultYaw;
   controls.pitch = defaultPitch;

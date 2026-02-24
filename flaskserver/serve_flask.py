@@ -451,43 +451,43 @@ def _bootstrap_backend() -> None:
       db.commit()
       log_db.info(f"Updated max_depth metadata to {ENHANCE_DEPTH}")
 
-    # Ensure startup asset metadata + structure sites exist so frontend can
-    # always load world placements from backend tables at app startup.
+    # Ensure structure instances exist so frontend can always load world
+    # placements from backend tables at app startup.
     assets_bootstrap = get_assets_bootstrap_response(db, log_assets)
     seeded = assets_bootstrap.get("seeded") or {}
-    seeded_metadata = bool(seeded.get("metadata"))
-    seeded_structure_sites = bool(seeded.get("structureSites"))
+    seeded_structure_instances = bool(seeded.get("structureInstances"))
     assets_payload = assets_bootstrap.get("assets") or {}
-    structure_sites = assets_payload.get("structureSites") or []
-    structure_model = assets_payload.get("structureModel") or {}
-    vehicle_model = assets_payload.get("vehicleModel") or {}
+    structure_instances = assets_payload.get("structure_instances")
+    if not isinstance(structure_instances, list):
+      structure_instances = []
+    structure_metadata = assets_payload.get("structure_metadata") or {}
+    vehicle_metadata = assets_payload.get("vehicle_metadata") or {}
+    structure_model = structure_metadata.get("model") if isinstance(structure_metadata, dict) else {}
+    if not isinstance(structure_model, dict):
+      structure_model = {}
+    vehicle_model = vehicle_metadata.get("model") if isinstance(vehicle_metadata, dict) else {}
+    if not isinstance(vehicle_model, dict):
+      vehicle_model = {}
     structure_model_url = structure_model.get("url")
     vehicle_model_url = vehicle_model.get("url")
-    if seeded_metadata or seeded_structure_sites:
-      seeded_parts = []
-      if seeded_metadata:
-        seeded_parts.append("metadata")
-      if seeded_structure_sites:
-        seeded_parts.append("structure_sites")
+    if seeded_structure_instances:
       log_assets.info(
-        "[ASSETS] prepopulated startup data: "
-        + ", ".join(seeded_parts)
+        "[ASSETS] prepopulated startup data: structure_instances"
       )
     else:
       log_assets.info("[ASSETS] found existing startup data (no prepopulation needed)")
     log_assets.info(
       "[ASSETS] bootstrap "
       f"source={assets_bootstrap.get('source')} "
-      f"metadataKey={assets_bootstrap.get('metadataKey')} "
       f"version={assets_bootstrap.get('version')} "
       f"corrupt={bool(assets_bootstrap.get('corrupt'))} "
-      f"structureSitesSource={assets_bootstrap.get('structureSitesSource')} "
-      f"structureSiteCount={len(structure_sites)} "
+      f"structureInstancesSource={assets_bootstrap.get('structureInstancesSource')} "
+      f"structureInstanceCount={len(structure_instances)} "
       f"structureModelUrl={structure_model_url} "
       f"vehicleModelUrl={vehicle_model_url}"
     )
-    if len(structure_sites) == 0:
-      log_assets.warning("[ASSETS] no enabled structure sites in DB")
+    if len(structure_instances) == 0:
+      log_assets.warning("[ASSETS] no enabled structure instances in DB")
 
     try:
       no_data_count = load_no_data_cache(db)
