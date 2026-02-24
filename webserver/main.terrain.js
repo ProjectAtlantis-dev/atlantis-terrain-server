@@ -1156,6 +1156,10 @@ const HOUSE_SHADOW_LOG_MS = HOUSE_SHADOW_SNAPSHOT_ENABLED
   ? Math.max(200, paramNumber('houseShadowLogMs', 2000))
   : 0;
 let lastHouseShadowLogAt = 0;
+const _lastHouseShadowPos = new THREE.Vector3();
+const _lastHouseShadowDir = new THREE.Vector3();
+let _lastHouseShadowRadius = 0;
+const HOUSE_SHADOW_MOVE_THRESHOLD = 0.5; // meters — ignore sub-pixel jitter
 const houseLocalShadowDirection = new THREE.Vector2();
 const HOUSE_MARKER_HEIGHT = 5000;
 const HOUSE_MARKER_BASE_LIFT = 5;
@@ -2820,7 +2824,16 @@ function updateHouseShadowSystem() {
   shadowCamera.updateProjectionMatrix();
 
   houseShadowReceiverMaterial.opacity = HOUSE_SHADOW_OPACITY;
-  houseShadowCasterLight.shadow.needsUpdate = true;
+  // Debounce: only re-render shadow map when light moved meaningfully
+  const posDelta = _lastHouseShadowPos.distanceTo(houseShadowCasterLight.position);
+  const dirDelta = _lastHouseShadowDir.distanceTo(houseShadowLightDirectionLocal);
+  const radiusDelta = Math.abs(shadowRadius - _lastHouseShadowRadius);
+  if (posDelta > HOUSE_SHADOW_MOVE_THRESHOLD || dirDelta > 0.001 || radiusDelta > 0.5) {
+    houseShadowCasterLight.shadow.needsUpdate = true;
+    _lastHouseShadowPos.copy(houseShadowCasterLight.position);
+    _lastHouseShadowDir.copy(houseShadowLightDirectionLocal);
+    _lastHouseShadowRadius = shadowRadius;
+  }
   houseShadowReceiverLayer.visible = true;
 }
 
@@ -4248,6 +4261,8 @@ async function fetchTiles(lat, lon) {
             }
           }
           if (hasCoverage) {
+            // Textured parent covers this area — defer until our texture
+            // arrives so we don't z-fight with the parent.
             tileLog(tile.id, 'added — deferred (stale coverage exists)');
             deferred++;
           } else if (built < MESH_BUILD_BUDGET) {

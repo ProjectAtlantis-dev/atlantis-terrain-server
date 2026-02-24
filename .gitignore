@@ -37,8 +37,8 @@ flaskserver/greenland.db
 flaskserver/terrain.db
 flaskserver/terrain.db-wal
 flaskserver/terrain.db-shm
-samples/
-sample/
+water_samples/
+
 _metadata.json
 
 *.OLD
