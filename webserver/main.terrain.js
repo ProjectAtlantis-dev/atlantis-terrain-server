@@ -2381,9 +2381,6 @@ function snapVehicleToTerrain(options = {}) {
     vehicleAwaitingInitialSnap = false;
     vehicleGroup.visible = true;
   }
-  vehicleConsoleLog(
-    `snapped to terrain, z=${vehicleGroup.position.z.toFixed(3)}, target=${Number(vehicleGroundZTarget ?? NaN).toFixed(3)}, normal=(${vehicleGroundNormal.x.toFixed(3)},${vehicleGroundNormal.y.toFixed(3)},${vehicleGroundNormal.z.toFixed(3)})`
-  );
 }
 
 function updateVehicleFollowCamera() {
@@ -2401,13 +2398,14 @@ function updateVehicleFollowCamera() {
   const verticalOffset = radius * Math.sin(vehicleCameraOrbitPitch);
   const backScale = Math.cos(vehicleCameraOrbitYaw);
   const sideScale = Math.sin(vehicleCameraOrbitYaw);
-  const offsetX = (-forwardX * backScale + rightX * sideScale) * horizontalRadius;
-  const offsetY = (-forwardY * backScale + rightY * sideScale) * horizontalRadius;
-  vehicleFollowLocal.set(
-    vehicleGroup.position.x + offsetX,
-    vehicleGroup.position.y + offsetY,
-    vehicleGroup.position.z + verticalOffset
-  );
+  // Compute offset in vehicle-local frame (forward=+Y, right=+X, up=+Z)
+  const localOffX = sideScale * horizontalRadius;
+  const localOffY = -backScale * horizontalRadius;
+  const localOffZ = verticalOffset;
+  // Rotate by vehicle orientation so camera tilts with the vehicle on slopes
+  vehicleFollowLocal.set(localOffX, localOffY, localOffZ);
+  vehicleFollowLocal.applyQuaternion(vehicleGroup.quaternion);
+  vehicleFollowLocal.add(vehicleGroup.position);
   vehicleLookTargetLocal.set(
     vehicleGroup.position.x,
     vehicleGroup.position.y,
