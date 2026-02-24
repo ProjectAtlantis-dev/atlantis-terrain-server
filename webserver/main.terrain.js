@@ -1637,7 +1637,7 @@ let VEHICLE_CAMERA_FOLLOW_HEIGHT = paramNumber('vehicleCamHeight', 12);
 const VEHICLE_CAMERA_LOOK_HEIGHT = paramNumber('vehicleCamLookHeight', 2.2);
 const VEHICLE_CAMERA_ORBIT_SENS = paramNumber('vehicleCamOrbitSens', MOUSE_SENS);
 const VEHICLE_CAMERA_ORBIT_PITCH_MIN = THREE.MathUtils.degToRad(
-  paramNumber('vehicleCamPitchMinDeg', -8)
+  paramNumber('vehicleCamPitchMinDeg', -20)
 );
 const VEHICLE_CAMERA_ORBIT_PITCH_MAX = THREE.MathUtils.degToRad(
   paramNumber('vehicleCamPitchMaxDeg', 70)
@@ -4705,18 +4705,32 @@ function updateMovement(dt) {
       vehicleHeadingRad += steer * VEHICLE_STEER_SPEED * dt;
     }
     const drive = (forwardPressed ? 1 : 0) + (backPressed ? -1 : 0);
-    // Momentum: accelerate toward VEHICLE_DRIVE_SPEED, brake when released
+    // Slope gravity: project downhill direction onto vehicle forward axis.
+    // groundNormal.z ≈ 1 on flat ground; x/y components point "uphill" in local space.
+    // Dot with forward gives slope component: negative = uphill, positive = downhill.
+    const slopeForwardComponent = -(
+      vehicleGroundNormal.x * (-Math.sin(vehicleHeadingRad)) +
+      vehicleGroundNormal.y * Math.cos(vehicleHeadingRad)
+    );
+    const VEHICLE_SLOPE_GRAVITY = 6.0; // m/s² at 90° slope (~60% of real gravity)
+    const slopeAccel = slopeForwardComponent * VEHICLE_SLOPE_GRAVITY;
+    // Friction always opposes current motion; slope always pushes downhill.
+    const friction = vehicleSpeed > 0 ? -VEHICLE_BRAKE
+                   : vehicleSpeed < 0 ?  VEHICLE_BRAKE
+                   : 0;
     if (drive !== 0) {
-      vehicleSpeed += drive * VEHICLE_ACCEL * dt;
-      vehicleSpeed = Math.max(-VEHICLE_DRIVE_SPEED, Math.min(VEHICLE_DRIVE_SPEED, vehicleSpeed));
+      vehicleSpeed += (drive * VEHICLE_ACCEL + slopeAccel) * dt;
     } else {
-      // Engine brake: decelerate toward zero
-      if (vehicleSpeed > 0) {
-        vehicleSpeed = Math.max(vehicleSpeed - VEHICLE_BRAKE * dt, 0);
-      } else if (vehicleSpeed < 0) {
-        vehicleSpeed = Math.min(vehicleSpeed + VEHICLE_BRAKE * dt, 0);
-      }
+      const coastAccel = slopeAccel + friction;
+      const prevSpeed = vehicleSpeed;
+      vehicleSpeed += coastAccel * dt;
+      // Only let friction stop motion, not reverse it (slope CAN reverse it)
+      if (prevSpeed > 0 && vehicleSpeed < 0 && slopeAccel >= 0) vehicleSpeed = 0;
+      if (prevSpeed < 0 && vehicleSpeed > 0 && slopeAccel <= 0) vehicleSpeed = 0;
+      // Slope can start rolling from standstill
+      if (prevSpeed === 0) vehicleSpeed = slopeAccel * dt;
     }
+    vehicleSpeed = Math.max(-VEHICLE_DRIVE_SPEED, Math.min(VEHICLE_DRIVE_SPEED, vehicleSpeed));
     if (vehicleSpeed !== 0 || steer !== 0) {
       const heading = vehicleHeadingRad;
       const forwardX = -Math.sin(heading);
@@ -4979,7 +4993,7 @@ window.addEventListener('mousemove', event => {
     return;
   }
   if (vehicleControlActive) {
-    vehicleCameraOrbitYaw += event.movementX * VEHICLE_CAMERA_ORBIT_SENS;
+    vehicleCameraOrbitYaw -= event.movementX * VEHICLE_CAMERA_ORBIT_SENS;
     vehicleCameraOrbitPitch += event.movementY * VEHICLE_CAMERA_ORBIT_SENS;
     vehicleCameraOrbitPitch = THREE.MathUtils.clamp(
       vehicleCameraOrbitPitch,
