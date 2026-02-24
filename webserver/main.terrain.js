@@ -1629,11 +1629,11 @@ const vehicleUpDirection = up.clone().normalize();
 let vehicleMeshes = [];
 const VEHICLE_DRIVE_SPEED = paramNumber('vehicleDriveSpeed', 24);
 const VEHICLE_ACCEL = paramNumber('vehicleAccel', 24);      // m/s² throttle
-const VEHICLE_BRAKE = paramNumber('vehicleBrake', 36);      // m/s² engine brake
+const VEHICLE_BRAKE = paramNumber('vehicleBrake', 3);       // m/s² engine brake (coast-down)
 const VEHICLE_STEER_SPEED = paramNumber('vehicleSteerSpeed', 1.5);
 let vehicleSpeed = 0; // current vehicle speed in m/s
-const VEHICLE_CAMERA_FOLLOW_DISTANCE = paramNumber('vehicleCamDistance', 38);
-const VEHICLE_CAMERA_FOLLOW_HEIGHT = paramNumber('vehicleCamHeight', 12);
+let VEHICLE_CAMERA_FOLLOW_DISTANCE = paramNumber('vehicleCamDistance', 38);
+let VEHICLE_CAMERA_FOLLOW_HEIGHT = paramNumber('vehicleCamHeight', 12);
 const VEHICLE_CAMERA_LOOK_HEIGHT = paramNumber('vehicleCamLookHeight', 2.2);
 const VEHICLE_CAMERA_ORBIT_SENS = paramNumber('vehicleCamOrbitSens', MOUSE_SENS);
 const VEHICLE_CAMERA_ORBIT_PITCH_MIN = THREE.MathUtils.degToRad(
@@ -1936,6 +1936,25 @@ function updateVehicleSuspension(dt) {
   const orientationAlpha = 1 - Math.exp(-VEHICLE_ORIENTATION_RESPONSE * stepDt);
   vehicleGroup.quaternion.slerp(vehicleOrientationTargetQuat, orientationAlpha);
   vehicleMarker.position.z = vehicleGroup.position.z + HOUSE_MARKER_BASE_LIFT;
+}
+
+let _vehicleSaveTrailingTimer = 0;
+let _vehicleLastSaveAt = 0;
+const VEHICLE_SAVE_THROTTLE_MS = 5000;
+const VEHICLE_SAVE_TRAILING_MS = 2000;
+function throttledVehicleSave() {
+  const now = performance.now();
+  // Throttle: save immediately if enough time has passed
+  if (now - _vehicleLastSaveAt >= VEHICLE_SAVE_THROTTLE_MS) {
+    _vehicleLastSaveAt = now;
+    saveVehicleState('drive-throttle');
+  }
+  // Trailing: always schedule a final save after movement stops
+  clearTimeout(_vehicleSaveTrailingTimer);
+  _vehicleSaveTrailingTimer = setTimeout(() => {
+    _vehicleLastSaveAt = performance.now();
+    saveVehicleState('drive-trailing');
+  }, VEHICLE_SAVE_TRAILING_MS);
 }
 
 async function saveVehicleState(reason = 'manual', options = {}) {
@@ -4151,54 +4170,52 @@ async function fetchTiles(lat, lon) {
       if (t.id && t.bbox) tileBboxMap.set(t.id, t.bbox);
     }
 
-    // Evict stale meshes: always remove untextured; remove textured parents
-    // ONLY when every overlapping child in the new LOD set has a cached texture.
-    // Keep the stale parent visible until all children are ready to replace it.
+    // Evict stale meshes: remove any mesh not in the current tile set.
+    // With logarithmic depth buffer, polygonOffset is ineffective, so we
+    // can't keep stale parents alongside children — they z-fight even when
+    // both are textured (e.g. depth-11 and depth-12 tiles on scene load
+    // near ground level).
+    //
+    // NOTE: Previously we kept textured stale parents visible until ALL
+    // overlapping children had cached textures, to avoid visible gaps on
+    // the east side of Greenland where tile coverage is incomplete. That
+    // logic is preserved below (commented out) in case incomplete-coverage
+    // areas need it again. The trade-off is z-fighting vs gaps:
+    //
+    // if (!child.material || !child.material.map) {
+    //   staleToRemove.push(child);
+    // } else {
+    //   const sb = child.userData.bbox;
+    //   if (sb) {
+    //     let coveredByChildren = true;
+    //     let foundOverlap = false;
+    //     for (const cid of newIds) {
+    //       const cdepth = parseInt(cid.split('-')[0]);
+    //       const pdepth = parseInt(tid.split('-')[0]);
+    //       if (cdepth <= pdepth) continue;
+    //       const cmesh = meshMap.get(cid);
+    //       const cb = cmesh ? cmesh.userData.bbox : tileBboxMap.get(cid);
+    //       if (!cb) continue;
+    //       if (sb[0] <= cb[0] && sb[2] >= cb[2] && sb[1] <= cb[1] && sb[3] >= cb[3]) {
+    //         foundOverlap = true;
+    //         if (!texCache.has(cid)) { coveredByChildren = false; break; }
+    //       }
+    //     }
+    //     if (!foundOverlap) coveredByChildren = false;
+    //     if (coveredByChildren) {
+    //       staleToRemove.push(child);
+    //     }
+    //   } else {
+    //     staleToRemove.push(child);
+    //   }
+    // }
     const staleToRemove = [];
     for (const child of terrainRoot.children) {
       if (!child.isMesh) continue;
       const tid = child.userData.tileId;
       if (!tid) continue;
       if (!newIds.has(tid)) {
-        if (!child.material || !child.material.map) {
-          staleToRemove.push(child);
-        } else {
-          // Textured stale tile — only evict when ALL overlapping children
-          // have cached textures so there's no visible gap.
-          const sb = child.userData.bbox;
-          if (sb) {
-            let coveredByChildren = true;
-            let foundOverlap = false;
-            for (const cid of newIds) {
-              const cdepth = parseInt(cid.split('-')[0]);
-              const pdepth = parseInt(tid.split('-')[0]);
-              if (cdepth <= pdepth) continue;
-              // Check mesh bbox first, fall back to API tile data for
-              // children that don't have meshes yet (deferred/new).
-              const cmesh = meshMap.get(cid);
-              const cb = cmesh ? cmesh.userData.bbox : tileBboxMap.get(cid);
-              if (!cb) continue;
-              // Is this child tile within the stale parent's area?
-              if (sb[0] <= cb[0] && sb[2] >= cb[2] && sb[1] <= cb[1] && sb[3] >= cb[3]) {
-                foundOverlap = true;
-                if (!texCache.has(cid)) { coveredByChildren = false; break; }
-              }
-            }
-            // No overlapping children found → keep parent (don't evict into void)
-            if (!foundOverlap) coveredByChildren = false;
-            if (coveredByChildren) {
-              staleToRemove.push(child);
-            } else {
-              // Keep for now but disable polygonOffset
-              if (child.material.polygonOffset) {
-                child.material.polygonOffset = false;
-                child.material.needsUpdate = true;
-              }
-            }
-          } else {
-            staleToRemove.push(child);
-          }
-        }
+        staleToRemove.push(child);
       } else if (child.material && child.material.map && !child.material.polygonOffset) {
         const depth = parseInt(tid.split('-')[0]);
         child.material.polygonOffset = true;
@@ -4710,6 +4727,7 @@ function updateMovement(dt) {
       vehicleMarker.position.x = vehicleGroup.position.x;
       vehicleMarker.position.y = vehicleGroup.position.y;
       vehicleSnapPending = true;
+      throttledVehicleSave();
       _lastCamMoveTime = performance.now();
       abortAllEnhancements();
     }
@@ -5123,6 +5141,10 @@ renderer.domElement.addEventListener(
       controls.mapZoom = Math.max(500, Math.min(40000, controls.mapZoom));
       savePosition();
       updateMapCamera();
+    } else if (vehicleControlActive) {
+      const scale = zoomIn ? 0.9 : 1.1;
+      VEHICLE_CAMERA_FOLLOW_DISTANCE = Math.max(8, Math.min(200, VEHICLE_CAMERA_FOLLOW_DISTANCE * scale));
+      VEHICLE_CAMERA_FOLLOW_HEIGHT = Math.max(2, Math.min(80, VEHICLE_CAMERA_FOLLOW_HEIGHT * scale));
     } else {
       camera.fov *= zoomIn ? 0.95 : 1.05;
       camera.fov = Math.max(20, Math.min(100, camera.fov));
