@@ -1348,9 +1348,10 @@ houseLayer.visible = housesRuntimeVisible;
 // ── Patria AMV vehicle ──────────────────────────────────────────────────
 const VEHICLE_MODEL = {
   url: '/models/patria_amv.glb',
-  lat: 64.1835,
-  lon: -51.7216,
-  headingDeg: 45,
+  lat: 64.18423381,
+  lon: -51.70139232,
+  headingDeg: 234.341,
+  z: 16.279,
   realLengthM: 7.7, // Patria AMV real-world length in meters
   tireDiameterM: paramNumber('vehicleTireDiameterM', 1.27),
   altOffsetM: 0.05,
@@ -1368,6 +1369,11 @@ vehicleMarkerLayer.name = 'vehicle-markers';
 vehicleMarkerLayer.visible = false;
 vehicleMarkerLayer.renderOrder = 1002;
 terrainRoot.add(vehicleMarkerLayer);
+const VEHICLE_MARKER_MAP_SCALE = THREE.MathUtils.clamp(
+  paramNumber('vehicleMarkerMapScale', 1.0),
+  0.02,
+  2
+);
 const vehicleMarkerColor = 0xff2d55;
 const vehicleMarker = (function createVehicleMarker() {
   const marker = new THREE.Group();
@@ -1428,6 +1434,12 @@ const VEHICLE_SHADOW_MAP_SIZE = 1024;
 const VEHICLE_SHADOW_LIGHT_DISTANCE = 250;
 const VEHICLE_SHADOW_MIN_RADIUS = 60;
 const VEHICLE_SHADOW_MAX_RADIUS = 180;
+const VEHICLE_SHADOW_TEXEL_SNAP = params.get('vehicleShadowTexelSnap') !== '0';
+const VEHICLE_SHADOW_GROUND_ANCHOR = THREE.MathUtils.clamp(
+  paramNumber('vehicleShadowGroundAnchor', 1.0),
+  0,
+  1
+);
 // Aggressive default so the vehicle shadow is clearly legible on bright ortho textures.
 const VEHICLE_SHADOW_OPACITY = THREE.MathUtils.clamp(paramNumber('vehicleShadowOpacity', 0.95), 0, 1);
 let vehicleShadowRadius = 100;
@@ -1459,6 +1471,13 @@ vehicleShadowCasterLight.shadow.camera.near = 20;
 vehicleShadowCasterLight.shadow.camera.far = 700;
 terrainRoot.add(vehicleShadowCasterLight);
 terrainRoot.add(vehicleShadowCasterLight.target);
+const vehicleShadowCenterLocal = new THREE.Vector3();
+const vehicleShadowCenterWorld = new THREE.Vector3();
+const vehicleShadowCenterLight = new THREE.Vector3();
+const vehicleShadowSnappedLight = new THREE.Vector3();
+const vehicleShadowSnappedWorld = new THREE.Vector3();
+const vehicleShadowSnapOffsetWorld = new THREE.Vector3();
+const vehicleShadowSnapOffsetLocal = new THREE.Vector3();
 const vehicleLoader = new GLTFLoader();
 const vehicleDownRaycaster = new THREE.Raycaster();
 const vehicleDownDirection = up.clone().negate().normalize();
@@ -1536,6 +1555,10 @@ const vehicleProbeNormalLocal = new THREE.Vector3();
 const vehicleLookTargetLocal = new THREE.Vector3();
 const vehicleLookTargetWorld = new THREE.Vector3();
 const vehicleLookDirLocal = new THREE.Vector3();
+const VEHICLE_TEXTURE_ANISOTROPY = Math.max(
+  1,
+  Math.floor(paramNumber('vehicleTextureAnisotropy', 8))
+);
 let vehicleCameraOrbitYaw = 0;
 let vehicleCameraOrbitPitch = Math.atan2(
   VEHICLE_CAMERA_FOLLOW_HEIGHT,
@@ -1548,6 +1571,27 @@ function vehicleConsoleLog(message, ...args) {
 
 function vehicleConsoleWarn(message, ...args) {
   console.warn(`%c[VEHICLE] ${message}`, VEHICLE_LOG_STYLE, ...args);
+}
+
+function applyVehicleTextureSampling(texture) {
+  if (!texture || !texture.isTexture) return;
+  const maxAniso = renderer.capabilities.getMaxAnisotropy?.() ?? 1;
+  texture.anisotropy = Math.max(1, Math.min(maxAniso, VEHICLE_TEXTURE_ANISOTROPY));
+  texture.minFilter = THREE.LinearMipmapLinearFilter;
+  texture.magFilter = THREE.LinearFilter;
+  texture.generateMipmaps = true;
+  texture.needsUpdate = true;
+}
+
+function applyVehicleMaterialSampling(material) {
+  if (!material) return;
+  applyVehicleTextureSampling(material.map);
+  applyVehicleTextureSampling(material.normalMap);
+  applyVehicleTextureSampling(material.roughnessMap);
+  applyVehicleTextureSampling(material.metalnessMap);
+  applyVehicleTextureSampling(material.aoMap);
+  applyVehicleTextureSampling(material.emissiveMap);
+  applyVehicleTextureSampling(material.alphaMap);
 }
 
 function vehicleLocalToLatLon(x, y) {
@@ -1766,15 +1810,22 @@ function updateVehicleSuspension(dt) {
 }
 
 async function saveVehicleState(reason = 'manual', options = {}) {
-  const { snapToGround = false, requireGroundedZ = false } = options;
+  const {
+    snapToGround = false,
+    requireGroundedZ = false,
+    bypassSnapThrottle = false,
+  } = options;
   let zGrounded = false;
   if (snapToGround && vehicleLoaded) {
     vehicleSnapPending = true;
-    snapVehicleToTerrain({ forceImmediate: true });
+    snapVehicleToTerrain({ forceImmediate: true, bypassThrottle: bypassSnapThrottle });
     zGrounded = !vehicleSnapPending && Number.isFinite(vehicleGroundZTarget);
   }
   const state = getVehicleStateSnapshot();
   if (state == null) return false;
+  if (Number.isFinite(vehicleGroundZTarget)) {
+    state.z = Number(vehicleGroundZTarget.toFixed(3));
+  }
   const terrainSample = sampleBestVehicleTerrainHit();
   if (terrainSample.depth >= 0) {
     state.terrainDepth = terrainSample.depth;
@@ -1783,7 +1834,7 @@ async function saveVehicleState(reason = 'manual', options = {}) {
     state.terrainTileId = terrainSample.tileId;
   }
   if ((snapToGround || requireGroundedZ) && !zGrounded) {
-    delete state.z;
+    bootLog('vehicle.state.save.ungrounded', { reason, state }, 'warn');
   }
   try {
     const response = await fetch(VEHICLE_STATE_ENDPOINT, {
@@ -1857,6 +1908,13 @@ function loadVehicleModel() {
         if (obj.isMesh) {
           obj.castShadow = true;
           obj.receiveShadow = true;
+          if (Array.isArray(obj.material)) {
+            for (const material of obj.material) {
+              applyVehicleMaterialSampling(material);
+            }
+          } else {
+            applyVehicleMaterialSampling(obj.material);
+          }
         }
       });
       // Measure model bounding box to compute real-world scale
@@ -1894,7 +1952,7 @@ function loadVehicleModel() {
       const startHeadingDeg = Number.isFinite(savedState?.headingDeg)
         ? savedState.headingDeg
         : VEHICLE_MODEL.headingDeg;
-      const startZ = Number.isFinite(savedState?.z) ? savedState.z : 0;
+      const startZ = Number.isFinite(savedState?.z) ? savedState.z : (VEHICLE_MODEL.z ?? 0);
       const local = houseLocalFromLatLon(startLat, startLon);
       vehicleHeadingRad = THREE.MathUtils.degToRad(startHeadingDeg);
       vehicleGroundNormal.copy(up);
@@ -2036,7 +2094,15 @@ function updateVehicleShadowSystem() {
     sunDirection.dot(up)
   ).normalize();
 
-  const center = vehicleGroup.position;
+  vehicleShadowCenterLocal.copy(vehicleGroup.position);
+  if (Number.isFinite(vehicleGroundZTarget)) {
+    vehicleShadowCenterLocal.z = THREE.MathUtils.lerp(
+      vehicleShadowCenterLocal.z,
+      vehicleGroundZTarget,
+      VEHICLE_SHADOW_GROUND_ANCHOR
+    );
+  }
+  const center = vehicleShadowCenterLocal;
   vehicleShadowCasterLight.visible = true;
   vehicleShadowCasterLight.position
     .copy(center)
@@ -2053,6 +2119,31 @@ function updateVehicleShadowSystem() {
   shadowCamera.near = 20;
   shadowCamera.far = VEHICLE_SHADOW_LIGHT_DISTANCE + vehicleShadowRadius * 4;
   shadowCamera.updateProjectionMatrix();
+  shadowCamera.updateMatrixWorld(true);
+
+  if (VEHICLE_SHADOW_TEXEL_SNAP) {
+    vehicleShadowCenterWorld.copy(center);
+    terrainRoot.localToWorld(vehicleShadowCenterWorld);
+    vehicleShadowCenterLight.copy(vehicleShadowCenterWorld).applyMatrix4(shadowCamera.matrixWorldInverse);
+    const texelSizeX = (shadowCamera.right - shadowCamera.left) / Math.max(1, vehicleShadowCasterLight.shadow.mapSize.x);
+    const texelSizeY = (shadowCamera.top - shadowCamera.bottom) / Math.max(1, vehicleShadowCasterLight.shadow.mapSize.y);
+    vehicleShadowSnappedLight.set(
+      Math.round(vehicleShadowCenterLight.x / texelSizeX) * texelSizeX,
+      Math.round(vehicleShadowCenterLight.y / texelSizeY) * texelSizeY,
+      vehicleShadowCenterLight.z
+    );
+    vehicleShadowSnappedWorld.copy(vehicleShadowSnappedLight).applyMatrix4(shadowCamera.matrixWorld);
+    vehicleShadowSnapOffsetWorld.copy(vehicleShadowSnappedWorld).sub(vehicleShadowCenterWorld);
+    if (vehicleShadowSnapOffsetWorld.lengthSq() > 0) {
+      vehicleShadowSnapOffsetLocal.copy(vehicleShadowCenterWorld).add(vehicleShadowSnapOffsetWorld);
+      terrainRoot.worldToLocal(vehicleShadowSnapOffsetLocal);
+      vehicleShadowSnapOffsetLocal.sub(vehicleShadowCenterLocal);
+      vehicleShadowCasterLight.position.add(vehicleShadowSnapOffsetLocal);
+      vehicleShadowCasterLight.target.position.add(vehicleShadowSnapOffsetLocal);
+      vehicleShadowCasterLight.target.updateMatrixWorld(true);
+      vehicleShadowCasterLight.updateMatrixWorld(true);
+    }
+  }
 
   vehicleShadowReceiverMaterial.opacity = VEHICLE_SHADOW_OPACITY;
   vehicleShadowCasterLight.shadow.needsUpdate = true;
@@ -2060,11 +2151,11 @@ function updateVehicleShadowSystem() {
 }
 
 function snapVehicleToTerrain(options = {}) {
-  const { forceImmediate = false } = options;
+  const { forceImmediate = false, bypassThrottle = false } = options;
   if (!vehicleLoaded) return;
   const now = performance.now();
   const minInterval = vehicleSnapPending ? VEHICLE_SNAP_PENDING_MS : VEHICLE_SNAP_IDLE_MS;
-  if (now - lastVehicleSnapAttemptAt < minInterval) return;
+  if (!bypassThrottle && now - lastVehicleSnapAttemptAt < minInterval) return;
   lastVehicleSnapAttemptAt = now;
   const terrainMeshes = houseTerrainMeshes();
   if (terrainMeshes.length === 0 || vehicleMeshes.length === 0) return;
@@ -2189,11 +2280,13 @@ function updateVehicleFollowCamera() {
   controls.pitch = Math.asin(THREE.MathUtils.clamp(vehicleLookDirLocal.z, -1, 1));
 }
 
-function setVehicleControlActive(nextActive, reason = 'manual') {
+function setVehicleControlActive(nextActive, reason = 'manual', options = {}) {
+  const { skipExitSave = false } = options;
   const requested = Boolean(nextActive);
   if (requested && (!vehicleLoaded || controls.mapMode)) {
     return false;
   }
+  const wasActive = vehicleControlActive;
   const next = requested;
   if (vehicleControlActive === next) {
     return vehicleControlActive;
@@ -2209,6 +2302,13 @@ function setVehicleControlActive(nextActive, reason = 'manual') {
     );
     controls.yaw = vehicleHeadingRad;
     updateVehicleFollowCamera();
+  }
+  if (wasActive && !vehicleControlActive && vehicleLoaded && !skipExitSave) {
+    saveVehicleState(`exit-${reason}`, {
+      snapToGround: true,
+      requireGroundedZ: false,
+      bypassSnapThrottle: true,
+    });
   }
   bootLog('vehicle.control', {
     active: vehicleControlActive,
@@ -4590,8 +4690,12 @@ window.addEventListener('keydown', event => {
   controls.keys[event.code] = true;
   if (event.code === 'Escape' && !event.repeat) {
     if (vehicleControlActive) {
-      saveVehicleState('escape', { snapToGround: true, requireGroundedZ: true });
-      setVehicleControlActive(false, 'escape');
+      saveVehicleState('escape', {
+        snapToGround: true,
+        requireGroundedZ: false,
+        bypassSnapThrottle: true,
+      });
+      setVehicleControlActive(false, 'escape', { skipExitSave: true });
       controls.keys[event.code] = false;
       return;
     }
@@ -4655,7 +4759,7 @@ window.addEventListener('mousemove', event => {
   }
   if (vehicleControlActive) {
     vehicleCameraOrbitYaw += event.movementX * VEHICLE_CAMERA_ORBIT_SENS;
-    vehicleCameraOrbitPitch -= event.movementY * VEHICLE_CAMERA_ORBIT_SENS;
+    vehicleCameraOrbitPitch += event.movementY * VEHICLE_CAMERA_ORBIT_SENS;
     vehicleCameraOrbitPitch = THREE.MathUtils.clamp(
       vehicleCameraOrbitPitch,
       VEHICLE_CAMERA_ORBIT_PITCH_MIN,
@@ -4950,6 +5054,7 @@ function render() {
     for (const house of houseInstances) {
       house.marker.scale.setScalar(markerScale);
     }
+    vehicleMarker.scale.setScalar(markerScale * VEHICLE_MARKER_MAP_SCALE);
     scene.fog = null;
     scene.background = _mapBg;
     renderer.render(scene, mapCam);

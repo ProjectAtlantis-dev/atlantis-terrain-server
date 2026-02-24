@@ -1688,6 +1688,12 @@ def api_vehicle_state_post():
     terrain_tile_id = str(raw_terrain_tile_id).strip()
     if not terrain_tile_id:
       terrain_tile_id = None
+  raw_reason = data.get("reason")
+  reason = None
+  if raw_reason is not None:
+    reason = str(raw_reason).strip()
+    if not reason:
+      reason = None
 
   if not math.isfinite(lat) or not math.isfinite(lon) or not math.isfinite(heading_deg):
     return jsonify({"error": "lat/lon/headingDeg must be finite numbers"}), 400
@@ -1723,13 +1729,18 @@ def api_vehicle_state_post():
     if terrain_depth is not None
     else ""
   )
+  reason_log = (
+    f" reason={reason}"
+    if reason is not None
+    else ""
+  )
   if z is None:
     log_vehicle.info(
-      f"[VEHICLE STATE] saved lat={lat:.6f} lon={lon:.6f} headingDeg={heading_deg:.2f}{depth_log}"
+      f"[VEHICLE STATE] saved lat={lat:.6f} lon={lon:.6f} headingDeg={heading_deg:.2f}{depth_log}{reason_log}"
     )
   else:
     log_vehicle.info(
-      f"[VEHICLE STATE] saved lat={lat:.6f} lon={lon:.6f} headingDeg={heading_deg:.2f} z={z:.3f}{depth_log}"
+      f"[VEHICLE STATE] saved lat={lat:.6f} lon={lon:.6f} headingDeg={heading_deg:.2f} z={z:.3f}{depth_log}{reason_log}"
     )
   return jsonify({"ok": True, "state": state})
 
