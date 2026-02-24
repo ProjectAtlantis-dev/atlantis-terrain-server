@@ -802,6 +802,7 @@ def _queue_texture_fetch(tile_id: str, bbox: tuple[float, float, float, float]) 
 
 
 _api_tiles_state: dict[str, str | None] = {"last_result": None}
+VEHICLE_STATE_METADATA_KEY = "vehicle_state_v1"
 
 @app.get("/api/tiles")
 def api_tiles():
@@ -1617,6 +1618,94 @@ def api_tile_inspect():
     for ev in hist:
       log_db.info(f"    {ev}")
   return jsonify({"ok": True})
+
+
+@app.get("/api/vehicle_state")
+def api_vehicle_state_get():
+  unavailable = _terrain_unavailable_response()
+  if unavailable is not None:
+    return unavailable
+
+  db = _get_db()
+  row = db.execute(
+    "SELECT value FROM metadata WHERE key = ?",
+    (VEHICLE_STATE_METADATA_KEY,),
+  ).fetchone()
+  if row is None or row[0] is None:
+    return jsonify({"ok": True, "state": None})
+
+  raw = row[0]
+  try:
+    state = json.loads(raw)
+  except Exception as exc:
+    log.warning(
+      f"[VEHICLE STATE] invalid JSON in metadata key={VEHICLE_STATE_METADATA_KEY}: "
+      f"{type(exc).__name__}: {exc}"
+    )
+    return jsonify({"ok": True, "state": None, "corrupt": True})
+
+  return jsonify({"ok": True, "state": state})
+
+
+@app.post("/api/vehicle_state")
+def api_vehicle_state_post():
+  unavailable = _terrain_unavailable_response()
+  if unavailable is not None:
+    return unavailable
+
+  data = request.get_json(silent=True) or {}
+  try:
+    lat = float(data.get("lat"))
+    lon = float(data.get("lon"))
+    heading_deg = float(data.get("headingDeg"))
+  except (TypeError, ValueError):
+    return jsonify({"error": "lat/lon/headingDeg must be finite numbers"}), 400
+  raw_z = data.get("z")
+  z = None
+  if raw_z is not None:
+    try:
+      z_val = float(raw_z)
+      if math.isfinite(z_val):
+        z = z_val
+      else:
+        return jsonify({"error": "z must be a finite number when provided"}), 400
+    except (TypeError, ValueError):
+      return jsonify({"error": "z must be a finite number when provided"}), 400
+
+  if not math.isfinite(lat) or not math.isfinite(lon) or not math.isfinite(heading_deg):
+    return jsonify({"error": "lat/lon/headingDeg must be finite numbers"}), 400
+  if lat < -90 or lat > 90:
+    return jsonify({"error": "lat out of range [-90, 90]"}), 400
+  if lon < -180 or lon > 180:
+    return jsonify({"error": "lon out of range [-180, 180]"}), 400
+
+  heading_deg = heading_deg % 360.0
+  state = {
+    "lat": lat,
+    "lon": lon,
+    "headingDeg": heading_deg,
+    "savedAt": time.time(),
+  }
+  if z is not None:
+    state["z"] = z
+  raw_state = json.dumps(state, separators=(",", ":"))
+
+  db = _get_db()
+  db.execute(
+    "INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)",
+    (VEHICLE_STATE_METADATA_KEY, raw_state),
+  )
+  db.commit()
+
+  if z is None:
+    log.info(
+      f"[VEHICLE STATE] saved lat={lat:.6f} lon={lon:.6f} headingDeg={heading_deg:.2f}"
+    )
+  else:
+    log.info(
+      f"[VEHICLE STATE] saved lat={lat:.6f} lon={lon:.6f} headingDeg={heading_deg:.2f} z={z:.3f}"
+    )
+  return jsonify({"ok": True, "state": state})
 
 
 def _client_log_level(raw_level: Any) -> int:
