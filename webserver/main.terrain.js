@@ -4407,6 +4407,7 @@ function updateTextures(tiles) {
     const ac = new AbortController();
     texInflight.set(tile.id, ac);
     const tid = tile.id;
+    const t = tile;
     // tileLog(tid, `fetch start (inflight=${texInflight.size}/${TEX_MAX})`);
     fetch(`/api/texture/${tid}.jpg?v=${_texV}`, { signal: ac.signal })
       .then(r => {
