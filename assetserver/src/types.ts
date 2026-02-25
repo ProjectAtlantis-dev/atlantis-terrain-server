@@ -95,3 +95,52 @@ export interface AssetsResponse {
   vehicle_instances: VehicleInstance[];
   structure_instances: StructureInstance[];
 }
+
+// --- Unified asset types ---
+
+export type AssetType = "vehicle" | "structure";
+
+export interface VehicleProperties {
+  headlightsOn: boolean;
+  terrainDepth?: number;
+  terrainTileId?: string;
+}
+
+export interface StructureProperties {
+  scale: number;
+  tileId?: string;
+}
+
+export interface AssetRow {
+  id: string;
+  type: AssetType;
+  enabled: number;
+  lat: number;
+  lon: number;
+  heading_deg: number;
+  z: number | null;
+  properties: string;
+  saved_at: number | null;
+  updated_at: string;
+}
+
+export interface PatchAssetRequest {
+  enabled?: boolean;
+  lat?: number;
+  lon?: number;
+  headingDeg?: number;
+  z?: number | null;
+  properties?: Partial<VehicleProperties> | Partial<StructureProperties>;
+}
+
+export interface PatchAssetResponse {
+  ok: true;
+  id: string;
+  type: AssetType;
+  enabled: boolean;
+  lat: number;
+  lon: number;
+  headingDeg: number;
+  z: number | null;
+  properties: Record<string, unknown>;
+}

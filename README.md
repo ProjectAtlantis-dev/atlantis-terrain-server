@@ -79,6 +79,9 @@ DATAFORSYNINGEN_TOKEN=<your-token>
 To get a free token: [create a user account](https://dataforsyningen.dk/) (click "Log ind" → "Opret Profil"), confirm via email, then log in and go to your profile → "Administrer token til webservice og API'er" to generate a token.
 
 ### Asset Server (TypeScript + SQLite)
+
+The asset server manages vehicles, structures, and their placement via a SQLite database (`assets.db`). It must be running for vehicles and structures to load in the frontend. Still WIP — schema and endpoints may change.
+
 ```bash
 cd assetserver
 npm install

@@ -26,6 +26,16 @@ webserver/dist-ssr
 
 # Secrets
 .env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+id_rsa
+id_dsa
+id_ecdsa
+id_ed25519
 
 # Local workspace artifacts
 three-geospatial/

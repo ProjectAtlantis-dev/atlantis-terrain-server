@@ -995,7 +995,7 @@ const waterMat = new THREE.ShaderMaterial({
     varying vec3 vWorldNormal;
     varying vec3 vWorldPos;
     void main() {
-      vLocalPos = position.xy * 0.002; // scale for tiling (~500m repeat)
+      vLocalPos = position.xy * 0.002;
       vec4 wp = modelMatrix * vec4(position, 1.0);
       vWorldPos = wp.xyz;
       vWorldNormal = normalize((modelMatrix * vec4(0.0, 0.0, 1.0, 0.0)).xyz);
@@ -1027,15 +1027,18 @@ const waterMat = new THREE.ShaderMaterial({
       vec4 noise = getNoise(vLocalPos);
       vec3 surfNormal = normalize(mix(vWorldNormal, normalize(noise.xzy), 0.45));
       vec3 toEye = normalize(cameraPosition - vWorldPos);
+      vec3 sunDir = normalize(sunDirection);
       // Fresnel — more reflective at grazing angles
       float fresnel = 0.04 + 0.96 * pow(1.0 - max(dot(toEye, surfNormal), 0.0), 4.0);
+      // Diffuse ripple shading — waves facing the sun lighten, facing away darken
+      float diffuse = max(dot(surfNormal, sunDir), 0.0);
+      vec3 rippleColor = waterColor * (0.6 + 0.4 * diffuse);
       // Sun specular
-      vec3 refl = reflect(-normalize(sunDirection), surfNormal);
-      float spec = pow(max(dot(toEye, refl), 0.0), 64.0) * 3.0;
-      // Transparent ripple overlay — satellite texture shows through underneath.
-      // Additive specular only, no color tint.
-      vec3 col = sunColor * spec * 0.8;
-      float alpha = clamp(spec * 0.9 + fresnel * 0.15, 0.0, 0.8);
+      vec3 refl = reflect(-sunDir, surfNormal);
+      float spec = pow(max(dot(toEye, refl), 0.0), 80.0) * 2.0;
+      // Blend ripple shading + specular highlight
+      vec3 col = rippleColor + sunColor * spec * 0.6;
+      float alpha = clamp(fresnel * 0.35 + spec * 0.7 + 0.12, 0.0, 0.55);
       gl_FragColor = vec4(col, alpha);
     }
   `,
@@ -3620,9 +3623,12 @@ function loadAtmosphereTexturesWithLocalCache() {
 bootLog('atmosphere.cache.load-sequence.invoke');
 loadAtmosphereTexturesWithLocalCache();
 
+// MSAA on the composer — the renderer's antialias:true does nothing when
+// postprocessing renders to its own framebuffers. Without this, everything
+// (terrain, vehicle, mountains) gets zero anti-aliasing.
 const composer = new EffectComposer(renderer, {
   frameBufferType: THREE.HalfFloatType,
-  multisampling: 0
+  multisampling: Math.min(4, renderer.capabilities.maxSamples)
 });
 composer.addPass(new RenderPass(scene, camera));
 composer.addPass(normalPass);
@@ -3707,7 +3713,8 @@ function buildMesh(tile) {
   // vehicle headlights to illuminate terrain but it breaks everything else.
   // If we revisit headlight-on-terrain lighting, add scene lights first.
   const mat = new THREE.MeshBasicMaterial({
-    color: 0x0a2650, side: THREE.FrontSide,
+    color: 0xffffff, side: THREE.FrontSide,
+    vertexColors: true,
   });
   const mesh = new THREE.Mesh(g, mat);
   mesh.userData.tileId = tile.id;
@@ -3817,7 +3824,7 @@ const texRetryAtMs = new Map();
 const waterMaskCache = new Map();
 const waterMaskInflight = new Map();
 const ENABLE_WATER_MASKS = false;
-const TEX_MAX = 50;
+const TEX_MAX = 120; // max concurrent HTTP texture requests (texFetching 202s don't count)
 const TEX_RETRY_202_MS = 1200;
 const TEX_RETRY_ERROR_MS = 3000;
 const _ancestorLogged = new Set();
@@ -3944,10 +3951,13 @@ function updateTextures(tiles) {
 
 
 
-  // Fire fetches for hottest uncached tiles
+  // Fire fetches for hottest uncached tiles (priority-sorted by heatmap).
+  // Only count actual HTTP requests (texInflight) against TEX_MAX — NOT
+  // texFetching (202 server-pending). Previously texFetching counted too,
+  // which starved close tiles when many distant tiles were server-pending.
   const nowMs = performance.now();
   for (const { tile } of scored) {
-    if (texInflight.size + texFetching.size >= TEX_MAX) break;
+    if (texInflight.size >= TEX_MAX) break;
     if (texCache.has(tile.id) || texInflight.has(tile.id)) continue;
     if (texFetching.has(tile.id)) {
       const pendingRetryAt = texRetryAtMs.get(tile.id) ?? 0;
@@ -4305,51 +4315,43 @@ async function fetchTiles(lat, lon) {
     }
 
     // Evict stale meshes: remove any mesh not in the current tile set.
-    // With logarithmic depth buffer, polygonOffset is ineffective, so we
-    // can't keep stale parents alongside children — they z-fight even when
-    // both are textured (e.g. depth-11 and depth-12 tiles on scene load
-    // near ground level).
-    //
-    // NOTE: Previously we kept textured stale parents visible until ALL
-    // overlapping children had cached textures, to avoid visible gaps on
-    // the east side of Greenland where tile coverage is incomplete. That
-    // logic is preserved below (commented out) in case incomplete-coverage
-    // areas need it again. The trade-off is z-fighting vs gaps:
-    //
-    // if (!child.material || !child.material.map) {
-    //   staleToRemove.push(child);
-    // } else {
-    //   const sb = child.userData.bbox;
-    //   if (sb) {
-    //     let coveredByChildren = true;
-    //     let foundOverlap = false;
-    //     for (const cid of newIds) {
-    //       const cdepth = parseInt(cid.split('-')[0]);
-    //       const pdepth = parseInt(tid.split('-')[0]);
-    //       if (cdepth <= pdepth) continue;
-    //       const cmesh = meshMap.get(cid);
-    //       const cb = cmesh ? cmesh.userData.bbox : tileBboxMap.get(cid);
-    //       if (!cb) continue;
-    //       if (sb[0] <= cb[0] && sb[2] >= cb[2] && sb[1] <= cb[1] && sb[3] >= cb[3]) {
-    //         foundOverlap = true;
-    //         if (!texCache.has(cid)) { coveredByChildren = false; break; }
-    //       }
-    //     }
-    //     if (!foundOverlap) coveredByChildren = false;
-    //     if (coveredByChildren) {
-    //       staleToRemove.push(child);
-    //     }
-    //   } else {
-    //     staleToRemove.push(child);
-    //   }
-    // }
+    // Keep textured (or vertex-colored) stale parents visible until ALL
+    // overlapping children have cached textures, to avoid visible gaps
+    // during the preview→full-depth transition and in areas with
+    // incomplete tile coverage.
     const staleToRemove = [];
     for (const child of terrainRoot.children) {
       if (!child.isMesh) continue;
       const tid = child.userData.tileId;
       if (!tid) continue;
       if (!newIds.has(tid)) {
-        staleToRemove.push(child);
+        if (!child.material || (!child.material.map && !child.material.vertexColors)) {
+          staleToRemove.push(child);
+        } else {
+          const sb = child.userData.bbox;
+          if (sb) {
+            let coveredByChildren = true;
+            let foundOverlap = false;
+            const pdepth = parseInt(tid.split('-')[0]);
+            for (const cid of newIds) {
+              const cdepth = parseInt(cid.split('-')[0]);
+              if (cdepth <= pdepth) continue;
+              const cmesh = meshMap.get(cid);
+              const cb = cmesh ? cmesh.userData.bbox : tileBboxMap.get(cid);
+              if (!cb) continue;
+              if (sb[0] <= cb[0] && sb[2] >= cb[2] && sb[1] <= cb[1] && sb[3] >= cb[3]) {
+                foundOverlap = true;
+                if (!texCache.has(cid)) { coveredByChildren = false; break; }
+              }
+            }
+            if (!foundOverlap) coveredByChildren = false;
+            if (coveredByChildren) {
+              staleToRemove.push(child);
+            }
+          } else {
+            staleToRemove.push(child);
+          }
+        }
       } else if (child.material && child.material.map && !child.material.polygonOffset) {
         const depth = parseInt(tid.split('-')[0]);
         child.material.polygonOffset = true;
@@ -4373,7 +4375,7 @@ async function fetchTiles(lat, lon) {
       }
       const addedSet = new Set(added);
       let built = 0, deferred = 0;
-      const MESH_BUILD_BUDGET = 30; // max meshes to build per fetch (spread the rest across frames)
+      const MESH_BUILD_BUDGET = 200; // max meshes to build per fetch
       for (const tile of data.tiles) {
         if (!addedSet.has(tile.id) || !tile.heightmap) continue;
         if (existingIds.has(tile.id)) continue;

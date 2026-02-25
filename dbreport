@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# Quick row-count report for terrain.db and assets.db
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+TERRAIN_DB="$SCRIPT_DIR/flaskserver/terrain.db"
+ASSET_DB="$SCRIPT_DIR/assetserver/assets.db"
+
+print_report() {
+  local db="$1"
+  local label="$2"
+  if [ ! -f "$db" ]; then
+    echo "$label: not found ($db)"
+    echo
+    return
+  fi
+  echo "$label ($db)"
+  echo "────────────────────────────────────────"
+  local tables
+  tables=$(sqlite3 "$db" "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name;")
+  if [ -z "$tables" ]; then
+    echo "  (no tables)"
+  else
+    for t in $tables; do
+      count=$(sqlite3 "$db" "SELECT COUNT(*) FROM \"$t\";")
+      printf "  %-30s %s rows\n" "$t" "$count"
+    done
+  fi
+  echo
+}
+
+print_report "$TERRAIN_DB" "terrain.db"
+print_report "$ASSET_DB" "assets.db"
