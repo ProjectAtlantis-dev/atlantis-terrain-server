@@ -14,7 +14,7 @@ import urllib.parse
 import urllib.request
 import zlib
 from concurrent.futures import ThreadPoolExecutor
-from logging.handlers import RotatingFileHandler
+from logging import FileHandler
 from pathlib import Path
 from typing import Any, cast
 
@@ -66,15 +66,12 @@ def _env_int(name: str, default: int) -> int:
     return default
 
 
-CLIENT_LOG_MAX_BYTES = max(1024, _env_int("CLIENT_LOG_MAX_BYTES", 8 * 1024 * 1024))
-CLIENT_LOG_BACKUP_COUNT = max(1, _env_int("CLIENT_LOG_BACKUP_COUNT", 4))
 _client_log = logging.getLogger("terrain.client")
 if not _client_log.handlers:
   CLIENT_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-  _client_handler = RotatingFileHandler(
+  _client_handler = FileHandler(
     str(CLIENT_LOG_PATH),
-    maxBytes=CLIENT_LOG_MAX_BYTES,
-    backupCount=CLIENT_LOG_BACKUP_COUNT,
+    mode="w",
     encoding="utf-8",
   )
   class _ClientColorFormatter(logging.Formatter):
@@ -137,7 +134,7 @@ if not _client_log.handlers:
 
   _client_handler.setFormatter(_ClientColorFormatter())
   _client_log.addHandler(_client_handler)
-  _client_log.setLevel(logging.INFO)
+  _client_log.setLevel(logging.DEBUG)
   _client_log.propagate = False
 
 

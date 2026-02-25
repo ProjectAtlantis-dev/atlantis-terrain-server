@@ -204,16 +204,18 @@ bootLog('script.start', {
   href: window.location.href,
   userAgent: navigator.userAgent
 });
+// Force immediate flush so we know the log pipeline is alive.
+flushClientLogQueue();
 
 // Use summer daytime in Nuuk so textured ground is clearly visible.
 const referenceDate = new Date('2025-07-01T12:00:00Z');
-const currentDate = new Date(referenceDate);
 const GAME_HOURS_PER_REAL_HOUR = 24;
 const GAME_TIME_SCALE = GAME_HOURS_PER_REAL_HOUR;
 const GAME_CLOCK_STORAGE_KEY = 'game-clock-ms';
 const _savedGameClockMs = Number(localStorage.getItem(GAME_CLOCK_STORAGE_KEY));
-const gameClockStartMs = _savedGameClockMs || referenceDate.getTime();
-const browserTimeStartMs = Date.now();
+let gameClockStartMs = _savedGameClockMs || referenceDate.getTime();
+let browserTimeStartMs = Date.now();
+const currentDate = new Date(gameClockStartMs);
 let _lastGameClockSave = 0;
 
 const DEFAULT_CENTER = {
@@ -478,10 +480,53 @@ gameClockEl.style.cssText = [
   'color:#5af',
   'font:13px/1.35 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace',
   'border-radius:6px',
-  'pointer-events:none',
-  'z-index:5'
+  'pointer-events:auto',
+  'z-index:5',
+  'user-select:none'
 ].join(';');
 document.body.appendChild(gameClockEl);
+
+// Transport control handlers for game clock HUD
+function _gcRewind() {
+  if (useRealtimeGameClock) {
+    currentDate.setTime(getGameDateFromBrowserTime().getTime());
+  }
+  useRealtimeGameClock = false;
+  currentDate.setTime(currentDate.getTime() - 15 * 60 * 1000);
+  applyDate(currentDate);
+}
+function _gcStop() {
+  if (useRealtimeGameClock) {
+    currentDate.setTime(getGameDateFromBrowserTime().getTime());
+  }
+  useRealtimeGameClock = false;
+}
+function _gcPlay() {
+  if (!useRealtimeGameClock) {
+    gameClockStartMs = currentDate.getTime();
+    browserTimeStartMs = Date.now();
+    useRealtimeGameClock = true;
+  }
+}
+function _gcFfwd() {
+  if (useRealtimeGameClock) {
+    currentDate.setTime(getGameDateFromBrowserTime().getTime());
+  }
+  useRealtimeGameClock = false;
+  currentDate.setTime(currentDate.getTime() + 15 * 60 * 1000);
+  applyDate(currentDate);
+}
+gameClockEl.addEventListener('mousedown', e => {
+  const btn = e.target.closest('button[data-gc]');
+  if (!btn) return;
+  e.preventDefault();
+  e.stopPropagation();
+  const action = btn.dataset.gc;
+  if (action === 'rw') _gcRewind();
+  else if (action === 'stop') _gcStop();
+  else if (action === 'play') _gcPlay();
+  else if (action === 'ff') _gcFfwd();
+});
 
 const tileInfoEl = document.createElement('div');
 tileInfoEl.style.cssText = [
@@ -814,6 +859,12 @@ function resetTuningUI() {
     }
   }
 }
+function tuningSliderSetValue(label, v) {
+  const def = _tuningDefs.find(d => d.label === label && d.type === 'slider');
+  if (!def) return;
+  def.inp.value = v;
+  if (def.valSpan) def.valSpan.textContent = def.fmt(v);
+}
 function tuningSectionLabel(text) {
   const d = document.createElement('div');
   d.style.cssText = 'margin:10px 0 4px;font-size:10px;text-transform:uppercase;color:#6889a8;letter-spacing:1px;border-bottom:1px solid #334;padding-bottom:3px';
@@ -825,11 +876,6 @@ function tuningSectionLabel(text) {
 function buildTuningControls(ap, ce) {
   tuningSectionLabel('Date / Time');
   const monthNames = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
-  const fmtHour = h => {
-    const hh = Math.floor(h) % 24;
-    const mm = Math.round((h % 1) * 60);
-    return `${String(hh).padStart(2,'0')}:${String(mm).padStart(2,'0')}`;
-  };
   tuningSlider('month', {
     min: 1, max: 12, step: 1, value: referenceDate.getUTCMonth() + 1,
     decimals: 0,
@@ -837,16 +883,6 @@ function buildTuningControls(ap, ce) {
     onChange: v => {
       useRealtimeGameClock = false;
       currentDate.setUTCMonth(v - 1);
-      applyDate(currentDate);
-    }
-  });
-  tuningSlider('hour (UTC)', {
-    min: 0, max: 24, step: 0.25, value: referenceDate.getUTCHours() + referenceDate.getUTCMinutes() / 60,
-    decimals: 1,
-    format: fmtHour,
-    onChange: v => {
-      useRealtimeGameClock = false;
-      currentDate.setUTCHours(Math.floor(v), (v % 1) * 60, 0, 0);
       applyDate(currentDate);
     }
   });
@@ -3458,8 +3494,10 @@ aerialPerspective.shadowSampleCount = 12;
 
 // Wire up tuning panel now that effects exist
 const sunDirection = new THREE.Vector3();
+let lastRenderedDate = new Date(currentDate);
 
 function applyDate(date) {
+  lastRenderedDate = date;
   getSunDirectionECEF(date, sunDirection);
   aerialPerspective.sunDirection.copy(sunDirection);
   cloudsEffect.sunDirection.copy(sunDirection);
@@ -3718,7 +3756,7 @@ const OCEAN_DEPTH_GAIN = Math.max(0.0, paramNumber('oceanDepthGain', 0.8));
 const OCEAN_MAX_DROP_M = Math.max(OCEAN_BASE_DROP_M, paramNumber('oceanMaxDropM', 16.0));
 const OCEAN_EDGE_CACHE_MAX = Math.max(512, Math.floor(paramNumber('oceanEdgeCacheMax', 30000)));
 const oceanEdgeState = new Map();
-let oceanMapDebugEnabled = params.get('oceanMapDebug') !== '0';
+let oceanMapDebugEnabled = params.get('oceanMapDebug') === '1';
 const OCEAN_COLOR_ASSIST_ENABLED = params.get('oceanColorAssist') !== '0';
 const OCEAN_COLOR_SCORE_MIN = THREE.MathUtils.clamp(paramNumber('oceanColorScoreMin', 0.20), 0.0, 1.0);
 const OCEAN_COLOR_PASSABLE_SCORE_MIN = THREE.MathUtils.clamp(
@@ -4125,7 +4163,9 @@ const deferredTiles = new Map();
 const tileHistory = new Map();
 function tileLog(tileId, msg) {
   if (!tileHistory.has(tileId)) tileHistory.set(tileId, []);
-  tileHistory.get(tileId).push(`${(performance.now() / 1000).toFixed(1)}s ${msg}`);
+  const ts = (performance.now() / 1000).toFixed(1);
+  tileHistory.get(tileId).push(`${ts}s ${msg}`);
+  enqueueClientLog('debug', 'tile', { tileId, msg, ts: `${ts}s` });
 }
 
 function applyTerrainMaterialMode(mesh, tex) {
@@ -4367,6 +4407,7 @@ function updateTextures(tiles) {
     const ac = new AbortController();
     texInflight.set(tile.id, ac);
     const tid = tile.id;
+    // tileLog(tid, `fetch start (inflight=${texInflight.size}/${TEX_MAX})`);
     fetch(`/api/texture/${tid}.jpg?v=${_texV}`, { signal: ac.signal })
       .then(r => {
         texInflight.delete(tid);
@@ -4376,7 +4417,10 @@ function updateTextures(tiles) {
           texRetryAtMs.set(tid, performance.now() + TEX_RETRY_202_MS);
           return;
         }
-        if (!r.ok) throw new Error(r.status);
+        if (!r.ok) {
+          tileLog(tid, `fetch -> HTTP ${r.status}`);
+          throw new Error(r.status);
+        }
         const ancestorHeader = r.headers.get('X-Tex-Ancestor');
         return r.blob()
           .then(blob => createImageBitmap(blob, { imageOrientation: 'flipY' }))
@@ -4407,6 +4451,7 @@ function updateTextures(tiles) {
               texCache.set(tid, tex);
               texSource.set(tid, texSrc);
               requestWaterMask(tid);
+              tryEvictParent(tid); // boot parent ASAP if all 4 quad siblings are now cached
               if (deferredTiles.has(tid)) {
                 tileLog(tid, `cached + materialize (was deferred)`);
                 materializeTile(tid, tex);
@@ -4430,8 +4475,61 @@ function updateTextures(tiles) {
       .catch(err => {
         texInflight.delete(tid);
         texRetryAtMs.set(tid, performance.now() + TEX_RETRY_ERROR_MS);
-        if (err.name !== 'AbortError') console.warn(`[TEX] ${tid}:`, err.message);
+        if (err.name !== 'AbortError') {
+          tileLog(tid, `fetch error: ${err.message} (retry in ${TEX_RETRY_ERROR_MS}ms)`);
+          console.warn(`[TEX] ${tid}:`, err.message);
+        }
       });
+  }
+
+  // ── Eager parent eviction ──────────────────────────────────────
+  // Problem: the normal stale-parent sweeps only run on fetchTiles()
+  // and the 1 Hz updateTextures() cycle, so a low-LOD parent (e.g. 11-x)
+  // can linger visually on top of its higher-LOD children (e.g. 12-x)
+  // for up to a full second after all four children are textured.
+  // Because texture fetches are heatmap-sorted (closest-first), nearby
+  // parents are the ones that suffer most — their children arrive early
+  // but the parent hangs around until the next sweep.
+  //
+  // Fix: each time a child texture lands and enters texCache, check
+  // whether all 4 siblings in that quad now have cached textures.
+  // If so, the parent mesh is fully occluded and can be removed
+  // immediately. This is a fast-path supplement — the existing sweep
+  // logic in updateTextures() and fetchTiles() remains as a safety net.
+  function tryEvictParent(childTileId) {
+    const addr = parseTileAddress(childTileId);
+    if (!addr || addr.depth <= 0) return;
+    // Derive parent address: each parent tile covers a 2×2 quad of children.
+    // Integer-dividing the child col/row by 2 gives the parent col/row.
+    const pCol = addr.col >> 1, pRow = addr.row >> 1;
+    const parentId = tileIdFromAddress(addr.depth - 1, pCol, pRow);
+    // Check all 4 children in this quad — bail if any is still missing.
+    const missingSiblings = [];
+    for (let dx = 0; dx < 2; dx++) {
+      for (let dy = 0; dy < 2; dy++) {
+        const sibId = tileIdFromAddress(addr.depth, pCol * 2 + dx, pRow * 2 + dy);
+        if (!texCache.has(sibId)) missingSiblings.push(sibId);
+      }
+    }
+    if (missingSiblings.length > 0) {
+      tileLog(parentId, `evict-check — ${missingSiblings.length}/4 siblings still missing: ${missingSiblings.join(', ')} (triggered by ${childTileId})`);
+      return;
+    }
+    // All 4 children textured — find and remove the parent mesh.
+    let found = false;
+    for (const c of terrainRoot.children) {
+      if (c.userData.tileId === parentId) {
+        tileLog(parentId, `evicted — eager (all children textured, triggered by ${childTileId})`);
+        terrainRoot.remove(c);
+        if (c.geometry) c.geometry.dispose();
+        if (c.material) c.material.dispose();
+        found = true;
+        break;
+      }
+    }
+    if (!found) {
+      tileLog(parentId, `evict-check — all 4 children textured but parent not in scene (triggered by ${childTileId})`);
+    }
   }
 
   // Sweep stale parents: evict textured parents whose overlapping children
@@ -4784,6 +4882,7 @@ async function fetchTiles(lat, lon) {
             built++;
           } else {
             // Over budget — defer to next frame cycle
+            tileLog(tile.id, `added — deferred (build budget exceeded, built=${built}/${MESH_BUILD_BUDGET})`);
             deferredTiles.set(tile.id, tile);
             deferred++;
           }
@@ -5390,8 +5489,8 @@ function updateHud() {
     ? '<span style="color:#ff3b30">VEHICLE</span>'
     : modeLabel;
 
-  // Game clock display (bottom-left)
-  const gameDate = useRealtimeGameClock ? getGameDateFromBrowserTime() : currentDate;
+  // Game clock display (bottom-left) — always show the date actually being rendered
+  const gameDate = lastRenderedDate;
   // Persist game clock to localStorage ~every 5s
   const _now = performance.now();
   if (_now - _lastGameClockSave > 5000) {
@@ -5403,8 +5502,15 @@ function updateHud() {
   const gdDay = gameDate.getUTCDate();
   const gdHH = String(gameDate.getUTCHours()).padStart(2, '0');
   const gdMM = String(gameDate.getUTCMinutes()).padStart(2, '0');
-  const clockLabel = useRealtimeGameClock ? `${GAME_TIME_SCALE}x` : 'manual';
-  gameClockEl.innerHTML = `<b>${gdDay} ${gdMon} ${gdHH}:${gdMM} UTC</b> <span style="color:#888">(${clockLabel})</span>`;
+  const _btnStyle = 'cursor:pointer;padding:0 4px;border:none;background:none;font-size:12px;line-height:1;vertical-align:middle;';
+  const _activeClr = '#5af';
+  const _dimClr = '#666';
+  gameClockEl.innerHTML = `<button data-gc="rw" style="${_btnStyle}color:${_activeClr}" title="−15 min"><i class="fa-solid fa-backward"></i></button>`
+    + ` <b>${gdHH}:${gdMM}</b>`
+    + (useRealtimeGameClock
+      ? `<button data-gc="stop" style="${_btnStyle}color:${_activeClr}" title="Pause"><i class="fa-solid fa-pause"></i></button>`
+      : `<button data-gc="play" style="${_btnStyle}color:${_activeClr}" title="Play 24×"><i class="fa-solid fa-play"></i></button>`)
+    + `<button data-gc="ff" style="${_btnStyle}color:${_activeClr}" title="+15 min"><i class="fa-solid fa-forward"></i></button>`;
 
   hud.innerHTML = [
     '<b>Clouds Terrain Managed Flask UX WIP</b>',
@@ -5740,8 +5846,9 @@ function render() {
   const dt = Math.min(0.05, clock.getDelta());
   const nowMs = performance.now();
   if (useRealtimeGameClock) {
-    applyDate(getGameDateFromBrowserTime());
+    currentDate.setTime(getGameDateFromBrowserTime().getTime());
   }
+  applyDate(currentDate);
   updateMovement(dt);
   applyCameraOrientation();
   updateHud();
