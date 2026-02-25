@@ -8,6 +8,7 @@ pnpm-debug.log*
 lerna-debug.log*
 
 webserver/node_modules
+assetserver/node_modules
 webserver/dist
 webserver/dist-ssr
 *.local
@@ -37,6 +38,9 @@ flaskserver/greenland.db
 flaskserver/terrain.db
 flaskserver/terrain.db-wal
 flaskserver/terrain.db-shm
+assetserver/assets.db
+assetserver/assets.db-wal
+assetserver/assets.db-shm
 water_samples/
 
 _metadata.json

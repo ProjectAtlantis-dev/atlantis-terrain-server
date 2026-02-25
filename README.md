@@ -78,6 +78,12 @@ DATAFORSYNINGEN_TOKEN=<your-token>
 
 To get a free token: [create a user account](https://dataforsyningen.dk/) (click "Log ind" → "Opret Profil"), confirm via email, then log in and go to your profile → "Administrer token til webservice og API'er" to generate a token.
 
+### Asset Server (TypeScript + SQLite)
+```bash
+cd assetserver
+npm install
+```
+
 ### Frontend (Vite)
 
 The frontend depends on a local clone of the [Takram three-geospatial](https://github.com/takram-design-engineering/three-geospatial) monorepo for atmosphere and cloud effects. Vite aliases `@takram/*` imports to this local source.
@@ -91,14 +97,20 @@ npm install
 
 ### Running
 ```bash
-# Terminal 1 — backend (terrain DB)
+# Terminal 1 — asset server (assets.db)
+./assetserver/runAssetServer
+
+# Terminal 2 — terrain backend (terrain.db)
 ./flaskserver/runFlaskServer
 
-# Terminal 2 — frontend (snazzy 3d ux)
+# Terminal 3 — frontend (snazzy 3d ux)
 ./webserver/runViteServer
 ```
 
-Both scripts log output to their respective directories (`runFlaskServer.log`, `runViteServer.log`).
+Browser asset calls go directly to `http://127.0.0.1:8787` by default.
+Override in the frontend URL with `?assetServer=http://<host>:<port>`.
+
+Scripts log to their respective directories (`runAssetServer.log`, `runFlaskServer.log`, `runViteServer.log`).
 
 ## Data Attribution
 

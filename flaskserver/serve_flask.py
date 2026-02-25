@@ -19,19 +19,12 @@ from pathlib import Path
 from typing import Any, cast
 
 from colored_log import get_logger
-from structure import get_assets_bootstrap_response
 from terrain_config import BOOTSTRAP_SEED_DEPTH, ENHANCE_DEPTH
-from vehicle import (
-  get_vehicle_state_response,
-  save_vehicle_state_response,
-)
 
 log = get_logger("terrain")
 log_db = get_logger("terrain.db")
 log_tex = get_logger("terrain.tex")
 log_cog = get_logger("terrain.cog")
-log_vehicle = get_logger("terrain.vehicle")
-log_assets = get_logger("terrain.assets")
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -97,6 +90,30 @@ if not _client_log.handlers:
     _DIM = "\033[2m"
     _BOLD = "\033[1m"
     _PHASE_COLOR = "\033[35m"  # magenta
+    _KEY_COLOR = "\033[36m"    # cyan for JSON keys
+    _STR_COLOR = "\033[33m"    # yellow for string values
+    _NUM_COLOR = "\033[32m"    # green for numbers
+    _BOOL_COLOR = "\033[35m"   # magenta for booleans/null
+    # Regex to colorize JSON tokens in pretty-printed output
+    _JSON_TOKEN_RE = re.compile(
+      r'("(?:[^"\\]|\\.)*")\s*:'       # key followed by colon
+      r'|("(?:[^"\\]|\\.)*")'          # string value
+      r'|(-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)' # number
+      r'|\b(true|false|null)\b'         # boolean/null
+    )
+
+    def _colorize_json(self, text):
+      def _repl(m):
+        if m.group(1) is not None:    # JSON key
+          return f"{self._KEY_COLOR}{m.group(1)}{self._RESET}:"
+        if m.group(2) is not None:    # string value
+          return f"{self._STR_COLOR}{m.group(2)}{self._RESET}"
+        if m.group(3) is not None:    # number
+          return f"{self._NUM_COLOR}{m.group(3)}{self._RESET}"
+        if m.group(4) is not None:    # bool/null
+          return f"{self._BOOL_COLOR}{m.group(4)}{self._RESET}"
+        return m.group(0)
+      return self._JSON_TOKEN_RE.sub(_repl, text)
 
     def format(self, record):
       ts = self.formatTime(record, self.datefmt)
@@ -108,6 +125,7 @@ if not _client_log.handlers:
         obj = json.loads(msg)
         phase = obj.pop("phase", "client.log")
         pretty = json.dumps(obj, indent=2, ensure_ascii=False, default=str)
+        pretty = self._colorize_json(pretty)
         return (
           f"{self._DIM}{ts}{self._RESET} "
           f"{color}[{level}]{self._RESET} "
@@ -392,9 +410,6 @@ def _recover_worker(prompt_id: str, tile_id: str):
       wdb.close()
     with _enhancing_lock:
       _enhancing.discard(tile_id)
-
-
-
 def _bootstrap_backend() -> None:
   global _backend_ready, _backend_error
   global _np, _Image, _to_stereo, _query_tiles_stereo, _load_no_data_cache
@@ -450,44 +465,6 @@ def _bootstrap_backend() -> None:
       db.execute("INSERT OR REPLACE INTO metadata (key, value) VALUES ('max_depth', ?)", (str(ENHANCE_DEPTH),))
       db.commit()
       log_db.info(f"Updated max_depth metadata to {ENHANCE_DEPTH}")
-
-    # Ensure structure instances exist so frontend can always load world
-    # placements from backend tables at app startup.
-    assets_bootstrap = get_assets_bootstrap_response(db, log_assets)
-    seeded = assets_bootstrap.get("seeded") or {}
-    seeded_structure_instances = bool(seeded.get("structureInstances"))
-    assets_payload = assets_bootstrap.get("assets") or {}
-    structure_instances = assets_payload.get("structure_instances")
-    if not isinstance(structure_instances, list):
-      structure_instances = []
-    structure_metadata = assets_payload.get("structure_metadata") or {}
-    vehicle_metadata = assets_payload.get("vehicle_metadata") or {}
-    structure_model = structure_metadata.get("model") if isinstance(structure_metadata, dict) else {}
-    if not isinstance(structure_model, dict):
-      structure_model = {}
-    vehicle_model = vehicle_metadata.get("model") if isinstance(vehicle_metadata, dict) else {}
-    if not isinstance(vehicle_model, dict):
-      vehicle_model = {}
-    structure_model_url = structure_model.get("url")
-    vehicle_model_url = vehicle_model.get("url")
-    if seeded_structure_instances:
-      log_assets.info(
-        "[ASSETS] prepopulated startup data: structure_instances"
-      )
-    else:
-      log_assets.info("[ASSETS] found existing startup data (no prepopulation needed)")
-    log_assets.info(
-      "[ASSETS] bootstrap "
-      f"source={assets_bootstrap.get('source')} "
-      f"version={assets_bootstrap.get('version')} "
-      f"corrupt={bool(assets_bootstrap.get('corrupt'))} "
-      f"structureInstancesSource={assets_bootstrap.get('structureInstancesSource')} "
-      f"structureInstanceCount={len(structure_instances)} "
-      f"structureModelUrl={structure_model_url} "
-      f"vehicleModelUrl={vehicle_model_url}"
-    )
-    if len(structure_instances) == 0:
-      log_assets.warning("[ASSETS] no enabled structure instances in DB")
 
     try:
       no_data_count = load_no_data_cache(db)
@@ -849,14 +826,6 @@ def _queue_texture_fetch(tile_id: str, bbox: tuple[float, float, float, float]) 
 
 _api_tiles_state: dict[str, str | None] = {"last_result": None}
 
-
-@app.get("/api/assets_bootstrap")
-def api_assets_bootstrap():
-  unavailable = _terrain_unavailable_response()
-  if unavailable is not None:
-    return unavailable
-
-  return jsonify(get_assets_bootstrap_response(_get_db(), log_assets))
 
 @app.get("/api/tiles")
 def api_tiles():
@@ -1673,29 +1642,6 @@ def api_tile_inspect():
     for ev in hist:
       log_db.info(f"    {ev}")
   return jsonify({"ok": True})
-
-
-@app.get("/api/vehicle_state")
-def api_vehicle_state_get():
-  unavailable = _terrain_unavailable_response()
-  if unavailable is not None:
-    return unavailable
-
-  return jsonify(get_vehicle_state_response(_get_db(), log_vehicle))
-
-
-@app.post("/api/vehicle_state")
-def api_vehicle_state_post():
-  unavailable = _terrain_unavailable_response()
-  if unavailable is not None:
-    return unavailable
-
-  payload, status = save_vehicle_state_response(
-    _get_db(),
-    request.get_json(silent=True) or {},
-    log_vehicle,
-  )
-  return jsonify(payload), status
 
 
 def _client_log_level(raw_level: Any) -> int:

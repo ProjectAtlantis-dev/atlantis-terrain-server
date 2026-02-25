@@ -27,8 +27,18 @@ import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 
 const params = new URLSearchParams(window.location.search);
 const CLIENT_LOG_ENDPOINT = '/api/client_log';
-const VEHICLE_STATE_ENDPOINT = '/api/vehicle_state';
-const ASSETS_BOOTSTRAP_ENDPOINT = '/api/assets_bootstrap';
+const DEFAULT_ASSET_SERVER_BASE = 'http://127.0.0.1:8787';
+const ASSET_SERVER_BASE = (() => {
+  const raw = params.get('assetServer');
+  const text = typeof raw === 'string' ? raw.trim() : '';
+  const base = text || DEFAULT_ASSET_SERVER_BASE;
+  return base.replace(/\/+$/, '');
+})();
+const VEHICLE_STATE_ENDPOINT = `${ASSET_SERVER_BASE}/api/vehicle_state`;
+const ASSETS_ENDPOINT = `${ASSET_SERVER_BASE}/api/assets`;
+const ASSETS_FETCH_TIMEOUT_MS = 1500;
+const VEHICLE_SAVE_FETCH_TIMEOUT_MS = 1500;
+const VEHICLE_SAVE_FAILURE_COOLDOWN_MS = 15000;
 const CLIENT_LOG_ENABLED = params.get('clientLog') !== '0';
 const CLIENT_LOG_BATCH_SIZE = 40;
 const CLIENT_LOG_MAX_QUEUE = 600;
@@ -222,61 +232,41 @@ const ATMOSPHERE_TEXTURE_FILES = [
 const centerLon = Number(params.get('lon') ?? DEFAULT_CENTER.lon);
 const centerLat = Number(params.get('lat') ?? DEFAULT_CENTER.lat);
 
-function cloneFallbackStartupAssets() {
+function defaultStartupAssets() {
   return {
-    structure_metadata: {
-      model: {},
-    },
-    vehicle_metadata: {
-      model: {},
-    },
+    vehicle_definition: {},
+    structure_definition: {},
+    vehicle_instances: [],
     structure_instances: [],
   };
 }
 
 function normalizeStartupAssetsPayload(payload) {
-  const fallback = cloneFallbackStartupAssets();
+  const fallback = defaultStartupAssets();
   if (payload == null || typeof payload !== 'object') {
     return fallback;
   }
-  const rawStructureMetadata = payload.structure_metadata;
-  const rawVehicleMetadata = payload.vehicle_metadata;
-  const rawStructureInstances = payload.structure_instances;
 
-  const structureModelSource = (
-    rawStructureMetadata != null &&
-    typeof rawStructureMetadata === 'object' &&
-    rawStructureMetadata.model != null &&
-    typeof rawStructureMetadata.model === 'object'
-  )
-    ? rawStructureMetadata.model
-    : null;
-  if (structureModelSource != null && typeof structureModelSource === 'object') {
-    fallback.structure_metadata.model = {
-      ...fallback.structure_metadata.model,
-      ...structureModelSource,
-    };
+  const rawVehicleDef = payload.vehicle_definition;
+  if (rawVehicleDef != null && typeof rawVehicleDef === 'object') {
+    fallback.vehicle_definition = { ...rawVehicleDef };
   }
 
-  if (Array.isArray(rawStructureInstances)) {
-    fallback.structure_instances = rawStructureInstances
-      .filter(site => site != null && typeof site === 'object')
-      .map(site => ({ ...site }));
+  const rawStructureDef = payload.structure_definition;
+  if (rawStructureDef != null && typeof rawStructureDef === 'object') {
+    fallback.structure_definition = { ...rawStructureDef };
   }
 
-  const vehicleModelSource = (
-    rawVehicleMetadata != null &&
-    typeof rawVehicleMetadata === 'object' &&
-    rawVehicleMetadata.model != null &&
-    typeof rawVehicleMetadata.model === 'object'
-  )
-    ? rawVehicleMetadata.model
-    : null;
-  if (vehicleModelSource != null && typeof vehicleModelSource === 'object') {
-    fallback.vehicle_metadata.model = {
-      ...fallback.vehicle_metadata.model,
-      ...vehicleModelSource,
-    };
+  if (Array.isArray(payload.vehicle_instances)) {
+    fallback.vehicle_instances = payload.vehicle_instances
+      .filter(v => v != null && typeof v === 'object')
+      .map(v => ({ ...v }));
+  }
+
+  if (Array.isArray(payload.structure_instances)) {
+    fallback.structure_instances = payload.structure_instances
+      .filter(s => s != null && typeof s === 'object')
+      .map(s => ({ ...s }));
   }
 
   return fallback;
@@ -285,56 +275,73 @@ function normalizeStartupAssetsPayload(payload) {
 async function loadStartupAssets() {
   const fallback = {
     source: 'defaults',
-    corrupt: false,
-    metadataKey: null,
-    version: 1,
-    schemaVersion: 3,
-    structureInstancesSource: 'unavailable',
+    schemaVersion: 4,
     seeded: null,
-    assets: cloneFallbackStartupAssets(),
+    ...defaultStartupAssets(),
   };
   try {
-    const response = await fetch(ASSETS_BOOTSTRAP_ENDPOINT, { cache: 'no-store' });
+    const controller = typeof AbortController !== 'undefined'
+      ? new AbortController()
+      : null;
+    const timeoutHandle = controller != null
+      ? window.setTimeout(() => controller.abort(), ASSETS_FETCH_TIMEOUT_MS)
+      : null;
+    const response = await fetch(ASSETS_ENDPOINT, {
+      cache: 'no-store',
+      signal: controller?.signal,
+    }).finally(() => {
+      if (timeoutHandle != null) {
+        window.clearTimeout(timeoutHandle);
+      }
+    });
     if (!response.ok) {
-      throw new Error(`assets bootstrap status ${response.status}`);
+      throw new Error(`assets endpoint status ${response.status}`);
     }
     const payload = await response.json();
+    const normalized = normalizeStartupAssetsPayload(payload);
+    const source = typeof payload?.source === 'string' ? payload.source : 'metadata';
+    const schemaVersion = Number.isFinite(payload?.schemaVersion) ? payload.schemaVersion : 4;
+    bootLog('assets.fetch.ok', {
+      endpoint: ASSETS_ENDPOINT,
+      status: response.status,
+      source,
+      schemaVersion,
+      structureCount: normalized.structure_instances.length,
+      vehicleCount: normalized.vehicle_instances.length,
+    });
     return {
-      source: typeof payload?.source === 'string' ? payload.source : 'metadata',
-      corrupt: Boolean(payload?.corrupt),
-      metadataKey: typeof payload?.metadataKey === 'string' ? payload.metadataKey : null,
-      version: Number.isFinite(payload?.version) ? payload.version : 1,
-      schemaVersion: Number.isFinite(payload?.schemaVersion) ? payload.schemaVersion : 3,
-      structureInstancesSource: typeof payload?.structureInstancesSource === 'string'
-        ? payload.structureInstancesSource
-        : 'unknown',
+      source,
+      schemaVersion,
       seeded: payload?.seeded ?? null,
-      assets: normalizeStartupAssetsPayload(payload?.assets),
+      ...normalized,
     };
   } catch (error) {
-    console.warn('[BOOT] startup assets fallback', {
-      endpoint: ASSETS_BOOTSTRAP_ENDPOINT,
+    const timedOut = error?.name === 'AbortError';
+    bootLog('assets.fetch.fallback', {
+      endpoint: ASSETS_ENDPOINT,
+      timeoutMs: ASSETS_FETCH_TIMEOUT_MS,
+      timedOut,
+      error: error?.message ?? String(error),
+    }, 'warn');
+    console.warn('[ASSETS] startup fallback', {
+      endpoint: ASSETS_ENDPOINT,
+      timeoutMs: ASSETS_FETCH_TIMEOUT_MS,
+      timedOut,
       error: error?.message ?? String(error),
     });
     return fallback;
   }
 }
 
-const startupAssetsBootstrap = await loadStartupAssets();
-const startupAssets = startupAssetsBootstrap.assets;
-let VEHICLE_HEADLIGHTS = null;
-bootLog('assets.bootstrap.loaded', {
-  source: startupAssetsBootstrap.source,
-  corrupt: startupAssetsBootstrap.corrupt,
-  metadataKey: startupAssetsBootstrap.metadataKey,
-  version: startupAssetsBootstrap.version,
-  schemaVersion: startupAssetsBootstrap.schemaVersion,
-  structureInstancesSource: startupAssetsBootstrap.structureInstancesSource,
-  seeded: startupAssetsBootstrap.seeded,
-  structureCount: Array.isArray(startupAssets.structure_instances)
-    ? startupAssets.structure_instances.length
-    : 0,
-});
+const startupAssetsResponse = await loadStartupAssets();
+const VEHICLE_DEFINITION = startupAssetsResponse.vehicle_definition;
+const STRUCTURE_DEFINITION = startupAssetsResponse.structure_definition;
+const VEHICLE_HEADLIGHTS = (
+  VEHICLE_DEFINITION.headlights != null &&
+  typeof VEHICLE_DEFINITION.headlights === 'object'
+)
+  ? VEHICLE_DEFINITION.headlights
+  : null;
 
 const scene = new THREE.Scene();
 // Black fog — aerial perspective inscatter fills in the natural sky color at distance.
@@ -1110,54 +1117,36 @@ function paramNumber(name, fallback) {
   return Number.isFinite(value) ? value : fallback;
 }
 
-const ASSET_STRUCTURE_METADATA = (
-  startupAssets.structure_metadata != null && typeof startupAssets.structure_metadata === 'object'
-)
-  ? startupAssets.structure_metadata
-  : {};
-const ASSET_STRUCTURE_MODEL = (
-  ASSET_STRUCTURE_METADATA.model != null && typeof ASSET_STRUCTURE_METADATA.model === 'object'
-)
-  ? ASSET_STRUCTURE_METADATA.model
-  : {};
-const ASSET_STRUCTURE_INSTANCES = Array.isArray(startupAssets.structure_instances)
-  ? startupAssets.structure_instances
+const ASSET_STRUCTURE_INSTANCES = Array.isArray(startupAssetsResponse.structure_instances)
+  ? startupAssetsResponse.structure_instances
   : [];
-const ASSET_VEHICLE_METADATA = (
-  startupAssets.vehicle_metadata != null && typeof startupAssets.vehicle_metadata === 'object'
-)
-  ? startupAssets.vehicle_metadata
-  : {};
-const ASSET_VEHICLE_MODEL = (
-  ASSET_VEHICLE_METADATA.model != null && typeof ASSET_VEHICLE_METADATA.model === 'object'
-)
-  ? ASSET_VEHICLE_METADATA.model
-  : {};
+const ASSET_VEHICLE_INSTANCES = Array.isArray(startupAssetsResponse.vehicle_instances)
+  ? startupAssetsResponse.vehicle_instances
+  : [];
 const houseEnabledParam = params.get('house');
 const HOUSE_MODEL = {
-  url: (typeof ASSET_STRUCTURE_MODEL.url === 'string' && ASSET_STRUCTURE_MODEL.url.trim() !== '')
-    ? ASSET_STRUCTURE_MODEL.url
+  url: (typeof STRUCTURE_DEFINITION.url === 'string' && STRUCTURE_DEFINITION.url.trim() !== '')
+    ? STRUCTURE_DEFINITION.url
     : '',
   altOffsetM: paramNumber(
     'houseAltOffset',
-    Number.isFinite(ASSET_STRUCTURE_MODEL.altOffsetM) ? ASSET_STRUCTURE_MODEL.altOffsetM : 0.4
+    Number.isFinite(STRUCTURE_DEFINITION.altOffsetM) ? STRUCTURE_DEFINITION.altOffsetM : 0.4
   ),
   hotReloadMs: Math.max(
     500,
     paramNumber(
       'houseReloadMs',
-      Number.isFinite(ASSET_STRUCTURE_MODEL.hotReloadMs) ? ASSET_STRUCTURE_MODEL.hotReloadMs : 2000
+      Number.isFinite(STRUCTURE_DEFINITION.hotReloadMs) ? STRUCTURE_DEFINITION.hotReloadMs : 2000
     )
   ),
   enabled: houseEnabledParam == null
-    ? Boolean(ASSET_STRUCTURE_MODEL.enabled)
+    ? Boolean(STRUCTURE_DEFINITION.enabled)
     : houseEnabledParam === '1'
 };
 if (!HOUSE_MODEL.url) {
   HOUSE_MODEL.enabled = false;
   bootLog('house.config.missing_model_url', {
-    source: startupAssetsBootstrap.source,
-    metadataKey: startupAssetsBootstrap.metadataKey,
+    source: startupAssetsResponse.source,
   }, 'warn');
 }
 const HOUSE_SHADOW_MODE_RAW = (params.get('houseShadowMode') || 'shadowmap').toLowerCase();
@@ -1529,23 +1518,33 @@ let housesRuntimeVisible = HOUSE_MODEL.enabled;
 houseLayer.visible = housesRuntimeVisible;
 
 // ── Patria AMV vehicle ──────────────────────────────────────────────────
+const _vehicleSeedInstance = ASSET_VEHICLE_INSTANCES.length > 0 ? ASSET_VEHICLE_INSTANCES[0] : {};
 const VEHICLE_MODEL = {
-  url: (typeof ASSET_VEHICLE_MODEL.url === 'string' && ASSET_VEHICLE_MODEL.url.trim() !== '')
-    ? ASSET_VEHICLE_MODEL.url
+  url: (typeof VEHICLE_DEFINITION.url === 'string' && VEHICLE_DEFINITION.url.trim() !== '')
+    ? VEHICLE_DEFINITION.url
     : '/models/patria_amv.glb',
-  lat: Number.isFinite(ASSET_VEHICLE_MODEL.lat) ? ASSET_VEHICLE_MODEL.lat : centerLat,
-  lon: Number.isFinite(ASSET_VEHICLE_MODEL.lon) ? ASSET_VEHICLE_MODEL.lon : centerLon,
-  headingDeg: Number.isFinite(ASSET_VEHICLE_MODEL.headingDeg) ? ASSET_VEHICLE_MODEL.headingDeg : 0,
-  z: Number.isFinite(ASSET_VEHICLE_MODEL.z) ? ASSET_VEHICLE_MODEL.z : 0,
-  realLengthM: Number.isFinite(ASSET_VEHICLE_MODEL.realLengthM) ? ASSET_VEHICLE_MODEL.realLengthM : 7.7,
+  lat: Number.isFinite(_vehicleSeedInstance.lat) ? _vehicleSeedInstance.lat : centerLat,
+  lon: Number.isFinite(_vehicleSeedInstance.lon) ? _vehicleSeedInstance.lon : centerLon,
+  headingDeg: Number.isFinite(_vehicleSeedInstance.headingDeg) ? _vehicleSeedInstance.headingDeg : 0,
+  z: Number.isFinite(_vehicleSeedInstance.z) ? _vehicleSeedInstance.z : 0,
+  realLengthM: Number.isFinite(VEHICLE_DEFINITION.realLengthM) ? VEHICLE_DEFINITION.realLengthM : 7.7,
   tireDiameterM: paramNumber(
     'vehicleTireDiameterM',
-    Number.isFinite(ASSET_VEHICLE_MODEL.tireDiameterM)
-      ? ASSET_VEHICLE_MODEL.tireDiameterM
+    Number.isFinite(VEHICLE_DEFINITION.tireDiameterM)
+      ? VEHICLE_DEFINITION.tireDiameterM
       : 1.27
   ),
-  altOffsetM: Number.isFinite(ASSET_VEHICLE_MODEL.altOffsetM) ? ASSET_VEHICLE_MODEL.altOffsetM : 0.05,
+  altOffsetM: Number.isFinite(VEHICLE_DEFINITION.altOffsetM) ? VEHICLE_DEFINITION.altOffsetM : 0.05,
 };
+bootLog('assets.loaded', {
+  source: startupAssetsResponse.source,
+  schemaVersion: startupAssetsResponse.schemaVersion,
+  seeded: startupAssetsResponse.seeded,
+  headlightsOn: _vehicleSeedInstance.headlightsOn === true,
+  headlightsParams: VEHICLE_HEADLIGHTS != null,
+  structureCount: ASSET_STRUCTURE_INSTANCES.length,
+  vehicleCount: ASSET_VEHICLE_INSTANCES.length,
+});
 const VEHICLE_TIRE_RADIUS_M = Math.max(
   0,
   paramNumber('vehicleTireRadiusM', VEHICLE_MODEL.tireDiameterM * 0.5)
@@ -1958,7 +1957,7 @@ function requestVehicleTerrainResnap(reason = 'terrain-update') {
   if (!vehicleLoaded) return;
   if (vehicleSnapPending) return;
   vehicleSnapPending = true;
-  bootLog('vehicle.resnap.requested', { reason });
+  // bootLog('vehicle.resnap.requested', { reason });
 }
 
 function setVehicleGroundTarget(nextZ, options = {}) {
@@ -2004,6 +2003,8 @@ function updateVehicleSuspension(dt) {
 
 let _vehicleSaveTrailingTimer = 0;
 let _vehicleLastSaveAt = 0;
+let _vehicleSaveFailureUntilMs = 0;
+let _vehicleSaveFailureReported = false;
 const VEHICLE_SAVE_THROTTLE_MS = 5000;
 const VEHICLE_SAVE_TRAILING_MS = 2000;
 function throttledVehicleSave() {
@@ -2028,6 +2029,10 @@ async function saveVehicleState(reason = 'manual', options = {}) {
     bypassSnapThrottle = false,
   } = options;
   let zGrounded = false;
+  const nowMs = Date.now();
+  if (_vehicleSaveFailureUntilMs > nowMs) {
+    return false;
+  }
   if (snapToGround && vehicleLoaded) {
     vehicleSnapPending = true;
     snapVehicleToTerrain({ forceImmediate: true, bypassThrottle: bypassSnapThrottle });
@@ -2046,78 +2051,84 @@ async function saveVehicleState(reason = 'manual', options = {}) {
     state.terrainTileId = terrainSample.tileId;
   }
   if ((snapToGround || requireGroundedZ) && !zGrounded) {
-    bootLog('vehicle.state.save.ungrounded', { reason, state }, 'warn');
+    // bootLog('vehicle.state.save.ungrounded', { reason, state }, 'warn');
   }
   try {
+    const controller = typeof AbortController !== 'undefined'
+      ? new AbortController()
+      : null;
+    const timeoutHandle = controller != null
+      ? window.setTimeout(() => controller.abort(), VEHICLE_SAVE_FETCH_TIMEOUT_MS)
+      : null;
     const response = await fetch(VEHICLE_STATE_ENDPOINT, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ ...state, reason }),
+      signal: controller?.signal,
+    }).finally(() => {
+      if (timeoutHandle != null) {
+        window.clearTimeout(timeoutHandle);
+      }
     });
     if (!response.ok) {
-      throw new Error(`vehicle_state save status ${response.status}`);
+      const responseText = await response.text().catch(() => '');
+      const preview = responseText.slice(0, 180);
+      throw new Error(
+        `vehicle_state save status ${response.status}${preview ? ` body=${preview}` : ''}`
+      );
     }
-    bootLog('vehicle.state.save.success', { reason, state, zGrounded });
+    if (_vehicleSaveFailureReported) {
+      bootLog('vehicle.state.save.recovered', {
+        reason,
+      });
+    }
+    _vehicleSaveFailureUntilMs = 0;
+    _vehicleSaveFailureReported = false;
+    // bootLog('vehicle.state.save.success', { reason, state, zGrounded });
     return true;
   } catch (error) {
-    bootLog('vehicle.state.save.error', {
-      reason,
-      message: error?.message ?? String(error),
-    }, 'error');
+    _vehicleSaveFailureUntilMs = Date.now() + VEHICLE_SAVE_FAILURE_COOLDOWN_MS;
+    if (!_vehicleSaveFailureReported) {
+      const timedOut = error?.name === 'AbortError';
+      bootLog('vehicle.state.save.error', {
+        reason,
+        timeoutMs: VEHICLE_SAVE_FETCH_TIMEOUT_MS,
+        timedOut,
+        cooldownMs: VEHICLE_SAVE_FAILURE_COOLDOWN_MS,
+        message: error?.message ?? String(error),
+      }, 'error');
+      _vehicleSaveFailureReported = true;
+    }
     return false;
   }
 }
 
-async function loadVehicleState() {
-  try {
-    const response = await fetch(VEHICLE_STATE_ENDPOINT, { cache: 'no-store' });
-    if (!response.ok) {
-      throw new Error(`vehicle_state load status ${response.status}`);
-    }
-    const payload = await response.json();
-    VEHICLE_HEADLIGHTS = (
-      payload?.headlights != null &&
-      typeof payload.headlights === 'object' &&
-      payload.headlights.enabled === true
-    )
-      ? payload.headlights
-      : null;
-    bootLog('vehicle.headlights.loaded', {
-      source: 'vehicle_state',
-      enabled: VEHICLE_HEADLIGHTS?.enabled === true,
-    });
-    const state = payload?.state ?? null;
-    if (state == null) {
-      bootLog('vehicle.state.load.empty');
-      return null;
-    }
-    const lat = Number(state.lat);
-    const lon = Number(state.lon);
-    const headingDeg = Number(state.headingDeg);
-    const z = Number(state.z);
-    const terrainDepthRaw = Number(state.terrainDepth);
-    const terrainDepth = Number.isFinite(terrainDepthRaw)
-      ? Math.max(0, Math.floor(terrainDepthRaw))
-      : null;
-    if (!Number.isFinite(lat) || !Number.isFinite(lon) || !Number.isFinite(headingDeg)) {
-      bootLog('vehicle.state.load.invalid', { state }, 'error');
-      return null;
-    }
-    vehicleSavedStatePending = {
-      lat,
-      lon,
-      headingDeg,
-      z: Number.isFinite(z) ? z : null,
-      terrainDepth,
-    };
-    bootLog('vehicle.state.load.success', { state: vehicleSavedStatePending });
-    return vehicleSavedStatePending;
-  } catch (error) {
-    bootLog('vehicle.state.load.error', {
-      message: error?.message ?? String(error),
-    }, 'error');
+function loadVehicleState() {
+  const state = ASSET_VEHICLE_INSTANCES.length > 0 ? ASSET_VEHICLE_INSTANCES[0] : null;
+  if (state == null) {
+    bootLog('vehicle.state.load.empty');
     return null;
   }
+  const lat = Number(state.lat);
+  const lon = Number(state.lon);
+  const headingDeg = Number(state.headingDeg);
+  const z = Number(state.z);
+  const terrainDepthRaw = Number(state.terrainDepth);
+  const terrainDepth = Number.isFinite(terrainDepthRaw)
+    ? Math.max(0, Math.floor(terrainDepthRaw))
+    : null;
+  if (!Number.isFinite(lat) || !Number.isFinite(lon) || !Number.isFinite(headingDeg)) {
+    bootLog('vehicle.state.load.invalid', { state }, 'error');
+    return null;
+  }
+  vehicleSavedStatePending = {
+    lat,
+    lon,
+    headingDeg,
+    z: Number.isFinite(z) ? z : null,
+    terrainDepth,
+  };
+  return vehicleSavedStatePending;
 }
 
 function loadVehicleModel() {
@@ -2167,7 +2178,7 @@ function loadVehicleModel() {
       vehicleConsoleLog(`model bbox: ${modelSize.x.toFixed(2)} x ${modelSize.y.toFixed(2)} x ${modelSize.z.toFixed(2)}, longest=${modelLength.toFixed(2)}, scale=${vehicleScale.toFixed(4)}, bottomOffset=${bbox.min.z.toFixed(2)}`);
       vehicleGroup.add(model);
       // ── Headlights ──────────────────────────────────────────────────
-      if (VEHICLE_HEADLIGHTS?.enabled === true) {
+      if (VEHICLE_HEADLIGHTS != null && _vehicleSeedInstance.headlightsOn === true) {
         const localScale = vehicleScale !== 0 ? vehicleScale : 1;
         const hlColor = VEHICLE_HEADLIGHTS.color;
         const hlIntensity = VEHICLE_HEADLIGHTS.intensity;
@@ -3690,8 +3701,13 @@ function buildMesh(tile) {
   g.setAttribute('uv', new THREE.BufferAttribute(uv, 2));
   g.setIndex(idx);
   g.computeVertexNormals();
-  const mat = new THREE.MeshStandardMaterial({
-    color: 0x0a2650, side: THREE.FrontSide, roughness: 0.9, metalness: 0.0
+  // NOTE: Must be MeshBasicMaterial, NOT MeshStandardMaterial!
+  // MeshStandardMaterial needs scene lights to render — without them all textured
+  // tiles (water, lakes, etc.) turn grey. We tried MeshStandardMaterial to get
+  // vehicle headlights to illuminate terrain but it breaks everything else.
+  // If we revisit headlight-on-terrain lighting, add scene lights first.
+  const mat = new THREE.MeshBasicMaterial({
+    color: 0x0a2650, side: THREE.FrontSide,
   });
   const mesh = new THREE.Mesh(g, mat);
   mesh.userData.tileId = tile.id;
@@ -3797,10 +3813,13 @@ const texCache = new Map();
 const texSource = new Map();
 const texInflight = new Map();
 const texFetching = new Set();
+const texRetryAtMs = new Map();
 const waterMaskCache = new Map();
 const waterMaskInflight = new Map();
 const ENABLE_WATER_MASKS = false;
 const TEX_MAX = 50;
+const TEX_RETRY_202_MS = 1200;
+const TEX_RETRY_ERROR_MS = 3000;
 const _ancestorLogged = new Set();
 let _texV = Date.now();
 
@@ -3878,7 +3897,6 @@ function tilePriority(tile) {
 }
 
 function updateTextures(tiles) {
-  texFetching.clear();
   const meshMap = new Map();
   for (const child of terrainRoot.children) {
     if (child.userData.tileId) meshMap.set(child.userData.tileId, child);
@@ -3927,9 +3945,18 @@ function updateTextures(tiles) {
 
 
   // Fire fetches for hottest uncached tiles
+  const nowMs = performance.now();
   for (const { tile } of scored) {
-    if (texFetching.size >= TEX_MAX) break;
-    if (texCache.has(tile.id) || texInflight.has(tile.id) || texFetching.has(tile.id)) continue;
+    if (texInflight.size + texFetching.size >= TEX_MAX) break;
+    if (texCache.has(tile.id) || texInflight.has(tile.id)) continue;
+    if (texFetching.has(tile.id)) {
+      const pendingRetryAt = texRetryAtMs.get(tile.id) ?? 0;
+      if (pendingRetryAt > nowMs) continue;
+      texFetching.delete(tile.id);
+    }
+    const retryAt = texRetryAtMs.get(tile.id) ?? 0;
+    if (retryAt > nowMs) continue;
+    texRetryAtMs.delete(tile.id);
     if (_coveredByEnhancedParent(tile)) continue;
 
     const ac = new AbortController();
@@ -3938,13 +3965,19 @@ function updateTextures(tiles) {
     fetch(`/api/texture/${tid}.jpg?v=${_texV}`, { signal: ac.signal })
       .then(r => {
         texInflight.delete(tid);
-        if (r.status === 202) { tileLog(tid, 'fetch -> 202 (server fetching)'); texFetching.add(tid); return; }
+        if (r.status === 202) {
+          tileLog(tid, 'fetch -> 202 (server fetching)');
+          texFetching.add(tid);
+          texRetryAtMs.set(tid, performance.now() + TEX_RETRY_202_MS);
+          return;
+        }
         if (!r.ok) throw new Error(r.status);
         const ancestorHeader = r.headers.get('X-Tex-Ancestor');
         return r.blob()
           .then(blob => createImageBitmap(blob, { imageOrientation: 'flipY' }))
           .then(bmp => {
             texFetching.delete(tid);
+            texRetryAtMs.delete(tid);
             const isAncestorCrop = !!ancestorHeader;
             const texSrc = r.headers.get('X-Tex-Source') || '';
             tileLog(tid, `fetch -> ${bmp.width}x${bmp.height}${isAncestorCrop ? ' ANCESTOR=' + ancestorHeader : ''} src=${texSrc}`);
@@ -3955,6 +3988,7 @@ function updateTextures(tiles) {
             if (isAncestorCrop) {
               tileLog(tid, `ancestor crop from ${ancestorHeader} — not caching, will retry`);
               _ancestorLogged.add(tid);
+              texRetryAtMs.set(tid, performance.now() + TEX_RETRY_202_MS);
               // Apply ancestor texture as placeholder (don't cache — will re-fetch for sharp version)
               let mesh = null;
               for (const child of terrainRoot.children) {
@@ -3993,6 +4027,7 @@ function updateTextures(tiles) {
       })
       .catch(err => {
         texInflight.delete(tid);
+        texRetryAtMs.set(tid, performance.now() + TEX_RETRY_ERROR_MS);
         if (err.name !== 'AbortError') console.warn(`[TEX] ${tid}:`, err.message);
       });
   }
@@ -4497,9 +4532,8 @@ if (HOUSE_MODEL.enabled && housesRuntimeVisible) {
     houseModelSig = sig;
   });
 }
-loadVehicleState().finally(() => {
-  loadVehicleModel();
-});
+loadVehicleState();
+loadVehicleModel();
 
 window.takramDebug = {
   sceneMode: 'clouds-terrain-managed-flask-ux-wip',
