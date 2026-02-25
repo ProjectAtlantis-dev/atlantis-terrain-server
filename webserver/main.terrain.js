@@ -5501,8 +5501,8 @@ function updateHud() {
   const _mn3 = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
   const gdMon = _mn3[gameDate.getUTCMonth()];
   const gdDay = gameDate.getUTCDate();
-  const gdHH = String(gameDate.getUTCHours()).padStart(2, '0');
-  const gdMM = String(gameDate.getUTCMinutes()).padStart(2, '0');
+  const _nuukTime = gameDate.toLocaleString('en-GB', { timeZone: 'America/Nuuk', hour: '2-digit', minute: '2-digit', hour12: false });
+  const [gdHH, gdMM] = _nuukTime.split(':');
   const _btnStyle = 'cursor:pointer;padding:0 4px;border:none;background:none;font-size:12px;line-height:1;vertical-align:middle;';
   const _activeClr = '#5af';
   const _dimClr = '#666';
