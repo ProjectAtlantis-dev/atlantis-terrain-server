@@ -4739,7 +4739,7 @@ function getCameraLatLon() {
 
 let pollTimer = null;
 
-const PREVIEW_MAX_DEPTH = 8;
+const PREVIEW_MAX_DEPTH = 10;
 const clock = new THREE.Clock();
 
 async function fetchTiles(lat, lon) {
