@@ -39,6 +39,7 @@ import io
 import json
 import math
 import os
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -59,6 +60,28 @@ log_tex = get_logger("terrain.tex")
 
 COMFY_URL = "http://100.106.176.121:8188"
 _UPSCALER_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "upscaler")
+
+def _env_bool(name, default=False):
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+# SAM-only water mask backend (no heuristic fallback).
+# Fixed to SAM2 for the water-mask service.
+_SAM_MODEL_ID = "facebook/sam2-hiera-small"
+_SAM_POINTS_PER_BATCH = int(os.environ.get("WATER_MASK_SAM_POINTS_PER_BATCH", "64"))
+_SAM_SEED_PRECISION_MIN = float(os.environ.get("WATER_MASK_SAM_SEED_PRECISION_MIN", "0.30"))
+_SAM_EDGE_BOTTOM_MIN = float(os.environ.get("WATER_MASK_SAM_EDGE_BOTTOM_MIN", "0.08"))
+_sam_pipeline = None
+_sam_init_lock = threading.Lock()
+_sam_infer_lock = threading.Lock()
+_sam_supports_points_per_batch = None
+
+
+def water_mask_model_id():
+    return _SAM_MODEL_ID
 
 
 # ---------------------------------------------------------------------------
@@ -140,6 +163,14 @@ def fetch_dataforsyningen_texture(bbox, resolution=256):
     zero_pct = np.mean(dst_arr.max(axis=2) == 0) * 100
     if zero_pct > 50:
         log_tex.warning(f"[DFORSYNINGEN] rejecting {zero_pct:.0f}% zero-fill result (no coverage)")
+        return None, 'no_coverage'
+    # Reject nearly uniform white frames (provider no-data response at coarse scales).
+    white_pct = np.mean(dst_arr.min(axis=2) >= 250) * 100
+    std_val = float(dst_arr.std())
+    if white_pct > 98 and std_val < 2.0:
+        log_tex.warning(
+            f"[DFORSYNINGEN] rejecting white-fill result white={white_pct:.0f}% std={std_val:.2f} (no coverage)"
+        )
         return None, 'no_coverage'
     # Re-encode as JPEG
     img = Image.fromarray(dst_arr)
@@ -331,69 +362,159 @@ def _flood_connected(seed, passable):
     return out
 
 
+def _get_sam_pipeline():
+    global _sam_pipeline
+    if _sam_pipeline is not None:
+        return _sam_pipeline
+    with _sam_init_lock:
+        if _sam_pipeline is None:
+            from transformers import pipeline as hf_pipeline
+
+            log_tex.info(f"[WATER MASK][SAM2] loading model={_SAM_MODEL_ID}")
+            base_kwargs = {
+                "task": "mask-generation",
+                "model": _SAM_MODEL_ID,
+                "device": "cpu",
+            }
+            try:
+                _sam_pipeline = hf_pipeline(use_fast=True, **base_kwargs)
+            except Exception as exc:
+                msg = str(exc).lower()
+                if "use_fast" not in msg and "fast image processor" not in msg:
+                    raise
+                log_tex.warning(
+                    f"[WATER MASK][SAM2] model={_SAM_MODEL_ID} does not support use_fast; "
+                    "retrying without use_fast"
+                )
+                _sam_pipeline = hf_pipeline(**base_kwargs)
+    return _sam_pipeline
+
+
+def _run_sam_mask_generation(pipe, tex):
+    global _sam_supports_points_per_batch
+    if _sam_supports_points_per_batch is not False:
+        try:
+            out = pipe(tex, points_per_batch=_SAM_POINTS_PER_BATCH)
+            _sam_supports_points_per_batch = True
+            return out
+        except Exception as exc:
+            msg = str(exc).lower()
+            if "points_per_batch" not in msg and "unexpected keyword" not in msg:
+                raise
+            _sam_supports_points_per_batch = False
+            log_tex.warning(
+                "[WATER MASK][SAM2] points_per_batch unsupported by current pipeline; "
+                "retrying without it"
+            )
+    return pipe(tex)
+
+
+def _sam_mask_to_bool(mask):
+    arr = mask.detach().cpu().numpy() if hasattr(mask, "detach") else np.asarray(mask)
+    if arr.ndim == 3:
+        arr = arr[:, :, 0]
+    if arr.dtype == np.bool_:
+        return arr
+    if arr.dtype.kind in {"f", "c"}:
+        return arr > 0.5
+    return arr > 0
+
+
+def _water_seed_from_rgb(rgb_u8):
+    rgb = rgb_u8.astype(np.float32) / 255.0
+    r = rgb[:, :, 0]
+    g = rgb[:, :, 1]
+    b = rgb[:, :, 2]
+    mx = np.maximum(np.maximum(r, g), b)
+    mn = np.minimum(np.minimum(r, g), b)
+    sat = (mx - mn) / np.maximum(mx, 1e-6)
+    blue_dom = b - np.maximum(r, g)
+    blue_cyan = b - 0.5 * r - 0.35 * g
+    lum = 0.299 * r + 0.587 * g + 0.114 * b
+    return (np.maximum(blue_dom, blue_cyan) > 0.03) & (sat > 0.03) & (lum < 0.72)
+
+
+def _score_sam_masks(masks, sam_scores, seed, rgb_u8):
+    rgb = rgb_u8.astype(np.float32) / 255.0
+    blue_strength = np.maximum(
+        rgb[:, :, 2] - np.maximum(rgb[:, :, 0], rgb[:, :, 1]),
+        rgb[:, :, 2] - 0.5 * rgb[:, :, 0] - 0.35 * rgb[:, :, 1],
+    )
+    seed_total = int(seed.sum())
+    rows = []
+    for i, m in enumerate(masks):
+        area = int(m.sum())
+        if area <= 0:
+            continue
+        overlap = int((m & seed).sum())
+        precision = overlap / area
+        edge_bottom = float(m[-1, :].mean())
+        blue_mean = float(blue_strength[m].mean())
+        sam = float(sam_scores[i]) if i < len(sam_scores) else 0.0
+        score = 2.2 * precision + 1.0 * edge_bottom + 0.8 * blue_mean + 0.05 * sam
+        rows.append(
+            {
+                "mask_index": i,
+                "area_px": area,
+                "seed_precision": precision,
+                "seed_recall": overlap / max(seed_total, 1),
+                "edge_bottom": edge_bottom,
+                "blue_mean": blue_mean,
+                "sam_score": sam,
+                "water_score": score,
+            }
+        )
+    rows.sort(key=lambda r: r["water_score"], reverse=True)
+    return rows
+
+
 def build_water_mask(texture_jpeg, heightmap, bbox, resolution=256):
-    """Build an L8 water mask, primarily from sea-level connectivity.
+    """Build an L8 water mask using SAM (no heuristic fallback)."""
+    _ = heightmap, bbox  # kept for call signature compatibility
+    tex = Image.open(io.BytesIO(texture_jpeg)).convert("RGB")
+    if tex.size != (resolution, resolution):
+        tex = tex.resize((resolution, resolution), Image.Resampling.BILINEAR)
+    rgb_u8 = np.asarray(tex, dtype=np.uint8)
 
-    Strategy:
-    - Height/slope-first: identify near-sea terrain and require ocean-edge connectivity.
-    - Optional color assist: only broadens passable regions near sea level.
-    - Output: PNG grayscale (0=no water, 255=strong water).
-    """
-    color_score = np.zeros((resolution, resolution), dtype=np.float32)
-    try:
-        tex = Image.open(io.BytesIO(texture_jpeg)).convert("RGB")
-        if tex.size != (resolution, resolution):
-            tex = tex.resize((resolution, resolution), Image.Resampling.BILINEAR)
-        rgb = np.asarray(tex, dtype=np.float32) / 255.0
-        r = rgb[:, :, 0]
-        g = rgb[:, :, 1]
-        b = rgb[:, :, 2]
-        mx = np.maximum(np.maximum(r, g), b)
-        mn = np.minimum(np.minimum(r, g), b)
-        sat = (mx - mn) / np.maximum(mx, 1e-6)
-        blue_dom = b - np.maximum(r, g)
-        blue_score = np.clip((blue_dom - 0.02) / 0.22, 0.0, 1.0)
-        blue_cyan = np.clip((b - 0.5 * r - 0.35 * g) / 0.24, 0.0, 1.0)
-        color_score = np.maximum(blue_score, blue_cyan) * np.clip((sat + 0.05) / 0.35, 0.0, 1.0)
-    except Exception:
-        # Heightmap-only path still works if texture decode fails.
-        pass
+    seed = _water_seed_from_rgb(rgb_u8)
+    pipe = _get_sam_pipeline()
+    with _sam_infer_lock:
+        out = _run_sam_mask_generation(pipe, tex)
 
-    hm = _resample_heightmap(heightmap, resolution)
-    span_x = max(float(bbox[2] - bbox[0]), 1.0)
-    span_y = max(float(bbox[3] - bbox[1]), 1.0)
-    px_x = span_x / max(resolution - 1, 1)
-    px_y = span_y / max(resolution - 1, 1)
-    d_h_dy, d_h_dx = np.gradient(hm, px_y, px_x)
-    slope = np.sqrt(d_h_dx * d_h_dx + d_h_dy * d_h_dy)
+    if isinstance(out, list):
+        if not out:
+            raise RuntimeError("SAM returned empty output list")
+        out = out[0]
+    if not isinstance(out, dict):
+        raise RuntimeError(f"SAM returned unsupported output type: {type(out).__name__}")
 
-    edge_mask = np.zeros((resolution, resolution), dtype=bool)
-    edge_mask[0, :] = True
-    edge_mask[-1, :] = True
-    edge_mask[:, 0] = True
-    edge_mask[:, -1] = True
-    edge_heights = hm[edge_mask]
+    raw_masks = out.get("masks")
+    if raw_masks is None:
+        raise RuntimeError("SAM output missing 'masks'")
+    masks = [_sam_mask_to_bool(m) for m in raw_masks]
+    if not masks:
+        raise RuntimeError("SAM returned no masks")
 
-    # Greenland ocean/fjords are near sea level; clamp anchor to avoid
-    # accidental "all-flat-land-is-water" when edge elevations are high.
-    edge_p10 = float(np.percentile(edge_heights, 10.0))
-    sea_anchor = min(edge_p10, 6.0)
+    scores_tensor = out.get("scores", [])
+    sam_scores = (
+        scores_tensor.detach().cpu().numpy()
+        if hasattr(scores_tensor, "detach")
+        else np.asarray(scores_tensor)
+    )
+    ranked = _score_sam_masks(masks, sam_scores, seed, rgb_u8)
 
-    seed = edge_mask & (hm <= (sea_anchor + 2.5)) & (slope <= 0.14)
-    passable = (hm <= (sea_anchor + 12.0)) & (slope <= 0.40)
+    selected_ids = [
+        int(r["mask_index"])
+        for r in ranked
+        if r["seed_precision"] >= _SAM_SEED_PRECISION_MIN
+        and r["edge_bottom"] >= _SAM_EDGE_BOTTOM_MIN
+    ]
+    water = np.zeros((resolution, resolution), dtype=bool)
+    for idx in selected_ids:
+        water |= masks[idx]
 
-    # Allow color to help along shorelines without becoming the primary signal.
-    passable |= (hm <= (sea_anchor + 18.0)) & (slope <= 0.30) & (color_score >= 0.50)
-
-    connected = _flood_connected(seed, passable)
-
-    # Denoise while preserving narrow fjords.
-    neighbor = _box3_sum(connected.astype(np.float32))
-    connected = (connected & (neighbor >= 2.0)) | (neighbor >= 6.0)
-    softness = np.clip(_box3_sum(connected.astype(np.float32)) / 9.0, 0.0, 1.0)
-    mask_u8 = np.clip(softness * 255.0, 0, 255).astype(np.uint8)
-
-    coverage = float(np.mean(mask_u8 >= 128))
+    mask_u8 = (water.astype(np.uint8) * 255).astype(np.uint8)
+    coverage = float(np.mean(water))
     buf = io.BytesIO()
     Image.fromarray(mask_u8, mode="L").save(buf, format="PNG", optimize=True)
     return buf.getvalue(), coverage

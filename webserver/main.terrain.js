@@ -1159,9 +1159,15 @@ let lastFetchX = 0, lastFetchY = 0;
 let _lastFetchTriggerMs = 0;
 let fetching = false;
 let isFirstLoad = true;
+let _loadPass = 1;  // 1 = preview (low-LOD), 2 = full-depth
 let bootFetchLogged = false;
 let currentTileIds = new Set();
 let lastTiles = null;
+let _hmMissing = 0;   // heightmaps the server hasn't started
+let _hmDownloading = 0; // heightmaps the server is fetching
+let _srvTexFetching = 0;   // server-side: textures being fetched from dataforsyningen
+let _srvTexRetry = 0;      // server-side: textures in retry queue (rate-limited)
+let _srvTexStatus = {};    // server-side: {ready, ancestor_fallback, fetching, missing}
 
 function paramNumber(name, fallback) {
   const raw = params.get(name);
@@ -2597,6 +2603,7 @@ function updateVehicleFollowCamera() {
 
 function setVehicleControlActive(nextActive, reason = 'manual', options = {}) {
   const { skipExitSave = false } = options;
+  driftMode = false;
   const requested = Boolean(nextActive);
   if (requested && (!vehicleLoaded || controls.mapMode)) {
     return false;
@@ -4258,12 +4265,15 @@ const texSource = new Map();
 const texInflight = new Map();
 const texFetching = new Set();
 const texRetryAtMs = new Map();
+const texRetryCount = new Map();  // tid -> number of consecutive 202 retries
 const waterMaskCache = new Map();
 const waterMaskInflight = new Map();
 const ENABLE_WATER_MASKS = false;
 const TEX_MAX = 120; // max concurrent HTTP texture requests (texFetching 202s don't count)
-const TEX_RETRY_202_MS = 1200;
+const TEX_RETRY_202_BASE_MS = 2000;   // initial 202 retry delay
+const TEX_RETRY_202_MAX_MS = 30000;   // cap backoff at 30s
 const TEX_RETRY_ERROR_MS = 3000;
+const TEX_REPOLL_BATCH = 8;           // max 202 re-polls fired per frame
 const _ancestorLogged = new Set();
 let _texV = Date.now();
 
@@ -4391,12 +4401,15 @@ function updateTextures(tiles) {
   // texFetching (202 server-pending). Previously texFetching counted too,
   // which starved close tiles when many distant tiles were server-pending.
   const nowMs = performance.now();
+  let repollBudget = TEX_REPOLL_BATCH; // limit 202 re-polls per frame
   for (const { tile } of scored) {
     if (texInflight.size >= TEX_MAX) break;
     if (texCache.has(tile.id) || texInflight.has(tile.id)) continue;
     if (texFetching.has(tile.id)) {
       const pendingRetryAt = texRetryAtMs.get(tile.id) ?? 0;
       if (pendingRetryAt > nowMs) continue;
+      if (repollBudget <= 0) continue;  // don't remove from texFetching if no budget
+      repollBudget--;
       texFetching.delete(tile.id);
     }
     const retryAt = texRetryAtMs.get(tile.id) ?? 0;
@@ -4413,9 +4426,12 @@ function updateTextures(tiles) {
       .then(r => {
         texInflight.delete(tid);
         if (r.status === 202) {
-          tileLog(tid, 'fetch -> 202 (server fetching)');
+          const n = (texRetryCount.get(tid) || 0) + 1;
+          texRetryCount.set(tid, n);
+          const delay = Math.min(TEX_RETRY_202_BASE_MS * Math.pow(1.5, n - 1), TEX_RETRY_202_MAX_MS);
+          tileLog(tid, `fetch -> 202 (server fetching, retry #${n} in ${(delay/1000).toFixed(1)}s)`);
           texFetching.add(tid);
-          texRetryAtMs.set(tid, performance.now() + TEX_RETRY_202_MS);
+          texRetryAtMs.set(tid, performance.now() + delay);
           return;
         }
         if (!r.ok) {
@@ -4436,9 +4452,13 @@ function updateTextures(tiles) {
             tex.colorSpace = THREE.SRGBColorSpace;
             tex.needsUpdate = true;
             if (isAncestorCrop) {
-              tileLog(tid, `ancestor crop from ${ancestorHeader} — not caching, will retry`);
+              const n = (texRetryCount.get(tid) || 0) + 1;
+              texRetryCount.set(tid, n);
+              const delay = Math.min(TEX_RETRY_202_BASE_MS * Math.pow(1.5, n - 1), TEX_RETRY_202_MAX_MS);
+              tileLog(tid, `ancestor crop from ${ancestorHeader} — placeholder applied, retry #${n} in ${(delay/1000).toFixed(1)}s`);
               _ancestorLogged.add(tid);
-              texRetryAtMs.set(tid, performance.now() + TEX_RETRY_202_MS);
+              texFetching.add(tid);
+              texRetryAtMs.set(tid, performance.now() + delay);
               // Apply ancestor texture as placeholder (don't cache — will re-fetch for sharp version)
               let mesh = null;
               for (const child of terrainRoot.children) {
@@ -4449,6 +4469,7 @@ function updateTextures(tiles) {
               }
             } else {
               _ancestorLogged.delete(tid);
+              texRetryCount.delete(tid);
               texCache.set(tid, tex);
               texSource.set(tid, texSrc);
               requestWaterMask(tid);
@@ -4939,12 +4960,16 @@ async function fetchTiles(lat, lon) {
     lastFetchX = camStereoX;
     lastFetchY = camStereoY;
 
-    const nm = (data.missing || []).length;
-    const nd = (data.downloading || []).length;
+    const nm = _hmMissing = (data.missing || []).length;
+    const nd = _hmDownloading = (data.downloading || []).length;
     const texInFlight = (data.texFetching || 0);
+    _srvTexFetching = data.texFetching || 0;
+    _srvTexRetry = data.texRetryQueue || 0;
+    _srvTexStatus = data.texStatusCounts || {};
 
     if (pollTimer) clearTimeout(pollTimer);
     if (wasFirstLoad) {
+      _loadPass = 2;
       // Preview pass done — immediately fetch full-depth tiles.
       // The normal eviction/replacement logic will upgrade the low-LOD
       // preview tiles as higher-detail children arrive with textures.
@@ -5388,7 +5413,7 @@ function updateMovement(dt) {
     controls.speed = Math.min(controls.speed + ACCEL * dt, MAX_SPEED);
   } else if (backPressed) {
     controls.speed = Math.max(controls.speed - ACCEL * dt, -MAX_SPEED);
-  } else {
+  } else if (!driftMode) {
     if (controls.speed > 0) {
       controls.speed = Math.max(controls.speed - BRAKE * dt, 0);
     } else if (controls.speed < 0) {
@@ -5469,14 +5494,40 @@ function updateHud() {
   const deg = (((-headingForHud * 180) / Math.PI) % 360 + 360) % 360;
   const dirs = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW'];
   const compass = dirs[Math.round(deg / 45) % 8];
-  let texLine = `tiles: ${currentTileIds.size}  tex: ${texCache.size}`;
+  // Heightmap line — always present, stable width
+  const hmPending = _hmMissing + _hmDownloading;
+  const passLabel = _loadPass === 1
+    ? '<span style="color:#ff0">PASS 1 (preview)</span>'
+    : '<span style="color:#8f8">PASS 2 (full)</span>';
+  const hmLine = `${passLabel}  hm: ${currentTileIds.size} tiles`
+    + (hmPending > 0
+      ? `  <span style="color:#fc8">${_hmDownloading} downloading  ${_hmMissing} queued</span>`
+      : '');
+
+  // Texture line: client fetch status + server-side pipeline
+  const srvReady = _srvTexStatus.ready || 0;
+  const srvFetching = _srvTexStatus.fetching || 0;
+  const srvMissing = _srvTexStatus.missing || 0;
+  const srvAncestor = _srvTexStatus.ancestor_fallback || 0;
+  let texLine = `tex: ${texCache.size} cached`;
+  // Client fetch pipeline
+  if (texInflight.size > 0 || texFetching.size > 0) {
+    texLine += `  <span style="color:#8cf">http: ${texInflight.size}</span>`;
+    texLine += `  <span style="color:#fc8">poll: ${texFetching.size}</span>`;
+  }
+  // Server-side pipeline — show when there's work happening
+  if (_srvTexFetching > 0 || _srvTexRetry > 0 || srvMissing > 0) {
+    texLine += `  <span style="color:#f8c">srv: ${_srvTexFetching} fetching</span>`;
+    if (_srvTexRetry > 0) texLine += `  <span style="color:#f66">${_srvTexRetry} retry</span>`;
+    if (srvMissing > 0) texLine += `  <span style="color:#999">${srvMissing} missing</span>`;
+  }
   const es = _enhanceStatus;
   const enhDone = es.done || 0;
   const enhTotal = es.total || 0;
   const enhInProg = es.in_progress || 0;
   const enhEligible = es.eligible || 0;
   if (enhTotal > 0) {
-    const pct = enhTotal > 0 ? Math.round(enhDone / enhTotal * 100) : 0;
+    const pct = Math.round(enhDone / enhTotal * 100);
     let enhParts = [];
     if (enhInProg > 0) enhParts.push(`<span style="color:#f8c">${enhInProg} upscaling</span>`);
     enhParts.push(`<span style="color:#8f8">${enhDone}/${enhTotal} enhanced (${pct}%)</span>`);
@@ -5518,6 +5569,7 @@ function updateHud() {
     `mode: <b>${modeHtml}</b>`,
     `enu: E ${eastM.toFixed(0)}m  N ${northM.toFixed(0)}m  U ${altM.toFixed(0)}m`,
     `speed: ${speedKmh.toFixed(0)} km/h  heading: ${deg.toFixed(0)}° ${compass}`,
+    hmLine,
     texLine,
     vehicleControlActive
       ? 'W/S drive, A/D steer, mouse orbit camera, Esc exits vehicle control'
@@ -5567,6 +5619,7 @@ function resetView() {
   updateHud();
   // Re-fetch tiles at Nuuk anchor
   isFirstLoad = true;
+  _loadPass = 1;
   originX = 0; originY = 0;
   camStereoX = 0; camStereoY = 0;
   lastFetchX = 0; lastFetchY = 0;
@@ -5574,9 +5627,23 @@ function resetView() {
   fetchTiles(centerLat, centerLon);
 }
 
+let driftMode = false;
+let _lastForwardTapTime = 0;
+const DOUBLE_TAP_MS = 300;
+
 window.addEventListener('keydown', event => {
   if (event.target.tagName === 'TEXTAREA' || event.target.tagName === 'INPUT') return;
   controls.keys[event.code] = true;
+  if ((event.code === 'KeyW' || event.code === 'ArrowUp') && !event.repeat) {
+    const now = performance.now();
+    if (now - _lastForwardTapTime < DOUBLE_TAP_MS) {
+      driftMode = !driftMode;
+      console.log(`[drift] ${driftMode ? 'ON' : 'OFF'}`);
+      _lastForwardTapTime = 0;
+    } else {
+      _lastForwardTapTime = now;
+    }
+  }
   if (event.code === 'Escape' && !event.repeat) {
     if (vehicleControlActive) {
       saveVehicleState('escape', {
@@ -5591,6 +5658,7 @@ window.addEventListener('keydown', event => {
   }
   if (event.code === 'KeyM' && !event.repeat) {
     controls.mapMode = !controls.mapMode;
+    driftMode = false;
     if (controls.mapMode) {
       setVehicleControlActive(false, 'map-mode');
     }
