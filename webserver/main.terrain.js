@@ -4765,7 +4765,7 @@ const PREVIEW_MAX_DEPTH = 10;
 const clock = new THREE.Clock();
 
 async function fetchTiles(lat, lon) {
-  if (fetching) return;
+  if (fetching) { enqueueClientLog('debug', 'fetchTiles.skip', { reason: 'already fetching' }); return; }
   fetching = true;
   try {
     const t0 = performance.now();
@@ -4780,8 +4780,12 @@ async function fetchTiles(lat, lon) {
     } else {
       url = `/api/tiles?lat=${fetchLat}&lon=${fetchLon}&ox=${originX}&oy=${originY}&alt=${fetchAlt}&heading=${heading}&range=${_terrainRange}`;
     }
+    enqueueClientLog('info', 'fetchTiles.request', { pass: _loadPass, isFirstLoad, lat: fetchLat, lon: fetchLon });
     const resp = await fetch(url);
     const data = await resp.json();
+    const withHm = data.tiles.filter(t => t.heightmap).length;
+    const noHm = data.tiles.length - withHm;
+    enqueueClientLog('info', 'fetchTiles.response', { pass: _loadPass, status: resp.status, tiles: data.tiles.length, withHm, noHm, missing: data.missing?.length ?? 0, downloading: data.downloading?.length ?? 0 });
     if (!bootFetchLogged) {
       bootFetchLogged = true;
       bootLog('tiles.initial-fetch.response', {
@@ -4825,20 +4829,22 @@ async function fetchTiles(lat, lon) {
       if (t.id && t.bbox) tileBboxMap.set(t.id, t.bbox);
     }
 
-    // Evict stale meshes: remove any mesh not in the current tile set.
-    // Keep textured (or vertex-colored) stale parents visible until ALL
-    // overlapping children have cached textures, to avoid visible gaps
-    // during the preview→full-depth transition and in areas with
-    // incomplete tile coverage.
+    // Evict stale meshes: remove any mesh not in the current tile set,
+    // BUT only once every overlapping child has a cached texture.
+    // This keeps heightmap ridgelines (and textured parents) visible
+    // during the preview→full-depth transition instead of flashing to void.
     const staleToRemove = [];
     for (const child of terrainRoot.children) {
       if (!child.isMesh) continue;
       const tid = child.userData.tileId;
       if (!tid) continue;
       if (!newIds.has(tid)) {
-        if (!child.material || (!child.material.map && !child.material.vertexColors)) {
-          staleToRemove.push(child);
-        } else {
+        // NEVER purge a heightmap mesh just because it has no texture.
+        // Those dark ridges in the distance are the only terrain visual
+        // until higher-depth children arrive with textures.  Treat ALL
+        // stale meshes (textured or not) the same: keep them visible
+        // until every overlapping child has a cached texture.
+        {
           const sb = child.userData.bbox;
           if (sb) {
             let coveredByChildren = true;
@@ -4878,6 +4884,8 @@ async function fetchTiles(lat, lon) {
       if (c.geometry) c.geometry.dispose();
       if (c.material) c.material.dispose();
     }
+
+    enqueueClientLog('info', 'fetchTiles.diff', { pass: _loadPass, added: added.length, removed: removed.length, purgedDeferred: purged, sceneMeshes: terrainRoot.children.filter(c => c.isMesh).length });
 
     if (added.length > 0) {
       const existingIds = new Set();
@@ -4949,6 +4957,9 @@ async function fetchTiles(lat, lon) {
       }
     }
 
+    const meshesAfter = terrainRoot.children.filter(c => c.isMesh).length;
+    enqueueClientLog('info', 'fetchTiles.built', { pass: _loadPass, meshesInScene: meshesAfter, deferred: deferredTiles.size, staleRemoved: staleToRemove.length });
+
     updateTextures(data.tiles);
     markMissing(data.missing || [], data.downloading || []);
     lastTiles = data.tiles;
@@ -4978,7 +4989,9 @@ async function fetchTiles(lat, lon) {
         elapsedMs: Number((performance.now() - t0).toFixed(1))
       });
       fetching = false;
-      fetchTiles();
+      // DEBUG: Pass 2 disabled — sitting on Pass 1 only to verify
+      // preview tiles actually render.
+      // requestAnimationFrame(() => fetchTiles());
       return;
     } else if (nd > 0 || nm > 0 || texInFlight > 0) {
       pollTimer = setTimeout(() => fetchTiles(), 3000);
@@ -5578,7 +5591,7 @@ function updateHud() {
     controls.mapMode
       ? `ocean overlay: ${oceanMapDebugEnabled ? 'ON' : 'OFF'}  (right-click menu; cyan=ocean, magenta=seed, orange=passable)`
       : '',
-    'M map mode, R reset'
+    'M map mode, R reset · <a href="/api/client_log/view" target="_blank" style="color:#0af">debug log</a>'
   ].join('<br>');
   alt.textContent =
     `${altM.toFixed(0)}m / ${(altM * 3.28084).toFixed(0)}ft  ${deg.toFixed(0)}° ${compass}` +
