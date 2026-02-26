@@ -18,6 +18,8 @@ from logging import FileHandler
 from pathlib import Path
 from typing import Any, cast
 
+import asyncio
+
 from colored_log import get_logger
 from terrain_config import BOOTSTRAP_SEED_DEPTH, ENHANCE_DEPTH
 
@@ -69,6 +71,9 @@ def _env_int(name: str, default: int) -> int:
 # In-memory ring buffer of raw client log entries for the HTML viewer.
 _client_log_ring = []        # list of dicts
 _CLIENT_LOG_RING_MAX = 2000
+_ws_clients: set = set()       # active async websocket connections
+_ws_loop: asyncio.AbstractEventLoop | None = None  # set when ws server starts
+_ws_queue: asyncio.Queue | None = None             # set when ws server starts
 
 _client_log = logging.getLogger("terrain.client")
 if not _client_log.handlers:
@@ -1799,6 +1804,7 @@ def api_client_log():
     _client_log_ring.append(payload)
     if len(_client_log_ring) > _CLIENT_LOG_RING_MAX:
       del _client_log_ring[:len(_client_log_ring) - _CLIENT_LOG_RING_MAX]
+    _broadcast_client_log(payload)
     written += 1
 
   return jsonify(
@@ -1815,6 +1821,59 @@ def api_client_log():
 def api_client_log_ring():
   """Raw JSON dump of the ring buffer for debugging."""
   return jsonify({"count": len(_client_log_ring), "entries": _client_log_ring[-50:]})
+
+
+def _broadcast_client_log(payload: dict) -> None:
+  """Push a log entry to all connected websocket viewers (thread-safe)."""
+  if _ws_loop is None or _ws_queue is None:
+    return
+  msg = json.dumps(payload, ensure_ascii=False, default=str)
+  _ws_loop.call_soon_threadsafe(_ws_queue.put_nowait, msg)
+
+
+async def _ws_broadcaster() -> None:
+  """Async task that pulls from the queue and sends to all ws clients."""
+  import websockets
+  while True:
+    msg = await _ws_queue.get()
+    dead = set()
+    for ws in list(_ws_clients):
+      try:
+        await ws.send(msg)
+      except Exception:
+        dead.add(ws)
+    for ws in dead:
+      _ws_clients.discard(ws)
+
+
+async def _ws_handler(websocket) -> None:
+  log.info(f"[WS] client connected, total={len(_ws_clients) + 1}")
+  _ws_clients.add(websocket)
+  try:
+    await websocket.wait_closed()
+  except Exception:
+    pass
+  finally:
+    _ws_clients.discard(websocket)
+    log.info(f"[WS] client disconnected, total={len(_ws_clients)}")
+
+
+def _start_ws_server(host: str, port: int) -> None:
+  """Run the async websocket server in a background thread."""
+  import websockets
+
+  global _ws_loop, _ws_queue
+
+  async def _serve():
+    global _ws_loop, _ws_queue
+    _ws_loop = asyncio.get_running_loop()
+    _ws_queue = asyncio.Queue()
+    asyncio.create_task(_ws_broadcaster())
+    async with websockets.serve(_ws_handler, host, port, compression=None):
+      log.info(f"WebSocket server listening on ws://{host}:{port}")
+      await asyncio.Future()  # run forever
+
+  asyncio.run(_serve())
 
 
 @app.get("/api/health/terrain")
@@ -1873,4 +1932,7 @@ if __name__ == "__main__":
     raise SystemExit(f"Backend init failed: {_backend_error}")
   host = os.environ.get("FLASK_HOST", "127.0.0.1")
   port = int(os.environ.get("FLASK_PORT", "5180"))
+  ws_port = int(os.environ.get("WS_PORT", "5181"))
+  ws_thread = threading.Thread(target=_start_ws_server, args=(host, ws_port), daemon=True)
+  ws_thread.start()
   app.run(host=host, port=port, debug=False)

@@ -1,4 +1,5 @@
 Flask
+websockets
 pydantic>=2,<3
 numpy
 pyproj

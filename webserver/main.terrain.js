@@ -454,6 +454,20 @@ hud.style.cssText = [
   'z-index:5'
 ].join(';');
 document.body.appendChild(hud);
+hud.addEventListener('mousedown', e => {
+  if (e.target.id === 'debugLogLink') {
+    e.stopPropagation();
+    e.preventDefault();
+    console.log('[HUD] debug log link clicked');
+    window.open('/client_log.html', '_blank');
+  }
+});
+hud.addEventListener('click', e => {
+  if (e.target.id === 'debugLogLink') {
+    e.stopPropagation();
+    e.preventDefault();
+  }
+});
 
 const alt = document.createElement('div');
 alt.style.cssText = [
@@ -5811,7 +5825,7 @@ function updateHud() {
     controls.mapMode
       ? `ocean overlay: ${oceanMapDebugEnabled ? 'ON' : 'OFF'}  (right-click menu; cyan=ocean, magenta=seed, orange=passable)`
       : '',
-    'M map mode, R reset · <a href="/api/client_log/view" target="_blank" style="color:#0af">debug log</a>'
+    'M map mode, R reset · <span id="debugLogLink" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">debug log</span>'
   ].join('<br>');
   alt.textContent =
     `${altM.toFixed(0)}m / ${(altM * 3.28084).toFixed(0)}ft  ${deg.toFixed(0)}° ${compass}` +

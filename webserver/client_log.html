@@ -17,6 +17,8 @@
   .phase { color: #f0f; font-weight: bold; }
   .count { color: #0ff; }
   .paused { color: #f44; }
+  .ws-live { color: #0f0; }
+  .ws-dead { color: #f44; }
 </style></head><body>
 <h1>Client Debug Log</h1>
 <div class="controls">
@@ -24,12 +26,15 @@
   <input id="filter" placeholder="filter phase..." size="20">
   <a class="btn" onclick="clearLog()">clear</a>
   <a class="btn" onclick="togglePause()" id="pauseBtn">pause</a>
+  <span id="wsStatus"></span>
   <span id="status"></span>
 </div>
 <table><thead id="thead"><tr><th>time</th><th>phase</th><th>mode</th></tr></thead>
 <tbody id="tbody"></tbody></table>
 <script>
 let paused = false;
+const entries = [];
+const MAX_ENTRIES = 200;
 const seenDetailKeys = [];
 const seenKeySet = new Set();
 
@@ -39,7 +44,8 @@ function togglePause() {
   document.getElementById('pauseBtn').className = paused ? 'btn paused' : 'btn';
 }
 function clearLog() {
-  document.getElementById('tbody').innerHTML = '';
+  entries.length = 0;
+  render();
 }
 function fmtVal(v) {
   if (v == null) return '';
@@ -52,45 +58,85 @@ function fmtTime(ts) {
   return ts.split('T')[1].substring(0, 12);
 }
 
-async function poll() {
-  if (paused) return;
+function discoverKeys(entry) {
+  for (const k of Object.keys(entry.details || {})) {
+    if (!seenKeySet.has(k)) { seenKeySet.add(k); seenDetailKeys.push(k); }
+  }
+}
+
+function render() {
+  const filter = document.getElementById('filter').value.trim().toLowerCase();
+  let visible = entries;
+  if (filter) visible = entries.filter(e => (e.phase || '').toLowerCase().includes(filter));
+
+  document.getElementById('thead').innerHTML = '<tr><th>time</th><th>phase</th><th>mode</th>' +
+    seenDetailKeys.map(k => '<th>' + k + '</th>').join('') + '</tr>';
+
+  const tbody = document.getElementById('tbody');
+  tbody.innerHTML = '';
+  for (let i = visible.length - 1; i >= 0; i--) {
+    const e = visible[i];
+    const d = e.details || {};
+    const tr = document.createElement('tr');
+    tr.innerHTML = '<td>' + fmtTime(e.ts) + '</td>' +
+      '<td class="phase">' + (e.phase || '') + '</td>' +
+      '<td>' + (e.sceneMode || '') + '</td>' +
+      seenDetailKeys.map(k => '<td>' + fmtVal(d[k]) + '</td>').join('');
+    tbody.appendChild(tr);
+  }
+  document.getElementById('count').textContent = visible.length + ' entries';
+}
+
+function addEntry(entry) {
+  discoverKeys(entry);
+  entries.push(entry);
+  if (entries.length > MAX_ENTRIES) entries.splice(0, entries.length - MAX_ENTRIES);
+  if (!paused) render();
+}
+
+// --- Initial load from ring buffer, then switch to websocket push ---
+
+async function loadInitial() {
   try {
     const resp = await fetch('/api/client_log/ring');
     const data = await resp.json();
-    const filter = document.getElementById('filter').value.trim().toLowerCase();
-    let entries = data.entries || [];
-    if (filter) entries = entries.filter(e => (e.phase || '').toLowerCase().includes(filter));
-
-    // Discover detail keys
-    for (const e of entries) {
-      for (const k of Object.keys(e.details || {})) {
-        if (!seenKeySet.has(k)) { seenKeySet.add(k); seenDetailKeys.push(k); }
-      }
+    for (const e of (data.entries || [])) {
+      discoverKeys(e);
+      entries.push(e);
     }
-
-    // Rebuild header
-    document.getElementById('thead').innerHTML = '<tr><th>time</th><th>phase</th><th>mode</th>' +
-      seenDetailKeys.map(k => '<th>' + k + '</th>').join('') + '</tr>';
-
-    // Rebuild rows (newest first)
-    const tbody = document.getElementById('tbody');
-    tbody.innerHTML = '';
-    for (let i = entries.length - 1; i >= 0; i--) {
-      const e = entries[i];
-      const d = e.details || {};
-      const tr = document.createElement('tr');
-      tr.innerHTML = '<td>' + fmtTime(e.ts) + '</td>' +
-        '<td class="phase">' + (e.phase || '') + '</td>' +
-        '<td>' + (e.sceneMode || '') + '</td>' +
-        seenDetailKeys.map(k => '<td>' + fmtVal(d[k]) + '</td>').join('');
-      tbody.appendChild(tr);
-    }
-    document.getElementById('count').textContent = entries.length + ' entries';
-    document.getElementById('status').textContent = '';
+    render();
   } catch (err) {
-    document.getElementById('status').textContent = 'fetch error: ' + err.message;
+    document.getElementById('status').textContent = 'initial load error: ' + err.message;
   }
 }
-setInterval(poll, 2000);
-poll();
+
+function connectWs() {
+  const url = 'ws://' + location.hostname + ':5181';
+  const ws = new WebSocket(url);
+  const statusEl = document.getElementById('wsStatus');
+
+  ws.onopen = () => {
+    statusEl.textContent = 'live';
+    statusEl.className = 'ws-live';
+    document.getElementById('status').textContent = '';
+  };
+
+  ws.onmessage = (evt) => {
+    try {
+      addEntry(JSON.parse(evt.data));
+    } catch (e) { /* ignore */ }
+  };
+
+  ws.onclose = () => {
+    statusEl.textContent = 'reconnecting...';
+    statusEl.className = 'ws-dead';
+    setTimeout(connectWs, 2000);
+  };
+
+  ws.onerror = () => {
+    ws.close();
+  };
+}
+
+loadInitial().then(connectWs);
 </script></body></html>
