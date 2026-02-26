@@ -865,6 +865,212 @@ function tuningSliderSetValue(label, v) {
   def.inp.value = v;
   if (def.valSpan) def.valSpan.textContent = def.fmt(v);
 }
+// ── Google Maps Panel (toggle with G) ─────────────────────────────────────────
+let gmapsPanelOpen = false;
+let gmapsPanelMinimized = false;
+let _gmapsLastLat = null;
+let _gmapsLastLon = null;
+const GMAPS_UPDATE_INTERVAL = 1500; // ms between iframe updates while moving
+let _gmapsLastUpdate = 0;
+let _gmapsActiveTab = 0;
+
+const gmapsPanel = document.createElement('div');
+gmapsPanel.style.cssText = [
+  'position:absolute',
+  'bottom:50px',
+  'left:12px',
+  'width:420px',
+  'background:rgba(10,16,24,0.95)',
+  'border:1px solid #2a3a4a',
+  'border-radius:8px',
+  'overflow:hidden',
+  'z-index:20',
+  'display:none',
+  'font:12px/1.4 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace',
+  'color:#dbe5f1',
+  'box-shadow:0 4px 24px rgba(0,0,0,0.7)'
+].join(';');
+
+// Make panel draggable via header
+(function makeDraggable(panel) {
+  let dragging = false, ox = 0, oy = 0;
+  panel.querySelector && panel.addEventListener('mousedown', e => {
+    if (e.target.closest('#gmap-drag-handle')) {
+      dragging = true;
+      const r = panel.getBoundingClientRect();
+      ox = e.clientX - r.left;
+      oy = e.clientY - r.top;
+      e.preventDefault();
+    }
+  });
+  document.addEventListener('mousemove', e => {
+    if (!dragging) return;
+    panel.style.left = (e.clientX - ox) + 'px';
+    panel.style.top  = (e.clientY - oy) + 'px';
+    panel.style.bottom = 'auto';
+    panel.style.right  = 'auto';
+  });
+  document.addEventListener('mouseup', () => { dragging = false; });
+})(gmapsPanel);
+
+// Header (draggable handle)
+const gmapsHeader = document.createElement('div');
+gmapsHeader.id = 'gmap-drag-handle';
+gmapsHeader.style.cssText = 'display:flex;align-items:center;gap:6px;padding:7px 10px;background:rgba(255,255,255,0.06);cursor:grab;user-select:none';
+gmapsHeader.innerHTML = `
+  <span style="flex:1;font-weight:bold;color:#5af">&#x1F5FA; Maps  <span style="font-size:10px;color:#6889a8;font-weight:normal">(drag to move)</span></span>
+  <button id="gmap-min" title="Minimize" style="background:none;border:none;color:#8aa;cursor:pointer;font-size:14px;padding:0 4px">&#x2212;</button>
+  <button id="gmap-close" title="Close (G)" style="background:none;border:none;color:#8aa;cursor:pointer;font-size:14px;padding:0 4px">&#x2715;</button>
+`;
+gmapsPanel.appendChild(gmapsHeader);
+
+// Nav input row
+const gmapsNavRow = document.createElement('div');
+gmapsNavRow.id = 'gmap-nav-row';
+gmapsNavRow.style.cssText = 'display:flex;gap:6px;padding:7px 10px;border-bottom:1px solid #1e2d3a';
+gmapsNavRow.innerHTML = `
+  <input id="gmap-input" type="text" placeholder="Paste lat, lon  e.g. 64.18, -51.70"
+    style="flex:1;background:rgba(255,255,255,0.07);border:1px solid #2a3a4a;border-radius:4px;
+           color:#dbe5f1;padding:4px 8px;font:12px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;outline:none" />
+  <button id="gmap-go"
+    style="background:#1a3a5a;border:1px solid #2a5a8a;border-radius:4px;color:#5af;
+           padding:4px 12px;cursor:pointer;font:12px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace">Go</button>
+`;
+gmapsPanel.appendChild(gmapsNavRow);
+
+// Tab bar
+const gmapsTabBar = document.createElement('div');
+gmapsTabBar.id = 'gmap-tab-row';
+gmapsTabBar.style.cssText = 'display:flex;border-bottom:1px solid #1e2d3a;user-select:none';
+['Satellite', 'Map', 'Navigate'].forEach((label, i) => {
+  const tab = document.createElement('div');
+  tab.dataset.gmtab = String(i);
+  tab.textContent = label;
+  tab.style.cssText = `flex:1;text-align:center;padding:5px 0;cursor:pointer;font-size:11px;color:${i === 0 ? '#5af' : '#6889a8'};border-bottom:${i === 0 ? '2px solid #5af' : '2px solid transparent'}`;
+  tab.addEventListener('click', () => {
+    document.querySelectorAll('[data-gmtab]').forEach(t => {
+      t.style.color = '#6889a8'; t.style.borderBottom = '2px solid transparent';
+    });
+    tab.style.color = '#5af'; tab.style.borderBottom = '2px solid #5af';
+    _gmapsActiveTab = i;
+    _gmapsLastLat = null; // force refresh
+    _gmapsForceUpdate();
+  });
+  gmapsTabBar.appendChild(tab);
+});
+gmapsPanel.appendChild(gmapsTabBar);
+
+// iframe container
+const gmapsIframeWrap = document.createElement('div');
+gmapsIframeWrap.style.cssText = 'width:100%;height:320px';
+const gmapsIframe = document.createElement('iframe');
+gmapsIframe.style.cssText = 'width:100%;height:100%;border:none;display:block';
+gmapsIframe.setAttribute('loading', 'eager');
+gmapsIframeWrap.appendChild(gmapsIframe);
+gmapsPanel.appendChild(gmapsIframeWrap);
+
+document.body.appendChild(gmapsPanel);
+
+function _gmapsBuildUrl(lat, lon) {
+  if (_gmapsActiveTab === 0) {
+    return `https://maps.google.com/maps?q=${lat},${lon}&t=k&z=16&output=embed`;
+  } else if (_gmapsActiveTab === 1) {
+    return `https://maps.google.com/maps?q=${lat},${lon}&t=m&z=16&output=embed`;
+  } else {
+    return `/mapview.html?lat=${lat}&lon=${lon}&t=k`;
+  }
+}
+
+function _gmapsForceUpdate() {
+  const camLL = getCameraLatLon();
+  const lat = camLL.lat.toFixed(6);
+  const lon = camLL.lon.toFixed(6);
+  gmapsIframe.src = _gmapsBuildUrl(lat, lon);
+  _gmapsLastLat = lat;
+  _gmapsLastLon = lon;
+  _gmapsLastUpdate = performance.now();
+}
+
+function _gmapsNavigateTo(lat, lon) {
+  if (!Number.isFinite(lat) || !Number.isFinite(lon)) return;
+  const dLat = lat - centerLat;
+  const dLon = lon - centerLon;
+  const eM = dLon * 111320 * Math.cos(centerLat * Math.PI / 180);
+  const nM = dLat * 111320;
+  const alt = getCameraLatLon().alt;
+  camera.position.copy(anchorPosition)
+    .addScaledVector(east, eM)
+    .addScaledVector(north, nM)
+    .addScaledVector(up, Math.max(50, alt));
+  applyCameraOrientation();
+  fetchTiles(lat, lon);
+  _gmapsLastLat = null;
+  _gmapsLastUpdate = 0; // force immediate re-center on next render cycle
+}
+
+function toggleGmapsPanel(forceState) {
+  gmapsPanelOpen = forceState !== undefined ? forceState : !gmapsPanelOpen;
+  gmapsPanel.style.display = gmapsPanelOpen ? 'block' : 'none';
+  if (gmapsPanelOpen) {
+    // Always force-reload when opening so tiles request after container is visible
+    _gmapsLastLat = null;
+    _gmapsForceUpdate();
+  }
+}
+
+// Wire up header buttons
+document.getElementById('gmap-min').addEventListener('click', e => {
+  e.stopPropagation();
+  gmapsPanelMinimized = !gmapsPanelMinimized;
+  gmapsNavRow.style.display = gmapsPanelMinimized ? 'none' : '';
+  gmapsTabBar.style.display = gmapsPanelMinimized ? 'none' : '';
+  gmapsIframeWrap.style.display = gmapsPanelMinimized ? 'none' : '';
+  document.getElementById('gmap-min').innerHTML = gmapsPanelMinimized ? '&#x25A1;' : '&#x2212;';
+});
+document.getElementById('gmap-close').addEventListener('click', e => {
+  e.stopPropagation();
+  toggleGmapsPanel(false);
+});
+
+// Wire up Go button + Enter key
+document.getElementById('gmap-go').addEventListener('click', () => {
+  const val = document.getElementById('gmap-input').value.trim();
+  // Match each coordinate token: optional minus, digits, optional decimal, optional N/S/E/W
+  const tokens = [...val.matchAll(/([-]?\d+(?:\.\d+)?)\s*°?\s*([NSEWnsew])?/g)];
+  if (tokens.length >= 2) {
+    let lat = parseFloat(tokens[0][1]);
+    let lon = parseFloat(tokens[1][1]);
+    const latDir = (tokens[0][2] || '').toUpperCase();
+    const lonDir = (tokens[1][2] || '').toUpperCase();
+    if (latDir === 'S') lat = -Math.abs(lat);
+    if (lonDir === 'W') lon = -Math.abs(lon);
+    _gmapsNavigateTo(lat, lon);
+  }
+});
+document.getElementById('gmap-input').addEventListener('keydown', e => {
+  if (e.key === 'Enter') document.getElementById('gmap-go').click();
+  e.stopPropagation(); // prevent WASD etc from firing while typing
+});
+
+// Navigate tab: receive click coords and ready signal from mapview.html iframe
+window.addEventListener('message', e => {
+  if (e.data && e.data.ready) {
+    // Leaflet just finished loading — push current camera position immediately
+    if (_gmapsActiveTab === 2 && gmapsPanelOpen) {
+      const camLL = getCameraLatLon();
+      gmapsIframe.contentWindow?.postMessage({ lat: camLL.lat, lon: camLL.lon }, '*');
+      _gmapsLastLat = camLL.lat.toFixed(4);
+      _gmapsLastLon = camLL.lon.toFixed(4);
+      _gmapsLastUpdate = performance.now();
+    }
+    return;
+  }
+  if (e.data && e.data.nav && e.data.lat != null) {
+    _gmapsNavigateTo(e.data.lat, e.data.lon);
+  }
+});
+// ── end Google Maps Panel ───────────────────────────────────────────────────────
+
 function tuningSectionLabel(text) {
   const d = document.createElement('div');
   d.style.cssText = 'margin:10px 0 4px;font-size:10px;text-transform:uppercase;color:#6889a8;letter-spacing:1px;border-bottom:1px solid #334;padding-bottom:3px';
@@ -5516,6 +5722,7 @@ function updateHud() {
   hud.innerHTML = [
     '<b>Clouds Terrain Managed Flask UX WIP</b>',
     `mode: <b>${modeHtml}</b>`,
+    `lat: ${(centerLat + northM / 111320).toFixed(5)}°  lon: ${(centerLon + eastM / (111320 * Math.cos(centerLat * Math.PI / 180))).toFixed(5)}°  alt: ${altM.toFixed(0)}m`,
     `enu: E ${eastM.toFixed(0)}m  N ${northM.toFixed(0)}m  U ${altM.toFixed(0)}m`,
     `speed: ${speedKmh.toFixed(0)} km/h  heading: ${deg.toFixed(0)}° ${compass}`,
     texLine,
@@ -5588,6 +5795,10 @@ window.addEventListener('keydown', event => {
       controls.keys[event.code] = false;
       return;
     }
+  }
+  if (event.code === 'KeyG' && !event.repeat) {
+    toggleGmapsPanel();
+    return;
   }
   if (event.code === 'KeyM' && !event.repeat) {
     controls.mapMode = !controls.mapMode;
@@ -5853,6 +6064,27 @@ function render() {
   updateMovement(dt);
   applyCameraOrientation();
   updateHud();
+
+  // Update Google Maps panel iframe if open and position changed enough
+  if (gmapsPanelOpen && !gmapsPanelMinimized) {
+    const nowMs = performance.now();
+    const interval = _gmapsActiveTab === 2 ? 200 : GMAPS_UPDATE_INTERVAL;
+    if (nowMs - _gmapsLastUpdate > interval) {
+      const camLL = getCameraLatLon();
+      const lat = camLL.lat.toFixed(4);
+      const lon = camLL.lon.toFixed(4);
+      if (lat !== _gmapsLastLat || lon !== _gmapsLastLon) {
+        if (_gmapsActiveTab === 2) {
+          gmapsIframe.contentWindow?.postMessage({ lat: parseFloat(lat), lon: parseFloat(lon) }, '*');
+        } else {
+          gmapsIframe.src = _gmapsBuildUrl(lat, lon);
+        }
+        _gmapsLastLat = lat;
+        _gmapsLastLon = lon;
+        _gmapsLastUpdate = nowMs;
+      }
+    }
+  }
 
   // Update fog density from slider
   const fogStrength = controls._fogStrength ?? 4.5;
