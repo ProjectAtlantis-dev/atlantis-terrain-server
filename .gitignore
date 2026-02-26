@@ -52,6 +52,7 @@ assetserver/assets.db
 assetserver/assets.db-wal
 assetserver/assets.db-shm
 water_samples/
+sample/
 
 _metadata.json
 

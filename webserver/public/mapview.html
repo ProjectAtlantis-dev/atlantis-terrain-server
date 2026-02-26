@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<style>
+  html, body, #map { margin: 0; padding: 0; width: 100%; height: 100%; background: #000; }
+</style>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+</head>
+<body>
+<div id="map"></div>
+<script>
+const p = new URLSearchParams(location.search);
+const lat = parseFloat(p.get('lat')) || 64.18;
+const lon = parseFloat(p.get('lon')) || -51.70;
+const zoom = parseInt(p.get('z')) || 16;
+const type = p.get('t') || 'k';
+
+const map = L.map('map', { zoomControl: false, attributionControl: true })
+              .setView([lat, lon], zoom);
+
+const tileUrl = type === 'k'
+  ? 'https://mt{s}.google.com/vt/lyrs=s,h&x={x}&y={y}&z={z}'
+  : 'https://mt{s}.google.com/vt/lyrs=m&x={x}&y={y}&z={z}';
+
+L.tileLayer(tileUrl, {
+  subdomains: '0123',
+  attribution: '© Google',
+  maxZoom: 20,
+  crossOrigin: true
+}).addTo(map);
+
+// Parent frame can post { lat, lon } to reposition
+window.addEventListener('message', e => {
+  if (e.data && e.data.lat != null) {
+    map.setView([e.data.lat, e.data.lon], zoom, { animate: false });
+  }
+});
+
+// Click sends nav request to parent (Navigate tab)
+map.on('click', e => {
+  window.parent.postMessage({ nav: true, lat: e.latlng.lat, lon: e.latlng.lng }, '*');
+});
+
+// Tell parent Leaflet is ready — parent will send current camera position
+window.parent.postMessage({ ready: true }, '*');
+</script>
+</body>
+</html>
