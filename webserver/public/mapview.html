@@ -31,20 +31,15 @@ L.tileLayer(tileUrl, {
   crossOrigin: true
 }).addTo(map);
 
-// Crosshair pin at center
-const pin = L.marker([lat, lon]).addTo(map);
-
-// Parent frame can post { lat, lon, t } to reposition
+// Parent frame can post { lat, lon } to reposition
 window.addEventListener('message', e => {
   if (e.data && e.data.lat != null) {
     map.setView([e.data.lat, e.data.lon], zoom, { animate: false });
-    pin.setLatLng([e.data.lat, e.data.lon]);
   }
 });
 
 // Click sends nav request to parent (Navigate tab)
 map.on('click', e => {
-  pin.setLatLng(e.latlng);
   window.parent.postMessage({ nav: true, lat: e.latlng.lat, lon: e.latlng.lng }, '*');
 });
 

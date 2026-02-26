@@ -884,8 +884,13 @@ gmapsPanel.style.cssText = [
   'border:1px solid #2a3a4a',
   'border-radius:8px',
   'overflow:hidden',
+  'resize:both',
+  'min-width:300px',
+  'min-height:200px',
   'z-index:20',
   'display:none',
+  'flex-direction:column',
+  'height:460px',
   'font:12px/1.4 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace',
   'color:#dbe5f1',
   'box-shadow:0 4px 24px rgba(0,0,0,0.7)'
@@ -960,14 +965,21 @@ gmapsTabBar.style.cssText = 'display:flex;border-bottom:1px solid #1e2d3a;user-s
 });
 gmapsPanel.appendChild(gmapsTabBar);
 
-// iframe container
+// iframe container — fills remaining panel height
 const gmapsIframeWrap = document.createElement('div');
-gmapsIframeWrap.style.cssText = 'width:100%;height:320px';
+gmapsIframeWrap.style.cssText = 'flex:1;min-height:0';
 const gmapsIframe = document.createElement('iframe');
 gmapsIframe.style.cssText = 'width:100%;height:100%;border:none;display:block';
 gmapsIframe.setAttribute('loading', 'eager');
 gmapsIframeWrap.appendChild(gmapsIframe);
 gmapsPanel.appendChild(gmapsIframeWrap);
+
+// Disable iframe pointer-events during resize so the drag handle works
+new ResizeObserver(() => {
+  gmapsIframe.style.pointerEvents = 'none';
+  clearTimeout(gmapsPanel._resizeTimer);
+  gmapsPanel._resizeTimer = setTimeout(() => { gmapsIframe.style.pointerEvents = ''; }, 150);
+}).observe(gmapsPanel);
 
 document.body.appendChild(gmapsPanel);
 
@@ -1010,7 +1022,7 @@ function _gmapsNavigateTo(lat, lon) {
 
 function toggleGmapsPanel(forceState) {
   gmapsPanelOpen = forceState !== undefined ? forceState : !gmapsPanelOpen;
-  gmapsPanel.style.display = gmapsPanelOpen ? 'block' : 'none';
+  gmapsPanel.style.display = gmapsPanelOpen ? 'flex' : 'none';
   if (gmapsPanelOpen) {
     // Always force-reload when opening so tiles request after container is visible
     _gmapsLastLat = null;
@@ -5294,9 +5306,10 @@ function updateMapCamera() {
     .addScaledVector(east, rpe)
     .addScaledVector(north, rpn);
   mapCam.position.copy(target).addScaledVector(up, MAP_CAM_ALT);
-  mapCam.up.copy(north);
+  mapCam.up.set(0, 0, 0)
+    .addScaledVector(north, cosY)
+    .addScaledVector(east, -sinY);
   mapCam.lookAt(target);
-  mapCam.rotation.z = controls.yaw;
 }
 
 function disposeObjectMaterial(material) {
@@ -5855,12 +5868,25 @@ window.addEventListener('mousemove', event => {
   if (controls.mapMode) {
     if (controls.dragButton === 2) {
       const panStep = controls.mapZoom * MOUSE_SENS * MAP_PAN_FACTOR;
-      controls.mapPanEast -= event.movementX * panStep;
-      controls.mapPanNorth += event.movementY * panStep;
+      const dx = -event.movementX * panStep;
+      const dy = event.movementY * panStep;
+      const cosY = Math.cos(controls.yaw);
+      const sinY = Math.sin(controls.yaw);
+      controls.mapPanEast  += dx * cosY + dy * sinY;
+      controls.mapPanNorth += -dx * sinY + dy * cosY;
       updateMapCamera();
       return;
     }
-    controls.yaw += event.movementX * MOUSE_SENS;
+    const cx = window.innerWidth / 2;
+    const cy = window.innerHeight / 2;
+    const prevX = event.clientX - event.movementX;
+    const prevY = event.clientY - event.movementY;
+    const prevAngle = Math.atan2(prevX - cx, -(prevY - cy));
+    const currAngle = Math.atan2(event.clientX - cx, -(event.clientY - cy));
+    let dAngle = currAngle - prevAngle;
+    if (dAngle > Math.PI) dAngle -= 2 * Math.PI;
+    if (dAngle < -Math.PI) dAngle += 2 * Math.PI;
+    controls.yaw += dAngle;
     return;
   }
   if (vehicleControlActive) {
