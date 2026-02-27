@@ -4402,9 +4402,10 @@ const deferredTiles = new Map();
 const tileHistory = new Map();
 function tileLog(tileId, msg) {
   if (!tileHistory.has(tileId)) tileHistory.set(tileId, []);
+  const passTag = _loadPass === 1 ? '[P1-preview]' : '[P2-full]';
   const ts = (performance.now() / 1000).toFixed(1);
-  tileHistory.get(tileId).push(`${ts}s ${msg}`);
-  enqueueClientLog('debug', 'tile', { tileId, msg, ts: `${ts}s` });
+  tileHistory.get(tileId).push(`${ts}s ${passTag} ${msg}`);
+  enqueueClientLog('debug', 'tile', { tileId, pass: _loadPass, msg, ts: `${ts}s` });
 }
 
 function applyTerrainMaterialMode(mesh, tex) {
@@ -5012,12 +5013,12 @@ async function fetchTiles(lat, lon) {
     } else {
       url = `/api/tiles?lat=${fetchLat}&lon=${fetchLon}&ox=${originX}&oy=${originY}&alt=${fetchAlt}&heading=${heading}&range=${_terrainRange}`;
     }
-    enqueueClientLog('info', 'fetchTiles.request', { pass: _loadPass, isFirstLoad, lat: fetchLat, lon: fetchLon });
+    enqueueClientLog('info', `fetchTiles.request[pass${_loadPass}]`, { pass: _loadPass, passLabel: _loadPass === 1 ? 'preview' : 'full', isFirstLoad, lat: fetchLat, lon: fetchLon });
     const resp = await fetch(url);
     const data = await resp.json();
     const withHm = data.tiles.filter(t => t.heightmap).length;
     const noHm = data.tiles.length - withHm;
-    enqueueClientLog('info', 'fetchTiles.response', { pass: _loadPass, status: resp.status, tiles: data.tiles.length, withHm, noHm, missing: data.missing?.length ?? 0, downloading: data.downloading?.length ?? 0 });
+    enqueueClientLog('info', `fetchTiles.response[pass${_loadPass}]`, { pass: _loadPass, passLabel: _loadPass === 1 ? 'preview' : 'full', status: resp.status, tiles: data.tiles.length, withHm, noHm, missing: data.missing?.length ?? 0, downloading: data.downloading?.length ?? 0 });
     if (!bootFetchLogged) {
       bootFetchLogged = true;
       bootLog('tiles.initial-fetch.response', {
@@ -5117,7 +5118,7 @@ async function fetchTiles(lat, lon) {
       if (c.material) c.material.dispose();
     }
 
-    enqueueClientLog('info', 'fetchTiles.diff', { pass: _loadPass, added: added.length, removed: removed.length, purgedDeferred: purged, sceneMeshes: terrainRoot.children.filter(c => c.isMesh).length });
+    enqueueClientLog('info', `fetchTiles.diff[pass${_loadPass}]`, { pass: _loadPass, passLabel: _loadPass === 1 ? 'preview' : 'full', added: added.length, removed: removed.length, purgedDeferred: purged, sceneMeshes: terrainRoot.children.filter(c => c.isMesh).length });
 
     if (added.length > 0) {
       const existingIds = new Set();
@@ -5190,7 +5191,7 @@ async function fetchTiles(lat, lon) {
     }
 
     const meshesAfter = terrainRoot.children.filter(c => c.isMesh).length;
-    enqueueClientLog('info', 'fetchTiles.built', { pass: _loadPass, meshesInScene: meshesAfter, deferred: deferredTiles.size, staleRemoved: staleToRemove.length });
+    enqueueClientLog('info', `fetchTiles.built[pass${_loadPass}]`, { pass: _loadPass, passLabel: _loadPass === 1 ? 'preview' : 'full', meshesInScene: meshesAfter, deferred: deferredTiles.size, staleRemoved: staleToRemove.length });
 
     updateTextures(data.tiles);
     markMissing(data.missing || [], data.downloading || []);
@@ -5212,17 +5213,21 @@ async function fetchTiles(lat, lon) {
 
     if (pollTimer) clearTimeout(pollTimer);
     if (wasFirstLoad) {
-      _loadPass = 2;
       // Preview pass done — immediately fetch full-depth tiles.
       // The normal eviction/replacement logic will upgrade the low-LOD
       // preview tiles as higher-detail children arrive with textures.
-      bootLog('tiles.preview-done', {
+      bootLog('tiles.pass1-preview-done', {
+        pass: 1,
         previewTiles: data.tiles.length,
+        maxDepth: PREVIEW_MAX_DEPTH,
+        meshesInScene: terrainRoot.children.filter(c => c.isMesh).length,
+        deferred: deferredTiles.size,
         elapsedMs: Number((performance.now() - t0).toFixed(1))
       });
       fetching = false;
       // DEBUG: Pass 2 disabled — sitting on Pass 1 only to verify
       // preview tiles actually render.
+      // _loadPass = 2;
       // requestAnimationFrame(() => fetchTiles());
       return;
     } else if (nd > 0 || nm > 0 || texInFlight > 0) {

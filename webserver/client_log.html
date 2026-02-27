@@ -29,7 +29,7 @@
   <span id="wsStatus"></span>
   <span id="status"></span>
 </div>
-<table><thead id="thead"><tr><th>time</th><th>phase</th><th>mode</th></tr></thead>
+<table><thead id="thead"><tr><th>time</th><th>pass</th><th>phase</th></tr></thead>
 <tbody id="tbody"></tbody></table>
 <script>
 let paused = false;
@@ -60,6 +60,7 @@ function fmtTime(ts) {
 
 function discoverKeys(entry) {
   for (const k of Object.keys(entry.details || {})) {
+    if (k === 'pass' || k === 'passLabel') continue; // promoted to own column
     if (!seenKeySet.has(k)) { seenKeySet.add(k); seenDetailKeys.push(k); }
   }
 }
@@ -69,7 +70,7 @@ function render() {
   let visible = entries;
   if (filter) visible = entries.filter(e => (e.phase || '').toLowerCase().includes(filter));
 
-  document.getElementById('thead').innerHTML = '<tr><th>time</th><th>phase</th><th>mode</th>' +
+  document.getElementById('thead').innerHTML = '<tr><th>time</th><th>pass</th><th>phase</th>' +
     seenDetailKeys.map(k => '<th>' + k + '</th>').join('') + '</tr>';
 
   const tbody = document.getElementById('tbody');
@@ -78,9 +79,10 @@ function render() {
     const e = visible[i];
     const d = e.details || {};
     const tr = document.createElement('tr');
+    const pass = d.pass != null ? d.pass : '';
     tr.innerHTML = '<td>' + fmtTime(e.ts) + '</td>' +
+      '<td>' + pass + '</td>' +
       '<td class="phase">' + (e.phase || '') + '</td>' +
-      '<td>' + (e.sceneMode || '') + '</td>' +
       seenDetailKeys.map(k => '<td>' + fmtVal(d[k]) + '</td>').join('');
     tbody.appendChild(tr);
   }
