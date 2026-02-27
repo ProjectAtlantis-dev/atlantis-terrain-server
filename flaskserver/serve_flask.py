@@ -1836,7 +1836,11 @@ async def _ws_broadcaster() -> None:
   """Async task that pulls from the queue and sends to all ws clients."""
   import websockets
   while True:
-    msg = await _ws_queue.get()
+    queue = _ws_queue
+    if queue is None:
+      await asyncio.sleep(0.05)
+      continue
+    msg = await queue.get()
     dead = set()
     for ws in list(_ws_clients):
       try:
