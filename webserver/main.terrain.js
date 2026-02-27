@@ -1848,6 +1848,7 @@ const VEHICLE_TIRE_RADIUS_M = Math.max(
 const VEHICLE_TERRAIN_LIFT_M = VEHICLE_MODEL.altOffsetM + VEHICLE_TIRE_RADIUS_M;
 const vehicleGroup = new THREE.Group();
 vehicleGroup.name = 'patria-amv';
+window.__vehicleGroup = vehicleGroup; // expose for Playwright tests
 terrainRoot.add(vehicleGroup);
 const vehicleMarkerLayer = new THREE.Group();
 vehicleMarkerLayer.name = 'vehicle-markers';
@@ -1970,6 +1971,10 @@ const vehicleTargetWorld = new THREE.Vector3();
 const vehicleTargetLocal = new THREE.Vector3();
 let vehicleSnapPending = true;
 let vehicleLoaded = false;
+const WHEEL_OBJECT_NAMES = ['Object_8', 'Object_9', 'Object_10'];
+let vehicleWheelObjects = [];
+// Per-wheel cluster data: { mesh, indices, centerY, centerZ, basePositions }
+let vehicleWheelClusters = [];
 let vehicleControlActive = false;
 let vehicleSavedStatePending = null;
 let lastVehicleSnapAttemptAt = 0;
@@ -2504,6 +2509,71 @@ function loadVehicleModel() {
       // Collect vehicle meshes for upward raycast collision
       vehicleMeshes = [];
       model.traverse(obj => { if (obj.isMesh) vehicleMeshes.push(obj); });
+      vehicleWheelObjects = [];
+      vehicleWheelClusters = [];
+      model.traverse(obj => {
+        if (WHEEL_OBJECT_NAMES.includes(obj.name)) {
+          vehicleWheelObjects.push(obj);
+        }
+      });
+      // Build per-wheel clusters: group vertices by Y position, split doubles
+      for (const mesh of vehicleWheelObjects) {
+        const posAttr = mesh.geometry.attributes.position;
+        const count = posAttr.count;
+        // Collect vertices with indices
+        const verts = [];
+        for (let i = 0; i < count; i++) {
+          verts.push({ i, y: posAttr.getY(i), z: posAttr.getZ(i) });
+        }
+        verts.sort((a, b) => a.y - b.y);
+        // Cluster by Y gap > 0.15
+        const rawClusters = [[verts[0]]];
+        for (let i = 1; i < verts.length; i++) {
+          if (verts[i].y - verts[i - 1].y > 0.15) {
+            rawClusters.push([verts[i]]);
+          } else {
+            rawClusters[rawClusters.length - 1].push(verts[i]);
+          }
+        }
+        // Split large clusters (>3500 verts = 2 wheels) at Y midpoint
+        const clusters = [];
+        for (const rc of rawClusters) {
+          if (rc.length > 3500) {
+            const midY = (rc[0].y + rc[rc.length - 1].y) / 2;
+            const lo = rc.filter(v => v.y <= midY);
+            const hi = rc.filter(v => v.y > midY);
+            if (lo.length > 0) clusters.push(lo);
+            if (hi.length > 0) clusters.push(hi);
+          } else {
+            clusters.push(rc);
+          }
+        }
+        // For each cluster, compute YZ center and store base positions
+        for (const cl of clusters) {
+          let sumY = 0, sumZ = 0;
+          const indices = [];
+          for (const v of cl) {
+            sumY += v.y;
+            sumZ += v.z;
+            indices.push(v.i);
+          }
+          const n = cl.length;
+          // Store base (original) positions for each vertex in this cluster
+          const basePositions = new Float32Array(indices.length * 3);
+          for (let j = 0; j < indices.length; j++) {
+            basePositions[j * 3] = posAttr.getX(indices[j]);
+            basePositions[j * 3 + 1] = posAttr.getY(indices[j]);
+            basePositions[j * 3 + 2] = posAttr.getZ(indices[j]);
+          }
+          vehicleWheelClusters.push({
+            mesh,
+            indices,
+            centerY: sumY / n,
+            centerZ: sumZ / n,
+            basePositions,
+          });
+        }
+      }
       const savedState = vehicleSavedStatePending;
       const startLat = Number.isFinite(savedState?.lat) ? savedState.lat : VEHICLE_MODEL.lat;
       const startLon = Number.isFinite(savedState?.lon) ? savedState.lon : VEHICLE_MODEL.lon;
@@ -2790,6 +2860,30 @@ function snapVehicleToTerrain(options = {}) {
   if (vehicleAwaitingInitialSnap) {
     vehicleAwaitingInitialSnap = false;
     vehicleGroup.visible = true;
+  }
+}
+
+let vehicleWheelAngle = 0;
+function updateVehicleWheelSpin(dt) {
+  if (!vehicleLoaded || vehicleWheelClusters.length === 0) return;
+  const angularDelta = (vehicleSpeed / VEHICLE_TIRE_RADIUS_M) * dt;
+  vehicleWheelAngle -= angularDelta;
+  const cos = Math.cos(vehicleWheelAngle);
+  const sin = Math.sin(vehicleWheelAngle);
+  const dirty = new Set();
+  for (const cl of vehicleWheelClusters) {
+    const posAttr = cl.mesh.geometry.attributes.position;
+    const { indices, centerY, centerZ, basePositions } = cl;
+    for (let j = 0; j < indices.length; j++) {
+      const by = basePositions[j * 3 + 1] - centerY;
+      const bz = basePositions[j * 3 + 2] - centerZ;
+      posAttr.setY(indices[j], centerY + by * cos - bz * sin);
+      posAttr.setZ(indices[j], centerZ + by * sin + bz * cos);
+    }
+    dirty.add(cl.mesh);
+  }
+  for (const mesh of dirty) {
+    mesh.geometry.attributes.position.needsUpdate = true;
   }
 }
 
@@ -6397,6 +6491,7 @@ function render() {
   snapVehicleToTerrain();
   updateDieselVolume();
   updateVehicleSuspension(dt);
+  updateVehicleWheelSpin(dt);
   if (vehicleControlActive && !controls.mapMode) {
     updateVehicleFollowCamera();
   }
