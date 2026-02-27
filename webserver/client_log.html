@@ -3,11 +3,12 @@
 <style>
   body { font-family: monospace; background: #1a1a2e; color: #e0e0e0; margin: 1em; }
   h1 { color: #0ff; font-size: 1.2em; }
-  table { border-collapse: collapse; width: 100%; font-size: 0.85em; }
+  .table-wrap { overflow: auto; max-height: calc(100vh - 90px); border: 1px solid #333; }
+  table { border-collapse: collapse; width: max-content; min-width: 100%; font-size: 0.85em; }
   th { background: #16213e; color: #0ff; padding: 4px 8px; text-align: left;
        position: sticky; top: 0; }
   td { padding: 3px 8px; border-bottom: 1px solid #333; white-space: nowrap;
-       max-width: 400px; overflow: hidden; text-overflow: ellipsis; }
+       max-width: 420px; overflow: hidden; text-overflow: ellipsis; }
   td:hover { white-space: normal; overflow: visible; }
   tr:hover { background: #16213e; }
   .controls { margin-bottom: 1em; color: #888; display: flex; gap: 1em; align-items: center; }
@@ -29,14 +30,15 @@
   <span id="wsStatus"></span>
   <span id="status"></span>
 </div>
-<table><thead id="thead"><tr><th>time</th><th>pass</th><th>phase</th></tr></thead>
+<div class="table-wrap">
+<table><thead><tr><th>time</th><th>tileId</th><th>pass</th><th>phase</th><th>msg</th><th>details</th></tr></thead>
 <tbody id="tbody"></tbody></table>
+</div>
 <script>
 let paused = false;
 const entries = [];
 const MAX_ENTRIES = 200;
-const seenDetailKeys = [];
-const seenKeySet = new Set();
+const PROMOTED_KEYS = ['pass', 'passLabel', 'tileId', 'msg'];
 
 function togglePause() {
   paused = !paused;
@@ -58,11 +60,13 @@ function fmtTime(ts) {
   return ts.split('T')[1].substring(0, 12);
 }
 
-function discoverKeys(entry) {
-  for (const k of Object.keys(entry.details || {})) {
-    if (k === 'pass' || k === 'passLabel') continue; // promoted to own column
-    if (!seenKeySet.has(k)) { seenKeySet.add(k); seenDetailKeys.push(k); }
+function remainingDetails(d) {
+  const rest = {};
+  for (const k of Object.keys(d)) {
+    if (PROMOTED_KEYS.includes(k)) continue;
+    rest[k] = d[k];
   }
+  return Object.keys(rest).length ? rest : null;
 }
 
 function render() {
@@ -70,27 +74,25 @@ function render() {
   let visible = entries;
   if (filter) visible = entries.filter(e => (e.phase || '').toLowerCase().includes(filter));
 
-  document.getElementById('thead').innerHTML = '<tr><th>time</th><th>pass</th><th>phase</th>' +
-    seenDetailKeys.map(k => '<th>' + k + '</th>').join('') + '</tr>';
-
   const tbody = document.getElementById('tbody');
   tbody.innerHTML = '';
   for (let i = visible.length - 1; i >= 0; i--) {
     const e = visible[i];
     const d = e.details || {};
     const tr = document.createElement('tr');
-    const pass = d.pass != null ? d.pass : '';
+    const rest = remainingDetails(d);
     tr.innerHTML = '<td>' + fmtTime(e.ts) + '</td>' +
-      '<td>' + pass + '</td>' +
+      '<td>' + fmtVal(d.tileId) + '</td>' +
+      '<td>' + fmtVal(d.pass) + '</td>' +
       '<td class="phase">' + (e.phase || '') + '</td>' +
-      seenDetailKeys.map(k => '<td>' + fmtVal(d[k]) + '</td>').join('');
+      '<td>' + fmtVal(d.msg) + '</td>' +
+      '<td>' + (rest ? JSON.stringify(rest) : '') + '</td>';
     tbody.appendChild(tr);
   }
   document.getElementById('count').textContent = visible.length + ' entries';
 }
 
 function addEntry(entry) {
-  discoverKeys(entry);
   entries.push(entry);
   if (entries.length > MAX_ENTRIES) entries.splice(0, entries.length - MAX_ENTRIES);
   if (!paused) render();
@@ -103,7 +105,6 @@ async function loadInitial() {
     const resp = await fetch('/api/client_log/ring');
     const data = await resp.json();
     for (const e of (data.entries || [])) {
-      discoverKeys(e);
       entries.push(e);
     }
     render();

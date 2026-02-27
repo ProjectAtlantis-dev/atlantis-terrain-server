@@ -218,7 +218,7 @@ let browserTimeStartMs = Date.now();
 const currentDate = new Date(gameClockStartMs);
 let _lastGameClockSave = 0;
 
-const DEFAULT_CENTER = {
+const DEFAULT_LOCATION = {
   // Nuuk, Greenland
   lon: -51.7216,
   lat: 64.1835
@@ -231,8 +231,8 @@ const ATMOSPHERE_TEXTURE_FILES = [
   'higher_order_scattering.exr'
 ];
 
-const centerLon = Number(params.get('lon') ?? DEFAULT_CENTER.lon);
-const centerLat = Number(params.get('lat') ?? DEFAULT_CENTER.lat);
+const anchorLon = Number(params.get('lon') ?? DEFAULT_LOCATION.lon);
+const anchorLat = Number(params.get('lat') ?? DEFAULT_LOCATION.lat);
 
 function defaultStartupAssets() {
   return {
@@ -352,7 +352,7 @@ const _sceneFog = scene.fog;
 const _mapBg = new THREE.Color(0x222222);
 
 // Geospatial scenes use a local ENU frame anchored at the target geodetic point.
-const anchorGeodetic = new Geodetic(radians(centerLon), radians(centerLat), 0);
+const anchorGeodetic = new Geodetic(radians(anchorLon), radians(anchorLat), 0);
 const anchorPosition = anchorGeodetic.toECEF();
 const east = new THREE.Vector3();
 const north = new THREE.Vector3();
@@ -1019,9 +1019,9 @@ function _gmapsForceUpdate() {
 
 function _gmapsNavigateTo(lat, lon) {
   if (!Number.isFinite(lat) || !Number.isFinite(lon)) return;
-  const dLat = lat - centerLat;
-  const dLon = lon - centerLon;
-  const eM = dLon * 111320 * Math.cos(centerLat * Math.PI / 180);
+  const dLat = lat - anchorLat;
+  const dLon = lon - anchorLon;
+  const eM = dLon * 111320 * Math.cos(anchorLat * Math.PI / 180);
   const nM = dLat * 111320;
   const alt = getCameraLatLon().alt;
   camera.position.copy(anchorPosition)
@@ -1388,6 +1388,9 @@ const REFETCH_DIST = 5000;
 let originX = 0, originY = 0;        // stereo scene origin from server
 let camStereoX = 0, camStereoY = 0;  // current cam position in stereo
 let lastFetchX = 0, lastFetchY = 0;
+let tileFrameOffsetX = 0;            // shift server stereo-local bboxes into camera ENU-local frame
+let tileFrameOffsetY = 0;
+let tileFrameOffsetReady = false;
 let _lastFetchTriggerMs = 0;
 let fetching = false;
 let isFirstLoad = true;
@@ -1816,8 +1819,8 @@ const VEHICLE_MODEL = {
   url: (typeof VEHICLE_DEFINITION.url === 'string' && VEHICLE_DEFINITION.url.trim() !== '')
     ? VEHICLE_DEFINITION.url
     : '/models/patria_amv.glb',
-  lat: Number.isFinite(_vehicleSeedInstance.lat) ? _vehicleSeedInstance.lat : centerLat,
-  lon: Number.isFinite(_vehicleSeedInstance.lon) ? _vehicleSeedInstance.lon : centerLon,
+  lat: Number.isFinite(_vehicleSeedInstance.lat) ? _vehicleSeedInstance.lat : anchorLat,
+  lon: Number.isFinite(_vehicleSeedInstance.lon) ? _vehicleSeedInstance.lon : anchorLon,
   headingDeg: Number.isFinite(_vehicleSeedInstance.headingDeg) ? _vehicleSeedInstance.headingDeg : 0,
   z: Number.isFinite(_vehicleSeedInstance.z) ? _vehicleSeedInstance.z : 0,
   realLengthM: Number.isFinite(VEHICLE_DEFINITION.realLengthM) ? VEHICLE_DEFINITION.realLengthM : 7.7,
@@ -2081,8 +2084,8 @@ function applyVehicleMaterialSampling(material) {
 }
 
 function vehicleLocalToLatLon(x, y) {
-  const lat = centerLat + y / 111320;
-  const lon = centerLon + x / (111320 * Math.cos(centerLat * Math.PI / 180));
+  const lat = anchorLat + y / 111320;
+  const lon = anchorLon + x / (111320 * Math.cos(anchorLat * Math.PI / 180));
   return { lat, lon };
 }
 
@@ -2657,12 +2660,12 @@ function updateVehicleShadowSystem() {
       VEHICLE_SHADOW_GROUND_ANCHOR
     );
   }
-  const center = vehicleShadowCenterLocal;
+  const shadowCenter = vehicleShadowCenterLocal;
   vehicleShadowCasterLight.visible = true;
   vehicleShadowCasterLight.position
-    .copy(center)
+    .copy(shadowCenter)
     .addScaledVector(_vehicleSunLocal, VEHICLE_SHADOW_LIGHT_DISTANCE + vehicleShadowRadius);
-  vehicleShadowCasterLight.target.position.copy(center);
+  vehicleShadowCasterLight.target.position.copy(shadowCenter);
   vehicleShadowCasterLight.target.updateMatrixWorld(true);
   vehicleShadowCasterLight.updateMatrixWorld(true);
 
@@ -2677,7 +2680,7 @@ function updateVehicleShadowSystem() {
   shadowCamera.updateMatrixWorld(true);
 
   if (VEHICLE_SHADOW_TEXEL_SNAP) {
-    vehicleShadowCenterWorld.copy(center);
+    vehicleShadowCenterWorld.copy(shadowCenter);
     terrainRoot.localToWorld(vehicleShadowCenterWorld);
     vehicleShadowCenterLight.copy(vehicleShadowCenterWorld).applyMatrix4(shadowCamera.matrixWorldInverse);
     const texelSizeX = (shadowCamera.right - shadowCamera.left) / Math.max(1, vehicleShadowCasterLight.shadow.mapSize.x);
@@ -3099,8 +3102,8 @@ function updateHouseMarkerPosition(house) {
 }
 
 function houseLocalFromLatLon(lat, lon) {
-  const eastM = (lon - centerLon) * 111320 * Math.cos(centerLat * Math.PI / 180);
-  const northM = (lat - centerLat) * 111320;
+  const eastM = (lon - anchorLon) * 111320 * Math.cos(anchorLat * Math.PI / 180);
+  const northM = (lat - anchorLat) * 111320;
   return { x: eastM, y: northM };
 }
 
@@ -4985,9 +4988,63 @@ function getCameraLatLon() {
   const eastM = rel.dot(east);
   const northM = rel.dot(north);
   const altM = rel.dot(up);
-  const lat = centerLat + northM / 111320;
-  const lon = centerLon + eastM / (111320 * Math.cos(centerLat * Math.PI / 180));
+  const lat = anchorLat + northM / 111320;
+  const lon = anchorLon + eastM / (111320 * Math.cos(anchorLat * Math.PI / 180));
   return { lat, lon, alt: altM };
+}
+
+function getCameraLogSnapshot(camLL = null) {
+  const ll = camLL ?? getCameraLatLon();
+  const rel = camera.position.clone().sub(anchorPosition);
+  const eastM = rel.dot(east);
+  const northM = rel.dot(north);
+  const upM = rel.dot(up);
+  const camStereoApproxX = originX + (ll.lon - anchorLon) * 111320 * Math.cos(anchorLat * Math.PI / 180);
+  const camStereoApproxY = originY + (ll.lat - anchorLat) * 111320;
+  const num = (value, digits) => (
+    Number.isFinite(value) ? Number(value.toFixed(digits)) : null
+  );
+  return {
+    camLat: num(ll.lat, 8),
+    camLon: num(ll.lon, 8),
+    camAltM: num(ll.alt, 2),
+    camEastM: num(eastM, 1),
+    camNorthM: num(northM, 1),
+    camUpM: num(upM, 1),
+    camStereoApproxX: num(camStereoApproxX, 1),
+    camStereoApproxY: num(camStereoApproxY, 1),
+    originX: num(originX, 1),
+    originY: num(originY, 1),
+    tileFrameOffsetX: num(tileFrameOffsetX, 1),
+    tileFrameOffsetY: num(tileFrameOffsetY, 1),
+    tileFrameOffsetReady,
+  };
+}
+
+function applyTileFrameOffsetToPayload(data) {
+  if (!tileFrameOffsetReady || !data) return;
+  if (Array.isArray(data.tiles)) {
+    for (const tile of data.tiles) {
+      if (!Array.isArray(tile?.bbox) || tile.bbox.length !== 4) continue;
+      tile.bbox = [
+        tile.bbox[0] + tileFrameOffsetX,
+        tile.bbox[1] + tileFrameOffsetY,
+        tile.bbox[2] + tileFrameOffsetX,
+        tile.bbox[3] + tileFrameOffsetY,
+      ];
+    }
+  }
+  if (Array.isArray(data.missing)) {
+    for (const miss of data.missing) {
+      if (!Array.isArray(miss?.bbox) || miss.bbox.length !== 4) continue;
+      miss.bbox = [
+        miss.bbox[0] + tileFrameOffsetX,
+        miss.bbox[1] + tileFrameOffsetY,
+        miss.bbox[2] + tileFrameOffsetX,
+        miss.bbox[3] + tileFrameOffsetY,
+      ];
+    }
+  }
 }
 
 // --- Tile fetching ---
@@ -4998,12 +5055,19 @@ const PREVIEW_MAX_DEPTH = 10;
 const clock = new THREE.Clock();
 
 async function fetchTiles(lat, lon) {
-  if (fetching) { enqueueClientLog('debug', 'fetchTiles.skip', { reason: 'already fetching' }); return; }
+  if (fetching) {
+    enqueueClientLog('debug', 'fetchTiles.skip', {
+      reason: 'already fetching',
+      ...getCameraLogSnapshot(),
+    });
+    return;
+  }
   fetching = true;
   try {
     const t0 = performance.now();
     const heading = controls.yaw;
     const camLL = getCameraLatLon();
+    const camSnapshot = getCameraLogSnapshot(camLL);
     const fetchLat = lat ?? camLL.lat;
     const fetchLon = lon ?? camLL.lon;
     const fetchAlt = camLL.alt;
@@ -5013,12 +5077,78 @@ async function fetchTiles(lat, lon) {
     } else {
       url = `/api/tiles?lat=${fetchLat}&lon=${fetchLon}&ox=${originX}&oy=${originY}&alt=${fetchAlt}&heading=${heading}&range=${_terrainRange}`;
     }
-    enqueueClientLog('info', `fetchTiles.request[pass${_loadPass}]`, { pass: _loadPass, passLabel: _loadPass === 1 ? 'preview' : 'full', isFirstLoad, lat: fetchLat, lon: fetchLon });
+    enqueueClientLog('info', `fetchTiles.request[pass${_loadPass}]`, {
+      pass: _loadPass,
+      passLabel: _loadPass === 1 ? 'preview' : 'full',
+      isFirstLoad,
+      requestLat: fetchLat,
+      requestLon: fetchLon,
+      requestAltM: fetchAlt,
+      headingRad: heading,
+      maxDepth: isFirstLoad ? PREVIEW_MAX_DEPTH : null,
+      ...camSnapshot,
+    });
     const resp = await fetch(url);
     const data = await resp.json();
+    if (isFirstLoad && !tileFrameOffsetReady) {
+      const rel = camera.position.clone().sub(anchorPosition);
+      tileFrameOffsetX = rel.dot(east);
+      tileFrameOffsetY = rel.dot(north);
+      tileFrameOffsetReady = true;
+      enqueueClientLog('info', 'fetchTiles.frame.offset.set', {
+        pass: _loadPass,
+        passLabel: _loadPass === 1 ? 'preview' : 'full',
+        offsetX: Number(tileFrameOffsetX.toFixed(1)),
+        offsetY: Number(tileFrameOffsetY.toFixed(1)),
+        camEastM: camSnapshot.camEastM,
+        camNorthM: camSnapshot.camNorthM,
+      });
+    }
+    applyTileFrameOffsetToPayload(data);
     const withHm = data.tiles.filter(t => t.heightmap).length;
     const noHm = data.tiles.length - withHm;
-    enqueueClientLog('info', `fetchTiles.response[pass${_loadPass}]`, { pass: _loadPass, passLabel: _loadPass === 1 ? 'preview' : 'full', status: resp.status, tiles: data.tiles.length, withHm, noHm, missing: data.missing?.length ?? 0, downloading: data.downloading?.length ?? 0 });
+    const camRel = camera.position.clone().sub(anchorPosition);
+    const camLocalX = camRel.dot(east);
+    const camLocalY = camRel.dot(north);
+    let closestTileId = null;
+    let closestTileDist = Infinity;
+    let closestTileCx = null;
+    let closestTileCy = null;
+    for (const tile of data.tiles) {
+      if (!Array.isArray(tile?.bbox) || tile.bbox.length !== 4) continue;
+      const cx = (tile.bbox[0] + tile.bbox[2]) * 0.5;
+      const cy = (tile.bbox[1] + tile.bbox[3]) * 0.5;
+      const dx = cx - camLocalX;
+      const dy = cy - camLocalY;
+      const dist = Math.hypot(dx, dy);
+      if (dist < closestTileDist) {
+        closestTileDist = dist;
+        closestTileId = tile.id ?? null;
+        closestTileCx = cx;
+        closestTileCy = cy;
+      }
+    }
+    enqueueClientLog('info', `fetchTiles.response[pass${_loadPass}]`, {
+      pass: _loadPass,
+      passLabel: _loadPass === 1 ? 'preview' : 'full',
+      status: resp.status,
+      tiles: data.tiles.length,
+      withHm,
+      noHm,
+      missing: data.missing?.length ?? 0,
+      downloading: data.downloading?.length ?? 0,
+      qx: Number.isFinite(data.qx) ? Number(data.qx.toFixed(1)) : null,
+      qy: Number.isFinite(data.qy) ? Number(data.qy.toFixed(1)) : null,
+      ox: Number.isFinite(data.ox) ? Number(data.ox.toFixed(1)) : null,
+      oy: Number.isFinite(data.oy) ? Number(data.oy.toFixed(1)) : null,
+      closestTileId,
+      closestTileDistM: Number.isFinite(closestTileDist) ? Number(closestTileDist.toFixed(1)) : null,
+      closestTileCx: Number.isFinite(closestTileCx) ? Number(closestTileCx.toFixed(1)) : null,
+      closestTileCy: Number.isFinite(closestTileCy) ? Number(closestTileCy.toFixed(1)) : null,
+      tileFrameOffsetX: Number(tileFrameOffsetX.toFixed(1)),
+      tileFrameOffsetY: Number(tileFrameOffsetY.toFixed(1)),
+      tileFrameOffsetReady,
+    });
     if (!bootFetchLogged) {
       bootFetchLogged = true;
       bootLog('tiles.initial-fetch.response', {
@@ -5036,6 +5166,22 @@ async function fetchTiles(lat, lon) {
       lastFetchX = data.qx;
       lastFetchY = data.qy;
       isFirstLoad = false;
+      enqueueClientLog('info', 'fetchTiles.origin.set', {
+        pass: _loadPass,
+        passLabel: _loadPass === 1 ? 'preview' : 'full',
+        qx: Number.isFinite(data.qx) ? Number(data.qx.toFixed(1)) : null,
+        qy: Number.isFinite(data.qy) ? Number(data.qy.toFixed(1)) : null,
+        ox: Number.isFinite(data.ox) ? Number(data.ox.toFixed(1)) : null,
+        oy: Number.isFinite(data.oy) ? Number(data.oy.toFixed(1)) : null,
+        requestCamStereoApproxX: camSnapshot.camStereoApproxX,
+        requestCamStereoApproxY: camSnapshot.camStereoApproxY,
+        originDeltaX: Number.isFinite(data.ox) && Number.isFinite(camSnapshot.camStereoApproxX)
+          ? Number((data.ox - camSnapshot.camStereoApproxX).toFixed(1))
+          : null,
+        originDeltaY: Number.isFinite(data.oy) && Number.isFinite(camSnapshot.camStereoApproxY)
+          ? Number((data.oy - camSnapshot.camStereoApproxY).toFixed(1))
+          : null,
+      });
     }
 
     const newIds = new Set(data.tiles.map(t => t.id));
@@ -5199,8 +5345,8 @@ async function fetchTiles(lat, lon) {
 
     // Update stereo position from camera
     const camLLNow = getCameraLatLon();
-    camStereoX = originX + (camLLNow.lon - centerLon) * 111320 * Math.cos(centerLat * Math.PI / 180);
-    camStereoY = originY + (camLLNow.lat - centerLat) * 111320;
+    camStereoX = originX + (camLLNow.lon - anchorLon) * 111320 * Math.cos(anchorLat * Math.PI / 180);
+    camStereoY = originY + (camLLNow.lat - anchorLat) * 111320;
     lastFetchX = camStereoX;
     lastFetchY = camStereoY;
 
@@ -5267,9 +5413,9 @@ window.addEventListener('beforeunload', savePosition);
 try {
   const saved = JSON.parse(localStorage.getItem('clouds-cam'));
   if (saved && saved.lat != null && saved.lon != null) {
-    const dLat = saved.lat - centerLat;
-    const dLon = saved.lon - centerLon;
-    const eM = dLon * 111320 * Math.cos(centerLat * Math.PI / 180);
+    const dLat = saved.lat - anchorLat;
+    const dLon = saved.lon - anchorLon;
+    const eM = dLon * 111320 * Math.cos(anchorLat * Math.PI / 180);
     const nM = dLat * 111320;
     const alt = saved.alt ?? 700;
     camera.position.copy(anchorPosition)
@@ -5283,13 +5429,16 @@ try {
     applyCameraOrientation();
   }
 } catch (_) {}
-// Always fetch at center first so origin = stereo(center) matches the ECEF anchor.
-// The render loop will immediately refetch around the restored camera position.
+// Start tile fetch at the current camera location (which may have been restored
+// from localStorage), not the static anchor location.
+const initialCamLL = getCameraLatLon();
 bootLog('tiles.initial-fetch.start', {
-  centerLat,
-  centerLon
+  cameraLat: Number(initialCamLL.lat.toFixed(6)),
+  cameraLon: Number(initialCamLL.lon.toFixed(6)),
+  anchorLat,
+  anchorLon
 });
-fetchTiles(centerLat, centerLon);
+fetchTiles();
 if (HOUSE_MODEL.enabled && housesRuntimeVisible) {
   bootLog('house.initial-load.start', {
     instanceCount: houseInstances.length
@@ -5308,8 +5457,8 @@ window.takramDebug = {
   cloudsEffect,
   aerialPerspective,
   referenceDate,
-  centerLat,
-  centerLon,
+  anchorLat,
+  anchorLon,
   controls,
   applyDate,
   bootEvents,
@@ -5818,7 +5967,7 @@ function updateHud() {
   hud.innerHTML = [
     '<b>Clouds Terrain Managed Flask UX WIP</b>',
     `mode: <b>${modeHtml}</b>`,
-    `lat: ${(centerLat + northM / 111320).toFixed(5)}°  lon: ${(centerLon + eastM / (111320 * Math.cos(centerLat * Math.PI / 180))).toFixed(5)}°  alt: ${altM.toFixed(0)}m`,
+    `lat: ${(anchorLat + northM / 111320).toFixed(5)}°  lon: ${(anchorLon + eastM / (111320 * Math.cos(anchorLat * Math.PI / 180))).toFixed(5)}°  alt: ${altM.toFixed(0)}m`,
     `enu: E ${eastM.toFixed(0)}m  N ${northM.toFixed(0)}m  U ${altM.toFixed(0)}m`,
     `speed: ${speedKmh.toFixed(0)} km/h  heading: ${deg.toFixed(0)}° ${compass}`,
     hmLine,
@@ -5869,14 +6018,16 @@ function resetView() {
   tuningBody.style.display = 'none';
   document.getElementById('tuning-toggle').innerHTML = '&#9660;';
   updateHud();
-  // Re-fetch tiles at Nuuk anchor
+  // Re-fetch tiles around the reset camera position.
   isFirstLoad = true;
   _loadPass = 1;
   originX = 0; originY = 0;
   camStereoX = 0; camStereoY = 0;
   lastFetchX = 0; lastFetchY = 0;
+  tileFrameOffsetX = 0; tileFrameOffsetY = 0;
+  tileFrameOffsetReady = false;
   markHousesNeedSnap();
-  fetchTiles(centerLat, centerLon);
+  fetchTiles();
 }
 
 let driftMode = false;
@@ -6225,8 +6376,8 @@ function render() {
   // Terrain streaming: check if camera moved far enough to re-fetch
   if (!isFirstLoad) {
     const camLL = getCameraLatLon();
-    const approxStereoX = originX + (camLL.lon - centerLon) * 111320 * Math.cos(centerLat * Math.PI / 180);
-    const approxStereoY = originY + (camLL.lat - centerLat) * 111320;
+    const approxStereoX = originX + (camLL.lon - anchorLon) * 111320 * Math.cos(anchorLat * Math.PI / 180);
+    const approxStereoY = originY + (camLL.lat - anchorLat) * 111320;
     camStereoX = approxStereoX;
     camStereoY = approxStereoY;
     const fdx = camStereoX - lastFetchX;

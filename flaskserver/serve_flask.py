@@ -33,6 +33,7 @@ ROOT = Path(__file__).resolve().parent.parent
 from flask import Flask, Response, g, jsonify, request, send_from_directory
 DIST_DIR = ROOT / "webserver" / "dist"
 STATIC_DIR = str(DIST_DIR)
+CLIENT_LOG_HTML_PATH = ROOT / "webserver" / "client_log.html"
 
 FLASK_DIR = Path(__file__).resolve().parent
 LOCAL_DB_PATH = FLASK_DIR / "terrain.db"
@@ -1902,6 +1903,20 @@ def terrain_health():
 @app.get("/test/watermask")
 def test_watermask_page():
   return send_from_directory(str(ROOT), "watermask_results.html")
+
+
+@app.get("/client_log.html")
+def client_log_page():
+  if CLIENT_LOG_HTML_PATH.is_file():
+    response = send_from_directory(str(CLIENT_LOG_HTML_PATH.parent), CLIENT_LOG_HTML_PATH.name)
+    response.headers["Cache-Control"] = "no-store"
+    return response
+  dist_candidate = DIST_DIR / "client_log.html"
+  if dist_candidate.is_file():
+    response = send_from_directory(STATIC_DIR, "client_log.html")
+    response.headers["Cache-Control"] = "no-store"
+    return response
+  return Response("client_log.html not found", status=404, mimetype="text/plain")
 
 
 @app.get("/")
