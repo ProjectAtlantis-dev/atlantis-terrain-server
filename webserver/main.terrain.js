@@ -5071,11 +5071,13 @@ async function fetchTiles(lat, lon) {
     const fetchLat = lat ?? camLL.lat;
     const fetchLon = lon ?? camLL.lon;
     const fetchAlt = camLL.alt;
-    let url;
-    if (isFirstLoad) {
-      url = `/api/tiles?lat=${fetchLat}&lon=${fetchLon}&alt=${fetchAlt}&heading=${heading}&maxDepth=${PREVIEW_MAX_DEPTH}&range=${_terrainRange}`;
-    } else {
-      url = `/api/tiles?lat=${fetchLat}&lon=${fetchLon}&ox=${originX}&oy=${originY}&alt=${fetchAlt}&heading=${heading}&range=${_terrainRange}`;
+    const forcePreviewDepth = _loadPass === 1;
+    let url = `/api/tiles?lat=${fetchLat}&lon=${fetchLon}&alt=${fetchAlt}&heading=${heading}&range=${_terrainRange}`;
+    if (forcePreviewDepth) {
+      url += `&maxDepth=${PREVIEW_MAX_DEPTH}`;
+    }
+    if (!isFirstLoad) {
+      url += `&ox=${originX}&oy=${originY}`;
     }
     enqueueClientLog('info', `fetchTiles.request[pass${_loadPass}]`, {
       pass: _loadPass,
@@ -5085,7 +5087,7 @@ async function fetchTiles(lat, lon) {
       requestLon: fetchLon,
       requestAltM: fetchAlt,
       headingRad: heading,
-      maxDepth: isFirstLoad ? PREVIEW_MAX_DEPTH : null,
+      maxDepth: forcePreviewDepth ? PREVIEW_MAX_DEPTH : null,
       ...camSnapshot,
     });
     const resp = await fetch(url);
@@ -5371,10 +5373,8 @@ async function fetchTiles(lat, lon) {
         elapsedMs: Number((performance.now() - t0).toFixed(1))
       });
       fetching = false;
-      // DEBUG: Pass 2 disabled — sitting on Pass 1 only to verify
-      // preview tiles actually render.
-      // _loadPass = 2;
-      // requestAnimationFrame(() => fetchTiles());
+      _loadPass = 2;
+      requestAnimationFrame(() => fetchTiles());
       return;
     } else if (nd > 0 || nm > 0 || texInFlight > 0) {
       pollTimer = setTimeout(() => fetchTiles(), 3000);
