@@ -218,7 +218,7 @@ let browserTimeStartMs = Date.now();
 const currentDate = new Date(gameClockStartMs);
 let _lastGameClockSave = 0;
 
-const DEFAULT_CENTER = {
+const DEFAULT_LOCATION = {
   // Nuuk, Greenland
   lon: -51.7216,
   lat: 64.1835
@@ -231,8 +231,8 @@ const ATMOSPHERE_TEXTURE_FILES = [
   'higher_order_scattering.exr'
 ];
 
-const centerLon = Number(params.get('lon') ?? DEFAULT_CENTER.lon);
-const centerLat = Number(params.get('lat') ?? DEFAULT_CENTER.lat);
+const anchorLon = Number(params.get('lon') ?? DEFAULT_LOCATION.lon);
+const anchorLat = Number(params.get('lat') ?? DEFAULT_LOCATION.lat);
 
 function defaultStartupAssets() {
   return {
@@ -352,7 +352,7 @@ const _sceneFog = scene.fog;
 const _mapBg = new THREE.Color(0x222222);
 
 // Geospatial scenes use a local ENU frame anchored at the target geodetic point.
-const anchorGeodetic = new Geodetic(radians(centerLon), radians(centerLat), 0);
+const anchorGeodetic = new Geodetic(radians(anchorLon), radians(anchorLat), 0);
 const anchorPosition = anchorGeodetic.toECEF();
 const east = new THREE.Vector3();
 const north = new THREE.Vector3();
@@ -454,6 +454,20 @@ hud.style.cssText = [
   'z-index:5'
 ].join(';');
 document.body.appendChild(hud);
+hud.addEventListener('mousedown', e => {
+  if (e.target.id === 'debugLogLink') {
+    e.stopPropagation();
+    e.preventDefault();
+    console.log('[HUD] debug log link clicked');
+    window.open('/client_log.html', '_blank');
+  }
+});
+hud.addEventListener('click', e => {
+  if (e.target.id === 'debugLogLink') {
+    e.stopPropagation();
+    e.preventDefault();
+  }
+});
 
 const alt = document.createElement('div');
 alt.style.cssText = [
@@ -865,6 +879,224 @@ function tuningSliderSetValue(label, v) {
   def.inp.value = v;
   if (def.valSpan) def.valSpan.textContent = def.fmt(v);
 }
+// ── Google Maps Panel (toggle with G) ─────────────────────────────────────────
+let gmapsPanelOpen = false;
+let gmapsPanelMinimized = false;
+let _gmapsLastLat = null;
+let _gmapsLastLon = null;
+const GMAPS_UPDATE_INTERVAL = 1500; // ms between iframe updates while moving
+let _gmapsLastUpdate = 0;
+let _gmapsActiveTab = 0;
+
+const gmapsPanel = document.createElement('div');
+gmapsPanel.style.cssText = [
+  'position:absolute',
+  'bottom:50px',
+  'left:12px',
+  'width:420px',
+  'background:rgba(10,16,24,0.95)',
+  'border:1px solid #2a3a4a',
+  'border-radius:8px',
+  'overflow:hidden',
+  'resize:both',
+  'min-width:300px',
+  'min-height:200px',
+  'z-index:20',
+  'display:none',
+  'flex-direction:column',
+  'height:460px',
+  'font:12px/1.4 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace',
+  'color:#dbe5f1',
+  'box-shadow:0 4px 24px rgba(0,0,0,0.7)'
+].join(';');
+
+// Make panel draggable via header
+(function makeDraggable(panel) {
+  let dragging = false, ox = 0, oy = 0;
+  panel.querySelector && panel.addEventListener('mousedown', e => {
+    if (e.target.closest('#gmap-drag-handle')) {
+      dragging = true;
+      const r = panel.getBoundingClientRect();
+      ox = e.clientX - r.left;
+      oy = e.clientY - r.top;
+      e.preventDefault();
+    }
+  });
+  document.addEventListener('mousemove', e => {
+    if (!dragging) return;
+    panel.style.left = (e.clientX - ox) + 'px';
+    panel.style.top  = (e.clientY - oy) + 'px';
+    panel.style.bottom = 'auto';
+    panel.style.right  = 'auto';
+  });
+  document.addEventListener('mouseup', () => { dragging = false; });
+})(gmapsPanel);
+
+// Header (draggable handle)
+const gmapsHeader = document.createElement('div');
+gmapsHeader.id = 'gmap-drag-handle';
+gmapsHeader.style.cssText = 'display:flex;align-items:center;gap:6px;padding:7px 10px;background:rgba(255,255,255,0.06);cursor:grab;user-select:none';
+gmapsHeader.innerHTML = `
+  <span style="flex:1;font-weight:bold;color:#5af">&#x1F5FA; Maps  <span style="font-size:10px;color:#6889a8;font-weight:normal">(drag to move)</span></span>
+  <button id="gmap-min" title="Minimize" style="background:none;border:none;color:#8aa;cursor:pointer;font-size:14px;padding:0 4px">&#x2212;</button>
+  <button id="gmap-close" title="Close (G)" style="background:none;border:none;color:#8aa;cursor:pointer;font-size:14px;padding:0 4px">&#x2715;</button>
+`;
+gmapsPanel.appendChild(gmapsHeader);
+
+// Nav input row
+const gmapsNavRow = document.createElement('div');
+gmapsNavRow.id = 'gmap-nav-row';
+gmapsNavRow.style.cssText = 'display:flex;gap:6px;padding:7px 10px;border-bottom:1px solid #1e2d3a';
+gmapsNavRow.innerHTML = `
+  <input id="gmap-input" type="text" placeholder="Paste lat, lon  e.g. 64.18, -51.70"
+    style="flex:1;background:rgba(255,255,255,0.07);border:1px solid #2a3a4a;border-radius:4px;
+           color:#dbe5f1;padding:4px 8px;font:12px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;outline:none" />
+  <button id="gmap-go"
+    style="background:#1a3a5a;border:1px solid #2a5a8a;border-radius:4px;color:#5af;
+           padding:4px 12px;cursor:pointer;font:12px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace">Go</button>
+`;
+gmapsPanel.appendChild(gmapsNavRow);
+
+// Tab bar
+const gmapsTabBar = document.createElement('div');
+gmapsTabBar.id = 'gmap-tab-row';
+gmapsTabBar.style.cssText = 'display:flex;border-bottom:1px solid #1e2d3a;user-select:none';
+['Satellite', 'Map', 'Navigate'].forEach((label, i) => {
+  const tab = document.createElement('div');
+  tab.dataset.gmtab = String(i);
+  tab.textContent = label;
+  tab.style.cssText = `flex:1;text-align:center;padding:5px 0;cursor:pointer;font-size:11px;color:${i === 0 ? '#5af' : '#6889a8'};border-bottom:${i === 0 ? '2px solid #5af' : '2px solid transparent'}`;
+  tab.addEventListener('click', () => {
+    document.querySelectorAll('[data-gmtab]').forEach(t => {
+      t.style.color = '#6889a8'; t.style.borderBottom = '2px solid transparent';
+    });
+    tab.style.color = '#5af'; tab.style.borderBottom = '2px solid #5af';
+    _gmapsActiveTab = i;
+    _gmapsLastLat = null; // force refresh
+    _gmapsForceUpdate();
+  });
+  gmapsTabBar.appendChild(tab);
+});
+gmapsPanel.appendChild(gmapsTabBar);
+
+// iframe container — fills remaining panel height
+const gmapsIframeWrap = document.createElement('div');
+gmapsIframeWrap.style.cssText = 'flex:1;min-height:0';
+const gmapsIframe = document.createElement('iframe');
+gmapsIframe.style.cssText = 'width:100%;height:100%;border:none;display:block';
+gmapsIframe.setAttribute('loading', 'eager');
+gmapsIframeWrap.appendChild(gmapsIframe);
+gmapsPanel.appendChild(gmapsIframeWrap);
+
+// Disable iframe pointer-events during resize so the drag handle works
+new ResizeObserver(() => {
+  gmapsIframe.style.pointerEvents = 'none';
+  clearTimeout(gmapsPanel._resizeTimer);
+  gmapsPanel._resizeTimer = setTimeout(() => { gmapsIframe.style.pointerEvents = ''; }, 150);
+}).observe(gmapsPanel);
+
+document.body.appendChild(gmapsPanel);
+
+function _gmapsBuildUrl(lat, lon) {
+  if (_gmapsActiveTab === 0) {
+    return `https://maps.google.com/maps?q=${lat},${lon}&t=k&z=16&output=embed`;
+  } else if (_gmapsActiveTab === 1) {
+    return `https://maps.google.com/maps?q=${lat},${lon}&t=m&z=16&output=embed`;
+  } else {
+    return `/mapview.html?lat=${lat}&lon=${lon}&t=k`;
+  }
+}
+
+function _gmapsForceUpdate() {
+  const camLL = getCameraLatLon();
+  const lat = camLL.lat.toFixed(6);
+  const lon = camLL.lon.toFixed(6);
+  gmapsIframe.src = _gmapsBuildUrl(lat, lon);
+  _gmapsLastLat = lat;
+  _gmapsLastLon = lon;
+  _gmapsLastUpdate = performance.now();
+}
+
+function _gmapsNavigateTo(lat, lon) {
+  if (!Number.isFinite(lat) || !Number.isFinite(lon)) return;
+  const dLat = lat - anchorLat;
+  const dLon = lon - anchorLon;
+  const eM = dLon * 111320 * Math.cos(anchorLat * Math.PI / 180);
+  const nM = dLat * 111320;
+  const alt = getCameraLatLon().alt;
+  camera.position.copy(anchorPosition)
+    .addScaledVector(east, eM)
+    .addScaledVector(north, nM)
+    .addScaledVector(up, Math.max(50, alt));
+  applyCameraOrientation();
+  fetchTiles(lat, lon);
+  _gmapsLastLat = null;
+  _gmapsLastUpdate = 0; // force immediate re-center on next render cycle
+}
+
+function toggleGmapsPanel(forceState) {
+  gmapsPanelOpen = forceState !== undefined ? forceState : !gmapsPanelOpen;
+  gmapsPanel.style.display = gmapsPanelOpen ? 'flex' : 'none';
+  if (gmapsPanelOpen) {
+    // Always force-reload when opening so tiles request after container is visible
+    _gmapsLastLat = null;
+    _gmapsForceUpdate();
+  }
+}
+
+// Wire up header buttons
+document.getElementById('gmap-min').addEventListener('click', e => {
+  e.stopPropagation();
+  gmapsPanelMinimized = !gmapsPanelMinimized;
+  gmapsNavRow.style.display = gmapsPanelMinimized ? 'none' : '';
+  gmapsTabBar.style.display = gmapsPanelMinimized ? 'none' : '';
+  gmapsIframeWrap.style.display = gmapsPanelMinimized ? 'none' : '';
+  document.getElementById('gmap-min').innerHTML = gmapsPanelMinimized ? '&#x25A1;' : '&#x2212;';
+});
+document.getElementById('gmap-close').addEventListener('click', e => {
+  e.stopPropagation();
+  toggleGmapsPanel(false);
+});
+
+// Wire up Go button + Enter key
+document.getElementById('gmap-go').addEventListener('click', () => {
+  const val = document.getElementById('gmap-input').value.trim();
+  // Match each coordinate token: optional minus, digits, optional decimal, optional N/S/E/W
+  const tokens = [...val.matchAll(/([-]?\d+(?:\.\d+)?)\s*°?\s*([NSEWnsew])?/g)];
+  if (tokens.length >= 2) {
+    let lat = parseFloat(tokens[0][1]);
+    let lon = parseFloat(tokens[1][1]);
+    const latDir = (tokens[0][2] || '').toUpperCase();
+    const lonDir = (tokens[1][2] || '').toUpperCase();
+    if (latDir === 'S') lat = -Math.abs(lat);
+    if (lonDir === 'W') lon = -Math.abs(lon);
+    _gmapsNavigateTo(lat, lon);
+  }
+});
+document.getElementById('gmap-input').addEventListener('keydown', e => {
+  if (e.key === 'Enter') document.getElementById('gmap-go').click();
+  e.stopPropagation(); // prevent WASD etc from firing while typing
+});
+
+// Navigate tab: receive click coords and ready signal from mapview.html iframe
+window.addEventListener('message', e => {
+  if (e.data && e.data.ready) {
+    // Leaflet just finished loading — push current camera position immediately
+    if (_gmapsActiveTab === 2 && gmapsPanelOpen) {
+      const camLL = getCameraLatLon();
+      gmapsIframe.contentWindow?.postMessage({ lat: camLL.lat, lon: camLL.lon }, '*');
+      _gmapsLastLat = camLL.lat.toFixed(4);
+      _gmapsLastLon = camLL.lon.toFixed(4);
+      _gmapsLastUpdate = performance.now();
+    }
+    return;
+  }
+  if (e.data && e.data.nav && e.data.lat != null) {
+    _gmapsNavigateTo(e.data.lat, e.data.lon);
+  }
+});
+// ── end Google Maps Panel ───────────────────────────────────────────────────────
+
 function tuningSectionLabel(text) {
   const d = document.createElement('div');
   d.style.cssText = 'margin:10px 0 4px;font-size:10px;text-transform:uppercase;color:#6889a8;letter-spacing:1px;border-bottom:1px solid #334;padding-bottom:3px';
@@ -1156,12 +1388,21 @@ const REFETCH_DIST = 5000;
 let originX = 0, originY = 0;        // stereo scene origin from server
 let camStereoX = 0, camStereoY = 0;  // current cam position in stereo
 let lastFetchX = 0, lastFetchY = 0;
+let tileFrameOffsetX = 0;            // shift server stereo-local bboxes into camera ENU-local frame
+let tileFrameOffsetY = 0;
+let tileFrameOffsetReady = false;
 let _lastFetchTriggerMs = 0;
 let fetching = false;
 let isFirstLoad = true;
+let _loadPass = 1;  // 1 = preview (low-LOD), 2 = full-depth
 let bootFetchLogged = false;
 let currentTileIds = new Set();
 let lastTiles = null;
+let _hmMissing = 0;   // heightmaps the server hasn't started
+let _hmDownloading = 0; // heightmaps the server is fetching
+let _srvTexFetching = 0;   // server-side: textures being fetched from dataforsyningen
+let _srvTexRetry = 0;      // server-side: textures in retry queue (rate-limited)
+let _srvTexStatus = {};    // server-side: {ready, ancestor_fallback, fetching, missing}
 
 function paramNumber(name, fallback) {
   const raw = params.get(name);
@@ -1578,8 +1819,8 @@ const VEHICLE_MODEL = {
   url: (typeof VEHICLE_DEFINITION.url === 'string' && VEHICLE_DEFINITION.url.trim() !== '')
     ? VEHICLE_DEFINITION.url
     : '/models/patria_amv.glb',
-  lat: Number.isFinite(_vehicleSeedInstance.lat) ? _vehicleSeedInstance.lat : centerLat,
-  lon: Number.isFinite(_vehicleSeedInstance.lon) ? _vehicleSeedInstance.lon : centerLon,
+  lat: Number.isFinite(_vehicleSeedInstance.lat) ? _vehicleSeedInstance.lat : anchorLat,
+  lon: Number.isFinite(_vehicleSeedInstance.lon) ? _vehicleSeedInstance.lon : anchorLon,
   headingDeg: Number.isFinite(_vehicleSeedInstance.headingDeg) ? _vehicleSeedInstance.headingDeg : 0,
   z: Number.isFinite(_vehicleSeedInstance.z) ? _vehicleSeedInstance.z : 0,
   realLengthM: Number.isFinite(VEHICLE_DEFINITION.realLengthM) ? VEHICLE_DEFINITION.realLengthM : 7.7,
@@ -1843,8 +2084,8 @@ function applyVehicleMaterialSampling(material) {
 }
 
 function vehicleLocalToLatLon(x, y) {
-  const lat = centerLat + y / 111320;
-  const lon = centerLon + x / (111320 * Math.cos(centerLat * Math.PI / 180));
+  const lat = anchorLat + y / 111320;
+  const lon = anchorLon + x / (111320 * Math.cos(anchorLat * Math.PI / 180));
   return { lat, lon };
 }
 
@@ -2419,12 +2660,12 @@ function updateVehicleShadowSystem() {
       VEHICLE_SHADOW_GROUND_ANCHOR
     );
   }
-  const center = vehicleShadowCenterLocal;
+  const shadowCenter = vehicleShadowCenterLocal;
   vehicleShadowCasterLight.visible = true;
   vehicleShadowCasterLight.position
-    .copy(center)
+    .copy(shadowCenter)
     .addScaledVector(_vehicleSunLocal, VEHICLE_SHADOW_LIGHT_DISTANCE + vehicleShadowRadius);
-  vehicleShadowCasterLight.target.position.copy(center);
+  vehicleShadowCasterLight.target.position.copy(shadowCenter);
   vehicleShadowCasterLight.target.updateMatrixWorld(true);
   vehicleShadowCasterLight.updateMatrixWorld(true);
 
@@ -2439,7 +2680,7 @@ function updateVehicleShadowSystem() {
   shadowCamera.updateMatrixWorld(true);
 
   if (VEHICLE_SHADOW_TEXEL_SNAP) {
-    vehicleShadowCenterWorld.copy(center);
+    vehicleShadowCenterWorld.copy(shadowCenter);
     terrainRoot.localToWorld(vehicleShadowCenterWorld);
     vehicleShadowCenterLight.copy(vehicleShadowCenterWorld).applyMatrix4(shadowCamera.matrixWorldInverse);
     const texelSizeX = (shadowCamera.right - shadowCamera.left) / Math.max(1, vehicleShadowCasterLight.shadow.mapSize.x);
@@ -2597,6 +2838,7 @@ function updateVehicleFollowCamera() {
 
 function setVehicleControlActive(nextActive, reason = 'manual', options = {}) {
   const { skipExitSave = false } = options;
+  driftMode = false;
   const requested = Boolean(nextActive);
   if (requested && (!vehicleLoaded || controls.mapMode)) {
     return false;
@@ -2860,8 +3102,8 @@ function updateHouseMarkerPosition(house) {
 }
 
 function houseLocalFromLatLon(lat, lon) {
-  const eastM = (lon - centerLon) * 111320 * Math.cos(centerLat * Math.PI / 180);
-  const northM = (lat - centerLat) * 111320;
+  const eastM = (lon - anchorLon) * 111320 * Math.cos(anchorLat * Math.PI / 180);
+  const northM = (lat - anchorLat) * 111320;
   return { x: eastM, y: northM };
 }
 
@@ -4163,9 +4405,10 @@ const deferredTiles = new Map();
 const tileHistory = new Map();
 function tileLog(tileId, msg) {
   if (!tileHistory.has(tileId)) tileHistory.set(tileId, []);
+  const passTag = _loadPass === 1 ? '[P1-preview]' : '[P2-full]';
   const ts = (performance.now() / 1000).toFixed(1);
-  tileHistory.get(tileId).push(`${ts}s ${msg}`);
-  enqueueClientLog('debug', 'tile', { tileId, msg, ts: `${ts}s` });
+  tileHistory.get(tileId).push(`${ts}s ${passTag} ${msg}`);
+  enqueueClientLog('debug', 'tile', { tileId, pass: _loadPass, msg, ts: `${ts}s` });
 }
 
 function applyTerrainMaterialMode(mesh, tex) {
@@ -4258,12 +4501,15 @@ const texSource = new Map();
 const texInflight = new Map();
 const texFetching = new Set();
 const texRetryAtMs = new Map();
+const texRetryCount = new Map();  // tid -> number of consecutive 202 retries
 const waterMaskCache = new Map();
 const waterMaskInflight = new Map();
 const ENABLE_WATER_MASKS = false;
 const TEX_MAX = 120; // max concurrent HTTP texture requests (texFetching 202s don't count)
-const TEX_RETRY_202_MS = 1200;
+const TEX_RETRY_202_BASE_MS = 2000;   // initial 202 retry delay
+const TEX_RETRY_202_MAX_MS = 30000;   // cap backoff at 30s
 const TEX_RETRY_ERROR_MS = 3000;
+const TEX_REPOLL_BATCH = 8;           // max 202 re-polls fired per frame
 const _ancestorLogged = new Set();
 let _texV = Date.now();
 
@@ -4391,12 +4637,15 @@ function updateTextures(tiles) {
   // texFetching (202 server-pending). Previously texFetching counted too,
   // which starved close tiles when many distant tiles were server-pending.
   const nowMs = performance.now();
+  let repollBudget = TEX_REPOLL_BATCH; // limit 202 re-polls per frame
   for (const { tile } of scored) {
     if (texInflight.size >= TEX_MAX) break;
     if (texCache.has(tile.id) || texInflight.has(tile.id)) continue;
     if (texFetching.has(tile.id)) {
       const pendingRetryAt = texRetryAtMs.get(tile.id) ?? 0;
       if (pendingRetryAt > nowMs) continue;
+      if (repollBudget <= 0) continue;  // don't remove from texFetching if no budget
+      repollBudget--;
       texFetching.delete(tile.id);
     }
     const retryAt = texRetryAtMs.get(tile.id) ?? 0;
@@ -4413,9 +4662,12 @@ function updateTextures(tiles) {
       .then(r => {
         texInflight.delete(tid);
         if (r.status === 202) {
-          tileLog(tid, 'fetch -> 202 (server fetching)');
+          const n = (texRetryCount.get(tid) || 0) + 1;
+          texRetryCount.set(tid, n);
+          const delay = Math.min(TEX_RETRY_202_BASE_MS * Math.pow(1.5, n - 1), TEX_RETRY_202_MAX_MS);
+          tileLog(tid, `fetch -> 202 (server fetching, retry #${n} in ${(delay/1000).toFixed(1)}s)`);
           texFetching.add(tid);
-          texRetryAtMs.set(tid, performance.now() + TEX_RETRY_202_MS);
+          texRetryAtMs.set(tid, performance.now() + delay);
           return;
         }
         if (!r.ok) {
@@ -4436,9 +4688,13 @@ function updateTextures(tiles) {
             tex.colorSpace = THREE.SRGBColorSpace;
             tex.needsUpdate = true;
             if (isAncestorCrop) {
-              tileLog(tid, `ancestor crop from ${ancestorHeader} — not caching, will retry`);
+              const n = (texRetryCount.get(tid) || 0) + 1;
+              texRetryCount.set(tid, n);
+              const delay = Math.min(TEX_RETRY_202_BASE_MS * Math.pow(1.5, n - 1), TEX_RETRY_202_MAX_MS);
+              tileLog(tid, `ancestor crop from ${ancestorHeader} — placeholder applied, retry #${n} in ${(delay/1000).toFixed(1)}s`);
               _ancestorLogged.add(tid);
-              texRetryAtMs.set(tid, performance.now() + TEX_RETRY_202_MS);
+              texFetching.add(tid);
+              texRetryAtMs.set(tid, performance.now() + delay);
               // Apply ancestor texture as placeholder (don't cache — will re-fetch for sharp version)
               let mesh = null;
               for (const child of terrainRoot.children) {
@@ -4449,6 +4705,7 @@ function updateTextures(tiles) {
               }
             } else {
               _ancestorLogged.delete(tid);
+              texRetryCount.delete(tid);
               texCache.set(tid, tex);
               texSource.set(tid, texSrc);
               requestWaterMask(tid);
@@ -4731,9 +4988,63 @@ function getCameraLatLon() {
   const eastM = rel.dot(east);
   const northM = rel.dot(north);
   const altM = rel.dot(up);
-  const lat = centerLat + northM / 111320;
-  const lon = centerLon + eastM / (111320 * Math.cos(centerLat * Math.PI / 180));
+  const lat = anchorLat + northM / 111320;
+  const lon = anchorLon + eastM / (111320 * Math.cos(anchorLat * Math.PI / 180));
   return { lat, lon, alt: altM };
+}
+
+function getCameraLogSnapshot(camLL = null) {
+  const ll = camLL ?? getCameraLatLon();
+  const rel = camera.position.clone().sub(anchorPosition);
+  const eastM = rel.dot(east);
+  const northM = rel.dot(north);
+  const upM = rel.dot(up);
+  const camStereoApproxX = originX + (ll.lon - anchorLon) * 111320 * Math.cos(anchorLat * Math.PI / 180);
+  const camStereoApproxY = originY + (ll.lat - anchorLat) * 111320;
+  const num = (value, digits) => (
+    Number.isFinite(value) ? Number(value.toFixed(digits)) : null
+  );
+  return {
+    camLat: num(ll.lat, 8),
+    camLon: num(ll.lon, 8),
+    camAltM: num(ll.alt, 2),
+    camEastM: num(eastM, 1),
+    camNorthM: num(northM, 1),
+    camUpM: num(upM, 1),
+    camStereoApproxX: num(camStereoApproxX, 1),
+    camStereoApproxY: num(camStereoApproxY, 1),
+    originX: num(originX, 1),
+    originY: num(originY, 1),
+    tileFrameOffsetX: num(tileFrameOffsetX, 1),
+    tileFrameOffsetY: num(tileFrameOffsetY, 1),
+    tileFrameOffsetReady,
+  };
+}
+
+function applyTileFrameOffsetToPayload(data) {
+  if (!tileFrameOffsetReady || !data) return;
+  if (Array.isArray(data.tiles)) {
+    for (const tile of data.tiles) {
+      if (!Array.isArray(tile?.bbox) || tile.bbox.length !== 4) continue;
+      tile.bbox = [
+        tile.bbox[0] + tileFrameOffsetX,
+        tile.bbox[1] + tileFrameOffsetY,
+        tile.bbox[2] + tileFrameOffsetX,
+        tile.bbox[3] + tileFrameOffsetY,
+      ];
+    }
+  }
+  if (Array.isArray(data.missing)) {
+    for (const miss of data.missing) {
+      if (!Array.isArray(miss?.bbox) || miss.bbox.length !== 4) continue;
+      miss.bbox = [
+        miss.bbox[0] + tileFrameOffsetX,
+        miss.bbox[1] + tileFrameOffsetY,
+        miss.bbox[2] + tileFrameOffsetX,
+        miss.bbox[3] + tileFrameOffsetY,
+      ];
+    }
+  }
 }
 
 // --- Tile fetching ---
@@ -4744,23 +5055,102 @@ const PREVIEW_MAX_DEPTH = 10;
 const clock = new THREE.Clock();
 
 async function fetchTiles(lat, lon) {
-  if (fetching) return;
+  if (fetching) {
+    enqueueClientLog('debug', 'fetchTiles.skip', {
+      reason: 'already fetching',
+      ...getCameraLogSnapshot(),
+    });
+    return;
+  }
   fetching = true;
   try {
     const t0 = performance.now();
     const heading = controls.yaw;
     const camLL = getCameraLatLon();
+    const camSnapshot = getCameraLogSnapshot(camLL);
     const fetchLat = lat ?? camLL.lat;
     const fetchLon = lon ?? camLL.lon;
     const fetchAlt = camLL.alt;
-    let url;
-    if (isFirstLoad) {
-      url = `/api/tiles?lat=${fetchLat}&lon=${fetchLon}&alt=${fetchAlt}&heading=${heading}&maxDepth=${PREVIEW_MAX_DEPTH}&range=${_terrainRange}`;
-    } else {
-      url = `/api/tiles?lat=${fetchLat}&lon=${fetchLon}&ox=${originX}&oy=${originY}&alt=${fetchAlt}&heading=${heading}&range=${_terrainRange}`;
+    const forcePreviewDepth = _loadPass === 1;
+    let url = `/api/tiles?lat=${fetchLat}&lon=${fetchLon}&alt=${fetchAlt}&heading=${heading}&range=${_terrainRange}`;
+    if (forcePreviewDepth) {
+      url += `&maxDepth=${PREVIEW_MAX_DEPTH}`;
     }
+    if (!isFirstLoad) {
+      url += `&ox=${originX}&oy=${originY}`;
+    }
+    enqueueClientLog('info', `fetchTiles.request[pass${_loadPass}]`, {
+      pass: _loadPass,
+      passLabel: _loadPass === 1 ? 'preview' : 'full',
+      isFirstLoad,
+      requestLat: fetchLat,
+      requestLon: fetchLon,
+      requestAltM: fetchAlt,
+      headingRad: heading,
+      maxDepth: forcePreviewDepth ? PREVIEW_MAX_DEPTH : null,
+      ...camSnapshot,
+    });
     const resp = await fetch(url);
     const data = await resp.json();
+    if (isFirstLoad && !tileFrameOffsetReady) {
+      const rel = camera.position.clone().sub(anchorPosition);
+      tileFrameOffsetX = rel.dot(east);
+      tileFrameOffsetY = rel.dot(north);
+      tileFrameOffsetReady = true;
+      enqueueClientLog('info', 'fetchTiles.frame.offset.set', {
+        pass: _loadPass,
+        passLabel: _loadPass === 1 ? 'preview' : 'full',
+        offsetX: Number(tileFrameOffsetX.toFixed(1)),
+        offsetY: Number(tileFrameOffsetY.toFixed(1)),
+        camEastM: camSnapshot.camEastM,
+        camNorthM: camSnapshot.camNorthM,
+      });
+    }
+    applyTileFrameOffsetToPayload(data);
+    const withHm = data.tiles.filter(t => t.heightmap).length;
+    const noHm = data.tiles.length - withHm;
+    const camRel = camera.position.clone().sub(anchorPosition);
+    const camLocalX = camRel.dot(east);
+    const camLocalY = camRel.dot(north);
+    let closestTileId = null;
+    let closestTileDist = Infinity;
+    let closestTileCx = null;
+    let closestTileCy = null;
+    for (const tile of data.tiles) {
+      if (!Array.isArray(tile?.bbox) || tile.bbox.length !== 4) continue;
+      const cx = (tile.bbox[0] + tile.bbox[2]) * 0.5;
+      const cy = (tile.bbox[1] + tile.bbox[3]) * 0.5;
+      const dx = cx - camLocalX;
+      const dy = cy - camLocalY;
+      const dist = Math.hypot(dx, dy);
+      if (dist < closestTileDist) {
+        closestTileDist = dist;
+        closestTileId = tile.id ?? null;
+        closestTileCx = cx;
+        closestTileCy = cy;
+      }
+    }
+    enqueueClientLog('info', `fetchTiles.response[pass${_loadPass}]`, {
+      pass: _loadPass,
+      passLabel: _loadPass === 1 ? 'preview' : 'full',
+      status: resp.status,
+      tiles: data.tiles.length,
+      withHm,
+      noHm,
+      missing: data.missing?.length ?? 0,
+      downloading: data.downloading?.length ?? 0,
+      qx: Number.isFinite(data.qx) ? Number(data.qx.toFixed(1)) : null,
+      qy: Number.isFinite(data.qy) ? Number(data.qy.toFixed(1)) : null,
+      ox: Number.isFinite(data.ox) ? Number(data.ox.toFixed(1)) : null,
+      oy: Number.isFinite(data.oy) ? Number(data.oy.toFixed(1)) : null,
+      closestTileId,
+      closestTileDistM: Number.isFinite(closestTileDist) ? Number(closestTileDist.toFixed(1)) : null,
+      closestTileCx: Number.isFinite(closestTileCx) ? Number(closestTileCx.toFixed(1)) : null,
+      closestTileCy: Number.isFinite(closestTileCy) ? Number(closestTileCy.toFixed(1)) : null,
+      tileFrameOffsetX: Number(tileFrameOffsetX.toFixed(1)),
+      tileFrameOffsetY: Number(tileFrameOffsetY.toFixed(1)),
+      tileFrameOffsetReady,
+    });
     if (!bootFetchLogged) {
       bootFetchLogged = true;
       bootLog('tiles.initial-fetch.response', {
@@ -4778,6 +5168,22 @@ async function fetchTiles(lat, lon) {
       lastFetchX = data.qx;
       lastFetchY = data.qy;
       isFirstLoad = false;
+      enqueueClientLog('info', 'fetchTiles.origin.set', {
+        pass: _loadPass,
+        passLabel: _loadPass === 1 ? 'preview' : 'full',
+        qx: Number.isFinite(data.qx) ? Number(data.qx.toFixed(1)) : null,
+        qy: Number.isFinite(data.qy) ? Number(data.qy.toFixed(1)) : null,
+        ox: Number.isFinite(data.ox) ? Number(data.ox.toFixed(1)) : null,
+        oy: Number.isFinite(data.oy) ? Number(data.oy.toFixed(1)) : null,
+        requestCamStereoApproxX: camSnapshot.camStereoApproxX,
+        requestCamStereoApproxY: camSnapshot.camStereoApproxY,
+        originDeltaX: Number.isFinite(data.ox) && Number.isFinite(camSnapshot.camStereoApproxX)
+          ? Number((data.ox - camSnapshot.camStereoApproxX).toFixed(1))
+          : null,
+        originDeltaY: Number.isFinite(data.oy) && Number.isFinite(camSnapshot.camStereoApproxY)
+          ? Number((data.oy - camSnapshot.camStereoApproxY).toFixed(1))
+          : null,
+      });
     }
 
     const newIds = new Set(data.tiles.map(t => t.id));
@@ -4804,20 +5210,22 @@ async function fetchTiles(lat, lon) {
       if (t.id && t.bbox) tileBboxMap.set(t.id, t.bbox);
     }
 
-    // Evict stale meshes: remove any mesh not in the current tile set.
-    // Keep textured (or vertex-colored) stale parents visible until ALL
-    // overlapping children have cached textures, to avoid visible gaps
-    // during the preview→full-depth transition and in areas with
-    // incomplete tile coverage.
+    // Evict stale meshes: remove any mesh not in the current tile set,
+    // BUT only once every overlapping child has a cached texture.
+    // This keeps heightmap ridgelines (and textured parents) visible
+    // during the preview→full-depth transition instead of flashing to void.
     const staleToRemove = [];
     for (const child of terrainRoot.children) {
       if (!child.isMesh) continue;
       const tid = child.userData.tileId;
       if (!tid) continue;
       if (!newIds.has(tid)) {
-        if (!child.material || (!child.material.map && !child.material.vertexColors)) {
-          staleToRemove.push(child);
-        } else {
+        // NEVER purge a heightmap mesh just because it has no texture.
+        // Those dark ridges in the distance are the only terrain visual
+        // until higher-depth children arrive with textures.  Treat ALL
+        // stale meshes (textured or not) the same: keep them visible
+        // until every overlapping child has a cached texture.
+        {
           const sb = child.userData.bbox;
           if (sb) {
             let coveredByChildren = true;
@@ -4857,6 +5265,8 @@ async function fetchTiles(lat, lon) {
       if (c.geometry) c.geometry.dispose();
       if (c.material) c.material.dispose();
     }
+
+    enqueueClientLog('info', `fetchTiles.diff[pass${_loadPass}]`, { pass: _loadPass, passLabel: _loadPass === 1 ? 'preview' : 'full', added: added.length, removed: removed.length, purgedDeferred: purged, sceneMeshes: terrainRoot.children.filter(c => c.isMesh).length });
 
     if (added.length > 0) {
       const existingIds = new Set();
@@ -4928,32 +5338,43 @@ async function fetchTiles(lat, lon) {
       }
     }
 
+    const meshesAfter = terrainRoot.children.filter(c => c.isMesh).length;
+    enqueueClientLog('info', `fetchTiles.built[pass${_loadPass}]`, { pass: _loadPass, passLabel: _loadPass === 1 ? 'preview' : 'full', meshesInScene: meshesAfter, deferred: deferredTiles.size, staleRemoved: staleToRemove.length });
+
     updateTextures(data.tiles);
     markMissing(data.missing || [], data.downloading || []);
     lastTiles = data.tiles;
 
     // Update stereo position from camera
     const camLLNow = getCameraLatLon();
-    camStereoX = originX + (camLLNow.lon - centerLon) * 111320 * Math.cos(centerLat * Math.PI / 180);
-    camStereoY = originY + (camLLNow.lat - centerLat) * 111320;
+    camStereoX = originX + (camLLNow.lon - anchorLon) * 111320 * Math.cos(anchorLat * Math.PI / 180);
+    camStereoY = originY + (camLLNow.lat - anchorLat) * 111320;
     lastFetchX = camStereoX;
     lastFetchY = camStereoY;
 
-    const nm = (data.missing || []).length;
-    const nd = (data.downloading || []).length;
+    const nm = _hmMissing = (data.missing || []).length;
+    const nd = _hmDownloading = (data.downloading || []).length;
     const texInFlight = (data.texFetching || 0);
+    _srvTexFetching = data.texFetching || 0;
+    _srvTexRetry = data.texRetryQueue || 0;
+    _srvTexStatus = data.texStatusCounts || {};
 
     if (pollTimer) clearTimeout(pollTimer);
     if (wasFirstLoad) {
       // Preview pass done — immediately fetch full-depth tiles.
       // The normal eviction/replacement logic will upgrade the low-LOD
       // preview tiles as higher-detail children arrive with textures.
-      bootLog('tiles.preview-done', {
+      bootLog('tiles.pass1-preview-done', {
+        pass: 1,
         previewTiles: data.tiles.length,
+        maxDepth: PREVIEW_MAX_DEPTH,
+        meshesInScene: terrainRoot.children.filter(c => c.isMesh).length,
+        deferred: deferredTiles.size,
         elapsedMs: Number((performance.now() - t0).toFixed(1))
       });
       fetching = false;
-      fetchTiles();
+      _loadPass = 2;
+      requestAnimationFrame(() => fetchTiles());
       return;
     } else if (nd > 0 || nm > 0 || texInFlight > 0) {
       pollTimer = setTimeout(() => fetchTiles(), 3000);
@@ -4992,9 +5413,9 @@ window.addEventListener('beforeunload', savePosition);
 try {
   const saved = JSON.parse(localStorage.getItem('clouds-cam'));
   if (saved && saved.lat != null && saved.lon != null) {
-    const dLat = saved.lat - centerLat;
-    const dLon = saved.lon - centerLon;
-    const eM = dLon * 111320 * Math.cos(centerLat * Math.PI / 180);
+    const dLat = saved.lat - anchorLat;
+    const dLon = saved.lon - anchorLon;
+    const eM = dLon * 111320 * Math.cos(anchorLat * Math.PI / 180);
     const nM = dLat * 111320;
     const alt = saved.alt ?? 700;
     camera.position.copy(anchorPosition)
@@ -5008,13 +5429,16 @@ try {
     applyCameraOrientation();
   }
 } catch (_) {}
-// Always fetch at center first so origin = stereo(center) matches the ECEF anchor.
-// The render loop will immediately refetch around the restored camera position.
+// Start tile fetch at the current camera location (which may have been restored
+// from localStorage), not the static anchor location.
+const initialCamLL = getCameraLatLon();
 bootLog('tiles.initial-fetch.start', {
-  centerLat,
-  centerLon
+  cameraLat: Number(initialCamLL.lat.toFixed(6)),
+  cameraLon: Number(initialCamLL.lon.toFixed(6)),
+  anchorLat,
+  anchorLon
 });
-fetchTiles(centerLat, centerLon);
+fetchTiles();
 if (HOUSE_MODEL.enabled && housesRuntimeVisible) {
   bootLog('house.initial-load.start', {
     instanceCount: houseInstances.length
@@ -5033,8 +5457,8 @@ window.takramDebug = {
   cloudsEffect,
   aerialPerspective,
   referenceDate,
-  centerLat,
-  centerLon,
+  anchorLat,
+  anchorLon,
   controls,
   applyDate,
   bootEvents,
@@ -5088,9 +5512,10 @@ function updateMapCamera() {
     .addScaledVector(east, rpe)
     .addScaledVector(north, rpn);
   mapCam.position.copy(target).addScaledVector(up, MAP_CAM_ALT);
-  mapCam.up.copy(north);
+  mapCam.up.set(0, 0, 0)
+    .addScaledVector(north, cosY)
+    .addScaledVector(east, -sinY);
   mapCam.lookAt(target);
-  mapCam.rotation.z = controls.yaw;
 }
 
 function disposeObjectMaterial(material) {
@@ -5388,7 +5813,7 @@ function updateMovement(dt) {
     controls.speed = Math.min(controls.speed + ACCEL * dt, MAX_SPEED);
   } else if (backPressed) {
     controls.speed = Math.max(controls.speed - ACCEL * dt, -MAX_SPEED);
-  } else {
+  } else if (!driftMode) {
     if (controls.speed > 0) {
       controls.speed = Math.max(controls.speed - BRAKE * dt, 0);
     } else if (controls.speed < 0) {
@@ -5469,14 +5894,40 @@ function updateHud() {
   const deg = (((-headingForHud * 180) / Math.PI) % 360 + 360) % 360;
   const dirs = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW'];
   const compass = dirs[Math.round(deg / 45) % 8];
-  let texLine = `tiles: ${currentTileIds.size}  tex: ${texCache.size}`;
+  // Heightmap line — always present, stable width
+  const hmPending = _hmMissing + _hmDownloading;
+  const passLabel = _loadPass === 1
+    ? '<span style="color:#ff0">PASS 1 (preview)</span>'
+    : '<span style="color:#8f8">PASS 2 (full)</span>';
+  const hmLine = `${passLabel}  hm: ${currentTileIds.size} tiles`
+    + (hmPending > 0
+      ? `  <span style="color:#fc8">${_hmDownloading} downloading  ${_hmMissing} queued</span>`
+      : '');
+
+  // Texture line: client fetch status + server-side pipeline
+  const srvReady = _srvTexStatus.ready || 0;
+  const srvFetching = _srvTexStatus.fetching || 0;
+  const srvMissing = _srvTexStatus.missing || 0;
+  const srvAncestor = _srvTexStatus.ancestor_fallback || 0;
+  let texLine = `tex: ${texCache.size} cached`;
+  // Client fetch pipeline
+  if (texInflight.size > 0 || texFetching.size > 0) {
+    texLine += `  <span style="color:#8cf">http: ${texInflight.size}</span>`;
+    texLine += `  <span style="color:#fc8">poll: ${texFetching.size}</span>`;
+  }
+  // Server-side pipeline — show when there's work happening
+  if (_srvTexFetching > 0 || _srvTexRetry > 0 || srvMissing > 0) {
+    texLine += `  <span style="color:#f8c">srv: ${_srvTexFetching} fetching</span>`;
+    if (_srvTexRetry > 0) texLine += `  <span style="color:#f66">${_srvTexRetry} retry</span>`;
+    if (srvMissing > 0) texLine += `  <span style="color:#999">${srvMissing} missing</span>`;
+  }
   const es = _enhanceStatus;
   const enhDone = es.done || 0;
   const enhTotal = es.total || 0;
   const enhInProg = es.in_progress || 0;
   const enhEligible = es.eligible || 0;
   if (enhTotal > 0) {
-    const pct = enhTotal > 0 ? Math.round(enhDone / enhTotal * 100) : 0;
+    const pct = Math.round(enhDone / enhTotal * 100);
     let enhParts = [];
     if (enhInProg > 0) enhParts.push(`<span style="color:#f8c">${enhInProg} upscaling</span>`);
     enhParts.push(`<span style="color:#8f8">${enhDone}/${enhTotal} enhanced (${pct}%)</span>`);
@@ -5516,8 +5967,10 @@ function updateHud() {
   hud.innerHTML = [
     '<b>Clouds Terrain Managed Flask UX WIP</b>',
     `mode: <b>${modeHtml}</b>`,
+    `lat: ${(anchorLat + northM / 111320).toFixed(5)}°  lon: ${(anchorLon + eastM / (111320 * Math.cos(anchorLat * Math.PI / 180))).toFixed(5)}°  alt: ${altM.toFixed(0)}m`,
     `enu: E ${eastM.toFixed(0)}m  N ${northM.toFixed(0)}m  U ${altM.toFixed(0)}m`,
     `speed: ${speedKmh.toFixed(0)} km/h  heading: ${deg.toFixed(0)}° ${compass}`,
+    hmLine,
     texLine,
     vehicleControlActive
       ? 'W/S drive, A/D steer, mouse orbit camera, Esc exits vehicle control'
@@ -5526,7 +5979,7 @@ function updateHud() {
     controls.mapMode
       ? `ocean overlay: ${oceanMapDebugEnabled ? 'ON' : 'OFF'}  (right-click menu; cyan=ocean, magenta=seed, orange=passable)`
       : '',
-    'M map mode, R reset'
+    'M map mode, R reset · <span id="debugLogLink" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">debug log</span>'
   ].join('<br>');
   alt.textContent =
     `${altM.toFixed(0)}m / ${(altM * 3.28084).toFixed(0)}ft  ${deg.toFixed(0)}° ${compass}` +
@@ -5565,18 +6018,35 @@ function resetView() {
   tuningBody.style.display = 'none';
   document.getElementById('tuning-toggle').innerHTML = '&#9660;';
   updateHud();
-  // Re-fetch tiles at Nuuk anchor
+  // Re-fetch tiles around the reset camera position.
   isFirstLoad = true;
+  _loadPass = 1;
   originX = 0; originY = 0;
   camStereoX = 0; camStereoY = 0;
   lastFetchX = 0; lastFetchY = 0;
+  tileFrameOffsetX = 0; tileFrameOffsetY = 0;
+  tileFrameOffsetReady = false;
   markHousesNeedSnap();
-  fetchTiles(centerLat, centerLon);
+  fetchTiles();
 }
+
+let driftMode = false;
+let _lastForwardTapTime = 0;
+const DOUBLE_TAP_MS = 300;
 
 window.addEventListener('keydown', event => {
   if (event.target.tagName === 'TEXTAREA' || event.target.tagName === 'INPUT') return;
   controls.keys[event.code] = true;
+  if ((event.code === 'KeyW' || event.code === 'ArrowUp') && !event.repeat) {
+    const now = performance.now();
+    if (now - _lastForwardTapTime < DOUBLE_TAP_MS) {
+      driftMode = !driftMode;
+      console.log(`[drift] ${driftMode ? 'ON' : 'OFF'}`);
+      _lastForwardTapTime = 0;
+    } else {
+      _lastForwardTapTime = now;
+    }
+  }
   if (event.code === 'Escape' && !event.repeat) {
     if (vehicleControlActive) {
       saveVehicleState('escape', {
@@ -5589,8 +6059,13 @@ window.addEventListener('keydown', event => {
       return;
     }
   }
+  if (event.code === 'KeyG' && !event.repeat) {
+    toggleGmapsPanel();
+    return;
+  }
   if (event.code === 'KeyM' && !event.repeat) {
     controls.mapMode = !controls.mapMode;
+    driftMode = false;
     if (controls.mapMode) {
       setVehicleControlActive(false, 'map-mode');
     }
@@ -5644,12 +6119,25 @@ window.addEventListener('mousemove', event => {
   if (controls.mapMode) {
     if (controls.dragButton === 2) {
       const panStep = controls.mapZoom * MOUSE_SENS * MAP_PAN_FACTOR;
-      controls.mapPanEast -= event.movementX * panStep;
-      controls.mapPanNorth += event.movementY * panStep;
+      const dx = -event.movementX * panStep;
+      const dy = event.movementY * panStep;
+      const cosY = Math.cos(controls.yaw);
+      const sinY = Math.sin(controls.yaw);
+      controls.mapPanEast  += dx * cosY + dy * sinY;
+      controls.mapPanNorth += -dx * sinY + dy * cosY;
       updateMapCamera();
       return;
     }
-    controls.yaw += event.movementX * MOUSE_SENS;
+    const cx = window.innerWidth / 2;
+    const cy = window.innerHeight / 2;
+    const prevX = event.clientX - event.movementX;
+    const prevY = event.clientY - event.movementY;
+    const prevAngle = Math.atan2(prevX - cx, -(prevY - cy));
+    const currAngle = Math.atan2(event.clientX - cx, -(event.clientY - cy));
+    let dAngle = currAngle - prevAngle;
+    if (dAngle > Math.PI) dAngle -= 2 * Math.PI;
+    if (dAngle < -Math.PI) dAngle += 2 * Math.PI;
+    controls.yaw += dAngle;
     return;
   }
   if (vehicleControlActive) {
@@ -5854,6 +6342,27 @@ function render() {
   applyCameraOrientation();
   updateHud();
 
+  // Update Google Maps panel iframe if open and position changed enough
+  if (gmapsPanelOpen && !gmapsPanelMinimized) {
+    const nowMs = performance.now();
+    const interval = _gmapsActiveTab === 2 ? 200 : GMAPS_UPDATE_INTERVAL;
+    if (nowMs - _gmapsLastUpdate > interval) {
+      const camLL = getCameraLatLon();
+      const lat = camLL.lat.toFixed(4);
+      const lon = camLL.lon.toFixed(4);
+      if (lat !== _gmapsLastLat || lon !== _gmapsLastLon) {
+        if (_gmapsActiveTab === 2) {
+          gmapsIframe.contentWindow?.postMessage({ lat: parseFloat(lat), lon: parseFloat(lon) }, '*');
+        } else {
+          gmapsIframe.src = _gmapsBuildUrl(lat, lon);
+        }
+        _gmapsLastLat = lat;
+        _gmapsLastLon = lon;
+        _gmapsLastUpdate = nowMs;
+      }
+    }
+  }
+
   // Update fog density from slider
   const fogStrength = controls._fogStrength ?? 4.5;
   _sceneFog.density = fogStrength / getFogDistance();
@@ -5867,8 +6376,8 @@ function render() {
   // Terrain streaming: check if camera moved far enough to re-fetch
   if (!isFirstLoad) {
     const camLL = getCameraLatLon();
-    const approxStereoX = originX + (camLL.lon - centerLon) * 111320 * Math.cos(centerLat * Math.PI / 180);
-    const approxStereoY = originY + (camLL.lat - centerLat) * 111320;
+    const approxStereoX = originX + (camLL.lon - anchorLon) * 111320 * Math.cos(anchorLat * Math.PI / 180);
+    const approxStereoY = originY + (camLL.lat - anchorLat) * 111320;
     camStereoX = approxStereoX;
     camStereoY = approxStereoY;
     const fdx = camStereoX - lastFetchX;

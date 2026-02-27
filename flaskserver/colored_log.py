@@ -40,6 +40,9 @@ class ColoredFormatter(logging.Formatter):
             or "[ASSETS" in message
         ):
             log_fmt = ORANGE + "%(asctime)s [%(levelname)s] %(name)s: %(message)s" + RESET
+        # Water-mask messages in amber.
+        elif "[WATER MASK" in message and record.levelno == logging.INFO:
+            log_fmt = ORANGE + "%(asctime)s [%(levelname)s] %(name)s: %(message)s" + RESET
         # DB messages in cyan
         elif record.name == "terrain.db" and record.levelno == logging.INFO:
             log_fmt = CYAN + "%(asctime)s [%(levelname)s] %(name)s: %(message)s" + RESET

@@ -18,6 +18,8 @@ from logging import FileHandler
 from pathlib import Path
 from typing import Any, cast
 
+import asyncio
+
 from colored_log import get_logger
 from terrain_config import BOOTSTRAP_SEED_DEPTH, ENHANCE_DEPTH
 
@@ -31,6 +33,7 @@ ROOT = Path(__file__).resolve().parent.parent
 from flask import Flask, Response, g, jsonify, request, send_from_directory
 DIST_DIR = ROOT / "webserver" / "dist"
 STATIC_DIR = str(DIST_DIR)
+CLIENT_LOG_HTML_PATH = ROOT / "webserver" / "client_log.html"
 
 FLASK_DIR = Path(__file__).resolve().parent
 LOCAL_DB_PATH = FLASK_DIR / "terrain.db"
@@ -65,6 +68,13 @@ def _env_int(name: str, default: int) -> int:
   except (TypeError, ValueError):
     return default
 
+
+# In-memory ring buffer of raw client log entries for the HTML viewer.
+_client_log_ring = []        # list of dicts
+_CLIENT_LOG_RING_MAX = 2000
+_ws_clients: set = set()       # active async websocket connections
+_ws_loop: asyncio.AbstractEventLoop | None = None  # set when ws server starts
+_ws_queue: asyncio.Queue | None = None             # set when ws server starts
 
 _client_log = logging.getLogger("terrain.client")
 if not _client_log.handlers:
@@ -138,7 +148,6 @@ if not _client_log.handlers:
   _client_log.propagate = False
 
 
-ENABLE_WATER_MASKS = _env_bool("ENABLE_WATER_MASKS", default=False)
 
 # Lazily imported terrain backend symbols.
 _backend_ready = False
@@ -162,6 +171,7 @@ _fetch_dataforsyningen_texture: Any = None
 _fetch_enhanced_texture: Any = None
 _init_textures: Any = None
 _enqueue_seam_jobs: Any = None
+_water_mask_model_id: str | None = None
 
 _tex_pool = ThreadPoolExecutor(max_workers=4)
 _tex_fetching: set[str] = set()
@@ -224,7 +234,7 @@ def _tex_retry_worker() -> None:
       jpeg, fail_reason = _fetch_dataforsyningen_texture(list(bbox), resolution=256)
       if jpeg is not None:
         _write_texture(db, tile_id, jpeg, "dataforsyningen")
-        _update_water_mask_for_tile(db, tile_id, jpeg, "dataforsyningen")
+        # _update_water_mask_for_tile(db, tile_id, jpeg, "dataforsyningen")  # disabled — SAM too expensive during load
         log_tex.info(f"[tex-retry] {tile_id}: SUCCESS on attempt {attempt + 1}")
       elif fail_reason == 'no_coverage':
         if cur_row and cur_row[1]:
@@ -413,6 +423,7 @@ def _bootstrap_backend() -> None:
   global _GRID_N, _tile_bbox, _texture_ids_in, _read_texture, _write_texture
   global _water_mask_ids_in, _read_water_mask, _write_water_mask, _build_water_mask
   global _fetch_sentinel2_texture, _fetch_dataforsyningen_texture, _fetch_enhanced_texture, _init_textures, _enqueue_seam_jobs
+  global _water_mask_model_id
 
   if _backend_ready or _backend_error is not None:
     return
@@ -435,6 +446,7 @@ def _bootstrap_backend() -> None:
       read_texture,
       texture_ids_in,
       water_mask_ids_in,
+      water_mask_model_id,
       write_water_mask,
       write_texture,
     )
@@ -489,9 +501,11 @@ def _bootstrap_backend() -> None:
     _fetch_enhanced_texture = fetch_enhanced_texture
     _init_textures = init_textures
     _enqueue_seam_jobs = enqueue_tile_and_neighbors
+    _water_mask_model_id = str(water_mask_model_id())
 
     _backend_ready = True
     log.info(f"Terrain backend ready. DB={DB_PATH}")
+    log_tex.info(f"[WATER MASK] startup model={_water_mask_model_id}")
     log_db.info(f"No-data cache: {no_data_count} tiles")
     _recover_comfy_jobs()
 
@@ -527,9 +541,8 @@ def _update_water_mask_for_tile(
     tile_id,
     texture_jpeg,
     texture_source,
-    allow_when_disabled=False,
   )
-  if not ok and reason not in ("disabled",):
+  if not ok:
     log_tex.debug(f"[WATER MASK] {tile_id}: skipped ({reason})")
   if ok and coverage is not None:
     log_tex.debug(f"[WATER MASK] {tile_id}: cached coverage={coverage * 100:.1f}% source={texture_source}")
@@ -540,11 +553,7 @@ def _generate_water_mask_for_tile(
   tile_id: str,
   texture_jpeg: bytes,
   texture_source: str,
-  *,
-  allow_when_disabled: bool,
 ) -> tuple[bool, str, float | None]:
-  if not allow_when_disabled and not ENABLE_WATER_MASKS:
-    return False, "disabled", None
   if _build_water_mask is None or _write_water_mask is None:
     return False, "backend_unavailable", None
   tile_row = db.execute(
@@ -563,12 +572,25 @@ def _generate_water_mask_for_tile(
     return False, "heightmap_decode_failed", None
 
   bbox = (float(tile_row[0]), float(tile_row[1]), float(tile_row[2]), float(tile_row[3]))
-  built = _build_water_mask(texture_jpeg, hm, bbox, resolution=256)
+  try:
+    built = _build_water_mask(texture_jpeg, hm, bbox, resolution=256)
+  except Exception as exc:
+    log_tex.warning(f"[WATER MASK] {tile_id}: build failed: {type(exc).__name__}: {exc}")
+    return False, "build_exception", None
   if built is None:
     return False, "build_failed", None
+  if not isinstance(built, tuple) or len(built) != 2:
+    return False, "build_invalid_result", None
   mask_png, coverage = built
-  _write_water_mask(db, tile_id, mask_png, texture_source, coverage)
-  return True, "ok", float(coverage)
+  if mask_png is None:
+    return False, "build_empty_mask", None
+  try:
+    coverage = float(coverage)
+  except Exception:
+    return False, "build_invalid_coverage", None
+  from texture import _SAM_MODEL_ID
+  _write_water_mask(db, tile_id, mask_png, _SAM_MODEL_ID, coverage)
+  return True, "ok", coverage
 
 
 def _terrain_unavailable_response(status: int = 503):
@@ -792,7 +814,7 @@ def _queue_texture_fetch(tile_id: str, bbox: tuple[float, float, float, float]) 
       if jpeg is not None:
         log_tex.debug(f"[tex-worker] {tile_id}: got {len(jpeg)} bytes from dataforsyningen")
         _write_texture(db, tile_id, jpeg, "dataforsyningen")
-        _update_water_mask_for_tile(db, tile_id, jpeg, "dataforsyningen")
+        # _update_water_mask_for_tile(db, tile_id, jpeg, "dataforsyningen")  # disabled — SAM too expensive during load
       elif fail_reason == 'no_coverage':
         # Permanent — mark so we never retry automatically.
         existing = db.execute(
@@ -1050,6 +1072,7 @@ def api_tiles():
       "waterMaskCached": len(water_mask_ids),
       "texFetching": len(tex_fetching),
       "texQueued": len(tex_fetching),
+      "texRetryQueue": len(_tex_retry_queue),
       "texStatusCounts": tex_status_counts,
     }
   )
@@ -1324,13 +1347,6 @@ def api_watermask(tile_id: str):
         "X-WaterMask-Status": "ready",
       },
     )
-  if not ENABLE_WATER_MASKS:
-    return Response(
-      b"",
-      status=204,
-      headers={"Cache-Control": "no-store", "X-WaterMask-Status": "disabled"},
-    )
-
   tex_row = db.execute(
     "SELECT texture, source FROM textures WHERE tile_id = ?",
     (tile_id,),
@@ -1389,7 +1405,6 @@ def api_watermask_generate(tile_id: str):
     tile_id,
     texture_jpeg,
     texture_source,
-    allow_when_disabled=True,
   )
   if not ok:
     status = 409 if reason in ("tile_missing", "heightmap_missing") else 422
@@ -1404,6 +1419,91 @@ def api_watermask_generate(tile_id: str):
       "coverage": coverage,
       "waterMaskUrl": f"/api/watermask/{tile_id}.png",
     }
+  )
+
+
+@app.post("/api/watermask/from_texture.png")
+def api_watermask_from_texture():
+  """Basic standalone water-mask endpoint from a provided texture image."""
+  unavailable = _terrain_unavailable_response()
+  if unavailable is not None:
+    return unavailable
+  if _build_water_mask is None or _np is None:
+    raise RuntimeError("water mask backend unavailable")
+
+  resolution = _arg_int("resolution", 256)
+  if resolution < 32 or resolution > 2048:
+    return jsonify({"error": "resolution must be in [32, 2048]"}), 400
+
+  texture_jpeg: bytes | None = None
+  if "texture" in request.files:
+    texture_jpeg = request.files["texture"].read()
+  elif request.data:
+    texture_jpeg = bytes(request.data)
+  else:
+    payload = request.get_json(silent=True) or {}
+    encoded = payload.get("textureBase64")
+    if encoded:
+      try:
+        texture_jpeg = base64.b64decode(str(encoded), validate=True)
+      except Exception:
+        return jsonify({"error": "invalid textureBase64"}), 400
+
+  if not texture_jpeg:
+    return (
+      jsonify(
+        {
+          "error": (
+            "missing texture input: send multipart field 'texture', "
+            "raw image bytes in body, or JSON field textureBase64"
+          )
+        }
+      ),
+      400,
+    )
+
+  # Treat uniform white frames as invalid input (provider no-data artifact).
+  try:
+    img = _Image.open(io.BytesIO(texture_jpeg)).convert("RGB")
+    arr = _np.asarray(img, dtype=_np.uint8)
+    white_pct = float((arr.min(axis=2) >= 250).mean() * 100.0)
+    std_val = float(arr.std())
+    if white_pct > 98.0 and std_val < 2.0:
+      raise ValueError(
+        "DATA_ERROR: flat-white texture input (likely no-data source image); "
+        f"white={white_pct:.1f}% std={std_val:.2f}"
+      )
+  except ValueError:
+    raise
+  except Exception as exc:
+    raise RuntimeError(
+      f"PROCESSING_ERROR: failed to decode texture input: {type(exc).__name__}: {exc}"
+    )
+
+  # The standalone service is texture-driven; height/bbox are placeholders.
+  hm = _np.zeros((_GRID_N, _GRID_N), dtype=_np.float32)
+  bbox = (0.0, 0.0, 1.0, 1.0)
+  built = _build_water_mask(
+    texture_jpeg,
+    hm,
+    bbox,
+    resolution=resolution,
+  )
+  if built is None:
+    raise RuntimeError("water mask segmentation failed to produce output")
+  mask_png, coverage = built
+  if mask_png is None:
+    raise RuntimeError("water mask segmentation returned empty mask")
+
+  return Response(
+    mask_png,
+    mimetype="image/png",
+    headers={
+      "Cache-Control": "no-store",
+      "X-WaterMask-Coverage": f"{float(coverage):.4f}",
+      "X-WaterMask-SAM-Model": _water_mask_model_id or "facebook/sam2-hiera-small",
+      "X-WaterMask-Status": "ready",
+    },
   )
 
 
@@ -1702,6 +1802,10 @@ def api_client_log():
     if len(line) > 20000:
       line = line[:20000] + "...<truncated>"
     _client_log.log(_client_log_level(item.get("level")), line)
+    _client_log_ring.append(payload)
+    if len(_client_log_ring) > _CLIENT_LOG_RING_MAX:
+      del _client_log_ring[:len(_client_log_ring) - _CLIENT_LOG_RING_MAX]
+    _broadcast_client_log(payload)
     written += 1
 
   return jsonify(
@@ -1712,6 +1816,65 @@ def api_client_log():
       "logPath": str(CLIENT_LOG_PATH),
     }
   )
+
+
+@app.get("/api/client_log/ring")
+def api_client_log_ring():
+  """Raw JSON dump of the ring buffer for debugging."""
+  return jsonify({"count": len(_client_log_ring), "entries": _client_log_ring[-50:]})
+
+
+def _broadcast_client_log(payload: dict) -> None:
+  """Push a log entry to all connected websocket viewers (thread-safe)."""
+  if _ws_loop is None or _ws_queue is None:
+    return
+  msg = json.dumps(payload, ensure_ascii=False, default=str)
+  _ws_loop.call_soon_threadsafe(_ws_queue.put_nowait, msg)
+
+
+async def _ws_broadcaster() -> None:
+  """Async task that pulls from the queue and sends to all ws clients."""
+  import websockets
+  while True:
+    msg = await _ws_queue.get()
+    dead = set()
+    for ws in list(_ws_clients):
+      try:
+        await ws.send(msg)
+      except Exception:
+        dead.add(ws)
+    for ws in dead:
+      _ws_clients.discard(ws)
+
+
+async def _ws_handler(websocket) -> None:
+  log.info(f"[WS] client connected, total={len(_ws_clients) + 1}")
+  _ws_clients.add(websocket)
+  try:
+    await websocket.wait_closed()
+  except Exception:
+    pass
+  finally:
+    _ws_clients.discard(websocket)
+    log.info(f"[WS] client disconnected, total={len(_ws_clients)}")
+
+
+def _start_ws_server(host: str, port: int) -> None:
+  """Run the async websocket server in a background thread."""
+  import websockets
+
+  global _ws_loop, _ws_queue
+
+  async def _serve():
+    global _ws_loop, _ws_queue
+    _ws_loop = asyncio.get_running_loop()
+    _ws_queue = asyncio.Queue()
+    asyncio.create_task(_ws_broadcaster())
+    async with websockets.serve(_ws_handler, host, port, compression=None):
+      log.info(f"WebSocket server listening on ws://{host}:{port}")
+      await asyncio.Future()  # run forever
+
+  asyncio.run(_serve())
 
 
 @app.get("/api/health/terrain")
@@ -1735,6 +1898,25 @@ def terrain_health():
       "tileRows": tile_rows,
     }
   )
+
+
+@app.get("/test/watermask")
+def test_watermask_page():
+  return send_from_directory(str(ROOT), "watermask_results.html")
+
+
+@app.get("/client_log.html")
+def client_log_page():
+  if CLIENT_LOG_HTML_PATH.is_file():
+    response = send_from_directory(str(CLIENT_LOG_HTML_PATH.parent), CLIENT_LOG_HTML_PATH.name)
+    response.headers["Cache-Control"] = "no-store"
+    return response
+  dist_candidate = DIST_DIR / "client_log.html"
+  if dist_candidate.is_file():
+    response = send_from_directory(STATIC_DIR, "client_log.html")
+    response.headers["Cache-Control"] = "no-store"
+    return response
+  return Response("client_log.html not found", status=404, mimetype="text/plain")
 
 
 @app.get("/")
@@ -1765,4 +1947,7 @@ if __name__ == "__main__":
     raise SystemExit(f"Backend init failed: {_backend_error}")
   host = os.environ.get("FLASK_HOST", "127.0.0.1")
   port = int(os.environ.get("FLASK_PORT", "5180"))
+  ws_port = int(os.environ.get("WS_PORT", "5181"))
+  ws_thread = threading.Thread(target=_start_ws_server, args=(host, ws_port), daemon=True)
+  ws_thread.start()
   app.run(host=host, port=port, debug=False)

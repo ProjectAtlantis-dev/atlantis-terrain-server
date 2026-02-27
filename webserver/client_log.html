@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Client Debug Log</title>
+<style>
+  body { font-family: monospace; background: #1a1a2e; color: #e0e0e0; margin: 1em; }
+  h1 { color: #0ff; font-size: 1.2em; }
+  .table-wrap { overflow: auto; max-height: calc(100vh - 90px); border: 1px solid #333; }
+  table { border-collapse: collapse; width: max-content; min-width: 100%; font-size: 0.85em; }
+  th { background: #16213e; color: #0ff; padding: 4px 8px; text-align: left;
+       position: sticky; top: 0; }
+  td { padding: 3px 8px; border-bottom: 1px solid #333; white-space: nowrap;
+       max-width: 420px; overflow: hidden; text-overflow: ellipsis; }
+  td:hover { white-space: normal; overflow: visible; }
+  tr:hover { background: #16213e; }
+  .controls { margin-bottom: 1em; color: #888; display: flex; gap: 1em; align-items: center; }
+  .controls input { background: #16213e; color: #e0e0e0; border: 1px solid #444;
+                     padding: 4px 8px; font-family: monospace; }
+  a.btn { color: #0af; cursor: pointer; }
+  .phase { color: #f0f; font-weight: bold; }
+  .count { color: #0ff; }
+  .paused { color: #f44; }
+  .ws-live { color: #0f0; }
+  .ws-dead { color: #f44; }
+</style></head><body>
+<h1>Client Debug Log</h1>
+<div class="controls">
+  <span class="count" id="count"></span>
+  <input id="filter" placeholder="filter phase..." size="20">
+  <a class="btn" onclick="clearLog()">clear</a>
+  <a class="btn" onclick="togglePause()" id="pauseBtn">pause</a>
+  <span id="wsStatus"></span>
+  <span id="status"></span>
+</div>
+<div class="table-wrap">
+<table><thead><tr><th>time</th><th>tileId</th><th>pass</th><th>phase</th><th>msg</th><th>details</th></tr></thead>
+<tbody id="tbody"></tbody></table>
+</div>
+<script>
+let paused = false;
+const entries = [];
+const MAX_ENTRIES = 200;
+const PROMOTED_KEYS = ['pass', 'passLabel', 'tileId', 'msg'];
+
+function togglePause() {
+  paused = !paused;
+  document.getElementById('pauseBtn').textContent = paused ? 'resume' : 'pause';
+  document.getElementById('pauseBtn').className = paused ? 'btn paused' : 'btn';
+}
+function clearLog() {
+  entries.length = 0;
+  render();
+}
+function fmtVal(v) {
+  if (v == null) return '';
+  if (typeof v === 'object') return JSON.stringify(v);
+  if (typeof v === 'number' && !Number.isInteger(v)) return v.toFixed(1);
+  return String(v);
+}
+function fmtTime(ts) {
+  if (!ts || !ts.includes('T')) return ts || '';
+  return ts.split('T')[1].substring(0, 12);
+}
+
+function remainingDetails(d) {
+  const rest = {};
+  for (const k of Object.keys(d)) {
+    if (PROMOTED_KEYS.includes(k)) continue;
+    rest[k] = d[k];
+  }
+  return Object.keys(rest).length ? rest : null;
+}
+
+function render() {
+  const filter = document.getElementById('filter').value.trim().toLowerCase();
+  let visible = entries;
+  if (filter) visible = entries.filter(e => (e.phase || '').toLowerCase().includes(filter));
+
+  const tbody = document.getElementById('tbody');
+  tbody.innerHTML = '';
+  for (let i = visible.length - 1; i >= 0; i--) {
+    const e = visible[i];
+    const d = e.details || {};
+    const tr = document.createElement('tr');
+    const rest = remainingDetails(d);
+    tr.innerHTML = '<td>' + fmtTime(e.ts) + '</td>' +
+      '<td>' + fmtVal(d.tileId) + '</td>' +
+      '<td>' + fmtVal(d.pass) + '</td>' +
+      '<td class="phase">' + (e.phase || '') + '</td>' +
+      '<td>' + fmtVal(d.msg) + '</td>' +
+      '<td>' + (rest ? JSON.stringify(rest) : '') + '</td>';
+    tbody.appendChild(tr);
+  }
+  document.getElementById('count').textContent = visible.length + ' entries';
+}
+
+function addEntry(entry) {
+  entries.push(entry);
+  if (entries.length > MAX_ENTRIES) entries.splice(0, entries.length - MAX_ENTRIES);
+  if (!paused) render();
+}
+
+// --- Initial load from ring buffer, then switch to websocket push ---
+
+async function loadInitial() {
+  try {
+    const resp = await fetch('/api/client_log/ring');
+    const data = await resp.json();
+    for (const e of (data.entries || [])) {
+      entries.push(e);
+    }
+    render();
+  } catch (err) {
+    document.getElementById('status').textContent = 'initial load error: ' + err.message;
+  }
+}
+
+function connectWs() {
+  const url = 'ws://' + location.hostname + ':5181';
+  const ws = new WebSocket(url);
+  const statusEl = document.getElementById('wsStatus');
+
+  ws.onopen = () => {
+    statusEl.textContent = 'live';
+    statusEl.className = 'ws-live';
+    document.getElementById('status').textContent = '';
+  };
+
+  ws.onmessage = (evt) => {
+    try {
+      addEntry(JSON.parse(evt.data));
+    } catch (e) { /* ignore */ }
+  };
+
+  ws.onclose = () => {
+    statusEl.textContent = 'reconnecting...';
+    statusEl.className = 'ws-dead';
+    setTimeout(connectWs, 2000);
+  };
+
+  ws.onerror = () => {
+    ws.close();
+  };
+}
+
+loadInitial().then(connectWs);
+</script></body></html>
