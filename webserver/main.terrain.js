@@ -500,6 +500,25 @@ gameClockEl.style.cssText = [
 ].join(';');
 document.body.appendChild(gameClockEl);
 
+// ── Turret crosshair overlay ────────────────────────────────────────────
+const crosshairEl = document.createElement('div');
+crosshairEl.id = 'turret-crosshair';
+crosshairEl.style.cssText = [
+  'position:fixed', 'top:50%', 'left:50%',
+  'transform:translate(-50%,-50%)',
+  'pointer-events:none', 'z-index:10', 'display:none'
+].join(';');
+crosshairEl.innerHTML = `<svg width="60" height="60" viewBox="0 0 60 60">
+  <circle cx="30" cy="30" r="18" stroke="#0f0" stroke-width="1.5" fill="none" opacity="0.8"/>
+  <line x1="30" y1="6" x2="30" y2="22" stroke="#0f0" stroke-width="1.5" opacity="0.8"/>
+  <line x1="30" y1="38" x2="30" y2="54" stroke="#0f0" stroke-width="1.5" opacity="0.8"/>
+  <line x1="6" y1="30" x2="22" y2="30" stroke="#0f0" stroke-width="1.5" opacity="0.8"/>
+  <line x1="38" y1="30" x2="54" y2="30" stroke="#0f0" stroke-width="1.5" opacity="0.8"/>
+  <circle cx="30" cy="30" r="2" fill="#0f0" opacity="0.6"/>
+</svg>`;
+document.body.appendChild(crosshairEl);
+// ── end crosshair ───────────────────────────────────────────────────────
+
 // Transport control handlers for game clock HUD
 function _gcRewind() {
   if (useRealtimeGameClock) {
@@ -1975,6 +1994,36 @@ const WHEEL_OBJECT_NAMES = ['Object_8', 'Object_9', 'Object_10'];
 let vehicleWheelObjects = [];
 // Per-wheel cluster data: { mesh, indices, centerY, centerZ, basePositions }
 let vehicleWheelClusters = [];
+// ── Turret state ─────────────────────────────────────────────────────────
+let turretControlActive = false;
+let turretYawRad = 0;       // relative to vehicle heading
+let turretPitchRad = 0;     // gun elevation
+const TURRET_PITCH_MIN = THREE.MathUtils.degToRad(-10);
+const TURRET_PITCH_MAX = THREE.MathUtils.degToRad(45);
+const TURRET_MOUSE_SENS = 0.003;
+let turretPivot = null;     // THREE.Group — yaw pivot
+let gunPivot = null;        // THREE.Group — pitch pivot (child of turretPivot)
+let turretMesh = null;
+let gunMesh = null;
+let barrelTipLocal = new THREE.Vector3(); // barrel tip relative to gunPivot
+// Fire state
+let fireHeld = false;
+let lastFireTime = 0;
+const FIRE_INTERVAL = 1 / 10; // 600 RPM = 10 rounds/sec
+const TRACER_SPEED = 900;     // m/s
+const TRACER_MAX_RANGE = 1500; // m
+const MAX_TRACERS = 10;
+const MAX_IMPACTS = 5;
+let tracerPool = [];
+let impactPool = [];
+let muzzleFlashSprite = null;
+let muzzleFlashTimer = 0;
+// Turret camera
+const TURRET_CAM_BEHIND = 8;
+const TURRET_CAM_ABOVE = 3;
+// Gunshot audio
+let gunshotBuffer = null;
+// ── end turret state ─────────────────────────────────────────────────────
 let vehicleControlActive = false;
 let vehicleSavedStatePending = null;
 let lastVehicleSnapAttemptAt = 0;
@@ -1997,8 +2046,15 @@ const VEHICLE_ACCEL = paramNumber('vehicleAccel', 24);      // m/s² throttle
 const VEHICLE_BRAKE = paramNumber('vehicleBrake', 3);       // m/s² engine brake (coast-down)
 const VEHICLE_STEER_SPEED = paramNumber('vehicleSteerSpeed', 1.5);
 let vehicleSpeed = 0; // current vehicle speed in m/s
-let VEHICLE_CAMERA_FOLLOW_DISTANCE = paramNumber('vehicleCamDistance', 38);
-let VEHICLE_CAMERA_FOLLOW_HEIGHT = paramNumber('vehicleCamHeight', 12);
+// Camera distance modes: cycle with V key (close / medium / far)
+const VEHICLE_CAM_MODES = [
+  { name: 'CLOSE',  dist: 15, height: 5  },
+  { name: 'MEDIUM', dist: 25, height: 8  },
+  { name: 'FAR',    dist: 38, height: 12 },
+];
+let vehicleCamModeIndex = 1; // start on MEDIUM
+let VEHICLE_CAMERA_FOLLOW_DISTANCE = VEHICLE_CAM_MODES[vehicleCamModeIndex].dist;
+let VEHICLE_CAMERA_FOLLOW_HEIGHT = VEHICLE_CAM_MODES[vehicleCamModeIndex].height;
 const VEHICLE_CAMERA_LOOK_HEIGHT = paramNumber('vehicleCamLookHeight', 2.2);
 const VEHICLE_CAMERA_ORBIT_SENS = paramNumber('vehicleCamOrbitSens', MOUSE_SENS);
 const VEHICLE_CAMERA_ORBIT_PITCH_MIN = THREE.MathUtils.degToRad(
@@ -2574,6 +2630,150 @@ function loadVehicleModel() {
           });
         }
       }
+      // ── Turret & gun pivot setup (Battlefield-style) ──────────────────
+      // Standard game engine approach: reparent turret+gun under pivot Groups
+      // so rotation.z (yaw) and rotation.x (pitch) Just Work.
+      try {
+      turretMesh = null;
+      gunMesh = null;
+      turretPivot = null;
+      gunPivot = null;
+      barrelTipLocal = new THREE.Vector3();
+      model.traverse(obj => {
+        if (!obj.isMesh) return;
+        console.log(`[VEHICLE] mesh: name=${obj.name} material=${obj.material?.name} verts=${obj.geometry?.attributes?.position?.count}`);
+        if (obj.name === 'Object_3') turretMesh = obj;
+        if (obj.name === 'Object_2') gunMesh = obj;
+      });
+      if (turretMesh) {
+        // Compute turret center from vertices (pivot point for yaw)
+        const posAttr = turretMesh.geometry.attributes.position;
+        const count = posAttr.count;
+        let sumX = 0, sumY = 0, sumZ = 0;
+        for (let i = 0; i < count; i++) {
+          sumX += posAttr.getX(i);
+          sumY += posAttr.getY(i);
+          sumZ += posAttr.getZ(i);
+        }
+        const cx = sumX / count, cy = sumY / count, cz = sumZ / count;
+        // Create turret yaw pivot at turret center
+        turretPivot = new THREE.Group();
+        turretPivot.name = 'turretPivot';
+        turretPivot.position.set(cx, cy, cz);
+        // Reparent turret mesh under pivot, offset its position
+        const turretParent = turretMesh.parent;
+        turretParent.add(turretPivot);
+        turretParent.remove(turretMesh);
+        turretMesh.position.set(-cx, -cy, -cz);
+        turretPivot.add(turretMesh);
+        console.log(`[VEHICLE] turret pivot at (${cx.toFixed(3)}, ${cy.toFixed(3)}, ${cz.toFixed(3)})`);
+
+        if (gunMesh) {
+          // Compute gun barrel tip (max-Y vertex = muzzle)
+          const gunPos = gunMesh.geometry.attributes.position;
+          const gunCount = gunPos.count;
+          let gSumX = 0, gSumY = 0, gSumZ = 0, maxY = -Infinity;
+          for (let i = 0; i < gunCount; i++) {
+            const x = gunPos.getX(i), y = gunPos.getY(i), z = gunPos.getZ(i);
+            gSumX += x; gSumY += y; gSumZ += z;
+            if (y > maxY) { maxY = y; barrelTipLocal.set(x, y, z); }
+          }
+          // Gun pitch pivot at turret center XY, gun center Z
+          const gcz = gSumZ / gunCount;
+          gunPivot = new THREE.Group();
+          gunPivot.name = 'gunPivot';
+          // Gun pivot position is relative to turret pivot
+          gunPivot.position.set(0, 0, gcz - cz);
+          // Reparent gun mesh under gun pivot (which is under turret pivot)
+          const gunParent = gunMesh.parent;
+          gunParent.remove(gunMesh);
+          gunMesh.position.set(-cx, -cy, -gcz);
+          turretPivot.add(gunPivot);
+          gunPivot.add(gunMesh);
+          // Store barrel tip relative to gun pivot
+          barrelTipLocal.set(
+            barrelTipLocal.x - cx,
+            barrelTipLocal.y - cy,
+            barrelTipLocal.z - gcz
+          );
+          console.log(`[VEHICLE] gun pivot at z=${gcz.toFixed(3)}, barrel tip local=(${barrelTipLocal.x.toFixed(3)}, ${barrelTipLocal.y.toFixed(3)}, ${barrelTipLocal.z.toFixed(3)})`);
+        }
+      }
+      // ── Muzzle flash sprite ───────────────────────────────────────────
+      {
+        const flashCanvas = document.createElement('canvas');
+        flashCanvas.width = 64;
+        flashCanvas.height = 64;
+        const ctx = flashCanvas.getContext('2d');
+        const grad = ctx.createRadialGradient(32, 32, 0, 32, 32, 32);
+        grad.addColorStop(0, 'rgba(255,255,200,1)');
+        grad.addColorStop(0.3, 'rgba(255,200,50,0.8)');
+        grad.addColorStop(1, 'rgba(255,100,0,0)');
+        ctx.fillStyle = grad;
+        ctx.fillRect(0, 0, 64, 64);
+        const flashTex = new THREE.CanvasTexture(flashCanvas);
+        const flashMat = new THREE.SpriteMaterial({
+          map: flashTex,
+          blending: THREE.AdditiveBlending,
+          transparent: true,
+          depthWrite: false,
+        });
+        muzzleFlashSprite = new THREE.Sprite(flashMat);
+        muzzleFlashSprite.scale.setScalar(0.5);
+        muzzleFlashSprite.visible = false;
+        vehicleGroup.add(muzzleFlashSprite);
+      }
+      // ── Tracer pool ───────────────────────────────────────────────────
+      {
+        const tracerGeo = new THREE.CylinderGeometry(0.08, 0.08, 3, 6);
+        // Cylinder is along Y by default; setFromUnitVectors(Y→dir) orients it
+        const tracerMat = new THREE.MeshBasicMaterial({ color: 0xffcc00, toneMapped: false });
+        tracerPool = [];
+        for (let i = 0; i < MAX_TRACERS; i++) {
+          const m = new THREE.Mesh(tracerGeo, tracerMat);
+          m.visible = false;
+          m.userData = { active: false, pos: new THREE.Vector3(), dir: new THREE.Vector3(), dist: 0 };
+          terrainRoot.add(m);
+          tracerPool.push(m);
+        }
+      }
+      // ── Impact pool ───────────────────────────────────────────────────
+      {
+        const impCanvas = document.createElement('canvas');
+        impCanvas.width = 32;
+        impCanvas.height = 32;
+        const ctx = impCanvas.getContext('2d');
+        const grad = ctx.createRadialGradient(16, 16, 0, 16, 16, 16);
+        grad.addColorStop(0, 'rgba(200,150,80,1)');
+        grad.addColorStop(0.5, 'rgba(150,100,40,0.6)');
+        grad.addColorStop(1, 'rgba(100,60,20,0)');
+        ctx.fillStyle = grad;
+        ctx.fillRect(0, 0, 32, 32);
+        const impTex = new THREE.CanvasTexture(impCanvas);
+        const impMat = new THREE.SpriteMaterial({
+          map: impTex,
+          blending: THREE.AdditiveBlending,
+          transparent: true,
+          depthWrite: false,
+        });
+        impactPool = [];
+        for (let i = 0; i < MAX_IMPACTS; i++) {
+          const s = new THREE.Sprite(impMat.clone());
+          s.visible = false;
+          s.userData = { active: false, timer: 0 };
+          terrainRoot.add(s);
+          impactPool.push(s);
+        }
+      }
+      bootLog('vehicle.turret.setup', {
+        hasTurret: !!turretPivot,
+        hasGun: !!gunPivot,
+        barrelTip: gunPivot ? barrelTipLocal.toArray().map(v => v.toFixed(3)) : null,
+      });
+      } catch (turretErr) {
+        console.warn('[VEHICLE] turret setup failed:', turretErr);
+      }
+      // ── end turret setup ──────────────────────────────────────────────
       const savedState = vehicleSavedStatePending;
       const startLat = Number.isFinite(savedState?.lat) ? savedState.lat : VEHICLE_MODEL.lat;
       const startLon = Number.isFinite(savedState?.lon) ? savedState.lon : VEHICLE_MODEL.lon;
@@ -2887,6 +3087,246 @@ function updateVehicleWheelSpin(dt) {
   }
 }
 
+// ── Turret pivot rotation (Battlefield-style) ──────────────────────────
+function updateTurretRotation() {
+  if (!vehicleLoaded) return;
+  // Yaw: rotate turret pivot around Z axis (model Z = vertical)
+  if (turretPivot) {
+    turretPivot.rotation.z = turretYawRad;
+  }
+  // Pitch: rotate gun pivot around X axis (model X = lateral)
+  if (gunPivot) {
+    gunPivot.rotation.x = turretPitchRad;
+  }
+  // Force world matrix update so getBarrelTipWorld/getTurretDirection
+  // use the current frame's rotation (not last frame's stale matrix)
+  vehicleGroup.updateMatrixWorld(true);
+}
+
+const _barrelTipWorld = new THREE.Vector3();
+const _turretDir = new THREE.Vector3();
+const _turretCamLocal = new THREE.Vector3();
+const _turretLookLocal = new THREE.Vector3();
+const _turretCamWorld = new THREE.Vector3();
+const _turretLookWorld = new THREE.Vector3();
+
+function getBarrelTipWorld(target) {
+  // Use gunPivot's transform chain to get barrel tip in terrainRoot-local space
+  if (!gunPivot) return target.copy(vehicleGroup.position);
+  target.copy(barrelTipLocal);
+  gunPivot.localToWorld(target);         // → world space
+  terrainRoot.worldToLocal(target);      // → terrainRoot-local
+  return target;
+}
+
+function getTurretDirection(target) {
+  // Forward direction of the gun (model +Y) in terrainRoot-local space
+  if (!gunPivot) {
+    // Fallback: vehicle forward
+    target.set(0, 1, 0).applyQuaternion(vehicleGroup.quaternion).normalize();
+    return target;
+  }
+  // Get two points along gun barrel in world space, convert to local
+  const origin = new THREE.Vector3(0, 0, 0);
+  const forward = new THREE.Vector3(0, 1, 0); // +Y = forward in model space
+  gunPivot.localToWorld(origin);
+  gunPivot.localToWorld(forward);
+  terrainRoot.worldToLocal(origin);
+  terrainRoot.worldToLocal(forward);
+  target.copy(forward).sub(origin).normalize();
+  return target;
+}
+
+function updateTurretFollowCamera() {
+  if (!vehicleLoaded) return;
+  getBarrelTipWorld(_barrelTipWorld);
+  getTurretDirection(_turretDir);
+  // 3rd-person shooter: camera behind barrel, looking ALONG turret direction
+  // Camera position: behind and above the barrel tip
+  _turretCamLocal.copy(_barrelTipWorld);
+  _turretCamLocal.addScaledVector(_turretDir, -TURRET_CAM_BEHIND);
+  const vUp = new THREE.Vector3(0, 0, 1).applyQuaternion(vehicleGroup.quaternion);
+  _turretCamLocal.addScaledVector(vUp, TURRET_CAM_ABOVE);
+  // Look target: far ahead along turret direction (crosshair = where bullets go)
+  _turretLookLocal.copy(_barrelTipWorld);
+  _turretLookLocal.addScaledVector(_turretDir, 500);
+  // Convert to world
+  _turretCamWorld.copy(_turretCamLocal);
+  terrainRoot.localToWorld(_turretCamWorld);
+  _turretLookWorld.copy(_turretLookLocal);
+  terrainRoot.localToWorld(_turretLookWorld);
+  camera.position.copy(_turretCamWorld);
+  camera.up.copy(up);
+  camera.lookAt(_turretLookWorld);
+}
+
+// ── Fire system ─────────────────────────────────────────────────────────
+const _fireOrigin = new THREE.Vector3();
+const _fireDir = new THREE.Vector3();
+const _fireRaycaster = new THREE.Raycaster();
+const _aimTarget = new THREE.Vector3();
+const _camRayOrigin = new THREE.Vector3();
+const _camRayDir = new THREE.Vector3();
+const _tracerQuat = new THREE.Quaternion();
+const _tracerUp = new THREE.Vector3(0, 1, 0);
+
+function fireTurret() {
+  const now = performance.now() / 1000;
+  if (now - lastFireTime < FIRE_INTERVAL) return;
+  lastFireTime = now;
+
+  // 3rd-person shooter: raycast from camera center to find where crosshair
+  // points in the world, then shoot from barrel muzzle toward that point.
+  // All coordinates in terrainRoot-local space for consistency.
+  getBarrelTipWorld(_fireOrigin); // terrainRoot-local
+
+  // Camera ray in world space
+  camera.getWorldPosition(_camRayOrigin);
+  camera.getWorldDirection(_camRayDir);
+  _fireRaycaster.set(_camRayOrigin, _camRayDir);
+  _fireRaycaster.far = TRACER_MAX_RANGE;
+  const targets = houseTerrainMeshes();
+  const camHits = _fireRaycaster.intersectObjects(targets, false);
+
+  if (camHits.length > 0) {
+    // Hit point is in world space from intersect — convert to terrainRoot-local
+    _aimTarget.copy(camHits[0].point);
+    terrainRoot.worldToLocal(_aimTarget);
+  } else {
+    // No terrain hit — aim far along camera direction, convert to local
+    _aimTarget.copy(_camRayDir).multiplyScalar(TRACER_MAX_RANGE).add(_camRayOrigin);
+    terrainRoot.worldToLocal(_aimTarget);
+  }
+
+  // Fire direction: muzzle → aim point (both in terrainRoot-local)
+  _fireDir.copy(_aimTarget).sub(_fireOrigin).normalize();
+
+  // Muzzle flash at barrel tip
+  if (muzzleFlashSprite && gunPivot) {
+    // Get barrel tip in vehicleGroup-local space for sprite positioning
+    const worldTip = barrelTipLocal.clone();
+    gunPivot.localToWorld(worldTip);
+    vehicleGroup.worldToLocal(worldTip);
+    muzzleFlashSprite.position.copy(worldTip);
+    muzzleFlashSprite.visible = true;
+    muzzleFlashSprite.material.opacity = 1;
+    muzzleFlashTimer = 0.05;
+  }
+
+  // Spawn tracer — orient along fire direction using quaternion
+  for (const t of tracerPool) {
+    if (!t.userData.active) {
+      t.userData.active = true;
+      t.userData.pos.copy(_fireOrigin);
+      t.userData.dir.copy(_fireDir);
+      t.userData.dist = 0;
+      t.visible = true;
+      t.position.copy(_fireOrigin);
+      // Align cylinder (geometry Z-axis) along fire direction
+      _tracerQuat.setFromUnitVectors(_tracerUp, _fireDir);
+      t.quaternion.copy(_tracerQuat);
+      break;
+    }
+  }
+
+  // Spawn impact at terrain hit (convert to terrainRoot-local)
+  if (camHits.length > 0) {
+    const hitLocal = camHits[0].point.clone();
+    terrainRoot.worldToLocal(hitLocal);
+    for (const imp of impactPool) {
+      if (!imp.userData.active) {
+        imp.userData.active = true;
+        imp.userData.timer = 0.4;
+        imp.position.copy(hitLocal);
+        imp.scale.setScalar(0.5);
+        imp.material.opacity = 1;
+        imp.visible = true;
+        break;
+      }
+    }
+  }
+
+  playGunshotSound();
+}
+
+function updateTracers(dt) {
+  const step = TRACER_SPEED * dt;
+  for (const t of tracerPool) {
+    if (!t.userData.active) continue;
+    t.userData.dist += step;
+    if (t.userData.dist > TRACER_MAX_RANGE) {
+      t.userData.active = false;
+      t.visible = false;
+      continue;
+    }
+    t.userData.pos.addScaledVector(t.userData.dir, step);
+    t.position.copy(t.userData.pos);
+    _tracerQuat.setFromUnitVectors(_tracerUp, t.userData.dir);
+    t.quaternion.copy(_tracerQuat);
+  }
+}
+
+function updateImpacts(dt) {
+  for (const imp of impactPool) {
+    if (!imp.userData.active) continue;
+    imp.userData.timer -= dt;
+    if (imp.userData.timer <= 0) {
+      imp.userData.active = false;
+      imp.visible = false;
+      continue;
+    }
+    imp.material.opacity = imp.userData.timer / 0.4;
+    imp.scale.setScalar(0.5 + (1 - imp.userData.timer / 0.4) * 1.5);
+  }
+}
+
+// ── Gunshot audio (procedural) ──────────────────────────────────────────
+function playGunshotSound() {
+  try {
+    const ctx = THREE.AudioContext.getContext();
+    if (!ctx || ctx.state !== 'running') return;
+    const now = ctx.currentTime;
+    // Noise burst
+    const bufLen = Math.floor(ctx.sampleRate * 0.05);
+    const noiseBuf = ctx.createBuffer(1, bufLen, ctx.sampleRate);
+    const data = noiseBuf.getChannelData(0);
+    for (let i = 0; i < bufLen; i++) {
+      data[i] = (Math.random() * 2 - 1) * Math.exp(-i / (bufLen * 0.15));
+    }
+    const noiseSource = ctx.createBufferSource();
+    noiseSource.buffer = noiseBuf;
+    // Bandpass filter
+    const bp = ctx.createBiquadFilter();
+    bp.type = 'bandpass';
+    bp.frequency.value = 800;
+    bp.Q.value = 1.5;
+    // Gain envelope
+    const gain = ctx.createGain();
+    gain.gain.setValueAtTime(0.3, now);
+    gain.gain.exponentialRampToValueAtTime(0.001, now + 0.08);
+    noiseSource.connect(bp);
+    bp.connect(gain);
+    gain.connect(ctx.destination);
+    noiseSource.start(now);
+    noiseSource.stop(now + 0.08);
+    // Low thump
+    const osc = ctx.createOscillator();
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(100, now);
+    osc.frequency.exponentialRampToValueAtTime(30, now + 0.06);
+    const thumpGain = ctx.createGain();
+    thumpGain.gain.setValueAtTime(0.2, now);
+    thumpGain.gain.exponentialRampToValueAtTime(0.001, now + 0.06);
+    osc.connect(thumpGain);
+    thumpGain.connect(ctx.destination);
+    osc.start(now);
+    osc.stop(now + 0.06);
+  } catch (e) {
+    // Audio context not ready, ignore
+  }
+}
+// ── end turret functions ────────────────────────────────────────────────
+
 function updateVehicleFollowCamera() {
   if (!vehicleLoaded) return;
   const heading = vehicleHeadingRad;
@@ -2956,6 +3396,15 @@ function setVehicleControlActive(nextActive, reason = 'manual', options = {}) {
   }
   if (wasActive && !vehicleControlActive) {
     controls.speed = 0; // stop camera drift when exiting vehicle mode
+    // Reset turret state
+    turretControlActive = false;
+    fireHeld = false;
+    turretYawRad = 0;
+    turretPitchRad = 0;
+    crosshairEl.style.display = 'none';
+    if (document.pointerLockElement) document.exitPointerLock();
+    if (turretPivot) turretPivot.rotation.z = 0;
+    if (gunPivot) gunPivot.rotation.x = 0;
   }
   if (wasActive && !vehicleControlActive && vehicleLoaded && !skipExitSave) {
     saveVehicleState(`exit-${reason}`, {
@@ -6030,10 +6479,12 @@ function updateHud() {
   }
   const modeLabel = controls.mapMode
     ? 'MAP'
-    : (vehicleControlActive ? 'VEHICLE' : 'FLIGHT');
-  const modeHtml = vehicleControlActive
-    ? '<span style="color:#ff3b30">VEHICLE</span>'
-    : modeLabel;
+    : (turretControlActive ? 'TURRET' : (vehicleControlActive ? 'VEHICLE' : 'FLIGHT'));
+  const modeHtml = turretControlActive
+    ? '<span style="color:#ff8c00">TURRET</span>'
+    : (vehicleControlActive
+      ? '<span style="color:#ff3b30">VEHICLE</span>'
+      : modeLabel);
 
   // Game clock display (bottom-left) — always show the date actually being rendered
   const gameDate = lastRenderedDate;
@@ -6066,9 +6517,11 @@ function updateHud() {
     `speed: ${speedKmh.toFixed(0)} km/h  heading: ${deg.toFixed(0)}° ${compass}`,
     hmLine,
     texLine,
-    vehicleControlActive
-      ? 'W/S drive, A/D steer, mouse orbit camera, Esc exits vehicle control'
-      : 'WASD or Arrows move, Q/Z altitude, drag look',
+    turretControlActive
+      ? 'Mouse aim turret, LMB fire .50cal, WASD drive, T or Esc exit turret'
+      : (vehicleControlActive
+        ? `W/S drive, A/D steer, V camera (${VEHICLE_CAM_MODES[vehicleCamModeIndex].name}), T turret, Esc exit`
+        : 'WASD or Arrows move, Q/Z altitude, drag look'),
     'map: left-drag rotate, right-drag pan, wheel zoom',
     controls.mapMode
       ? `ocean overlay: ${oceanMapDebugEnabled ? 'ON' : 'OFF'}  (right-click menu; cyan=ocean, magenta=seed, orange=passable)`
@@ -6141,7 +6594,26 @@ window.addEventListener('keydown', event => {
       _lastForwardTapTime = now;
     }
   }
+  if (event.code === 'KeyT' && !event.repeat && vehicleControlActive) {
+    turretControlActive = !turretControlActive;
+    crosshairEl.style.display = turretControlActive ? '' : 'none';
+    if (turretControlActive) {
+      renderer.domElement.requestPointerLock();
+    } else {
+      if (document.pointerLockElement) document.exitPointerLock();
+      fireHeld = false;
+    }
+    console.log(`[turret] ${turretControlActive ? 'ON' : 'OFF'}`);
+  }
   if (event.code === 'Escape' && !event.repeat) {
+    if (turretControlActive) {
+      turretControlActive = false;
+      fireHeld = false;
+      crosshairEl.style.display = 'none';
+      if (document.pointerLockElement) document.exitPointerLock();
+      controls.keys[event.code] = false;
+      return;
+    }
     if (vehicleControlActive) {
       saveVehicleState('escape', {
         snapToGround: true,
@@ -6190,6 +6662,13 @@ window.addEventListener('keydown', event => {
   if (event.code === 'KeyL' && !event.repeat && vehicleControlActive) {
     for (const hl of vehicleHeadlightSpots) hl.visible = !hl.visible;
   }
+  if (event.code === 'KeyV' && !event.repeat && vehicleControlActive && !turretControlActive) {
+    vehicleCamModeIndex = (vehicleCamModeIndex + 1) % VEHICLE_CAM_MODES.length;
+    const mode = VEHICLE_CAM_MODES[vehicleCamModeIndex];
+    VEHICLE_CAMERA_FOLLOW_DISTANCE = mode.dist;
+    VEHICLE_CAMERA_FOLLOW_HEIGHT = mode.height;
+    console.log(`[camera] ${mode.name} (${mode.dist}m / ${mode.height}m)`);
+  }
 });
 
 window.addEventListener('keyup', event => {
@@ -6199,14 +6678,33 @@ window.addEventListener('keyup', event => {
 renderer.domElement.addEventListener('mousedown', event => {
   controls.dragging = true;
   controls.dragButton = event.button;
+  if (event.button === 0 && turretControlActive) {
+    fireHeld = true;
+  }
 });
 
 window.addEventListener('mouseup', () => {
   controls.dragging = false;
   controls.dragButton = 0;
+  fireHeld = false;
+});
+
+document.addEventListener('pointerlockchange', () => {
+  if (!document.pointerLockElement && turretControlActive) {
+    turretControlActive = false;
+    fireHeld = false;
+    crosshairEl.style.display = 'none';
+    console.log('[turret] OFF (pointer lock lost)');
+  }
 });
 
 window.addEventListener('mousemove', event => {
+  if (turretControlActive) {
+    turretYawRad -= event.movementX * TURRET_MOUSE_SENS;
+    turretPitchRad -= event.movementY * TURRET_MOUSE_SENS;
+    turretPitchRad = THREE.MathUtils.clamp(turretPitchRad, TURRET_PITCH_MIN, TURRET_PITCH_MAX);
+    return;
+  }
   if (!controls.dragging) {
     return;
   }
@@ -6492,8 +6990,25 @@ function render() {
   updateDieselVolume();
   updateVehicleSuspension(dt);
   updateVehicleWheelSpin(dt);
+  updateTurretRotation();
+  // Camera must update BEFORE firing so the camera ray matches current turret aim
   if (vehicleControlActive && !controls.mapMode) {
-    updateVehicleFollowCamera();
+    if (turretControlActive) {
+      updateTurretFollowCamera();
+    } else {
+      updateVehicleFollowCamera();
+    }
+  }
+  if (turretControlActive && fireHeld) fireTurret();
+  updateTracers(dt);
+  updateImpacts(dt);
+  if (muzzleFlashSprite && muzzleFlashTimer > 0) {
+    muzzleFlashTimer -= dt;
+    if (muzzleFlashTimer <= 0) {
+      muzzleFlashSprite.visible = false;
+    } else {
+      muzzleFlashSprite.material.opacity = muzzleFlashTimer / 0.05;
+    }
   }
   syncVehicleSunLight();
   syncVehicleShadowReceivers();
