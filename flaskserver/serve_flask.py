@@ -71,7 +71,7 @@ def _env_int(name: str, default: int) -> int:
 
 # In-memory ring buffer of raw client log entries for the HTML viewer.
 _client_log_ring = []        # list of dicts
-_CLIENT_LOG_RING_MAX = 2000
+_CLIENT_LOG_RING_MAX = 10000
 _ws_clients: set = set()       # active async websocket connections
 _ws_loop: asyncio.AbstractEventLoop | None = None  # set when ws server starts
 _ws_queue: asyncio.Queue | None = None             # set when ws server starts
@@ -1909,6 +1909,92 @@ def test_watermask_page():
   return send_from_directory(str(ROOT), "watermask_results.html")
 
 
+TILE_VIEWER_HTML_PATH = ROOT / "webserver" / "tile_viewer.html"
+WEBSERVER_DIR = ROOT / "webserver"
+
+@app.get("/tile_viewer.html")
+def tile_viewer_page():
+  if TILE_VIEWER_HTML_PATH.is_file():
+    response = send_from_directory(str(TILE_VIEWER_HTML_PATH.parent), TILE_VIEWER_HTML_PATH.name)
+    response.headers["Cache-Control"] = "no-store"
+    return response
+  return Response("tile_viewer.html not found", status=404, mimetype="text/plain")
+
+
+@app.get("/greenland_outline_3413.json")
+def greenland_outline():
+  return send_from_directory(str(WEBSERVER_DIR), "greenland_outline_3413.json")
+
+
+@app.get("/api/tile_viewer")
+def api_tile_viewer():
+  """Return lightweight tile metadata for the tile viewer (no blobs)."""
+  unavailable = _terrain_unavailable_response()
+  if unavailable is not None:
+    return unavailable
+
+  db = _get_db()
+
+  # Get depth filter from query params (default: all depths)
+  depth_param = request.args.get("depth")
+  source_filter = request.args.get("source")  # e.g. "!empty" to exclude empty
+
+  query = """
+    SELECT t.tile_id, t.depth, t.col, t.row,
+           t.x_min, t.y_min, t.x_max, t.y_max,
+           t.source AS hm_source,
+           COALESCE(tx.source, '') AS tex_source
+    FROM tiles t
+    LEFT JOIN textures tx ON t.tile_id = tx.tile_id
+    WHERE 1=1
+  """
+  params: list = []
+
+  if depth_param is not None:
+    query += " AND t.depth = ?"
+    params.append(int(depth_param))
+
+  if source_filter == "!empty":
+    query += " AND (t.source <> 'empty' OR tx.source IS NOT NULL)"
+
+  query += " ORDER BY t.depth, t.col, t.row"
+  rows = db.execute(query, params).fetchall()
+
+  tiles = []
+  for r in rows:
+    tiles.append({
+      "id": r[0], "d": r[1], "c": r[2], "r": r[3],
+      "bbox": [r[4], r[5], r[6], r[7]],
+      "hm": r[8], "tx": r[9],
+    })
+
+  return jsonify({"count": len(tiles), "tiles": tiles})
+
+
+@app.get("/api/tile_viewer/state")
+def api_tile_viewer_state_get():
+  """Return saved tile viewer camera state (viewX, viewY, viewScale)."""
+  db = _get_db()
+  row = db.execute("SELECT value FROM metadata WHERE key = 'tile_viewer_state'").fetchone()
+  if row:
+    return Response(row[0], mimetype="application/json")
+  return jsonify(None)
+
+
+@app.put("/api/tile_viewer/state")
+def api_tile_viewer_state_put():
+  """Save tile viewer camera state."""
+  db = _get_db()
+  state = request.get_data(as_text=True)
+  db.execute(
+    "INSERT INTO metadata (key, value) VALUES ('tile_viewer_state', ?) "
+    "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+    (state,),
+  )
+  db.commit()
+  return jsonify({"ok": True})
+
+
 @app.get("/client_log.html")
 def client_log_page():
   if CLIENT_LOG_HTML_PATH.is_file():
@@ -1921,6 +2007,22 @@ def client_log_page():
     response.headers["Cache-Control"] = "no-store"
     return response
   return Response("client_log.html not found", status=404, mimetype="text/plain")
+
+
+MAP_HTML_PATH = ROOT / "webserver" / "map.html"
+
+@app.get("/map.html")
+def map_page():
+  if MAP_HTML_PATH.is_file():
+    response = send_from_directory(str(MAP_HTML_PATH.parent), MAP_HTML_PATH.name)
+    response.headers["Cache-Control"] = "no-store"
+    return response
+  dist_candidate = DIST_DIR / "map.html"
+  if dist_candidate.is_file():
+    response = send_from_directory(STATIC_DIR, "map.html")
+    response.headers["Cache-Control"] = "no-store"
+    return response
+  return Response("map.html not found", status=404, mimetype="text/plain")
 
 
 @app.get("/")

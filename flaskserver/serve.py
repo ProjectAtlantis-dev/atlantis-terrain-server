@@ -187,17 +187,8 @@ def _traverse(db, depth, col, row, qx, qy, max_depth, error_threshold,
         if _debug:
             log_trav.debug(f"{tid}: screen_error={screen_error:.6f} threshold={error_threshold:.6f} dist={dist:.0f}")
 
-        if screen_error > error_threshold:
-            # Hard subdivision ceiling — enhanced textures are the final quality.
-            if depth >= ENHANCE_DEPTH:
-                if _debug:
-                    log_trav.debug(f"{tid}: depth>={depth} — NOT subdividing (depth-{ENHANCE_DEPTH} ceiling) real={has_real_data}")
-                if has_real_data:
-                    results.append(tid)
-                elif tid not in _no_data_cache:
-                    missing.append((tid, meta['bbox']))
-                return
-
+        # Always subdivide up to ENHANCE_DEPTH; beyond that use screen error LOD
+        if depth < ENHANCE_DEPTH or screen_error > error_threshold:
             child_id = _tile_id(depth + 1, col * 2, row * 2)
             child_meta = read_tile_metadata(db, child_id)
 

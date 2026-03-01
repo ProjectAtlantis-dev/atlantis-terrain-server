@@ -461,9 +461,20 @@ hud.addEventListener('mousedown', e => {
     console.log('[HUD] debug log link clicked');
     window.open('/client_log.html', '_blank');
   }
+  if (e.target.id === 'tileViewerLink') {
+    e.stopPropagation();
+    e.preventDefault();
+    window.open('/tile_viewer.html', '_blank');
+  }
+  if (e.target.id === 'osmMapLink') {
+    e.stopPropagation();
+    e.preventDefault();
+    const camLL = getCameraLatLon();
+    window.open(`/map.html?lat=${camLL.lat.toFixed(6)}&lon=${camLL.lon.toFixed(6)}`, '_blank');
+  }
 });
 hud.addEventListener('click', e => {
-  if (e.target.id === 'debugLogLink') {
+  if (e.target.id === 'debugLogLink' || e.target.id === 'tileViewerLink' || e.target.id === 'osmMapLink') {
     e.stopPropagation();
     e.preventDefault();
   }
@@ -887,6 +898,7 @@ let _gmapsLastLon = null;
 const GMAPS_UPDATE_INTERVAL = 1500; // ms between iframe updates while moving
 let _gmapsLastUpdate = 0;
 let _gmapsActiveTab = 0;
+let _gmapsUserZoom = 16; // default zoom; preserved across location updates
 
 const gmapsPanel = document.createElement('div');
 gmapsPanel.style.cssText = [
@@ -938,6 +950,9 @@ gmapsHeader.id = 'gmap-drag-handle';
 gmapsHeader.style.cssText = 'display:flex;align-items:center;gap:6px;padding:7px 10px;background:rgba(255,255,255,0.06);cursor:grab;user-select:none';
 gmapsHeader.innerHTML = `
   <span style="flex:1;font-weight:bold;color:#5af">&#x1F5FA; Maps  <span style="font-size:10px;color:#6889a8;font-weight:normal">(drag to move)</span></span>
+  <button id="gmap-zout" title="Zoom out" style="background:none;border:none;color:#8aa;cursor:pointer;font-size:14px;padding:0 4px;font-weight:bold">&minus;</button>
+  <span id="gmap-zlevel" style="color:#5af;font-size:11px;min-width:18px;text-align:center">16</span>
+  <button id="gmap-zin" title="Zoom in" style="background:none;border:none;color:#8aa;cursor:pointer;font-size:14px;padding:0 4px;font-weight:bold">+</button>
   <button id="gmap-min" title="Minimize" style="background:none;border:none;color:#8aa;cursor:pointer;font-size:14px;padding:0 4px">&#x2212;</button>
   <button id="gmap-close" title="Close (G)" style="background:none;border:none;color:#8aa;cursor:pointer;font-size:14px;padding:0 4px">&#x2715;</button>
 `;
@@ -998,10 +1013,11 @@ new ResizeObserver(() => {
 document.body.appendChild(gmapsPanel);
 
 function _gmapsBuildUrl(lat, lon) {
+  const z = _gmapsUserZoom;
   if (_gmapsActiveTab === 0) {
-    return `https://maps.google.com/maps?q=${lat},${lon}&t=k&z=16&output=embed`;
+    return `https://maps.google.com/maps?q=${lat},${lon}&t=k&z=${z}&output=embed`;
   } else if (_gmapsActiveTab === 1) {
-    return `https://maps.google.com/maps?q=${lat},${lon}&t=m&z=16&output=embed`;
+    return `https://maps.google.com/maps?q=${lat},${lon}&t=m&z=${z}&output=embed`;
   } else {
     return `/mapview.html?lat=${lat}&lon=${lon}&t=k`;
   }
@@ -1043,6 +1059,24 @@ function toggleGmapsPanel(forceState) {
     _gmapsForceUpdate();
   }
 }
+
+// Wire up zoom buttons
+function _gmapsUpdateZoomLabel() {
+  const el = document.getElementById('gmap-zlevel');
+  if (el) el.textContent = _gmapsUserZoom;
+}
+document.getElementById('gmap-zin').addEventListener('click', e => {
+  e.stopPropagation();
+  _gmapsUserZoom = Math.min(21, _gmapsUserZoom + 1);
+  _gmapsUpdateZoomLabel();
+  _gmapsForceUpdate();
+});
+document.getElementById('gmap-zout').addEventListener('click', e => {
+  e.stopPropagation();
+  _gmapsUserZoom = Math.max(1, _gmapsUserZoom - 1);
+  _gmapsUpdateZoomLabel();
+  _gmapsForceUpdate();
+});
 
 // Wire up header buttons
 document.getElementById('gmap-min').addEventListener('click', e => {
@@ -5277,8 +5311,9 @@ async function fetchTiles(lat, lon) {
       let built = 0, deferred = 0;
       const MESH_BUILD_BUDGET = 200; // max meshes to build per fetch
       for (const tile of data.tiles) {
-        if (!addedSet.has(tile.id) || !tile.heightmap) continue;
-        if (existingIds.has(tile.id)) continue;
+        if (!addedSet.has(tile.id)) continue;            // not newly added — already tracked
+        if (!tile.heightmap) { tileLog(tile.id, 'skipped — no heightmap data'); continue; }
+        if (existingIds.has(tile.id)) { tileLog(tile.id, 'skipped — mesh already in scene'); continue; }
         // Skip children whose parent is already enhanced — the parent covers this area
         if (_coveredByEnhancedParent(tile)) {
           tileLog(tile.id, 'skipped — covered by enhanced parent');
@@ -5910,11 +5945,6 @@ function updateHud() {
   const srvMissing = _srvTexStatus.missing || 0;
   const srvAncestor = _srvTexStatus.ancestor_fallback || 0;
   let texLine = `tex: ${texCache.size} cached`;
-  // Client fetch pipeline
-  if (texInflight.size > 0 || texFetching.size > 0) {
-    texLine += `  <span style="color:#8cf">http: ${texInflight.size}</span>`;
-    texLine += `  <span style="color:#fc8">poll: ${texFetching.size}</span>`;
-  }
   // Server-side pipeline — show when there's work happening
   if (_srvTexFetching > 0 || _srvTexRetry > 0 || srvMissing > 0) {
     texLine += `  <span style="color:#f8c">srv: ${_srvTexFetching} fetching</span>`;
@@ -5933,6 +5963,11 @@ function updateHud() {
     enhParts.push(`<span style="color:#8f8">${enhDone}/${enhTotal} enhanced (${pct}%)</span>`);
     if (enhEligible > 0) enhParts.push(`<span style="color:#fc8">${enhEligible} eligible</span>`);
     texLine += '  ' + enhParts.join('  ');
+  }
+  // Client HTTP pipeline on its own line to prevent width flickering
+  let texPipeLine = '';
+  if (texInflight.size > 0 || texFetching.size > 0) {
+    texPipeLine = `<span style="color:#8cf">http: ${texInflight.size}</span>  <span style="color:#fc8">poll: ${texFetching.size}</span>`;
   }
   const modeLabel = controls.mapMode
     ? 'MAP'
@@ -5969,9 +6004,10 @@ function updateHud() {
     `mode: <b>${modeHtml}</b>`,
     `lat: ${(anchorLat + northM / 111320).toFixed(5)}°  lon: ${(anchorLon + eastM / (111320 * Math.cos(anchorLat * Math.PI / 180))).toFixed(5)}°  alt: ${altM.toFixed(0)}m`,
     `enu: E ${eastM.toFixed(0)}m  N ${northM.toFixed(0)}m  U ${altM.toFixed(0)}m`,
-    `speed: ${speedKmh.toFixed(0)} km/h  heading: ${deg.toFixed(0)}° ${compass}`,
+    `speed: ${speedKmh.toFixed(0)} km/h  heading: ${deg.toFixed(0)}° ${compass}` + (driftMode ? '  <span style="color:#ff0;font-weight:bold">⚡ SPEED LOCK</span>' : ''),
     hmLine,
     texLine,
+    texPipeLine,
     vehicleControlActive
       ? 'W/S drive, A/D steer, mouse orbit camera, Esc exits vehicle control'
       : 'WASD or Arrows move, Q/Z altitude, drag look',
@@ -5979,12 +6015,13 @@ function updateHud() {
     controls.mapMode
       ? `ocean overlay: ${oceanMapDebugEnabled ? 'ON' : 'OFF'}  (right-click menu; cyan=ocean, magenta=seed, orange=passable)`
       : '',
-    'M map mode, R reset · <span id="debugLogLink" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">debug log</span>'
+    'M map mode, R reset · <span id="debugLogLink" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">debug log</span> · <span id="tileViewerLink" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">tiles</span> · <span id="osmMapLink" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">OSM</span>'
   ].join('<br>');
   alt.textContent =
     `${altM.toFixed(0)}m / ${(altM * 3.28084).toFixed(0)}ft  ${deg.toFixed(0)}° ${compass}` +
     `  FOV ${camera.fov.toFixed(0)}°` +
-    (controls.mapMode ? '  [MAP]' : (vehicleControlActive ? '  [VEHICLE]' : ''));
+    (controls.mapMode ? '  [MAP]' : (vehicleControlActive ? '  [VEHICLE]' : ''))
+    + (driftMode ? '  [SPEED LOCK]' : '');
 }
 
 function resetView() {
