@@ -78,7 +78,7 @@ def _fetch_tile(db, tile_id, bbox, allow_overwrite=False):
         mark_no_data(db, tile_id)
         return False
 
-    conf = CONFIDENCE.get(src_name, CONFIDENCE['arcticdem'])
+    conf = CONFIDENCE.get(src_name, CONFIDENCE['arcticdem'])  # type: ignore[call-overload]
     cm = np.where(np.isnan(data), np.uint8(0), np.uint8(conf))
     hm = np.where(np.isnan(data), 0.0, data).astype(np.float32)
     try:
@@ -138,7 +138,8 @@ def _traverse(db, depth, col, row, qx, qy, max_depth, error_threshold,
     """
     tid = _tile_id(depth, col, row)
     meta = read_tile_metadata(db, tid)
-    _debug = tid in ('9-172-98', '10-344-196', '10-344-197', '10-345-196', '10-345-197')
+    _debug = tid in ('9-172-98', '10-344-196', '10-344-197', '10-345-196', '10-345-197',
+                      '11-723-362', '12-1446-724', '12-1446-725', '12-1447-724', '12-1447-725')
 
     if meta is None:
         if _debug:
@@ -315,12 +316,11 @@ def _query_tiles_impl(db, qx, qy, error_threshold, max_depth, max_range, log, al
     leaf_ids = []
     missing_raw = []
     _traverse(db, 0, 0, 0, qx, qy, max_depth, error_threshold, leaf_ids, missing_raw, max_range, altitude)
+    traversal_total = len(leaf_ids)
 
     # Tile budget: if LOD produced too many tiles, drop the deepest/farthest.
-    # Keep coarse tiles (coverage) and nearest deep tiles (detail where it matters).
-    MAX_TILES = 2500
+    MAX_TILES = 5000
     if len(leaf_ids) > MAX_TILES:
-        # Score each tile: (depth, distance) — drop highest scores first
         def _tile_score(tid):
             parts = tid.split('-')
             d = int(parts[0])
@@ -394,7 +394,7 @@ def _query_tiles_impl(db, qx, qy, error_threshold, max_depth, max_range, log, al
     if skip_count:
         log(f"  [NO DATA] {skip_count} tiles known to have no COG data (ocean/cached skip)")
 
-    return results, missing
+    return results, missing, traversal_total
 
 
 def fetch_missing_tiles(db, missing, max_workers=6, log=print):
@@ -460,7 +460,7 @@ def fetch_missing_tiles(db, missing, max_workers=6, log=print):
                     no_data += 1
                     continue
 
-                conf = CONFIDENCE.get(src_name, CONFIDENCE['arcticdem'])
+                conf = CONFIDENCE.get(src_name, CONFIDENCE['arcticdem'])  # type: ignore[call-overload]
                 cm = np.where(np.isnan(data), np.uint8(0), np.uint8(conf))
                 hm = np.where(np.isnan(data), 0.0, data).astype(np.float32)
                 overwrite = tid in upgrade_tids

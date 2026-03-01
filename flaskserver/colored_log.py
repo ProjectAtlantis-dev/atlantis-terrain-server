@@ -71,10 +71,6 @@ def get_logger(name="terrain"):
         handler = logging.StreamHandler()
         handler.setFormatter(ColoredFormatter())
         logger.addHandler(handler)
-        logger.setLevel(
-            logging.INFO
-            if name in ("terrain.trav", "terrain", "terrain.tex", "terrain.cog", "terrain.vehicle", "terrain.assets")
-            else logging.DEBUG
-        )
+        logger.setLevel(logging.DEBUG)
         logger.propagate = False
     return logger

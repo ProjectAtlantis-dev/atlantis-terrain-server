@@ -1,0 +1,416 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Tile Viewer</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #0a0a1a; color: #ccc; font-family: monospace; overflow: hidden; }
+  #controls {
+    position: fixed; top: 0; left: 0; right: 0; z-index: 10;
+    background: rgba(10,10,26,0.92); padding: 8px 12px;
+    display: flex; gap: 12px; align-items: center; flex-wrap: wrap;
+    border-bottom: 1px solid #333;
+  }
+  #controls label { color: #888; font-size: 0.8em; }
+  #controls select, #controls input[type=number] {
+    background: #16213e; color: #e0e0e0; border: 1px solid #444;
+    padding: 3px 6px; font-family: monospace; font-size: 0.85em;
+  }
+  #controls .stat { color: #0ff; font-size: 0.85em; }
+  #controls .btn {
+    color: #0af; cursor: pointer; font-size: 0.85em;
+    background: none; border: 1px solid #0af; padding: 2px 8px;
+  }
+  #controls .btn:hover { background: #0af2; }
+  canvas { display: block; cursor: grab; }
+  canvas:active { cursor: grabbing; }
+  #tooltip {
+    display: none; position: fixed; z-index: 20;
+    background: rgba(22,33,62,0.95); color: #e0e0e0; border: 1px solid #0ff;
+    padding: 6px 10px; font-size: 0.8em; pointer-events: none;
+    max-width: 300px; white-space: pre-line;
+  }
+  #legend {
+    position: fixed; bottom: 12px; right: 12px; z-index: 10;
+    background: rgba(10,10,26,0.9); border: 1px solid #333;
+    padding: 8px 12px; font-size: 0.75em;
+  }
+  #legend div { display: flex; align-items: center; gap: 6px; margin: 2px 0; }
+  #legend .swatch { width: 14px; height: 14px; border: 1px solid #555; }
+</style></head><body>
+<div id="controls">
+  <label>Depth: <select id="depthSelect"><option value="">all</option></select></label>
+  <label>Filter: <select id="sourceFilter">
+    <option value="">all tiles</option>
+    <option value="!empty" selected>non-empty only</option>
+  </select></label>
+  <label>Color by: <select id="colorBy">
+    <option value="hm_source">heightmap source</option>
+    <option value="tex_source">texture source</option>
+    <option value="depth">depth</option>
+  </select></label>
+  <button class="btn" onclick="loadTiles()">reload</button>
+  <button class="btn" onclick="resetView()">reset view</button>
+  <span class="stat" id="stats"></span>
+</div>
+<canvas id="c"></canvas>
+<div id="tooltip"></div>
+<div id="legend"></div>
+
+<script>
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+const tooltip = document.getElementById('tooltip');
+
+// Greenland bbox in EPSG:3413 (from tiles.py)
+const CX = (-627247 + 849164) / 2;
+const CY = (-3326128 + -666027) / 2;
+const HALF = 2700000 / 2;
+const GBOX = { xmin: CX - HALF, ymin: CY - HALF, xmax: CX + HALF, ymax: CY + HALF };
+
+// Real Greenland coastline in EPSG:3413, loaded from pipeline data
+let GREENLAND_OUTLINE_3413 = [];
+
+let tiles = [];
+let viewX = (GBOX.xmin + GBOX.xmax) / 2;
+let viewY = (GBOX.ymin + GBOX.ymax) / 2;
+let viewScale = 1;
+let dragging = false;
+let dragStart = { x: 0, y: 0 };
+let dragViewStart = { x: 0, y: 0 };
+let hoveredTile = null;
+
+// Source color palettes
+const HM_COLORS = {
+  empty:              'rgba(40, 40, 60, 0.3)',
+  procedural:         'rgba(120, 80, 200, 0.6)',
+  parent_resampled:   'rgba(200, 150, 50, 0.6)',
+  etopo:              'rgba(60, 160, 120, 0.6)',
+  copernicus:         'rgba(50, 150, 220, 0.6)',
+  external:           'rgba(50, 150, 220, 0.6)',
+  arcticdem:          'rgba(0, 200, 100, 0.7)',
+  arcticdem_10m:      'rgba(0, 255, 80, 0.8)',
+};
+
+const TEX_COLORS = {
+  '':                         'rgba(40, 40, 60, 0.3)',
+  ancestor_crop:              'rgba(180, 120, 40, 0.5)',
+  ancestor_crop_ratelimit:    'rgba(200, 80, 30, 0.6)',
+  ancestor_crop_nodata:       'rgba(100, 60, 30, 0.4)',
+  dataforsyningen:            'rgba(0, 180, 220, 0.7)',
+  dataforsyningen_enhanced:   'rgba(0, 220, 120, 0.8)',
+  sentinel2:                  'rgba(100, 100, 220, 0.6)',
+  sentinel2_enhanced:         'rgba(80, 220, 180, 0.8)',
+  upscaled:                   'rgba(255, 80, 255, 0.8)',
+};
+
+const DEPTH_COLORS = [
+  'rgba(80, 80, 120, 0.4)',
+  'rgba(60, 120, 180, 0.5)',
+  'rgba(40, 160, 160, 0.5)',
+  'rgba(40, 180, 100, 0.6)',
+  'rgba(80, 200, 60, 0.6)',
+  'rgba(140, 200, 40, 0.6)',
+  'rgba(200, 180, 40, 0.7)',
+  'rgba(220, 140, 40, 0.7)',
+  'rgba(240, 100, 40, 0.7)',
+  'rgba(255, 60, 60, 0.8)',
+  'rgba(255, 40, 120, 0.8)',
+  'rgba(255, 40, 200, 0.8)',
+  'rgba(200, 40, 255, 0.8)',
+  'rgba(140, 40, 255, 0.8)',
+];
+
+function getTileColor(tile) {
+  const mode = document.getElementById('colorBy').value;
+  if (mode === 'depth') {
+    return DEPTH_COLORS[Math.min(tile.d, DEPTH_COLORS.length - 1)];
+  }
+  if (mode === 'tex_source') {
+    return TEX_COLORS[tile.tx] || 'rgba(255, 0, 0, 0.5)';
+  }
+  return HM_COLORS[tile.hm] || 'rgba(255, 0, 0, 0.5)';
+}
+
+function resize() {
+  canvas.width = window.innerWidth;
+  canvas.height = window.innerHeight;
+  draw();
+}
+
+// World coords to screen
+function w2s(wx, wy) {
+  const cx = canvas.width / 2;
+  const cy = canvas.height / 2;
+  const range = (GBOX.xmax - GBOX.xmin);
+  const basePx = Math.min(canvas.width, canvas.height) * 0.85;
+  const scale = (basePx / range) * viewScale;
+  return {
+    x: cx + (wx - viewX) * scale,
+    y: cy - (wy - viewY) * scale,  // flip Y: screen Y is down, world Y is up
+  };
+}
+
+// Screen coords to world
+function s2w(sx, sy) {
+  const cx = canvas.width / 2;
+  const cy = canvas.height / 2;
+  const range = (GBOX.xmax - GBOX.xmin);
+  const basePx = Math.min(canvas.width, canvas.height) * 0.85;
+  const scale = (basePx / range) * viewScale;
+  return {
+    x: viewX + (sx - cx) / scale,
+    y: viewY - (sy - cy) / scale,
+  };
+}
+
+function draw() {
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+  // Draw Greenland outline
+  ctx.beginPath();
+  for (let i = 0; i < GREENLAND_OUTLINE_3413.length; i++) {
+    const p = w2s(GREENLAND_OUTLINE_3413[i][0], GREENLAND_OUTLINE_3413[i][1]);
+    if (i === 0) ctx.moveTo(p.x, p.y);
+    else ctx.lineTo(p.x, p.y);
+  }
+  ctx.closePath();
+  ctx.fillStyle = 'rgba(30, 50, 40, 0.3)';
+  ctx.fill();
+  ctx.strokeStyle = 'rgba(0, 255, 100, 0.4)';
+  ctx.lineWidth = 1.5;
+  ctx.stroke();
+
+  // Draw grid bbox outline
+  const gTL = w2s(GBOX.xmin, GBOX.ymax);
+  const gBR = w2s(GBOX.xmax, GBOX.ymin);
+  ctx.strokeStyle = 'rgba(0, 255, 100, 0.25)';
+  ctx.lineWidth = 1;
+  ctx.strokeRect(gTL.x, gTL.y, gBR.x - gTL.x, gBR.y - gTL.y);
+
+  // Draw tiles
+  for (const t of tiles) {
+    const tl = w2s(t.bbox[0], t.bbox[3]); // x_min, y_max
+    const br = w2s(t.bbox[2], t.bbox[1]); // x_max, y_min
+    const w = br.x - tl.x;
+    const h = br.y - tl.y;
+
+    // Skip tiles too small to see
+    if (w < 1 && h < 1) continue;
+
+    ctx.fillStyle = getTileColor(t);
+    ctx.fillRect(tl.x, tl.y, w, h);
+
+    // Border — only draw if tile is big enough
+    if (w > 3) {
+      ctx.strokeStyle = 'rgba(200, 200, 200, 0.4)';
+      ctx.lineWidth = 0.5;
+      ctx.strokeRect(tl.x, tl.y, w, h);
+    }
+  }
+
+  // Highlight hovered tile
+  if (hoveredTile) {
+    const tl = w2s(hoveredTile.bbox[0], hoveredTile.bbox[3]);
+    const br = w2s(hoveredTile.bbox[2], hoveredTile.bbox[1]);
+    ctx.strokeStyle = '#000';
+    ctx.lineWidth = 2;
+    ctx.strokeRect(tl.x, tl.y, br.x - tl.x, br.y - tl.y);
+  }
+}
+
+function resetView() {
+  viewX = (GBOX.xmin + GBOX.xmax) / 2;
+  viewY = (GBOX.ymin + GBOX.ymax) / 2;
+  viewScale = 1;
+  draw();
+  // Clear saved state so next load starts at default too
+  fetch('/api/tile_viewer/state', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(null),
+  }).catch(() => {});
+}
+
+async function loadTiles() {
+  const depth = document.getElementById('depthSelect').value;
+  const source = document.getElementById('sourceFilter').value;
+  let url = '/api/tile_viewer?';
+  if (depth) url += `depth=${depth}&`;
+  if (source) url += `source=${encodeURIComponent(source)}&`;
+
+  document.getElementById('stats').textContent = 'loading...';
+  try {
+    const resp = await fetch(url);
+    const data = await resp.json();
+    tiles = data.tiles;
+
+    // Populate depth selector
+    const depths = [...new Set(tiles.map(t => t.d))].sort((a, b) => a - b);
+    const sel = document.getElementById('depthSelect');
+    const cur = sel.value;
+    sel.innerHTML = '<option value="">all</option>';
+    for (const d of depths) {
+      const opt = document.createElement('option');
+      opt.value = d;
+      opt.textContent = d;
+      sel.appendChild(opt);
+    }
+    sel.value = cur;
+
+    // Stats
+    const hmSources = {};
+    const txSources = {};
+    for (const t of tiles) {
+      hmSources[t.hm] = (hmSources[t.hm] || 0) + 1;
+      if (t.tx) txSources[t.tx] = (txSources[t.tx] || 0) + 1;
+    }
+    document.getElementById('stats').textContent =
+      `${data.count} tiles | ` +
+      Object.entries(hmSources).map(([k, v]) => `${k}:${v}`).join(' ');
+
+    updateLegend();
+    draw();
+  } catch (e) {
+    document.getElementById('stats').textContent = 'error: ' + e.message;
+  }
+}
+
+function updateLegend() {
+  const mode = document.getElementById('colorBy').value;
+  const legend = document.getElementById('legend');
+  let palette;
+  if (mode === 'depth') {
+    const depths = [...new Set(tiles.map(t => t.d))].sort((a, b) => a - b);
+    palette = {};
+    for (const d of depths) palette[`depth ${d}`] = DEPTH_COLORS[Math.min(d, DEPTH_COLORS.length - 1)];
+  } else if (mode === 'tex_source') {
+    palette = {};
+    const seen = new Set(tiles.map(t => t.tx));
+    for (const k of seen) {
+      if (k === '') continue;
+      palette[k] = TEX_COLORS[k] || 'rgba(255,0,0,0.5)';
+    }
+  } else {
+    palette = {};
+    const seen = new Set(tiles.map(t => t.hm));
+    for (const k of seen) palette[k] = HM_COLORS[k] || 'rgba(255,0,0,0.5)';
+  }
+  legend.innerHTML = '';
+  for (const [name, color] of Object.entries(palette)) {
+    const row = document.createElement('div');
+    row.innerHTML = `<div class="swatch" style="background:${color}"></div><span>${name}</span>`;
+    legend.appendChild(row);
+  }
+}
+
+// --- Persist view state ---
+let saveTimer = null;
+function saveViewState() {
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(() => {
+    fetch('/api/tile_viewer/state', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ x: viewX, y: viewY, scale: viewScale }),
+    }).catch(() => {});
+  }, 300);
+}
+
+async function restoreViewState() {
+  try {
+    const resp = await fetch('/api/tile_viewer/state');
+    const state = await resp.json();
+    if (state && state.x != null) {
+      viewX = state.x;
+      viewY = state.y;
+      viewScale = state.scale;
+      draw();
+    }
+  } catch {}
+}
+
+// --- Mouse interaction ---
+
+canvas.addEventListener('mousedown', e => {
+  dragging = true;
+  dragStart = { x: e.clientX, y: e.clientY };
+  dragViewStart = { x: viewX, y: viewY };
+});
+
+window.addEventListener('mousemove', e => {
+  if (dragging) {
+    const range = (GBOX.xmax - GBOX.xmin);
+    const basePx = Math.min(canvas.width, canvas.height) * 0.85;
+    const scale = (basePx / range) * viewScale;
+    viewX = dragViewStart.x - (e.clientX - dragStart.x) / scale;
+    viewY = dragViewStart.y + (e.clientY - dragStart.y) / scale;
+    draw();
+    saveViewState();
+  }
+
+  // Tooltip
+  const wp = s2w(e.clientX, e.clientY);
+  let found = null;
+  // Search in reverse (higher depth drawn last = on top)
+  for (let i = tiles.length - 1; i >= 0; i--) {
+    const t = tiles[i];
+    if (wp.x >= t.bbox[0] && wp.x <= t.bbox[2] && wp.y >= t.bbox[1] && wp.y <= t.bbox[3]) {
+      found = t;
+      break;
+    }
+  }
+  hoveredTile = found;
+  if (found) {
+    tooltip.style.display = 'block';
+    tooltip.style.left = (e.clientX + 14) + 'px';
+    tooltip.style.top = (e.clientY + 14) + 'px';
+    const sizeKm = ((found.bbox[2] - found.bbox[0]) / 1000).toFixed(1);
+    tooltip.textContent =
+      `${found.id}\ndepth: ${found.d}  col: ${found.c}  row: ${found.r}\n` +
+      `heightmap: ${found.hm}\ntexture: ${found.tx || '(none)'}\n` +
+      `size: ${sizeKm} km`;
+  } else {
+    tooltip.style.display = 'none';
+  }
+  if (!dragging) draw();  // redraw for hover highlight
+});
+
+window.addEventListener('mouseup', () => { dragging = false; });
+
+canvas.addEventListener('wheel', e => {
+  e.preventDefault();
+  const zoomFactor = e.deltaY < 0 ? 1.15 : 1 / 1.15;
+
+  // Zoom toward cursor
+  const wp = s2w(e.clientX, e.clientY);
+  viewScale *= zoomFactor;
+  // Adjust viewX/viewY so the world point under cursor stays fixed
+  const wpAfter = s2w(e.clientX, e.clientY);
+  viewX -= (wpAfter.x - wp.x);
+  viewY -= (wpAfter.y - wp.y);
+
+  draw();
+  saveViewState();
+}, { passive: false });
+
+// Controls
+document.getElementById('depthSelect').addEventListener('change', loadTiles);
+document.getElementById('sourceFilter').addEventListener('change', loadTiles);
+document.getElementById('colorBy').addEventListener('change', () => { updateLegend(); draw(); });
+
+window.addEventListener('resize', resize);
+resize();
+
+// Restore saved view position, then load coastline + tiles
+restoreViewState();
+
+// Load real coastline outline then tiles
+fetch('greenland_outline_3413.json')
+  .then(r => r.json())
+  .then(data => {
+    GREENLAND_OUTLINE_3413 = data.geometry.coordinates[0];
+    draw();
+  })
+  .catch(e => console.warn('Could not load coastline:', e));
+
+loadTiles();
+</script></body></html>

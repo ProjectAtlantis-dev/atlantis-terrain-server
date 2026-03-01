@@ -41,7 +41,7 @@ const VEHICLE_SAVE_FETCH_TIMEOUT_MS = 1500;
 const VEHICLE_SAVE_FAILURE_COOLDOWN_MS = 15000;
 const CLIENT_LOG_ENABLED = params.get('clientLog') !== '0';
 const CLIENT_LOG_BATCH_SIZE = 40;
-const CLIENT_LOG_MAX_QUEUE = 600;
+const CLIENT_LOG_MAX_QUEUE = 10000;
 const CLIENT_LOG_FLUSH_MS = 800;
 const clientLogQueue = [];
 let clientLogInFlight = false;
@@ -1437,6 +1437,8 @@ let _hmDownloading = 0; // heightmaps the server is fetching
 let _srvTexFetching = 0;   // server-side: textures being fetched from dataforsyningen
 let _srvTexRetry = 0;      // server-side: textures in retry queue (rate-limited)
 let _srvTexStatus = {};    // server-side: {ready, ancestor_fallback, fetching, missing}
+let _srvTraversalTotal = 0; // server-side: total tiles from LOD traversal (before budget cap)
+let _srvTileBudget = 5000;  // server-side: max tile budget
 
 function paramNumber(name, fallback) {
   const raw = params.get(name);
@@ -4654,13 +4656,14 @@ function updateTextures(tiles) {
     requestWaterMask(t.id);
     let mesh = meshMap.get(t.id);
     if (!mesh) continue;
+    const prevMap = mesh.material?.map;
     mesh = rebuildTileMeshWithTexture(mesh, t, tex);
     meshMap.set(t.id, mesh);
+    applyTerrainMaterialMode(mesh, tex);
     const useOceanOverlay = oceanMapDebugEnabled && controls.mapMode;
-    if (!useOceanOverlay && mesh.material.map !== tex) {
+    if (!useOceanOverlay && prevMap !== tex) {
       tileLog(t.id, `apply cached tex (src=${texSource.get(t.id) || '?'})`);
     }
-    applyTerrainMaterialMode(mesh, tex);
     mesh.userData.waterMask = waterMaskCache.get(t.id) || null;
   }
 
@@ -5308,17 +5311,26 @@ async function fetchTiles(lat, lon) {
         if (c.userData.tileId) existingIds.add(c.userData.tileId);
       }
       const addedSet = new Set(added);
-      let built = 0, deferred = 0;
       const MESH_BUILD_BUDGET = 200; // max meshes to build per fetch
+      const BATCH_SIZE = 20; // yield to browser every N mesh builds
+
+      // Collect tiles to process, then build meshes in async batches
+      const tilesToProcess = [];
       for (const tile of data.tiles) {
         if (!addedSet.has(tile.id)) continue;            // not newly added — already tracked
         if (!tile.heightmap) { tileLog(tile.id, 'skipped — no heightmap data'); continue; }
         if (existingIds.has(tile.id)) { tileLog(tile.id, 'skipped — mesh already in scene'); continue; }
-        // Skip children whose parent is already enhanced — the parent covers this area
         if (_coveredByEnhancedParent(tile)) {
           tileLog(tile.id, 'skipped — covered by enhanced parent');
           continue;
         }
+        tilesToProcess.push(tile);
+      }
+
+      // Phase 1 (sync): handle deferred tiles and tiles with cached textures
+      let built = 0, deferred = 0;
+      const buildQueue = []; // tiles needing mesh build (no cached tex, no coverage)
+      for (const tile of tilesToProcess) {
         const cachedTex = texCache.get(tile.id);
         if (cachedTex) {
           if (built < MESH_BUILD_BUDGET) {
@@ -5327,17 +5339,12 @@ async function fetchTiles(lat, lon) {
             materializeTile(tile.id, cachedTex);
             built++;
           } else {
-            // Over budget — defer to next frame cycle
             tileLog(tile.id, `added — deferred (build budget exceeded, built=${built}/${MESH_BUILD_BUDGET})`);
             deferredTiles.set(tile.id, tile);
             deferred++;
           }
         } else {
-          // No texture yet — defer until texture arrives.
           deferredTiles.set(tile.id, tile);
-          // If a stale textured mesh covers this area, skip the untextured
-          // fallback — the stale texture looks better than a blank mesh.
-          // materializeTile() will swap in the real textured mesh when ready.
           const tb = tile.bbox;
           let hasCoverage = false;
           for (const child of terrainRoot.children) {
@@ -5350,11 +5357,22 @@ async function fetchTiles(lat, lon) {
             }
           }
           if (hasCoverage) {
-            // Textured parent covers this area — defer until our texture
-            // arrives so we don't z-fight with the parent.
             tileLog(tile.id, 'added — deferred (stale coverage exists)');
             deferred++;
           } else if (built < MESH_BUILD_BUDGET) {
+            buildQueue.push(tile);
+          } else {
+            deferred++;
+          }
+        }
+      }
+
+      // Phase 2 (async): build untextured fallback meshes in batches,
+      // yielding to the browser between batches so rendering doesn't freeze.
+      if (buildQueue.length > 0) {
+        (async () => {
+          for (let i = 0; i < buildQueue.length; i++) {
+            const tile = buildQueue[i];
             tileLog(tile.id, 'added — untextured fallback (no stale coverage)');
             const mesh = buildMesh(tile);
             if (mesh) {
@@ -5364,12 +5382,11 @@ async function fetchTiles(lat, lon) {
               mesh.material.polygonOffsetUnits = -depth;
               terrainRoot.add(mesh);
             }
-            built++;
-          } else {
-            deferredTiles.set(tile.id, tile);
-            deferred++;
+            if ((i + 1) % BATCH_SIZE === 0) {
+              await new Promise(r => requestAnimationFrame(r));
+            }
           }
-        }
+        })();
       }
     }
 
@@ -5393,6 +5410,8 @@ async function fetchTiles(lat, lon) {
     _srvTexFetching = data.texFetching || 0;
     _srvTexRetry = data.texRetryQueue || 0;
     _srvTexStatus = data.texStatusCounts || {};
+    _srvTraversalTotal = data.traversalTotal || 0;
+    _srvTileBudget = data.tileBudget || 5000;
 
     if (pollTimer) clearTimeout(pollTimer);
     if (wasFirstLoad) {
@@ -5934,7 +5953,9 @@ function updateHud() {
   const passLabel = _loadPass === 1
     ? '<span style="color:#ff0">PASS 1 (preview)</span>'
     : '<span style="color:#8f8">PASS 2 (full)</span>';
-  const hmLine = `${passLabel}  hm: ${currentTileIds.size} tiles`
+  const budgetPct = _srvTileBudget > 0 ? Math.round(_srvTraversalTotal / _srvTileBudget * 100) : 0;
+  const budgetColor = budgetPct >= 100 ? '#f66' : budgetPct >= 80 ? '#fc8' : '#8f8';
+  const hmLine = `${passLabel}  hm: ${currentTileIds.size} tiles  <span style="color:${budgetColor}">lod: ${_srvTraversalTotal}/${_srvTileBudget} (${budgetPct}%)</span>`
     + (hmPending > 0
       ? `  <span style="color:#fc8">${_hmDownloading} downloading  ${_hmMissing} queued</span>`
       : '');

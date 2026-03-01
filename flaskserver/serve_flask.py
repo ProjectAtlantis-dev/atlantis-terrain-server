@@ -872,7 +872,7 @@ def api_tiles():
   heading = _arg_float("heading", 0.0)
 
   try:
-    tiles, missing = _query_tiles_stereo(
+    tiles, missing, traversal_total = _query_tiles_stereo(
       _get_db(),
       qx,
       qy,
@@ -1074,6 +1074,8 @@ def api_tiles():
       "texQueued": len(tex_fetching),
       "texRetryQueue": len(_tex_retry_queue),
       "texStatusCounts": tex_status_counts,
+      "traversalTotal": traversal_total,
+      "tileBudget": 5000,
     }
   )
 
@@ -1084,7 +1086,7 @@ def api_texture(tile_id: str):
   if unavailable is not None:
     return unavailable
 
-  log_tex.debug(f"[/api/texture] tile_id={tile_id}")
+  # log_tex.debug(f"[/api/texture] tile_id={tile_id}")
 
   db = _get_db()
   row = db.execute(
@@ -1097,7 +1099,7 @@ def api_texture(tile_id: str):
   _TEX_TEMPORARY = {"sentinel2_crop", "ancestor_crop", "ancestor_crop_ratelimit"}
   if row is not None:
     cached, source = row[0], row[1]
-    log_tex.debug(f"[/api/texture] {tile_id}: cache HIT source={source} size={len(cached)} bytes")
+    # log_tex.debug(f"[/api/texture] {tile_id}: cache HIT source={source} size={len(cached)} bytes")
     if source not in _TEX_TEMPORARY:
       is_crop = source == "ancestor_crop_nodata"
       return Response(
@@ -2056,4 +2058,4 @@ if __name__ == "__main__":
   ws_port = int(os.environ.get("WS_PORT", "5181"))
   ws_thread = threading.Thread(target=_start_ws_server, args=(host, ws_port), daemon=True)
   ws_thread.start()
-  app.run(host=host, port=port, debug=False)
+  app.run(host=host, port=port, debug=False, threaded=True)
