@@ -2795,8 +2795,8 @@ function loadVehicleModel(vehicle) {
           map: flashTex,
           blending: THREE.AdditiveBlending,
           transparent: true,
-          depthTest: false,
           depthWrite: false,
+          depthTest: false,
         });
         vehicle.muzzleFlashSprite = new THREE.Sprite(flashMat);
         vehicle.muzzleFlashSprite.scale.setScalar(0.5);
@@ -2832,8 +2832,8 @@ function loadVehicleModel(vehicle) {
           map: impTex,
           blending: THREE.AdditiveBlending,
           transparent: true,
-          depthTest: false,
           depthWrite: false,
+          depthTest: false,
         });
         for (let i = 0; i < MAX_IMPACTS; i++) {
           const s = new THREE.Sprite(impMat.clone());
@@ -3288,6 +3288,21 @@ function fireTurret(vehicle) {
     vehicle.muzzleFlashSprite.visible = true;
     vehicle.muzzleFlashSprite.material.opacity = 1;
     vehicle.muzzleFlashTimer = 0.05;
+    // DEBUG — log sprite material state to diagnose black squares
+    if (!vehicle._flashLoggedOnce) {
+      vehicle._flashLoggedOnce = true;
+      const m = vehicle.muzzleFlashSprite.material;
+      console.log('[DEBUG flash]', {
+        blending: m.blending, transparent: m.transparent, depthWrite: m.depthWrite,
+        depthTest: m.depthTest, opacity: m.opacity, visible: vehicle.muzzleFlashSprite.visible,
+        hasMap: !!m.map, mapImage: m.map?.image?.tagName, parent: vehicle.muzzleFlashSprite.parent?.name,
+      });
+      const im = impactPool[0]?.material;
+      if (im) console.log('[DEBUG impact]', {
+        blending: im.blending, transparent: im.transparent, depthWrite: im.depthWrite,
+        depthTest: im.depthTest, hasMap: !!im.map, mapImage: im.map?.image?.tagName,
+      });
+    }
   }
 
   // Spawn tracer — orient along fire direction using quaternion
@@ -4315,6 +4330,34 @@ async function updateHouseHotReload(nowMs) {
 }
 
 const normalPass = new NormalPass(scene, camera);
+
+// THREE.Sprite ignores scene.overrideMaterial, so sprites write their raw
+// texture colors into the normal buffer instead of proper encoded normals.
+// This corrupts the normal buffer at the sprite's screen-space pixels and
+// causes AerialPerspectiveEffect to apply incorrect (dark/black) irradiance
+// there. Fix: hide effect sprites during the NormalPass render.
+{
+  const _origNormalRender = normalPass.render.bind(normalPass);
+  normalPass.render = function (renderer, inputBuffer, outputBuffer, deltaTime, stencilTest) {
+    // Save & hide muzzle flash sprites for ALL vehicles in registry
+    const flashVis = [];
+    for (const [, v] of vehicleRegistry) {
+      if (v.muzzleFlashSprite) {
+        flashVis.push({ sprite: v.muzzleFlashSprite, was: v.muzzleFlashSprite.visible });
+        v.muzzleFlashSprite.visible = false;
+      }
+    }
+    // Save & hide impact pool sprites
+    const impVis = impactPool.map(s => s.visible);
+    impactPool.forEach(s => { s.visible = false; });
+
+    _origNormalRender(renderer, inputBuffer, outputBuffer, deltaTime, stencilTest);
+
+    // Restore visibility
+    for (const entry of flashVis) entry.sprite.visible = entry.was;
+    impactPool.forEach((s, i) => { s.visible = impVis[i]; });
+  };
+}
 
 const cloudsEffect = new CloudsEffect(camera, { resolutionScale: 1 });
 cloudsEffect.qualityPreset = 'high';
@@ -7091,7 +7134,6 @@ function render() {
     snapVehicleToTerrain(_veh);
     updateVehicleSuspension(_veh, dt);
     updateVehicleWheelSpin(_veh, dt);
-    syncVehicleSunLight(_veh);
   }
   updateDieselVolume();
   // Active vehicle only: turret, camera, fire
@@ -7117,6 +7159,11 @@ function render() {
     } else {
       _renderVehicle.muzzleFlashSprite.material.opacity = _renderVehicle.muzzleFlashTimer / 0.05;
     }
+  }
+  // Sync vehicle sun lights for ALL vehicles (must run after sprite updates, before shadow system)
+  for (const [, _veh] of vehicleRegistry) {
+    if (!_veh.loaded) continue;
+    syncVehicleSunLight(_veh);
   }
   syncVehicleShadowReceivers(_renderVehicle);
   updateVehicleShadowSystem(_renderVehicle);

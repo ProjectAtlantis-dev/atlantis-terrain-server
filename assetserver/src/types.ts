@@ -15,11 +15,22 @@ export interface VehicleHeadlights {
   targetXScale: number;
 }
 
+export interface VehicleParts {
+  wheels: string[];
+  turret?: string | null;
+  gun?: string | null;
+  body?: string[];
+  shield?: string[];
+}
+
 export interface VehicleDefinition {
   url: string;
+  displayName?: string;
   realLengthM: number;
   tireDiameterM: number;
   altOffsetM: number;
+  parts?: VehicleParts;
+  wheelClusterSplitThreshold?: number | null;
 }
 
 export interface StructureDefinition {

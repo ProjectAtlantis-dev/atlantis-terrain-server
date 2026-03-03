@@ -22,6 +22,7 @@ import {
   type VehicleDefinition,
   type VehicleHeadlights,
   type VehicleInstance,
+  type VehicleParts,
   type VehicleProperties,
   type VehicleSeedInstance,
   type VehicleStateCommon,
@@ -34,9 +35,18 @@ type SeedVehicleMetadata = VehicleStateCommon & { id: string; headlightsOn: bool
 
 const FALLBACK_VEHICLE_DEFINITION: VehicleDefinition = {
   url: "/models/patria_amv.glb",
+  displayName: "Patria AMV",
   realLengthM: 7.7,
   tireDiameterM: 1.27,
   altOffsetM: 0.05,
+  parts: {
+    wheels: ["Object_8", "Object_9", "Object_10"],
+    turret: "Object_3",
+    gun: "Object_2",
+    body: ["Object_4", "Object_5", "Object_6"],
+    shield: ["Object_7"],
+  },
+  wheelClusterSplitThreshold: 3500,
 };
 
 const FALLBACK_STRUCTURE_DEFINITION: StructureDefinition = {
@@ -239,12 +249,66 @@ function sanitizeVehicleHeadlights(raw: unknown): VehicleHeadlights {
   return out;
 }
 
+function sanitizeVehicleParts(raw: unknown): VehicleParts | undefined {
+  if (raw == null || typeof raw !== "object") {
+    return undefined;
+  }
+  const source = raw as JsonObject;
+
+  const wheels: string[] = [];
+  if (Array.isArray(source.wheels)) {
+    for (const w of source.wheels) {
+      if (typeof w === "string" && w.trim()) {
+        wheels.push(w.trim());
+      }
+    }
+  }
+
+  const turret = typeof source.turret === "string" && source.turret.trim()
+    ? source.turret.trim()
+    : (source.turret === null ? null : undefined);
+
+  const gun = typeof source.gun === "string" && source.gun.trim()
+    ? source.gun.trim()
+    : (source.gun === null ? null : undefined);
+
+  const body: string[] = [];
+  if (Array.isArray(source.body)) {
+    for (const b of source.body) {
+      if (typeof b === "string" && b.trim()) {
+        body.push(b.trim());
+      }
+    }
+  }
+
+  const shield: string[] = [];
+  if (Array.isArray(source.shield)) {
+    for (const s of source.shield) {
+      if (typeof s === "string" && s.trim()) {
+        shield.push(s.trim());
+      }
+    }
+  }
+
+  const parts: VehicleParts = { wheels };
+  if (turret !== undefined) parts.turret = turret;
+  if (gun !== undefined) parts.gun = gun;
+  if (body.length > 0) parts.body = body;
+  if (shield.length > 0) parts.shield = shield;
+
+  return parts;
+}
+
 function sanitizeVehicleDefinition(raw: unknown): VehicleDefinition {
   const source: JsonObject = raw != null && typeof raw === "object" ? (raw as JsonObject) : {};
   const out: VehicleDefinition = { ...FALLBACK_VEHICLE_DEFINITION };
 
   if (typeof source.url === "string" && source.url.trim()) {
     out.url = source.url.trim();
+  }
+
+  if (typeof source.displayName === "string" && source.displayName.trim()) {
+    out.displayName = source.displayName.trim();
   }
 
   const realLengthM = coerceFiniteNumber(source.realLengthM);
@@ -260,6 +324,18 @@ function sanitizeVehicleDefinition(raw: unknown): VehicleDefinition {
   const altOffsetM = coerceFiniteNumber(source.altOffsetM);
   if (altOffsetM != null) {
     out.altOffsetM = altOffsetM;
+  }
+
+  const parts = sanitizeVehicleParts(source.parts);
+  if (parts != null) {
+    out.parts = parts;
+  }
+
+  const wheelClusterSplitThreshold = coerceFiniteNumber(source.wheelClusterSplitThreshold);
+  if (wheelClusterSplitThreshold != null) {
+    out.wheelClusterSplitThreshold = wheelClusterSplitThreshold > 0 ? wheelClusterSplitThreshold : null;
+  } else if (source.wheelClusterSplitThreshold === null) {
+    out.wheelClusterSplitThreshold = null;
   }
 
   return out;

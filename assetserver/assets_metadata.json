@@ -8,9 +8,18 @@
   },
   "vehicle_definition": {
     "url": "/models/patria_amv.glb",
+    "displayName": "Patria AMV",
     "realLengthM": 7.7,
     "tireDiameterM": 1.27,
     "altOffsetM": 0.05,
+    "parts": {
+      "wheels": ["Object_8", "Object_9", "Object_10"],
+      "turret": "Object_3",
+      "gun": "Object_2",
+      "body": ["Object_4", "Object_5", "Object_6"],
+      "shield": ["Object_7"]
+    },
+    "wheelClusterSplitThreshold": 3500,
     "headlights": {
       "color": "#FFF4E0",
       "intensity": 800,
