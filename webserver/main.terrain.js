@@ -4235,6 +4235,24 @@ async function updateHouseHotReload(nowMs) {
 
 const normalPass = new NormalPass(scene, camera);
 
+// THREE.Sprite ignores scene.overrideMaterial, so sprites write their raw
+// texture colors into the normal buffer instead of proper encoded normals.
+// This corrupts the normal buffer at the sprite's screen-space pixels and
+// causes AerialPerspectiveEffect to apply incorrect (dark/black) irradiance
+// there. Fix: hide effect sprites during the NormalPass render.
+{
+  const _origNormalRender = normalPass.render.bind(normalPass);
+  normalPass.render = function (renderer, inputBuffer, outputBuffer, deltaTime, stencilTest) {
+    const flashWasVisible = muzzleFlashSprite ? muzzleFlashSprite.visible : false;
+    if (muzzleFlashSprite) muzzleFlashSprite.visible = false;
+    const impVis = impactPool.map(s => s.visible);
+    impactPool.forEach(s => { s.visible = false; });
+    _origNormalRender(renderer, inputBuffer, outputBuffer, deltaTime, stencilTest);
+    if (muzzleFlashSprite) muzzleFlashSprite.visible = flashWasVisible;
+    impactPool.forEach((s, i) => { s.visible = impVis[i]; });
+  };
+}
+
 const cloudsEffect = new CloudsEffect(camera, { resolutionScale: 1 });
 cloudsEffect.qualityPreset = 'high';
 cloudsEffect.coverage = 0.28;
