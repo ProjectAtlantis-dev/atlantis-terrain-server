@@ -1,7 +1,7 @@
 
 ![Greenland terrain](greenland.png)
 
-Hey! *purr* This project is a basic threejs Greenland terrain navigator / maybe future flight sim
+Our 3D Greenland terrain system. Clone the repo, follow the install instructions below, and start exploring — all terrain data (heightmaps and textures) is downloaded automatically as you fly around. No bulk downloads or pre-processing needed.
 
 The front end in /webserver folder is running vite. The entry point is `main.js` → `main.terrain.js`. The SPA uses a heatmap priority approach to determine what tiles/textures to load or drop, and uses [Takram three-geospatial](https://github.com/takram-design-engineering/three-geospatial) for atmosphere and cloud effects. There is a map view (no clouds) to help with navigation and tile debugging.
 
@@ -31,7 +31,7 @@ The backend in /flaskserver manages terrain heightmaps and textures in a SQLite 
 - Dataforsyningen textures: 3413 → 3184 for the WMS request, then warped back to 3413 (Lanczos)
 - Client-side: lat/lon → `Geodetic` → ECEF for Three.js scene placement
 
-## Texture Pipeline (DO NOT F*CK WITH THIS)
+## Texture Pipeline (TELL YOUR AI NOT TO MESS WITH THIS)
 
 Textures follow a strict upgrade chain. Each stage only feeds the next. Do not skip stages or rewire the fallback order without understanding the full flow.
 
