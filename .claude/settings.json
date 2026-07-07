@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(node --check *)",
+      "Bash(npx tsc)",
+      "Bash(npx tsc *)",
+      "Bash(sqlite3 flaskserver/terrain.db .schema*)",
+      "Bash(sqlite3 flaskserver/terrain.db .tables*)",
+      "Bash(sqlite3 flaskserver/terrain.db \"SELECT *)",
+      "Bash(sqlite3 terrain.db \"SELECT *)"
+    ]
+  }
+}

@@ -24,6 +24,7 @@ import {
 import { DitheringEffect } from './three-geospatial/packages/effects/src/index.ts';
 import { Ellipsoid, Geodetic, radians } from '@takram/three-geospatial';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
+import { initVegetation, updateVegetation } from './vegetation.js';
 
 const params = new URLSearchParams(window.location.search);
 const CLIENT_LOG_ENDPOINT = '/api/client_log';
@@ -209,8 +210,7 @@ flushClientLogQueue();
 
 // Use summer daytime in Nuuk so textured ground is clearly visible.
 const referenceDate = new Date('2025-07-01T12:00:00Z');
-const GAME_HOURS_PER_REAL_HOUR = 24;
-const GAME_TIME_SCALE = GAME_HOURS_PER_REAL_HOUR;
+const GAME_TIME_SCALE = 1;
 const GAME_CLOCK_STORAGE_KEY = 'game-clock-ms';
 const _savedGameClockMs = Number(localStorage.getItem(GAME_CLOCK_STORAGE_KEY));
 let gameClockStartMs = _savedGameClockMs || referenceDate.getTime();
@@ -388,6 +388,7 @@ const controls = {
   yaw: 0,
   pitch: -0.32,
   speed: 0,
+  strafeSpeed: 0,
   dragging: false,
   dragButton: 0,
   mapMode: false,
@@ -689,6 +690,18 @@ function showTileMenu(x, y, tileId, source) {
     });
     tileMenuEl.appendChild(oceanToggleBtn);
   }
+
+  // Side-by-side vs Google satellite reference (compare.html + /api/google)
+  const compareBtn = document.createElement('div');
+  compareBtn.style.cssText = 'padding:6px 12px;cursor:pointer';
+  compareBtn.textContent = 'Compare vs Google';
+  compareBtn.addEventListener('mouseenter', () => compareBtn.style.background = 'rgba(255,255,255,0.15)');
+  compareBtn.addEventListener('mouseleave', () => compareBtn.style.background = 'none');
+  compareBtn.addEventListener('click', () => {
+    hideTileMenu();
+    window.open(`/compare.html?tile=${tileId}`, '_blank');
+  });
+  tileMenuEl.appendChild(compareBtn);
 
   const isEnhanced = source && (source.includes('enhanced') || source === 'upscaled');
 
@@ -1255,6 +1268,14 @@ Ellipsoid.WGS84
   .getEastNorthUpFrame(anchorPosition)
   .decompose(terrainRoot.position, terrainRoot.quaternion, terrainRoot.scale);
 scene.add(terrainRoot);
+
+// Procedural vegetation PoC (?veg=1) — see vegetation.js
+initVegetation({
+  terrainRoot,
+  camera,
+  params,
+  getFrameOffset: () => ({ x: tileFrameOffsetX, y: tileFrameOffsetY }),
+});
 
 // --- Water plane ---
 // Large flat water surface at z=0.5 in terrainRoot local coords.
@@ -2851,6 +2872,7 @@ function setVehicleControlActive(nextActive, reason = 'manual', options = {}) {
   vehicleControlActive = next;
   if (vehicleControlActive) {
     controls.speed = 0;
+    controls.strafeSpeed = 0;
     vehicleCameraOrbitYaw = 0;
     vehicleCameraOrbitPitch = THREE.MathUtils.clamp(
       Math.atan2(VEHICLE_CAMERA_FOLLOW_HEIGHT, VEHICLE_CAMERA_FOLLOW_DISTANCE),
@@ -2862,6 +2884,7 @@ function setVehicleControlActive(nextActive, reason = 'manual', options = {}) {
   }
   if (wasActive && !vehicleControlActive) {
     controls.speed = 0; // stop camera drift when exiting vehicle mode
+    controls.strafeSpeed = 0;
   }
   if (wasActive && !vehicleControlActive && vehicleLoaded && !skipExitSave) {
     saveVehicleState(`exit-${reason}`, {
@@ -5402,7 +5425,7 @@ function savePosition() {
   const camLL = getCameraLatLon();
   localStorage.setItem('clouds-cam', JSON.stringify({
     lat: camLL.lat, lon: camLL.lon, alt: camLL.alt,
-    yaw: controls.yaw, pitch: controls.pitch, speed: controls.speed,
+    yaw: controls.yaw, pitch: controls.pitch, speed: controls.speed, strafeSpeed: controls.strafeSpeed,
     mapZoom: controls.mapZoom
   }));
 }
@@ -5425,6 +5448,7 @@ try {
     if (saved.yaw != null) controls.yaw = saved.yaw;
     if (saved.pitch != null) controls.pitch = saved.pitch;
     if (saved.speed != null) controls.speed = saved.speed;
+    if (saved.strafeSpeed != null) controls.strafeSpeed = saved.strafeSpeed;
     if (saved.mapZoom != null) controls.mapZoom = saved.mapZoom;
     applyCameraOrientation();
   }
@@ -5747,6 +5771,7 @@ function updateMovement(dt) {
 
   if (vehicleControlActive && !controls.mapMode) {
     controls.speed = 0;
+    controls.strafeSpeed = 0;
     if (!vehicleLoaded) {
       setVehicleControlActive(false, 'vehicle-unloaded');
       return;
@@ -5808,6 +5833,7 @@ function updateMovement(dt) {
 
   // clamp existing speed to new AGL-scaled max
   controls.speed = Math.max(-MAX_SPEED, Math.min(MAX_SPEED, controls.speed));
+  controls.strafeSpeed = Math.max(-STRAFE_SPEED, Math.min(STRAFE_SPEED, controls.strafeSpeed));
 
   if (forwardPressed) {
     controls.speed = Math.min(controls.speed + ACCEL * dt, MAX_SPEED);
@@ -5818,6 +5844,20 @@ function updateMovement(dt) {
       controls.speed = Math.max(controls.speed - BRAKE * dt, 0);
     } else if (controls.speed < 0) {
       controls.speed = Math.min(controls.speed + BRAKE * dt, 0);
+    }
+  }
+
+  if (controls.mapMode) {
+    controls.strafeSpeed = 0;
+  } else if (rightPressed) {
+    controls.strafeSpeed = Math.min(controls.strafeSpeed + ACCEL * dt, STRAFE_SPEED);
+  } else if (leftPressed) {
+    controls.strafeSpeed = Math.max(controls.strafeSpeed - ACCEL * dt, -STRAFE_SPEED);
+  } else if (!driftMode) {
+    if (controls.strafeSpeed > 0) {
+      controls.strafeSpeed = Math.max(controls.strafeSpeed - BRAKE * dt, 0);
+    } else if (controls.strafeSpeed < 0) {
+      controls.strafeSpeed = Math.min(controls.strafeSpeed + BRAKE * dt, 0);
     }
   }
 
@@ -5854,11 +5894,8 @@ function updateMovement(dt) {
       controls.yaw -= TURN_SPEED * dt;
     }
   } else {
-    if (leftPressed) {
-      move.addScaledVector(movementRight, -STRAFE_SPEED * dt);
-    }
-    if (rightPressed) {
-      move.addScaledVector(movementRight, STRAFE_SPEED * dt);
+    if (controls.strafeSpeed !== 0) {
+      move.addScaledVector(movementRight, controls.strafeSpeed * dt);
     }
   }
   if (controls.keys.KeyQ) {
@@ -5878,6 +5915,7 @@ function updateMovement(dt) {
     console.warn('[CAM] NaN detected — restoring last good position');
     camera.position.copy(_lastGoodCamPos);
     controls.speed = 0;
+    controls.strafeSpeed = 0;
   } else {
     _lastGoodCamPos.copy(camera.position);
   }
@@ -5889,7 +5927,7 @@ function updateHud() {
   const eastM = rel.dot(east);
   const northM = rel.dot(north);
   const altM = rel.dot(up);
-  const speedKmh = Math.abs(controls.speed) * 3.6;
+  const speedKmh = Math.hypot(controls.speed, controls.strafeSpeed) * 3.6;
   const headingForHud = vehicleControlActive ? vehicleHeadingRad : controls.yaw;
   const deg = (((-headingForHud * 180) / Math.PI) % 360 + 360) % 360;
   const dirs = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW'];
@@ -5961,7 +5999,7 @@ function updateHud() {
     + ` <b>${gdHH}:${gdMM}</b>`
     + (useRealtimeGameClock
       ? `<button data-gc="stop" style="${_btnStyle}color:${_activeClr}" title="Pause"><i class="fa-solid fa-pause"></i></button>`
-      : `<button data-gc="play" style="${_btnStyle}color:${_activeClr}" title="Play 24×"><i class="fa-solid fa-play"></i></button>`)
+      : `<button data-gc="play" style="${_btnStyle}color:${_activeClr}" title="Play"><i class="fa-solid fa-play"></i></button>`)
     + `<button data-gc="ff" style="${_btnStyle}color:${_activeClr}" title="+15 min"><i class="fa-solid fa-forward"></i></button>`;
 
   hud.innerHTML = [
@@ -5995,6 +6033,7 @@ function resetView() {
   controls.yaw = defaultYaw;
   controls.pitch = defaultPitch;
   controls.speed = 0;
+  controls.strafeSpeed = 0;
   controls.dragging = false;
   controls.dragButton = 0;
   controls.mapMode = false;
@@ -6066,6 +6105,7 @@ window.addEventListener('keydown', event => {
   if (event.code === 'KeyM' && !event.repeat) {
     controls.mapMode = !controls.mapMode;
     driftMode = false;
+    controls.strafeSpeed = 0;
     if (controls.mapMode) {
       setVehicleControlActive(false, 'map-mode');
     }
@@ -6439,6 +6479,7 @@ function render() {
   vehicleMarkerLayer.visible = controls.mapMode;
   enhanceOutlines.visible = controls.mapMode;
   enhancedOutlines.visible = controls.mapMode;
+  updateVegetation(controls.mapMode);
   if (controls.mapMode) {
     pollSeamStatus();
     updateEnhanceOutlines();

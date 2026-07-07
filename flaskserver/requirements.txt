@@ -2,6 +2,7 @@ Flask
 websockets
 pydantic>=2,<3
 numpy
+scipy
 pyproj
 rasterio
 shapely

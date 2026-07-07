@@ -21,7 +21,7 @@ from typing import Any, cast
 import asyncio
 
 from colored_log import get_logger
-from terrain_config import BOOTSTRAP_SEED_DEPTH, ENHANCE_DEPTH
+from terrain_config import BOOTSTRAP_SEED_DEPTH, ENHANCE_DEPTH, ENHANCE_ENABLED
 
 log = get_logger("terrain")
 log_db = get_logger("terrain.db")
@@ -273,6 +273,9 @@ _INPUT_TILE_RE = re.compile(r"\btile_(\d+-\d+-\d+)_(?:texture|heightmap)\.png\b"
 
 def _recover_comfy_jobs():
   """On startup, check ComfyUI /queue for in-flight tile jobs and resume tracking them."""
+  if not ENHANCE_ENABLED:
+    log_tex.info("[ENHANCE RECOVERY] skipped — SUPIR upscaling disabled (ENHANCE_ENABLED=False)")
+    return
   from texture import COMFY_URL
   log_tex.info(f"[ENHANCE RECOVERY] checking ComfyUI at {COMFY_URL}")
   try:
@@ -1194,6 +1197,182 @@ def api_texture(tile_id: str):
   )
 
 
+@app.get("/api/google/<tile_id>.jpg")
+def api_google_ref(tile_id: str):
+  """Google satellite reference for a tile, warped to its exact 3413 bbox.
+
+  Pixel-aligned with /api/texture/<tile_id>.jpg for side-by-side comparison.
+  Debug/QA only — never fed into the texture pipeline. Cached in google_refs.
+  Query params: res (output px, default 512), z (force zoom), refresh=1.
+  """
+  unavailable = _terrain_unavailable_response()
+  if unavailable is not None:
+    return unavailable
+
+  parsed = _parse_tile_id(tile_id)
+  if parsed is None:
+    return Response(b"", status=400)
+  d, c, r = parsed
+
+  try:
+    res = max(64, min(2048, int(request.args.get("res", "512"))))
+  except ValueError:
+    return Response(b"", status=400)
+  zoom_arg = request.args.get("z")
+  zoom = int(zoom_arg) if zoom_arg and zoom_arg.isdigit() else None
+  refresh = request.args.get("refresh") == "1"
+
+  from google_ref import get_google_ref, init_google_refs
+
+  db = _get_db()
+  init_google_refs(db)
+  jpeg, z = get_google_ref(db, tile_id, _tile_bbox(d, c, r),
+                           resolution=res, zoom=zoom, refresh=refresh)
+  if jpeg is None:
+    return Response(b"", status=502, headers={"X-Tex-Status": "google_fetch_failed"})
+  return Response(
+    jpeg,
+    mimetype="image/jpeg",
+    headers={
+      "Cache-Control": "public, max-age=86400",
+      "X-Google-Zoom": str(z),
+      "X-Tex-Source": "google_ref",
+    },
+  )
+
+
+@app.get("/api/channel/<tile_id>/<chan>.png")
+def api_terrain_channel(tile_id: str, chan: str):
+  """DEM-derived conditioning channel (elev/slope/southness/sun) as a debug
+  PNG, computed on the fly from the tile heightmap and pixel-aligned with
+  /api/texture and /api/google. Southness renders diverging blue (north-
+  facing) / red (south-facing). Query params: res (default 512).
+  """
+  if chan not in ("elev", "slope", "southness", "sun"):
+    return Response(b"", status=400)
+  parsed = _parse_tile_id(tile_id)
+  if parsed is None:
+    return Response(b"", status=400)
+
+  try:
+    res = max(64, min(2048, int(request.args.get("res", "512"))))
+  except ValueError:
+    return Response(b"", status=400)
+
+  import io as _io
+
+  import numpy as np
+  from PIL import Image as _Image
+
+  from database import GRID_N, _decompress_float32
+  from training_data import render_channel, terrain_channels
+
+  db = _get_db()
+  row = db.execute(
+    "SELECT heightmap, x_min, x_max FROM tiles WHERE tile_id = ?",
+    (tile_id,)).fetchone()
+  if row is None or row[0] is None:
+    return Response(b"", status=404, headers={"X-Tex-Status": "no_heightmap"})
+  hm = _decompress_float32(row[0], (GRID_N, GRID_N))
+  chans = terrain_channels(hm, row[2] - row[1])
+  img = render_channel(chans, chan)
+  # DB heightmaps are row 0 = south; flip to image orientation
+  img = np.ascontiguousarray(img[::-1])
+  img = np.array(_Image.fromarray(img).resize((res, res), _Image.Resampling.BILINEAR))
+  buf = _io.BytesIO()
+  _Image.fromarray(img).save(buf, format="PNG")
+  return Response(
+    buf.getvalue(),
+    mimetype="image/png",
+    headers={"Cache-Control": "no-store", "X-Tex-Source": f"channel_{chan}"},
+  )
+
+
+@app.get("/api/classes/<tile_id>/<stage>.png")
+def api_classes(tile_id: str, stage: str):
+  """Heuristic classifier overlay on the Google reference, as a debug PNG
+  pixel-aligned with /api/texture and /api/google. stage `field` is the
+  5-class depth<=11 labeler; `refined` adds the fixed-scale rock hard/loose
+  split (slope from the tile heightmap when available) plus detected boulder
+  instances; `bands` renders rock-banding orientation/coherence segments
+  (structure tensor — hue = band direction, opacity = coherence). Google refs
+  are cached, so the first hit on an unflown tile pays the upstream fetch.
+  Query params: res (default 512), alpha (overlay strength 0..1, default .55).
+  """
+  if stage not in ("field", "refined", "bands"):
+    return Response(b"", status=400)
+  unavailable = _terrain_unavailable_response()
+  if unavailable is not None:
+    return unavailable
+  parsed = _parse_tile_id(tile_id)
+  if parsed is None:
+    return Response(b"", status=400)
+  d, c, r = parsed
+
+  try:
+    res = max(64, min(2048, int(request.args.get("res", "512"))))
+    alpha = max(0.0, min(1.0, float(request.args.get("alpha", "0.55"))))
+  except ValueError:
+    return Response(b"", status=400)
+
+  import io as _io
+
+  import numpy as np
+  from PIL import Image as _Image
+
+  from biomes import (BAND_ZOOM, FIELD_NAMES, REFINED_NAMES, band_overlay,
+                      band_structure, class_overlay, classify_field, refine_rock)
+  from database import GRID_N, _decompress_float32
+  from google_ref import get_google_ref, init_google_refs
+  from training_data import _upsample_f32, terrain_channels
+
+  db = _get_db()
+  init_google_refs(db)
+  bbox = _tile_bbox(d, c, r)
+  # banding is measured at z16 — its signal lives at 30-100 m wavelength
+  jpeg, z = get_google_ref(db, tile_id, bbox, resolution=res,
+                           zoom=BAND_ZOOM if stage == "bands" else None)
+  if jpeg is None:
+    return Response(b"", status=502, headers={"X-Tex-Status": "google_fetch_failed"})
+  rgb = np.array(_Image.open(_io.BytesIO(jpeg)).convert("RGB")
+                 .resize((res, res), _Image.Resampling.LANCZOS))
+
+  if stage == "bands":
+    theta, coh = band_structure(rgb, (bbox[2] - bbox[0]) / res)
+    buf = _io.BytesIO()
+    _Image.fromarray(band_overlay(rgb, theta, coh)).save(buf, format="PNG")
+    return Response(
+      buf.getvalue(), mimetype="image/png",
+      headers={"Cache-Control": "no-store", "X-Google-Zoom": str(z),
+               "X-Tex-Source": "classes_bands"})
+
+  cls = classify_field(rgb)
+  names = FIELD_NAMES
+  if stage == "refined":
+    slope = None
+    row = db.execute(
+      "SELECT heightmap, x_min, x_max FROM tiles WHERE tile_id = ?",
+      (tile_id,)).fetchone()
+    if row is not None and row[0] is not None:
+      hm = _decompress_float32(row[0], (GRID_N, GRID_N))
+      # DB heightmaps are row 0 = south; flip to image orientation
+      slope = _upsample_f32(terrain_channels(hm, row[2] - row[1])["slope"], res)[::-1]
+    cls = refine_rock(rgb, (bbox[2] - bbox[0]) / res, cls, slope=slope, google_zoom=z)
+    names = REFINED_NAMES
+
+  buf = _io.BytesIO()
+  _Image.fromarray(class_overlay(rgb, cls, names=names, alpha=alpha)).save(buf, format="PNG")
+  return Response(
+    buf.getvalue(),
+    mimetype="image/png",
+    headers={
+      "Cache-Control": "no-store",
+      "X-Google-Zoom": str(z),
+      "X-Tex-Source": f"classes_{stage}",
+    },
+  )
+
+
 @app.post("/api/texture/<tile_id>/enhance")
 def api_texture_enhance(tile_id: str):
   unavailable = _terrain_unavailable_response()
@@ -1229,6 +1408,10 @@ def api_texture_enhance(tile_id: str):
         "X-Tex-Temporary": "0",
       },
     )
+
+  if not ENHANCE_ENABLED:
+    log_tex.info(f"[ENHANCE] {tile_id}: rejected — SUPIR upscaling disabled (ENHANCE_ENABLED=False)")
+    return Response(b"", status=503, headers={"X-Tex-Status": "enhance_disabled"})
 
   parsed = _parse_tile_id(tile_id)
   if parsed is None:
@@ -1835,8 +2018,11 @@ def _broadcast_client_log(payload: dict) -> None:
 async def _ws_broadcaster() -> None:
   """Async task that pulls from the queue and sends to all ws clients."""
   import websockets
+  queue = _ws_queue
+  if queue is None:
+    return
   while True:
-    msg = await _ws_queue.get()
+    msg = await queue.get()
     dead = set()
     for ws in list(_ws_clients):
       try:
