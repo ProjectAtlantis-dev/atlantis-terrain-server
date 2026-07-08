@@ -166,9 +166,10 @@ def export_tile(db, tid, out_root, zoom=None, res=512, refresh=False):
   Image.fromarray(google).save(d / "google.png")
   Image.fromarray(coarse).save(d / "coarse.png")
   # both label stages, for eyeball-tuning thresholds in biomes.py
-  field = classify_field(google)
+  field = classify_field(google, southness=chans["southness"], slope=chans["slope"],
+                         mpp=tile_size_m / res)
   refined = refine_rock(google, tile_size_m / res, field, slope=chans["slope"],
-                        google_zoom=z)
+                        google_zoom=z, tile_depth=int(tid.split("-")[0]))
   Image.fromarray(class_overlay(google, field)).save(d / "field.png")
   Image.fromarray(class_overlay(google, refined, names=REFINED_NAMES)).save(d / "refined.png")
   for chan in ("elev", "slope", "southness", "sun"):

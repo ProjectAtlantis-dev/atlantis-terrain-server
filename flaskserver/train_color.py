@@ -6,14 +6,24 @@ field stage of CLASSIFICATION.md; rock hard/loose refinement and bush
 instances happen at finer depths, not here) from our coarse SPOT texture
 plus DEM-derived conditioning (slope,
 southness, sun, elev). Google is the authority on water/shorelines: pixels it
-classifies as water are excluded from the loss regardless of DEM elevation.
+classifies as water are excluded from the RGB loss regardless of DEM
+elevation, but they DO supervise the class head as `water` — otherwise the
+head is untrained over water and hallucinates lichen/grass across the fjord.
 
 The headline experiment is the ABLATION: train with and without the terrain
 channels and compare held-out error — overall and split by aspect (north- vs
 south-facing), since aspect is the hypothesis under test.
 
-    venv/bin/python train_color.py --channels rgb          # baseline
-    venv/bin/python train_color.py --channels rgb+terrain  # conditioned
+    venv/bin/python train_color.py --channels rgb               # baseline
+    venv/bin/python train_color.py --channels rgb+terrain       # conditioned
+    venv/bin/python train_color.py --channels rgb+terrain+gcls  # + google classes
+
+gcls feeds the google-derived field class map (one-hot) as INPUT conditioning:
+the coarse SPOT texture is blind to patch-scale vegetation (measured -0.07
+sigma separation on 14-5511-3144 vs +1.63 sigma in google), so placement
+signal must come from the google refs — the server can fetch/cache one for
+any tile at inference (get_google_ref). Tiles without google coverage get
+all-zero class channels, which the model sees as "no signal".
 
 Validation: --val accepts tile ids or "auto" (default, every 10th tile).
 Augmentation: horizontal flips only — vertical flips would silently negate
@@ -55,7 +65,8 @@ def load_tiles(root):
     except Exception as e:   # partial write from a concurrent export run
       print(f"skipping {npz.parent.name}: {e}")
       continue
-    cls = classify_field(google_u8)
+    cls = classify_field(google_u8, southness=z["southness"], slope=z["slope"],
+                         mpp=float(z["bbox"][2] - z["bbox"][0]) / google_u8.shape[1])
     terr = np.stack([
       np.clip(z["slope"], 0, 1.5) / 1.5,
       z["southness"],
@@ -69,8 +80,14 @@ def load_tiles(root):
       "cls": cls.astype(np.int64),
       # Google is the authority on water/shorelines: DEM water artifacts
       # (spiky fjord noise above sea level) must not train as land, so the
-      # mask requires BOTH dem-land and google-not-water.
+      # RGB mask requires BOTH dem-land and google-not-water.
       "mask": ((z["elev"] > MIN_GROUND_Z) & (cls != WATER_IDX)).astype(np.float32),
+      # The CLASS head must consult google's water, not skip it: excluded
+      # water pixels leave the head free to argmax lichen/grass over the
+      # fjord at inference. Water labels are valid supervision (lakes over
+      # dem-land included); dem-ocean pixels google calls land (shoreline
+      # misalignment slivers) stay out.
+      "cls_mask": ((cls == WATER_IDX) | (z["elev"] > MIN_GROUND_Z)).astype(np.float32),
       "southness": z["southness"],
     }
   return tiles
@@ -102,45 +119,53 @@ class UNet(nn.Module):
     return torch.sigmoid(out[:, :3]), out[:, 3:]
 
 
-def make_inputs(tile, use_terrain):
+def make_inputs(tile, feats):
+  use_terrain, use_gcls = feats
   chans = [tile["coarse"]]
   if use_terrain:
     chans.append(tile["terr"])
+  if use_gcls:
+    chans.append(np.eye(N_CLASSES, dtype=np.float32)[tile["cls"]])
   return np.concatenate(chans, axis=-1)
 
 
-def sample_batch(rng, train_tiles, names, use_terrain, batch, patch):
-  xs, ys, cs, ms = [], [], [], []
+def sample_batch(rng, train_tiles, names, feats, batch, patch):
+  xs, ys, cs, ms, cms = [], [], [], [], []
   while len(xs) < batch:
     t = train_tiles[names[rng.integers(len(names))]]
     r = rng.integers(0, t["google"].shape[0] - patch)
     c = rng.integers(0, t["google"].shape[1] - patch)
     m = t["mask"][r:r + patch, c:c + patch]
-    if m.mean() < 0.3:   # mostly ocean crop, skip
+    cm = t["cls_mask"][r:r + patch, c:c + patch]
+    # skip crops with nothing to supervise anywhere; pure-water crops still
+    # train the class head (that's where the water label lives)
+    if cm.mean() < 0.3:
       continue
-    x = make_inputs(t, use_terrain)[r:r + patch, c:c + patch]
+    x = make_inputs(t, feats)[r:r + patch, c:c + patch]
     y = t["google"][r:r + patch, c:c + patch]
     k = t["cls"][r:r + patch, c:c + patch]
     if rng.random() < 0.5:  # horizontal flip is aspect-safe
-      x, y, k, m = x[:, ::-1], y[:, ::-1], k[:, ::-1], m[:, ::-1]
+      x, y, k, m, cm = x[:, ::-1], y[:, ::-1], k[:, ::-1], m[:, ::-1], cm[:, ::-1]
     xs.append(np.ascontiguousarray(x))
     ys.append(np.ascontiguousarray(y))
     cs.append(np.ascontiguousarray(k))
     ms.append(np.ascontiguousarray(m))
+    cms.append(np.ascontiguousarray(cm))
   x = torch.from_numpy(np.stack(xs)).permute(0, 3, 1, 2)
   y = torch.from_numpy(np.stack(ys)).permute(0, 3, 1, 2)
   k = torch.from_numpy(np.stack(cs))
   m = torch.from_numpy(np.stack(ms)).unsqueeze(1)
-  return x, y, k, m
+  cm = torch.from_numpy(np.stack(cms))
+  return x, y, k, m, cm
 
 
 @torch.no_grad()
-def eval_tiles(model, tiles, names, use_terrain, device):
+def eval_tiles(model, tiles, names, feats, device):
   l1s, accs = [], []
   agg = {"south": [], "north": []}
   for n in names:
     t = tiles[n]
-    x = torch.from_numpy(make_inputs(t, use_terrain)).permute(2, 0, 1)[None].to(device)
+    x = torch.from_numpy(make_inputs(t, feats)).permute(2, 0, 1)[None].to(device)
     rgb, logits = model(x)
     pred = rgb[0].permute(1, 2, 0).cpu().numpy()
     pcls = logits[0].argmax(0).cpu().numpy()
@@ -149,7 +174,8 @@ def eval_tiles(model, tiles, names, use_terrain, device):
     if not m.any():
       continue
     l1s.append(err[m].mean())
-    mc = m & (t["cls"] != SNOW_IDX)   # class head is never trained on snow
+    # class accuracy over the class-head mask (includes google water)
+    mc = (t["cls_mask"] > 0) & (t["cls"] != SNOW_IDX)
     if mc.any():
       accs.append((pcls[mc] == t["cls"][mc]).mean())
     for key, sel in (("south", m & (t["southness"] > 0.15)),
@@ -165,9 +191,9 @@ def eval_tiles(model, tiles, names, use_terrain, device):
 
 
 @torch.no_grad()
-def save_composite(model, tile, use_terrain, device, path):
+def save_composite(model, tile, feats, device, path):
   from PIL import Image
-  x = torch.from_numpy(make_inputs(tile, use_terrain)).permute(2, 0, 1)[None].to(device)
+  x = torch.from_numpy(make_inputs(tile, feats)).permute(2, 0, 1)[None].to(device)
   rgb, logits = model(x)
   pred = rgb[0].permute(1, 2, 0).cpu().numpy()
   pcls = logits[0].argmax(0).cpu().numpy()
@@ -186,7 +212,8 @@ def save_composite(model, tile, use_terrain, device, path):
 
 def main():
   ap = argparse.ArgumentParser()
-  ap.add_argument("--channels", choices=["rgb", "rgb+terrain"], default="rgb+terrain")
+  ap.add_argument("--channels", choices=["rgb", "rgb+terrain", "rgb+terrain+gcls"],
+                  default="rgb+terrain+gcls")
   ap.add_argument("--data", default=str(SAMPLE_ROOT),
                   help="training-pairs dir (default sample/training)")
   ap.add_argument("--name", default=None,
@@ -202,7 +229,9 @@ def main():
   ap.add_argument("--seed", type=int, default=0)
   args = ap.parse_args()
 
-  use_terrain = args.channels == "rgb+terrain"
+  use_terrain = "terrain" in args.channels
+  use_gcls = "gcls" in args.channels
+  feats = (use_terrain, use_gcls)
   device = "mps" if torch.backends.mps.is_available() else "cpu"
   torch.manual_seed(args.seed)
   rng = np.random.default_rng(args.seed)
@@ -231,7 +260,7 @@ def main():
   counts = np.zeros(N_CLASSES)
   for n in train_names:
     t = tiles[n]
-    sel = (t["mask"] > 0) & (t["cls"] != SNOW_IDX)
+    sel = (t["cls_mask"] > 0) & (t["cls"] != SNOW_IDX)
     counts += np.bincount(t["cls"][sel].ravel(), minlength=N_CLASSES)
   used = counts > 0
   w = np.zeros(N_CLASSES, dtype=np.float32)
@@ -241,7 +270,7 @@ def main():
   print("class weights: " + "  ".join(
     f"{n}={v:.2f}" for n, v in zip(FIELD_NAMES, w)), flush=True)
 
-  in_ch = 3 + (len(TERRAIN_KEYS) if use_terrain else 0)
+  in_ch = 3 + (len(TERRAIN_KEYS) if use_terrain else 0) + (N_CLASSES if use_gcls else 0)
   model = UNet(in_ch).to(device)
   print(f"model: {sum(p.numel() for p in model.parameters())/1e6:.2f}M params, in_ch={in_ch}")
   opt = torch.optim.AdamW(model.parameters(), lr=args.lr)
@@ -249,11 +278,11 @@ def main():
 
   t0 = time.monotonic()
   for step in range(1, args.steps + 1):
-    x, y, k, m = sample_batch(rng, tiles, train_names, use_terrain, args.batch, args.patch)
-    x, y, k, m = x.to(device), y.to(device), k.to(device), m.to(device)
+    x, y, k, m, cm = sample_batch(rng, tiles, train_names, feats, args.batch, args.patch)
+    x, y, k, m, cm = x.to(device), y.to(device), k.to(device), m.to(device), cm.to(device)
     rgb, logits = model(x)
     l1 = (torch.abs(rgb - y) * m).sum() / (m.sum() * 3 + 1e-6)
-    cm = m[:, 0] * (k != SNOW_IDX).float()
+    cm = cm * (k != SNOW_IDX).float()
     ce = (F.cross_entropy(logits, k, weight=class_w, reduction="none") * cm).sum() / (cm.sum() + 1e-6)
     loss = l1 + args.cls_weight * ce
     opt.zero_grad()
@@ -261,7 +290,7 @@ def main():
     opt.step()
     sched.step()
     if step % 500 == 0 or step == 1:
-      vm = eval_tiles(model, tiles, val_names, use_terrain, device)
+      vm = eval_tiles(model, tiles, val_names, feats, device)
       elapsed = time.monotonic() - t0
       eta_min = elapsed / step * (args.steps - step) / 60
       print(f"step {step:5d}/{args.steps} ({100 * step // args.steps:3d}%, "
@@ -269,7 +298,7 @@ def main():
             f"val L1 {vm['l1']:.4f} (S {vm['l1_south']:.4f} N {vm['l1_north']:.4f}) "
             f"cls acc {vm['cls_acc']:.3f}", flush=True)
 
-  vm = eval_tiles(model, tiles, val_names, use_terrain, device)
+  vm = eval_tiles(model, tiles, val_names, feats, device)
   run_dir = data_root / "runs" / (args.name or args.channels.replace("+", "_"))
   run_dir.mkdir(parents=True, exist_ok=True)
   torch.save(model.state_dict(), run_dir / "model.pt")
@@ -277,7 +306,7 @@ def main():
     {"channels": args.channels, "data": str(data_root), "val_tiles": val_names,
      "steps": args.steps, **vm}, indent=1))
   for n in val_names[:6]:
-    save_composite(model, tiles[n], use_terrain, device,
+    save_composite(model, tiles[n], feats, device,
                    run_dir / f"val_{n}_coarse_pred_cls_google.png")
   print(f"final: val L1 {vm['l1']:.4f}  south {vm['l1_south']:.4f}  "
         f"north {vm['l1_north']:.4f}  cls acc {vm['cls_acc']:.3f}")

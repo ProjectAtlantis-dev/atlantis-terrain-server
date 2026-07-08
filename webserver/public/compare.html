@@ -41,6 +41,17 @@
     position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
     color: #6889a8; pointer-events: none;
   }
+  #biome-key {
+    display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 4px 10px;
+    color: #8fb0cc; font-size: 12px; line-height: 1.25;
+  }
+  .key-item { display: flex; align-items: center; gap: 6px; min-width: 0; }
+  .key-swatch {
+    width: 12px; height: 12px; border-radius: 2px; flex: 0 0 auto;
+    border: 1px solid rgba(255,255,255,0.25);
+  }
+  .key-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .key-note { color: #44607c; grid-column: 1 / -1; }
   #help { padding: 4px 14px 14px; color: #44607c; text-align: center; }
   kbd {
     background: #16222e; border: 1px solid #2a3a4a; border-radius: 3px;
@@ -89,6 +100,7 @@
       <span id="cls-info"></span>
     </div>
     <div class="imgbox"><img id="cls-img" alt=""><div class="status" id="cls-status"></div></div>
+    <div id="biome-key" aria-label="terrain biome coloring key"></div>
   </div>
 </div>
 <div id="help">
@@ -105,6 +117,19 @@ let chanBlinkSaved = null;
 let clsBlinkSaved = null;
 
 const $ = id => document.getElementById(id);
+const FIELD_NAMES = ['rock', 'lichen', 'grass', 'snow', 'water', 'semi'];
+const REFINED_NAMES = ['rock_hard', 'rock_loose', 'lichen', 'grass', 'snow', 'water', 'boulder', 'semi'];
+const BIOME_TINTS = {
+  rock: '#9669d2',
+  rock_hard: '#9669d2',
+  rock_loose: '#cdaa5a',
+  lichen: '#d77d2d',
+  grass: '#96e13c',
+  semi: '#46be8c',
+  snow: '#ffffff',
+  water: '#285aff',
+  boulder: '#eb2d2d'
+};
 
 function tileId() { return `${depth}-${col}-${row}`; }
 
@@ -158,6 +183,22 @@ function load(refreshGoogle) {
     `/api/channel/${tid}/${$('chan-select').value}.png?res=${GOOGLE_RES}`, []);
   loadInto($('cls-img'), $('cls-status'), $('cls-info'),
     `/api/classes/${tid}/${$('cls-select').value}.png?res=${GOOGLE_RES}`, []);
+  renderBiomeKey();
+}
+
+function renderBiomeKey() {
+  const stage = $('cls-select').value;
+  const names = stage === 'refined' ? REFINED_NAMES : stage === 'field' ? FIELD_NAMES : [];
+  if (!names.length) {
+    $('biome-key').innerHTML = '<span class="key-note">bands view: hue shows band orientation, opacity shows coherence</span>';
+    return;
+  }
+  $('biome-key').innerHTML = names.map(name => `
+    <span class="key-item">
+      <span class="key-swatch" style="background:${BIOME_TINTS[name]}"></span>
+      <span class="key-label">${name.replace(/_/g, ' ')}</span>
+    </span>
+  `).join('');
 }
 
 $('go').addEventListener('click', () => { if (parseTile($('tile-input').value)) load(); });

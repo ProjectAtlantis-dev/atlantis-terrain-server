@@ -1241,6 +1241,40 @@ def api_google_ref(tile_id: str):
   )
 
 
+def _heightmap_ancestor_crop(db, d: int, c: int, r: int, max_up: int = 4):
+  """Tile heightmap, cropped out of the nearest ancestor's when the tile
+  itself was never seeded/flown (compare.html can ask for any tile id; tile
+  rows only exist where the frontend heatmap demanded them). Same philosophy
+  as ancestor-crop textures. Returns (hm, source, depth_found) or
+  (None, None, None); hm is (GRID_N, GRID_N), row 0 = south.
+  """
+  import numpy as np
+  from PIL import Image as _Image
+
+  from database import GRID_N, _decompress_float32
+
+  bits = []
+  dd, cc, rr = d, c, r
+  for _ in range(max_up + 1):
+    row = db.execute(
+      "SELECT heightmap, source FROM tiles WHERE tile_id = ?",
+      (f"{dd}-{cc}-{rr}",)).fetchone()
+    if row is not None and row[0] is not None:
+      hm = _decompress_float32(row[0], (GRID_N, GRID_N))
+      half = (GRID_N - 1) // 2
+      for cb, rb in reversed(bits):
+        # row 0 = south: north child (rb=1) is the upper index half
+        sub = hm[rb * half:rb * half + half + 1, cb * half:cb * half + half + 1]
+        hm = np.array(_Image.fromarray(sub, mode="F")
+                      .resize((GRID_N, GRID_N), _Image.Resampling.BILINEAR))
+      return hm, row[1], dd
+    if dd == 0:
+      break
+    bits.append((cc & 1, rr & 1))
+    dd, cc, rr = dd - 1, cc >> 1, rr >> 1
+  return None, None, None
+
+
 @app.get("/api/channel/<tile_id>/<chan>.png")
 def api_terrain_channel(tile_id: str, chan: str):
   """DEM-derived conditioning channel (elev/slope/southness/sun) as a debug
@@ -1253,6 +1287,7 @@ def api_terrain_channel(tile_id: str, chan: str):
   parsed = _parse_tile_id(tile_id)
   if parsed is None:
     return Response(b"", status=400)
+  d, c, r = parsed
 
   try:
     res = max(64, min(2048, int(request.args.get("res", "512"))))
@@ -1264,17 +1299,14 @@ def api_terrain_channel(tile_id: str, chan: str):
   import numpy as np
   from PIL import Image as _Image
 
-  from database import GRID_N, _decompress_float32
   from training_data import render_channel, terrain_channels
 
   db = _get_db()
-  row = db.execute(
-    "SELECT heightmap, x_min, x_max FROM tiles WHERE tile_id = ?",
-    (tile_id,)).fetchone()
-  if row is None or row[0] is None:
+  hm, hm_source, hm_depth = _heightmap_ancestor_crop(db, d, c, r)
+  if hm is None:
     return Response(b"", status=404, headers={"X-Tex-Status": "no_heightmap"})
-  hm = _decompress_float32(row[0], (GRID_N, GRID_N))
-  chans = terrain_channels(hm, row[2] - row[1])
+  bbox = _tile_bbox(d, c, r)
+  chans = terrain_channels(hm, bbox[2] - bbox[0])
   img = render_channel(chans, chan)
   # DB heightmaps are row 0 = south; flip to image orientation
   img = np.ascontiguousarray(img[::-1])
@@ -1284,7 +1316,8 @@ def api_terrain_channel(tile_id: str, chan: str):
   return Response(
     buf.getvalue(),
     mimetype="image/png",
-    headers={"Cache-Control": "no-store", "X-Tex-Source": f"channel_{chan}"},
+    headers={"Cache-Control": "no-store", "X-Tex-Source": f"channel_{chan}",
+             "X-DEM-Depth": str(hm_depth), "X-DEM-Source": str(hm_source)},
   )
 
 
@@ -1320,18 +1353,21 @@ def api_classes(tile_id: str, stage: str):
   import numpy as np
   from PIL import Image as _Image
 
-  from biomes import (BAND_ZOOM, FIELD_NAMES, REFINED_NAMES, band_overlay,
-                      band_structure, class_overlay, classify_field, refine_rock)
-  from database import GRID_N, _decompress_float32
+  from biomes import (BAND_ZOOM, BOULDER_MIN_ZOOM, FIELD_NAMES, REFINED_NAMES,
+                      band_overlay, band_structure, class_overlay,
+                      classify_field, refine_rock)
   from google_ref import get_google_ref, init_google_refs
   from training_data import _upsample_f32, terrain_channels
 
   db = _get_db()
   init_google_refs(db)
   bbox = _tile_bbox(d, c, r)
-  # banding is measured at z16 — its signal lives at 30-100 m wavelength
-  jpeg, z = get_google_ref(db, tile_id, bbox, resolution=res,
-                           zoom=BAND_ZOOM if stage == "bands" else None)
+  # banding is measured at z16 (signal lives at 30-100 m wavelength); the
+  # refined stage needs z18 — boulder shadows don't resolve below that, and
+  # the depth-default zoom at the refined band (12-13) is only z16/17, which
+  # silently disabled the boulder detector for the whole refined view
+  zoom = {"bands": BAND_ZOOM, "refined": BOULDER_MIN_ZOOM}.get(stage)
+  jpeg, z = get_google_ref(db, tile_id, bbox, resolution=res, zoom=zoom)
   if jpeg is None:
     return Response(b"", status=502, headers={"X-Tex-Status": "google_fetch_failed"})
   rgb = np.array(_Image.open(_io.BytesIO(jpeg)).convert("RGB")
@@ -1346,18 +1382,19 @@ def api_classes(tile_id: str, stage: str):
       headers={"Cache-Control": "no-store", "X-Google-Zoom": str(z),
                "X-Tex-Source": "classes_bands"})
 
-  cls = classify_field(rgb)
+  slope = southness = None
+  hm, _hm_src, _hm_d = _heightmap_ancestor_crop(db, d, c, r)
+  if hm is not None:
+    chans = terrain_channels(hm, bbox[2] - bbox[0])
+    # DB heightmaps are row 0 = south; flip to image orientation
+    slope = _upsample_f32(chans["slope"], res)[::-1]
+    southness = _upsample_f32(chans["southness"], res)[::-1]
+  cls = classify_field(rgb, southness=southness, slope=slope,
+                       mpp=(bbox[2] - bbox[0]) / res)
   names = FIELD_NAMES
   if stage == "refined":
-    slope = None
-    row = db.execute(
-      "SELECT heightmap, x_min, x_max FROM tiles WHERE tile_id = ?",
-      (tile_id,)).fetchone()
-    if row is not None and row[0] is not None:
-      hm = _decompress_float32(row[0], (GRID_N, GRID_N))
-      # DB heightmaps are row 0 = south; flip to image orientation
-      slope = _upsample_f32(terrain_channels(hm, row[2] - row[1])["slope"], res)[::-1]
-    cls = refine_rock(rgb, (bbox[2] - bbox[0]) / res, cls, slope=slope, google_zoom=z)
+    cls = refine_rock(rgb, (bbox[2] - bbox[0]) / res, cls, slope=slope,
+                      google_zoom=z, tile_depth=d)
     names = REFINED_NAMES
 
   buf = _io.BytesIO()
