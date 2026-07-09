@@ -1,6 +1,31 @@
 """Hierarchical ground classification on Google reference imagery.
 
-Two stages, one per tile-depth band (see CLASSIFICATION.md):
+The zoom-gated ladder — each stage subdivides its parent's buckets, only
+where the imagery resolves the evidence, and children refine, never
+re-decide (no class flicker while flying in):
+
+  d12 coarse        water | grey | dark slopes & shadows | green | white.
+                    The entire real->procedural contract; below d12 proc gen
+                    invents everything from this map + DEM + coord seed.
+                    `dark` is a first-class bucket, never disambiguated into
+                    water/rock by heuristics — that's what flipped fjords to
+                    rock at exposure seams and painted glaciers as rock.
+  shadows resolve   grey -> hard rock / scree / ridges;
+                    white -> snow vs beach (white WITHOUT shadows)
+  deep (z17-18)     green -> grass / bushes / lichen
+
+Rules: measure texture at a fixed physical scale (thresholds tuned at one
+m/px silently break at another); DEM conditioning (slope/aspect/sun) is not
+optional — north and south slopes are never interchangeable in Greenland.
+Google is the labeling authority (sharper than SPOT, and the authority on
+water — fjord DEMs have bottom-reflection defects) but pixels are a guide
+only, never shipped; note our SPOT is summer, Google is spring.
+
+TODO: restructure the two legacy stages below into the ladder (classify_field
+has no dark bucket, splits green too early, lacks ridge/beach); verify on the
+regression_cases.json tiles at d12.
+
+Two legacy stages, one per tile-depth band:
 
   classify_field  depth <= 11   the FIELD classes — hillside-scale facts
                                 (rock / lichen / grass / snow / water / semi),
@@ -56,7 +81,7 @@ TINTS = {  # debug overlay colors (sRGB) — rock is violet, NOT gray: gray tint
   "white": (255, 255, 255),
 }
 
-# ---- coarse stage (the d12 contract, see CLASSIFICATION.md) -----------------
+# ---- coarse stage (the d12 contract, see module docstring) ------------------
 # Five buckets. This map is the entire semantic contract between real imagery
 # and the below-d12 procedural synthesis — everything finer is invented.
 # Deliberately SIMPLE: ordered steps, each traceable (pass trace={} and every
@@ -304,7 +329,7 @@ def classify_field(rgb, southness=None, slope=None, mpp=None, elev=None):
 
   Color rules — the field classes are what survives any m/px, so this
   stage is deliberately scale-free. Google is the authority on water (fjord
-  DEM artifacts must not label as land, see CLASSIFICATION.md).
+  DEM artifacts must not label as land).
 
   southness / slope / elev: optional float (H, W) DEM channels aligned with
   rgb (image-oriented), southness in -1..1, slope in rise/run, elev in

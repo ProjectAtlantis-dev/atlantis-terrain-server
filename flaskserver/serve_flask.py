@@ -1635,7 +1635,7 @@ def api_colorized_file(tile_id: str, name: str):
 def api_classes(tile_id: str, stage: str):
   """Heuristic classifier overlay on the Google reference, as a debug PNG
   pixel-aligned with /api/texture and /api/google. stage `coarse` is the
-  5-bucket d12-contract labeler (see CLASSIFICATION.md); `field` is the
+  5-bucket d12-contract labeler (biomes.classify_coarse); `field` is the
   legacy 6-class labeler; `refined` adds the fixed-scale rock hard/loose
   split (slope from the tile heightmap when available) plus detected boulder
   instances; `bands` renders rock-banding orientation/coherence segments

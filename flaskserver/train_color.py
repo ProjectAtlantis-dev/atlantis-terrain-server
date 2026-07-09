@@ -2,7 +2,7 @@
 
 Learns google-reference color AND field class (rock/lichen/grass/snow/water,
 pseudo-labeled by biomes.classify_field on the Google target — the depth-11
-field stage of CLASSIFICATION.md; rock hard/loose refinement and bush
+field stage; rock hard/loose refinement and bush
 instances happen at finer depths, not here) from our coarse SPOT texture
 plus DEM-derived conditioning (slope,
 southness, sun, elev). Google is the authority on water/shorelines: pixels it

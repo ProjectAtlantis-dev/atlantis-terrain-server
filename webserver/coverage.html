@@ -1,4 +1,4 @@
-<!DOCTYPE html><html><head><meta charset="utf-8"><title>tile radar</title>
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>radar</title>
 <style>
   html, body { margin:0; height:100%; overflow:hidden; background:#060a10; color:#dbe5f1;
                font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }
@@ -34,13 +34,12 @@
 <canvas id="cv"></canvas>
 <div id="panel">
   <div id="tabs">
-    <div data-mode="heatmap">1 heatmap</div>
-    <div data-mode="coverage">2 coverage</div>
-    <div data-mode="imagery" title="cached texture mosaic — NOT the 3D map mode (press M in the flight view for that)">3 imagery</div>
+    <div data-mode="heatmap" title="live fetch queue — quadtree tiles colored by priority">heatmap</div>
+    <div data-mode="coverage" title="every tile with a cached texture — click a tile to open its tile inspector (P from the 3D view)">pipeline map</div>
     <div id="backBtn" title="Return to the 3D flight view (Esc)" style="margin-left:8px">back to 3D view</div>
     <div id="backMapBtn" title="Open the 3D app in top-down map mode (M)">back to map view</div>
-    <a href="/pipeline.html" target="_blank" title="per-tile pipeline progress (heightmap → texture → classes → procgen)"
-       style="margin-left:8px;color:#5af;text-decoration:none">pipeline</a>
+    <a href="/pipeline.html" target="_blank" title="tile inspector — per-tile pipeline progress (heightmap → texture → classes → procgen)"
+       style="margin-left:8px;color:#5af;text-decoration:none">tile inspector</a>
     <a href="/api/regression/" target="_blank" title="classifier regression gallery — known-problem tiles"
        style="margin-left:8px;color:#5af;text-decoration:none">regression cases</a>
   </div>
@@ -54,12 +53,16 @@
 <script>
 // Ship-centered, heading-up radar (same convention as the 3D app's map mode):
 // the ship icon is pinned at center pointing up and the world rotates around
-// it as the saved camera moves. Three layers, flipped with 1/2/3 or Tab:
-//   heatmap  — live /api/heatmap quadtree, priority-colored like the fetcher
-//   coverage — model-painted (colorize.py) tiles as imagery thumbs
-//   map      — cached real textures (/api/texture) on the heatmap grid
+// it as the saved camera moves. Two modes (internal ids kept for URLs and
+// localStorage; on-screen tab names in parens):
+//   heatmap  ("heatmap")      — live /api/heatmap quadtree, priority-colored
+//                               like the fetcher
+//   coverage ("pipeline map") — every tile with a real cached texture
+//                               (/api/coverage/index.json); click opens the
+//                               tile inspector (pipeline.html); P in the 3D
+//                               view lands here
 const DEPTH_COLORS = { 10:'#355', 11:'#2b6cb0', 12:'#2f9e44', 13:'#e8a33d', 14:'#e5484d', 15:'#b197fc' };
-const MODES = ['heatmap', 'coverage', 'imagery'];
+const MODES = ['heatmap', 'coverage'];
 const cv = document.getElementById('cv'), ctx = cv.getContext('2d');
 const tip = document.getElementById('tip');
 const meta = document.getElementById('meta');
@@ -113,9 +116,8 @@ cv.addEventListener('wheel', ev => {
   localStorage.setItem(`radar-zoom-${mode}`, String(zoom));
 }, { passive: false });
 
-// --- imagery caches (lazy, per visible tile) --------------------------------
+// --- imagery cache (lazy, per visible pipeline-map tile) ---------------------
 const covThumbs = new Map();     // tile id -> Image of cached texture
-const texThumbs = new Map();     // tile id -> Image of cached real texture
 function imageFor(cache, tid, url) {
   let im = cache.get(tid);
   if (!im) {
@@ -137,13 +139,14 @@ function resize() {
 window.addEventListener('resize', resize);
 resize();
 
-// View transform. EPSG:3413 grid north differs from true north by the
-// meridian convergence (lon - lon0); yaw is relative to TRUE north, so the
-// heading-up rotation is yaw + convergence.
+// View transform. NO meridian-convergence correction, on purpose: the 3D
+// engine places tiles at raw EPSG:3413 coords inside the anchor's ENU frame,
+// i.e. it identifies grid north with true north — so the app's yaw is
+// effectively relative to GRID north. Correcting for convergence here made
+// the radar disagree with the 3D map by ~7° at Nuuk (user-visible tilt).
 function viewParams() {
   const s = (H / 2) / zoom;
-  const conv = smooth ? (smooth.lon + 45) * Math.PI / 180 : 0;
-  const a = (smooth ? smooth.yaw : 0) + conv;
+  const a = smooth ? smooth.yaw : 0;
   return { s, a, cos: Math.cos(a), sin: Math.sin(a), cx: W / 2, cy: H / 2 };
 }
 function worldToScreen(X, Y, v) {
@@ -169,7 +172,7 @@ function priorityColor(t) {
 }
 
 // --- per-mode tile drawing ----------------------------------------------------
-function drawHeat(v, margin, withImagery) {
+function drawHeat(v, margin) {
   if (!heat) return;
   const tiles = heat.tiles || [];
   let minP = Infinity, maxP = -Infinity;
@@ -184,26 +187,16 @@ function drawHeat(v, margin, withImagery) {
     const rx = (x0 - smooth.x) * v.s, ry = -(y1 - smooth.y) * v.s;
     const rw = (x1 - x0) * v.s, rh = (y1 - y0) * v.s;
     if (rw < 0.5) continue;
-    let painted = false;
-    if (withImagery && t.hasTexture) {
-      const im = imageFor(texThumbs, t.id, `/api/texture/${t.id}.jpg`);
-      if (im.complete && im.naturalWidth) {
-        ctx.drawImage(im, rx, ry, rw, rh);      // jpeg row 0 = north = y_max
-        painted = true;
-      }
-    }
-    if (!painted) {
-      const norm = maxP > minP ? (t.priority - minP) / (maxP - minP) : 0;
-      ctx.globalAlpha = withImagery ? 0.25 : 0.7;
-      ctx.fillStyle = priorityColor(norm);
-      ctx.fillRect(rx, ry, rw, rh);
-      ctx.globalAlpha = 1;
-    }
+    const norm = maxP > minP ? (t.priority - minP) / (maxP - minP) : 0;
+    ctx.globalAlpha = 0.7;
+    ctx.fillStyle = priorityColor(norm);
+    ctx.fillRect(rx, ry, rw, rh);
+    ctx.globalAlpha = 1;
     if (rw > 3) {
       ctx.strokeStyle = 'rgba(200,200,200,0.3)';
       ctx.strokeRect(rx, ry, rw, rh);
     }
-    if (!withImagery && t.order != null && rw > 26 && rh > 16) {
+    if (t.order != null && rw > 26 && rh > 16) {
       labels.push([t.order, (x0 + x1) / 2, (y0 + y1) / 2, Math.min(rw, rh), '#000']);
     }
   }
@@ -273,8 +266,7 @@ function frame(now) {
   ctx.rotate(v.a);
   const margin = Math.hypot(W, H) / 2 / v.s;   // cull to the rotated viewport
   let labels = null;
-  if (mode === 'heatmap') labels = drawHeat(v, margin, false);
-  else if (mode === 'imagery') drawHeat(v, margin, true);
+  if (mode === 'heatmap') labels = drawHeat(v, margin);
   else labels = drawCoverage(v, margin);
   ctx.restore();
 
@@ -363,23 +355,15 @@ function goBack() {
   setTimeout(() => { location.href = '/'; }, 150);  // close() was refused
 }
 document.getElementById('backBtn').addEventListener('click', goBack);
-// map mode lives inside the 3D app (M key) — navigate there with ?map=1 so
-// it boots straight into the top-down view
+// Return to the main app; map mode is controlled there with its own UI.
 document.getElementById('backMapBtn').addEventListener('click', () => {
-  location.href = '/?map=1';
+  location.href = '/';
 });
 
 window.addEventListener('keydown', ev => {
-  if (ev.code === 'Digit1') setMode('heatmap');
-  else if (ev.code === 'Digit2') setMode('coverage');
-  else if (ev.code === 'Digit3') setMode('imagery');
-  else if (ev.code === 'Escape') {
+  if (ev.code === 'Escape') {
     if (viewer.classList.contains('open')) closeViewer();
     else goBack();
-  }
-  else if (ev.code === 'Tab') {
-    ev.preventDefault();
-    setMode(MODES[(MODES.indexOf(mode) + 1) % MODES.length]);
   }
 });
 
@@ -391,14 +375,12 @@ function updateMeta() {
       ? `<b>${covTiles.length}</b> tiles with cached texture (d&le;12) —` +
         Object.keys(counts).sort().map(d =>
           `<span class="sw" style="background:${DEPTH_COLORS[d] || '#888'}"></span>d${d}: <b>${counts[d]}</b>`
-        ).join('') + ' — scroll zoom · hover id · click opens pipeline'
+        ).join('') + ' — scroll zoom · hover id · click opens tile inspector'
       : 'no cached textures yet — fly around to fetch some';
   } else if (heat) {
     const n = heat.tiles.length;
-    const cached = heat.tiles.filter(t => t.hasTexture).length;
-    meta.innerHTML = mode === 'heatmap'
-      ? `<b>${n}</b> quadtree tiles — priority <span class="grad"></span> hot→cold — numbers = fetch order`
-      : `<b>${cached}</b>/<b>${n}</b> tiles with cached texture — uncached tinted by priority`;
+    meta.innerHTML =
+      `<b>${n}</b> quadtree tiles — priority <span class="grad"></span> hot→cold — numbers = fetch order`;
   } else {
     meta.textContent = 'waiting for /api/heatmap (server up + 3D session fetching?)';
   }

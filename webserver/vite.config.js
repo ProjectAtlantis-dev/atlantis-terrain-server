@@ -30,6 +30,9 @@ function logServeUrl() {
 
 export default defineConfig({
   plugins: [logServeUrl()],
+  build: {
+    target: 'esnext'
+  },
   resolve: {
     alias: [
       { find: '@takram/three-atmosphere', replacement: pkg('atmosphere') },

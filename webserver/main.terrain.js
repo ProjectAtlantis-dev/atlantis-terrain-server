@@ -24,27 +24,24 @@ import {
 import { DitheringEffect } from './three-geospatial/packages/effects/src/index.ts';
 import { Ellipsoid, Geodetic, radians } from '@takram/three-geospatial';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
+import { buildAssetLibrary } from './procgen/library.ts';
+import { buildTileScatter, disposeTileScatter, updateScatterVisibility, SCATTER_MIN_DEPTH } from './procgen/scatter.ts';
 
-const params = new URLSearchParams(window.location.search);
-// ?recolor=1 opts into the RETIRED colorize.py painted textures (kept only
-// for A/B archaeology, see CLASSIFICATION.md "what's dead"). Default is the
-// real texture chain — the painted patches used to default on and made map
-// mode look like scattered coverage tiles instead of imagery.
-const _recolor = params.get('recolor') === '1';
+// The main view is controlled entirely through its UI. Discard stale query
+// parameters instead of exposing URL state that does not stay in sync.
+if (window.location.search) {
+  history.replaceState(null, '', `${window.location.pathname}${window.location.hash}`);
+}
+const _recolor = false;
 const CLIENT_LOG_ENDPOINT = '/api/client_log';
 const DEFAULT_ASSET_SERVER_BASE = 'http://127.0.0.1:8787';
-const ASSET_SERVER_BASE = (() => {
-  const raw = params.get('assetServer');
-  const text = typeof raw === 'string' ? raw.trim() : '';
-  const base = text || DEFAULT_ASSET_SERVER_BASE;
-  return base.replace(/\/+$/, '');
-})();
+const ASSET_SERVER_BASE = DEFAULT_ASSET_SERVER_BASE;
 const VEHICLE_STATE_ENDPOINT = `${ASSET_SERVER_BASE}/api/vehicle_state`;
 const ASSETS_ENDPOINT = `${ASSET_SERVER_BASE}/api/assets`;
 const ASSETS_FETCH_TIMEOUT_MS = 1500;
 const VEHICLE_SAVE_FETCH_TIMEOUT_MS = 1500;
 const VEHICLE_SAVE_FAILURE_COOLDOWN_MS = 15000;
-const CLIENT_LOG_ENABLED = params.get('clientLog') !== '0';
+const CLIENT_LOG_ENABLED = true;
 const CLIENT_LOG_BATCH_SIZE = 40;
 const CLIENT_LOG_MAX_QUEUE = 600;
 const CLIENT_LOG_FLUSH_MS = 800;
@@ -235,8 +232,8 @@ const ATMOSPHERE_TEXTURE_FILES = [
   'higher_order_scattering.exr'
 ];
 
-const anchorLon = Number(params.get('lon') ?? DEFAULT_LOCATION.lon);
-const anchorLat = Number(params.get('lat') ?? DEFAULT_LOCATION.lat);
+const anchorLon = DEFAULT_LOCATION.lon;
+const anchorLat = DEFAULT_LOCATION.lat;
 
 function defaultStartupAssets() {
   return {
@@ -366,6 +363,7 @@ Ellipsoid.WGS84.getEastNorthUpVectors(anchorPosition, east, north, up);
 // --- View distance constants ---
 const MAX_VIEW_DIST = 50000;       // 50km — camera far, fog, map extents
 let _terrainRange = 20000;         // terrain tile fetch range (meters), slider-controlled
+let tileFetchingReady = false;
 const MAP_CAM_ALT = MAX_VIEW_DIST; // map camera altitude above target
 
 const camera = new THREE.PerspectiveCamera(
@@ -462,21 +460,13 @@ document.body.appendChild(hud);
 const HUD_LINKS = {
   debugLogLink: '/client_log.html',
   radarHeatmapLink: '/coverage.html?mode=heatmap',
-  radarCoverageLink: '/coverage.html?mode=coverage',
-  radarImageryLink: '/coverage.html?mode=imagery'
+  pipelineMapLink: '/coverage.html?mode=coverage'
 };
 hud.addEventListener('mousedown', e => {
   if (e.target.id === 'mapModeLink') {
     e.stopPropagation();
     e.preventDefault();
     toggleMapMode();
-    return;
-  }
-  if (e.target.id === 'pipelineLink') {
-    e.stopPropagation();
-    e.preventDefault();
-    const ll = getCameraLatLon();
-    window.open(`/pipeline.html?ll=${ll.lat.toFixed(6)},${ll.lon.toFixed(6)}`, '_blank');
     return;
   }
   const url = HUD_LINKS[e.target.id];
@@ -487,7 +477,7 @@ hud.addEventListener('mousedown', e => {
   }
 });
 hud.addEventListener('click', e => {
-  if (e.target.id === 'mapModeLink' || e.target.id === 'pipelineLink' || HUD_LINKS[e.target.id]) {
+  if (e.target.id === 'mapModeLink' || HUD_LINKS[e.target.id]) {
     e.stopPropagation();
     e.preventDefault();
   }
@@ -718,7 +708,7 @@ function showTileMenu(x, y, tileId, source) {
   // buckets → procgen)
   const compareBtn = document.createElement('div');
   compareBtn.style.cssText = 'padding:6px 12px;cursor:pointer';
-  compareBtn.textContent = 'Tile pipeline';
+  compareBtn.textContent = 'Tile inspector';
   compareBtn.addEventListener('mouseenter', () => compareBtn.style.background = 'rgba(255,255,255,0.15)');
   compareBtn.addEventListener('mouseleave', () => compareBtn.style.background = 'none');
   compareBtn.addEventListener('click', () => {
@@ -1245,7 +1235,10 @@ function buildTuningControls(ap, ce) {
     min: 10000, max: 50000, step: 1000, value: _terrainRange,
     decimals: 0,
     format: v => `${(v/1000).toFixed(0)}km`,
-    onChange: v => { _terrainRange = v; fetchTiles(); }
+    onChange: v => {
+      _terrainRange = v;
+      if (tileFetchingReady) fetchTiles();
+    }
   });
   tuningSectionLabel('Atmosphere');
   tuningSlider('fog strength', {
@@ -1421,6 +1414,54 @@ const SEAM_POLL_MS = 2000;
 
 // --- Terrain streaming state ---
 const EXAG = 1.0;
+
+// --- Procedural asset scatter (fable5-world-demo port, chain validation) ---
+const SCATTER_ENABLED = true;
+const SCATTER_SEED = 1337;
+let _scatterLib = null;   // built lazily on the first deep tile
+let _scatterLibFailed = false;
+function scatterLibrary() {
+  if (_scatterLib || _scatterLibFailed || !SCATTER_ENABLED) return _scatterLib;
+  try {
+    _scatterLib = buildAssetLibrary(renderer, SCATTER_SEED);
+    console.log('[scatter] asset library built', _scatterLib.stats);
+    enqueueClientLog('info', 'scatter.library', _scatterLib.stats);
+  } catch (err) {
+    _scatterLibFailed = true;
+    console.error('[scatter] library build failed — scatter disabled', err);
+    enqueueClientLog('error', 'scatter.library', { error: String(err) });
+  }
+  return _scatterLib;
+}
+
+function attachTileScatter(mesh, tile, hm) {
+  if (!SCATTER_ENABLED || !mesh || !tile?.id) return;
+  const depth = tileDepthFromId(tile.id);
+  if (depth < SCATTER_MIN_DEPTH) return;
+  const lib = scatterLibrary();
+  if (!lib) return;
+  try {
+    const group = buildTileScatter({
+      tileId: tile.id,
+      bbox: tile.bbox,
+      hm,
+      res: tile.resolution,
+      lib,
+      exag: EXAG
+    });
+    if (group) mesh.add(group);
+  } catch (err) {
+    enqueueClientLog('error', 'scatter.tile', { tileId: tile.id, error: String(err) });
+  }
+}
+
+/** single eviction path: scene removal + geometry/material + scatter children */
+function evictTileMesh(c) {
+  terrainRoot.remove(c);
+  disposeTileScatter(c);
+  if (c.geometry) c.geometry.dispose();
+  if (c.material) c.material.dispose();
+}
 const REFETCH_DIST = 5000;
 let originX = 0, originY = 0;        // stereo scene origin from server
 let camStereoX = 0, camStereoY = 0;  // current cam position in stereo
@@ -1441,13 +1482,8 @@ let _srvTexFetching = 0;   // server-side: textures being fetched from dataforsy
 let _srvTexRetry = 0;      // server-side: textures in retry queue (rate-limited)
 let _srvTexStatus = {};    // server-side: {ready, ancestor_fallback, fetching, missing}
 
-function paramNumber(name, fallback) {
-  const raw = params.get(name);
-  if (raw == null) return fallback;
-  const text = raw.trim();
-  if (text === '') return fallback;
-  const value = Number(text);
-  return Number.isFinite(value) ? value : fallback;
+function paramNumber(_name, fallback) {
+  return fallback;
 }
 
 const ASSET_STRUCTURE_INSTANCES = Array.isArray(startupAssetsResponse.structure_instances)
@@ -1456,25 +1492,18 @@ const ASSET_STRUCTURE_INSTANCES = Array.isArray(startupAssetsResponse.structure_
 const ASSET_VEHICLE_INSTANCES = Array.isArray(startupAssetsResponse.vehicle_instances)
   ? startupAssetsResponse.vehicle_instances
   : [];
-const houseEnabledParam = params.get('house');
 const HOUSE_MODEL = {
   url: (typeof STRUCTURE_DEFINITION.url === 'string' && STRUCTURE_DEFINITION.url.trim() !== '')
     ? STRUCTURE_DEFINITION.url
     : '',
-  altOffsetM: paramNumber(
-    'houseAltOffset',
-    Number.isFinite(STRUCTURE_DEFINITION.altOffsetM) ? STRUCTURE_DEFINITION.altOffsetM : 0.4
-  ),
+  altOffsetM: Number.isFinite(STRUCTURE_DEFINITION.altOffsetM)
+    ? STRUCTURE_DEFINITION.altOffsetM
+    : 0.4,
   hotReloadMs: Math.max(
     500,
-    paramNumber(
-      'houseReloadMs',
-      Number.isFinite(STRUCTURE_DEFINITION.hotReloadMs) ? STRUCTURE_DEFINITION.hotReloadMs : 2000
-    )
+    Number.isFinite(STRUCTURE_DEFINITION.hotReloadMs) ? STRUCTURE_DEFINITION.hotReloadMs : 2000
   ),
-  enabled: houseEnabledParam == null
-    ? Boolean(STRUCTURE_DEFINITION.enabled)
-    : houseEnabledParam === '1'
+  enabled: Boolean(STRUCTURE_DEFINITION.enabled)
 };
 if (!HOUSE_MODEL.url) {
   HOUSE_MODEL.enabled = false;
@@ -1482,17 +1511,17 @@ if (!HOUSE_MODEL.url) {
     source: startupAssetsResponse.source,
   }, 'warn');
 }
-const HOUSE_SHADOW_MODE_RAW = (params.get('houseShadowMode') || 'shadowmap').toLowerCase();
+const HOUSE_SHADOW_MODE_RAW = 'shadowmap';
 const HOUSE_SHADOW_MODE = HOUSE_SHADOW_MODE_RAW === 'local' ? 'local' : 'shadowmap';
 const HOUSE_USE_LOCAL_SHADOWS = HOUSE_SHADOW_MODE === 'local';
 const HOUSE_USE_SHADOW_MAP = HOUSE_SHADOW_MODE === 'shadowmap';
-const HOUSE_LOCAL_SHADOW_DEBUG = params.get('houseLocalShadowDebug') !== '0';
-const HOUSE_SHADOW_SNAPSHOT_ENABLED = params.get('houseShadowSnapshot') === '1';
-const HOUSE_PROBE_CONSOLE = params.get('houseProbeConsole') === '1';
+const HOUSE_LOCAL_SHADOW_DEBUG = true;
+const HOUSE_SHADOW_SNAPSHOT_ENABLED = false;
+const HOUSE_PROBE_CONSOLE = false;
 const DEFAULT_NUUK_HOUSE_SITES = ASSET_STRUCTURE_INSTANCES;
-const singleHouseLat = paramNumber('houseLat', NaN);
-const singleHouseLon = paramNumber('houseLon', NaN);
-const houseCountParam = paramNumber('houseCount', DEFAULT_NUUK_HOUSE_SITES.length);
+const singleHouseLat = NaN;
+const singleHouseLon = NaN;
+const houseCountParam = DEFAULT_NUUK_HOUSE_SITES.length;
 const houseCount = DEFAULT_NUUK_HOUSE_SITES.length === 0
   ? 0
   : Number.isFinite(houseCountParam)
@@ -1956,7 +1985,7 @@ const VEHICLE_SHADOW_MAP_SIZE = 1024;
 const VEHICLE_SHADOW_LIGHT_DISTANCE = 250;
 const VEHICLE_SHADOW_MIN_RADIUS = 60;
 const VEHICLE_SHADOW_MAX_RADIUS = 180;
-const VEHICLE_SHADOW_TEXEL_SNAP = params.get('vehicleShadowTexelSnap') !== '0';
+const VEHICLE_SHADOW_TEXEL_SNAP = true;
 const VEHICLE_SHADOW_GROUND_ANCHOR = THREE.MathUtils.clamp(
   paramNumber('vehicleShadowGroundAnchor', 1.0),
   0,
@@ -4015,7 +4044,7 @@ function eColor(e) {
   return s[s.length - 1];
 }
 
-const OCEAN_CLASSIFIER_ENABLED = params.get('oceanClassifier') !== '0';
+const OCEAN_CLASSIFIER_ENABLED = true;
 const OCEAN_EDGE_SEED_MAX_M = paramNumber('oceanEdgeSeedMaxM', 1.5);
 const OCEAN_EDGE_PASSABLE_MAX_M = Math.max(
   OCEAN_EDGE_SEED_MAX_M,
@@ -4037,8 +4066,8 @@ const OCEAN_DEPTH_GAIN = Math.max(0.0, paramNumber('oceanDepthGain', 0.8));
 const OCEAN_MAX_DROP_M = Math.max(OCEAN_BASE_DROP_M, paramNumber('oceanMaxDropM', 16.0));
 const OCEAN_EDGE_CACHE_MAX = Math.max(512, Math.floor(paramNumber('oceanEdgeCacheMax', 30000)));
 const oceanEdgeState = new Map();
-let oceanMapDebugEnabled = params.get('oceanMapDebug') === '1';
-const OCEAN_COLOR_ASSIST_ENABLED = params.get('oceanColorAssist') !== '0';
+let oceanMapDebugEnabled = false;
+const OCEAN_COLOR_ASSIST_ENABLED = true;
 const OCEAN_COLOR_SCORE_MIN = THREE.MathUtils.clamp(paramNumber('oceanColorScoreMin', 0.20), 0.0, 1.0);
 const OCEAN_COLOR_PASSABLE_SCORE_MIN = THREE.MathUtils.clamp(
   paramNumber('oceanColorPassableScoreMin', 0.18),
@@ -4054,7 +4083,7 @@ const OCEAN_COLOR_EDGE_MAX_M = Math.max(
   OCEAN_EDGE_PASSABLE_MAX_M + Math.max(0.0, paramNumber('oceanColorEdgeExtraM', 10.0))
 );
 const OCEAN_COLOR_SLOPE_MAX = Math.max(0.02, paramNumber('oceanColorSlopeMax', 0.90));
-const OCEAN_GHOST_BRIDGE_ENABLED = params.get('oceanGhostBridge') !== '0';
+const OCEAN_GHOST_BRIDGE_ENABLED = true;
 const OCEAN_GHOST_GAP_PX = Math.max(1, Math.floor(paramNumber('oceanGhostGapPx', 10)));
 const OCEAN_GHOST_SCORE_MIN = THREE.MathUtils.clamp(paramNumber('oceanGhostScoreMin', 0.10), 0.0, 1.0);
 const OCEAN_GHOST_MIN_SCORE_FRACTION = THREE.MathUtils.clamp(paramNumber('oceanGhostMinScoreFrac', 0.30), 0.0, 1.0);
@@ -4403,6 +4432,7 @@ function buildMesh(tile, oceanAssistTex = null) {
   mesh.userData.oceanTextureSig = oceanAssistTex ? oceanAssistTex.uuid : null;
   mesh.userData.waterMaskUrl = `/api/watermask/${tile.id}.png`;
   mesh.userData.waterMask = null;
+  attachTileScatter(mesh, tile, hm);
   return mesh;
 }
 
@@ -4481,9 +4511,7 @@ function rebuildTileMeshWithTexture(mesh, tile, tex) {
   rebuilt.material.polygonOffsetUnits = -depth;
   rebuilt.userData.waterMask = mesh.userData?.waterMask ?? null;
   terrainRoot.add(rebuilt);
-  terrainRoot.remove(mesh);
-  if (mesh.geometry) mesh.geometry.dispose();
-  if (mesh.material) mesh.material.dispose();
+  evictTileMesh(mesh);
   return rebuilt;
 }
 
@@ -4519,9 +4547,7 @@ function materializeTile(tileId, tex) {
     const eid = c.userData.tileId || '?';
     const reason = eid === tileId ? 'replaced by textured self' : `contained by ${tileId}`;
     tileLog(eid, `evicted — ${reason}`);
-    terrainRoot.remove(c);
-    if (c.geometry) c.geometry.dispose();
-    if (c.material) c.material.dispose();
+    evictTileMesh(c);
   }
   terrainRoot.add(mesh);
   if (vehicleNearTileBbox(mesh.userData?.bbox)) {
@@ -4817,9 +4843,7 @@ function updateTextures(tiles) {
     for (const c of terrainRoot.children) {
       if (c.userData.tileId === parentId) {
         tileLog(parentId, `evicted — eager (all children textured, triggered by ${childTileId})`);
-        terrainRoot.remove(c);
-        if (c.geometry) c.geometry.dispose();
-        if (c.material) c.material.dispose();
+        evictTileMesh(c);
         found = true;
         break;
       }
@@ -4863,9 +4887,7 @@ function updateTextures(tiles) {
   }
   for (const c of staleParents) {
     tileLog(c.userData.tileId || '?', 'evicted — stale parent (children now textured)');
-    terrainRoot.remove(c);
-    if (c.geometry) c.geometry.dispose();
-    if (c.material) c.material.dispose();
+    evictTileMesh(c);
   }
 }
 
@@ -5300,9 +5322,7 @@ async function fetchTiles(lat, lon) {
     for (const c of staleToRemove) {
       const reason = c.material?.map ? 'evicted — stale parent (children textured)' : 'evicted — stale untextured';
       tileLog(c.userData.tileId || '?', reason);
-      terrainRoot.remove(c);
-      if (c.geometry) c.geometry.dispose();
-      if (c.material) c.material.dispose();
+      evictTileMesh(c);
     }
 
     enqueueClientLog('info', `fetchTiles.diff[pass${_loadPass}]`, { pass: _loadPass, passLabel: _loadPass === 1 ? 'preview' : 'full', added: added.length, removed: removed.length, purgedDeferred: purged, sceneMeshes: terrainRoot.children.filter(c => c.isMesh).length });
@@ -5478,6 +5498,7 @@ bootLog('tiles.initial-fetch.start', {
   anchorLat,
   anchorLon
 });
+tileFetchingReady = true;
 fetchTiles();
 if (HOUSE_MODEL.enabled && housesRuntimeVisible) {
   bootLog('house.initial-load.start', {
@@ -6034,10 +6055,8 @@ function updateHud() {
       ? `ocean overlay: ${oceanMapDebugEnabled ? 'ON' : 'OFF'}  (right-click menu; cyan=ocean, magenta=seed, orange=passable)`
       : '',
     '<span id="mapModeLink" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">map mode</span> (M), R reset · <span id="debugLogLink" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">debug log</span>'
-    + ' · <span id="pipelineLink" title="this tile\'s progress through the texture pipeline" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">pipeline</span>'
-    + ' · radar: <span id="radarHeatmapLink" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">heatmap</span>'
-    + ' · <span id="radarCoverageLink" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">coverage</span>'
-    + ' · <span id="radarImageryLink" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">imagery</span>'
+    + ' · <span id="pipelineMapLink" title="2D radar in pipeline-map mode — click any tile to open its tile inspector" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">pipeline map</span> (P)'
+    + ' · <span id="radarHeatmapLink" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">heatmap</span>'
   ].join('<br>');
   alt.textContent =
     `${altM.toFixed(0)}m / ${(altM * 3.28084).toFixed(0)}ft  ${deg.toFixed(0)}° ${compass}` +
@@ -6115,12 +6134,6 @@ function toggleMapMode() {
   }
 }
 
-// ?map=1 boots straight into top-down map mode (coverage.html's "back to
-// map view" button uses this)
-if (params.get('map') === '1' && !controls.mapMode) {
-  toggleMapMode();
-}
-
 window.addEventListener('keydown', event => {
   if (event.target.tagName === 'TEXTAREA' || event.target.tagName === 'INPUT') return;
   controls.keys[event.code] = true;
@@ -6152,6 +6165,11 @@ window.addEventListener('keydown', event => {
   }
   if (event.code === 'KeyM' && !event.repeat) {
     toggleMapMode();
+  }
+  if (event.code === 'KeyP' && !event.repeat) {
+    // Pipeline map: the radar (coverage.html) in coverage mode — click a
+    // tile to open its tile inspector (pipeline.html).
+    window.open(HUD_LINKS.pipelineMapLink, '_blank');
   }
   if (event.code === 'KeyR' && !event.repeat) {
     resetView();
@@ -6544,6 +6562,7 @@ function render() {
     scene.fog = _sceneFog;
     return;
   }
+  if (SCATTER_ENABLED && _scatterLib) updateScatterVisibility(terrainRoot, camera);
   composer.render();
 }
 
