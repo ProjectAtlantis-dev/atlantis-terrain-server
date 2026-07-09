@@ -24,9 +24,13 @@ import {
 import { DitheringEffect } from './three-geospatial/packages/effects/src/index.ts';
 import { Ellipsoid, Geodetic, radians } from '@takram/three-geospatial';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
-import { initVegetation, updateVegetation } from './vegetation.js';
 
 const params = new URLSearchParams(window.location.search);
+// ?recolor=1 opts into the RETIRED colorize.py painted textures (kept only
+// for A/B archaeology, see CLASSIFICATION.md "what's dead"). Default is the
+// real texture chain — the painted patches used to default on and made map
+// mode look like scattered coverage tiles instead of imagery.
+const _recolor = params.get('recolor') === '1';
 const CLIENT_LOG_ENDPOINT = '/api/client_log';
 const DEFAULT_ASSET_SERVER_BASE = 'http://127.0.0.1:8787';
 const ASSET_SERVER_BASE = (() => {
@@ -455,16 +459,35 @@ hud.style.cssText = [
   'z-index:5'
 ].join(';');
 document.body.appendChild(hud);
+const HUD_LINKS = {
+  debugLogLink: '/client_log.html',
+  radarHeatmapLink: '/coverage.html?mode=heatmap',
+  radarCoverageLink: '/coverage.html?mode=coverage',
+  radarImageryLink: '/coverage.html?mode=imagery'
+};
 hud.addEventListener('mousedown', e => {
-  if (e.target.id === 'debugLogLink') {
+  if (e.target.id === 'mapModeLink') {
     e.stopPropagation();
     e.preventDefault();
-    console.log('[HUD] debug log link clicked');
-    window.open('/client_log.html', '_blank');
+    toggleMapMode();
+    return;
+  }
+  if (e.target.id === 'pipelineLink') {
+    e.stopPropagation();
+    e.preventDefault();
+    const ll = getCameraLatLon();
+    window.open(`/pipeline.html?ll=${ll.lat.toFixed(6)},${ll.lon.toFixed(6)}`, '_blank');
+    return;
+  }
+  const url = HUD_LINKS[e.target.id];
+  if (url) {
+    e.stopPropagation();
+    e.preventDefault();
+    window.open(url, '_blank');
   }
 });
 hud.addEventListener('click', e => {
-  if (e.target.id === 'debugLogLink') {
+  if (e.target.id === 'mapModeLink' || e.target.id === 'pipelineLink' || HUD_LINKS[e.target.id]) {
     e.stopPropagation();
     e.preventDefault();
   }
@@ -691,15 +714,16 @@ function showTileMenu(x, y, tileId, source) {
     tileMenuEl.appendChild(oceanToggleBtn);
   }
 
-  // Side-by-side vs Google satellite reference (compare.html + /api/google)
+  // Per-tile pipeline X-ray (pipeline.html: heightmap → texture → google →
+  // buckets → procgen)
   const compareBtn = document.createElement('div');
   compareBtn.style.cssText = 'padding:6px 12px;cursor:pointer';
-  compareBtn.textContent = 'Compare vs Google';
+  compareBtn.textContent = 'Tile pipeline';
   compareBtn.addEventListener('mouseenter', () => compareBtn.style.background = 'rgba(255,255,255,0.15)');
   compareBtn.addEventListener('mouseleave', () => compareBtn.style.background = 'none');
   compareBtn.addEventListener('click', () => {
     hideTileMenu();
-    window.open(`/compare.html?tile=${tileId}`, '_blank');
+    window.open(`/pipeline.html?tile=${tileId}`, '_blank');
   });
   tileMenuEl.appendChild(compareBtn);
 
@@ -1268,14 +1292,6 @@ Ellipsoid.WGS84
   .getEastNorthUpFrame(anchorPosition)
   .decompose(terrainRoot.position, terrainRoot.quaternion, terrainRoot.scale);
 scene.add(terrainRoot);
-
-// Procedural vegetation PoC (?veg=1) — see vegetation.js
-initVegetation({
-  terrainRoot,
-  camera,
-  params,
-  getFrameOffset: () => ({ x: tileFrameOffsetX, y: tileFrameOffsetY }),
-});
 
 // --- Water plane ---
 // Large flat water surface at z=0.5 in terrainRoot local coords.
@@ -4681,7 +4697,7 @@ function updateTextures(tiles) {
     const tid = tile.id;
     const t = tile;
     // tileLog(tid, `fetch start (inflight=${texInflight.size}/${TEX_MAX})`);
-    fetch(`/api/texture/${tid}.jpg?v=${_texV}`, { signal: ac.signal })
+    fetch(`/api/texture/${tid}.jpg?v=${_texV}${_recolor ? '&stage=colorized' : ''}`, { signal: ac.signal })
       .then(r => {
         texInflight.delete(tid);
         if (r.status === 202) {
@@ -6017,7 +6033,11 @@ function updateHud() {
     controls.mapMode
       ? `ocean overlay: ${oceanMapDebugEnabled ? 'ON' : 'OFF'}  (right-click menu; cyan=ocean, magenta=seed, orange=passable)`
       : '',
-    'M map mode, R reset · <span id="debugLogLink" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">debug log</span>'
+    '<span id="mapModeLink" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">map mode</span> (M), R reset · <span id="debugLogLink" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">debug log</span>'
+    + ' · <span id="pipelineLink" title="this tile\'s progress through the texture pipeline" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">pipeline</span>'
+    + ' · radar: <span id="radarHeatmapLink" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">heatmap</span>'
+    + ' · <span id="radarCoverageLink" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">coverage</span>'
+    + ' · <span id="radarImageryLink" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">imagery</span>'
   ].join('<br>');
   alt.textContent =
     `${altM.toFixed(0)}m / ${(altM * 3.28084).toFixed(0)}ft  ${deg.toFixed(0)}° ${compass}` +
@@ -6073,6 +6093,34 @@ let driftMode = false;
 let _lastForwardTapTime = 0;
 const DOUBLE_TAP_MS = 300;
 
+function toggleMapMode() {
+  controls.mapMode = !controls.mapMode;
+  driftMode = false;
+  controls.strafeSpeed = 0;
+  if (controls.mapMode) {
+    setVehicleControlActive(false, 'map-mode');
+  }
+  camMarker.visible = controls.mapMode;
+  tuningPanel.style.display = controls.mapMode ? 'none' : '';
+  controls.mapPanEast = 0;
+  controls.mapPanNorth = 0;
+  if (controls.mapMode) {
+    updateMapCamera();
+  } else {
+    hideTileInfo();
+    hideTileMenu();
+  }
+  if (lastTiles) {
+    updateTextures(lastTiles);
+  }
+}
+
+// ?map=1 boots straight into top-down map mode (coverage.html's "back to
+// map view" button uses this)
+if (params.get('map') === '1' && !controls.mapMode) {
+  toggleMapMode();
+}
+
 window.addEventListener('keydown', event => {
   if (event.target.tagName === 'TEXTAREA' || event.target.tagName === 'INPUT') return;
   controls.keys[event.code] = true;
@@ -6103,25 +6151,7 @@ window.addEventListener('keydown', event => {
     return;
   }
   if (event.code === 'KeyM' && !event.repeat) {
-    controls.mapMode = !controls.mapMode;
-    driftMode = false;
-    controls.strafeSpeed = 0;
-    if (controls.mapMode) {
-      setVehicleControlActive(false, 'map-mode');
-    }
-    camMarker.visible = controls.mapMode;
-    tuningPanel.style.display = controls.mapMode ? 'none' : '';
-    controls.mapPanEast = 0;
-    controls.mapPanNorth = 0;
-    if (controls.mapMode) {
-      updateMapCamera();
-    } else {
-      hideTileInfo();
-      hideTileMenu();
-    }
-    if (lastTiles) {
-      updateTextures(lastTiles);
-    }
+    toggleMapMode();
   }
   if (event.code === 'KeyR' && !event.repeat) {
     resetView();
@@ -6479,7 +6509,6 @@ function render() {
   vehicleMarkerLayer.visible = controls.mapMode;
   enhanceOutlines.visible = controls.mapMode;
   enhancedOutlines.visible = controls.mapMode;
-  updateVegetation(controls.mapMode);
   if (controls.mapMode) {
     pollSeamStatus();
     updateEnhanceOutlines();

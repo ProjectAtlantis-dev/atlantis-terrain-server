@@ -66,7 +66,8 @@ def load_tiles(root):
       print(f"skipping {npz.parent.name}: {e}")
       continue
     cls = classify_field(google_u8, southness=z["southness"], slope=z["slope"],
-                         mpp=float(z["bbox"][2] - z["bbox"][0]) / google_u8.shape[1])
+                         mpp=float(z["bbox"][2] - z["bbox"][0]) / google_u8.shape[1],
+                         elev=z["elev"])
     terr = np.stack([
       np.clip(z["slope"], 0, 1.5) / 1.5,
       z["southness"],

@@ -1,7 +1,7 @@
 """LAAS asset-guide extraction from Google reference tiles.
 
 Workflow (see LAAS_ASSETS.md):
-  1. Browse compare.html, find representative ground, note tile ids.
+  1. Browse pipeline.html, find representative ground, note tile ids.
   2. venv/bin/python guide_assets.py <tile_id> [...] --zoom 17
   3. Open sample/laas_guide/index.html and eyeball the class overlays,
      detected bush instances, palettes and scatter stats.
@@ -21,12 +21,16 @@ import json
 import sqlite3
 import sys
 from pathlib import Path
+from typing import cast
 
 import numpy as np
 from PIL import Image
 from scipy import ndimage
 
+from biomes import VEG_MIN_SOUTHNESS
+from database import GRID_N, _decompress_float32
 from google_ref import get_google_ref, init_google_refs
+from training_data import _upsample_f32, terrain_channels
 
 CLASS_NAMES = ["rock", "heath", "lush", "snow", "water"]
 CLASS_TINTS = {  # gallery overlay colors (sRGB)
@@ -38,10 +42,16 @@ CLASS_TINTS = {  # gallery overlay colors (sRGB)
 }
 
 
-def classify(rgb, veg_dead_zone=0.02, lush_thresh=0.12):
+def classify(rgb, veg_dead_zone=0.02, lush_thresh=0.12, southness=None):
   """Per-pixel ground classes on GOOGLE imagery (no SPOT olive cast, so the
   excess-green dead zone is lower than vegetation.js's 0.06). Returns a
-  class-index map (CLASS_NAMES order) plus the veg weight map."""
+  class-index map (CLASS_NAMES order) plus the veg weight map.
+
+  southness: optional float (H, W) DEM aspect channel, image-oriented. When
+  given, ALL vegetation (heath and lush alike) is masked out against north
+  slopes (VEG_MIN_SOUTHNESS, same rule as biomes.py) BEFORE any measurement:
+  cast shadows all face north, and their green cast otherwise counts as lush
+  blobs — inflating bush density and polluting palettes with shade tint."""
   a = rgb.astype(np.float32)
   r, g, b = a[..., 0], a[..., 1], a[..., 2]
   bright = a.mean(-1)
@@ -55,6 +65,10 @@ def classify(rgb, veg_dead_zone=0.02, lush_thresh=0.12):
   veg = np.clip((eg - veg_dead_zone) * 4.2, 0, 1)
   veg[snow | water] = 0
   lush = (eg > lush_thresh) & ~snow & ~water
+  if southness is not None:
+    south_ok = southness >= VEG_MIN_SOUTHNESS
+    veg[~south_ok] = 0
+    lush &= south_ok
 
   cls = np.zeros(rgb.shape[:2], dtype=np.uint8)          # rock
   cls[veg > 0.25] = 1                                    # heath
@@ -98,7 +112,7 @@ def bush_stats(cls, mpp, max_diam_m=8.0):
   measure the numbers the scatter needs: density, size distribution,
   clumping (Clark-Evans R: <1 clumped, ~1 Poisson random)."""
   lush = cls == 2
-  labels, n = ndimage.label(lush)
+  labels, n = cast(tuple[np.ndarray, int], ndimage.label(lush))
   if n == 0:
     return None, labels
   sizes = ndimage.sum_labels(lush, labels, np.arange(1, n + 1))
@@ -155,7 +169,7 @@ def boulder_stats(goog, cls, mpp, min_diam_m=1.0, max_diam_m=5.0):
   # local background over ~6 m so hillside-scale shading doesn't count
   bg = ndimage.uniform_filter(lum, max(3, int(round(6.0 / mpp)) | 1))
   dark = rock & (lum < bg - 20)
-  labels, n = ndimage.label(dark)
+  labels, n = cast(tuple[np.ndarray, int], ndimage.label(dark))
   if n == 0:
     return None, labels
   idx = np.arange(1, n + 1)
@@ -224,7 +238,7 @@ def scree_stats(goog, cls, mpp, min_patch_m2=30.0):
   granular = rock & (np.array(Image.fromarray(scree05.astype(np.float32), mode="F")
                               .resize((w, h), Image.Resampling.BILINEAR)) > 0.5)
 
-  labels, n = ndimage.label(granular)
+  labels, n = cast(tuple[np.ndarray, int], ndimage.label(granular))
   patches_m2 = []
   if n:
     sizes = ndimage.sum_labels(granular, labels, np.arange(1, n + 1)) * mpp * mpp
@@ -249,15 +263,28 @@ def _blob_edges(labels):
 
 def analyze_tile(db, tid, out_root, zoom=None, res=640, refresh=False):
   row = db.execute(
-    "SELECT t.x_min, t.y_min, t.x_max, t.y_max, x.texture FROM tiles t "
-    "LEFT JOIN textures x ON x.tile_id = t.tile_id WHERE t.tile_id = ?",
+    "SELECT t.x_min, t.y_min, t.x_max, t.y_max, x.texture, t.heightmap "
+    "FROM tiles t LEFT JOIN textures x ON x.tile_id = t.tile_id "
+    "WHERE t.tile_id = ?",
     (tid,),
   ).fetchone()
   if row is None:
     print(f"{tid}: not in tiles table, skipping")
     return None
-  bbox, ours_blob = row[:4], row[4]
+  bbox, ours_blob, hm_blob = row[:4], row[4], row[5]
   mpp = (bbox[2] - bbox[0]) / res
+
+  # DEM aspect for the north-slope vegetation mask (see classify); DB
+  # heightmaps are row 0 = south, flip to image orientation like
+  # training_data.export_tile does
+  southness = None
+  if hm_blob is not None:
+    hm = _decompress_float32(hm_blob, (GRID_N, GRID_N))
+    southness = _upsample_f32(
+      terrain_channels(hm, bbox[2] - bbox[0])["southness"], res)[::-1]
+  else:
+    print(f"{tid}: no heightmap — aspect mask OFF, north-shadow green will "
+          f"count as vegetation")
 
   jpeg, z = get_google_ref(db, tid, bbox, resolution=res, zoom=zoom, refresh=refresh)
   if jpeg is None:
@@ -265,7 +292,7 @@ def analyze_tile(db, tid, out_root, zoom=None, res=640, refresh=False):
     return None
   goog = np.array(Image.open(io.BytesIO(jpeg)).convert("RGB"))
 
-  cls, veg = classify(goog)
+  cls, veg = classify(goog, southness=southness)
   shares = {name: round(float((cls == i).mean()), 4) for i, name in enumerate(CLASS_NAMES)}
 
   palettes = {}
@@ -409,7 +436,7 @@ def write_gallery(out_root):
     rows.append(f"""
   <section>
     <h2>{tid} <small>z{g["google_zoom"]} &middot; {g["m_per_px"]} m/px &middot;
-      <a href="http://localhost:5173/compare.html?tile={tid}">open in compare</a></small></h2>
+      <a href="http://localhost:5173/pipeline.html?tile={tid}">open in compare</a></small></h2>
     <div class="imgs">{imgs}</div>
     <div class="meta">{sw_html}<div class="bush">{bush_txt}</div><div class="rock">{rock_txt}</div></div>
   </section>""")

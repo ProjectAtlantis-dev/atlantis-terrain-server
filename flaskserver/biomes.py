@@ -19,6 +19,8 @@ grows there.
 Labels are heuristic pseudo-ground-truth — tune thresholds by eyeballing the
 field.png overlays in the sample/training gallery, same loop as LAAS_ASSETS.md.
 """
+from typing import cast
+
 import numpy as np
 from PIL import Image
 from scipy import ndimage
@@ -47,7 +49,115 @@ TINTS = {  # debug overlay colors (sRGB) — rock is violet, NOT gray: gray tint
   "snow": (255, 255, 255),
   "water": (40, 90, 255),
   "boulder": (235, 45, 45),
+  # coarse stage buckets (grey/water reuse the rock/water colors)
+  "grey": (150, 105, 210),
+  "green": (150, 225, 60),
+  "dark": (255, 140, 0),    # orange — must stay visible over near-black pixels
+  "white": (255, 255, 255),
 }
+
+# ---- coarse stage (the d12 contract, see CLASSIFICATION.md) -----------------
+# Five buckets. This map is the entire semantic contract between real imagery
+# and the below-d12 procedural synthesis — everything finer is invented.
+# Deliberately SIMPLE: ordered steps, each traceable (pass trace={} and every
+# decision's mask is recorded; regression_cases.py bakes them to PNGs).
+COARSE_NAMES = ["grey", "green", "dark", "white", "water"]
+
+COARSE_DARK_LUM = 60         # below this = dark bucket (shadow / dark slope)
+COARSE_WHITE_LUM = 190       # bright...
+COARSE_WHITE_MAX_SAT = 30    # ...and colorless = white stuff
+COARSE_GREEN_EG = 0.05       # excess green above this = green stuff
+
+
+def classify_coarse(rgb, slope=None, elev=None, trace=None):
+  """Five-bucket coarse class map (COARSE_NAMES order) from google RGB uint8.
+
+  Steps, in order (each records its mask into `trace` when given):
+    10_white           bright + colorless
+    20_green           excess green
+    30_dark            luminance floor — shadows and dark north slopes
+    40_water_color     blue-tinted pixels (bright-blue or dark-blue rules)
+    50_water_seed      water color on FLAT ground — confident water (sea,
+                       lakes); water color on slopes alone is shadow-suspect
+    55_water_flood     water = flood-fill from the seeds through 40's mask.
+                       Water bleeding over fake DEM shoreline skirts stays
+                       water (connected to the sea); isolated water-colored
+                       patches on slopes have no seed -> reclassified dark
+                       ("sloping lakes" are shadows, not water)
+    60_seamount_water  fake DEM seamounts (above-sea blobs where google shows
+                       no confident land) forced to water — shore-shadowed
+                       ones are too black even for the color rules
+    90_classes         final assembly (paint order: grey < green < dark <
+                       white < water — google is the water authority)
+
+  slope (rise/run) and elev (m) are optional aligned DEM channels; without
+  them the color rules stand alone.
+  """
+  def _t(name, mask):
+    if trace is not None:
+      trace[name] = mask.copy()
+
+  a = rgb.astype(np.float32)
+  r, g, b = a[..., 0], a[..., 1], a[..., 2]
+  lum = a.mean(-1)
+  sat = a.max(-1) - a.min(-1)
+
+  white = (lum >= COARSE_WHITE_LUM) & (sat < COARSE_WHITE_MAX_SAT)
+  _t("10_white", white)
+
+  eg = (2 * g - r - b) / 255
+  green = (eg > COARSE_GREEN_EG) & ~white
+  _t("20_green", green)
+
+  dark = lum < COARSE_DARK_LUM
+  _t("30_dark", dark)
+
+  # water color: bright blue, or dark-but-still-blue (fjord water in shade)
+  water = ((b > r + 12) & (b > g + 6)) | (dark & (b >= g - 4) & (b > r))
+  _t("40_water_color", water)
+
+  if slope is not None:
+    seed = water & (slope < WATER_MAX_SLOPE)
+    _t("50_water_seed", seed)
+    # SciPy's return annotation includes non-boolean array variants even
+    # though binary_propagation returns a boolean mask for boolean inputs.
+    flooded = np.asarray(
+      ndimage.binary_propagation(seed, mask=water),
+      dtype=bool,
+    )
+    _t("55_water_flood", flooded)
+    dark |= water & ~flooded
+    water = flooded
+    if elev is not None:
+      # fake-seamount test: DEM blobs rising above sea level that google
+      # shows essentially no confident land on are DEM artifacts over water —
+      # force their ambiguous pixels to water. Confident land = neither
+      # water-colored nor shadow-dark.
+      labels, n = cast(
+        tuple[np.ndarray, int],
+        ndimage.label(elev >= WATER_SEA_LEVEL_M),
+      )
+      forced = np.zeros_like(water)
+      if n:
+        ids = np.arange(1, n + 1)
+        conf_land = water | (lum >= COARSE_DARK_LUM)
+        land_frac = ndimage.mean((conf_land & ~water).astype(np.float32),
+                                 labels, ids)
+        fake = np.zeros(n + 1, dtype=bool)
+        fake[1:] = land_frac <= SEAMOUNT_MAX_LAND_FRAC
+        forced = fake[labels] & ~conf_land
+      _t("60_seamount_water", forced)
+      water |= forced
+      dark &= ~forced
+
+  cls = np.full(rgb.shape[:2], COARSE_NAMES.index("grey"), dtype=np.uint8)
+  cls[green] = COARSE_NAMES.index("green")
+  cls[dark] = COARSE_NAMES.index("dark")
+  cls[white] = COARSE_NAMES.index("white")
+  cls[water] = COARSE_NAMES.index("water")
+  _t("90_classes", cls)
+  return cls
+
 
 # color thresholds (google imagery — no SPOT olive cast). Nuuk google greens
 # are DARK (strong-green median lum ~54), so no brightness gate.
@@ -66,23 +176,57 @@ EG_STRONG = 0.10     # decisively green (grass/lush) vs lichen mat
 # the patch can't dominate its own background.
 GB_SEMI_DELTA = 0.06   # blue depletion above local background = semi
 GB_BG_WINDOW_M = 40.0  # neighborhood the "surrounding grey" is measured over
-# lush grass is a south-slope fact (north and south aspects are never
-# interchangeable): on north-facing ground a strong-green reading is moss /
-# shade-tinted mat, not meadow — it falls back to the mat tier (lichen /
-# semi), never grass. Small negative margin
-# so flat ground (southness ~ 0, gradient noise) keeps its grass.
-GRASS_MIN_SOUTHNESS = -0.05
-# water-colored pixels also fire on ridge cast-shadows (dim blue-grey in
-# shade). Water is FLAT: measured on the Nuuk fjord tile, true water sits at
-# slope ~0 (87-100% under 0.20, the rest coastline DEM bleed) while shadow
-# false-positives sit at slope p50 0.25. But the DEM must not get authority
-# over water at FJORD scale, where its spiky noise artifacts live — those
-# artifacts are vastly bigger than any cast shadow, so the tiebreaker is
-# size: steep water-colored ground is dropped only when its connected water
-# body is small (a shadow); bodies at fjord scale keep their water no matter
-# what the DEM claims. Lakes are flat, so small real lakes survive the gate.
+# vegetation is a south-slope fact (north and south aspects are never
+# interchangeable), and ALL cast shadows face north here — so a green reading
+# on north-facing ground is shade tint, not ground cover. The DEM aspect mask
+# comes FIRST, before any color rule: every vegetation tier (grass, lichen,
+# semi) is masked out against north slopes and falls back to rock. Color from
+# the imagery never overrides aspect. Small negative margin so flat ground
+# (southness ~ 0, gradient noise) keeps its vegetation.
+VEG_MIN_SOUTHNESS = -0.05
+# water-colored pixels also fire on cast shadows — BOTH clauses: deep
+# mountain shade lit only by skylight is dark BLUE (tile 12-1379-788: the
+# north-flank shadow reads rgb ~(7,7,36), slope p50 1.0), so the blue rule
+# needs the slope gate every bit as much as the dark rule. Water is FLAT:
+# measured on the Nuuk fjord tile, true water sits at slope ~0 (87-100%
+# under 0.20, the rest coastline DEM bleed) while shadow false-positives sit
+# far above. The one place the DEM must not get authority over water is its
+# fake-seamount artifacts — spiky noise over fjord/ocean surfaces (mounds
+# reach ~18 m and slope 0.3+ on open water). The defining property of a
+# fake seamount is that it NEVER TOUCHES LAND: it is a DEM blob rising off
+# the sea surface, enclosed by sea level on all sides (a bounding polygon
+# around it sits entirely at ~0 m). So the test runs on the DEM, not on the
+# water-color bodies: label connected components of ground rising above the
+# sea surface (WATER_SEA_LEVEL_M, just over the DEM's flat ~-0.5 m sea — a
+# higher cutoff was tried and orphaned the mounds' steep SKIRTS outside
+# every blob) — the labeling itself is the enclosure test — and a blob is
+# fake when google (the water authority) shows essentially no land anywhere
+# on it. Real terrain always fails that: a coastal cliff or a mountain
+# flank belongs to a blob that runs on into sunlit land-colored ground, and
+# even a sea-level-enclosed ISLAND shows its own rock. The DEM's steep veto
+# stands ONLY on blobs that pass — sea-level ground outside every blob is
+# by definition where color wins over the DEM. Body size was tried and
+# never separated anything (a depth-14 tile is smaller than any fjord-scale
+# cutoff, killing the rescue on open water, while a flank shadow at
+# altitude IS fjord-sized). Lakes at altitude are flat, so they survive the
+# slope gate without any rescue.
 WATER_MAX_SLOPE = 0.20
-WATER_BODY_MIN_M2 = 50_000   # connected water at least this big overrules the DEM
+WATER_SEA_LEVEL_M = 1.0      # DEM ground above this rises out of the sea
+WATER_DARK_LUM = 55          # darker than this = shadow-ambiguous ground
+# "touches land" means CONFIDENT land — pixels that are neither water-colored
+# nor shadow-dark (WATER_DARK_LUM). Along a fjord's SOUTH shore the shore's
+# cast shadow falls north onto the water (grid-south sun), and fake seamounts
+# sitting in it are black like the shadow around them — sometimes so black
+# the water color rules miss them too (b ~ r, no blue signature), which
+# would paint them rock with the DEM backing it up. A shadowed blob shows no
+# confident land, so it stays fake and is FORCED to water outright. The
+# deliberate trade: a real island wholly inside a shore shadow is erased —
+# always preferable, islands almost never happen inside fjords.
+# The frac tolerance: sun glint / whitecap speckles on open water read
+# bright (the snow rule), so a strict zero would declare real every mound
+# with a few sparkle pixels; any sunlit coast or island carries far more
+# confident land than this.
+SEAMOUNT_MAX_LAND_FRAC = 0.05
 # vegetation never touches water: fjord edges have a barren tidal band (Nuuk
 # tides run ~4-5 m), so any vegetation reading within this distance of water
 # — grass, lichen, semi alike — is a shoreline artifact (wet rock, algae,
@@ -155,23 +299,28 @@ def _odd_px(window_m, mpp):
   return max(3, int(round(window_m / mpp)) | 1)
 
 
-def classify_field(rgb, southness=None, slope=None, mpp=None):
+def classify_field(rgb, southness=None, slope=None, mpp=None, elev=None):
   """Per-pixel field class map (FIELD_NAMES order) from google RGB uint8.
 
   Color rules — the field classes are what survives any m/px, so this
   stage is deliberately scale-free. Google is the authority on water (fjord
   DEM artifacts must not label as land, see CLASSIFICATION.md).
 
-  southness / slope: optional float (H, W) DEM channels aligned with rgb
-  (image-oriented), southness in -1..1, slope in rise/run. When given,
-  `grass` is confined to ground at GRASS_MIN_SOUTHNESS or sunnier, and the
-  dark-water clause is confined to flat ground (< WATER_MAX_SLOPE) so ridge
-  cast-shadows don't read as water. mpp (meters/px) sizes connected water
-  bodies for the WATER_BODY_MIN_M2 tiebreaker (without it the slope gate
-  applies unconditionally) and scales the shoreline no-mans land where all
-  vegetation demotes to rock (VEG_SHORE_BUFFER_M) and waterline "snow" is
-  read as white sand (SNOW_SHORE_BUFFER_M). None means "trust the caller"
-  and the color rules stand alone.
+  southness / slope / elev: optional float (H, W) DEM channels aligned with
+  rgb (image-oriented), southness in -1..1, slope in rise/run, elev in
+  meters. When given, ALL vegetation tiers (grass, lichen, semi) are confined
+  to ground at VEG_MIN_SOUTHNESS or sunnier — north slopes are masked out
+  before any color rule — and ALL water-colored pixels are confined to flat ground
+  (< WATER_MAX_SLOPE) so cast shadows — dim blue-grey and deep skylight-blue
+  alike — don't read as water. elev drives the fake-seamount rescue
+  (WATER_SEA_LEVEL_M): above-sea-level DEM blobs showing no confident land
+  are artifacts — they can't veto water and are forced to water outright,
+  even where shore shadow blacks them out past the color rules; without
+  elev the slope gate applies unconditionally. mpp
+  (meters/px) scales the shoreline no-mans land where all vegetation demotes
+  to rock (VEG_SHORE_BUFFER_M) and waterline "snow" is read as white sand
+  (SNOW_SHORE_BUFFER_M). None means "trust the caller" and the color rules
+  stand alone.
   """
   a = rgb.astype(np.float32)
   r, g, b = a[..., 0], a[..., 1], a[..., 2]
@@ -181,27 +330,43 @@ def classify_field(rgb, southness=None, slope=None, mpp=None):
 
   snow = (lum > 190) & (sat < 30)
   water_blue = (b > r + 12) & (b > g + 6)
-  water_dark = (lum < 55) & (b >= g - 4) & (b > r)
+  water_dark = (lum < WATER_DARK_LUM) & (b >= g - 4) & (b > r)
   water = water_blue | water_dark
   if slope is not None:
-    steep_dark = water_dark & ~water_blue & (slope >= WATER_MAX_SLOPE)
-    if mpp is not None:
-      # size tiebreaker (see WATER_BODY_MIN_M2): the DEM only gets to veto
-      # water in SMALL connected bodies — fjord-scale water keeps its label
-      # over any DEM spike. Bodies are labeled on the color-only mask so
-      # fjord connectivity is judged before any pixel is dropped.
-      labels, n = ndimage.label(water)
+    steep = water & (slope >= WATER_MAX_SLOPE)
+    if elev is not None:
+      # fake-seamount rescue (see WATER_SEA_LEVEL_M): the DEM's steep veto
+      # stands only on ground that rises out of the sea AND shows confident
+      # land. Labeling the above-sea mask IS the enclosure test (every blob
+      # is ringed by sea level or the tile edge by construction); sea-level
+      # ground outside every blob never vetoes — at sea level color wins
+      # over the DEM. Fake blobs are forced to water: in shore shadow their
+      # pixels can be too black for the color rules, and rock labels there
+      # would be fake islands (see SEAMOUNT_MAX_LAND_FRAC). Only the blob's
+      # AMBIGUOUS pixels are forced, never confident land — a shoreline
+      # blob can mix a sliver of true sunlit rock into a long run of dark
+      # water (DEM/imagery misregistration) and fail the frac test, and the
+      # rock must keep its color authority (a wholesale force was tried and
+      # erased a sunlit rocky shore).
+      labels, n = cast(
+        tuple[np.ndarray, int],
+        ndimage.label(elev >= WATER_SEA_LEVEL_M),
+      )
+      real = np.zeros(n + 1, dtype=bool)
       if n:
-        sizes = ndimage.sum_labels(np.ones_like(labels, np.float32), labels,
-                                   np.arange(1, n + 1))
-        small = np.zeros(n + 1, dtype=bool)
-        small[1:] = sizes * mpp * mpp < WATER_BODY_MIN_M2
-        steep_dark &= small[labels]
-    water &= ~steep_dark
-  veg = (eg > EG_VEG) & ~snow & ~water
+        ids = np.arange(1, n + 1)
+        conf_land = ~water & (lum >= WATER_DARK_LUM)
+        land_frac = ndimage.mean(conf_land.astype(np.float32), labels, ids)
+        real[1:] = land_frac > SEAMOUNT_MAX_LAND_FRAC
+        water |= (labels > 0) & ~real[labels] & ~conf_land
+      steep &= real[labels]
+    water &= ~steep
+  # aspect mask FIRST (see VEG_MIN_SOUTHNESS): north-facing ground grows
+  # nothing, whatever color the imagery shows there — shadows all face north
+  # and their green/olive cast must not read as ground cover
+  south_ok = True if southness is None else southness >= VEG_MIN_SOUTHNESS
+  veg = (eg > EG_VEG) & ~snow & ~water & south_ok
   strong = (eg > EG_STRONG) & veg
-  if southness is not None:
-    strong &= southness >= GRASS_MIN_SOUTHNESS
   # olive vegetation that excess-green cannot see (see GB_SEMI_DELTA):
   # clearly greener than the surrounding grey, not an absolute cutoff.
   # Background = water-excluded neighborhood mean of blue depletion; water
@@ -215,7 +380,7 @@ def classify_field(rgb, southness=None, slope=None, mpp=None):
   land = (~water).astype(np.float32)
   gb_bg = ndimage.uniform_filter(gb * land, win) / np.maximum(
     ndimage.uniform_filter(land, win), 1e-6)
-  semi = (gb - gb_bg > GB_SEMI_DELTA) & ~snow & ~water
+  semi = (gb - gb_bg > GB_SEMI_DELTA) & ~snow & ~water & south_ok
   if mpp is not None and water.any():
     # no-mans land (see VEG_SHORE_BUFFER_M / SNOW_SHORE_BUFFER_M): the tidal
     # band is barren — all vegetation tiers demote to rock, and waterline
@@ -253,7 +418,7 @@ def detect_boulders(lum_ref):
   """
   bg = ndimage.median_filter(lum_ref, size=_odd_px(BG_WINDOW_M, REF_MPP))
   dark = lum_ref < bg - SHADOW_DARK_DELTA
-  labels, n = ndimage.label(dark)
+  labels, n = cast(tuple[np.ndarray, int], ndimage.label(dark))
   if not n:
     return np.zeros_like(dark), np.zeros_like(dark), 0, bg
   px_area = REF_MPP * REF_MPP
@@ -378,11 +543,24 @@ BAND_MPP = 4.0            # working resolution for the tensor
 BAND_TENSOR_M = 25.0      # gaussian window the tensor is averaged over
 BAND_MIN_COH = 0.25       # below this the ground is isotropic — no band
 BAND_ZOOM = 16            # google zoom the banding is measured at
+BAND_MAX_DEPTH = 11       # banding is an aerial-scale fact measured ONCE, at
+                          # this depth — every deeper tile crops its quadrant
+                          # out of the ancestor's band field, never remeasures.
+                          # This is what makes band count monotone under zoom:
+                          # N formations at depth 11 can only shrink to the
+                          # subset crossing a deeper tile, never grow — a
+                          # deeper tensor pass would imagine bands from noise
+                          # (tiles smaller than a few 30-100 m wavelengths)
 # joint sets are PARALLEL families, not a swirling flow field: snap local
 # orientations to the tile's dominant modes (up to two — Nuuk gneiss often
 # carries two joint sets) and drop everything off-mode
 BAND_SNAP_DEG = 16        # max deviation from a mode to count as that band
 BAND_MODE2_MIN = 0.35     # secondary mode must carry this share of the primary
+BAND_MIN_EXTENT_M = 100   # a formation must span at least one full band
+                          # wavelength; shorter coherent specks are texture
+                          # noise (measured: real formations 130-530 m,
+                          # specks < 80 m — this is what keeps the band
+                          # count in the single digits per tile)
 
 
 def band_structure(rgb, mpp):
@@ -418,7 +596,7 @@ def band_structure(rgb, mpp):
   lb = rgb_b.mean(-1)
   water = (((bb > rb + 12) & (bb > gb + 6))
            | ((lb < 55) & (bb >= gb - 4) & (bb > rb)))
-  water = ndimage.binary_dilation(water, iterations=3)
+  water = np.asarray(ndimage.binary_dilation(water, iterations=3), dtype=bool)
   land = (~water).astype(np.float32)
   gx *= land
   gy *= land
@@ -459,6 +637,19 @@ def band_structure(rgb, mpp):
   nearest = np.argmin(dev, axis=0)
   theta = np.choose(nearest, np.array(modes, dtype=np.float32)[:, None, None])
   coh = np.where(np.min(dev, axis=0) <= np.radians(BAND_SNAP_DEG), coh, 0.0)
+
+  # extent gate: a formation must span at least a band wavelength
+  # SciPy's overload also permits returning only the label array when an
+  # output buffer is supplied; no buffer is supplied here, so this is always
+  # the (labels, feature_count) form.
+  lbl, n = cast(
+    tuple[np.ndarray, int],
+    ndimage.label(coh > BAND_MIN_COH),
+  )
+  min_cells = int(BAND_MIN_EXTENT_M / BAND_MPP)
+  for i, sl in enumerate(ndimage.find_objects(lbl)):
+    if max(sl[0].stop - sl[0].start, sl[1].stop - sl[1].start) < min_cells:
+      coh[sl][lbl[sl] == i + 1] = 0.0
   return theta.astype(np.float32), coh.astype(np.float32)
 
 
@@ -487,7 +678,7 @@ def band_overlay(rgb, theta, coh, step_m=20.0, seg_m=70.0):
       # hue from orientation: 0..pi -> 0..360 on the wheel, doubled so theta
       # and theta+pi (same band) share a color
       hue = Image.new("HSV", (1, 1), (int(t / np.pi * 255) % 256, 230, 255))
-      r, g, b = hue.convert("RGB").getpixel((0, 0))
+      r, g, b = cast(tuple[int, int, int], hue.convert("RGB").getpixel((0, 0)))
       a = int(60 + 195 * min(1.0, (c - BAND_MIN_COH) / (1 - BAND_MIN_COH)))
       cx, cy = bx * sx, by * sy
       # theta is measured in image coords (y = row, grows southward), so the

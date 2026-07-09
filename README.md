@@ -14,7 +14,7 @@ The backend in /flaskserver manages terrain heightmaps and textures in a SQLite 
 | Heightmaps (primary) | [ArcticDEM v4.1](https://www.pgc.umn.edu/data/arcticdem/) mosaic via S3 | 10m | Cloud Optimized GeoTIFF, free, no auth |
 | Heightmaps (fallback) | [Copernicus GLO-30](https://spacedata.copernicus.eu/) via S3 | 30m | Used when ArcticDEM has no coverage |
 | Textures | [Dataforsyningen](https://dataforsyningen.dk/) WMS | 0.2m–1.6m | SPOT 6/7 + aerial ortho, requires free API token |
-| Enhancement | SUPIR via [ComfyUI](https://github.com/comfyanonymous/ComfyUI) | — | Optional, upscales Dataforsyningen textures at depth 12+ |
+| Labeling reference | Google satellite tiles | ~0.26 m/px (z18) | Classification ground truth only — measured, never shipped |
 
 ## Coordinate Systems
 
@@ -31,17 +31,21 @@ The backend in /flaskserver manages terrain heightmaps and textures in a SQLite 
 - Dataforsyningen textures: 3413 → 3184 for the WMS request, then warped back to 3413 (Lanczos)
 - Client-side: lat/lon → `Geodetic` → ECEF for Three.js scene placement
 
-## Texture Pipeline (TELL YOUR AI NOT TO MESS WITH THIS)
+## Texture Pipeline
 
-Textures follow a strict upgrade chain. Each stage only feeds the next. Do not skip stages or rewire the fallback order without understanding the full flow.
+Real imagery down to depth 12, invented detail below it.
 
-    dataforsyningen → dataforsyningen_enhanced → upscaled
+    dataforsyningen (faithful, depth ≤ 12) → procedural synthesis (gorgeous + deterministic, depth ≥ 13)
 
 1. **Bootstrap**: On first run, the server seeds the tile grid as empty skeletons (no heightmaps, no textures). These define the quadtree structure up to the target depth.
 2. **tex-worker** fetches from Dataforsyningen WMS (SPOT 6/7 1.6m, EPSG:3184) on demand. If it fails (rate limit, timeout, no coverage), the tile stays uncached and an ancestor texture is cropped and served as a placeholder until the next request retries.
 3. Dataforsyningen WMS requires EPSG:3184 (not 3413). The fetch reprojects 3413→3184 for the request, then warps the result back to 3413 with Lanczos resampling.
-4. **enhance** (SUPIR upscaler via ComfyUI) ONLY processes `dataforsyningen` tiles. It never fetches from the internet. The output is `dataforsyningen_enhanced`.
-5. Upscaling (SUPIR) only kicks in at **depth 12 and above**. Lower LOD tiles don't need it — the base Dataforsyningen imagery is sharp enough at those scales.
+4. Dataforsyningen runs out of detail around depth 13 (SPOT is 1.6 m/px). Below that, accuracy vs reality stops mattering: **depth 12 already tells us what goes where**. A coarse class map at d12 scale (water / grey / dark slopes & shadows / green / white — see CLASSIFICATION.md) is the entire semantic contract.
+5. **Everything below depth 12 is procedural** (work in progress): per-class texture and asset synthesis, seeded from absolute EPSG:3413 coordinates so every visit renders identical detail, color-anchored to the real d12 imagery so the transition doesn't pop. Judged on looks, not fidelity. Google imagery is a labeling/measurement reference only and never ships.
+
+Retired approaches, kept in git history only: SUPIR/ComfyUI enhance (`dataforsyningen_enhanced`/`upscaled` sources — never worked right) and the learned recoloring model (`train_color.py`/`colorize.py`, served as `?stage=colorized` — RGB imitation of Google produced unstable garbage).
+
+The eyeball harness is `pipeline.html?tile=<id>`: a tile's progress through every stage — heightmap → southness → texture → google ref → buckets → procgen — with per-stage status, keyboard navigation across tiles and depths, and a flag button that files the tile as a classifier regression case.
 
 ## Troubleshooting
 
@@ -53,7 +57,7 @@ The camera starts facing north at Nuuk (64.18°N, 51.72°W). You can override th
 
 ## Map Mode
 
-Press **M** to toggle a 2D map view (no clouds/atmosphere) for navigation and tile debugging. Right-click on a tile to inspect its metadata and submit an enhance request to the SUPIR upscaler. (WIP — enhance-on-click is still being hooked up.)
+Press **M** to toggle a 2D map view (no clouds/atmosphere) for navigation and tile debugging. Right-click on a tile to inspect its metadata or open it in pipeline.html.
 
 In 3D mode, atmosphere sliders allow adjusting cloud density, coverage, and lighting parameters. (WIP — still working out some bugs.)
 

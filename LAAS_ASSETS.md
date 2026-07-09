@@ -1,5 +1,12 @@
 # LAAS Asset Guide Workflow
 
+> **Status (July 2026): the graduation path into `vegetation.js` is retired**
+> — the classifier-heuristic vegetation PoC is dead. What survives is the
+> measurement loop (steps 1–3): grounding proc-gen parameters (densities,
+> sizes, clumping, palettes) in real imagery is still exactly how the new
+> below-d12 procedural synthesis stage gets its numbers (see
+> CLASSIFICATION.md). Read step 4 and the asset inventory as historical.
+
 Ground the procedural vegetation/rock assets (`webserver/vegetation.js`, LAAS
 builders) in real imagery instead of guessed constants. Google satellite tiles
 are the measurement reference — sharper than our SPOT textures and free of the

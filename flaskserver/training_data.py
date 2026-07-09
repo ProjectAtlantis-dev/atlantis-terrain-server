@@ -167,7 +167,7 @@ def export_tile(db, tid, out_root, zoom=None, res=512, refresh=False):
   Image.fromarray(coarse).save(d / "coarse.png")
   # both label stages, for eyeball-tuning thresholds in biomes.py
   field = classify_field(google, southness=chans["southness"], slope=chans["slope"],
-                         mpp=tile_size_m / res)
+                         mpp=tile_size_m / res, elev=chans["elev"])
   refined = refine_rock(google, tile_size_m / res, field, slope=chans["slope"],
                         google_zoom=z, tile_depth=int(tid.split("-")[0]))
   Image.fromarray(class_overlay(google, field)).save(d / "field.png")
@@ -217,7 +217,7 @@ def write_gallery(out_root):
       f'<td><img src="{tid}/{c}.png" loading="lazy"><br><small>{c}</small></td>'
       for c in cols)
     rows_html.append(
-      f'<tr><th>{tid}<br><small><a href="http://localhost:5173/compare.html'
+      f'<tr><th>{tid}<br><small><a href="http://localhost:5173/pipeline.html'
       f'?tile={tid}">compare</a></small></th>{cells}</tr>')
   (out_root / "index.html").write_text(
     "<!doctype html><meta charset=utf-8><title>training pairs</title>"

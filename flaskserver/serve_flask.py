@@ -847,6 +847,7 @@ def _queue_texture_fetch(tile_id: str, bbox: tuple[float, float, float, float]) 
 
 
 _api_tiles_state: dict[str, str | None] = {"last_result": None}
+_last_camera: dict[str, float] | None = None  # last /api/tiles pose, feeds /api/heatmap
 
 
 @app.get("/api/tiles")
@@ -873,6 +874,10 @@ def api_tiles():
   oy = _arg_float("oy", qy)
   alt = _arg_float("alt", 0.0)
   heading = _arg_float("heading", 0.0)
+
+  global _last_camera
+  _last_camera = {"qx": qx, "qy": qy, "alt": alt, "heading": heading,
+                  "maxDepth": max_depth}
 
   try:
     tiles, missing = _query_tiles_stereo(
@@ -1081,6 +1086,55 @@ def api_tiles():
   )
 
 
+def _colorized_jpeg(tile_id: str, resolution: int = 256):
+  """resolution² JPEG of the model-painted texture for a tile, or None.
+
+  colorize.py writes full-res PNGs at the model's native 0.32 m/px (a d12
+  tile -> 2048²). That output IS the upscaled texture: a tile without its own
+  colorized PNG is cut from the nearest colorized ancestor — native detail
+  down to depth 15 from a d12 source, and deep tiles get painted texture even
+  where dataforsyningen was never fetched that deep. Never upsamples past the
+  crop's native pixels (a d15 crop of a d12 source is 256² — sending it as
+  1024² would be 16x the bytes for zero detail). Results are cached as
+  <tile>/colorized_<res>.jpg so each crop is computed once.
+  """
+  from pathlib import Path as _Path
+  root = _Path(__file__).parent / "sample" / "colorized"
+  parsed = _parse_tile_id(tile_id)
+  if parsed is None:
+    return None
+  d, c, r = parsed
+  for up in range(0, 5):  # own tile, then up to 4 ancestor levels (d12->d16)
+    ad, ac, ar = d - up, c >> up, r >> up
+    if ad < 0:
+      break
+    src = root / f"{ad}-{ac}-{ar}" / "colorized.png"
+    if not src.is_file():
+      continue
+    from PIL import Image as _Image
+    with _Image.open(src) as probe:
+      native = max(1, probe.size[0] >> up)   # crop size before any resampling
+    res = max(256, min(resolution, native))
+    cached = root / tile_id / f"colorized_{res}.jpg"
+    if cached.is_file():
+      return cached.read_bytes()
+    im = _Image.open(src).convert("RGB")
+    if up:
+      # PNG row 0 = north, tile row index grows northward — flip the
+      # quadrant's row position (same convention as api_classes' band crop)
+      n = 1 << up
+      qx, qy = c - (ac << up), r - (ar << up)
+      w, h = im.size
+      ix0, iy0 = qx * w // n, (n - 1 - qy) * h // n
+      im = im.crop((ix0, iy0, ix0 + max(1, w // n), iy0 + max(1, h // n)))
+    if im.size != (res, res):
+      im = im.resize((res, res), _Image.Resampling.LANCZOS)
+    cached.parent.mkdir(parents=True, exist_ok=True)
+    im.save(cached, format="JPEG", quality=88)
+    return cached.read_bytes()
+  return None
+
+
 @app.get("/api/texture/<tile_id>.jpg")
 def api_texture(tile_id: str):
   unavailable = _terrain_unavailable_response()
@@ -1094,6 +1148,36 @@ def api_texture(tile_id: str):
     "SELECT texture, source FROM textures WHERE tile_id = ?",
     (tile_id,),
   ).fetchone()
+
+  # colorized stage (?stage=colorized, on by default in the frontend): the
+  # model-painted UPSCALE from colorize.py output — own tile or a native-res
+  # crop of a colorized ancestor (see _colorized_jpeg). It must never clobber
+  # real imagery that out-resolves it: painted output is 0.32 m/px, so it
+  # only wins where a 256² chain tile is starved for source detail — depth >=
+  # 13, where SPOT's 1.6 m no longer fills the tile. Shallower tiles, and
+  # tiles already enhanced/upscaled by SUPIR, always serve the real chain.
+  _COLORIZED_MIN_DEPTH = 13
+  if request.args.get("stage") == "colorized":
+    _p = _parse_tile_id(tile_id)
+    _src = row[1] if row else None
+    if (_p is not None and _p[0] >= _COLORIZED_MIN_DEPTH
+        and _src not in ("dataforsyningen_enhanced", "upscaled")):
+      # 1024² at d13 = 0.32 m/px — the model's native detail, Google-z18
+      # class. The 256² chain textures at d13 are 1.3 m/px; serving the
+      # paint at 256² made it indistinguishable from SPOT.
+      painted = _colorized_jpeg(tile_id, resolution=1024)
+      if painted is not None:
+        return Response(
+          painted,
+          mimetype="image/jpeg",
+          headers={
+            "Cache-Control": "no-store",
+            "X-Tex-Source": "colorized",
+            "X-Tex-Status": "ready",
+            "X-Tex-Quality": "full",
+            "X-Tex-Temporary": "0",
+          },
+        )
 
   cached_crop = None
   # Sources that are temporary placeholders — serve them but let client re-fetch
@@ -1243,7 +1327,7 @@ def api_google_ref(tile_id: str):
 
 def _heightmap_ancestor_crop(db, d: int, c: int, r: int, max_up: int = 4):
   """Tile heightmap, cropped out of the nearest ancestor's when the tile
-  itself was never seeded/flown (compare.html can ask for any tile id; tile
+  itself was never seeded/flown (pipeline.html can ask for any tile id; tile
   rows only exist where the frontend heatmap demanded them). Same philosophy
   as ancestor-crop textures. Returns (hm, source, depth_found) or
   (None, None, None); hm is (GRID_N, GRID_N), row 0 = south.
@@ -1321,18 +1405,245 @@ def api_terrain_channel(tile_id: str, chan: str):
   )
 
 
+@app.get("/api/heatmap")
+def api_heatmap():
+  """Pure quadtree grid for the last /api/tiles camera — no heightmaps, just
+  geometry + the same priority math the tile fetcher uses. Drives the heatmap
+  and map layers of webserver/coverage.html. hasTexture marks tiles whose own
+  texture is already cached (safe to pull /api/texture without triggering an
+  upstream fetch)."""
+  from tiles import build_lod_tree, get_leaves
+
+  cam = _last_camera
+  if cam is None:
+    return jsonify(None)
+
+  qx = _arg_float("qx", cam["qx"])
+  qy = _arg_float("qy", cam["qy"])
+  alt = _arg_float("alt", cam["alt"])
+  heading = _arg_float("heading", cam["heading"])
+  max_depth = _arg_int("maxDepth", int(cam["maxDepth"]))
+  lod_factor = _arg_float("lod", 2.0)
+
+  root = build_lod_tree(qx, qy, max_depth=max_depth, lod_factor=lod_factor)
+  leaves = get_leaves(root)
+
+  fwd_x = math.sin(heading) if heading else 0.0
+  fwd_y = math.cos(heading) if heading else 1.0
+
+  # Only count permanently cached textures — temporary placeholder sources
+  # would make /api/texture queue an upstream re-fetch when the map page
+  # pulls them (mirror of api_texture's _TEX_TEMPORARY).
+  leaf_ids = [leaf.id for leaf in leaves]
+  placeholders = ",".join("?" for _ in leaf_ids)
+  texture_ids = {r[0] for r in _get_db().execute(
+    f"SELECT tile_id FROM textures WHERE tile_id IN ({placeholders}) "
+    "AND source NOT IN ('sentinel2_crop', 'ancestor_crop', 'ancestor_crop_ratelimit')",
+    leaf_ids).fetchall()} if leaf_ids else set()
+  tiles = []
+  for leaf in leaves:
+    bbox = list(leaf.bbox)
+    priority = _tile_priority(bbox, qx, qy, fwd_x, fwd_y)
+    tiles.append({
+      "id": leaf.id,
+      "bbox": bbox,
+      "depth": leaf.depth,
+      "priority": math.log(max(priority, 1.0)),
+      "hasTexture": leaf.id in texture_ids,
+    })
+
+  # Sort by priority (lowest = closest/hottest) and add render order index
+  tiles.sort(key=lambda t: t["priority"])
+  for i, t in enumerate(tiles):
+    t["order"] = i
+
+  return jsonify({
+    "timestamp": time.time(),
+    "camera": {"qx": qx, "qy": qy, "alt": alt, "heading": heading},
+    "tiles": tiles,
+  })
+
+
+@app.get("/api/regression/")
+@app.get("/api/regression/<path:name>")
+def api_regression(name: str = "index.html"):
+  """Classifier regression gallery — regression_cases.py output on disk.
+  Rebuild with `venv/bin/python regression_cases.py` after classifier
+  changes; the frontend pages link here (vite proxies /api to us)."""
+  from pathlib import Path as _Path
+  root = _Path(__file__).parent / "sample" / "regression"
+  if not (root / "index.html").is_file():
+    return Response(
+      b"no regression gallery yet - run: venv/bin/python regression_cases.py",
+      status=404, mimetype="text/plain")
+  return send_from_directory(root, name)
+
+
+@app.get("/api/pipeline/at.json")
+def api_pipeline_at():
+  """Resolve lat/lon (e.g. the 3D camera position) to the deepest tile that
+  has real progress (a texture), falling back to the deepest seeded tile —
+  so the HUD's pipeline link lands on the tile under the camera."""
+  try:
+    lat = float(request.args["lat"])
+    lon = float(request.args["lon"])
+  except (KeyError, ValueError):
+    return jsonify({"error": "lat and lon required"}), 400
+  from coords import to_stereo
+  x, y = to_stereo(lat, lon)
+  db = _get_db()
+  base = ("FROM tiles t {join} WHERE t.x_min <= ? AND t.x_max > ? "
+          "AND t.y_min <= ? AND t.y_max > ? ORDER BY t.depth DESC LIMIT 1")
+  args = (x, x, y, y)
+  row = db.execute(
+    "SELECT t.tile_id " + base.format(
+      join="JOIN textures xt ON xt.tile_id = t.tile_id"), args).fetchone()
+  if row is None:
+    row = db.execute("SELECT t.tile_id " + base.format(join=""), args).fetchone()
+  if row is None:
+    return jsonify({"error": "no tile at this location"}), 404
+  return jsonify({"tile": row[0]})
+
+
+@app.get("/api/pipeline/<tile_id>.json")
+def api_pipeline(tile_id: str):
+  """Per-stage pipeline status for one tile — drives pipeline.html. Says what
+  each stage has (and where it came from) without rendering anything."""
+  if _parse_tile_id(tile_id) is None:
+    return jsonify({"error": f"bad tile id: {tile_id!r}"}), 400
+  db = _get_db()
+  t = db.execute(
+    "SELECT depth, x_min, y_min, x_max, y_max, heightmap IS NOT NULL, source, "
+    "updated_at FROM tiles WHERE tile_id = ?", (tile_id,)).fetchone()
+  if t is None:
+    return jsonify({"error": "tile not in grid — never seeded"}), 404
+  x = db.execute(
+    "SELECT source, LENGTH(texture), updated_at FROM textures WHERE tile_id = ?",
+    (tile_id,)).fetchone()
+  from google_ref import init_google_refs
+  init_google_refs(db)
+  g = db.execute(
+    "SELECT zoom, resolution, LENGTH(texture), updated_at FROM google_refs "
+    "WHERE tile_id = ?", (tile_id,)).fetchone()
+  return jsonify({
+    "tile": tile_id,
+    "depth": t[0],
+    "bbox": list(t[1:5]),
+    "size_m": round(t[3] - t[1], 1),
+    "heightmap": {"ok": bool(t[5]), "source": t[6], "updated": t[7]},
+    "texture": ({"ok": True, "source": x[0], "bytes": x[1], "updated": x[2]}
+                if x else {"ok": False}),
+    "google_ref": ({"ok": True, "zoom": g[0], "res": g[1], "bytes": g[2],
+                    "updated": g[3]} if g else
+                   {"ok": False, "note": "fetches+caches on first use"}),
+  })
+
+
+@app.post("/api/regression/cases")
+def api_regression_add():
+  """Flag a tile as a regression case (pipeline.html's flag button): appends
+  {tile, note} to regression_cases.json, bakes the case (classifier steps +
+  overlay) and rebuilds the gallery."""
+  from google_ref import init_google_refs
+  from regression_cases import add_case, bake
+
+  data = request.get_json(silent=True) or {}
+  tile_id = str(data.get("tile", "")).strip()
+  note = str(data.get("note", "")).strip()
+  if _parse_tile_id(tile_id) is None:
+    return jsonify({"error": f"bad tile id: {tile_id!r}"}), 400
+  if not note:
+    return jsonify({"error": "note is required — say what is wrong"}), 400
+  count = add_case(tile_id, note)
+  db = _get_db()
+  init_google_refs(db)
+  bake(db, [tile_id])
+  return jsonify({"ok": True, "cases": count, "tile": tile_id})
+
+
+@app.get("/api/coverage/index.json")
+def api_coverage_index():
+  """Every tile with a REAL cached texture (placeholder crops excluded) —
+  drives coverage.html's coverage mode. ?maxdepth caps the depth (default 12,
+  the contract level); deeper tiles are detail, not coverage."""
+  try:
+    maxdepth = int(request.args.get("maxdepth", "12"))
+  except ValueError:
+    return jsonify({"error": "bad maxdepth"}), 400
+  db = _get_db()
+  tiles = [
+    {"tile": tid, "bbox": [x0, y0, x1, y1], "depth": d}
+    for tid, d, x0, y0, x1, y1 in db.execute(
+      "SELECT t.tile_id, t.depth, t.x_min, t.y_min, t.x_max, t.y_max "
+      "FROM textures x JOIN tiles t ON t.tile_id = x.tile_id "
+      "WHERE t.depth <= ? AND x.source NOT IN "
+      "('sentinel2_crop', 'ancestor_crop', 'ancestor_crop_ratelimit', "
+      "'ancestor_crop_nodata') ORDER BY t.depth", (maxdepth,))
+  ]
+  return jsonify({"tiles": tiles})
+
+
+@app.get("/api/colorized/index.json")
+def api_colorized_index():
+  """Coverage index of model-painted tiles (colorize.py output on disk):
+  tile id, bbox (EPSG:3413) and depth for every tile with its own colorized
+  PNG. Drives webserver/coverage.html's map view."""
+  from pathlib import Path as _Path
+  root = _Path(__file__).parent / "sample" / "colorized"
+  db = _get_db()
+  tiles = []
+  for p in sorted(root.glob("*/colorized.png")):
+    tid = p.parent.name
+    row = db.execute(
+      "SELECT x_min, y_min, x_max, y_max, depth FROM tiles WHERE tile_id = ?",
+      (tid,)).fetchone()
+    if row is not None:
+      tiles.append({"tile": tid, "bbox": list(row[:4]), "depth": row[4]})
+  return jsonify({"tiles": tiles})
+
+
+@app.get("/api/colorized/<tile_id>/thumb.jpg")
+def api_colorized_thumb(tile_id: str):
+  """256² JPEG of the model-painted texture (own tile or ancestor crop, see
+  _colorized_jpeg). Drives the imagery layer of webserver/coverage.html."""
+  if _parse_tile_id(tile_id) is None:
+    return Response(b"", status=400)
+  data = _colorized_jpeg(tile_id)
+  if data is None:
+    return Response(b"", status=404)
+  return Response(data, mimetype="image/jpeg",
+                  headers={"Cache-Control": "no-store"})
+
+
+@app.get("/api/colorized/<tile_id>/<name>.png")
+def api_colorized_file(tile_id: str, name: str):
+  """Serve a colorize.py output image (composite/colorized/coarse/google/
+  classes) for the coverage map's click-through."""
+  if name not in ("composite", "colorized", "coarse", "google", "classes"):
+    return Response(b"", status=400)
+  if _parse_tile_id(tile_id) is None:
+    return Response(b"", status=400)
+  from pathlib import Path as _Path
+  p = _Path(__file__).parent / "sample" / "colorized" / tile_id / f"{name}.png"
+  if not p.is_file():
+    return Response(b"", status=404)
+  return Response(p.read_bytes(), mimetype="image/png",
+                  headers={"Cache-Control": "no-store"})
+
+
 @app.get("/api/classes/<tile_id>/<stage>.png")
 def api_classes(tile_id: str, stage: str):
   """Heuristic classifier overlay on the Google reference, as a debug PNG
-  pixel-aligned with /api/texture and /api/google. stage `field` is the
-  5-class depth<=11 labeler; `refined` adds the fixed-scale rock hard/loose
+  pixel-aligned with /api/texture and /api/google. stage `coarse` is the
+  5-bucket d12-contract labeler (see CLASSIFICATION.md); `field` is the
+  legacy 6-class labeler; `refined` adds the fixed-scale rock hard/loose
   split (slope from the tile heightmap when available) plus detected boulder
   instances; `bands` renders rock-banding orientation/coherence segments
   (structure tensor — hue = band direction, opacity = coherence). Google refs
   are cached, so the first hit on an unflown tile pays the upstream fetch.
   Query params: res (default 512), alpha (overlay strength 0..1, default .55).
   """
-  if stage not in ("field", "refined", "bands"):
+  if stage not in ("coarse", "field", "refined", "bands"):
     return Response(b"", status=400)
   unavailable = _terrain_unavailable_response()
   if unavailable is not None:
@@ -1353,8 +1664,9 @@ def api_classes(tile_id: str, stage: str):
   import numpy as np
   from PIL import Image as _Image
 
-  from biomes import (BAND_ZOOM, BOULDER_MIN_ZOOM, FIELD_NAMES, REFINED_NAMES,
-                      band_overlay, band_structure, class_overlay,
+  from biomes import (BAND_MAX_DEPTH, BAND_ZOOM, BOULDER_MIN_ZOOM,
+                      COARSE_NAMES, FIELD_NAMES, REFINED_NAMES, band_overlay,
+                      band_structure, class_overlay, classify_coarse,
                       classify_field, refine_rock)
   from google_ref import get_google_ref, init_google_refs
   from training_data import _upsample_f32, terrain_channels
@@ -1374,7 +1686,31 @@ def api_classes(tile_id: str, stage: str):
                  .resize((res, res), _Image.Resampling.LANCZOS))
 
   if stage == "bands":
-    theta, coh = band_structure(rgb, (bbox[2] - bbox[0]) / res)
+    if d > BAND_MAX_DEPTH:
+      # aerial-scale fact: measure on the BAND_MAX_DEPTH ancestor and crop
+      # this tile's quadrant, so deep tiles show the same formations instead
+      # of tensor noise (a deep tile spans too few band wavelengths)
+      shift = d - BAND_MAX_DEPTH
+      ac, ar = c >> shift, r >> shift
+      abox = _tile_bbox(BAND_MAX_DEPTH, ac, ar)
+      ajpeg, _az = get_google_ref(db, f"{BAND_MAX_DEPTH}-{ac}-{ar}", abox,
+                                  resolution=res, zoom=BAND_ZOOM)
+      if ajpeg is None:
+        return Response(b"", status=502,
+                        headers={"X-Tex-Status": "google_fetch_failed"})
+      argb = np.array(_Image.open(_io.BytesIO(ajpeg)).convert("RGB")
+                      .resize((res, res), _Image.Resampling.LANCZOS))
+      theta, coh = band_structure(argb, (abox[2] - abox[0]) / res)
+      # tile row index grows northward, image row 0 is north — flip the
+      # quadrant's row position (same convention as _heightmap_ancestor_crop)
+      n = 1 << shift
+      qx, qy = c - (ac << shift), r - (ar << shift)
+      bh, bw = theta.shape
+      iy0, ix0 = (n - 1 - qy) * bh // n, qx * bw // n
+      theta = theta[iy0:iy0 + max(1, bh // n), ix0:ix0 + max(1, bw // n)]
+      coh = coh[iy0:iy0 + max(1, bh // n), ix0:ix0 + max(1, bw // n)]
+    else:
+      theta, coh = band_structure(rgb, (bbox[2] - bbox[0]) / res)
     buf = _io.BytesIO()
     _Image.fromarray(band_overlay(rgb, theta, coh)).save(buf, format="PNG")
     return Response(
@@ -1382,16 +1718,21 @@ def api_classes(tile_id: str, stage: str):
       headers={"Cache-Control": "no-store", "X-Google-Zoom": str(z),
                "X-Tex-Source": "classes_bands"})
 
-  slope = southness = None
+  slope = southness = elev = None
   hm, _hm_src, _hm_d = _heightmap_ancestor_crop(db, d, c, r)
   if hm is not None:
     chans = terrain_channels(hm, bbox[2] - bbox[0])
     # DB heightmaps are row 0 = south; flip to image orientation
     slope = _upsample_f32(chans["slope"], res)[::-1]
     southness = _upsample_f32(chans["southness"], res)[::-1]
-  cls = classify_field(rgb, southness=southness, slope=slope,
-                       mpp=(bbox[2] - bbox[0]) / res)
-  names = FIELD_NAMES
+    elev = _upsample_f32(chans["elev"], res)[::-1]
+  if stage == "coarse":
+    cls = classify_coarse(rgb, slope=slope, elev=elev)
+    names = COARSE_NAMES
+  else:
+    cls = classify_field(rgb, southness=southness, slope=slope,
+                         mpp=(bbox[2] - bbox[0]) / res, elev=elev)
+    names = FIELD_NAMES
   if stage == "refined":
     cls = refine_rock(rgb, (bbox[2] - bbox[0]) / res, cls, slope=slope,
                       google_zoom=z, tile_depth=d)

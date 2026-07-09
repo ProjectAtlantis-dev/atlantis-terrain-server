@@ -1,0 +1,503 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>tile radar</title>
+<style>
+  html, body { margin:0; height:100%; overflow:hidden; background:#060a10; color:#dbe5f1;
+               font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }
+  #cv { position:absolute; inset:0; width:100%; height:100%; cursor:crosshair; }
+  #panel { position:fixed; top:10px; left:12px; z-index:2;
+           background:rgba(10,16,24,.8); border:1px solid #1e2d3a; border-radius:4px;
+           padding:6px 10px; max-width:min(680px, calc(100vw - 40px)); }
+  #tabs { display:flex; gap:2px; margin-bottom:3px; }
+  #tabs div { padding:2px 10px; border:1px solid #1e2d3a; border-bottom:none;
+              border-radius:3px 3px 0 0; color:#6889a8; cursor:pointer; user-select:none; }
+  #tabs div.on { color:#5af; background:#101a26; border-color:#2a3f55; }
+  #meta { color:#6889a8; }
+  #meta b { color:#dbe5f1; }
+  #tip { position:fixed; pointer-events:none; background:#111c28; border:1px solid #2a3f55;
+         padding:2px 8px; border-radius:3px; display:none; z-index:3; white-space:pre-line; }
+  .sw { display:inline-block; width:10px; height:10px; vertical-align:-1px;
+        margin:0 3px 0 10px; border:1px solid #000; }
+  .grad { display:inline-block; width:90px; height:10px; vertical-align:-1px; margin:0 4px;
+          border:1px solid #000;
+          background:linear-gradient(to right,#ff2020,#ffff00,#00e050,#0066ff); }
+  #viewer { display:none; position:fixed; inset:0; z-index:10;
+            background:rgba(4,8,14,.88); }
+  #viewer.open { display:flex; flex-direction:column; align-items:center; justify-content:center; gap:8px; }
+  #viewerImg { max-width:92vw; max-height:82vh; border:1px solid #2a3f55; background:#0a1018;
+               image-rendering:pixelated; }
+  #viewerBar { display:flex; align-items:center; gap:2px; }
+  #viewerBar b { color:#5af; margin-right:8px; }
+  #viewerBar div { padding:2px 10px; border:1px solid #1e2d3a; border-radius:3px;
+                   color:#6889a8; cursor:pointer; user-select:none; }
+  #viewerBar div.on { color:#5af; background:#101a26; border-color:#2a3f55; }
+  #viewerClose { margin-left:12px; color:#e5484d !important; }
+</style></head><body>
+<canvas id="cv"></canvas>
+<div id="panel">
+  <div id="tabs">
+    <div data-mode="heatmap">1 heatmap</div>
+    <div data-mode="coverage">2 coverage</div>
+    <div data-mode="imagery" title="cached texture mosaic — NOT the 3D map mode (press M in the flight view for that)">3 imagery</div>
+    <div id="backBtn" title="Return to the 3D flight view (Esc)" style="margin-left:8px">back to 3D view</div>
+    <div id="backMapBtn" title="Open the 3D app in top-down map mode (M)">back to map view</div>
+    <a href="/pipeline.html" target="_blank" title="per-tile pipeline progress (heightmap → texture → classes → procgen)"
+       style="margin-left:8px;color:#5af;text-decoration:none">pipeline</a>
+    <a href="/api/regression/" target="_blank" title="classifier regression gallery — known-problem tiles"
+       style="margin-left:8px;color:#5af;text-decoration:none">regression cases</a>
+  </div>
+  <div id="meta">loading…</div>
+</div>
+<div id="tip"></div>
+<div id="viewer">
+  <div id="viewerBar"></div>
+  <img id="viewerImg" alt="">
+</div>
+<script>
+// Ship-centered, heading-up radar (same convention as the 3D app's map mode):
+// the ship icon is pinned at center pointing up and the world rotates around
+// it as the saved camera moves. Three layers, flipped with 1/2/3 or Tab:
+//   heatmap  — live /api/heatmap quadtree, priority-colored like the fetcher
+//   coverage — model-painted (colorize.py) tiles as imagery thumbs
+//   map      — cached real textures (/api/texture) on the heatmap grid
+const DEPTH_COLORS = { 10:'#355', 11:'#2b6cb0', 12:'#2f9e44', 13:'#e8a33d', 14:'#e5484d', 15:'#b197fc' };
+const MODES = ['heatmap', 'coverage', 'imagery'];
+const cv = document.getElementById('cv'), ctx = cv.getContext('2d');
+const tip = document.getElementById('tip');
+const meta = document.getElementById('meta');
+// ?mode=heatmap|coverage|map (main-screen radar links) beats the saved choice
+let mode = new URLSearchParams(location.search).get('mode');
+if (!MODES.includes(mode)) mode = localStorage.getItem('radar-mode');
+if (!MODES.includes(mode)) mode = 'heatmap';
+let covTiles = [];               // /api/coverage/index.json — real cached textures
+let heat = null;                 // /api/heatmap snapshot
+
+// WGS84 -> EPSG:3413 (polar stereographic north, lat_ts 70, lon_0 -45) —
+// validated against coords.py to_stereo (sub-meter agreement)
+function toStereo(lat, lon) {
+  const a = 6378137.0, e = 0.0818191908426215;
+  const rad = Math.PI / 180, latTs = 70 * rad, lon0 = -45 * rad;
+  const t = p => Math.tan(Math.PI / 4 - p / 2) /
+    Math.pow((1 - e * Math.sin(p)) / (1 + e * Math.sin(p)), e / 2);
+  const m = p => Math.cos(p) / Math.sqrt(1 - e * e * Math.sin(p) ** 2);
+  const rho = a * m(latTs) * t(lat * rad) / t(latTs);
+  return [rho * Math.sin(lon * rad - lon0), -rho * Math.cos(lon * rad - lon0)];
+}
+
+// --- live camera from the 3D session (saved to localStorage every 2s) ------
+let target = null;               // { x, y, yaw, lat, lon, alt } raw
+let smooth = null;               // same, exponentially smoothed
+function pollCamera() {
+  try {
+    const c = JSON.parse(localStorage.getItem('clouds-cam'));
+    if (!c || c.lat == null || c.lon == null) return;
+    const [x, y] = toStereo(c.lat, c.lon);
+    target = { x, y, yaw: c.yaw || 0, lat: c.lat, lon: c.lon, alt: c.alt || 0 };
+    if (!smooth) smooth = { ...target };
+  } catch (_) { /* no saved camera yet */ }
+}
+pollCamera();
+setInterval(pollCamera, 250);
+
+// --- zoom (meters half-height of the view), wheel-controlled ----------------
+// Remembered per mode: the heatmap reads best zoomed way out, the texture map
+// zoomed in. Falls back to the pre-split shared key, then per-mode defaults.
+const ZOOM_DEFAULTS = { heatmap: 60000, coverage: 20000, map: 8000 };
+function zoomFor(m) {
+  return Number(localStorage.getItem(`radar-zoom-${m}`))
+    || Number(localStorage.getItem('coverage-zoom'))
+    || ZOOM_DEFAULTS[m];
+}
+let zoom = zoomFor(mode);
+cv.addEventListener('wheel', ev => {
+  ev.preventDefault();
+  zoom = Math.min(400000, Math.max(500, zoom * Math.exp(ev.deltaY * 0.0012)));
+  localStorage.setItem(`radar-zoom-${mode}`, String(zoom));
+}, { passive: false });
+
+// --- imagery caches (lazy, per visible tile) --------------------------------
+const covThumbs = new Map();     // tile id -> Image of cached texture
+const texThumbs = new Map();     // tile id -> Image of cached real texture
+function imageFor(cache, tid, url) {
+  let im = cache.get(tid);
+  if (!im) {
+    im = new Image();
+    im.src = url;
+    cache.set(tid, im);
+  }
+  return im;
+}
+
+// --- canvas sizing -----------------------------------------------------------
+let W = 0, H = 0;
+function resize() {
+  const dpr = window.devicePixelRatio || 1;
+  W = window.innerWidth; H = window.innerHeight;
+  cv.width = Math.round(W * dpr); cv.height = Math.round(H * dpr);
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+window.addEventListener('resize', resize);
+resize();
+
+// View transform. EPSG:3413 grid north differs from true north by the
+// meridian convergence (lon - lon0); yaw is relative to TRUE north, so the
+// heading-up rotation is yaw + convergence.
+function viewParams() {
+  const s = (H / 2) / zoom;
+  const conv = smooth ? (smooth.lon + 45) * Math.PI / 180 : 0;
+  const a = (smooth ? smooth.yaw : 0) + conv;
+  return { s, a, cos: Math.cos(a), sin: Math.sin(a), cx: W / 2, cy: H / 2 };
+}
+function worldToScreen(X, Y, v) {
+  const dx = (X - smooth.x) * v.s, dy = -(Y - smooth.y) * v.s;
+  return [v.cx + dx * v.cos - dy * v.sin, v.cy + dx * v.sin + dy * v.cos];
+}
+function screenToWorld(px, py, v) {
+  const dx = px - v.cx, dy = py - v.cy;
+  const rx = dx * v.cos + dy * v.sin, ry = -dx * v.sin + dy * v.cos;
+  return [smooth.x + rx / v.s, smooth.y - ry / v.s];
+}
+function inView(bbox, margin) {
+  return !(bbox[2] < smooth.x - margin || bbox[0] > smooth.x + margin ||
+           bbox[3] < smooth.y - margin || bbox[1] > smooth.y + margin);
+}
+
+// Priority heat color: red (close/hot) → yellow → green → blue (far)
+function priorityColor(t) {
+  if (t < 0.33) { const u = t / 0.33; return `rgb(255,${Math.round(u * 224)},32)`; }
+  if (t < 0.66) { const u = (t - 0.33) / 0.33; return `rgb(${Math.round(255 * (1 - u))},224,${Math.round(32 + u * 48)})`; }
+  const u = (t - 0.66) / 0.34;
+  return `rgb(0,${Math.round(224 * (1 - u))},${Math.round(80 + u * 175)})`;
+}
+
+// --- per-mode tile drawing ----------------------------------------------------
+function drawHeat(v, margin, withImagery) {
+  if (!heat) return;
+  const tiles = heat.tiles || [];
+  let minP = Infinity, maxP = -Infinity;
+  for (const t of tiles) {
+    if (t.priority < minP) minP = t.priority;
+    if (t.priority > maxP) maxP = t.priority;
+  }
+  const labels = [];
+  for (const t of tiles) {
+    if (!inView(t.bbox, margin)) continue;
+    const [x0, y0, x1, y1] = t.bbox;
+    const rx = (x0 - smooth.x) * v.s, ry = -(y1 - smooth.y) * v.s;
+    const rw = (x1 - x0) * v.s, rh = (y1 - y0) * v.s;
+    if (rw < 0.5) continue;
+    let painted = false;
+    if (withImagery && t.hasTexture) {
+      const im = imageFor(texThumbs, t.id, `/api/texture/${t.id}.jpg`);
+      if (im.complete && im.naturalWidth) {
+        ctx.drawImage(im, rx, ry, rw, rh);      // jpeg row 0 = north = y_max
+        painted = true;
+      }
+    }
+    if (!painted) {
+      const norm = maxP > minP ? (t.priority - minP) / (maxP - minP) : 0;
+      ctx.globalAlpha = withImagery ? 0.25 : 0.7;
+      ctx.fillStyle = priorityColor(norm);
+      ctx.fillRect(rx, ry, rw, rh);
+      ctx.globalAlpha = 1;
+    }
+    if (rw > 3) {
+      ctx.strokeStyle = 'rgba(200,200,200,0.3)';
+      ctx.strokeRect(rx, ry, rw, rh);
+    }
+    if (!withImagery && t.order != null && rw > 26 && rh > 16) {
+      labels.push([t.order, (x0 + x1) / 2, (y0 + y1) / 2, Math.min(rw, rh), '#000']);
+    }
+  }
+  return labels;
+}
+
+function drawCoverage(v, margin) {
+  const labels = [];
+  for (const t of covTiles) {
+    if (!inView(t.bbox, margin)) continue;
+    const [x0, y0, x1, y1] = t.bbox;
+    const rx = (x0 - smooth.x) * v.s, ry = -(y1 - smooth.y) * v.s;
+    const rw = (x1 - x0) * v.s, rh = (y1 - y0) * v.s;
+    // only fetch imagery for rects big enough to see — a zoomed-out view of
+    // ~40k tiles must not fire 40k jpeg requests
+    const im = rw >= 24
+      ? imageFor(covThumbs, t.tile, `/api/texture/${t.tile}.jpg`) : null;
+    if (im && im.complete && im.naturalWidth) {
+      ctx.drawImage(im, rx, ry, rw, rh);
+    } else {
+      ctx.globalAlpha = 0.35;
+      ctx.fillStyle = DEPTH_COLORS[t.depth] || '#888';
+      ctx.fillRect(rx, ry, rw, rh);
+      ctx.globalAlpha = 1;
+    }
+    ctx.strokeStyle = DEPTH_COLORS[t.depth] || '#888';
+    ctx.strokeRect(rx, ry, rw, rh);
+    if (rw > 34) {
+      labels.push([`d${t.depth}`, (x0 + x1) / 2, (y0 + y1) / 2,
+                   Math.min(rw, rh) * 0.8, DEPTH_COLORS[t.depth] || '#888']);
+    }
+  }
+  return labels;
+}
+
+let lastT = performance.now();
+function frame(now) {
+  requestAnimationFrame(frame);
+  const dt = Math.min(0.25, (now - lastT) / 1000);
+  lastT = now;
+
+  // ease toward the last saved camera so 2s save ticks look continuous
+  if (target && smooth) {
+    const k = 1 - Math.exp(-dt / 0.35);
+    smooth.x += (target.x - smooth.x) * k;
+    smooth.y += (target.y - smooth.y) * k;
+    smooth.lon += (target.lon - smooth.lon) * k;
+    let dyaw = target.yaw - smooth.yaw;
+    dyaw = Math.atan2(Math.sin(dyaw), Math.cos(dyaw));
+    smooth.yaw += dyaw * k;
+  }
+
+  ctx.clearRect(0, 0, W, H);
+  if (!smooth) {
+    ctx.fillStyle = '#6889a8';
+    ctx.textAlign = 'center';
+    ctx.fillText('no saved camera — fly around in the 3D view first', W / 2, H / 2);
+    ctx.textAlign = 'left';
+    return;
+  }
+  const v = viewParams();
+
+  // rotate the whole world around the centered ship; tiles are axis-aligned
+  // in 3413 so they can be drawn as plain rects under this transform
+  ctx.save();
+  ctx.translate(v.cx, v.cy);
+  ctx.rotate(v.a);
+  const margin = Math.hypot(W, H) / 2 / v.s;   // cull to the rotated viewport
+  let labels = null;
+  if (mode === 'heatmap') labels = drawHeat(v, margin, false);
+  else if (mode === 'imagery') drawHeat(v, margin, true);
+  else labels = drawCoverage(v, margin);
+  ctx.restore();
+
+  // tile labels (fetch order / depth) drawn unrotated so they stay readable
+  if (labels && labels.length) {
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    for (const [text, wx, wy, px, color] of labels) {
+      const [sx, sy] = worldToScreen(wx, wy, v);
+      ctx.font = `bold ${Math.min(Math.max(Math.floor(px * 0.35), 8), 14)}px ui-monospace`;
+      if (color !== '#000') {
+        ctx.strokeStyle = 'rgba(0,0,0,0.8)';
+        ctx.lineWidth = 3;
+        ctx.strokeText(text, sx, sy);
+        ctx.lineWidth = 1;
+      }
+      ctx.fillStyle = color;
+      ctx.fillText(text, sx, sy);
+    }
+    ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
+  }
+
+  // range ring + scale label
+  const ringR = 0.38 * Math.min(W, H);
+  ctx.strokeStyle = 'rgba(120,160,200,0.25)';
+  ctx.beginPath(); ctx.arc(v.cx, v.cy, ringR, 0, 2 * Math.PI); ctx.stroke();
+  const km = ringR / v.s / 1000;
+  ctx.fillStyle = '#6889a8';
+  ctx.fillText(km >= 10 ? `${Math.round(km)} km` : `${km.toFixed(1)} km`,
+               v.cx + 6, v.cy - ringR - 6);
+
+  // ship icon: fixed at center, always pointing up
+  ctx.save();
+  ctx.translate(v.cx, v.cy);
+  // yellow, matching the 3D map mode's camMarker cone
+  ctx.fillStyle = '#ffe14a'; ctx.strokeStyle = '#806c00'; ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(0, -12); ctx.lineTo(8, 10); ctx.lineTo(0, 5); ctx.lineTo(-8, 10);
+  ctx.closePath(); ctx.fill(); ctx.stroke();
+  ctx.restore();
+  ctx.lineWidth = 1;
+
+  // compass: true north on screen sits at angle yaw (0 = up when facing north)
+  const nR = 26, nx = W - 44, ny = 44;
+  ctx.strokeStyle = '#2a3f55';
+  ctx.beginPath(); ctx.arc(nx, ny, nR, 0, 2 * Math.PI); ctx.stroke();
+  const ndx = Math.sin(smooth.yaw), ndy = -Math.cos(smooth.yaw);
+  ctx.strokeStyle = '#e5484d';
+  ctx.beginPath(); ctx.moveTo(nx, ny); ctx.lineTo(nx + ndx * (nR - 6), ny + ndy * (nR - 6)); ctx.stroke();
+  ctx.fillStyle = '#e5484d';
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillText('N', nx + ndx * (nR + 9), ny + ndy * (nR + 9));
+  ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
+
+  // position readout beside the ship
+  const raw = target || smooth;
+  ctx.fillStyle = '#fff';
+  ctx.fillText(`${raw.lat.toFixed(4)}, ${raw.lon.toFixed(4)} · ${Math.round(raw.alt)}m`,
+               v.cx + 14, v.cy + 18);
+}
+requestAnimationFrame(frame);
+
+// --- mode switching ------------------------------------------------------------
+function setMode(m) {
+  mode = m;
+  zoom = zoomFor(m);
+  localStorage.setItem('radar-mode', m);
+  // keep the URL honest — the mode param must always match what's on screen
+  const url = new URL(location);
+  url.searchParams.set('mode', m);
+  history.replaceState(null, '', url);
+  for (const el of document.querySelectorAll('#tabs div')) {
+    el.classList.toggle('on', el.dataset.mode === m);
+  }
+  updateMeta();
+  if (m !== 'coverage' && !heat) pollHeat();
+}
+for (const el of document.querySelectorAll('#tabs div[data-mode]')) {
+  el.addEventListener('click', () => setMode(el.dataset.mode));
+}
+
+// Back to the 3D view: this tab is opened from the HUD via window.open, so
+// close() returns to the still-running 3D tab; if the page was opened
+// directly (no opener), fall back to navigating there.
+function goBack() {
+  window.close();
+  setTimeout(() => { location.href = '/'; }, 150);  // close() was refused
+}
+document.getElementById('backBtn').addEventListener('click', goBack);
+// map mode lives inside the 3D app (M key) — navigate there with ?map=1 so
+// it boots straight into the top-down view
+document.getElementById('backMapBtn').addEventListener('click', () => {
+  location.href = '/?map=1';
+});
+
+window.addEventListener('keydown', ev => {
+  if (ev.code === 'Digit1') setMode('heatmap');
+  else if (ev.code === 'Digit2') setMode('coverage');
+  else if (ev.code === 'Digit3') setMode('imagery');
+  else if (ev.code === 'Escape') {
+    if (viewer.classList.contains('open')) closeViewer();
+    else goBack();
+  }
+  else if (ev.code === 'Tab') {
+    ev.preventDefault();
+    setMode(MODES[(MODES.indexOf(mode) + 1) % MODES.length]);
+  }
+});
+
+function updateMeta() {
+  if (mode === 'coverage') {
+    const counts = {};
+    for (const x of covTiles) counts[x.depth] = (counts[x.depth] || 0) + 1;
+    meta.innerHTML = covTiles.length
+      ? `<b>${covTiles.length}</b> tiles with cached texture (d&le;12) —` +
+        Object.keys(counts).sort().map(d =>
+          `<span class="sw" style="background:${DEPTH_COLORS[d] || '#888'}"></span>d${d}: <b>${counts[d]}</b>`
+        ).join('') + ' — scroll zoom · hover id · click opens pipeline'
+      : 'no cached textures yet — fly around to fetch some';
+  } else if (heat) {
+    const n = heat.tiles.length;
+    const cached = heat.tiles.filter(t => t.hasTexture).length;
+    meta.innerHTML = mode === 'heatmap'
+      ? `<b>${n}</b> quadtree tiles — priority <span class="grad"></span> hot→cold — numbers = fetch order`
+      : `<b>${cached}</b>/<b>${n}</b> tiles with cached texture — uncached tinted by priority`;
+  } else {
+    meta.textContent = 'waiting for /api/heatmap (server up + 3D session fetching?)';
+  }
+}
+
+// --- polling ---------------------------------------------------------------------
+async function pollCoverage() {
+  try {
+    const { tiles: t } = await (await fetch('/api/coverage/index.json')).json();
+    covTiles = t.sort((a, b) => a.depth - b.depth);  // shallow first, deep on top
+  } catch (_) { /* server offline */ }
+  if (mode === 'coverage') updateMeta();
+}
+pollCoverage();
+setInterval(pollCoverage, 15000);   // batch may be painting — refetch coverage
+
+let heatBackoff = 2000;
+async function pollHeat() {
+  if (mode === 'coverage') { setTimeout(pollHeat, 2000); return; }
+  try {
+    const resp = await fetch('/api/heatmap');
+    if (!resp.ok) throw new Error(resp.status);
+    const d = await resp.json();
+    if (d) heat = d;
+    heatBackoff = 2000;
+  } catch (_) {
+    heatBackoff = Math.min(heatBackoff * 1.5, 30000);
+  }
+  updateMeta();
+  setTimeout(pollHeat, heatBackoff);
+}
+pollHeat();
+setMode(mode);
+
+// --- hover / click (deepest tile wins) ----------------------------------------
+function activeTiles() {
+  if (mode === 'coverage') return covTiles;
+  return heat ? heat.tiles : [];
+}
+function hit(ev) {
+  if (!smooth) return null;
+  const v = viewParams();
+  const [wx, wy] = screenToWorld(ev.clientX, ev.clientY, v);
+  let best = null;
+  for (const t of activeTiles()) {
+    const [x0, y0, x1, y1] = t.bbox;
+    if (wx >= x0 && wx < x1 && wy >= y0 && wy < y1 &&
+        (!best || t.depth > best.depth)) best = t;
+  }
+  return best;
+}
+cv.addEventListener('mousemove', ev => {
+  const t = hit(ev);
+  if (!t) { tip.style.display = 'none'; return; }
+  tip.textContent = mode === 'coverage'
+    ? `${t.tile} (d${t.depth})`
+    : `${t.id} (d${t.depth})\npriority ${t.priority.toFixed(2)} · order ${t.order}` +
+      (t.hasTexture ? ' · tex cached' : '');
+  tip.style.left = (ev.clientX + 14) + 'px';
+  tip.style.top = (ev.clientY + 10) + 'px';
+  tip.style.display = 'block';
+});
+// --- in-page tile image viewer (no new tabs, Esc/backdrop closes) --------------
+const viewer = document.getElementById('viewer');
+const viewerBar = document.getElementById('viewerBar');
+const viewerImg = document.getElementById('viewerImg');
+function openViewer(title, views, active) {
+  viewerBar.innerHTML = `<b>${title}</b>` +
+    views.map(v =>
+      `<div data-url="${v.url}" class="${v.name === active ? 'on' : ''}">${v.name}</div>`
+    ).join('') +
+    '<div id="viewerClose" title="close (Esc)">✕ close</div>';
+  viewerImg.src = views.find(v => v.name === active).url;
+  viewer.classList.add('open');
+  for (const el of viewerBar.querySelectorAll('div[data-url]')) {
+    el.addEventListener('click', () => {
+      viewerImg.src = el.dataset.url;
+      for (const o of viewerBar.querySelectorAll('div[data-url]')) o.classList.toggle('on', o === el);
+    });
+  }
+  document.getElementById('viewerClose').addEventListener('click', closeViewer);
+}
+function closeViewer() {
+  viewer.classList.remove('open');
+  viewerImg.src = '';
+}
+viewer.addEventListener('click', ev => {           // backdrop click closes
+  if (ev.target === viewer) closeViewer();
+});
+
+cv.addEventListener('click', ev => {
+  const t = hit(ev);
+  if (!t) return;
+  if (mode === 'coverage') {
+    // full inspector: ours/google/terrain/classes panes, biome key, blink keys
+    location.href = `/pipeline.html?tile=${t.tile}`;
+  } else if (t.hasTexture) {
+    openViewer(`${t.id} (d${t.depth})`,
+      [{ name: 'texture', url: `/api/texture/${t.id}.jpg` }], 'texture');
+  }
+});
+</script></body></html>
