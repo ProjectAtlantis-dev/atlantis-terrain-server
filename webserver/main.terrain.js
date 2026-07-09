@@ -5114,6 +5114,21 @@ let pollTimer = null;
 
 const PREVIEW_MAX_DEPTH = 10;
 const clock = new THREE.Clock();
+const FPS_SAMPLE_MS = 500;
+let fpsSampleStartMs = performance.now();
+let fpsSampleFrames = 0;
+let fpsDisplay = '--';
+
+function updateFpsCounter(nowMs) {
+  fpsSampleFrames += 1;
+  const elapsedMs = nowMs - fpsSampleStartMs;
+  if (elapsedMs < FPS_SAMPLE_MS) {
+    return;
+  }
+  fpsDisplay = String(Math.round((fpsSampleFrames * 1000) / elapsedMs));
+  fpsSampleFrames = 0;
+  fpsSampleStartMs = nowMs;
+}
 
 async function fetchTiles(lat, lon) {
   if (fetching) {
@@ -6042,6 +6057,7 @@ function updateHud() {
   hud.innerHTML = [
     '<b>Clouds Terrain Managed Flask UX WIP</b>',
     `mode: <b>${modeHtml}</b>`,
+    `fps: <b>${fpsDisplay}</b>`,
     `lat: ${(anchorLat + northM / 111320).toFixed(5)}°  lon: ${(anchorLon + eastM / (111320 * Math.cos(anchorLat * Math.PI / 180))).toFixed(5)}°  alt: ${altM.toFixed(0)}m`,
     `enu: E ${eastM.toFixed(0)}m  N ${northM.toFixed(0)}m  U ${altM.toFixed(0)}m`,
     `speed: ${speedKmh.toFixed(0)} km/h  heading: ${deg.toFixed(0)}° ${compass}`,
@@ -6422,6 +6438,7 @@ let lastTexRefresh = 0;
 function render() {
   const dt = Math.min(0.05, clock.getDelta());
   const nowMs = performance.now();
+  updateFpsCounter(nowMs);
   if (useRealtimeGameClock) {
     currentDate.setTime(getGameDateFromBrowserTime().getTime());
   }
