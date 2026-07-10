@@ -702,6 +702,20 @@ function showTileMenu(x, y, tileId, source) {
       }
     });
     tileMenuEl.appendChild(oceanToggleBtn);
+
+    const bathyToggleBtn = document.createElement('div');
+    bathyToggleBtn.style.cssText = 'padding:6px 12px;cursor:pointer';
+    bathyToggleBtn.textContent = `Flatten Overlay: ${bathyFixDebugEnabled ? 'ON' : 'OFF'}`;
+    bathyToggleBtn.addEventListener('mouseenter', () => bathyToggleBtn.style.background = 'rgba(255,255,255,0.15)');
+    bathyToggleBtn.addEventListener('mouseleave', () => bathyToggleBtn.style.background = 'none');
+    bathyToggleBtn.addEventListener('click', () => {
+      bathyFixDebugEnabled = !bathyFixDebugEnabled;
+      hideTileMenu();
+      if (lastTiles) {
+        updateTextures(lastTiles);
+      }
+    });
+    tileMenuEl.appendChild(bathyToggleBtn);
   }
 
   // Per-tile pipeline X-ray (pipeline.html: heightmap → texture → google →
@@ -4067,6 +4081,11 @@ const OCEAN_MAX_DROP_M = Math.max(OCEAN_BASE_DROP_M, paramNumber('oceanMaxDropM'
 const OCEAN_EDGE_CACHE_MAX = Math.max(512, Math.floor(paramNumber('oceanEdgeCacheMax', 30000)));
 const oceanEdgeState = new Map();
 let oceanMapDebugEnabled = false;
+// Map-mode overlay of bathymetry-corrected (flattened fake seamount) areas.
+let bathyFixDebugEnabled = false;
+const bathyFixMaskCache = new Map();   // tid -> ImageBitmap | null (204 = none)
+const bathyFixInflight = new Set();
+const bathyFixComposite = new Map();   // tid -> { tex, baseUuid }
 const OCEAN_COLOR_ASSIST_ENABLED = true;
 const OCEAN_COLOR_SCORE_MIN = THREE.MathUtils.clamp(paramNumber('oceanColorScoreMin', 0.20), 0.0, 1.0);
 const OCEAN_COLOR_PASSABLE_SCORE_MIN = THREE.MathUtils.clamp(
@@ -4480,6 +4499,49 @@ function tileLog(tileId, msg) {
   enqueueClientLog('debug', 'tile', { tileId, pass: _loadPass, msg, ts: `${ts}s` });
 }
 
+function requestBathyMask(tid) {
+  if (bathyFixMaskCache.has(tid) || bathyFixInflight.has(tid)) return;
+  bathyFixInflight.add(tid);
+  fetch(`/api/bathyfix/${tid}.png`)
+    .then(r => {
+      if (r.status !== 200) {
+        bathyFixInflight.delete(tid);
+        bathyFixMaskCache.set(tid, null);
+        return null;
+      }
+      return r.blob()
+        .then(blob => createImageBitmap(blob))
+        .then(img => {
+          bathyFixInflight.delete(tid);
+          bathyFixMaskCache.set(tid, img);
+          if (bathyFixDebugEnabled && lastTiles) updateTextures(lastTiles);
+        });
+    })
+    .catch(() => bathyFixInflight.delete(tid));
+}
+
+// Texture + magenta flatten-mask composite. Base texture bitmaps are
+// flipY'd at load (row 0 = south); the mask PNG is row 0 = north, so it
+// draws through a vertical flip.
+function bathyCompositeTexture(baseTex, maskImg) {
+  const w = baseTex.image.width, h = baseTex.image.height;
+  const cv = document.createElement('canvas');
+  cv.width = w; cv.height = h;
+  const ctx = cv.getContext('2d');
+  ctx.drawImage(baseTex.image, 0, 0, w, h);
+  ctx.save();
+  ctx.translate(0, h);
+  ctx.scale(1, -1);
+  ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(maskImg, 0, 0, w, h);
+  ctx.restore();
+  const t = new THREE.Texture(cv);
+  t.flipY = false;
+  t.colorSpace = THREE.SRGBColorSpace;
+  t.needsUpdate = true;
+  return t;
+}
+
 function applyTerrainMaterialMode(mesh, tex) {
   if (!mesh || !mesh.material) return;
   const useOceanOverlay = oceanMapDebugEnabled && controls.mapMode;
@@ -4490,7 +4552,22 @@ function applyTerrainMaterialMode(mesh, tex) {
     mesh.material.needsUpdate = true;
     return;
   }
-  if (tex) mesh.material.map = tex;
+  let useTex = tex;
+  if (tex && bathyFixDebugEnabled && controls.mapMode) {
+    const tid = mesh.userData.tileId;
+    const mask = bathyFixMaskCache.get(tid);
+    if (mask === undefined) {
+      requestBathyMask(tid); // composite applied on next pass once loaded
+    } else if (mask) {
+      let comp = bathyFixComposite.get(tid);
+      if (!comp || comp.baseUuid !== tex.uuid) {
+        comp = { tex: bathyCompositeTexture(tex, mask), baseUuid: tex.uuid };
+        bathyFixComposite.set(tid, comp);
+      }
+      useTex = comp.tex;
+    }
+  }
+  if (useTex) mesh.material.map = useTex;
   mesh.material.vertexColors = false;
   mesh.material.color.set(0xffffff);
   mesh.material.needsUpdate = true;

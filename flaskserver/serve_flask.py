@@ -235,6 +235,7 @@ def _tex_retry_worker() -> None:
       if jpeg is not None:
         jpeg = _repair_white_ocean_jpeg(db, tile_id, jpeg)
         _write_texture(db, tile_id, jpeg, "dataforsyningen")
+        _apply_bathymetry_fix(db, tile_id, jpeg)
         # _update_water_mask_for_tile(db, tile_id, jpeg, "dataforsyningen")  # disabled — SAM too expensive during load
         log_tex.info(f"[tex-retry] {tile_id}: SUCCESS on attempt {attempt + 1}")
       elif fail_reason == 'no_coverage':
@@ -689,6 +690,21 @@ def _repair_white_ocean_jpeg(db, tile_id: str, jpeg: bytes) -> bytes:
   return jpeg
 
 
+def _apply_bathymetry_fix(db, tile_id: str, jpeg: bytes) -> None:
+  """Flatten fake fjord seamounts once real imagery is available.
+
+  Fine depths only (bathymetry.MIN_FIX_DEPTH); corrected samples propagate
+  up the ancestor chain so coarse fjord views (d7/d8) agree. Failures are
+  logged, never fatal to the texture path.
+  """
+  try:
+    from bathymetry import fix_tile_in_db, propagate_to_ancestors
+    if fix_tile_in_db(db, tile_id, jpeg):
+      propagate_to_ancestors(db, tile_id)
+  except Exception as exc:
+    log_tex.warning(f"[bathy] {tile_id}: fix failed: {type(exc).__name__}: {exc}")
+
+
 def _resolve_no_coverage(db, tile_id: str, existing_jpeg, log_prefix: str) -> None:
   """Terminal-state a tile Dataforsyningen has no imagery for.
 
@@ -891,6 +907,7 @@ def _queue_texture_fetch(tile_id: str, bbox: tuple[float, float, float, float]) 
         log_tex.debug(f"[tex-worker] {tile_id}: got {len(jpeg)} bytes from dataforsyningen")
         jpeg = _repair_white_ocean_jpeg(db, tile_id, jpeg)
         _write_texture(db, tile_id, jpeg, "dataforsyningen")
+        _apply_bathymetry_fix(db, tile_id, jpeg)
         # _update_water_mask_for_tile(db, tile_id, jpeg, "dataforsyningen")  # disabled — SAM too expensive during load
       elif fail_reason == 'no_coverage':
         # Permanent — mark so we never retry automatically.
@@ -1356,6 +1373,34 @@ def api_texture(tile_id: str):
       "X-Tex-Temporary": "1",
     },
   )
+
+
+@app.get("/api/bathyfix/<tile_id>.png")
+def api_bathyfix(tile_id: str):
+  """Magenta translucent mask of bathymetry-corrected samples (map-mode
+  debug overlay). 204 when the tile has no corrected samples."""
+  unavailable = _terrain_unavailable_response()
+  if unavailable is not None:
+    return unavailable
+  from database import CONFIDENCE
+  db = _get_db()
+  row = db.execute(
+    "SELECT confidence_map FROM tiles WHERE tile_id = ?", (tile_id,)
+  ).fetchone()
+  if not row or row[0] is None:
+    return Response(b"", status=204, headers={"Cache-Control": "no-store"})
+  cm = _np.frombuffer(zlib.decompress(row[0]), dtype=_np.uint8).reshape(_GRID_N, _GRID_N)
+  mask = cm >= CONFIDENCE['bathymetry']
+  if not mask.any():
+    return Response(b"", status=204, headers={"Cache-Control": "no-store"})
+  rgba = _np.zeros((_GRID_N, _GRID_N, 4), dtype=_np.uint8)
+  rgba[..., 0] = 255
+  rgba[..., 2] = 255
+  rgba[..., 3] = _np.flipud(mask).astype(_np.uint8) * 150  # row 0 = north
+  buf = io.BytesIO()
+  _Image.fromarray(rgba, mode="RGBA").save(buf, format="PNG")
+  return Response(buf.getvalue(), mimetype="image/png",
+                  headers={"Cache-Control": "no-store"})
 
 
 @app.get("/api/google/<tile_id>.jpg")

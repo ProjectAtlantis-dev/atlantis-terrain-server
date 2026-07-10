@@ -49,7 +49,9 @@ def is_doomed(source: str, arr: np.ndarray) -> bool:
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap = argparse.ArgumentParser(
+        description="Purge/repair white-fill textures cached before the WMS reject filter."
+    )
     ap.add_argument("--dry-run", action="store_true", help="report only, delete nothing")
     ap.add_argument("--db", default=str(Path(__file__).parent / "terrain.db"))
     args = ap.parse_args()

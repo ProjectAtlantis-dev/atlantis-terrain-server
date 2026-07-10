@@ -38,6 +38,7 @@ CONFIDENCE = {
     'external':   4,
     'arcticdem':  5,
     'arcticdem_10m': 6,
+    'bathymetry': 7,   # fake-seamount flatten (bathymetry.py) — must win edges
 }
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")

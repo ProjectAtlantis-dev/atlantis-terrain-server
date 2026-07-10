@@ -1,6 +1,15 @@
 // UX WIP scene: preserve baseline rendering, layer in map mode + movement + HUD.
 import * as THREE from 'three';
-import { mrt, normalView, output, pass } from 'three/tsl';
+import {
+  color,
+  densityFogFactor,
+  fog,
+  mrt,
+  normalView,
+  output,
+  pass,
+  uniform
+} from 'three/tsl';
 import { PostProcessing, WebGPURenderer } from 'three/webgpu';
 import {
   EffectComposer,
@@ -19,10 +28,8 @@ import {
   PrecomputedTexturesLoader
 } from '@takram/three-atmosphere';
 import {
-  aerialPerspective as webgpuAerialPerspective,
   AtmosphereContextNode,
   AtmosphereLight,
-  AtmosphereLightNode,
   AtmosphereParameters as WebGPUAtmosphereParameters,
   skyBackground
 } from '@takram/three-atmosphere/webgpu';
@@ -36,12 +43,21 @@ import {
 import { DitheringEffect } from './three-geospatial/packages/effects/src/index.ts';
 import { Ellipsoid, Geodetic, radians } from '@takram/three-geospatial';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
+import {
+  CloudShadowAtmosphereLightNode,
+  WebGPUCloudShadows
+} from './webgpu-cloud-shadows.js';
+import { cloudShadowAerialPerspective } from './webgpu-cloud-shadow-aerial-perspective.js';
 import { buildAssetLibrary } from './procgen/library.ts';
 import { buildTileScatter, disposeTileScatter, updateScatterVisibility, SCATTER_MIN_DEPTH } from './procgen/scatter.ts';
 
 const USE_WEBGPU_RENDER_BACKEND = true;
-const WEBGPU_ATMOSPHERE_LUMINANCE_SCALE = 3.8;
-const WEBGPU_TONE_MAPPING_EXPOSURE = 1.5;
+// Calibrated against the cloudless WebGL reference. WebGL uses exposure 10
+// after relative-luminance normalization; this pair gives the WebGPU AgX path
+// a comparable pre-tone-map scale without changing physical scattering.
+const WEBGPU_ATMOSPHERE_LUMINANCE_SCALE = 5.0;
+const WEBGPU_TONE_MAPPING_EXPOSURE = 2.5;
+const WEBGPU_DEFAULT_HAZE = 6.5;
 const WEBGPU_SUN_ANGULAR_RADIUS = 0.02;
 const WEBGPU_ATMOSPHERE_DEFAULTS = Object.freeze({
   luminanceScale: WEBGPU_ATMOSPHERE_LUMINANCE_SCALE,
@@ -49,10 +65,23 @@ const WEBGPU_ATMOSPHERE_DEFAULTS = Object.freeze({
   sunAngularRadius: WEBGPU_SUN_ANGULAR_RADIUS,
   sunIntensity: 1,
   rayleighScale: 1,
-  mieScale: 1,
+  mieScale: 1.4,
   groundAlbedo: 0.3
 });
+const WEBGPU_CLOUD_SHADOW_DEFAULTS = Object.freeze({
+  enabled: true,
+  debugSurface: false,
+  coverage: 0.52,
+  density: 1.15,
+  strength: 1
+});
 const webgpuAtmosphereSettings = { ...WEBGPU_ATMOSPHERE_DEFAULTS };
+const webgpuCloudShadowSettings = {
+  ...WEBGPU_CLOUD_SHADOW_DEFAULTS,
+  // Shareable validation view; the UI toggle remains the normal control.
+  enabled: window.location.hash !== '#no-cloud-shadows',
+  debugSurface: window.location.hash === '#shadow-mask'
+};
 
 // The main view is controlled entirely through its UI. Discard stale query
 // parameters instead of exposing URL state that does not stay in sync.
@@ -378,8 +407,10 @@ const scene = new THREE.Scene();
 // Black fog — aerial perspective inscatter fills in the natural sky color at distance.
 scene.fog = new THREE.FogExp2(0x000000, 0.00009);
 const _sceneFog = scene.fog;
+const webgpuFogDensity = uniform(0).setName('webgpuDistanceFogDensity');
 if (USE_WEBGPU_RENDER_BACKEND) {
   scene.fog = null;
+  scene.fogNode = fog(color(0x000000), densityFogFactor(webgpuFogDensity));
 }
 const _mapBg = new THREE.Color(0x222222);
 
@@ -423,6 +454,7 @@ let webgpuSkyBackgroundNode = null;
 let webgpuAtmosphereLight = null;
 let webgpuAtmosphereNode = null;
 let webgpuAtmospherePostProcessing = null;
+let webgpuCloudShadows = null;
 let webgpuAtmospherePostProcessingReady = false;
 let webgpuSunLastLogMs = 0;
 let webgpuSunLastLogDateMs = NaN;
@@ -762,6 +794,7 @@ gameClockEl.addEventListener('mousedown', e => {
   else if (action === 'stop') _gcStop();
   else if (action === 'play') _gcPlay();
   else if (action === 'ff') _gcFfwd();
+  requestRender();
 });
 
 const tileInfoEl = document.createElement('div');
@@ -908,6 +941,7 @@ function showTileMenu(x, y, tileId, source) {
       if (lastTiles) {
         updateTextures(lastTiles);
       }
+      requestRender();
     });
     tileMenuEl.appendChild(oceanToggleBtn);
   }
@@ -953,6 +987,8 @@ function showTileMenu(x, y, tileId, source) {
                 }
                 child.material.color.set(child.userData.debugColor || 0x888888);
                 child.material.needsUpdate = true;
+                markSceneMutated();
+                requestRender();
                 break;
               }
             }
@@ -1009,6 +1045,8 @@ tuningPanel.style.cssText = [
   'backdrop-filter:blur(6px)'
 ].join(';');
 document.body.appendChild(tuningPanel);
+tuningPanel.addEventListener('input', requestRender);
+tuningPanel.addEventListener('change', requestRender);
 
 const tuningHeader = document.createElement('div');
 tuningHeader.style.cssText = 'padding:8px 12px;cursor:pointer;display:flex;justify-content:space-between;align-items:center';
@@ -1024,11 +1062,36 @@ tuningHeader.onclick = () => {
   tuningOpen = !tuningOpen;
   tuningBody.style.display = tuningOpen ? 'block' : 'none';
   document.getElementById('tuning-toggle').innerHTML = tuningOpen ? '&#9650;' : '&#9660;';
+  requestRender();
 };
 
 // --- Tuning panel persistence ---
 const TUNING_STORAGE_KEY = 'clouds-tuning';
 const _tuningState = JSON.parse(localStorage.getItem(TUNING_STORAGE_KEY) || '{}');
+const WEBGPU_CALIBRATION_VERSION = 3;
+if (_tuningState.webgpuCalibrationVersion !== WEBGPU_CALIBRATION_VERSION) {
+  if (_tuningState['webgpu exposure'] == null || _tuningState['webgpu exposure'] === 1.5) {
+    _tuningState['webgpu exposure'] = WEBGPU_TONE_MAPPING_EXPOSURE;
+  }
+  if (_tuningState['webgpu luminance'] == null || _tuningState['webgpu luminance'] === 3.8) {
+    _tuningState['webgpu luminance'] = WEBGPU_ATMOSPHERE_LUMINANCE_SCALE;
+  }
+  if (_tuningState.brightness == null || _tuningState.brightness === 2.2) {
+    _tuningState.brightness = WEBGPU_TONE_MAPPING_EXPOSURE;
+  }
+  if (_tuningState.haze == null || _tuningState.haze === 4.5) {
+    _tuningState.haze = WEBGPU_DEFAULT_HAZE;
+  }
+  _tuningState.webgpuCalibrationVersion = WEBGPU_CALIBRATION_VERSION;
+  localStorage.setItem(TUNING_STORAGE_KEY, JSON.stringify(_tuningState));
+}
+if (_tuningState.brightness == null && _tuningState['webgpu exposure'] != null) {
+  _tuningState.brightness = _tuningState['webgpu exposure'];
+}
+if (_tuningState.haze == null && _tuningState['fog strength'] != null) {
+  _tuningState.haze = _tuningState['fog strength'];
+}
+localStorage.setItem(TUNING_STORAGE_KEY, JSON.stringify(_tuningState));
 function saveTuning() {
   localStorage.setItem(TUNING_STORAGE_KEY, JSON.stringify(_tuningState));
 }
@@ -1354,6 +1417,7 @@ function buildTuningControls(ap, ce) {
     }
   });
 
+  if (!USE_WEBGPU_RENDER_BACKEND) {
   tuningSectionLabel('Aerial Perspective');
   tuningSlider('albedoScale', {
     min: 0, max: 3, step: 0.05, value: ap.albedoScale,
@@ -1438,6 +1502,7 @@ function buildTuningControls(ap, ce) {
     format: v => `${v}°`,
     onChange: v => { _driftAngle = v; _updateDrift(); }
   });
+  }
   tuningSectionLabel('Terrain');
   tuningSlider('terrain range', {
     min: 10000, max: 50000, step: 1000, value: _terrainRange,
@@ -1449,6 +1514,64 @@ function buildTuningControls(ap, ce) {
     }
   });
   tuningSectionLabel('Atmosphere');
+  if (USE_WEBGPU_RENDER_BACKEND) {
+    tuningSlider('brightness', {
+      min: 0.5, max: 4, step: 0.05,
+      value: WEBGPU_ATMOSPHERE_DEFAULTS.toneMappingExposure,
+      decimals: 2,
+      onChange: v => {
+        webgpuAtmosphereSettings.toneMappingExposure = v;
+        applyWebGPUAtmosphereLiveSettings();
+      }
+    });
+    tuningSlider('haze', {
+      min: 0, max: 10, step: 0.5, value: WEBGPU_DEFAULT_HAZE,
+      decimals: 1,
+      onChange: v => { controls._fogStrength = v; }
+    });
+    tuningSectionLabel('Cloud Shadows');
+    tuningToggle('cloud shadows', {
+      value: WEBGPU_CLOUD_SHADOW_DEFAULTS.enabled,
+      onChange: v => {
+        webgpuCloudShadowSettings.enabled = v;
+        applyWebGPUCloudShadowLiveSettings();
+      }
+    });
+    tuningToggle('shadow mask', {
+      value: WEBGPU_CLOUD_SHADOW_DEFAULTS.debugSurface,
+      onChange: v => {
+        webgpuCloudShadowSettings.debugSurface = v;
+        applyWebGPUCloudShadowLiveSettings();
+      }
+    });
+    tuningSlider('shadow coverage', {
+      min: 0, max: 1, step: 0.01,
+      value: WEBGPU_CLOUD_SHADOW_DEFAULTS.coverage,
+      decimals: 2,
+      onChange: v => {
+        webgpuCloudShadowSettings.coverage = v;
+        applyWebGPUCloudShadowLiveSettings();
+      }
+    });
+    tuningSlider('shadow density', {
+      min: 0, max: 3, step: 0.05,
+      value: WEBGPU_CLOUD_SHADOW_DEFAULTS.density,
+      decimals: 2,
+      onChange: v => {
+        webgpuCloudShadowSettings.density = v;
+        applyWebGPUCloudShadowLiveSettings();
+      }
+    });
+    tuningSlider('shadow strength', {
+      min: 0, max: 3, step: 0.05,
+      value: WEBGPU_CLOUD_SHADOW_DEFAULTS.strength,
+      decimals: 2,
+      onChange: v => {
+        webgpuCloudShadowSettings.strength = v;
+        applyWebGPUCloudShadowLiveSettings();
+      }
+    });
+  } else {
   tuningSlider('fog strength', {
     min: 1, max: 10, step: 0.5, value: 4.5,
     decimals: 1,
@@ -1475,65 +1598,6 @@ function buildTuningControls(ap, ce) {
     decimals: 1,
     onChange: v => { ce.absorptionCoefficient = v; }
   });
-
-  if (USE_WEBGPU_RENDER_BACKEND) {
-    tuningSectionLabel('WebGPU Atmosphere');
-    tuningSlider('webgpu exposure', {
-      min: 0.5, max: 3, step: 0.05, value: WEBGPU_ATMOSPHERE_DEFAULTS.toneMappingExposure,
-      decimals: 2,
-      onChange: v => {
-        webgpuAtmosphereSettings.toneMappingExposure = v;
-        applyWebGPUAtmosphereLiveSettings();
-      }
-    });
-    tuningSlider('webgpu luminance', {
-      min: 0.5, max: 8, step: 0.1, value: WEBGPU_ATMOSPHERE_DEFAULTS.luminanceScale,
-      decimals: 1,
-      onChange: v => {
-        webgpuAtmosphereSettings.luminanceScale = v;
-        rebuildWebGPUAtmosphere();
-      }
-    });
-    tuningSlider('webgpu sun size', {
-      min: 0.003, max: 0.05, step: 0.001, value: WEBGPU_ATMOSPHERE_DEFAULTS.sunAngularRadius,
-      decimals: 3,
-      onChange: v => {
-        webgpuAtmosphereSettings.sunAngularRadius = v;
-        applyWebGPUAtmosphereLiveSettings();
-      }
-    });
-    tuningSlider('webgpu sun', {
-      min: 0.1, max: 4, step: 0.05, value: WEBGPU_ATMOSPHERE_DEFAULTS.sunIntensity,
-      decimals: 2,
-      onChange: v => {
-        webgpuAtmosphereSettings.sunIntensity = v;
-        applyWebGPUAtmosphereLiveSettings();
-      }
-    });
-    tuningSlider('webgpu rayleigh', {
-      min: 0.25, max: 3, step: 0.05, value: WEBGPU_ATMOSPHERE_DEFAULTS.rayleighScale,
-      decimals: 2,
-      onChange: v => {
-        webgpuAtmosphereSettings.rayleighScale = v;
-        rebuildWebGPUAtmosphere();
-      }
-    });
-    tuningSlider('webgpu mie', {
-      min: 0.25, max: 3, step: 0.05, value: WEBGPU_ATMOSPHERE_DEFAULTS.mieScale,
-      decimals: 2,
-      onChange: v => {
-        webgpuAtmosphereSettings.mieScale = v;
-        rebuildWebGPUAtmosphere();
-      }
-    });
-    tuningSlider('webgpu ground', {
-      min: 0, max: 1, step: 0.02, value: WEBGPU_ATMOSPHERE_DEFAULTS.groundAlbedo,
-      decimals: 2,
-      onChange: v => {
-        webgpuAtmosphereSettings.groundAlbedo = v;
-        rebuildWebGPUAtmosphere();
-      }
-    });
   }
 
   // tuningSectionLabel('Shadows');
@@ -1660,6 +1724,7 @@ const raycaster = new THREE.Raycaster();
 const mouseNDC = new THREE.Vector2();
 const debugIntersectables = [];
 let hoverOutline = null;
+let hoverOutlineTileId = null;
 
 const enhanceOutlines = new THREE.Group();
 enhanceOutlines.visible = false;
@@ -1729,6 +1794,7 @@ function evictTileMesh(c) {
   disposeTileScatter(c);
   if (c.geometry) c.geometry.dispose();
   if (c.material) c.material.dispose();
+  markSceneMutated();
 }
 const REFETCH_DIST = 5000;
 let originX = 0, originY = 0;        // stereo scene origin from server
@@ -4299,9 +4365,19 @@ function createWebGPUAtmospherePostProcessing(renderer) {
   if (webgpuAtmosphereContext == null) {
     return null;
   }
-  renderer.library.addLight(AtmosphereLightNode, AtmosphereLight);
+  renderer.library.addLight(CloudShadowAtmosphereLightNode, AtmosphereLight);
   const atmosphereLight = new AtmosphereLight(webgpuAtmosphereContext, MAX_VIEW_DIST);
   atmosphereLight.name = 'webgpu-atmosphere-light';
+  webgpuCloudShadows = new WebGPUCloudShadows({
+    anchor: anchorPosition,
+    east,
+    north,
+    up,
+    camera,
+    atmosphereContext: webgpuAtmosphereContext
+  });
+  applyWebGPUCloudShadowLiveSettings();
+  atmosphereLight.cloudShadow = webgpuCloudShadows;
   scene.add(atmosphereLight);
   scene.add(atmosphereLight.target);
   webgpuAtmosphereLight = atmosphereLight;
@@ -4315,11 +4391,12 @@ function createWebGPUAtmospherePostProcessing(renderer) {
   const depthNode = scenePass.getTextureNode('depth');
   const normalNode = scenePass.getTextureNode('normal');
   const postProcessing = new PostProcessing(renderer);
-  const atmosphereNode = webgpuAerialPerspective(
+  const atmosphereNode = cloudShadowAerialPerspective(
     webgpuAtmosphereContext,
     colorNode,
     depthNode,
-    normalNode
+    normalNode,
+    webgpuCloudShadows
   );
   atmosphereNode.skyNode.sunNode.angularRadius.value = webgpuAtmosphereSettings.sunAngularRadius;
   atmosphereNode.skyNode.sunNode.intensity.value = webgpuAtmosphereSettings.sunIntensity;
@@ -4354,6 +4431,17 @@ function applyWebGPUAtmosphereLiveSettings() {
   }
 }
 
+function applyWebGPUCloudShadowLiveSettings() {
+  if (webgpuCloudShadows == null) {
+    return;
+  }
+  webgpuCloudShadows.enabled.value = webgpuCloudShadowSettings.enabled;
+  webgpuCloudShadows.debugSurface.value = webgpuCloudShadowSettings.debugSurface;
+  webgpuCloudShadows.coverage.value = webgpuCloudShadowSettings.coverage;
+  webgpuCloudShadows.density.value = webgpuCloudShadowSettings.density;
+  webgpuCloudShadows.strength.value = webgpuCloudShadowSettings.strength;
+}
+
 function rebuildWebGPUAtmosphere() {
   if (!renderBackend.isWebGPU || !webgpuAtmospherePostProcessingReady) {
     return;
@@ -4363,6 +4451,8 @@ function rebuildWebGPUAtmosphere() {
     scene.remove(webgpuAtmosphereLight);
     webgpuAtmosphereLight = null;
   }
+  webgpuCloudShadows?.dispose();
+  webgpuCloudShadows = null;
   webgpuAtmospherePostProcessing?.dispose?.();
   webgpuAtmosphereNode = null;
   webgpuAtmosphereContext?.dispose?.();
@@ -4831,6 +4921,7 @@ function applyWebGPUUntexturedTerrainMaterial(mesh) {
   }
   if (needsUpdate) {
     mesh.material.needsUpdate = true;
+    markSceneMutated();
   }
 }
 
@@ -4846,10 +4937,12 @@ function markMissing(missing, downloading) {
       child.material.color.copy(COLOR_DOWNLOADING);
       child.material.vertexColors = false;
       child.material.needsUpdate = true;
+      markSceneMutated();
     } else if (missingSet.has(tid)) {
       child.material.color.copy(COLOR_MISSING);
       child.material.vertexColors = false;
       child.material.needsUpdate = true;
+      markSceneMutated();
     }
   }
 }
@@ -4881,6 +4974,7 @@ function applyTerrainMaterialMode(mesh, tex) {
     mesh.material.color.set(0xffffff);
     if (needsUpdate) {
       mesh.material.needsUpdate = true;
+      markSceneMutated();
     }
     return;
   }
@@ -4899,6 +4993,7 @@ function applyTerrainMaterialMode(mesh, tex) {
   mesh.material.color.set(0xffffff);
   if (needsUpdate) {
     mesh.material.needsUpdate = true;
+    markSceneMutated();
   }
 }
 
@@ -4917,6 +5012,7 @@ function rebuildTileMeshWithTexture(mesh, tile, tex) {
   rebuilt.material.polygonOffsetUnits = -depth;
   rebuilt.userData.waterMask = mesh.userData?.waterMask ?? null;
   terrainRoot.add(rebuilt);
+  markSceneMutated();
   evictTileMesh(mesh);
   return rebuilt;
 }
@@ -4956,6 +5052,7 @@ function materializeTile(tileId, tex) {
     evictTileMesh(c);
   }
   terrainRoot.add(mesh);
+  markSceneMutated();
   if (vehicleNearTileBbox(mesh.userData?.bbox)) {
     const newDepth = tileDepthFromId(tileId);
     const reason = Number.isFinite(newDepth) && newDepth > vehicleLastContactDepth
@@ -5005,6 +5102,8 @@ function requestWaterMask(tileId) {
           tex.colorSpace = THREE.NoColorSpace;
           tex.needsUpdate = true;
           waterMaskCache.set(tileId, tex);
+          markSceneMutated();
+          requestRender();
         });
     })
     .catch(err => {
@@ -5173,6 +5272,7 @@ function updateTextures(tiles) {
               }
               if (mesh) {
                 applyTerrainMaterialMode(mesh, tex);
+                requestRender();
               }
             } else {
               _ancestorLogged.delete(tid);
@@ -5194,6 +5294,7 @@ function updateTextures(tiles) {
                   mesh = rebuildTileMeshWithTexture(mesh, t, tex);
                   applyTerrainMaterialMode(mesh, tex);
                   mesh.userData.waterMask = waterMaskCache.get(tid) || null;
+                  requestRender();
                 } else {
                   tileLog(tid, `cached but NO mesh in scene`);
                 }
@@ -5260,39 +5361,49 @@ function updateTextures(tiles) {
     }
   }
 
-  // Sweep stale parents: evict textured parents whose overlapping children
-  // now all have textured meshes in scene. This catches parents that survived the
-  // fetchTiles() eviction because children weren't textured yet.
+  // Sweep stale parents whose overlapping deeper tiles now all have textured
+  // meshes in scene. Any stale parent — textured or noTex — z-fights the
+  // textured children stacked on top of it. noTex ridges only earn their keep
+  // while some overlapping deeper tile is still untextured. Deeper tiles may
+  // skip generations (e.g. a depth-10 parent covered directly by depth-12
+  // children), so this checks every deeper overlapping tile, not just d+1.
+  const tileBboxMap = new Map();
+  for (const t of tiles) {
+    if (t.id && t.bbox) tileBboxMap.set(t.id, t.bbox);
+  }
   const staleParents = [];
   for (const child of terrainRoot.children) {
     if (!child.isMesh) continue;
     const tid = child.userData.tileId;
-    if (!tid || !child.material || !child.material.map) continue;
+    if (!tid || !child.material) continue;
     if (tileSet.has(tid)) continue; // not stale
     const sb = child.userData.bbox;
     if (!sb) continue;
+    const pdepth = parseInt(tid.split('-')[0]);
     let covered = true;
     let foundOverlap = false;
     for (const cid of tileSet) {
       const cdepth = parseInt(cid.split('-')[0]);
-      const pdepth = parseInt(tid.split('-')[0]);
       if (cdepth <= pdepth) continue;
       const cmesh = meshMap.get(cid);
+      const cb = cmesh?.userData?.bbox || tileBboxMap.get(cid);
+      if (!cb) continue;
+      // Only deeper tiles that actually overlap this parent matter.
+      if (cb[2] <= sb[0] || cb[0] >= sb[2] || cb[3] <= sb[1] || cb[1] >= sb[3]) continue;
       if (!cmesh?.material?.map) {
         covered = false;
         break;
       }
-      const cb = cmesh.userData.bbox;
-      if (!cb) continue;
-      if (sb[0] <= cb[0] && sb[2] >= cb[2] && sb[1] <= cb[1] && sb[3] >= cb[3]) {
-        foundOverlap = true;
-      }
+      foundOverlap = true;
     }
     if (!foundOverlap) covered = false;
     if (covered) staleParents.push(child);
   }
   for (const c of staleParents) {
-    tileLog(c.userData.tileId || '?', 'evicted — stale parent (children now textured)');
+    const reason = c.material?.map
+      ? 'evicted — stale parent (children now textured)'
+      : 'evicted — stale noTex parent (children now textured)';
+    tileLog(c.userData.tileId || '?', reason);
     evictTileMesh(c);
   }
 }
@@ -5403,6 +5514,7 @@ function _handleEnhanceResponse(tid, r, fromPending = false) {
         if (child.userData.tileId === tid) {
           applyTerrainMaterialMode(child, tex);
           child.userData.waterMask = waterMaskCache.get(tid) || null;
+          requestRender();
           break;
         }
       }
@@ -5521,9 +5633,69 @@ let pollTimer = null;
 const PREVIEW_MAX_DEPTH = 10;
 const clock = new THREE.Clock();
 const FPS_SAMPLE_MS = 500;
+const STREAMING_MAINTENANCE_MS = 1000;
 let fpsSampleStartMs = performance.now();
 let fpsSampleFrames = 0;
 let fpsDisplay = '--';
+let animationLoopActive = false;
+let sceneMutationVersion = 0;
+let streamingMaintenanceTimer = null;
+
+function markSceneMutated() {
+  sceneMutationVersion++;
+}
+
+function hasActiveKeyInput() {
+  return Object.values(controls.keys).some(Boolean);
+}
+
+function needsContinuousRender() {
+  return (
+    controls.dragging ||
+    hasActiveKeyInput() ||
+    Math.abs(controls.speed) > 1e-3 ||
+    Math.abs(controls.strafeSpeed) > 1e-3 ||
+    vehicleControlActive ||
+    (renderBackend.isWebGPU && webgpuCloudShadowSettings.enabled)
+  );
+}
+
+function startRenderLoop() {
+  if (animationLoopActive) {
+    return;
+  }
+  animationLoopActive = true;
+  clock.getDelta();
+  renderBackend.setAnimationLoop(render);
+}
+
+function requestRender() {
+  startRenderLoop();
+}
+
+function stopRenderLoopIfIdle() {
+  if (!animationLoopActive || needsContinuousRender()) {
+    return;
+  }
+  animationLoopActive = false;
+  renderBackend.setAnimationLoop(null);
+}
+
+function runStreamingMaintenance() {
+  const before = sceneMutationVersion;
+  let dateChanged = false;
+  if (useRealtimeGameClock) {
+    currentDate.setTime(getGameDateFromBrowserTime().getTime());
+    dateChanged = applyDate(currentDate, { force: false });
+  }
+  if (lastTiles) {
+    updateTextures(lastTiles);
+  }
+  updateEnhancement();
+  if (dateChanged || sceneMutationVersion !== before) {
+    requestRender();
+  }
+}
 
 function updateFpsCounter(nowMs) {
   fpsSampleFrames += 1;
@@ -5684,6 +5856,10 @@ async function fetchTiles(lat, lon) {
     for (const child of terrainRoot.children) {
       if (child.userData.tileId) meshMap.set(child.userData.tileId, child);
     }
+    const tileBboxMap = new Map();
+    for (const t of data.tiles) {
+      if (t.id && t.bbox) tileBboxMap.set(t.id, t.bbox);
+    }
 
     // Evict stale meshes: remove any mesh not in the current tile set,
     // BUT only once every overlapping child has a textured mesh in scene.
@@ -5695,11 +5871,10 @@ async function fetchTiles(lat, lon) {
       const tid = child.userData.tileId;
       if (!tid) continue;
       if (!newIds.has(tid)) {
-        // NEVER purge a heightmap mesh just because it has no texture.
-        // Those dark ridges in the distance are the only terrain visual
-        // until higher-depth children arrive with textures.  Treat ALL
-        // stale meshes (textured or not) the same: keep them visible
-        // until every overlapping child has a textured mesh in scene.
+        // Keep stale meshes (textured parents and noTex ridges alike) only
+        // until every overlapping deeper tile has a textured mesh in scene —
+        // then evict, or they z-fight the children stacked on top. Deeper
+        // tiles may skip generations (10 → 12), so check all deeper overlaps.
         {
           const sb = child.userData.bbox;
           if (sb) {
@@ -5710,15 +5885,15 @@ async function fetchTiles(lat, lon) {
               const cdepth = parseInt(cid.split('-')[0]);
               if (cdepth <= pdepth) continue;
               const cmesh = meshMap.get(cid);
+              const cb = cmesh?.userData?.bbox || tileBboxMap.get(cid);
+              if (!cb) continue;
+              // Only deeper tiles that actually overlap this parent matter.
+              if (cb[2] <= sb[0] || cb[0] >= sb[2] || cb[3] <= sb[1] || cb[1] >= sb[3]) continue;
               if (!cmesh?.material?.map) {
                 coveredByChildren = false;
                 break;
               }
-              const cb = cmesh.userData.bbox;
-              if (!cb) continue;
-              if (sb[0] <= cb[0] && sb[2] >= cb[2] && sb[1] <= cb[1] && sb[3] >= cb[3]) {
-                foundOverlap = true;
-              }
+              foundOverlap = true;
             }
             if (!foundOverlap) coveredByChildren = false;
             if (coveredByChildren) {
@@ -5805,6 +5980,7 @@ async function fetchTiles(lat, lon) {
               mesh.material.polygonOffsetUnits = -depth;
               applyWebGPUUntexturedTerrainMaterial(mesh);
               terrainRoot.add(mesh);
+              markSceneMutated();
             }
             built++;
           } else {
@@ -5821,6 +5997,7 @@ async function fetchTiles(lat, lon) {
     updateTextures(data.tiles);
     markMissing(data.missing || [], data.downloading || []);
     lastTiles = data.tiles;
+    requestRender();
 
     // Update stereo position from camera
     const camLLNow = getCameraLatLon();
@@ -5852,9 +6029,13 @@ async function fetchTiles(lat, lon) {
       fetching = false;
       _loadPass = 2;
       requestAnimationFrame(() => fetchTiles());
+      requestRender();
       return;
     } else if (nd > 0 || nm > 0 || texInFlight > 0) {
-      pollTimer = setTimeout(() => fetchTiles(), 3000);
+      pollTimer = setTimeout(() => {
+        fetchTiles();
+        requestRender();
+      }, 3000);
     }
 
   } catch (err) {
@@ -5870,6 +6051,7 @@ async function fetchTiles(lat, lon) {
   fetching = false;
   // Drain accumulated dt so the next render frame doesn't lurch the camera
   clock.getDelta();
+  requestRender();
 }
 
 // --- Save/restore camera position ---
@@ -5942,6 +6124,7 @@ window.takramDebug = {
   applyDate,
   bootEvents,
   getBootEvents: () => bootEvents.slice(),
+  getCloudShadowDebugSummary: () => webgpuCloudShadows?.debugSummary() ?? null,
   flushClientLogQueue: () => flushClientLogQueue(),
   fetchTiles,
   loadHouseModel,
@@ -6011,14 +6194,25 @@ function disposeObjectMaterial(material) {
 }
 
 function showTileBorder(mesh) {
+  const nextTileId = mesh?.userData?.tileId ?? null;
+  if (nextTileId != null && nextTileId === hoverOutlineTileId && hoverOutline != null) {
+    return false;
+  }
+  let changed = false;
   if (hoverOutline != null) {
     terrainRoot.remove(hoverOutline);
     hoverOutline.geometry?.dispose?.();
     disposeObjectMaterial(hoverOutline.material);
     hoverOutline = null;
+    hoverOutlineTileId = null;
+    changed = true;
   }
   if (mesh == null) {
-    return;
+    if (changed) {
+      markSceneMutated();
+      requestRender();
+    }
+    return changed;
   }
   let xMin = 0;
   let yMin = 0;
@@ -6034,7 +6228,11 @@ function showTileBorder(mesh) {
   } else {
     const box = new THREE.Box3().setFromObject(mesh);
     if (box.isEmpty()) {
-      return;
+      if (changed) {
+        markSceneMutated();
+        requestRender();
+      }
+      return changed;
     }
     xMin = box.min.x;
     yMin = box.min.y;
@@ -6057,6 +6255,10 @@ function showTileBorder(mesh) {
   );
   hoverOutline.renderOrder = 999;
   terrainRoot.add(hoverOutline);
+  hoverOutlineTileId = nextTileId;
+  markSceneMutated();
+  requestRender();
+  return true;
 }
 
 function updateEnhanceOutlines() {
@@ -6556,6 +6758,7 @@ function toggleMapMode() {
 window.addEventListener('keydown', event => {
   if (event.target.tagName === 'TEXTAREA' || event.target.tagName === 'INPUT') return;
   controls.keys[event.code] = true;
+  requestRender();
   if ((event.code === 'KeyW' || event.code === 'ArrowUp') && !event.repeat) {
     const now = performance.now();
     if (now - _lastForwardTapTime < DOUBLE_TAP_MS) {
@@ -6607,16 +6810,19 @@ window.addEventListener('keydown', event => {
 
 window.addEventListener('keyup', event => {
   controls.keys[event.code] = false;
+  requestRender();
 });
 
 renderer.domElement.addEventListener('mousedown', event => {
   controls.dragging = true;
   controls.dragButton = event.button;
+  requestRender();
 });
 
 window.addEventListener('mouseup', () => {
   controls.dragging = false;
   controls.dragButton = 0;
+  requestRender();
 });
 
 window.addEventListener('mousemove', event => {
@@ -6633,6 +6839,7 @@ window.addEventListener('mousemove', event => {
       controls.mapPanEast  += dx * cosY + dy * sinY;
       controls.mapPanNorth += -dx * sinY + dy * cosY;
       updateMapCamera();
+      requestRender();
       return;
     }
     const cx = window.innerWidth / 2;
@@ -6645,6 +6852,7 @@ window.addEventListener('mousemove', event => {
     if (dAngle > Math.PI) dAngle -= 2 * Math.PI;
     if (dAngle < -Math.PI) dAngle += 2 * Math.PI;
     controls.yaw += dAngle;
+    requestRender();
     return;
   }
   if (vehicleControlActive) {
@@ -6655,11 +6863,13 @@ window.addEventListener('mousemove', event => {
       VEHICLE_CAMERA_ORBIT_PITCH_MIN,
       VEHICLE_CAMERA_ORBIT_PITCH_MAX
     );
+    requestRender();
     return;
   }
   controls.yaw += event.movementX * MOUSE_SENS;
   controls.pitch += event.movementY * MOUSE_SENS;
   controls.pitch = Math.max(-1.4, Math.min(1.2, controls.pitch));
+  requestRender();
 });
 
 renderer.domElement.addEventListener('pointerdown', event => {
@@ -6810,14 +7020,17 @@ renderer.domElement.addEventListener(
       controls.mapZoom = Math.max(500, Math.min(40000, controls.mapZoom));
       savePosition();
       updateMapCamera();
+      requestRender();
     } else if (vehicleControlActive) {
       const scale = zoomIn ? 0.9 : 1.1;
       VEHICLE_CAMERA_FOLLOW_DISTANCE = Math.max(8, Math.min(200, VEHICLE_CAMERA_FOLLOW_DISTANCE * scale));
       VEHICLE_CAMERA_FOLLOW_HEIGHT = Math.max(2, Math.min(80, VEHICLE_CAMERA_FOLLOW_HEIGHT * scale));
+      requestRender();
     } else {
       camera.fov *= zoomIn ? 0.95 : 1.05;
       camera.fov = Math.max(20, Math.min(100, camera.fov));
       camera.updateProjectionMatrix();
+      requestRender();
     }
   },
   { passive: false }
@@ -6828,6 +7041,7 @@ window.addEventListener('resize', () => {
   camera.updateProjectionMatrix();
   renderBackend.resize(window.innerWidth, window.innerHeight);
   updateMapCamera();
+  requestRender();
 });
 
 applyCameraOrientation();
@@ -6836,7 +7050,6 @@ camera.updateMatrixWorld(true);
 updateMapCamera();
 updateHud();
 
-let lastTexRefresh = 0;
 function render() {
   const dt = Math.min(0.05, clock.getDelta());
   const nowMs = performance.now();
@@ -6873,11 +7086,12 @@ function render() {
   // Update fog density from slider
   const fogStrength = controls._fogStrength ?? 4.5;
   _sceneFog.density = fogStrength / getFogDistance();
+  webgpuFogDensity.value = renderBackend.isWebGPU ? _sceneFog.density : 0;
 
   // Animate water
   waterMat.uniforms.time.value = clock.elapsedTime * 0.4;
   waterMat.uniforms.sunDirection.value.copy(sunDirection);
-  // Hide water in map mode so it doesn't cover terrain overview
+  // The GLSL water material is not supported by WebGPURenderer.
   waterMesh.visible = !renderBackend.isWebGPU && !controls.mapMode;
 
   // Terrain streaming: check if camera moved far enough to re-fetch
@@ -6894,12 +7108,6 @@ function render() {
       _lastFetchTriggerMs = nowMs;
       fetchTiles();
     }
-  }
-  // Periodic texture refresh (~1 Hz)
-  if (lastTiles && clock.elapsedTime - lastTexRefresh > 1.0) {
-    lastTexRefresh = clock.elapsedTime;
-    updateTextures(lastTiles);
-    updateEnhancement();
   }
   snapVehicleToTerrain();
   updateDieselVolume();
@@ -6947,6 +7155,7 @@ function render() {
   enhanceOutlines.visible = controls.mapMode;
   enhancedOutlines.visible = controls.mapMode;
   if (controls.mapMode) {
+    webgpuFogDensity.value = 0;
     pollSeamStatus();
     updateEnhanceOutlines();
     updateEnhancedOutlines();
@@ -6979,10 +7188,16 @@ function render() {
     renderBackend.renderMap(scene, mapCam);
     scene.background = null;
     scene.fog = renderBackend.isWebGPU ? null : _sceneFog;
+    stopRenderLoopIfIdle();
     return;
   }
   if (SCATTER_ENABLED && _scatterLib) updateScatterVisibility(terrainRoot, camera);
+  if (renderBackend.isWebGPU && webgpuCloudShadows != null) {
+    webgpuCloudShadows.update(renderer, clock.elapsedTime);
+  }
   renderBackend.renderScene(scene, camera);
+  stopRenderLoopIfIdle();
 }
 
-renderBackend.setAnimationLoop(render);
+streamingMaintenanceTimer = window.setInterval(runStreamingMaintenance, STREAMING_MAINTENANCE_MS);
+startRenderLoop();
