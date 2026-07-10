@@ -233,22 +233,20 @@ def _tex_retry_worker() -> None:
 
       jpeg, fail_reason = _fetch_dataforsyningen_texture(list(bbox), resolution=256)
       if jpeg is not None:
+        jpeg = _repair_white_ocean_jpeg(db, tile_id, jpeg)
         _write_texture(db, tile_id, jpeg, "dataforsyningen")
         # _update_water_mask_for_tile(db, tile_id, jpeg, "dataforsyningen")  # disabled — SAM too expensive during load
         log_tex.info(f"[tex-retry] {tile_id}: SUCCESS on attempt {attempt + 1}")
       elif fail_reason == 'no_coverage':
-        if cur_row and cur_row[1]:
-          _write_texture(db, tile_id, cur_row[1], "ancestor_crop_nodata")
-        log_tex.info(f"[tex-retry] {tile_id}: no coverage → ancestor_crop_nodata")
+        _resolve_no_coverage(db, tile_id, cur_row[1] if cur_row else None, "[tex-retry]")
       else:
         # Still transient
         if attempt + 1 < _TEX_RETRY_MAX:
           _tex_retry_enqueue(tile_id, bbox, attempt + 1)
           log_tex.debug(f"[tex-retry] {tile_id}: still transient, re-queued attempt {attempt + 2}")
         else:
-          if cur_row and cur_row[1]:
-            _write_texture(db, tile_id, cur_row[1], "ancestor_crop_nodata")
-          log_tex.warning(f"[tex-retry] {tile_id}: max retries exhausted → ancestor_crop_nodata")
+          log_tex.warning(f"[tex-retry] {tile_id}: max retries exhausted")
+          _resolve_no_coverage(db, tile_id, cur_row[1] if cur_row else None, "[tex-retry]")
     except Exception as exc:
       log_tex.error(f"[tex-retry] {tile_id}: FAILED: {type(exc).__name__}: {exc}")
     finally:
@@ -645,6 +643,76 @@ def _arg_int(name: str, default: int) -> int:
 
 
 
+OCEAN_MAX_ELEV_M = 0.5
+
+
+def _is_ocean_tile(db, tile_id: str) -> bool:
+  """True when the tile's heightmap is entirely at/below sea level.
+
+  Tiles where both DEMs came up empty ('no_data') are open ocean too.
+  Unknown (no row / no heightmap yet) → False; a later texture request
+  re-checks once the heightmap has been ingested.
+  """
+  row = db.execute(
+    "SELECT source, heightmap FROM tiles WHERE tile_id = ?", (tile_id,)
+  ).fetchone()
+  if row is None:
+    return False
+  source, hm_blob = row
+  if source == 'no_data':
+    return True
+  if hm_blob is None:
+    return False
+  hm = _np.frombuffer(zlib.decompress(hm_blob), dtype=_np.float32)
+  if _np.all(_np.isnan(hm)):
+    return True
+  return float(_np.nanmax(hm)) <= OCEAN_MAX_ELEV_M
+
+
+def _repair_white_ocean_jpeg(db, tile_id: str, jpeg: bytes) -> bytes:
+  """Fill WMS white no-data pixels over ocean (per heightmap) with OCEAN_RGB.
+
+  Coastal frames arrive with real land + white sea fill and pass the
+  whole-frame white check. No-op when the tile has no heightmap yet.
+  """
+  from texture import repair_white_ocean
+  row = db.execute(
+    "SELECT heightmap FROM tiles WHERE tile_id = ?", (tile_id,)
+  ).fetchone()
+  if not row or row[0] is None:
+    return jpeg
+  hm = _np.frombuffer(zlib.decompress(row[0]), dtype=_np.float32).reshape(_GRID_N, _GRID_N)
+  repaired = repair_white_ocean(jpeg, hm)
+  if repaired is not None:
+    log_tex.info(f"[tex-repair] {tile_id}: filled white ocean pixels with OCEAN_RGB")
+    return repaired
+  return jpeg
+
+
+def _resolve_no_coverage(db, tile_id: str, existing_jpeg, log_prefix: str) -> None:
+  """Terminal-state a tile Dataforsyningen has no imagery for.
+
+  Ocean tiles get a flat deep-water texture. Land tiles keep their ancestor
+  crop, stamped ancestor_crop_nodata. A white ancestor crop is poison (a
+  pre-filter WMS no-data frame that got cached as imagery) — delete it so it
+  can't keep getting served.
+  """
+  from texture import is_white_fill_jpeg, ocean_texture_jpeg
+
+  if _is_ocean_tile(db, tile_id):
+    _write_texture(db, tile_id, ocean_texture_jpeg(), "ocean_nodata")
+    log_tex.info(f"{log_prefix} {tile_id}: no coverage + ocean heightmap → ocean_nodata")
+  elif existing_jpeg and not is_white_fill_jpeg(existing_jpeg):
+    _write_texture(db, tile_id, existing_jpeg, "ancestor_crop_nodata")
+    log_tex.info(f"{log_prefix} {tile_id}: no coverage → ancestor_crop_nodata")
+  elif existing_jpeg:
+    db.execute("DELETE FROM textures WHERE tile_id = ?", (tile_id,))
+    db.commit()
+    log_tex.warning(f"{log_prefix} {tile_id}: no coverage, dropped white-fill ancestor crop")
+  else:
+    log_tex.info(f"{log_prefix} {tile_id}: no coverage, no fallback available yet")
+
+
 def _nearest_ancestor_texture(tile_id: str, texture_ids: set[str]) -> str | None:
   parts = tile_id.split("-")
   if len(parts) != 3:
@@ -700,6 +768,10 @@ def _seed_children_from_parent(db, parent_id: str) -> int:
   p_d, p_c, p_r = parsed
 
   parent_img = _Image.open(io.BytesIO(parent_tex))
+  from texture import is_white_fill
+  if is_white_fill(_np.asarray(parent_img.convert("RGB"), dtype=_np.uint8)):
+    log_tex.warning(f"[tex-seed] {parent_id}: white-fill parent, refusing to seed children")
+    return 0
   child_depth = p_d + 1
   seeded = 0
 
@@ -716,6 +788,7 @@ def _seed_children_from_parent(db, parent_id: str) -> int:
         continue
 
       jpeg = _crop_child_from_parent(parent_img, p_d, child_depth, child_c, child_r)
+      jpeg = _repair_white_ocean_jpeg(db, child_id, jpeg)
       _write_texture(db, child_id, jpeg, "ancestor_crop")
       seeded += 1
 
@@ -816,6 +889,7 @@ def _queue_texture_fetch(tile_id: str, bbox: tuple[float, float, float, float]) 
       jpeg, fail_reason = _fetch_dataforsyningen_texture(list(bbox), resolution=256)
       if jpeg is not None:
         log_tex.debug(f"[tex-worker] {tile_id}: got {len(jpeg)} bytes from dataforsyningen")
+        jpeg = _repair_white_ocean_jpeg(db, tile_id, jpeg)
         _write_texture(db, tile_id, jpeg, "dataforsyningen")
         # _update_water_mask_for_tile(db, tile_id, jpeg, "dataforsyningen")  # disabled — SAM too expensive during load
       elif fail_reason == 'no_coverage':
@@ -823,9 +897,7 @@ def _queue_texture_fetch(tile_id: str, bbox: tuple[float, float, float, float]) 
         existing = db.execute(
           "SELECT texture FROM textures WHERE tile_id = ?", (tile_id,)
         ).fetchone()
-        if existing and existing[0]:
-          _write_texture(db, tile_id, existing[0], "ancestor_crop_nodata")
-        log_tex.debug(f"[tex-worker] {tile_id}: no coverage → ancestor_crop_nodata")
+        _resolve_no_coverage(db, tile_id, existing[0] if existing else None, "[tex-worker]")
       else:
         # Transient (rate limit / timeout). Mark and enqueue for retry.
         existing = db.execute(
@@ -1217,7 +1289,7 @@ def api_texture(tile_id: str):
 
   if cached_crop is not None:
     return Response(
-      cached_crop,
+      _repair_white_ocean_jpeg(db, tile_id, cached_crop),
       mimetype="image/jpeg",
       headers={
         "Cache-Control": "no-store",
@@ -1228,6 +1300,7 @@ def api_texture(tile_id: str):
       },
     )
 
+  from texture import is_white_fill_jpeg
   child_d, child_c, child_r = d, c, r
   ancestor_found = None
   while d > 0:
@@ -1237,6 +1310,10 @@ def api_texture(tile_id: str):
     ancestor_id = f"{d}-{c}-{r}"
     ancestor_tex = _read_texture(db, ancestor_id)
     if ancestor_tex is not None:
+      # Skip poisoned white-fill ancestors (pre-filter WMS no-data frames) —
+      # a 202 and the blue vertex fallback beat serving a white square.
+      if is_white_fill_jpeg(ancestor_tex):
+        continue
       ancestor_found = (ancestor_id, ancestor_tex)
       break
 
@@ -1269,7 +1346,7 @@ def api_texture(tile_id: str):
   cropped.save(buf, format="JPEG", quality=85)
 
   return Response(
-    buf.getvalue(),
+    _repair_white_ocean_jpeg(db, tile_id, buf.getvalue()),
     mimetype="image/jpeg",
     headers={
       "Cache-Control": "no-store",
@@ -2024,15 +2101,13 @@ def api_watermask_from_texture():
     )
 
   # Treat uniform white frames as invalid input (provider no-data artifact).
+  from texture import is_white_fill
   try:
     img = _Image.open(io.BytesIO(texture_jpeg)).convert("RGB")
     arr = _np.asarray(img, dtype=_np.uint8)
-    white_pct = float((arr.min(axis=2) >= 250).mean() * 100.0)
-    std_val = float(arr.std())
-    if white_pct > 98.0 and std_val < 2.0:
+    if is_white_fill(arr):
       raise ValueError(
-        "DATA_ERROR: flat-white texture input (likely no-data source image); "
-        f"white={white_pct:.1f}% std={std_val:.2f}"
+        "DATA_ERROR: flat-white texture input (likely no-data source image)"
       )
   except ValueError:
     raise

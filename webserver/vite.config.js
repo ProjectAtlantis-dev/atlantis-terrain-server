@@ -31,7 +31,13 @@ function logServeUrl() {
 export default defineConfig({
   plugins: [logServeUrl()],
   build: {
-    target: 'esnext'
+    target: 'esnext',
+    rollupOptions: {
+      input: {
+        main: path.resolve(__dirname, 'index.html'),
+        webgpu: path.resolve(__dirname, 'webgpu.html')
+      }
+    }
   },
   resolve: {
     alias: [

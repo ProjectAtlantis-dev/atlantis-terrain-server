@@ -11,6 +11,9 @@ TEXTURE SOURCE STATES:
                             Managed by background retry queue with exponential backoff.
 - ancestor_crop_nodata:     Dataforsyningen confirmed no coverage. Terminal.
                             Only manual inspect auto-fix can reset it.
+- ocean_nodata:             Dataforsyningen confirmed no coverage AND the tile's
+                            heightmap is entirely at/below sea level. Flat
+                            deep-ocean fill (OCEAN_RGB). Terminal.
 - sentinel2_crop:           Legacy Sentinel-2 placeholder. Re-fetchable.
 - dataforsyningen:          Primary source (SPOT 6/7, 1.6m/0.2m via EPSG:3184).
 - dataforsyningen_enhanced: SUPIR upscale of dataforsyningen via ComfyUI.
@@ -47,7 +50,7 @@ import urllib.request
 from collections import deque
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageFilter
 from rasterio.crs import CRS
 from rasterio.transform import from_bounds as transform_from_bounds
 from rasterio.warp import Resampling as WarpResampling, reproject, transform_bounds
@@ -57,6 +60,83 @@ from seam_queue import init_seam_jobs
 from terrain_config import ENHANCE_DEPTH
 
 log_tex = get_logger("terrain.tex")
+
+
+# --- White-fill (provider no-data) detection ------------------------------
+# Dataforsyningen's WMS answers no-coverage requests with a uniform white
+# frame. This is the single detector for those — used at fetch time, by the
+# tex-worker seeding guard, and by purge_white_textures.py. The std guard
+# keeps real (textured) snow/ice imagery from matching.
+WHITE_FILL_MIN_PCT = 98.0
+WHITE_FILL_MAX_STD = 2.0
+
+
+def is_white_fill(arr):
+    """True if an RGB uint8 array is a near-uniform white no-data frame."""
+    white_pct = float((arr.min(axis=2) >= 250).mean() * 100.0)
+    return white_pct > WHITE_FILL_MIN_PCT and float(arr.std()) < WHITE_FILL_MAX_STD
+
+
+def is_white_fill_jpeg(jpeg_bytes):
+    """is_white_fill() for an encoded image. Undecodable input → False."""
+    try:
+        arr = np.array(Image.open(io.BytesIO(jpeg_bytes)).convert("RGB"))
+    except Exception:
+        return False
+    return is_white_fill(arr)
+
+
+# Median SPOT 6/7 color over fully-ocean tiles in terrain.db (sampled 2026-07:
+# (6,20,25)), nudged blue so deep water reads as water rather than black.
+OCEAN_RGB = (6, 20, 30)
+
+
+def ocean_texture_jpeg(resolution=256):
+    """Flat deep-ocean texture for confirmed no-coverage all-water tiles."""
+    img = Image.new("RGB", (resolution, resolution), OCEAN_RGB)
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=85)
+    return buf.getvalue()
+
+
+def repair_white_ocean(jpeg_bytes, heightmap, max_elev_m=0.5, min_frac=0.005):
+    """Fill white WMS no-data pixels over ocean with OCEAN_RGB.
+
+    Coastal Dataforsyningen frames come back with real land imagery and white
+    fill over the sea — valid frames that pass the whole-image white check.
+    Pixels that are BOTH near-white AND at/below sea level per the heightmap
+    are provider fill, never imagery (snow/ice sits above sea level, which the
+    elevation gate protects).
+
+    heightmap is the tile's GRID_N² float32 array, row 0 = south (the mesh
+    convention); images are row 0 = north, so it is flipped before use.
+
+    Returns repaired JPEG bytes, or None if under min_frac needed fixing.
+    """
+    arr = np.array(Image.open(io.BytesIO(jpeg_bytes)).convert("RGB"))
+    white = arr.min(axis=2) >= 250
+    if not white.any():
+        return None
+    # Dilate to swallow the grey JPEG halo along the fill boundary.
+    white_img = Image.fromarray(white.astype(np.uint8) * 255).filter(ImageFilter.MaxFilter(5))
+    white = np.array(white_img) > 127
+    hm = np.where(np.isnan(heightmap), 0.0, heightmap)
+    ocean_img = Image.fromarray((np.flipud(hm) <= max_elev_m).astype(np.uint8) * 255)
+    ocean = np.array(ocean_img.resize((arr.shape[1], arr.shape[0]), Image.Resampling.BILINEAR)) > 127
+    mask = white & ocean
+    if mask.mean() < min_frac:
+        return None
+    # Match the tile's own water tone when it has enough real ocean pixels;
+    # fall back to the global constant for fully-white tiles.
+    real_ocean = ocean & ~white
+    if real_ocean.mean() > 0.05:
+        fill = tuple(int(v) for v in np.median(arr[real_ocean], axis=0))
+    else:
+        fill = OCEAN_RGB
+    arr[mask] = fill
+    buf = io.BytesIO()
+    Image.fromarray(arr).save(buf, format="JPEG", quality=85)
+    return buf.getvalue()
 
 COMFY_URL = "http://100.106.176.121:8188"
 _UPSCALER_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "upscaler")
@@ -165,12 +245,8 @@ def fetch_dataforsyningen_texture(bbox, resolution=256):
         log_tex.warning(f"[DFORSYNINGEN] rejecting {zero_pct:.0f}% zero-fill result (no coverage)")
         return None, 'no_coverage'
     # Reject nearly uniform white frames (provider no-data response at coarse scales).
-    white_pct = np.mean(dst_arr.min(axis=2) >= 250) * 100
-    std_val = float(dst_arr.std())
-    if white_pct > 98 and std_val < 2.0:
-        log_tex.warning(
-            f"[DFORSYNINGEN] rejecting white-fill result white={white_pct:.0f}% std={std_val:.2f} (no coverage)"
-        )
+    if is_white_fill(dst_arr):
+        log_tex.warning(f"[DFORSYNINGEN] rejecting white-fill result std={dst_arr.std():.2f} (no coverage)")
         return None, 'no_coverage'
     # Re-encode as JPEG
     img = Image.fromarray(dst_arr)
@@ -240,9 +316,13 @@ def write_texture(db, tile_id, jpeg_bytes, source):
             ("ancestor_crop", "dataforsyningen"),
             ("ancestor_crop", "ancestor_crop_ratelimit"),
             ("ancestor_crop", "ancestor_crop_nodata"),
+            ("ancestor_crop", "ocean_nodata"),
             ("ancestor_crop_ratelimit", "dataforsyningen"),
             ("ancestor_crop_ratelimit", "ancestor_crop_nodata"),
+            ("ancestor_crop_ratelimit", "ocean_nodata"),
             ("ancestor_crop_nodata", "ancestor_crop"),
+            ("ancestor_crop_nodata", "ocean_nodata"),
+            ("ocean_nodata", "dataforsyningen"),
             ("sentinel2", "dataforsyningen"),
             ("dataforsyningen", "dataforsyningen_enhanced"),
             ("dataforsyningen_enhanced", "upscaled"),
