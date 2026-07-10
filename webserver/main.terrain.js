@@ -3807,6 +3807,17 @@ const cloudsDefaults = {
 };
 
 const aerialPerspective = new AerialPerspectiveEffect(camera);
+// postprocessing >= 6.38 decodes logarithmic depth inside effect.frag's
+// readDepth(), but the pinned three-geospatial checkout still runs its own
+// reverseLogDepth() on the result. The double decode collapses reconstructed
+// terrain positions, so cloud shadows/god rays project onto a standing
+// curtain instead of lying flat on the ground. Strip the second decode.
+aerialPerspective.setFragmentShader(
+  aerialPerspective.getFragmentShader().replace(
+    'depth = reverseLogDepth(depth, cameraNear, cameraFar);',
+    ''
+  )
+);
 aerialPerspective.sky = true;
 aerialPerspective.sun = true;
 aerialPerspective.sunIrradiance = true; // shadows a bit strong but needed

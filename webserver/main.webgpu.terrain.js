@@ -1524,11 +1524,17 @@ function buildTuningControls(ap, ce) {
         applyWebGPUAtmosphereLiveSettings();
       }
     });
+    const applyWebGPUHaze = value => {
+      controls._fogStrength = value;
+      _sceneFog.density = value / getFogDistance();
+      webgpuFogDensity.value = _sceneFog.density;
+    };
     tuningSlider('haze', {
       min: 0, max: 10, step: 0.5, value: WEBGPU_DEFAULT_HAZE,
       decimals: 1,
-      onChange: v => { controls._fogStrength = v; }
+      onChange: applyWebGPUHaze
     });
+    applyWebGPUHaze(Number(_tuningState.haze ?? WEBGPU_DEFAULT_HAZE));
     tuningSectionLabel('Cloud Shadows');
     tuningToggle('cloud shadows', {
       value: WEBGPU_CLOUD_SHADOW_DEFAULTS.enabled,
@@ -7084,7 +7090,9 @@ function render() {
   }
 
   // Update fog density from slider
-  const fogStrength = controls._fogStrength ?? 4.5;
+  const fogStrength = controls._fogStrength ?? (
+    renderBackend.isWebGPU ? WEBGPU_DEFAULT_HAZE : 4.5
+  );
   _sceneFog.density = fogStrength / getFogDistance();
   webgpuFogDensity.value = renderBackend.isWebGPU ? _sceneFog.density : 0;
 
