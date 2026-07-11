@@ -12,6 +12,52 @@ import { stepSuspension, stepVehicleDrive } from './terrain-vehicle.js';
 import { meshUsesTextureClassification, scoreTextureTiles, textureRetryDelay } from './terrain-tile-runtime.js';
 import { createTextureStreamer } from './terrain-texture-streamer.js';
 import { createTileLifecycle } from './terrain-tile-lifecycle.js';
+import {
+  buildTerrainTilesRequest,
+  diffTerrainTileIds,
+  prioritizeTerrainBuildCandidates,
+} from './terrain-tile-fetch.js';
+
+test('terrain preview request preserves boot frame semantics', () => {
+  const request = buildTerrainTilesRequest({
+    lat: 64.1, lon: -51.2, altitude: 120, heading: 0.5, range: 30000,
+    pass: 1, previewMaxDepth: 10, isFirstLoad: true,
+    frameOffsetReady: false, originX: 1, originY: 2,
+    cameraSnapshot: { camEastM: 3 },
+  });
+  assert.equal(request.url, '/api/tiles?lat=64.1&lon=-51.2&alt=120&heading=0.5&range=30000&maxDepth=10');
+  assert.deepEqual(request.logDetails, {
+    pass: 1, passLabel: 'preview', isFirstLoad: true,
+    requestLat: 64.1, requestLon: -51.2, requestAltM: 120,
+    headingRad: 0.5, maxDepth: 10, camEastM: 3,
+  });
+});
+
+test('terrain full request reuses a restored frame', () => {
+  const request = buildTerrainTilesRequest({
+    lat: 64, lon: -51, altitude: 50, heading: 0, range: 40000,
+    pass: 2, previewMaxDepth: 10, isFirstLoad: true,
+    frameOffsetReady: true, originX: -12.5, originY: 99.25,
+  });
+  assert.equal(request.url, '/api/tiles?lat=64&lon=-51&alt=50&heading=0&range=40000&ox=-12.5&oy=99.25');
+  assert.equal(request.logDetails.maxDepth, null);
+});
+
+test('terrain tile diff and dirty-paint demand are deterministic', () => {
+  const tiles = [
+    { id: 'new-far', heightmap: 'x', priority: 9 },
+    { id: 'kept', heightmap: 'x', priority: 1 },
+    { id: 'new-hot', heightmap: 'x', priority: 2 },
+    { id: 'no-heightmap', heightmap: null, priority: 0 },
+  ];
+  const diff = diffTerrainTileIds(tiles, new Set(['kept', 'removed']));
+  assert.deepEqual(diff.added, ['new-far', 'new-hot', 'no-heightmap']);
+  assert.deepEqual(diff.removed, ['removed']);
+  const candidates = prioritizeTerrainBuildCandidates(
+    tiles, new Set(diff.added), tile => tile.priority,
+  );
+  assert.deepEqual(candidates.map(item => item.tile.id), ['new-hot', 'new-far']);
+});
 
 test('cardinal headings use the vehicle convention', () => {
   const cases = [

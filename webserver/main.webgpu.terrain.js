@@ -60,6 +60,7 @@ import { createTileHistory, terrainFogDistance, terrainVisibilityDistance } from
 import { createTextureStreamer } from './terrain-texture-streamer.js';
 import { createTerrainMeshRuntime } from './terrain-mesh-runtime.js';
 import { createTerrainTextureController } from './terrain-texture-controller.js';
+import { buildTerrainTilesRequest } from './terrain-tile-fetch.js';
 
 const USE_WEBGPU_RENDER_BACKEND = true;
 // Calibrated against the cloudless WebGL reference. WebGL uses exposure 10
@@ -4974,28 +4975,14 @@ async function fetchTiles(lat, lon) {
     const fetchLat = lat ?? camLL.lat;
     const fetchLon = lon ?? camLL.lon;
     const fetchAlt = camLL.alt;
-    const forcePreviewDepth = _loadPass === 1;
-    let url = `/api/tiles?lat=${fetchLat}&lon=${fetchLon}&alt=${fetchAlt}&heading=${heading}&range=${_terrainRange}`;
-    if (forcePreviewDepth) {
-      url += `&maxDepth=${PREVIEW_MAX_DEPTH}`;
-    }
-    // Reuse a restored terrain frame on reload. Choosing a fresh EPSG:3413
-    // origin at every boot makes the grid-to-ENU approximation origin-
-    // dependent, so the terrain appears to jump under a stationary camera.
-    if (!isFirstLoad || tileFrameOffsetReady) {
-      url += `&ox=${originX}&oy=${originY}`;
-    }
-    enqueueClientLog('info', `fetchTiles.request[pass${_loadPass}]`, {
-      pass: _loadPass,
-      passLabel: _loadPass === 1 ? 'preview' : 'full',
-      isFirstLoad,
-      requestLat: fetchLat,
-      requestLon: fetchLon,
-      requestAltM: fetchAlt,
-      headingRad: heading,
-      maxDepth: forcePreviewDepth ? PREVIEW_MAX_DEPTH : null,
-      ...camSnapshot,
+    const request = buildTerrainTilesRequest({
+      lat: fetchLat, lon: fetchLon, altitude: fetchAlt, heading,
+      range: _terrainRange, pass: _loadPass, previewMaxDepth: PREVIEW_MAX_DEPTH,
+      isFirstLoad, frameOffsetReady: tileFrameOffsetReady, originX, originY,
+      cameraSnapshot: camSnapshot,
     });
+    enqueueClientLog('info', `fetchTiles.request[pass${_loadPass}]`, request.logDetails);
+    const url = request.url;
     const resp = await fetch(url);
     const data = await resp.json();
     if (isFirstLoad && !tileFrameOffsetReady) {
