@@ -694,13 +694,25 @@ def _apply_bathymetry_fix(db, tile_id: str, jpeg: bytes) -> None:
   """Flatten fake fjord seamounts once real imagery is available.
 
   Fine depths only (bathymetry.MIN_FIX_DEPTH); corrected samples propagate
-  up the ancestor chain so coarse fjord views (d7/d8) agree. Failures are
-  logged, never fatal to the texture path.
+  up the ancestor chain so coarse fjord views (d7/d8) agree. A changed tile
+  also re-fixes its neighbors once: aprons span tile seams, and a neighbor's
+  earlier protected-land edge decisions may depend on this tile's new
+  heights. Failures are logged, never fatal to the texture path.
   """
   try:
     from bathymetry import fix_tile_in_db, propagate_to_ancestors
-    if fix_tile_in_db(db, tile_id, jpeg):
-      propagate_to_ancestors(db, tile_id)
+    if not fix_tile_in_db(db, tile_id, jpeg):
+      return
+    propagate_to_ancestors(db, tile_id)
+    d, c, r = (int(p) for p in tile_id.split("-"))
+    for dc, dr in ((0, 1), (0, -1), (1, 0), (-1, 0)):
+      nid = f"{d}-{c + dc}-{r + dr}"
+      nrow = db.execute(
+        "SELECT texture FROM textures WHERE tile_id = ? AND source = 'dataforsyningen'",
+        (nid,),
+      ).fetchone()
+      if nrow and fix_tile_in_db(db, nid, nrow[0], force=True):
+        propagate_to_ancestors(db, nid)
   except Exception as exc:
     log_tex.warning(f"[bathy] {tile_id}: fix failed: {type(exc).__name__}: {exc}")
 
@@ -1507,7 +1519,7 @@ def api_terrain_channel(tile_id: str, chan: str):
   import numpy as np
   from PIL import Image as _Image
 
-  from training_data import render_channel, terrain_channels
+  from classifier.training_data import render_channel, terrain_channels
 
   db = _get_db()
   hm, hm_source, hm_depth = _heightmap_ancestor_crop(db, d, c, r)
@@ -1619,13 +1631,13 @@ def api_heatmap():
 @app.get("/api/regression/<path:name>")
 def api_regression(name: str = "index.html"):
   """Classifier regression gallery — regression_cases.py output on disk.
-  Rebuild with `venv/bin/python regression_cases.py` after classifier
+  Rebuild with `venv/bin/python -m classifier.regression_cases` after classifier
   changes; the frontend pages link here (vite proxies /api to us)."""
   from pathlib import Path as _Path
   root = _Path(__file__).parent / "sample" / "regression"
   if not (root / "index.html").is_file():
     return Response(
-      b"no regression gallery yet - run: venv/bin/python regression_cases.py",
+      b"no regression gallery yet - run: venv/bin/python -m classifier.regression_cases",
       status=404, mimetype="text/plain")
   return send_from_directory(root, name)
 
@@ -1696,7 +1708,7 @@ def api_regression_add():
   {tile, note} to regression_cases.json, bakes the case (classifier steps +
   overlay) and rebuilds the gallery."""
   from google_ref import init_google_refs
-  from regression_cases import add_case, bake
+  from classifier.regression_cases import add_case, bake
 
   data = request.get_json(silent=True) or {}
   tile_id = str(data.get("tile", "")).strip()
@@ -1815,12 +1827,12 @@ def api_classes(tile_id: str, stage: str):
   import numpy as np
   from PIL import Image as _Image
 
-  from biomes import (BAND_MAX_DEPTH, BAND_ZOOM, BOULDER_MIN_ZOOM,
+  from classifier.biomes import (BAND_MAX_DEPTH, BAND_ZOOM, BOULDER_MIN_ZOOM,
                       COARSE_NAMES, FIELD_NAMES, REFINED_NAMES, band_overlay,
                       band_structure, class_overlay, classify_coarse,
                       classify_field, refine_rock)
   from google_ref import get_google_ref, init_google_refs
-  from training_data import _upsample_f32, terrain_channels
+  from classifier.training_data import _upsample_f32, terrain_channels
 
   db = _get_db()
   init_google_refs(db)

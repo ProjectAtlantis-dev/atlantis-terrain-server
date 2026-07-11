@@ -17,9 +17,9 @@ Same policy as LAAS_ASSETS.md: Google pixels are a measurement/training guide
 only, never shipped as terrain. Output goes to sample/ (gitignored).
 
 CLI (from flaskserver/):
-    venv/bin/python training_data.py                  # every flown land tile at depth 14
-    venv/bin/python training_data.py 14-5542-3157 --res 512 --zoom 18
-    venv/bin/python training_data.py --aoi 64.14,-51.66,64.18,-51.54   # optional restriction
+    venv/bin/python -m classifier.training_data                  # every flown land tile at depth 14
+    venv/bin/python -m classifier.training_data 14-5542-3157 --res 512 --zoom 18
+    venv/bin/python -m classifier.training_data --aoi 64.14,-51.66,64.18,-51.54
 
 Per tile writes sample/training/<tid>/: sample.npz (google uint8 HxWx3,
 coarse uint8 HxWx3, elev/slope/southness/sun float32 HxW, image-oriented,
@@ -35,7 +35,7 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
-from biomes import REFINED_NAMES, class_overlay, classify_field, refine_rock
+from classifier.biomes import REFINED_NAMES, class_overlay, classify_field, refine_rock
 from colored_log import get_logger
 from coords import to_stereo
 from database import GRID_N, _decompress_float32
@@ -234,7 +234,7 @@ def _cli(argv):
   import argparse
   import os
 
-  db_path = os.environ.get("TERRAIN_DB_PATH", "").strip() or str(Path(__file__).parent / "terrain.db")
+  db_path = os.environ.get("TERRAIN_DB_PATH", "").strip() or str(Path(__file__).parent.parent / "terrain.db")
   ap = argparse.ArgumentParser(description="Export Google-vs-terrain training pairs.")
   ap.add_argument("tile_ids", nargs="*",
                   help="explicit tiles; omit for every flown land tile at --depth")
@@ -244,7 +244,7 @@ def _cli(argv):
                   help="min fraction of grid nodes above sea level (default 0.2)")
   ap.add_argument("--res", type=int, default=512, help="output px per tile (default 512)")
   ap.add_argument("--zoom", type=int, default=None, help="force Google zoom (default: auto, capped at 18)")
-  ap.add_argument("--out", default=str(Path(__file__).parent / "sample" / "training"))
+  ap.add_argument("--out", default=str(Path(__file__).parent.parent / "sample" / "training"))
   ap.add_argument("--refresh", action="store_true", help="bypass google_refs cache")
   ap.add_argument("--db", default=db_path)
   args = ap.parse_args(argv)

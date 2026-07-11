@@ -12,8 +12,8 @@ patches at the training m/px and stitched (the UNet is fully conv but was
 trained at one scale; running native-res keeps it honest).
 
 CLI (from flaskserver/):
-    venv/bin/python colorize.py 12-1384-783
-    venv/bin/python colorize.py 12-1384-783 --run sample/training/runs/northmask_east
+    venv/bin/python -m classifier.colorize 12-1384-783
+    venv/bin/python -m classifier.colorize 12-1384-783 --run sample/training/runs/northmask_east
 Writes sample/colorized/<tid>/: colorized.png, coarse.png, google.png,
 classes.png and composite.png (coarse | colorized | classes | google).
 """
@@ -28,11 +28,11 @@ import numpy as np
 import torch
 from PIL import Image
 
-from biomes import FIELD_NAMES, TINTS, classify_field
+from classifier.biomes import FIELD_NAMES, TINTS, classify_field
 from database import GRID_N, _decompress_float32
 from google_ref import get_google_ref, init_google_refs
-from train_color import N_CLASSES, TERRAIN_KEYS, UNet
-from training_data import _upsample_f32, terrain_channels
+from classifier.train_color import N_CLASSES, TERRAIN_KEYS, UNet
+from classifier.training_data import _upsample_f32, terrain_channels
 
 TRAIN_MPP = 0.322      # d14 training pairs: 164.8 m tile at 512 px
 PATCH = 512
@@ -159,12 +159,12 @@ def colorize_tile(db, tid, run_dir, out_root, device):
 
 def main(argv):
   import os
-  db_path = os.environ.get("TERRAIN_DB_PATH", "").strip() or str(Path(__file__).parent / "terrain.db")
+  db_path = os.environ.get("TERRAIN_DB_PATH", "").strip() or str(Path(__file__).parent.parent / "terrain.db")
   ap = argparse.ArgumentParser(description="Recolor tiles with a trained coloring model.")
   ap.add_argument("tile_ids", nargs="+")
-  ap.add_argument("--run", default=str(Path(__file__).parent / "sample" / "training"
+  ap.add_argument("--run", default=str(Path(__file__).parent.parent / "sample" / "training"
                                        / "runs" / "northmask_east"))
-  ap.add_argument("--out", default=str(Path(__file__).parent / "sample" / "colorized"))
+  ap.add_argument("--out", default=str(Path(__file__).parent.parent / "sample" / "colorized"))
   ap.add_argument("--db", default=db_path)
   args = ap.parse_args(argv)
 

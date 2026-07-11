@@ -2,7 +2,7 @@
 
 Workflow (see LAAS_ASSETS.md):
   1. Browse pipeline.html, find representative ground, note tile ids.
-  2. venv/bin/python guide_assets.py <tile_id> [...] --zoom 17
+  2. venv/bin/python -m classifier.guide_assets <tile_id> [...] --zoom 17
   3. Open sample/laas_guide/index.html and eyeball the class overlays,
      detected bush instances, palettes and scatter stats.
   4. Numbers you approve graduate into vegetation.js / LAAS builder params
@@ -27,10 +27,10 @@ import numpy as np
 from PIL import Image
 from scipy import ndimage
 
-from biomes import VEG_MIN_SOUTHNESS
+from classifier.biomes import VEG_MIN_SOUTHNESS
 from database import GRID_N, _decompress_float32
 from google_ref import get_google_ref, init_google_refs
-from training_data import _upsample_f32, terrain_channels
+from classifier.training_data import _upsample_f32, terrain_channels
 
 CLASS_NAMES = ["rock", "heath", "lush", "snow", "water"]
 CLASS_TINTS = {  # gallery overlay colors (sRGB)
@@ -402,7 +402,7 @@ def write_gallery(out_root):
 
   # publish for the frontend: vegetation.js fetches /laas_guide.json at init
   # (derived numbers only — no Google imagery — so this one IS committable)
-  public_dir = Path(__file__).parent.parent / "webserver" / "public"
+  public_dir = Path(__file__).parents[2] / "webserver" / "public"
   if public_dir.is_dir():
     (public_dir / "laas_guide.json").write_text(json.dumps(manifest, indent=1))
     print(f"published: {public_dir / 'laas_guide.json'}")
@@ -471,13 +471,13 @@ Aggregate numbers in <a href="manifest.json">manifest.json</a>.</p>
 def main(argv):
   import argparse
   import os
-  db_path = os.environ.get("TERRAIN_DB_PATH", "").strip() or str(Path(__file__).parent / "terrain.db")
+  db_path = os.environ.get("TERRAIN_DB_PATH", "").strip() or str(Path(__file__).parent.parent / "terrain.db")
   ap = argparse.ArgumentParser(description="Extract LAAS asset-guide palettes and "
                                            "scatter stats from Google reference tiles.")
   ap.add_argument("tile_ids", nargs="*", help="tiles to (re)analyze; omit to just rebuild the gallery")
   ap.add_argument("--zoom", type=int, default=None, help="force Google zoom (e.g. 17)")
   ap.add_argument("--res", type=int, default=640, help="analysis resolution px (default 640)")
-  ap.add_argument("--out", default=str(Path(__file__).parent.parent / "sample" / "laas_guide"))
+  ap.add_argument("--out", default=str(Path(__file__).parents[2] / "sample" / "laas_guide"))
   ap.add_argument("--refresh", action="store_true", help="re-fetch Google imagery")
   ap.add_argument("--db", default=db_path)
   args = ap.parse_args(argv)

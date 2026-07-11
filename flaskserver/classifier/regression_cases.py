@@ -11,8 +11,8 @@ google ref, every traced step mask, DEM channels, final overlay. Served at
 /api/regression/ (linked from pipeline.html and coverage.html).
 
 CLI (from flaskserver/):
-    venv/bin/python regression_cases.py            # bake all cases
-    venv/bin/python regression_cases.py 12-1373-784 --res 1024
+    venv/bin/python -m classifier.regression_cases            # bake all cases
+    venv/bin/python -m classifier.regression_cases 12-1373-784 --res 1024
 
 Writes sample/regression/<tid>/*.png + case.json, and
 sample/regression/index.html.
@@ -29,13 +29,13 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
-from biomes import COARSE_NAMES, TINTS, class_overlay, classify_coarse
+from classifier.biomes import COARSE_NAMES, TINTS, class_overlay, classify_coarse
 from database import GRID_N, _decompress_float32
 from google_ref import get_google_ref, init_google_refs
-from training_data import _upsample_f32, render_channel, terrain_channels
+from classifier.training_data import _upsample_f32, render_channel, terrain_channels
 
 CASES_PATH = Path(__file__).parent / "regression_cases.json"
-OUT_ROOT = Path(__file__).parent / "sample" / "regression"
+OUT_ROOT = Path(__file__).parent.parent / "sample" / "regression"
 
 
 def load_cases():
@@ -138,7 +138,7 @@ def write_gallery():
     "<h1>Classifier regression cases</h1>"
     f"<p>coarse buckets: {key}</p>"
     "<p>Rerun after every classifier change: "
-    "<code>venv/bin/python regression_cases.py</code></p>"
+    "<code>venv/bin/python -m classifier.regression_cases</code></p>"
     + body)
   print(f"gallery: {OUT_ROOT / 'index.html'}  ({len(rows)} cases)", flush=True)
 
@@ -157,7 +157,7 @@ def bake(db, tile_ids=None, res=512):
 
 def main(argv):
   db_path = os.environ.get("TERRAIN_DB_PATH", "").strip() or str(
-    Path(__file__).parent / "terrain.db")
+    Path(__file__).parent.parent / "terrain.db")
   ap = argparse.ArgumentParser(description="Rebuild the classifier regression gallery.")
   ap.add_argument("tile_ids", nargs="*",
                   help="subset of case tiles to rebake (default: all)")

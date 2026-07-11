@@ -1,5 +1,10 @@
 import { findCoveredTileAncestors } from './tile-coverage.js';
 
+function parseTileId(tileId) {
+  const match = /^(\d+)-(\d+)-(\d+)$/.exec(tileId || '');
+  return match ? { depth: Number(match[1]), col: Number(match[2]), row: Number(match[3]) } : null;
+}
+
 export function createTileLifecycle({ terrainRoot, disposeScatter, log, onSceneMutated = () => {} }) {
   function evict(mesh) {
     if (!mesh) return;
@@ -56,18 +61,43 @@ export function createTileLifecycle({ terrainRoot, disposeScatter, log, onSceneM
 
   function sweepStaleParents(tiles, currentTileIds) {
     const meshById = new Map();
-    const resident = new Map();
+    const covered = new Set();
+    let maxDepth = 0;
     for (const mesh of terrainRoot.children) {
       if (!mesh.isMesh || !mesh.userData.tileId) continue;
-      meshById.set(mesh.userData.tileId, mesh);
-      resident.set(mesh.userData.tileId, Boolean(mesh.material?.map));
+      const id = mesh.userData.tileId;
+      meshById.set(id, mesh);
+      const address = parseTileId(id);
+      if (address) maxDepth = Math.max(maxDepth, address.depth);
+      if (mesh.material?.map) covered.add(id);
     }
-    const staleIds = new Set();
-    for (const childId of currentTileIds) {
-      if (resident.get(childId) !== true) continue;
-      for (const ancestorId of findCoveredTileAncestors(childId, resident)) {
-        if (!currentTileIds.has(ancestorId)) staleIds.add(ancestorId);
+
+    // Collapse complete textured quadrants bottom-up once. The previous code
+    // rebuilt and recursively searched the full resident map for every current
+    // child, which blocked the browser for hundreds of milliseconds on a
+    // 1,500-mesh scene.
+    const descendantCovered = new Set();
+    for (let depth = maxDepth; depth > 0; depth--) {
+      const quadrantsByParent = new Map();
+      for (const id of covered) {
+        const address = parseTileId(id);
+        if (!address || address.depth !== depth) continue;
+        const parentId = `${depth - 1}-${Math.floor(address.col / 2)}-${Math.floor(address.row / 2)}`;
+        const quadrant = (address.col & 1) * 2 + (address.row & 1);
+        let quadrants = quadrantsByParent.get(parentId);
+        if (!quadrants) quadrantsByParent.set(parentId, quadrants = new Set());
+        quadrants.add(quadrant);
       }
+      for (const [parentId, quadrants] of quadrantsByParent) {
+        if (quadrants.size !== 4) continue;
+        descendantCovered.add(parentId);
+        covered.add(parentId);
+      }
+    }
+
+    const staleIds = new Set();
+    for (const parentId of descendantCovered) {
+      if (meshById.has(parentId) && !currentTileIds.has(parentId)) staleIds.add(parentId);
     }
     for (const parentId of staleIds) {
       const parent = meshById.get(parentId);

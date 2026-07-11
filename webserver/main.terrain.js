@@ -27,7 +27,7 @@ import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { buildAssetLibrary } from './procgen/library.ts';
 import { buildTileScatter, disposeTileScatter, updateScatterVisibility, SCATTER_MIN_DEPTH } from './procgen/scatter.ts';
 import { createTileLifecycle } from './terrain-tile-lifecycle.js';
-import { createTerrainOceanClassifier } from './terrain-ocean.js';
+import { createTerrainOceanClassifier } from './classifier/terrain-ocean.js';
 import { priorityHeading, terrainTilePriority } from './terrain-priority.js';
 import { compassHeading, createTerrainHud, renderGameClock, TERRAIN_HUD_LINKS } from './terrain-hud.js';
 import { installTerrainKeyboardControls, installTerrainPointerControls } from './terrain-controls.js';
@@ -4175,19 +4175,29 @@ function applyTerrainMaterialMode(mesh, tex) {
       useTex = comp.tex;
     }
   }
-  if (useTex) mesh.material.map = useTex;
-  mesh.material.vertexColors = false;
-  mesh.material.color.set(0xffffff);
-  mesh.material.needsUpdate = true;
+  let needsUpdate = false;
+  if (useTex && mesh.material.map !== useTex) {
+    mesh.material.map = useTex;
+    needsUpdate = true;
+  }
+  if (mesh.material.vertexColors) {
+    mesh.material.vertexColors = false;
+    needsUpdate = true;
+  }
+  if (mesh.material.color.getHex() !== 0xffffff) {
+    mesh.material.color.set(0xffffff);
+  }
+  if (needsUpdate) mesh.material.needsUpdate = true;
 }
 
 function rebuildTileMeshWithTexture(mesh, tile, tex) {
   if (!mesh || !tile || !tile.heightmap || !tex) return mesh;
   const depth = tileDepthFromId(tile.id);
   const texSig = tex.uuid;
-  const alreadyAssisted = Boolean(mesh.userData?.oceanColorAssisted);
-  const assistedSig = mesh.userData?.oceanTextureSig;
-  if (alreadyAssisted && assistedSig === texSig) return mesh;
+  // oceanTextureSig records which texture the geometry classification used,
+  // even when the classifier found no blue/ocean pixels. Requiring the
+  // boolean assisted result here rebuilt every ordinary land tile at 1 Hz.
+  if (mesh.userData?.oceanTextureSig === texSig) return mesh;
 
   const rebuilt = buildMesh(tile, tex);
   if (!rebuilt) return mesh;
@@ -4312,7 +4322,10 @@ function updateTextures(tiles) {
   // Only count actual HTTP requests (texInflight) against TEX_MAX — NOT
   // texFetching (202 server-pending). Previously texFetching counted too,
   // which starved close tiles when many distant tiles were server-pending.
-  textureStreamer.pump(scored, {
+  // Roll back to the proven inline pump until the extracted streamer has been
+  // load-tested against Flask's bounded texture worker pool.
+  const USE_LEGACY_TEXTURE_PUMP = true;
+  if (!USE_LEGACY_TEXTURE_PUMP) textureStreamer.pump(scored, {
     isCovered: _coveredByEnhancedParent,
     onPlaceholder: ({ tileId, texture }) => {
       const mesh = terrainRoot.children.find(child => child.userData.tileId === tileId);
@@ -4338,7 +4351,6 @@ function updateTextures(tiles) {
   });
 
   // Temporary rollback path retained until live parity validation completes.
-  const USE_LEGACY_TEXTURE_PUMP = false;
   if (USE_LEGACY_TEXTURE_PUMP) {
   const nowMs = performance.now();
   let repollBudget = TEX_REPOLL_BATCH; // limit 202 re-polls per frame
@@ -4728,7 +4740,10 @@ async function fetchTiles(lat, lon) {
     if (forcePreviewDepth) {
       url += `&maxDepth=${PREVIEW_MAX_DEPTH}`;
     }
-    if (!isFirstLoad) {
+    // Reuse a restored terrain frame on reload. Choosing a fresh EPSG:3413
+    // origin at every boot makes the grid-to-ENU approximation origin-
+    // dependent, so the terrain appears to jump under a stationary camera.
+    if (!isFirstLoad || tileFrameOffsetReady) {
       url += `&ox=${originX}&oy=${originY}`;
     }
     enqueueClientLog('info', `fetchTiles.request[pass${_loadPass}]`, {
@@ -4878,8 +4893,13 @@ async function fetchTiles(lat, lon) {
       const addedSet = new Set(added);
       let built = 0, deferred = 0;
       const MESH_BUILD_BUDGET = 200; // max meshes to build per fetch
-      for (const tile of data.tiles) {
-        if (!addedSet.has(tile.id) || !tile.heightmap) continue;
+      // The build budget is visible demand: spend it in the same heatmap order
+      // as texture streaming, never in arbitrary API response order.
+      const buildCandidates = data.tiles
+        .filter(tile => addedSet.has(tile.id) && tile.heightmap)
+        .map(tile => ({ tile, prio: tilePriority(tile) }))
+        .sort((a, b) => a.prio - b.prio);
+      for (const { tile } of buildCandidates) {
         if (existingIds.has(tile.id)) continue;
         // Skip children whose parent is already enhanced — the parent covers this area
         if (_coveredByEnhancedParent(tile)) {
@@ -5002,11 +5022,17 @@ async function fetchTiles(lat, lon) {
 function savePosition() {
   if (isFirstLoad) return;
   const camLL = getCameraLatLon();
-  localStorage.setItem('clouds-cam', JSON.stringify({
+  const saved = {
     lat: camLL.lat, lon: camLL.lon, alt: camLL.alt,
-    yaw: controls.yaw, pitch: controls.pitch, speed: controls.speed, strafeSpeed: controls.strafeSpeed,
+    yaw: controls.yaw, pitch: controls.pitch,
     mapZoom: controls.mapZoom
-  }));
+  };
+  if (tileFrameOffsetReady) {
+    saved.terrainFrame = {
+      originX, originY, offsetX: tileFrameOffsetX, offsetY: tileFrameOffsetY
+    };
+  }
+  localStorage.setItem('clouds-cam', JSON.stringify(saved));
 }
 setInterval(savePosition, 2000);
 window.addEventListener('beforeunload', savePosition);
@@ -5026,9 +5052,21 @@ try {
       .addScaledVector(up, alt);
     if (saved.yaw != null) controls.yaw = saved.yaw;
     if (saved.pitch != null) controls.pitch = saved.pitch;
-    if (saved.speed != null) controls.speed = saved.speed;
-    if (saved.strafeSpeed != null) controls.strafeSpeed = saved.strafeSpeed;
+    // A reload restores a pose, not an in-progress movement. Restoring the
+    // old velocity made braking carry the camera several metres after boot,
+    // which looked like a small coordinate-system offset.
+    controls.speed = 0;
+    controls.strafeSpeed = 0;
     if (saved.mapZoom != null) controls.mapZoom = saved.mapZoom;
+    const frame = saved.terrainFrame;
+    if (frame && Number.isFinite(frame.originX) && Number.isFinite(frame.originY)
+        && Number.isFinite(frame.offsetX) && Number.isFinite(frame.offsetY)) {
+      originX = frame.originX;
+      originY = frame.originY;
+      tileFrameOffsetX = frame.offsetX;
+      tileFrameOffsetY = frame.offsetY;
+      tileFrameOffsetReady = true;
+    }
     applyCameraOrientation();
   }
 } catch (_) {}

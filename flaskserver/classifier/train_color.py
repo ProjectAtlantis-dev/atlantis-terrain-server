@@ -14,9 +14,9 @@ The headline experiment is the ABLATION: train with and without the terrain
 channels and compare held-out error — overall and split by aspect (north- vs
 south-facing), since aspect is the hypothesis under test.
 
-    venv/bin/python train_color.py --channels rgb               # baseline
-    venv/bin/python train_color.py --channels rgb+terrain       # conditioned
-    venv/bin/python train_color.py --channels rgb+terrain+gcls  # + google classes
+    venv/bin/python -m classifier.train_color --channels rgb               # baseline
+    venv/bin/python -m classifier.train_color --channels rgb+terrain       # conditioned
+    venv/bin/python -m classifier.train_color --channels rgb+terrain+gcls  # + google classes
 
 gcls feeds the google-derived field class map (one-hot) as INPUT conditioning:
 the coarse SPOT texture is blind to patch-scale vegetation (measured -0.07
@@ -41,9 +41,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from biomes import FIELD_NAMES, TINTS, classify_field
+from classifier.biomes import FIELD_NAMES, TINTS, classify_field
 
-SAMPLE_ROOT = Path(__file__).parent / "sample" / "training"
+SAMPLE_ROOT = Path(__file__).parent.parent / "sample" / "training"
 MIN_GROUND_Z = 0.6           # land mask, same convention as vegetation.js
 TERRAIN_KEYS = ("slope", "southness", "sun", "elev")
 N_CLASSES = len(FIELD_NAMES)
