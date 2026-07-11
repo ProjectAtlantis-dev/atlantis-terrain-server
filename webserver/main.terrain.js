@@ -32,8 +32,9 @@ import { priorityHeading, terrainTilePriority } from './terrain-priority.js';
 import { compassHeading, createTerrainHud, renderGameClock, TERRAIN_HUD_LINKS } from './terrain-hud.js';
 import { installTerrainKeyboardControls, installTerrainPointerControls } from './terrain-controls.js';
 import { stepSuspension, stepVehicleDrive } from './terrain-vehicle.js';
-import { createTileHistory, scoreTextureTiles, terrainFogDistance, terrainVisibilityDistance, textureRetryDelay } from './terrain-tile-runtime.js';
+import { createTileHistory, scoreTextureTiles, terrainFogDistance, terrainVisibilityDistance } from './terrain-tile-runtime.js';
 import { createTextureStreamer } from './terrain-texture-streamer.js';
+import { createTerrainMeshRuntime } from './terrain-mesh-runtime.js';
 
 // The main view is controlled entirely through its UI. Discard stale query
 // parameters instead of exposing URL state that does not stay in sync.
@@ -4190,47 +4191,14 @@ function applyTerrainMaterialMode(mesh, tex) {
   if (needsUpdate) mesh.material.needsUpdate = true;
 }
 
-function rebuildTileMeshWithTexture(mesh, tile, tex) {
-  if (!mesh || !tile || !tile.heightmap || !tex) return mesh;
-  const depth = tileDepthFromId(tile.id);
-  const texSig = tex.uuid;
-  // oceanTextureSig records which texture the geometry classification used,
-  // even when the classifier found no blue/ocean pixels. Requiring the
-  // boolean assisted result here rebuilt every ordinary land tile at 1 Hz.
-  if (mesh.userData?.oceanTextureSig === texSig) return mesh;
+let terrainMeshRuntime;
 
-  const rebuilt = buildMesh(tile, tex);
-  if (!rebuilt) return mesh;
-  rebuilt.material.polygonOffset = true;
-  rebuilt.material.polygonOffsetFactor = -depth;
-  rebuilt.material.polygonOffsetUnits = -depth;
-  rebuilt.userData.waterMask = mesh.userData?.waterMask ?? null;
-  terrainRoot.add(rebuilt);
-  tileLifecycle.evict(mesh);
-  return rebuilt;
+function rebuildTileMeshWithTexture(mesh, tile, tex) {
+  return terrainMeshRuntime.rebuildWithTexture(mesh, tile, tex);
 }
 
 function materializeTile(tileId, tex) {
-  const tileData = deferredTiles.get(tileId);
-  if (!tileData) return;
-  deferredTiles.delete(tileId);
-  tileLog(tileId, `materialize tex=${tex.image.width}x${tex.image.height}`);
-  const mesh = buildMesh(tileData, tex);
-  if (!mesh) return;
-  applyTerrainMaterialMode(mesh, tex);
-  mesh.userData.waterMask = waterMaskCache.get(tileId) || null;
-  const depth = parseInt(tileId.split('-')[0]);
-  mesh.material.polygonOffset = true;
-  mesh.material.polygonOffsetFactor = -depth;
-  mesh.material.polygonOffsetUnits = -depth;
-  tileLifecycle.replaceForMaterialized(mesh, currentTileIds);
-  if (vehicleNearTileBbox(mesh.userData?.bbox)) {
-    const newDepth = tileDepthFromId(tileId);
-    const reason = Number.isFinite(newDepth) && newDepth > vehicleLastContactDepth
-      ? `terrain-refined-${vehicleLastContactDepth}->${newDepth}`
-      : 'terrain-materialized-near-vehicle';
-    requestVehicleTerrainResnap(reason);
-  }
+  return terrainMeshRuntime.materialize(tileId, tex);
 }
 
 // --- Texture streaming ---
@@ -4253,6 +4221,20 @@ const {
   requestWaterMask,
 } = textureStreamer;
 let _texV = textureStreamer.version;
+terrainMeshRuntime = createTerrainMeshRuntime({
+  terrainRoot,
+  deferredTiles,
+  buildMesh,
+  applyMaterial: applyTerrainMaterialMode,
+  lifecycle: tileLifecycle,
+  log: tileLog,
+  getWaterMask: tileId => waterMaskCache.get(tileId),
+  getCurrentTileIds: () => currentTileIds,
+  tileDepth: tileDepthFromId,
+  vehicleNearTile: vehicleNearTileBbox,
+  getVehicleDepth: () => vehicleLastContactDepth,
+  requestVehicleResnap: requestVehicleTerrainResnap,
+});
 
 // Visibility distance from camera altitude.
 // Geometric horizon: sqrt(2 * R_earth * h), clamped to practical atmosphere limits.
@@ -4324,8 +4306,7 @@ function updateTextures(tiles) {
   // which starved close tiles when many distant tiles were server-pending.
   // Roll back to the proven inline pump until the extracted streamer has been
   // load-tested against Flask's bounded texture worker pool.
-  const USE_LEGACY_TEXTURE_PUMP = true;
-  if (!USE_LEGACY_TEXTURE_PUMP) textureStreamer.pump(scored, {
+  textureStreamer.pump(scored, {
     isCovered: _coveredByEnhancedParent,
     onPlaceholder: ({ tileId, texture }) => {
       const mesh = terrainRoot.children.find(child => child.userData.tileId === tileId);
@@ -4349,115 +4330,6 @@ function updateTextures(tiles) {
       tryEvictCoveredAncestors(tileId);
     },
   });
-
-  // Temporary rollback path retained until live parity validation completes.
-  if (USE_LEGACY_TEXTURE_PUMP) {
-  const nowMs = performance.now();
-  let repollBudget = TEX_REPOLL_BATCH; // limit 202 re-polls per frame
-  for (const { tile } of scored) {
-    if (texInflight.size >= TEX_MAX) break;
-    if (texCache.has(tile.id) || texInflight.has(tile.id)) continue;
-    if (texFetching.has(tile.id)) {
-      const pendingRetryAt = texRetryAtMs.get(tile.id) ?? 0;
-      if (pendingRetryAt > nowMs) continue;
-      if (repollBudget <= 0) continue;  // don't remove from texFetching if no budget
-      repollBudget--;
-      texFetching.delete(tile.id);
-    }
-    const retryAt = texRetryAtMs.get(tile.id) ?? 0;
-    if (retryAt > nowMs) continue;
-    texRetryAtMs.delete(tile.id);
-    if (_coveredByEnhancedParent(tile)) continue;
-
-    const ac = new AbortController();
-    texInflight.set(tile.id, ac);
-    const tid = tile.id;
-    const t = tile;
-    // tileLog(tid, `fetch start (inflight=${texInflight.size}/${TEX_MAX})`);
-    fetch(`/api/texture/${tid}.jpg?v=${_texV}${_recolor ? '&stage=colorized' : ''}`, { signal: ac.signal })
-      .then(r => {
-        texInflight.delete(tid);
-        if (r.status === 202) {
-          const n = (texRetryCount.get(tid) || 0) + 1;
-          texRetryCount.set(tid, n);
-          const delay = textureRetryDelay(n, TEX_RETRY_202_BASE_MS, TEX_RETRY_202_MAX_MS);
-          tileLog(tid, `fetch -> 202 (server fetching, retry #${n} in ${(delay/1000).toFixed(1)}s)`);
-          texFetching.add(tid);
-          texRetryAtMs.set(tid, performance.now() + delay);
-          return;
-        }
-        if (!r.ok) {
-          tileLog(tid, `fetch -> HTTP ${r.status}`);
-          throw new Error(r.status);
-        }
-        const ancestorHeader = r.headers.get('X-Tex-Ancestor');
-        return r.blob()
-          .then(blob => createImageBitmap(blob, { imageOrientation: 'flipY' }))
-          .then(bmp => {
-            texFetching.delete(tid);
-            texRetryAtMs.delete(tid);
-            const isAncestorCrop = !!ancestorHeader;
-            const texSrc = r.headers.get('X-Tex-Source') || '';
-            tileLog(tid, `fetch -> ${bmp.width}x${bmp.height}${isAncestorCrop ? ' ANCESTOR=' + ancestorHeader : ''} src=${texSrc}`);
-            const tex = new THREE.Texture(bmp);
-            tex.flipY = false;
-            tex.colorSpace = THREE.SRGBColorSpace;
-            tex.needsUpdate = true;
-            if (isAncestorCrop) {
-              const n = (texRetryCount.get(tid) || 0) + 1;
-              texRetryCount.set(tid, n);
-              const delay = textureRetryDelay(n, TEX_RETRY_202_BASE_MS, TEX_RETRY_202_MAX_MS);
-              tileLog(tid, `ancestor crop from ${ancestorHeader} — placeholder applied, retry #${n} in ${(delay/1000).toFixed(1)}s`);
-              _ancestorLogged.add(tid);
-              texFetching.add(tid);
-              texRetryAtMs.set(tid, performance.now() + delay);
-              // Apply ancestor texture as placeholder (don't cache — will re-fetch for sharp version)
-              let mesh = null;
-              for (const child of terrainRoot.children) {
-                if (child.userData.tileId === tid) { mesh = child; break; }
-              }
-              if (mesh) {
-                applyTerrainMaterialMode(mesh, tex);
-              }
-            } else {
-              _ancestorLogged.delete(tid);
-              texRetryCount.delete(tid);
-              texCache.set(tid, tex);
-              texSource.set(tid, texSrc);
-              requestWaterMask(tid);
-              if (deferredTiles.has(tid)) {
-                tileLog(tid, `cached + materialize (was deferred)`);
-                materializeTile(tid, tex);
-              } else {
-                let mesh = null;
-                for (const child of terrainRoot.children) {
-                  if (child.userData.tileId === tid) { mesh = child; break; }
-                }
-                if (mesh) {
-                  tileLog(tid, `cached + applied to existing mesh`);
-                  mesh = rebuildTileMeshWithTexture(mesh, t, tex);
-                  applyTerrainMaterialMode(mesh, tex);
-                  mesh.userData.waterMask = waterMaskCache.get(tid) || null;
-                } else {
-                  tileLog(tid, `cached but NO mesh in scene`);
-                }
-              }
-              // Coverage must be tested after the arriving texture is visible on
-              // its mesh; before this point the fourth child still looks missing.
-              tryEvictCoveredAncestors(tid);
-            }
-          });
-      })
-      .catch(err => {
-        texInflight.delete(tid);
-        texRetryAtMs.set(tid, performance.now() + TEX_RETRY_ERROR_MS);
-        if (err.name !== 'AbortError') {
-          tileLog(tid, `fetch error: ${err.message} (retry in ${TEX_RETRY_ERROR_MS}ms)`);
-          console.warn(`[TEX] ${tid}:`, err.message);
-        }
-      });
-  }
-  }
 
   // ── Eager parent eviction ──────────────────────────────────────
   // Problem: the normal stale-parent sweeps only run on fetchTiles()

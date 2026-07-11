@@ -9,7 +9,7 @@ import {
 import { compassHeading } from './terrain-hud.js';
 import { applyMapDrag } from './terrain-controls.js';
 import { stepSuspension, stepVehicleDrive } from './terrain-vehicle.js';
-import { scoreTextureTiles, textureRetryDelay } from './terrain-tile-runtime.js';
+import { meshUsesTextureClassification, scoreTextureTiles, textureRetryDelay } from './terrain-tile-runtime.js';
 import { createTextureStreamer } from './terrain-texture-streamer.js';
 import { createTileLifecycle } from './terrain-tile-lifecycle.js';
 
@@ -93,6 +93,12 @@ test('texture retries back off and cap', () => {
   assert.equal(textureRetryDelay(1), 2000);
   assert.equal(textureRetryDelay(2), 3000);
   assert.equal(textureRetryDelay(100), 30000);
+});
+
+test('texture classification signature prevents redundant land mesh rebuilds', () => {
+  const texture = { uuid: 'texture-1' };
+  const mesh = { userData: { oceanColorAssisted: false, oceanTextureSig: 'texture-1' } };
+  assert.equal(meshUsesTextureClassification(mesh, texture), true);
 });
 
 test('texture candidates are filtered and priority sorted', () => {
