@@ -435,10 +435,19 @@ function hit(ev) {
 cv.addEventListener('mousemove', ev => {
   const t = hit(ev);
   if (!t) { tip.style.display = 'none'; return; }
+  const confidence = t.confidence
+    ? (t.confidence.min === t.confidence.max
+      ? `${Object.keys(t.confidence.levels).join('/')} (${t.confidence.min})`
+      : `${t.confidence.min}–${t.confidence.max} · avg ${t.confidence.mean} · ` +
+        Object.entries(t.confidence.levels).map(([name, count]) => `${name}:${count}`).join(' '))
+    : 'none';
   tip.textContent = mode === 'coverage'
     ? `${t.tile} (d${t.depth})`
     : `${t.id} (d${t.depth})\npriority ${t.priority.toFixed(2)} · order ${t.order}` +
-      (t.hasTexture ? ' · tex cached' : '');
+      (t.hasTexture ? ' · tex cached' : '') +
+      `\nterrain ${t.source || 'none'} · heightmap ${t.hasHeightmap ? 'yes' : 'no'}` +
+      `\nconfidence ${confidence}` +
+      (t.geometricError != null ? `\ngeometric error ${t.geometricError.toFixed(2)}m` : '');
   tip.style.left = (ev.clientX + 14) + 'px';
   tip.style.top = (ev.clientY + 10) + 'px';
   tip.style.display = 'block';

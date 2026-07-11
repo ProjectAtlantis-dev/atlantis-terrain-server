@@ -1006,7 +1006,9 @@ def api_tiles():
     tex_fetching = list(_tex_fetching)
   tex_fetching_set = set(tex_fetching)
 
-  fwd_x = math.sin(heading) if heading else 0.0
+  # JS/vehicle convention: heading 0 points north and positive heading turns
+  # toward west, hence east/X is -sin(heading).
+  fwd_x = -math.sin(heading) if heading else 0.0
   fwd_y = math.cos(heading) if heading else 1.0
 
   tile_data = []
@@ -1529,11 +1531,12 @@ def api_terrain_channel(tile_id: str, chan: str):
 
 @app.get("/api/heatmap")
 def api_heatmap():
-  """Pure quadtree grid for the last /api/tiles camera — no heightmaps, just
-  geometry + the same priority math the tile fetcher uses. Drives the heatmap
-  and map layers of webserver/coverage.html. hasTexture marks tiles whose own
-  texture is already cached (safe to pull /api/texture without triggering an
-  upstream fetch)."""
+  """Quadtree grid and cached terrain diagnostics for the last /api/tiles
+  camera. Drives the heatmap in webserver/coverage.html. hasTexture marks
+  tiles whose own texture is already cached (safe to pull /api/texture without
+  triggering an upstream fetch)."""
+  import numpy as np
+  from database import CONFIDENCE, GRID_N, _decompress_uint8
   from tiles import build_lod_tree, get_leaves
 
   cam = _last_camera
@@ -1550,7 +1553,7 @@ def api_heatmap():
   root = build_lod_tree(qx, qy, max_depth=max_depth, lod_factor=lod_factor)
   leaves = get_leaves(root)
 
-  fwd_x = math.sin(heading) if heading else 0.0
+  fwd_x = -math.sin(heading) if heading else 0.0
   fwd_y = math.cos(heading) if heading else 1.0
 
   # Only count permanently cached textures — temporary placeholder sources
@@ -1562,17 +1565,43 @@ def api_heatmap():
     f"SELECT tile_id FROM textures WHERE tile_id IN ({placeholders}) "
     "AND source NOT IN ('sentinel2_crop', 'ancestor_crop', 'ancestor_crop_ratelimit')",
     leaf_ids).fetchall()} if leaf_ids else set()
+  terrain_rows = {r[0]: r[1:] for r in _get_db().execute(
+    f"SELECT tile_id, source, geometric_error, heightmap IS NOT NULL, confidence_map "
+    f"FROM tiles WHERE tile_id IN ({placeholders})",
+    leaf_ids).fetchall()} if leaf_ids else {}
+  confidence_names = {value: name for name, value in reversed(CONFIDENCE.items())}
   tiles = []
   for leaf in leaves:
     bbox = list(leaf.bbox)
     priority = _tile_priority(bbox, qx, qy, fwd_x, fwd_y)
-    tiles.append({
+    tile = {
       "id": leaf.id,
       "bbox": bbox,
       "depth": leaf.depth,
       "priority": math.log(max(priority, 1.0)),
       "hasTexture": leaf.id in texture_ids,
-    })
+    }
+    terrain_row = terrain_rows.get(leaf.id)
+    if terrain_row is not None:
+      source, geometric_error, has_heightmap, confidence_blob = terrain_row
+      tile.update({
+        "source": source,
+        "geometricError": geometric_error,
+        "hasHeightmap": bool(has_heightmap),
+      })
+      if confidence_blob:
+        confidence_map = _decompress_uint8(confidence_blob, (GRID_N, GRID_N))
+        values, counts = np.unique(confidence_map, return_counts=True)
+        tile["confidence"] = {
+          "min": int(values[0]),
+          "max": int(values[-1]),
+          "mean": round(float(confidence_map.mean()), 2),
+          "levels": {
+            confidence_names.get(int(value), str(int(value))): int(count)
+            for value, count in zip(values, counts)
+          },
+        }
+    tiles.append(tile)
 
   # Sort by priority (lowest = closest/hottest) and add render order index
   tiles.sort(key=lambda t: t["priority"])

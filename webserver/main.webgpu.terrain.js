@@ -50,6 +50,9 @@ import {
 import { cloudShadowAerialPerspective } from './webgpu-cloud-shadow-aerial-perspective.js';
 import { buildAssetLibrary } from './procgen/library.ts';
 import { buildTileScatter, disposeTileScatter, updateScatterVisibility, SCATTER_MIN_DEPTH } from './procgen/scatter.ts';
+import { findCoveredTileAncestors } from './tile-coverage.js';
+import { priorityHeading, terrainTilePriority } from './terrain-priority.js';
+import { compassHeading, createTerrainHud, renderGameClock, TERRAIN_HUD_LINKS } from './terrain-hud.js';
 
 const USE_WEBGPU_RENDER_BACKEND = true;
 // Calibrated against the cloudless WebGL reference. WebGL uses exposure 10
@@ -679,76 +682,17 @@ renderBackend.initialize();
 document.body.appendChild(renderer.domElement);
 renderer.domElement.addEventListener('contextmenu', event => event.preventDefault());
 
-const hud = document.createElement('div');
-hud.style.cssText = [
-  'position:absolute',
-  'top:12px',
-  'left:12px',
-  'padding:10px 12px',
-  'background:rgba(0,0,0,0.7)',
-  'color:#dbe5f1',
-  'font:13px/1.45 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace',
-  'border-radius:8px',
-  'pointer-events:none',
-  'z-index:5'
-].join(';');
-document.body.appendChild(hud);
-const HUD_LINKS = {
-  debugLogLink: '/client_log.html',
-  radarHeatmapLink: '/coverage.html?mode=heatmap',
-  pipelineMapLink: '/coverage.html?mode=coverage'
-};
-hud.addEventListener('mousedown', e => {
-  if (e.target.id === 'mapModeLink') {
-    e.stopPropagation();
-    e.preventDefault();
-    toggleMapMode();
-    return;
-  }
-  const url = HUD_LINKS[e.target.id];
-  if (url) {
-    e.stopPropagation();
-    e.preventDefault();
-    window.open(url, '_blank');
-  }
+const { hud, alt, gameClock: gameClockEl } = createTerrainHud({
+  onToggleMapMode: () => toggleMapMode(),
+  onClockAction: action => {
+    if (action === 'rw') _gcRewind();
+    else if (action === 'stop') _gcStop();
+    else if (action === 'play') _gcPlay();
+    else if (action === 'ff') _gcFfwd();
+    requestRender();
+  },
 });
-hud.addEventListener('click', e => {
-  if (e.target.id === 'mapModeLink' || HUD_LINKS[e.target.id]) {
-    e.stopPropagation();
-    e.preventDefault();
-  }
-});
-
-const alt = document.createElement('div');
-alt.style.cssText = [
-  'position:absolute',
-  'right:12px',
-  'bottom:12px',
-  'padding:8px 10px',
-  'background:rgba(0,0,0,0.7)',
-  'color:#8fd0ff',
-  'font:13px/1.35 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace',
-  'border-radius:6px',
-  'pointer-events:none',
-  'z-index:5'
-].join(';');
-document.body.appendChild(alt);
-
-const gameClockEl = document.createElement('div');
-gameClockEl.style.cssText = [
-  'position:absolute',
-  'left:12px',
-  'bottom:12px',
-  'padding:8px 10px',
-  'background:rgba(0,0,0,0.7)',
-  'color:#5af',
-  'font:13px/1.35 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace',
-  'border-radius:6px',
-  'pointer-events:auto',
-  'z-index:5',
-  'user-select:none'
-].join(';');
-document.body.appendChild(gameClockEl);
+const HUD_LINKS = TERRAIN_HUD_LINKS;
 
 // Transport control handlers for game clock HUD
 function _gcRewind() {
@@ -784,18 +728,6 @@ function _gcFfwd() {
   applyDate(currentDate);
   maybeLogWebGPUSun(currentDate, 'clock-forward', true);
 }
-gameClockEl.addEventListener('mousedown', e => {
-  const btn = e.target.closest('button[data-gc]');
-  if (!btn) return;
-  e.preventDefault();
-  e.stopPropagation();
-  const action = btn.dataset.gc;
-  if (action === 'rw') _gcRewind();
-  else if (action === 'stop') _gcStop();
-  else if (action === 'play') _gcPlay();
-  else if (action === 'ff') _gcFfwd();
-  requestRender();
-});
 
 const tileInfoEl = document.createElement('div');
 tileInfoEl.style.cssText = [
@@ -5135,31 +5067,19 @@ function getFogDistance() {
   return Math.min(horizon, 15000 + alt * 8);
 }
 
-// Cosine of the horizontal half-FOV — tiles inside this cone get full priority.
-function getFrustumDotMin() {
-  const vFovRad = camera.fov * Math.PI / 360; // half vertical FOV
-  const hHalf = Math.atan(Math.tan(vFovRad) * camera.aspect);
-  return Math.cos(hHalf) * 0.8; // 20% margin beyond screen edge
-}
-
 function tilePriority(tile) {
-  const cp = Math.cos(controls.pitch);
-  const fwdX = -Math.sin(controls.yaw) * cp;
-  const fwdY = Math.cos(controls.yaw) * cp;
   const rel = camera.position.clone().sub(anchorPosition);
   const camLocalX = rel.dot(east);
   const camLocalY = rel.dot(north);
-  const tcx = (tile.bbox[0] + tile.bbox[2]) / 2;
-  const tcy = (tile.bbox[1] + tile.bbox[3]) / 2;
-  const dx = tcx - camLocalX;
-  const dy = tcy - camLocalY;
-  const dist = Math.sqrt(dx * dx + dy * dy);
-  if (dist <= 0) return 0;
-  // Tiles within 2km always get top priority regardless of look direction
-  if (dist < 2000) return Math.log(Math.max(dist, 1));
-  const dot = (dx * fwdX + dy * fwdY) / dist;
-  const dotMin = getFrustumDotMin();
-  return Math.log(Math.max(dist / Math.max(dot, dotMin), 1));
+  return terrainTilePriority(tile, {
+    cameraX: camLocalX,
+    cameraY: camLocalY,
+    heading: priorityHeading(vehicleControlActive, vehicleHeadingRad, controls.yaw),
+    pitch: controls.pitch,
+    usePitch: !vehicleControlActive,
+    fovDeg: camera.fov,
+    aspect: camera.aspect,
+  });
 }
 
 function updateTextures(tiles) {
@@ -5286,7 +5206,6 @@ function updateTextures(tiles) {
               texCache.set(tid, tex);
               texSource.set(tid, texSrc);
               requestWaterMask(tid);
-              tryEvictParent(tid); // boot parent ASAP if all 4 quad siblings are now cached
               if (deferredTiles.has(tid)) {
                 tileLog(tid, `cached + materialize (was deferred)`);
                 materializeTile(tid, tex);
@@ -5305,6 +5224,9 @@ function updateTextures(tiles) {
                   tileLog(tid, `cached but NO mesh in scene`);
                 }
               }
+              // Coverage must be tested after the arriving texture is visible on
+              // its mesh; before this point the fourth child still looks missing.
+              tryEvictCoveredAncestors(tid);
             }
           });
       })
@@ -5327,43 +5249,23 @@ function updateTextures(tiles) {
   // parents are the ones that suffer most — their children arrive early
   // but the parent hangs around until the next sweep.
   //
-  // Fix: each time a child texture lands and enters texCache, check
-  // whether all 4 siblings in that quad now have textured meshes in scene.
-  // If so, the parent mesh is fully occluded and can be removed
-  // immediately. This is a fast-path supplement — the existing sweep
-  // logic in updateTextures() and fetchTiles() remains as a safety net.
-  function tryEvictParent(childTileId) {
-    const addr = parseTileAddress(childTileId);
-    if (!addr || addr.depth <= 0) return;
-    // Derive parent address: each parent tile covers a 2×2 quad of children.
-    // Integer-dividing the child col/row by 2 gives the parent col/row.
-    const pCol = addr.col >> 1, pRow = addr.row >> 1;
-    const parentId = tileIdFromAddress(addr.depth - 1, pCol, pRow);
-    // Check all 4 children in this quad — bail if any is still missing.
-    const missingSiblings = [];
-    for (let dx = 0; dx < 2; dx++) {
-      for (let dy = 0; dy < 2; dy++) {
-        const sibId = tileIdFromAddress(addr.depth, pCol * 2 + dx, pRow * 2 + dy);
-        const sibMesh = terrainRoot.children.find(c => c.isMesh && c.userData.tileId === sibId);
-        if (!sibMesh?.material?.map) missingSiblings.push(sibId);
-      }
-    }
-    if (missingSiblings.length > 0) {
-      tileLog(parentId, `evict-check — ${missingSiblings.length}/4 siblings still missing: ${missingSiblings.join(', ')} (triggered by ${childTileId})`);
-      return;
-    }
-    // All 4 children are textured and visible — find and remove the parent mesh.
-    let found = false;
+  // Each time a texture becomes visible, walk every resident ancestor and
+  // verify that its complete quadtree area is covered by textured resident
+  // meshes. This handles generation jumps (for example 7 -> 12) and mixed
+  // descendant depths without relying on the latest server response set.
+  function tryEvictCoveredAncestors(childTileId) {
+    const resident = new Map();
     for (const c of terrainRoot.children) {
-      if (c.userData.tileId === parentId) {
-        tileLog(parentId, `evicted — eager (all child meshes textured, triggered by ${childTileId})`);
-        evictTileMesh(c);
-        found = true;
-        break;
-      }
+      if (!c.isMesh || !c.userData.tileId) continue;
+      resident.set(c.userData.tileId, Boolean(c.material?.map));
     }
-    if (!found) {
-      tileLog(parentId, `evict-check — all 4 child meshes textured but parent not in scene (triggered by ${childTileId})`);
+    for (const ancestorId of findCoveredTileAncestors(childTileId, resident)) {
+      const ancestorMesh = terrainRoot.children.find(
+        c => c.isMesh && c.userData.tileId === ancestorId
+      );
+      if (!ancestorMesh) continue;
+      tileLog(ancestorId, `evicted — eager complete descendant coverage (triggered by ${childTileId})`);
+      evictTileMesh(ancestorMesh);
     }
   }
 
@@ -5725,7 +5627,7 @@ async function fetchTiles(lat, lon) {
   fetching = true;
   try {
     const t0 = performance.now();
-    const heading = controls.yaw;
+    const heading = priorityHeading(vehicleControlActive, vehicleHeadingRad, controls.yaw);
     const camLL = getCameraLatLon();
     const camSnapshot = getCameraLogSnapshot(camLL);
     const fetchLat = lat ?? camLL.lat;
@@ -6592,9 +6494,7 @@ function updateHud() {
   const altM = rel.dot(up);
   const speedKmh = Math.hypot(controls.speed, controls.strafeSpeed) * 3.6;
   const headingForHud = vehicleControlActive ? vehicleHeadingRad : controls.yaw;
-  const deg = (((-headingForHud * 180) / Math.PI) % 360 + 360) % 360;
-  const dirs = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW'];
-  const compass = dirs[Math.round(deg / 45) % 8];
+  const { degrees: deg, compass } = compassHeading(headingForHud);
   // Heightmap line — always present, stable width
   const hmPending = _hmMissing + _hmDownloading;
   const passLabel = _loadPass === 1
@@ -6650,20 +6550,7 @@ function updateHud() {
     _lastGameClockSave = _now;
     localStorage.setItem(GAME_CLOCK_STORAGE_KEY, String(gameDate.getTime()));
   }
-  const _mn3 = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
-  const gdMon = _mn3[gameDate.getUTCMonth()];
-  const gdDay = gameDate.getUTCDate();
-  const _nuukTime = gameDate.toLocaleString('en-GB', { timeZone: 'America/Nuuk', hour: '2-digit', minute: '2-digit', hour12: false });
-  const [gdHH, gdMM] = _nuukTime.split(':');
-  const _btnStyle = 'cursor:pointer;padding:0 4px;border:none;background:none;font-size:12px;line-height:1;vertical-align:middle;';
-  const _activeClr = '#5af';
-  const _dimClr = '#666';
-  gameClockEl.innerHTML = `<button data-gc="rw" style="${_btnStyle}color:${_activeClr}" title="−15 min"><i class="fa-solid fa-backward"></i></button>`
-    + ` <b>${gdHH}:${gdMM}</b>`
-    + (useRealtimeGameClock
-      ? `<button data-gc="stop" style="${_btnStyle}color:${_activeClr}" title="Pause"><i class="fa-solid fa-pause"></i></button>`
-      : `<button data-gc="play" style="${_btnStyle}color:${_activeClr}" title="Play"><i class="fa-solid fa-play"></i></button>`)
-    + `<button data-gc="ff" style="${_btnStyle}color:${_activeClr}" title="+15 min"><i class="fa-solid fa-forward"></i></button>`;
+  renderGameClock(gameClockEl, gameDate, useRealtimeGameClock);
 
   hud.innerHTML = [
     '<b>Clouds Terrain Managed Flask UX WIP</b>',
@@ -6973,10 +6860,12 @@ renderer.domElement.addEventListener('mousemove', event => {
   const mesh = hits[0].object;
   showTileBorder(mesh);
   const info = meshDebugSummary(mesh);
-  const overlapLines = hits.slice(0, 12)
-    .filter(hit => hit.object.userData?.tileId)
-    .map(hit => {
-      const row = meshDebugSummary(hit.object);
+  const overlappingMeshes = [...new Map(hits
+    .filter(hit => hit.object.userData?.tileId && hit.object.userData.tileId !== info.tileId)
+    .map(hit => [hit.object.userData.tileId, hit.object])).values()];
+  const overlapLines = overlappingMeshes.slice(0, 12)
+    .map(overlapMesh => {
+      const row = meshDebugSummary(overlapMesh);
       const rsrc = texSource.get(row.tileId) || '';
       return `${row.tileId} ${rsrc || (row.hasTexture ? 'tex' : 'noTex')}`;
     });
@@ -6992,8 +6881,8 @@ renderer.domElement.addEventListener('mousemove', event => {
     `<b style="color:${matHex}">${info.tileId}</b>`,
     `tex: ${info.hasTexture ? 'YES' : 'NO'} ${info.textureSize}  source: ${srcLabel}`,
     seamLabel ? `seam: ${seamLabel}` : null,
-    `<b>overlaps (${hits.length}):</b>`,
-    overlapLines.join('<br>')
+    `<b>overlaps: ${overlappingMeshes.length}</b>`,
+    overlapLines.length > 0 ? overlapLines.join('<br>') : null
   ].filter(Boolean).join('<br>');
   tileInfoEl.style.display = 'block';
 });

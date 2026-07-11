@@ -171,41 +171,51 @@ def _descend_backside(hm, captured):
     return captured
 
 
-BLEND_CELLS = 6  # shore ramp width, in heightmap cells
+def _erode_cliffs(hm, captured):
+    """Reject capture until sea-level flattening has a safe land boundary.
 
+    Every surviving captured sample is written to ``OCEAN_LEVEL_M``. If it
+    touches uncaptured terrain more than ``CLIFF_TOL_M`` higher than that,
+    flattening would manufacture a cliff. Peel that sample from the capture.
+    If the rejected sample is itself high, it becomes the new protected land
+    boundary and erosion continues inward. A low rejected sample is a safe
+    beach/valley, so erosion stops there.
 
-def _blend_flatten(hm, captured):
-    """Rule 3, as an output constraint: flattening must never create cliffs.
-
-    The fake body's valleys behind berms bottom out at 20-45m (still
-    contaminated), so a hard set-to-0 would leave a step at any land
-    boundary. Instead: interior of the capture goes to 0; within
-    BLEND_CELLS of uncaptured LAND the original elevation ramps down —
-    a synthetic beach. Boundaries against true sea don't ramp.
+    The tile edge is neutral because the neighboring tile is unavailable to
+    this pure per-tile function. Cross-tile seeds and edge reconciliation deal
+    with seams separately.
     """
     n = hm.shape[0]
-    dist = np.full((n, n), np.inf)
-    q = deque()
-    land = (hm > OCEAN_LEVEL_M) & ~captured
-    for r, c in zip(*np.nonzero(captured)):
-        for dr, dc in _N4:
-            rr, cc = r + dr, c + dc
-            if 0 <= rr < n and 0 <= cc < n and land[rr, cc]:
-                dist[r, c] = 1.0
-                q.append((r, c))
-                break
+    safe = captured.copy()
+    max_land_elev = OCEAN_LEVEL_M + CLIFF_TOL_M
+    q = deque(zip(*np.nonzero((~safe) & (hm > max_land_elev))))
     while q:
         r, c = q.popleft()
-        d = dist[r, c]
         for dr, dc in _N4:
             rr, cc = r + dr, c + dc
-            if (0 <= rr < n and 0 <= cc < n and captured[rr, cc]
-                    and dist[rr, cc] > d + 1):
-                dist[rr, cc] = d + 1
-                q.append((rr, cc))
-    keep = np.clip(1.0 - (dist - 1.0) / BLEND_CELLS, 0.0, 1.0)
-    keep[~captured] = 1.0
-    return hm * keep
+            if 0 <= rr < n and 0 <= cc < n and safe[rr, cc]:
+                safe[rr, cc] = False
+                if hm[rr, cc] > max_land_elev:
+                    q.append((rr, cc))
+    return safe
+
+
+def _flatten(hm, captured):
+    """Flatten the safety-checked capture to sea level."""
+    out = hm.copy()
+    out[captured] = OCEAN_LEVEL_M
+    return out
+
+
+def _safe_propagation_mask(hm, candidates):
+    """Validate sparse child samples before inserting them into a parent.
+
+    Propagation changes scale: samples that formed a continuous safe shoreline
+    in a child can become isolated sea-level points beside high parent terrain.
+    Treat the proposed parent samples as a fresh capture and apply the same
+    no-cliff invariant at the parent's resolution.
+    """
+    return _erode_cliffs(hm, candidates)
 
 
 def flatten_fake_bathymetry(hm, px, extra_seeds=None):
@@ -233,7 +243,10 @@ def flatten_fake_bathymetry(hm, px, extra_seeds=None):
     captured |= _elongated_islands(hmv, ocean, captured)
     captured = _descend_backside(hmv, captured)
     captured |= _elongated_islands(hmv, ocean, captured)
-    new = _blend_flatten(hmv, captured).astype(np.float32)
+    captured = _erode_cliffs(hmv, captured)
+    if not captured.any():
+        return hm, captured
+    new = _flatten(hmv, captured).astype(np.float32)
     return new, captured
 
 
@@ -298,7 +311,11 @@ def fix_tile_in_db(db, tile_id, jpeg_bytes) -> bool:
         return False
     cm[captured] = CONFIDENCE['bathymetry']
     hm_out = np.where(np.isnan(new_hm), 0.0, new_hm).astype(np.float32)
-    write_tile(db, tile_id, hm_out, cm, row[2], reconcile=True, allow_overwrite=True)
+    # Generic confidence-based reconciliation is not bathymetry-aware: it can
+    # copy a sea-level confidence-7 edge sample into a neighbor beside high
+    # terrain after the mask passed _erode_cliffs. Cross-tile bathymetry is
+    # handled by explicit neighbor seeding; never mutate either tile here.
+    write_tile(db, tile_id, hm_out, cm, row[2], reconcile=False, allow_overwrite=True)
     log_bathy.info(f"[bathy] {tile_id}: flattened {captured.mean():.0%} fake bathymetry")
     return True
 
@@ -345,10 +362,32 @@ def propagate_to_ancestors(db, tile_id) -> int:
         region = hm[r0:r0 + half + 1, c0:c0 + half + 1]
         if np.array_equal(region[mask], sub[mask]):
             break  # already in sync — ancestors above are too
-        region[mask] = sub[mask]
+
+        # A safe continuous child shoreline can subsample to isolated points
+        # at parent resolution. Validate the proposed parent mask against the
+        # unmodified parent terrain before copying any sea-level samples.
+        candidates = np.zeros((GRID_N, GRID_N), dtype=bool)
+        candidate_region = candidates[r0:r0 + half + 1, c0:c0 + half + 1]
+        candidate_region[mask] = True
+        safe = _safe_propagation_mask(hm, candidates)
+        safe_region = safe[r0:r0 + half + 1, c0:c0 + half + 1]
+        accepted = mask & safe_region
+        rejected = int(mask.sum() - accepted.sum())
+        if not accepted.any():
+            log_bathy.info(
+                f"[bathy] {tile_id}: stopped at {pid}; rejected all "
+                f"{int(mask.sum())} propagated samples by cliff guard"
+            )
+            break
+        region[accepted] = sub[accepted]
         cregion = cm[r0:r0 + half + 1, c0:c0 + half + 1]
-        cregion[mask] = np.maximum(cregion[mask], csub_cm[mask])
-        write_tile(db, pid, hm, cm, prow[2], reconcile=True, allow_overwrite=True)
+        cregion[accepted] = np.maximum(cregion[accepted], csub_cm[accepted])
+        write_tile(db, pid, hm, cm, prow[2], reconcile=False, allow_overwrite=True)
+        if rejected:
+            log_bathy.info(
+                f"[bathy] {tile_id}: {pid} rejected {rejected}/"
+                f"{int(mask.sum())} propagated samples by cliff guard"
+            )
         updated += 1
         d, c, r = pd, pc, pr
     if updated:
