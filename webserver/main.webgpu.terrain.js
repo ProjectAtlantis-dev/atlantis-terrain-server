@@ -56,9 +56,10 @@ import { priorityHeading, terrainTilePriority } from './terrain-priority.js';
 import { compassHeading, createTerrainHud, renderGameClock, TERRAIN_HUD_LINKS } from './terrain-hud.js';
 import { installTerrainKeyboardControls, installTerrainPointerControls } from './terrain-controls.js';
 import { stepSuspension, stepVehicleDrive } from './terrain-vehicle.js';
-import { createTileHistory, scoreTextureTiles, terrainFogDistance, terrainVisibilityDistance } from './terrain-tile-runtime.js';
+import { createTileHistory, terrainFogDistance, terrainVisibilityDistance } from './terrain-tile-runtime.js';
 import { createTextureStreamer } from './terrain-texture-streamer.js';
 import { createTerrainMeshRuntime } from './terrain-mesh-runtime.js';
+import { createTerrainTextureController } from './terrain-texture-controller.js';
 
 const USE_WEBGPU_RENDER_BACKEND = true;
 // Calibrated against the cloudless WebGL reference. WebGL uses exposure 10
@@ -4611,6 +4612,21 @@ terrainMeshRuntime = createTerrainMeshRuntime({
   getVehicleDepth: () => vehicleLastContactDepth,
   requestVehicleResnap: requestVehicleTerrainResnap,
 });
+const updateTerrainTextures = createTerrainTextureController({
+  terrainRoot,
+  deferredTiles,
+  textureStreamer,
+  meshRuntime: terrainMeshRuntime,
+  lifecycle: tileLifecycle,
+  priorityForTile: tilePriority,
+  getVisibilityDistance: getTileLoadDistance,
+  isCovered: _coveredByEnhancedParent,
+  applyMaterial: applyTerrainMaterialMode,
+  getWaterMask: tileId => waterMaskCache.get(tileId),
+  isMaterialOverlayActive: () => oceanMapDebugEnabled && controls.mapMode,
+  log: tileLog,
+  onMaterialApplied: requestRender,
+});
 
 // Visibility distance from camera altitude.
 // Geometric horizon: sqrt(2 * R_earth * h), clamped to practical atmosphere limits.
@@ -4639,96 +4655,7 @@ function tilePriority(tile) {
 }
 
 function updateTextures(tiles) {
-  const meshMap = new Map();
-  for (const child of terrainRoot.children) {
-    if (child.userData.tileId) meshMap.set(child.userData.tileId, child);
-  }
-  const visDist = getTileLoadDistance();
-  const TEX_PRIO_MAX = Math.log(visDist); // dynamic visibility cutoff
-  const { tileIds: tileSet, scored } = scoreTextureTiles(tiles, tilePriority, TEX_PRIO_MAX);
-
-  // Materialize deferred tiles that now have cached textures
-  for (const id of [...deferredTiles.keys()]) {
-    const tex = texCache.get(id);
-    if (tex) {
-      materializeTile(id, tex);
-    }
-  }
-
-  // Apply cached textures to existing meshes — always ensure white color
-  // (priority tinting may have changed color since texture was last applied)
-  for (const t of tiles) {
-    if (!t.id) continue;
-    const tex = texCache.get(t.id);
-    if (!tex) continue;
-    requestWaterMask(t.id);
-    let mesh = meshMap.get(t.id);
-    if (!mesh) continue;
-    mesh = rebuildTileMeshWithTexture(mesh, t, tex);
-    meshMap.set(t.id, mesh);
-    const useOceanOverlay = oceanMapDebugEnabled && controls.mapMode;
-    if (!useOceanOverlay && mesh.material.map !== tex) {
-      tileLog(t.id, `apply cached tex (src=${texSource.get(t.id) || '?'})`);
-    }
-    applyTerrainMaterialMode(mesh, tex);
-    mesh.userData.waterMask = waterMaskCache.get(t.id) || null;
-  }
-
-
-
-  // Fire fetches for hottest uncached tiles (priority-sorted by heatmap).
-  // Only count actual HTTP requests (texInflight) against TEX_MAX — NOT
-  // texFetching (202 server-pending). Previously texFetching counted too,
-  // which starved close tiles when many distant tiles were server-pending.
-  // Roll back to the proven inline pump until the extracted streamer has been
-  // load-tested against Flask's bounded texture worker pool.
-  textureStreamer.pump(scored, {
-    isCovered: _coveredByEnhancedParent,
-    onPlaceholder: ({ tileId, texture }) => {
-      const mesh = terrainRoot.children.find(child => child.userData.tileId === tileId);
-      if (mesh) {
-        applyTerrainMaterialMode(mesh, texture);
-        requestRender();
-      }
-    },
-    onTexture: ({ tileId, tile, texture }) => {
-      if (deferredTiles.has(tileId)) {
-        tileLog(tileId, 'cached + materialize (was deferred)');
-        materializeTile(tileId, texture);
-      } else {
-        let mesh = terrainRoot.children.find(child => child.userData.tileId === tileId);
-        if (mesh) {
-          tileLog(tileId, 'cached + applied to existing mesh');
-          mesh = rebuildTileMeshWithTexture(mesh, tile, texture);
-          applyTerrainMaterialMode(mesh, texture);
-          mesh.userData.waterMask = waterMaskCache.get(tileId) || null;
-          requestRender();
-        } else {
-          tileLog(tileId, 'cached but NO mesh in scene');
-        }
-      }
-      tryEvictCoveredAncestors(tileId);
-    },
-  });
-
-  // ── Eager parent eviction ──────────────────────────────────────
-  // Problem: the normal stale-parent sweeps only run on fetchTiles()
-  // and the 1 Hz updateTextures() cycle, so a low-LOD parent (e.g. 11-x)
-  // can linger visually on top of its higher-LOD children (e.g. 12-x)
-  // for up to a full second after all four children are textured.
-  // Because texture fetches are heatmap-sorted (closest-first), nearby
-  // parents are the ones that suffer most — their children arrive early
-  // but the parent hangs around until the next sweep.
-  //
-  // Each time a texture becomes visible, walk every resident ancestor and
-  // verify that its complete quadtree area is covered by textured resident
-  // meshes. This handles generation jumps (for example 7 -> 12) and mixed
-  // descendant depths without relying on the latest server response set.
-  function tryEvictCoveredAncestors(childTileId) {
-    tileLifecycle.evictCoveredAncestors(childTileId);
-  }
-
-  tileLifecycle.sweepStaleParents(tiles, tileSet);
+  updateTerrainTextures(tiles);
 }
 
 // --- Deferred enhancement (idle-time upgrade) ---
