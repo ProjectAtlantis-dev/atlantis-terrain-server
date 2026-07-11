@@ -361,6 +361,11 @@ document.getElementById('backMapBtn').addEventListener('click', () => {
 });
 
 window.addEventListener('keydown', ev => {
+  if (ev.code === 'KeyH') {
+    ev.preventDefault();
+    goBack();
+    return;
+  }
   if (ev.code === 'Escape') {
     if (viewer.classList.contains('open')) closeViewer();
     else goBack();

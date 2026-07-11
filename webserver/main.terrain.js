@@ -5560,7 +5560,7 @@ function updateHud() {
       : '',
     '<span id="mapModeLink" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">map mode</span> (M), R reset · <span id="debugLogLink" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">debug log</span>'
     + ' · <span id="pipelineMapLink" title="2D radar in pipeline-map mode — click any tile to open its tile inspector" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">pipeline map</span> (P)'
-    + ' · <span id="radarHeatmapLink" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">heatmap</span>'
+    + ' · <span id="radarHeatmapLink" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">heatmap</span> (H)'
   ].join('<br>');
   alt.textContent =
     `${altM.toFixed(0)}m / ${(altM * 3.28084).toFixed(0)}ft  ${deg.toFixed(0)}° ${compass}` +
@@ -5650,6 +5650,7 @@ installTerrainKeyboardControls({
   onToggleGmaps: toggleGmapsPanel,
   onToggleMap: toggleMapMode,
   onOpenPipeline: () => window.open(HUD_LINKS.pipelineMapLink, '_blank'),
+  onOpenHeatmap: () => window.open(HUD_LINKS.radarHeatmapLink, '_blank'),
   onReset: resetView,
   onHouseAction: load => load
     ? loadHouseModel('keyboard')
