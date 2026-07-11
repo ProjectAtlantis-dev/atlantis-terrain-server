@@ -29,6 +29,10 @@ import { buildTileScatter, disposeTileScatter, updateScatterVisibility, SCATTER_
 import { findCoveredTileAncestors } from './tile-coverage.js';
 import { priorityHeading, terrainTilePriority } from './terrain-priority.js';
 import { compassHeading, createTerrainHud, renderGameClock, TERRAIN_HUD_LINKS } from './terrain-hud.js';
+import { installTerrainKeyboardControls, installTerrainPointerControls } from './terrain-controls.js';
+import { stepSuspension, stepVehicleDrive } from './terrain-vehicle.js';
+import { createTileHistory, scoreTextureTiles, terrainFogDistance, terrainVisibilityDistance, textureRetryDelay } from './terrain-tile-runtime.js';
+import { createTextureStreamer } from './terrain-texture-streamer.js';
 
 // The main view is controlled entirely through its UI. Discard stale query
 // parameters instead of exposing URL state that does not stay in sync.
@@ -2287,25 +2291,16 @@ function setVehicleGroundTarget(nextZ, options = {}) {
 
 function updateVehicleSuspension(dt) {
   if (!vehicleLoaded || !Number.isFinite(vehicleGroundZTarget)) return;
-  const stepDt = Math.min(0.05, Math.max(0.001, dt));
-  const omega = 2 * Math.PI * VEHICLE_SUSPENSION_HZ;
-  const stiffness = omega * omega;
-  const damping = 2 * VEHICLE_SUSPENSION_DAMPING_RATIO * omega;
-  const error = vehicleGroundZTarget - vehicleGroup.position.z;
-  const accel = stiffness * error - damping * vehicleVerticalVelocity;
-  vehicleVerticalVelocity += accel * stepDt;
-  vehicleVerticalVelocity = THREE.MathUtils.clamp(
-    vehicleVerticalVelocity,
-    -VEHICLE_SUSPENSION_MAX_VEL,
-    VEHICLE_SUSPENSION_MAX_VEL
-  );
-  vehicleGroup.position.z += vehicleVerticalVelocity * stepDt;
-  if (Math.abs(error) < 0.002 && Math.abs(vehicleVerticalVelocity) < 0.01) {
-    vehicleGroup.position.z = vehicleGroundZTarget;
-    vehicleVerticalVelocity = 0;
-  }
+  const suspension = stepSuspension({
+    dt, position: vehicleGroup.position.z, target: vehicleGroundZTarget,
+    velocity: vehicleVerticalVelocity, frequency: VEHICLE_SUSPENSION_HZ,
+    dampingRatio: VEHICLE_SUSPENSION_DAMPING_RATIO,
+    maxVelocity: VEHICLE_SUSPENSION_MAX_VEL,
+  });
+  vehicleGroup.position.z = suspension.position;
+  vehicleVerticalVelocity = suspension.velocity;
   updateVehicleOrientationTargetFromGround();
-  const orientationAlpha = 1 - Math.exp(-VEHICLE_ORIENTATION_RESPONSE * stepDt);
+  const orientationAlpha = 1 - Math.exp(-VEHICLE_ORIENTATION_RESPONSE * suspension.stepDt);
   vehicleGroup.quaternion.slerp(vehicleOrientationTargetQuat, orientationAlpha);
   vehicleMarker.position.z = vehicleGroup.position.z + HOUSE_MARKER_BASE_LIFT;
 }
@@ -4433,14 +4428,10 @@ function markMissing(missing, downloading) {
 
 // --- Deferred tile system ---
 const deferredTiles = new Map();
-const tileHistory = new Map();
-function tileLog(tileId, msg) {
-  if (!tileHistory.has(tileId)) tileHistory.set(tileId, []);
-  const passTag = _loadPass === 1 ? '[P1-preview]' : '[P2-full]';
-  const ts = (performance.now() / 1000).toFixed(1);
-  tileHistory.get(tileId).push(`${ts}s ${passTag} ${msg}`);
-  enqueueClientLog('debug', 'tile', { tileId, pass: _loadPass, msg, ts: `${ts}s` });
-}
+const { history: tileHistory, log: tileLog } = createTileHistory({
+  getPass: () => _loadPass,
+  emit: details => enqueueClientLog('debug', 'tile', details),
+});
 
 function requestBathyMask(tid) {
   if (bathyFixMaskCache.has(tid) || bathyFixInflight.has(tid)) return;
@@ -4581,67 +4572,34 @@ function materializeTile(tileId, tex) {
 
 // --- Texture streaming ---
 
-const texCache = new Map();
-const texSource = new Map();
-const texInflight = new Map();
-const texFetching = new Set();
-const texRetryAtMs = new Map();
-const texRetryCount = new Map();  // tid -> number of consecutive 202 retries
-const waterMaskCache = new Map();
-const waterMaskInflight = new Map();
 const ENABLE_WATER_MASKS = false;
 const TEX_MAX = 120; // max concurrent HTTP texture requests (texFetching 202s don't count)
 const TEX_RETRY_202_BASE_MS = 2000;   // initial 202 retry delay
 const TEX_RETRY_202_MAX_MS = 30000;   // cap backoff at 30s
 const TEX_RETRY_ERROR_MS = 3000;
 const TEX_REPOLL_BATCH = 8;           // max 202 re-polls fired per frame
-const _ancestorLogged = new Set();
-let _texV = Date.now();
-
-function requestWaterMask(tileId) {
-  if (!ENABLE_WATER_MASKS) return;
-  if (!tileId) return;
-  if (waterMaskCache.has(tileId) || waterMaskInflight.has(tileId)) return;
-  const ac = new AbortController();
-  waterMaskInflight.set(tileId, ac);
-  fetch(`/api/watermask/${tileId}.png?v=${_texV}`, { signal: ac.signal })
-    .then(r => {
-      waterMaskInflight.delete(tileId);
-      if (r.status === 202 || !r.ok) return null;
-      return r.blob();
-    })
-    .then(blob => {
-      if (!blob) return;
-      return createImageBitmap(blob, { imageOrientation: 'flipY' })
-        .then(bmp => {
-          const tex = new THREE.Texture(bmp);
-          tex.flipY = false;
-          tex.colorSpace = THREE.NoColorSpace;
-          tex.needsUpdate = true;
-          waterMaskCache.set(tileId, tex);
-        });
-    })
-    .catch(err => {
-      waterMaskInflight.delete(tileId);
-      if (err.name !== 'AbortError') console.warn(`[WATER MASK] ${tileId}:`, err.message);
-    });
-}
+const textureStreamer = createTextureStreamer({
+  log: tileLog, recolor: _recolor, enableWaterMasks: ENABLE_WATER_MASKS,
+  maxInflight: TEX_MAX, repollBatch: TEX_REPOLL_BATCH,
+  retryBaseMs: TEX_RETRY_202_BASE_MS, retryMaxMs: TEX_RETRY_202_MAX_MS,
+  retryErrorMs: TEX_RETRY_ERROR_MS,
+});
+const {
+  texCache, texSource, texInflight, texFetching, texRetryAtMs, texRetryCount,
+  waterMaskCache, waterMaskInflight, ancestorLogged: _ancestorLogged,
+  requestWaterMask,
+} = textureStreamer;
+let _texV = textureStreamer.version;
 
 // Visibility distance from camera altitude.
 // Geometric horizon: sqrt(2 * R_earth * h), clamped to practical atmosphere limits.
 // Low alt → ~15km (haze-limited), high alt → scales toward horizon.
 function getTileLoadDistance() {
-  const alt = Math.max(25, getCameraLatLon().alt);
-  const R = 6371000;
-  const horizon = Math.sqrt(2 * R * alt);
-  return Math.min(horizon, 30000 + alt * 12);
+  return terrainVisibilityDistance(getCameraLatLon().alt);
 }
 
 function getFogDistance() {
-  const alt = Math.max(25, getCameraLatLon().alt);
-  const R = 6371000;
-  const horizon = Math.sqrt(2 * R * alt);
-  return Math.min(horizon, 15000 + alt * 8);
+  return terrainFogDistance(getCameraLatLon().alt);
 }
 
 function tilePriority(tile) {
@@ -4666,15 +4624,7 @@ function updateTextures(tiles) {
   }
   const visDist = getTileLoadDistance();
   const TEX_PRIO_MAX = Math.log(visDist); // dynamic visibility cutoff
-  const tileSet = new Set();
-  const scored = [];
-  for (const t of tiles) {
-    if (!t.id || !t.bbox) continue;
-    tileSet.add(t.id);
-    const prio = tilePriority(t);
-    if (prio <= TEX_PRIO_MAX) scored.push({ tile: t, prio });
-  }
-  scored.sort((a, b) => a.prio - b.prio);
+  const { tileIds: tileSet, scored } = scoreTextureTiles(tiles, tilePriority, TEX_PRIO_MAX);
 
   // Materialize deferred tiles that now have cached textures
   for (const id of [...deferredTiles.keys()]) {
@@ -4737,7 +4687,7 @@ function updateTextures(tiles) {
         if (r.status === 202) {
           const n = (texRetryCount.get(tid) || 0) + 1;
           texRetryCount.set(tid, n);
-          const delay = Math.min(TEX_RETRY_202_BASE_MS * Math.pow(1.5, n - 1), TEX_RETRY_202_MAX_MS);
+          const delay = textureRetryDelay(n, TEX_RETRY_202_BASE_MS, TEX_RETRY_202_MAX_MS);
           tileLog(tid, `fetch -> 202 (server fetching, retry #${n} in ${(delay/1000).toFixed(1)}s)`);
           texFetching.add(tid);
           texRetryAtMs.set(tid, performance.now() + delay);
@@ -4763,7 +4713,7 @@ function updateTextures(tiles) {
             if (isAncestorCrop) {
               const n = (texRetryCount.get(tid) || 0) + 1;
               texRetryCount.set(tid, n);
-              const delay = Math.min(TEX_RETRY_202_BASE_MS * Math.pow(1.5, n - 1), TEX_RETRY_202_MAX_MS);
+              const delay = textureRetryDelay(n, TEX_RETRY_202_BASE_MS, TEX_RETRY_202_MAX_MS);
               tileLog(tid, `ancestor crop from ${ancestorHeader} — placeholder applied, retry #${n} in ${(delay/1000).toFixed(1)}s`);
               _ancestorLogged.add(tid);
               texFetching.add(tid);
@@ -5820,43 +5770,18 @@ function updateMovement(dt) {
       return;
     }
     const steer = (leftPressed ? 1 : 0) + (rightPressed ? -1 : 0);
-    if (steer !== 0) {
-      vehicleHeadingRad += steer * VEHICLE_STEER_SPEED * dt;
-    }
     const drive = (forwardPressed ? 1 : 0) + (backPressed ? -1 : 0);
-    // Slope gravity: project downhill direction onto vehicle forward axis.
-    // groundNormal.z ≈ 1 on flat ground; x/y components point "uphill" in local space.
-    // Dot with forward gives slope component: negative = uphill, positive = downhill.
-    const slopeForwardComponent = -(
-      vehicleGroundNormal.x * (-Math.sin(vehicleHeadingRad)) +
-      vehicleGroundNormal.y * Math.cos(vehicleHeadingRad)
-    );
-    const VEHICLE_SLOPE_GRAVITY = 6.0; // m/s² at 90° slope (~60% of real gravity)
-    const slopeAccel = slopeForwardComponent * VEHICLE_SLOPE_GRAVITY;
-    // Friction always opposes current motion; slope always pushes downhill.
-    const friction = vehicleSpeed > 0 ? -VEHICLE_BRAKE
-                   : vehicleSpeed < 0 ?  VEHICLE_BRAKE
-                   : 0;
-    if (drive !== 0) {
-      vehicleSpeed += (drive * VEHICLE_ACCEL + slopeAccel) * dt;
-    } else {
-      const coastAccel = slopeAccel + friction;
-      const prevSpeed = vehicleSpeed;
-      vehicleSpeed += coastAccel * dt;
-      // Only let friction stop motion, not reverse it (slope CAN reverse it)
-      if (prevSpeed > 0 && vehicleSpeed < 0 && slopeAccel >= 0) vehicleSpeed = 0;
-      if (prevSpeed < 0 && vehicleSpeed > 0 && slopeAccel <= 0) vehicleSpeed = 0;
-      // Slope can start rolling from standstill
-      if (prevSpeed === 0) vehicleSpeed = slopeAccel * dt;
-    }
-    vehicleSpeed = Math.max(-VEHICLE_DRIVE_SPEED, Math.min(VEHICLE_DRIVE_SPEED, vehicleSpeed));
+    const driveStep = stepVehicleDrive({
+      dt, heading: vehicleHeadingRad, speed: vehicleSpeed, steer, drive,
+      groundNormalX: vehicleGroundNormal.x, groundNormalY: vehicleGroundNormal.y,
+      acceleration: VEHICLE_ACCEL, brake: VEHICLE_BRAKE,
+      steerSpeed: VEHICLE_STEER_SPEED, maxSpeed: VEHICLE_DRIVE_SPEED,
+    });
+    vehicleHeadingRad = driveStep.heading;
+    vehicleSpeed = driveStep.speed;
     if (vehicleSpeed !== 0 || steer !== 0) {
-      const heading = vehicleHeadingRad;
-      const forwardX = -Math.sin(heading);
-      const forwardY = Math.cos(heading);
-      const driveDist = vehicleSpeed * dt;
-      vehicleGroup.position.x += forwardX * driveDist;
-      vehicleGroup.position.y += forwardY * driveDist;
+      vehicleGroup.position.x += driveStep.deltaX;
+      vehicleGroup.position.y += driveStep.deltaY;
       vehicleMarker.position.x = vehicleGroup.position.x;
       vehicleMarker.position.y = vehicleGroup.position.y;
       vehicleSnapPending = true;
@@ -6101,8 +6026,6 @@ function resetView() {
 }
 
 let driftMode = false;
-let _lastForwardTapTime = 0;
-const DOUBLE_TAP_MS = 300;
 
 function toggleMapMode() {
   controls.mapMode = !controls.mapMode;
@@ -6126,113 +6049,44 @@ function toggleMapMode() {
   }
 }
 
-window.addEventListener('keydown', event => {
-  if (event.target.tagName === 'TEXTAREA' || event.target.tagName === 'INPUT') return;
-  controls.keys[event.code] = true;
-  if ((event.code === 'KeyW' || event.code === 'ArrowUp') && !event.repeat) {
-    const now = performance.now();
-    if (now - _lastForwardTapTime < DOUBLE_TAP_MS) {
-      driftMode = !driftMode;
-      console.log(`[drift] ${driftMode ? 'ON' : 'OFF'}`);
-      _lastForwardTapTime = 0;
-    } else {
-      _lastForwardTapTime = now;
-    }
-  }
-  if (event.code === 'Escape' && !event.repeat) {
-    if (vehicleControlActive) {
-      saveVehicleState('escape', {
-        snapToGround: true,
-        requireGroundedZ: false,
-        bypassSnapThrottle: true,
-      });
-      setVehicleControlActive(false, 'escape', { skipExitSave: true });
-      controls.keys[event.code] = false;
-      return;
-    }
-  }
-  if (event.code === 'KeyG' && !event.repeat) {
-    toggleGmapsPanel();
-    return;
-  }
-  if (event.code === 'KeyM' && !event.repeat) {
-    toggleMapMode();
-  }
-  if (event.code === 'KeyP' && !event.repeat) {
-    // Pipeline map: the radar (coverage.html) in coverage mode — click a
-    // tile to open its tile inspector (pipeline.html).
-    window.open(HUD_LINKS.pipelineMapLink, '_blank');
-  }
-  if (event.code === 'KeyR' && !event.repeat) {
-    resetView();
-  }
-  if (event.code === 'KeyH' && !event.repeat) {
-    if (event.shiftKey) {
-      loadHouseModel('keyboard');
-    } else {
-      setHousesRuntimeVisible(!housesRuntimeVisible, 'keyboard');
-    }
-  }
-  if (event.code === 'KeyL' && !event.repeat && vehicleControlActive) {
-    for (const hl of vehicleHeadlightSpots) hl.visible = !hl.visible;
-  }
+installTerrainKeyboardControls({
+  controls,
+  isVehicleActive: () => vehicleControlActive,
+  onForwardDoubleTap: () => {
+    driftMode = !driftMode;
+    console.log(`[drift] ${driftMode ? 'ON' : 'OFF'}`);
+  },
+  onEscapeVehicle: () => {
+    saveVehicleState('escape', { snapToGround: true, requireGroundedZ: false, bypassSnapThrottle: true });
+    setVehicleControlActive(false, 'escape', { skipExitSave: true });
+  },
+  onToggleGmaps: toggleGmapsPanel,
+  onToggleMap: toggleMapMode,
+  onOpenPipeline: () => window.open(HUD_LINKS.pipelineMapLink, '_blank'),
+  onReset: resetView,
+  onHouseAction: load => load
+    ? loadHouseModel('keyboard')
+    : setHousesRuntimeVisible(!housesRuntimeVisible, 'keyboard'),
+  onToggleHeadlights: () => {
+    for (const light of vehicleHeadlightSpots) light.visible = !light.visible;
+  },
 });
 
-window.addEventListener('keyup', event => {
-  controls.keys[event.code] = false;
-});
-
-renderer.domElement.addEventListener('mousedown', event => {
-  controls.dragging = true;
-  controls.dragButton = event.button;
-});
-
-window.addEventListener('mouseup', () => {
-  controls.dragging = false;
-  controls.dragButton = 0;
-});
-
-window.addEventListener('mousemove', event => {
-  if (!controls.dragging) {
-    return;
-  }
-  if (controls.mapMode) {
-    if (controls.dragButton === 2) {
-      const panStep = controls.mapZoom * MOUSE_SENS * MAP_PAN_FACTOR;
-      const dx = -event.movementX * panStep;
-      const dy = event.movementY * panStep;
-      const cosY = Math.cos(controls.yaw);
-      const sinY = Math.sin(controls.yaw);
-      controls.mapPanEast  += dx * cosY + dy * sinY;
-      controls.mapPanNorth += -dx * sinY + dy * cosY;
-      updateMapCamera();
-      return;
-    }
-    const cx = window.innerWidth / 2;
-    const cy = window.innerHeight / 2;
-    const prevX = event.clientX - event.movementX;
-    const prevY = event.clientY - event.movementY;
-    const prevAngle = Math.atan2(prevX - cx, -(prevY - cy));
-    const currAngle = Math.atan2(event.clientX - cx, -(event.clientY - cy));
-    let dAngle = currAngle - prevAngle;
-    if (dAngle > Math.PI) dAngle -= 2 * Math.PI;
-    if (dAngle < -Math.PI) dAngle += 2 * Math.PI;
-    controls.yaw += dAngle;
-    return;
-  }
-  if (vehicleControlActive) {
-    vehicleCameraOrbitYaw -= event.movementX * VEHICLE_CAMERA_ORBIT_SENS;
-    vehicleCameraOrbitPitch += event.movementY * VEHICLE_CAMERA_ORBIT_SENS;
+installTerrainPointerControls({
+  element: renderer.domElement,
+  controls,
+  mouseSensitivity: MOUSE_SENS,
+  mapPanFactor: MAP_PAN_FACTOR,
+  isVehicleActive: () => vehicleControlActive,
+  onVehicleOrbit: (movementX, movementY) => {
+    vehicleCameraOrbitYaw -= movementX * VEHICLE_CAMERA_ORBIT_SENS;
     vehicleCameraOrbitPitch = THREE.MathUtils.clamp(
-      vehicleCameraOrbitPitch,
+      vehicleCameraOrbitPitch + movementY * VEHICLE_CAMERA_ORBIT_SENS,
       VEHICLE_CAMERA_ORBIT_PITCH_MIN,
-      VEHICLE_CAMERA_ORBIT_PITCH_MAX
+      VEHICLE_CAMERA_ORBIT_PITCH_MAX,
     );
-    return;
-  }
-  controls.yaw += event.movementX * MOUSE_SENS;
-  controls.pitch += event.movementY * MOUSE_SENS;
-  controls.pitch = Math.max(-1.4, Math.min(1.2, controls.pitch));
+  },
+  onMapCameraChanged: updateMapCamera,
 });
 
 renderer.domElement.addEventListener('pointerdown', event => {
