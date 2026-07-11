@@ -12,6 +12,9 @@ export function createTextureStreamer({
   retryMaxMs = 30000,
   retryErrorMs = 3000,
   onWaterMask = () => {},
+  fetchImpl = (...args) => fetch(...args),
+  decodeImage = (...args) => createImageBitmap(...args),
+  now = () => performance.now(),
 }) {
   const texCache = new Map();
   const texSource = new Map();
@@ -28,13 +31,13 @@ export function createTextureStreamer({
     if (!enableWaterMasks || !tileId || waterMaskCache.has(tileId) || waterMaskInflight.has(tileId)) return;
     const controller = new AbortController();
     waterMaskInflight.set(tileId, controller);
-    fetch(`/api/watermask/${tileId}.png?v=${version}`, { signal: controller.signal })
+    fetchImpl(`/api/watermask/${tileId}.png?v=${version}`, { signal: controller.signal })
       .then(response => {
         waterMaskInflight.delete(tileId);
         if (response.status === 202 || !response.ok) return null;
         return response.blob();
       })
-      .then(blob => blob && createImageBitmap(blob, { imageOrientation: 'flipY' }))
+      .then(blob => blob && decodeImage(blob, { imageOrientation: 'flipY' }))
       .then(bitmap => {
         if (!bitmap) return;
         const texture = new THREE.Texture(bitmap);
@@ -51,24 +54,24 @@ export function createTextureStreamer({
   }
 
   function pump(scored, { isCovered, onPlaceholder, onTexture }) {
-    const now = performance.now();
+    const currentTime = now();
     let repolls = repollBatch;
     for (const { tile } of scored) {
       if (texInflight.size >= maxInflight) break;
       const tileId = tile.id;
       if (texCache.has(tileId) || texInflight.has(tileId)) continue;
       if (texFetching.has(tileId)) {
-        if ((texRetryAtMs.get(tileId) ?? 0) > now || repolls <= 0) continue;
+        if ((texRetryAtMs.get(tileId) ?? 0) > currentTime || repolls <= 0) continue;
         repolls -= 1;
         texFetching.delete(tileId);
       }
-      if ((texRetryAtMs.get(tileId) ?? 0) > now) continue;
+      if ((texRetryAtMs.get(tileId) ?? 0) > currentTime) continue;
       texRetryAtMs.delete(tileId);
       if (isCovered(tile)) continue;
 
       const controller = new AbortController();
       texInflight.set(tileId, controller);
-      fetch(`/api/texture/${tileId}.jpg?v=${version}${recolor ? '&stage=colorized' : ''}`, { signal: controller.signal })
+      fetchImpl(`/api/texture/${tileId}.jpg?v=${version}${recolor ? '&stage=colorized' : ''}`, { signal: controller.signal })
         .then(response => {
           texInflight.delete(tileId);
           if (response.status === 202) {
@@ -77,7 +80,7 @@ export function createTextureStreamer({
             const delay = textureRetryDelay(attempt, retryBaseMs, retryMaxMs);
             log(tileId, `fetch -> 202 (server fetching, retry #${attempt} in ${(delay / 1000).toFixed(1)}s)`);
             texFetching.add(tileId);
-            texRetryAtMs.set(tileId, performance.now() + delay);
+            texRetryAtMs.set(tileId, now() + delay);
             return null;
           }
           if (!response.ok) {
@@ -87,7 +90,7 @@ export function createTextureStreamer({
           const ancestorId = response.headers.get('X-Tex-Ancestor');
           const source = response.headers.get('X-Tex-Source') || '';
           return response.blob()
-            .then(blob => createImageBitmap(blob, { imageOrientation: 'flipY' }))
+            .then(blob => decodeImage(blob, { imageOrientation: 'flipY' }))
             .then(bitmap => ({ bitmap, ancestorId, source }));
         })
         .then(result => {
@@ -107,7 +110,7 @@ export function createTextureStreamer({
             log(tileId, `ancestor crop from ${ancestorId} — placeholder applied, retry #${attempt} in ${(delay / 1000).toFixed(1)}s)`);
             ancestorLogged.add(tileId);
             texFetching.add(tileId);
-            texRetryAtMs.set(tileId, performance.now() + delay);
+            texRetryAtMs.set(tileId, now() + delay);
             onPlaceholder({ tileId, tile, texture, ancestorId });
             return;
           }
@@ -120,7 +123,7 @@ export function createTextureStreamer({
         })
         .catch(error => {
           texInflight.delete(tileId);
-          texRetryAtMs.set(tileId, performance.now() + retryErrorMs);
+          texRetryAtMs.set(tileId, now() + retryErrorMs);
           if (error.name !== 'AbortError') {
             log(tileId, `fetch error: ${error.message} (retry in ${retryErrorMs}ms)`);
             console.warn(`[TEX] ${tileId}:`, error.message);

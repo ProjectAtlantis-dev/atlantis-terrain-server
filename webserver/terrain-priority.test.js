@@ -10,6 +10,8 @@ import { compassHeading } from './terrain-hud.js';
 import { applyMapDrag } from './terrain-controls.js';
 import { stepSuspension, stepVehicleDrive } from './terrain-vehicle.js';
 import { scoreTextureTiles, textureRetryDelay } from './terrain-tile-runtime.js';
+import { createTextureStreamer } from './terrain-texture-streamer.js';
+import { createTileLifecycle } from './terrain-tile-lifecycle.js';
 
 test('cardinal headings use the vehicle convention', () => {
   const cases = [
@@ -102,4 +104,68 @@ test('texture candidates are filtered and priority sorted', () => {
   const result = scoreTextureTiles(tiles, tile => tile.priority, 10);
   assert.deepEqual(result.scored.map(item => item.tile.id), ['hot', 'far']);
   assert.deepEqual([...result.tileIds], ['far', 'hot', 'cold']);
+});
+
+test('shared texture pump records HTTP 202 retry state', async () => {
+  const streamer = createTextureStreamer({
+    log: () => {},
+    fetchImpl: async () => ({ status: 202, ok: false }),
+    now: () => 100,
+  });
+  streamer.pump([{ tile: { id: '12-1-2', bbox: [0, 0, 1, 1] } }], {
+    isCovered: () => false,
+    onPlaceholder: () => assert.fail('unexpected placeholder'),
+    onTexture: () => assert.fail('unexpected texture'),
+  });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(streamer.texFetching.has('12-1-2'), true);
+  assert.equal(streamer.texRetryCount.get('12-1-2'), 1);
+  assert.equal(streamer.texRetryAtMs.get('12-1-2'), 2100);
+});
+
+test('shared texture pump caches successful exact texture', async () => {
+  let completed = null;
+  const streamer = createTextureStreamer({
+    log: () => {},
+    fetchImpl: async () => ({
+      status: 200,
+      ok: true,
+      headers: { get: name => name === 'X-Tex-Source' ? 'dataforsyningen' : null },
+      blob: async () => ({}),
+    }),
+    decodeImage: async () => ({ width: 256, height: 256 }),
+  });
+  streamer.pump([{ tile: { id: '12-3-4', bbox: [0, 0, 1, 1] } }], {
+    isCovered: () => false,
+    onPlaceholder: () => assert.fail('unexpected placeholder'),
+    onTexture: result => { completed = result; },
+  });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(streamer.texSource.get('12-3-4'), 'dataforsyningen');
+  assert.equal(completed.tileId, '12-3-4');
+});
+
+test('shared lifecycle keeps parent until all four quadrants are textured', () => {
+  const parent = {
+    isMesh: true,
+    userData: { tileId: '10-1-1', bbox: [0, 0, 10, 10] },
+    material: { map: null, dispose() {} },
+    geometry: { dispose() {} },
+  };
+  const children = ['11-2-2', '11-2-3', '11-3-2', '11-3-3'].map(tileId => ({
+    isMesh: true, userData: { tileId },
+    material: { map: {}, dispose() {} }, geometry: { dispose() {} },
+  }));
+  const root = {
+    children: [parent, children[0]],
+    remove(mesh) { this.children = this.children.filter(item => item !== mesh); },
+    add(mesh) { this.children.push(mesh); },
+  };
+  const lifecycle = createTileLifecycle({
+    terrainRoot: root, disposeScatter: () => {}, log: () => {},
+  });
+  assert.equal(lifecycle.sweepStaleParents([], new Set(['11-2-2'])), 0);
+  root.children.push(...children.slice(1));
+  assert.equal(lifecycle.sweepStaleParents([], new Set(children.map(c => c.userData.tileId))), 1);
+  assert.deepEqual(root.children, children);
 });
