@@ -129,10 +129,26 @@ export function createTextureStreamer({
     }
   }
 
+  function invalidate(tileId) {
+    texInflight.get(tileId)?.abort();
+    waterMaskInflight.get(tileId)?.abort();
+    texInflight.delete(tileId);
+    waterMaskInflight.delete(tileId);
+    texFetching.delete(tileId);
+    texRetryAtMs.delete(tileId);
+    texRetryCount.delete(tileId);
+    ancestorLogged.delete(tileId);
+    texCache.delete(tileId);
+    texSource.delete(tileId);
+    waterMaskCache.delete(tileId);
+    version = Date.now();
+    return version;
+  }
+
   return {
     texCache, texSource, texInflight, texFetching, texRetryAtMs, texRetryCount,
     waterMaskCache, waterMaskInflight, ancestorLogged,
-    requestWaterMask, pump,
+    requestWaterMask, pump, invalidate,
     get version() { return version; },
     bumpVersion() { version = Date.now(); return version; },
   };

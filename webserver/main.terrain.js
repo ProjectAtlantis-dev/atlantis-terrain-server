@@ -682,11 +682,9 @@ function showTileMenu(x, y, tileId, source) {
         .then(r => r.json())
         .then(data => {
           if (data.ok) {
-            texCache.delete(tileId);
-            texSource.delete(tileId);
-            waterMaskCache.delete(tileId);
+            textureStreamer.invalidate(tileId);
             _lastEnhancedKey = '';
-            _texV = Date.now();   // bust browser cache so re-fetch gets the reverted texture
+            _texV = textureStreamer.version;
             for (const child of terrainRoot.children) {
               if (child.userData.tileId === tileId) {
                 if (child.material.map) {
