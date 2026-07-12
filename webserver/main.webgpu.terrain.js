@@ -55,7 +55,7 @@ import { createTerrainOceanClassifier } from './classifier/terrain-ocean.js';
 import { priorityHeading, terrainTilePriority } from './terrain-priority.js';
 import { compassHeading, createTerrainHud, renderGameClock, TERRAIN_HUD_LINKS } from './terrain-hud.js';
 import { installTerrainKeyboardControls, installTerrainPointerControls } from './terrain-controls.js';
-import { stepSuspension, stepVehicleDrive } from './terrain-vehicle.js';
+import { normalizeSavedVehicleState, stepSuspension, stepVehicleDrive, vehicleLocalToLatLon as terrainVehicleLocalToLatLon, vehicleStateSnapshot } from './terrain-vehicle.js';
 import { createTileHistory, terrainFogDistance, terrainVisibilityDistance, tileDepthFromId } from './terrain-tile-runtime.js';
 import { createTextureStreamer, rendererTextureAnisotropy } from './terrain-texture-streamer.js';
 import { createTerrainMeshRuntime } from './terrain-mesh-runtime.js';
@@ -72,6 +72,7 @@ import { createTerrainClientLogger } from './terrain-client-logging.js';
 import { createTerrainFpsCounter } from './terrain-fps-counter.js';
 import { loadTerrainStartupAssets } from './terrain-startup-assets.js';
 import { createTerrainAtmosphereTextureRuntime } from './terrain-atmosphere-textures.js';
+import { createTerrainTuningControls } from './terrain-tuning-controls.js';
 import { createTerrainHouseConfiguration, createTerrainHouseMarkerRuntime, createTerrainHouseModelController, disposeTerrainHouseTree, markTerrainHousesNeedSnap, terrainHouseLocalPosition, terrainHouseShadowCoverage, terrainHouseZSummary } from './terrain-house-runtime.js';
 
 const USE_WEBGPU_RENDER_BACKEND = true;
@@ -789,301 +790,17 @@ const hasSavedMonth = Object.prototype.hasOwnProperty.call(_tuningState, 'month'
 const hasSavedHour = Object.prototype.hasOwnProperty.call(_tuningState, 'hour (UTC)');
 let useRealtimeGameClock = !(hasSavedMonth || hasSavedHour);
 
-// Deferred binding: controls reference aerialPerspective/cloudsEffect which are created later.
-// We define the panel structure now and wire it up after effects exist.
-const _tuningDefs = [];  // {label, defaultValue, inp, valSpan, fmt, onChange, type}
-function tuningSlider(label, opts) {
-  const saved = _tuningState[label];
-  const initial = saved != null ? saved : opts.value;
-  const row = document.createElement('div');
-  row.style.cssText = 'display:flex;align-items:center;gap:6px;margin:5px 0';
-  const lbl = document.createElement('span');
-  lbl.style.cssText = 'flex:0 0 90px;font-size:11px;color:#9ab';
-  lbl.textContent = label;
-  const inp = document.createElement('input');
-  inp.type = 'range';
-  inp.min = opts.min;
-  inp.max = opts.max;
-  inp.step = opts.step;
-  inp.value = initial;
-  inp.style.cssText = 'flex:1;accent-color:#5af';
-  const val = document.createElement('span');
-  val.style.cssText = 'flex:0 0 40px;text-align:right;font-size:11px;color:#7cf';
-  const fmt = opts.format || (v => v.toFixed(opts.decimals ?? 2));
-  val.textContent = fmt(Number(initial));
-  // Apply saved value on creation
-  if (saved != null) opts.onChange(Number(saved));
-  inp.oninput = () => {
-    const v = Number(inp.value);
-    val.textContent = fmt(v);
-    _tuningState[label] = v;
-    saveTuning();
-    opts.onChange(v);
-  };
-  row.append(lbl, inp, val);
-  tuningBody.appendChild(row);
-  _tuningDefs.push({ label, defaultValue: opts.value, inp, valSpan: val, fmt, onChange: opts.onChange, type: 'slider' });
-  return inp;
-}
-function tuningToggle(label, opts) {
-  const saved = _tuningState[label];
-  const initial = saved != null ? saved : opts.value;
-  const row = document.createElement('div');
-  row.style.cssText = 'display:flex;align-items:center;gap:6px;margin:5px 0';
-  const lbl = document.createElement('span');
-  lbl.style.cssText = 'flex:0 0 90px;font-size:11px;color:#9ab';
-  lbl.textContent = label;
-  const inp = document.createElement('input');
-  inp.type = 'checkbox';
-  inp.checked = initial;
-  inp.style.cssText = 'accent-color:#5af';
-  // Apply saved value on creation
-  if (saved != null) opts.onChange(initial);
-  inp.onchange = () => {
-    _tuningState[label] = inp.checked;
-    saveTuning();
-    opts.onChange(inp.checked);
-  };
-  row.append(lbl, inp);
-  tuningBody.appendChild(row);
-  _tuningDefs.push({ label, defaultValue: opts.value, inp, onChange: opts.onChange, type: 'toggle' });
-  return inp;
-}
-function resetTuningUI() {
-  for (const def of _tuningDefs) {
-    if (def.type === 'slider') {
-      def.inp.value = def.defaultValue;
-      if (def.valSpan) def.valSpan.textContent = def.fmt(def.defaultValue);
-      def.onChange(def.defaultValue);
-    } else {
-      def.inp.checked = def.defaultValue;
-      def.onChange(def.defaultValue);
-    }
-  }
-}
-function tuningSliderSetValue(label, v) {
-  const def = _tuningDefs.find(d => d.label === label && d.type === 'slider');
-  if (!def) return;
-  def.inp.value = v;
-  if (def.valSpan) def.valSpan.textContent = def.fmt(v);
-}
-// ── Google Maps Panel (toggle with G) ─────────────────────────────────────────
-let gmapsPanelOpen = false;
-let gmapsPanelMinimized = false;
-let _gmapsLastLat = null;
-let _gmapsLastLon = null;
-const GMAPS_UPDATE_INTERVAL = 1500; // ms between iframe updates while moving
-let _gmapsLastUpdate = 0;
-let _gmapsActiveTab = 0;
-
-const gmapsPanel = document.createElement('div');
-gmapsPanel.style.cssText = [
-  'position:absolute',
-  'bottom:50px',
-  'left:12px',
-  'width:420px',
-  'background:rgba(10,16,24,0.95)',
-  'border:1px solid #2a3a4a',
-  'border-radius:8px',
-  'overflow:hidden',
-  'resize:both',
-  'min-width:300px',
-  'min-height:200px',
-  'z-index:20',
-  'display:none',
-  'flex-direction:column',
-  'height:460px',
-  'font:12px/1.4 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace',
-  'color:#dbe5f1',
-  'box-shadow:0 4px 24px rgba(0,0,0,0.7)'
-].join(';');
-
-// Make panel draggable via header
-(function makeDraggable(panel) {
-  let dragging = false, ox = 0, oy = 0;
-  panel.querySelector && panel.addEventListener('mousedown', e => {
-    if (e.target.closest('#gmap-drag-handle')) {
-      dragging = true;
-      const r = panel.getBoundingClientRect();
-      ox = e.clientX - r.left;
-      oy = e.clientY - r.top;
-      e.preventDefault();
-    }
-  });
-  document.addEventListener('mousemove', e => {
-    if (!dragging) return;
-    panel.style.left = (e.clientX - ox) + 'px';
-    panel.style.top  = (e.clientY - oy) + 'px';
-    panel.style.bottom = 'auto';
-    panel.style.right  = 'auto';
-  });
-  document.addEventListener('mouseup', () => { dragging = false; });
-})(gmapsPanel);
-
-// Header (draggable handle)
-const gmapsHeader = document.createElement('div');
-gmapsHeader.id = 'gmap-drag-handle';
-gmapsHeader.style.cssText = 'display:flex;align-items:center;gap:6px;padding:7px 10px;background:rgba(255,255,255,0.06);cursor:grab;user-select:none';
-gmapsHeader.innerHTML = `
-  <span style="flex:1;font-weight:bold;color:#5af">&#x1F5FA; Maps  <span style="font-size:10px;color:#6889a8;font-weight:normal">(drag to move)</span></span>
-  <button id="gmap-min" title="Minimize" style="background:none;border:none;color:#8aa;cursor:pointer;font-size:14px;padding:0 4px">&#x2212;</button>
-  <button id="gmap-close" title="Close (G)" style="background:none;border:none;color:#8aa;cursor:pointer;font-size:14px;padding:0 4px">&#x2715;</button>
-`;
-gmapsPanel.appendChild(gmapsHeader);
-
-// Nav input row
-const gmapsNavRow = document.createElement('div');
-gmapsNavRow.id = 'gmap-nav-row';
-gmapsNavRow.style.cssText = 'display:flex;gap:6px;padding:7px 10px;border-bottom:1px solid #1e2d3a';
-gmapsNavRow.innerHTML = `
-  <input id="gmap-input" type="text" placeholder="Paste lat, lon  e.g. 64.18, -51.70"
-    style="flex:1;background:rgba(255,255,255,0.07);border:1px solid #2a3a4a;border-radius:4px;
-           color:#dbe5f1;padding:4px 8px;font:12px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;outline:none" />
-  <button id="gmap-go"
-    style="background:#1a3a5a;border:1px solid #2a5a8a;border-radius:4px;color:#5af;
-           padding:4px 12px;cursor:pointer;font:12px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace">Go</button>
-`;
-gmapsPanel.appendChild(gmapsNavRow);
-
-// Tab bar
-const gmapsTabBar = document.createElement('div');
-gmapsTabBar.id = 'gmap-tab-row';
-gmapsTabBar.style.cssText = 'display:flex;border-bottom:1px solid #1e2d3a;user-select:none';
-['Satellite', 'Map', 'Navigate'].forEach((label, i) => {
-  const tab = document.createElement('div');
-  tab.dataset.gmtab = String(i);
-  tab.textContent = label;
-  tab.style.cssText = `flex:1;text-align:center;padding:5px 0;cursor:pointer;font-size:11px;color:${i === 0 ? '#5af' : '#6889a8'};border-bottom:${i === 0 ? '2px solid #5af' : '2px solid transparent'}`;
-  tab.addEventListener('click', () => {
-    document.querySelectorAll('[data-gmtab]').forEach(t => {
-      t.style.color = '#6889a8'; t.style.borderBottom = '2px solid transparent';
-    });
-    tab.style.color = '#5af'; tab.style.borderBottom = '2px solid #5af';
-    _gmapsActiveTab = i;
-    _gmapsLastLat = null; // force refresh
-    _gmapsForceUpdate();
-  });
-  gmapsTabBar.appendChild(tab);
+// Deferred binding: renderer-specific callbacks are wired after effects exist.
+const {
+  reset: resetTuningUI,
+  setSliderValue: tuningSliderSetValue,
+  slider: tuningSlider,
+  toggle: tuningToggle,
+} = createTerrainTuningControls({
+  body: tuningBody,
+  state: _tuningState,
+  save: saveTuning,
 });
-gmapsPanel.appendChild(gmapsTabBar);
-
-// iframe container — fills remaining panel height
-const gmapsIframeWrap = document.createElement('div');
-gmapsIframeWrap.style.cssText = 'flex:1;min-height:0';
-const gmapsIframe = document.createElement('iframe');
-gmapsIframe.style.cssText = 'width:100%;height:100%;border:none;display:block';
-gmapsIframe.setAttribute('loading', 'eager');
-gmapsIframeWrap.appendChild(gmapsIframe);
-gmapsPanel.appendChild(gmapsIframeWrap);
-
-// Disable iframe pointer-events during resize so the drag handle works
-new ResizeObserver(() => {
-  gmapsIframe.style.pointerEvents = 'none';
-  clearTimeout(gmapsPanel._resizeTimer);
-  gmapsPanel._resizeTimer = setTimeout(() => { gmapsIframe.style.pointerEvents = ''; }, 150);
-}).observe(gmapsPanel);
-
-document.body.appendChild(gmapsPanel);
-
-function _gmapsBuildUrl(lat, lon) {
-  if (_gmapsActiveTab === 0) {
-    return `https://maps.google.com/maps?q=${lat},${lon}&t=k&z=16&output=embed`;
-  } else if (_gmapsActiveTab === 1) {
-    return `https://maps.google.com/maps?q=${lat},${lon}&t=m&z=16&output=embed`;
-  } else {
-    return `/mapview.html?lat=${lat}&lon=${lon}&t=k`;
-  }
-}
-
-function _gmapsForceUpdate() {
-  const camLL = getCameraLatLon();
-  const lat = camLL.lat.toFixed(6);
-  const lon = camLL.lon.toFixed(6);
-  gmapsIframe.src = _gmapsBuildUrl(lat, lon);
-  _gmapsLastLat = lat;
-  _gmapsLastLon = lon;
-  _gmapsLastUpdate = performance.now();
-}
-
-function _gmapsNavigateTo(lat, lon) {
-  if (!Number.isFinite(lat) || !Number.isFinite(lon)) return;
-  const dLat = lat - anchorLat;
-  const dLon = lon - anchorLon;
-  const eM = dLon * 111320 * Math.cos(anchorLat * Math.PI / 180);
-  const nM = dLat * 111320;
-  const alt = getCameraLatLon().alt;
-  camera.position.copy(anchorPosition)
-    .addScaledVector(east, eM)
-    .addScaledVector(north, nM)
-    .addScaledVector(up, Math.max(50, alt));
-  applyCameraOrientation();
-  fetchTiles(lat, lon);
-  _gmapsLastLat = null;
-  _gmapsLastUpdate = 0; // force immediate re-center on next render cycle
-}
-
-function toggleGmapsPanel(forceState) {
-  gmapsPanelOpen = forceState !== undefined ? forceState : !gmapsPanelOpen;
-  gmapsPanel.style.display = gmapsPanelOpen ? 'flex' : 'none';
-  if (gmapsPanelOpen) {
-    // Always force-reload when opening so tiles request after container is visible
-    _gmapsLastLat = null;
-    _gmapsForceUpdate();
-  }
-}
-
-// Wire up header buttons
-document.getElementById('gmap-min').addEventListener('click', e => {
-  e.stopPropagation();
-  gmapsPanelMinimized = !gmapsPanelMinimized;
-  gmapsNavRow.style.display = gmapsPanelMinimized ? 'none' : '';
-  gmapsTabBar.style.display = gmapsPanelMinimized ? 'none' : '';
-  gmapsIframeWrap.style.display = gmapsPanelMinimized ? 'none' : '';
-  document.getElementById('gmap-min').innerHTML = gmapsPanelMinimized ? '&#x25A1;' : '&#x2212;';
-});
-document.getElementById('gmap-close').addEventListener('click', e => {
-  e.stopPropagation();
-  toggleGmapsPanel(false);
-});
-
-// Wire up Go button + Enter key
-document.getElementById('gmap-go').addEventListener('click', () => {
-  const val = document.getElementById('gmap-input').value.trim();
-  // Match each coordinate token: optional minus, digits, optional decimal, optional N/S/E/W
-  const tokens = [...val.matchAll(/([-]?\d+(?:\.\d+)?)\s*°?\s*([NSEWnsew])?/g)];
-  if (tokens.length >= 2) {
-    let lat = parseFloat(tokens[0][1]);
-    let lon = parseFloat(tokens[1][1]);
-    const latDir = (tokens[0][2] || '').toUpperCase();
-    const lonDir = (tokens[1][2] || '').toUpperCase();
-    if (latDir === 'S') lat = -Math.abs(lat);
-    if (lonDir === 'W') lon = -Math.abs(lon);
-    _gmapsNavigateTo(lat, lon);
-  }
-});
-document.getElementById('gmap-input').addEventListener('keydown', e => {
-  if (e.key === 'Enter') document.getElementById('gmap-go').click();
-  e.stopPropagation(); // prevent WASD etc from firing while typing
-});
-
-// Navigate tab: receive click coords and ready signal from mapview.html iframe
-window.addEventListener('message', e => {
-  if (e.data && e.data.ready) {
-    // Leaflet just finished loading — push current camera position immediately
-    if (_gmapsActiveTab === 2 && gmapsPanelOpen) {
-      const camLL = getCameraLatLon();
-      gmapsIframe.contentWindow?.postMessage({ lat: camLL.lat, lon: camLL.lon }, '*');
-      _gmapsLastLat = camLL.lat.toFixed(4);
-      _gmapsLastLon = camLL.lon.toFixed(4);
-      _gmapsLastUpdate = performance.now();
-    }
-    return;
-  }
-  if (e.data && e.data.nav && e.data.lat != null) {
-    _gmapsNavigateTo(e.data.lat, e.data.lon);
-  }
-});
-// ── end Google Maps Panel ───────────────────────────────────────────────────────
 
 function tuningSectionLabel(text) {
   const d = document.createElement('div');
@@ -1992,24 +1709,17 @@ function applyVehicleMaterialSampling(material) {
 }
 
 function vehicleLocalToLatLon(x, y) {
-  const lat = anchorLat + y / 111320;
-  const lon = anchorLon + x / (111320 * Math.cos(anchorLat * Math.PI / 180));
-  return { lat, lon };
+  return terrainVehicleLocalToLatLon(x, y, anchorLat, anchorLon);
 }
 
 function getVehicleStateSnapshot() {
-  if (!vehicleLoaded) return null;
-  const local = vehicleGroup.position;
-  const latLon = vehicleLocalToLatLon(local.x, local.y);
-  const headingDeg = (
-    (THREE.MathUtils.radToDeg(vehicleHeadingRad) % 360) + 360
-  ) % 360;
-  return {
-    lat: Number(latLon.lat.toFixed(8)),
-    lon: Number(latLon.lon.toFixed(8)),
-    headingDeg: Number(headingDeg.toFixed(3)),
-    z: Number(local.z.toFixed(3)),
-  };
+  return vehicleStateSnapshot({
+    loaded: vehicleLoaded,
+    position: vehicleGroup.position,
+    headingRad: vehicleHeadingRad,
+    anchorLat,
+    anchorLon,
+  });
 }
 
 function sampleBestVehicleTerrainHit(localX = vehicleGroup.position.x, localY = vehicleGroup.position.y, terrainMeshes = null) {
@@ -2299,25 +2009,12 @@ function loadVehicleState() {
     bootLog('vehicle.state.load.empty');
     return null;
   }
-  const lat = Number(state.lat);
-  const lon = Number(state.lon);
-  const headingDeg = Number(state.headingDeg);
-  const z = Number(state.z);
-  const terrainDepthRaw = Number(state.terrainDepth);
-  const terrainDepth = Number.isFinite(terrainDepthRaw)
-    ? Math.max(0, Math.floor(terrainDepthRaw))
-    : null;
-  if (!Number.isFinite(lat) || !Number.isFinite(lon) || !Number.isFinite(headingDeg)) {
+  const normalized = normalizeSavedVehicleState(state);
+  if (normalized == null) {
     bootLog('vehicle.state.load.invalid', { state }, 'error');
     return null;
   }
-  vehicleSavedStatePending = {
-    lat,
-    lon,
-    headingDeg,
-    z: Number.isFinite(z) ? z : null,
-    terrainDepth,
-  };
+  vehicleSavedStatePending = normalized;
   return vehicleSavedStatePending;
 }
 
@@ -4698,7 +4395,6 @@ installTerrainKeyboardControls({
     saveVehicleState('escape', { snapToGround: true, requireGroundedZ: false, bypassSnapThrottle: true });
     setVehicleControlActive(false, 'escape', { skipExitSave: true });
   },
-  onToggleGmaps: toggleGmapsPanel,
   onToggleMap: toggleMapMode,
   onOpenPipeline: () => window.open(HUD_LINKS.pipelineMapLink, '_blank'),
   onOpenHeatmap: () => window.open(HUD_LINKS.radarHeatmapLink, '_blank'),
@@ -4921,27 +4617,6 @@ function render() {
   updateMovement(dt);
   applyCameraOrientation();
   updateHud();
-
-  // Update Google Maps panel iframe if open and position changed enough
-  if (gmapsPanelOpen && !gmapsPanelMinimized) {
-    const nowMs = performance.now();
-    const interval = _gmapsActiveTab === 2 ? 200 : GMAPS_UPDATE_INTERVAL;
-    if (nowMs - _gmapsLastUpdate > interval) {
-      const camLL = getCameraLatLon();
-      const lat = camLL.lat.toFixed(4);
-      const lon = camLL.lon.toFixed(4);
-      if (lat !== _gmapsLastLat || lon !== _gmapsLastLon) {
-        if (_gmapsActiveTab === 2) {
-          gmapsIframe.contentWindow?.postMessage({ lat: parseFloat(lat), lon: parseFloat(lon) }, '*');
-        } else {
-          gmapsIframe.src = _gmapsBuildUrl(lat, lon);
-        }
-        _gmapsLastLat = lat;
-        _gmapsLastLon = lon;
-        _gmapsLastUpdate = nowMs;
-      }
-    }
-  }
 
   // Update fog density from slider
   const fogStrength = controls._fogStrength ?? (

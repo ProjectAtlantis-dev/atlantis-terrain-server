@@ -1,5 +1,45 @@
 import { headingForward2D } from './terrain-priority.js';
 
+export function vehicleLocalToLatLon(x, y, anchorLat, anchorLon) {
+  return {
+    lat: anchorLat + y / 111320,
+    lon: anchorLon + x / (111320 * Math.cos(anchorLat * Math.PI / 180)),
+  };
+}
+
+export function vehicleStateSnapshot({ loaded, position, headingRad, anchorLat, anchorLon }) {
+  if (!loaded) return null;
+  const latLon = vehicleLocalToLatLon(position.x, position.y, anchorLat, anchorLon);
+  const headingDeg = ((headingRad * 180 / Math.PI) % 360 + 360) % 360;
+  return {
+    lat: Number(latLon.lat.toFixed(8)),
+    lon: Number(latLon.lon.toFixed(8)),
+    headingDeg: Number(headingDeg.toFixed(3)),
+    z: Number(position.z.toFixed(3)),
+  };
+}
+
+export function normalizeSavedVehicleState(state) {
+  if (state == null || typeof state !== 'object') return null;
+  const lat = Number(state.lat);
+  const lon = Number(state.lon);
+  const headingDeg = Number(state.headingDeg);
+  const z = Number(state.z);
+  const terrainDepthRaw = Number(state.terrainDepth);
+  if (!Number.isFinite(lat) || !Number.isFinite(lon) || !Number.isFinite(headingDeg)) {
+    return null;
+  }
+  return {
+    lat,
+    lon,
+    headingDeg,
+    z: Number.isFinite(z) ? z : null,
+    terrainDepth: Number.isFinite(terrainDepthRaw)
+      ? Math.max(0, Math.floor(terrainDepthRaw))
+      : null,
+  };
+}
+
 /** Pure vehicle drive integration shared by both renderer entry points. */
 export function stepVehicleDrive({
   dt,

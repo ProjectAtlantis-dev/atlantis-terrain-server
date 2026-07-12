@@ -8,7 +8,7 @@ import {
 } from './terrain-priority.js';
 import { compassHeading } from './terrain-hud.js';
 import { applyMapDrag } from './terrain-controls.js';
-import { stepSuspension, stepVehicleDrive } from './terrain-vehicle.js';
+import { normalizeSavedVehicleState, stepSuspension, stepVehicleDrive, vehicleLocalToLatLon, vehicleStateSnapshot } from './terrain-vehicle.js';
 import { meshUsesTextureClassification, scoreTextureTiles, textureRetryDelay, tileDepthFromId } from './terrain-tile-runtime.js';
 import { createTextureStreamer, rendererTextureAnisotropy } from './terrain-texture-streamer.js';
 import { createTileLifecycle } from './terrain-tile-lifecycle.js';
@@ -24,6 +24,8 @@ import { restoreTerrainCameraState, terrainCameraState } from './terrain-camera-
 import { createTerrainClientLogger } from './terrain-client-logging.js';
 import { createTerrainFpsCounter } from './terrain-fps-counter.js';
 import { loadTerrainStartupAssets, normalizeTerrainStartupAssets } from './terrain-startup-assets.js';
+import { createTerrainAtmosphereTextureRuntime } from './terrain-atmosphere-textures.js';
+import { createTerrainTuningControls } from './terrain-tuning-controls.js';
 import { createTerrainHouseConfiguration, createTerrainHouseMarkerRuntime, createTerrainHouseModelController, disposeTerrainHouseTree, markTerrainHousesNeedSnap, terrainHouseLocalPosition, terrainHouseShadowCoverage, terrainHouseZSummary } from './terrain-house-runtime.js';
 import {
   buildTerrainTilesRequest,
@@ -191,6 +193,95 @@ test('shared startup asset loader returns complete defaults on failure', async (
   } finally {
     console.warn = previousWarn;
   }
+});
+
+test('shared atmosphere texture runtime caches LUTs and applies them to both targets', async () => {
+  const cachedResponse = {
+    ok: true,
+    clone() { return this; },
+    async blob() { return { size: 7 }; },
+  };
+  const networkResponse = {
+    ok: true,
+    clone() { return this; },
+    async blob() { return { size: 11 }; },
+  };
+  const stored = [];
+  const objectUrls = [];
+  const revoked = [];
+  const targets = [{}, {}];
+  const runtime = createTerrainAtmosphereTextureRuntime({
+    baseUrl: '/atmosphere', cacheName: 'lut-cache', fileNames: ['a.exr', 'b.exr'],
+    LoadingManager: class {}, PrecomputedTexturesLoader: class {}, targets,
+    windowImpl: { caches: true },
+    cachesImpl: { async open(name) {
+      assert.equal(name, 'lut-cache');
+      return {
+        async match(url) { return url.endsWith('/a.exr') ? cachedResponse : null; },
+        async put(url, response) { stored.push([url, response]); },
+      };
+    } },
+    async fetchImpl(url) {
+      assert.equal(url, '/atmosphere/b.exr');
+      return networkResponse;
+    },
+    URLImpl: {
+      createObjectURL(blob) { const url = `blob:${blob.size}`; objectUrls.push(url); return url; },
+      revokeObjectURL(url) { revoked.push(url); },
+    },
+  });
+
+  const prepared = await runtime.prepareUrlMap();
+  assert.equal(prepared.cacheHits, 1);
+  assert.equal(prepared.networkHits, 1);
+  assert.deepEqual(objectUrls, ['blob:7', 'blob:11']);
+  assert.deepEqual(stored, [['/atmosphere/b.exr', networkResponse]]);
+  runtime.apply({ transmittance: 'texture' });
+  assert.deepEqual(targets, [{ transmittance: 'texture' }, { transmittance: 'texture' }]);
+  runtime.revokeObjectUrls(prepared.urlMap);
+  assert.deepEqual(revoked, objectUrls);
+});
+
+test('shared tuning controls initialize, persist, update, and reset widgets', () => {
+  const elements = [];
+  const documentImpl = { createElement(tagName) {
+    const element = {
+      tagName, style: {}, children: [],
+      append(...children) { this.children.push(...children); },
+      appendChild(child) { this.children.push(child); },
+    };
+    elements.push(element);
+    return element;
+  } };
+  const body = documentImpl.createElement('section');
+  const state = { exposure: 2, clouds: false };
+  const changes = [];
+  let saves = 0;
+  const tuning = createTerrainTuningControls({
+    body, state, documentImpl, save: () => { saves += 1; },
+  });
+  const slider = tuning.slider('exposure', {
+    value: 1, min: 0, max: 4, step: 0.1, decimals: 1,
+    onChange: value => changes.push(['exposure', value]),
+  });
+  const toggle = tuning.toggle('clouds', {
+    value: true, onChange: value => changes.push(['clouds', value]),
+  });
+  assert.deepEqual(changes, [['exposure', 2], ['clouds', false]]);
+
+  slider.value = '3.5';
+  slider.oninput();
+  toggle.checked = true;
+  toggle.onchange();
+  assert.deepEqual(state, { exposure: 3.5, clouds: true });
+  assert.equal(saves, 2);
+
+  tuning.setSliderValue('exposure', 2.25);
+  assert.equal(slider.value, 2.25);
+  tuning.reset();
+  assert.equal(slider.value, 1);
+  assert.equal(toggle.checked, true);
+  assert.deepEqual(changes.slice(-2), [['exposure', 1], ['clouds', true]]);
 });
 
 test('shared house configuration and placement preserve terrain conventions', () => {
@@ -776,6 +867,33 @@ test('vehicle drive follows heading and respects speed limit', () => {
   assert.equal(step.speed, 12);
   assert.ok(Math.abs(step.deltaX) < 1e-12);
   assert.equal(step.deltaY, 12);
+});
+
+test('shared vehicle persistence helpers preserve coordinates and normalize saved state', () => {
+  const anchorLat = 64;
+  const anchorLon = -51;
+  const local = vehicleLocalToLatLon(111320 * Math.cos(anchorLat * Math.PI / 180), 111320, anchorLat, anchorLon);
+  assert.ok(Math.abs(local.lat - 65) < 1e-12);
+  assert.ok(Math.abs(local.lon - -50) < 1e-12);
+
+  assert.equal(vehicleStateSnapshot({
+    loaded: false, position: { x: 0, y: 0, z: 0 }, headingRad: 0, anchorLat, anchorLon,
+  }), null);
+  assert.deepEqual(vehicleStateSnapshot({
+    loaded: true,
+    position: { x: 0, y: 0, z: 12.3456 },
+    headingRad: -Math.PI / 2,
+    anchorLat,
+    anchorLon,
+  }), { lat: 64, lon: -51, headingDeg: 270, z: 12.346 });
+
+  assert.deepEqual(normalizeSavedVehicleState({
+    lat: '64.1', lon: '-51.2', headingDeg: '361.5', z: '8.25', terrainDepth: '7.9',
+  }), { lat: 64.1, lon: -51.2, headingDeg: 361.5, z: 8.25, terrainDepth: 7 });
+  assert.deepEqual(normalizeSavedVehicleState({
+    lat: 64, lon: -51, headingDeg: 0, z: 'bad', terrainDepth: -2,
+  }), { lat: 64, lon: -51, headingDeg: 0, z: null, terrainDepth: 0 });
+  assert.equal(normalizeSavedVehicleState({ lat: 64, lon: 'bad', headingDeg: 0 }), null);
 });
 
 test('suspension converges without exceeding velocity limit', () => {
