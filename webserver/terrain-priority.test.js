@@ -1,0 +1,905 @@
+import assert from 'node:assert/strict';
+import test from 'node:test';
+
+import {
+  headingForward2D,
+  priorityHeading,
+  terrainTilePriority,
+} from './terrain-priority.js';
+import { compassHeading } from './terrain-hud.js';
+import { applyMapDrag } from './terrain-controls.js';
+import { stepSuspension, stepVehicleDrive } from './terrain-vehicle.js';
+import { meshUsesTextureClassification, scoreTextureTiles, textureRetryDelay, tileDepthFromId } from './terrain-tile-runtime.js';
+import { createTextureStreamer, rendererTextureAnisotropy } from './terrain-texture-streamer.js';
+import { createTileLifecycle } from './terrain-tile-lifecycle.js';
+import { reconcileTerrainTiles } from './terrain-tile-reconciler.js';
+import { createTerrainFetchScheduler } from './terrain-fetch-scheduler.js';
+import { createTerrainTextureController } from './terrain-texture-controller.js';
+import { createTerrainEnhancementController } from './terrain-enhancement-controller.js';
+import { createTerrainMeshBuilder, decodeTerrainHeightmap } from './terrain-mesh-builder.js';
+import { applyTerrainAvailabilityStatus, createTerrainSeamStatusController } from './terrain-status-controller.js';
+import { collectTerrainDebugMeshes, createTerrainOutlineController, summarizeTerrainMesh } from './terrain-debug-runtime.js';
+import { createTerrainFetchExecutor } from './terrain-fetch-executor.js';
+import { restoreTerrainCameraState, terrainCameraState } from './terrain-camera-state.js';
+import { createTerrainClientLogger } from './terrain-client-logging.js';
+import { createTerrainFpsCounter } from './terrain-fps-counter.js';
+import { loadTerrainStartupAssets, normalizeTerrainStartupAssets } from './terrain-startup-assets.js';
+import { createTerrainHouseConfiguration, createTerrainHouseMarkerRuntime, createTerrainHouseModelController, disposeTerrainHouseTree, markTerrainHousesNeedSnap, terrainHouseLocalPosition, terrainHouseShadowCoverage, terrainHouseZSummary } from './terrain-house-runtime.js';
+import {
+  buildTerrainTilesRequest,
+  adoptTerrainOrigin,
+  diffTerrainTileIds,
+  evaluateTerrainRefetch,
+  offsetTerrainPayload,
+  prioritizeTerrainBuildCandidates,
+  selectTerrainFrameOffset,
+  summarizeTerrainCamera,
+  summarizeTerrainResponse,
+  terrainCameraCoordinates,
+  terrainCameraStereoPosition,
+  terrainPipelineStatus,
+} from './terrain-tile-fetch.js';
+
+test('terrain camera persistence round-trips pose and frame state', () => {
+  const saved = terrainCameraState({
+    cameraLatLon: { lat: 64.1, lon: -51.2, alt: 123 },
+    yaw: 0.4,
+    pitch: -0.2,
+    mapZoom: 900,
+    terrainFrame: { originX: 1, originY: 2, offsetX: 3, offsetY: 4 },
+  });
+  const restored = restoreTerrainCameraState(saved, { anchorLat: 64, anchorLon: -51 });
+  assert.ok(Math.abs(restored.eastM - ((-0.2) * 111320 * Math.cos(64 * Math.PI / 180))) < 1e-9);
+  assert.ok(Math.abs(restored.northM - (0.1 * 111320)) < 1e-9);
+  assert.deepEqual({ ...restored, eastM: 0, northM: 0 }, {
+    eastM: 0,
+    northM: 0,
+    alt: 123,
+    yaw: 0.4,
+    pitch: -0.2,
+    mapZoom: 900,
+    terrainFrame: { originX: 1, originY: 2, offsetX: 3, offsetY: 4 },
+  });
+});
+
+test('terrain camera restore rejects corrupt poses and ignores corrupt frames', () => {
+  assert.equal(restoreTerrainCameraState({ lat: '64', lon: -51 }, {
+    anchorLat: 64, anchorLon: -51,
+  }), null);
+  const restored = restoreTerrainCameraState({
+    lat: 64, lon: -51, alt: null, yaw: 'bad',
+    terrainFrame: { originX: 1, originY: 2, offsetX: NaN, offsetY: 4 },
+  }, { anchorLat: 64, anchorLon: -51 });
+  assert.equal(restored.alt, 700);
+  assert.equal(restored.yaw, null);
+  assert.equal(restored.terrainFrame, null);
+});
+
+test('shared client logger batches transport and records boot diagnostics', async () => {
+  const listeners = new Map();
+  const requests = [];
+  let now = 100;
+  const logger = createTerrainClientLogger({
+    sceneMode: 'test-scene',
+    batchSize: 2,
+    windowRef: {
+      addEventListener(type, callback) { listeners.set(type, callback); },
+      setTimeout() { return 1; },
+    },
+    navigatorRef: {},
+    performanceRef: {
+      now: () => now,
+      memory: { usedJSHeapSize: 2 * 1024 * 1024, jsHeapSizeLimit: 8 * 1024 * 1024 },
+    },
+    fetchImpl: async (url, options) => {
+      requests.push({ url, options });
+      return { ok: true };
+    },
+  });
+  logger.enqueueClientLog('info', 'one', { value: 1 });
+  logger.enqueueClientLog('warn', 'two', { value: 2 });
+  await Promise.resolve();
+  assert.equal(requests.length, 1);
+  const payload = JSON.parse(requests[0].options.body);
+  assert.equal(payload.sceneMode, 'test-scene');
+  assert.deepEqual(payload.entries.map(entry => entry.phase), ['one', 'two']);
+  now = 112.5;
+  logger.bootLog('ready', { tiles: 4 });
+  assert.deepEqual(logger.bootEvents[0], {
+    elapsedMs: 12.5,
+    phase: 'ready',
+    level: 'info',
+    details: { tiles: 4 },
+    memory: { jsHeapMB: 2, jsHeapLimitMB: 8 },
+  });
+  assert.ok(listeners.has('error'));
+  assert.ok(listeners.has('unhandledrejection'));
+  assert.ok(listeners.has('beforeunload'));
+});
+
+test('shared FPS counter excludes idle time from its sample', () => {
+  const counter = createTerrainFpsCounter({ sampleMs: 500 });
+  counter.start(0);
+  for (let frame = 1; frame <= 31; frame += 1) counter.frame(frame * 16);
+  assert.equal(counter.display, '--');
+  counter.frame(512);
+  assert.equal(counter.display, '63');
+  counter.idle();
+  assert.equal(counter.display, 'idle');
+  counter.start(10_000);
+  counter.frame(10_016);
+  assert.equal(counter.display, '--');
+});
+
+test('startup asset normalization clones valid records and rejects junk', () => {
+  const vehicle = { id: 'v1' };
+  const normalized = normalizeTerrainStartupAssets({
+    vehicle_definition: { model: 'truck' },
+    structure_definition: null,
+    vehicle_instances: [vehicle, null, 'bad'],
+    structure_instances: [{ id: 's1' }, 4],
+  });
+  assert.deepEqual(normalized, {
+    vehicle_definition: { model: 'truck' },
+    structure_definition: {},
+    vehicle_instances: [{ id: 'v1' }],
+    structure_instances: [{ id: 's1' }],
+  });
+  assert.notEqual(normalized.vehicle_instances[0], vehicle);
+});
+
+test('shared startup asset loader preserves metadata and clears timeout', async () => {
+  const logs = [];
+  const cleared = [];
+  const result = await loadTerrainStartupAssets({
+    endpoint: '/assets',
+    timeoutMs: 25,
+    bootLog: (...args) => logs.push(args),
+    setTimeoutImpl: () => 7,
+    clearTimeoutImpl: handle => cleared.push(handle),
+    fetchImpl: async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        source: 'database', schemaVersion: 9, seeded: true,
+        vehicle_instances: [{ id: 'v1' }], structure_instances: [{ id: 's1' }],
+      }),
+    }),
+  });
+  assert.equal(result.source, 'database');
+  assert.equal(result.schemaVersion, 9);
+  assert.deepEqual(cleared, [7]);
+  assert.equal(logs[0][0], 'assets.fetch.ok');
+  assert.equal(logs[0][1].vehicleCount, 1);
+  assert.equal(logs[0][1].structureCount, 1);
+});
+
+test('shared startup asset loader returns complete defaults on failure', async () => {
+  const previousWarn = console.warn;
+  console.warn = () => {};
+  try {
+    const result = await loadTerrainStartupAssets({
+      endpoint: '/assets',
+      AbortControllerImpl: undefined,
+      fetchImpl: async () => ({ ok: false, status: 503 }),
+    });
+    assert.deepEqual(result, {
+      source: 'defaults', schemaVersion: 4, seeded: null,
+      vehicle_definition: {}, structure_definition: {},
+      vehicle_instances: [], structure_instances: [],
+    });
+  } finally {
+    console.warn = previousWarn;
+  }
+});
+
+test('shared house configuration and placement preserve terrain conventions', () => {
+  const logs = [];
+  const configured = createTerrainHouseConfiguration({
+    definition: { url: ' house.glb ', enabled: true, altOffsetM: 2, hotReloadMs: 100 },
+    instances: [{ id: 'h1' }], source: 'database', bootLog: (...args) => logs.push(args),
+  });
+  assert.deepEqual(configured.model, {
+    url: 'house.glb', altOffsetM: 2, hotReloadMs: 500, enabled: true,
+  });
+  assert.deepEqual(configured.sites, [{ id: 'h1' }]);
+  assert.equal(logs.length, 0);
+  const local = terrainHouseLocalPosition(64.1, -51.2, 64, -51);
+  assert.ok(Math.abs(local.y - 11132) < 1e-9);
+});
+
+test('shared house shadow coverage bounds loaded instances', () => {
+  const houses = [
+    { group: { position: { x: 0, y: 10, z: 2 } } },
+    { group: { position: { x: 100, y: 30, z: 4 } } },
+  ];
+  assert.deepEqual(terrainHouseShadowCoverage(houses, {
+    baseRadius: 50, radiusPadding: 10, maxRadius: 500,
+  }), {
+    centerX: 50, centerY: 20, centerZ: 3,
+    minX: 0, minY: 10, maxX: 100, maxY: 30, shadowRadius: 120,
+  });
+});
+
+test('shared house marker runtime creates and updates instance records', () => {
+  const children = [];
+  const markerChildren = [];
+  const runtime = createTerrainHouseMarkerRuntime({
+    documentRef: { createElement: () => ({ width: 0, height: 0, getContext: () => null }) },
+    markerHeight: 100,
+    baseLift: 5,
+    colors: [0xff0000],
+  });
+  const { instances, byId } = runtime.createHouseInstances({
+    sites: [{ id: 'nuuk-h1', tileId: '12-1-2' }],
+    houseLayer: { add: value => children.push(value) },
+    markerLayer: { add: value => markerChildren.push(value) },
+  });
+  assert.equal(instances.length, 1);
+  assert.equal(byId.get('nuuk-h1'), instances[0]);
+  assert.equal(children[0].name, 'house-nuuk-h1');
+  assert.equal(markerChildren[0].name, 'house-marker-nuuk-h1');
+  instances[0].group.position.set(10, 20, 30);
+  runtime.updateHouseMarkerPosition(instances[0]);
+  assert.deepEqual(instances[0].marker.position.toArray(), [10, 20, 35]);
+});
+
+test('shared house model controller rejects stale loads and reloads changed assets', async () => {
+  const loads = [];
+  const templates = [];
+  let signature = 'a';
+  const controller = createTerrainHouseModelController({
+    model: { enabled: true, url: '/house.glb', hotReloadMs: 10 },
+    loader: { load: (url, success) => loads.push({ url, success }) },
+    instanceCount: 2,
+    now: () => 123,
+    onTemplate: template => templates.push(template),
+    fetchImpl: async () => ({
+      ok: true,
+      headers: { get: name => name === 'etag' ? signature : '' },
+    }),
+  });
+  controller.load('first');
+  controller.load('second');
+  loads[0].success({ scene: 'stale' });
+  loads[1].success({ scene: 'current' });
+  assert.deepEqual(templates, ['current']);
+  await controller.updateHotReload(10);
+  signature = 'b';
+  await controller.updateHotReload(20);
+  assert.equal(loads.length, 3);
+  assert.equal(loads[2].url, '/house.glb?cb=123');
+});
+
+test('shared house disposal and snap summaries preserve lifecycle state', () => {
+  let geometryDisposals = 0;
+  let materialDisposals = 0;
+  const material = { dispose: () => { materialDisposals += 1; } };
+  const geometry = { dispose: () => { geometryDisposals += 1; } };
+  disposeTerrainHouseTree({
+    traverse(callback) {
+      callback({ isMesh: true, geometry, material });
+      callback({ isMesh: true, geometry, material });
+    },
+  }, new Set(), new Set());
+  assert.equal(geometryDisposals, 1);
+  assert.equal(materialDisposals, 1);
+  const houses = [{
+    site: { id: 'h1', lat: 1, lon: 2, tileId: '3-4-5' },
+    group: { position: { z: 7.125 } }, snapPending: false,
+  }];
+  assert.equal(terrainHouseZSummary(houses)[0].z, 7.125);
+  markTerrainHousesNeedSnap(houses);
+  assert.equal(houses[0].snapPending, true);
+});
+
+test('terrain preview request preserves boot frame semantics', () => {
+  const request = buildTerrainTilesRequest({
+    lat: 64.1, lon: -51.2, altitude: 120, heading: 0.5, range: 30000,
+    pass: 1, previewMaxDepth: 10, isFirstLoad: true,
+    frameOffsetReady: false, originX: 1, originY: 2,
+    cameraSnapshot: { camEastM: 3 },
+  });
+  assert.equal(request.url, '/api/tiles?lat=64.1&lon=-51.2&alt=120&heading=0.5&range=30000&maxDepth=10');
+  assert.deepEqual(request.logDetails, {
+    pass: 1, passLabel: 'preview', isFirstLoad: true,
+    requestLat: 64.1, requestLon: -51.2, requestAltM: 120,
+    headingRad: 0.5, maxDepth: 10, camEastM: 3,
+  });
+});
+
+test('terrain full request reuses a restored frame', () => {
+  const request = buildTerrainTilesRequest({
+    lat: 64, lon: -51, altitude: 50, heading: 0, range: 40000,
+    pass: 2, previewMaxDepth: 10, isFirstLoad: true,
+    frameOffsetReady: true, originX: -12.5, originY: 99.25,
+  });
+  assert.equal(request.url, '/api/tiles?lat=64&lon=-51&alt=50&heading=0&range=40000&ox=-12.5&oy=99.25');
+  assert.equal(request.logDetails.maxDepth, null);
+});
+
+test('terrain tile diff and dirty-paint demand are deterministic', () => {
+  const tiles = [
+    { id: 'new-far', heightmap: 'x', priority: 9 },
+    { id: 'kept', heightmap: 'x', priority: 1 },
+    { id: 'new-hot', heightmap: 'x', priority: 2 },
+    { id: 'no-heightmap', heightmap: null, priority: 0 },
+  ];
+  const diff = diffTerrainTileIds(tiles, new Set(['kept', 'removed']));
+  assert.deepEqual(diff.added, ['new-far', 'new-hot', 'no-heightmap']);
+  assert.deepEqual(diff.removed, ['removed']);
+  const candidates = prioritizeTerrainBuildCandidates(
+    tiles, new Set(diff.added), tile => tile.priority,
+  );
+  assert.deepEqual(candidates.map(item => item.tile.id), ['new-hot', 'new-far']);
+});
+
+test('terrain response normalization preserves frame and log semantics', () => {
+  assert.deepEqual(selectTerrainFrameOffset({
+    isFirstLoad: true, frameOffsetReady: false,
+    cameraEast: 100.25, cameraNorth: -20.5, offsetX: 0, offsetY: 0,
+  }), { offsetX: 100.25, offsetY: -20.5, ready: true, changed: true });
+  const data = {
+    qx: 1.26, qy: 2.34, ox: 3.45, oy: 4.56,
+    tiles: [
+      { id: 'near', bbox: [0, 0, 2, 2], heightmap: 'hm' },
+      { id: 'far', bbox: [10, 10, 12, 12], heightmap: null },
+    ],
+    missing: [{ id: 'missing', bbox: [2, 2, 3, 3] }],
+    downloading: ['x'],
+  };
+  offsetTerrainPayload(data, 100, -20);
+  assert.deepEqual(data.tiles[0].bbox, [100, -20, 102, -18]);
+  assert.deepEqual(data.missing[0].bbox, [102, -18, 103, -17]);
+  assert.deepEqual(summarizeTerrainResponse({
+    data, status: 200, pass: 2, cameraX: 101, cameraY: -19,
+    frameOffsetX: 100, frameOffsetY: -20, frameOffsetReady: true,
+  }), {
+    pass: 2, passLabel: 'full', status: 200, tiles: 2, withHm: 1, noHm: 1,
+    missing: 1, downloading: 1, qx: 1.3, qy: 2.3, ox: 3.5, oy: 4.6,
+    closestTileId: 'near', closestTileDistM: 0,
+    closestTileCx: 101, closestTileCy: -19,
+    tileFrameOffsetX: 100, tileFrameOffsetY: -20, tileFrameOffsetReady: true,
+  });
+});
+
+test('shared reconciler spends dirty-paint budget in heatmap order', () => {
+  const built = [];
+  const deferredTiles = new Map();
+  const terrainRoot = {
+    children: [],
+    add(mesh) { this.children.push(mesh); },
+  };
+  let diffDetails = null;
+  const result = reconcileTerrainTiles({
+    tiles: [
+      { id: 'far', bbox: [10, 10, 11, 11], heightmap: 'hm', priority: 9 },
+      { id: 'hot', bbox: [0, 0, 1, 1], heightmap: 'hm', priority: 1 },
+    ],
+    currentTileIds: new Set(), deferredTiles, terrainRoot,
+    lifecycle: { sweepStaleParents: () => 0 },
+    priorityForTile: tile => tile.priority,
+    textureCache: new Map(), materialize: () => assert.fail('unexpected materialize'),
+    buildMesh: tile => {
+      built.push(tile.id);
+      return {
+        isMesh: true, userData: { tileId: tile.id, bbox: tile.bbox },
+        material: { map: null },
+      };
+    },
+    log: () => {}, buildBudget: 1,
+    onDiff: details => { diffDetails = details; },
+  });
+  assert.deepEqual(built, ['hot']);
+  assert.deepEqual([...deferredTiles.keys()], ['hot', 'far']);
+  assert.equal(result.sceneMeshes, 1);
+  assert.deepEqual(diffDetails, { added: 2, removed: 0, purgedDeferred: 0, sceneMeshes: 0 });
+});
+
+test('terrain origin and pipeline decisions preserve two-pass behavior', () => {
+  const origin = adoptTerrainOrigin({
+    data: { ox: -100.25, oy: 200.25, qx: -90, qy: 210 },
+    pass: 1,
+    cameraSnapshot: { camStereoApproxX: -95, camStereoApproxY: 205 },
+  });
+  assert.equal(origin.originX, -100.25);
+  assert.equal(origin.cameraY, 210);
+  assert.equal(origin.logDetails.originDeltaX, -5.3);
+  assert.equal(terrainPipelineStatus({ missing: [], downloading: [], texFetching: 0 }, true).nextAction, 'full-pass');
+  assert.equal(terrainPipelineStatus({ missing: [{}], downloading: [], texFetching: 0 }, false).nextAction, 'poll');
+  assert.equal(terrainPipelineStatus({ missing: [], downloading: [], texFetching: 0 }, false).nextAction, 'idle');
+  assert.deepEqual(terrainCameraStereoPosition({
+    latitude: 64, longitude: -51, anchorLatitude: 64, anchorLongitude: -51,
+    originX: 12, originY: 34,
+  }), { x: 12, y: 34 });
+});
+
+test('shared terrain refetch decision enforces distance and trigger interval', () => {
+  assert.deepEqual(evaluateTerrainRefetch({
+    cameraX: 6000, cameraY: 0, lastFetchX: 0, lastFetchY: 0,
+    nowMs: 1000, lastTriggerMs: 0, distanceThreshold: 5000, triggerIntervalMs: 500,
+  }), { distance: 6000, shouldFetch: true, nextTriggerMs: 1000 });
+  assert.equal(evaluateTerrainRefetch({
+    cameraX: 7000, cameraY: 0, lastFetchX: 0, lastFetchY: 0,
+    nowMs: 1200, lastTriggerMs: 1000, distanceThreshold: 5000, triggerIntervalMs: 500,
+  }).shouldFetch, false);
+  assert.equal(evaluateTerrainRefetch({
+    cameraX: 100, cameraY: 0, lastFetchX: 0, lastFetchY: 0,
+    nowMs: 5000, lastTriggerMs: 0, distanceThreshold: 5000, triggerIntervalMs: 500,
+  }).shouldFetch, false);
+});
+
+test('shared camera coordinates and log summary use one ENU conversion', () => {
+  const vector = (x, y, z) => ({
+    x, y, z,
+    clone() { return vector(this.x, this.y, this.z); },
+    sub(other) { this.x -= other.x; this.y -= other.y; this.z -= other.z; return this; },
+    dot(other) { return this.x * other.x + this.y * other.y + this.z * other.z; },
+  });
+  const coordinates = terrainCameraCoordinates({
+    position: vector(10, 20, 30), anchorPosition: vector(0, 0, 0),
+    east: vector(1, 0, 0), north: vector(0, 1, 0), up: vector(0, 0, 1),
+    anchorLatitude: 64, anchorLongitude: -51, originX: 100, originY: 200,
+  });
+  assert.equal(coordinates.eastM, 10);
+  assert.equal(coordinates.northM, 20);
+  assert.equal(coordinates.alt, 30);
+  const summary = summarizeTerrainCamera(coordinates, {
+    originX: 100, originY: 200, frameOffsetX: 10, frameOffsetY: 20,
+    frameOffsetReady: true,
+  });
+  assert.equal(summary.camEastM, 10);
+  assert.equal(summary.camNorthM, 20);
+  assert.equal(summary.camStereoApproxX, 110);
+  assert.equal(summary.camStereoApproxY, 220);
+});
+
+test('shared fetch scheduler serializes preview, full pass, and polling', async () => {
+  const passes = [];
+  let frameCallback = null;
+  let pollCallback = null;
+  const scheduler = createTerrainFetchScheduler({
+    execute: async ({ pass }) => {
+      passes.push(pass);
+      return { nextAction: pass === 1 ? 'full-pass' : 'poll' };
+    },
+    scheduleFrame: callback => { frameCallback = callback; },
+    schedulePoll: callback => { pollCallback = callback; return 7; },
+    cancelPoll: () => {},
+  });
+  await scheduler.request();
+  assert.deepEqual(passes, [1]);
+  assert.equal(scheduler.pass, 2);
+  await frameCallback();
+  assert.deepEqual(passes, [1, 2]);
+  assert.equal(typeof pollCallback, 'function');
+  await pollCallback();
+  assert.deepEqual(passes, [1, 2, 2]);
+});
+
+test('shared fetch scheduler rejects overlapping requests', async () => {
+  let release;
+  let skips = 0;
+  const scheduler = createTerrainFetchScheduler({
+    execute: () => new Promise(resolve => { release = resolve; }),
+    onSkip: () => { skips += 1; },
+  });
+  const first = scheduler.request();
+  await scheduler.request();
+  assert.equal(skips, 1);
+  release({ nextAction: 'idle' });
+  await first;
+});
+
+test('reset aborts the active terrain generation and ignores its completion', async () => {
+  let activeSignal = null;
+  let release;
+  const scheduler = createTerrainFetchScheduler({
+    execute: ({ signal }) => {
+      activeSignal = signal;
+      return new Promise(resolve => { release = resolve; });
+    },
+  });
+  const request = scheduler.request();
+  scheduler.reset(1);
+  assert.equal(activeSignal.aborted, true);
+  release({ nextAction: 'poll' });
+  await request;
+  assert.equal(scheduler.pass, 1);
+  assert.equal(scheduler.fetching, false);
+});
+
+test('shared texture controller budgets scene applications per frame', () => {
+  const tiles = [
+    { id: 'a', bbox: [0, 0, 1, 1] },
+    { id: 'b', bbox: [1, 0, 2, 1] },
+  ];
+  const textures = new Map(tiles.map(tile => [tile.id, { image: { width: 1, height: 1 } }]));
+  const deferredTiles = new Map(tiles.map(tile => [tile.id, tile]));
+  const frames = [];
+  const materialized = [];
+  const controller = createTerrainTextureController({
+    terrainRoot: { children: [] }, deferredTiles,
+    textureStreamer: {
+      texCache: textures, texSource: new Map(), requestWaterMask() {},
+      pump() {},
+    },
+    meshRuntime: {
+      materialize(id) { materialized.push(id); deferredTiles.delete(id); },
+      rebuildWithTexture: mesh => mesh,
+    },
+    lifecycle: { evictCoveredAncestors() {}, sweepStaleParents() {} },
+    priorityForTile: () => 0, getVisibilityDistance: () => 1000,
+    isCovered: () => false, applyMaterial() {}, getWaterMask: () => null,
+    log() {}, applicationsPerFrame: 1,
+    scheduleFrame: callback => frames.push(callback),
+  });
+  controller(tiles);
+  assert.deepEqual(materialized, []);
+  frames.shift()();
+  assert.deepEqual(materialized, ['a']);
+  frames.shift()();
+  assert.deepEqual(materialized, ['a', 'b']);
+});
+
+test('shared texture controller discards late arrivals outside current heatmap demand', () => {
+  let callbacks = null;
+  let disposed = 0;
+  const lateTexture = { dispose: () => { disposed += 1; } };
+  const textureCache = new Map([['late', lateTexture]]);
+  const textureSource = new Map([['late', 'source']]);
+  const controller = createTerrainTextureController({
+    terrainRoot: { children: [] }, deferredTiles: new Map(),
+    textureStreamer: {
+      texCache: textureCache, texSource: textureSource, requestWaterMask() {},
+      pump(_scored, nextCallbacks) { callbacks = nextCallbacks; },
+    },
+    meshRuntime: { materialize() {}, rebuildWithTexture: mesh => mesh },
+    lifecycle: { evictCoveredAncestors() {}, sweepStaleParents() {} },
+    priorityForTile: () => 0, getVisibilityDistance: () => 1000,
+    isCovered: () => false, applyMaterial() {}, getWaterMask: () => null, log() {},
+    scheduleFrame() {},
+  });
+  controller([{ id: 'wanted', bbox: [0, 0, 1, 1] }]);
+  callbacks.onTexture({ tileId: 'late', tile: { id: 'late' }, texture: lateTexture });
+  assert.equal(textureCache.has('late'), false);
+  assert.equal(textureSource.has('late'), false);
+  assert.equal(disposed, 1);
+});
+
+test('shared enhancement controller tracks 202 pending and 429 backoff', () => {
+  let timestamp = 1000;
+  const controller = createTerrainEnhancementController({
+    log() {}, applyEnhancedTexture() {}, requestWaterMask() {},
+    textureCache: new Map(), textureSource: new Map(),
+    hasTextureWork: () => false, getLastCameraMoveTime: () => 0,
+    hasTiles: () => true, now: () => timestamp,
+  });
+  controller.handleResponse('tile', { status: 202 });
+  assert.deepEqual(controller.pending.get('tile'), { submitted: 1000, nextPollAt: 6000 });
+  timestamp = 2000;
+  controller.handleResponse('tile', { status: 429 }, true);
+  assert.equal(controller.backoffUntil, 12000);
+  assert.equal(controller.retryAfter.get('tile'), 12000);
+  assert.deepEqual(controller.pending.get('tile'), { submitted: 1000, nextPollAt: 12000 });
+});
+
+test('shared terrain mesh builder preserves heightmap geometry and metadata', () => {
+  const source = new Float32Array([1, 2, 3, 4]);
+  const encoded = Buffer.from(source.buffer).toString('base64');
+  assert.deepEqual([...decodeTerrainHeightmap(encoded)], [1, 2, 3, 4]);
+  let scatterHeightmap = null;
+  const build = createTerrainMeshBuilder({
+    oceanClassifier: {
+      OCEAN_EDGE_SEED_MAX_M: 0,
+      sampleOceanBlueScore: () => 0,
+      classifyOceanMask: () => null,
+      adjustedSeabedElevation: elevation => elevation,
+    },
+    exaggeration: 2,
+    attachScatter: (_mesh, _tile, heightmap) => { scatterHeightmap = heightmap; },
+  });
+  const mesh = build({
+    id: '1-2-3', resolution: 2, bbox: [10, 20, 12, 22], heightmap: encoded,
+  });
+  assert.deepEqual([...mesh.geometry.attributes.position.array], [
+    10, 20, 2, 12, 20, 4, 10, 22, 6, 12, 22, 8,
+  ]);
+  assert.equal(mesh.userData.tileId, '1-2-3');
+  assert.equal(mesh.userData.oceanCoverage, 0);
+  assert.deepEqual([...scatterHeightmap], [1, 2, 3, 4]);
+});
+
+test('shared availability status skips textured meshes and prioritizes downloading', () => {
+  const meshes = ['downloading', 'missing', 'textured'].map(tileId => ({
+    isMesh: true, userData: { tileId }, material: { map: tileId === 'textured' ? {} : null },
+  }));
+  const applied = [];
+  const changed = applyTerrainAvailabilityStatus({
+    terrainRoot: { children: meshes },
+    missing: [{ id: 'downloading' }, { id: 'missing' }, { id: 'textured' }],
+    downloading: ['downloading'],
+    applyStatus: (mesh, status) => applied.push([mesh.userData.tileId, status]),
+  });
+  assert.equal(changed, 2);
+  assert.deepEqual(applied, [['downloading', 'downloading'], ['missing', 'missing']]);
+});
+
+test('shared seam status preserves priority and labels', () => {
+  const seams = createTerrainSeamStatusController({ now: () => 3000 });
+  seams.apply({
+    pending: ['pending', 'both'], running: ['running', 'both'],
+    done_recent: ['done'], failed: ['failed'],
+  });
+  assert.equal(seams.status('both'), 'running');
+  assert.match(seams.statusHtml('failed'), /FAILED/);
+  assert.match(seams.statusHtml('pending'), /PENDING/);
+  assert.match(seams.statusHtml('done'), /DONE/);
+  assert.equal(seams.statusHtml('none'), null);
+});
+
+test('shared terrain debug metadata and outline selection remain deterministic', () => {
+  const mesh = {
+    isMesh: true,
+    userData: { tileId: 'tile', bbox: [0, 0, 1, 1] },
+    material: { map: { image: { width: 256, height: 128 } }, color: { getHexString: () => 'abcdef' } },
+  };
+  const root = {
+    children: [mesh],
+    traverse(callback) { callback(mesh); },
+  };
+  assert.deepEqual(collectTerrainDebugMeshes(root), [mesh]);
+  assert.deepEqual(summarizeTerrainMesh(mesh), {
+    tileId: 'tile', hasTexture: true, textureSize: '256x128',
+    color: '#abcdef', bbox: [0, 0, 1, 1],
+  });
+  const group = () => ({
+    children: [], add(child) { this.children.push(child); },
+    remove(child) { this.children = this.children.filter(item => item !== child); },
+  });
+  const pendingGroup = group(), enhancedGroup = group();
+  const outlines = createTerrainOutlineController({
+    terrainRoot: root, pendingGroup, enhancedGroup,
+    pending: new Map([['tile', {}]]), inflight: new Map(),
+    textureSource: new Map([['tile', 'dataforsyningen_enhanced']]),
+  });
+  assert.equal(outlines.updatePending(), true);
+  assert.equal(outlines.updatePending(), false);
+  assert.equal(pendingGroup.children.length, 1);
+  assert.equal(outlines.updateEnhanced(), true);
+  assert.equal(enhancedGroup.children.length, 1);
+});
+
+test('shared fetch executor preserves initial response transition ordering', async () => {
+  const events = [];
+  const state = {
+    pass: 1, isFirstLoad: true, frameOffsetReady: false,
+    frameOffsetX: 0, frameOffsetY: 0, originX: 0, originY: 0,
+    cameraX: 0, cameraY: 0, lastFetchX: 0, lastFetchY: 0,
+    currentTileIds: new Set(), lastTiles: null, bootFetchLogged: false,
+    set pipeline(value) { this.pipelineValue = value; },
+  };
+  const result = await createTerrainFetchExecutor({
+    state, previewMaxDepth: 10, getHeading: () => 0, getRange: () => 1000,
+    getCameraLatLon: () => ({ lat: 64, lon: -51, alt: 100 }),
+    getCameraSnapshot: () => ({ camEastM: 5, camNorthM: 6, camStereoApproxX: 10, camStereoApproxY: 20 }),
+    getCameraLocalPosition: () => ({ x: 5, y: 6 }),
+    anchorLatitude: 64, anchorLongitude: -51,
+    terrainRoot: { children: [] }, deferredTiles: new Map(),
+    lifecycle: { sweepStaleParents: () => 0 }, priorityForTile: () => 0,
+    textureCache: new Map(),
+    materialize() {}, buildMesh() {}, tileLog() {}, applyMissing() { events.push('missing'); },
+    updateTextures() { events.push('textures'); },
+    enqueueLog(_level, name) { events.push(name); }, bootLog(name) { events.push(name); },
+    fetchImpl: async () => ({
+      status: 200,
+      json: async () => ({
+        ox: 10, oy: 20, qx: 11, qy: 21, tiles: [], missing: [], downloading: [],
+        texFetching: 0, texRetryQueue: 0, texStatusCounts: {},
+      }),
+    }),
+    now: () => 100,
+  })({ pass: 1 });
+  assert.equal(result.nextAction, 'full-pass');
+  assert.equal(state.isFirstLoad, false);
+  assert.equal(state.originX, 10);
+  assert.deepEqual(events, [
+    'fetchTiles.request[pass1]', 'fetchTiles.frame.offset.set',
+    'fetchTiles.response[pass1]', 'tiles.initial-fetch.response',
+    'fetchTiles.origin.set', 'fetchTiles.diff[pass1]', 'fetchTiles.built[pass1]',
+    'textures', 'missing',
+  ]);
+});
+
+test('cardinal headings use the vehicle convention', () => {
+  const cases = [
+    [0, 0, 1],
+    [Math.PI / 2, -1, 0],
+    [Math.PI, 0, -1],
+    [-Math.PI / 2, 1, 0],
+  ];
+  for (const [heading, x, y] of cases) {
+    const actual = headingForward2D(heading);
+    assert.ok(Math.abs(actual.x - x) < 1e-12);
+    assert.ok(Math.abs(actual.y - y) < 1e-12);
+  }
+});
+
+test('stationary vehicle heading wins over orbiting camera yaw', () => {
+  assert.equal(priorityHeading(true, 1.25, -0.75), 1.25);
+  assert.equal(priorityHeading(false, 1.25, -0.75), -0.75);
+});
+
+test('tile ahead of vehicle is hotter than tile behind it', () => {
+  const options = {
+    cameraX: 0,
+    cameraY: 0,
+    heading: 0,
+    usePitch: false,
+    fovDeg: 60,
+    aspect: 16 / 9,
+  };
+  const ahead = terrainTilePriority({ bbox: [-50, 4950, 50, 5050] }, options);
+  const behind = terrainTilePriority({ bbox: [-50, -5050, 50, -4950] }, options);
+  assert.ok(ahead < behind);
+});
+
+test('HUD compass uses the same heading convention', () => {
+  assert.equal(compassHeading(0).compass, 'N');
+  assert.equal(compassHeading(Math.PI / 2).compass, 'W');
+  assert.equal(compassHeading(-Math.PI / 2).compass, 'E');
+});
+
+test('shared map pan respects map yaw', () => {
+  globalThis.window = { innerWidth: 1000, innerHeight: 800 };
+  const controls = {
+    dragButton: 2,
+    mapZoom: 1000,
+    yaw: 0,
+    mapPanEast: 0,
+    mapPanNorth: 0,
+  };
+  assert.equal(
+    applyMapDrag(controls, { movementX: 10, movementY: 0 }, 0.002, 1),
+    'pan',
+  );
+  assert.equal(controls.mapPanEast, -20);
+  assert.equal(controls.mapPanNorth, 0);
+});
+
+test('vehicle drive follows heading and respects speed limit', () => {
+  const step = stepVehicleDrive({
+    dt: 1, heading: 0, speed: 0, steer: 0, drive: 1,
+    groundNormalX: 0, groundNormalY: 0,
+    acceleration: 20, brake: 3, steerSpeed: 1.5, maxSpeed: 12,
+  });
+  assert.equal(step.speed, 12);
+  assert.ok(Math.abs(step.deltaX) < 1e-12);
+  assert.equal(step.deltaY, 12);
+});
+
+test('suspension converges without exceeding velocity limit', () => {
+  const step = stepSuspension({
+    dt: 0.05, position: 0, target: 10, velocity: 0,
+    frequency: 1.8, dampingRatio: 0.72, maxVelocity: 3,
+  });
+  assert.equal(step.velocity, 3);
+  assert.ok(Math.abs(step.position - 0.15) < 1e-12);
+});
+
+test('texture retries back off and cap', () => {
+  assert.equal(textureRetryDelay(1), 2000);
+  assert.equal(textureRetryDelay(2), 3000);
+  assert.equal(textureRetryDelay(100), 30000);
+});
+
+test('shared tile depth parsing rejects malformed ids', () => {
+  assert.equal(tileDepthFromId('12-1400-700'), 12);
+  assert.equal(tileDepthFromId('bad'), -1);
+  assert.equal(tileDepthFromId(null), -1);
+});
+
+test('texture classification signature prevents redundant land mesh rebuilds', () => {
+  const texture = { uuid: 'texture-1' };
+  const mesh = { userData: { oceanColorAssisted: false, oceanTextureSig: 'texture-1' } };
+  assert.equal(meshUsesTextureClassification(mesh, texture), true);
+});
+
+test('texture candidates are filtered and priority sorted', () => {
+  const tiles = [
+    { id: 'far', bbox: [0, 0, 1, 1], priority: 9 },
+    { id: 'hot', bbox: [0, 0, 1, 1], priority: 1 },
+    { id: 'cold', bbox: [0, 0, 1, 1], priority: 20 },
+  ];
+  const result = scoreTextureTiles(tiles, tile => tile.priority, 10);
+  assert.deepEqual(result.scored.map(item => item.tile.id), ['hot', 'far']);
+  assert.deepEqual([...result.tileIds], ['far', 'hot', 'cold']);
+});
+
+test('texture heatmap refines equivalent coverage before coarse parents', () => {
+  const tiles = [
+    { id: '8-87-48', bbox: [0, 0, 4, 4], priority: 5.0 },
+    { id: '11-699-390', bbox: [1, 1, 3, 3], priority: 5.1 },
+    { id: '12-1398-780', bbox: [1, 1, 2, 2], priority: 5.2 },
+    { id: '12-2000-2000', bbox: [10, 10, 11, 11], priority: 5.6 },
+  ];
+  const result = scoreTextureTiles(tiles, tile => tile.priority, 10);
+  assert.deepEqual(result.scored.map(item => item.tile.id), [
+    '12-1398-780', '11-699-390', '8-87-48', '12-2000-2000',
+  ]);
+});
+
+test('shared texture pump records HTTP 202 retry state', async () => {
+  const streamer = createTextureStreamer({
+    log: () => {},
+    fetchImpl: async () => ({ status: 202, ok: false }),
+    now: () => 100,
+  });
+  streamer.pump([{ tile: { id: '12-1-2', bbox: [0, 0, 1, 1] } }], {
+    isCovered: () => false,
+    onPlaceholder: () => assert.fail('unexpected placeholder'),
+    onTexture: () => assert.fail('unexpected texture'),
+  });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(streamer.texFetching.has('12-1-2'), true);
+  assert.equal(streamer.texRetryCount.get('12-1-2'), 1);
+  assert.equal(streamer.texRetryAtMs.get('12-1-2'), 2100);
+});
+
+test('shared texture pump caches successful exact texture', async () => {
+  let completed = null;
+  const streamer = createTextureStreamer({
+    log: () => {},
+    fetchImpl: async () => ({
+      status: 200,
+      ok: true,
+      headers: { get: name => name === 'X-Tex-Source' ? 'dataforsyningen' : null },
+      blob: async () => ({}),
+    }),
+    decodeImage: async () => ({ width: 256, height: 256 }),
+    getTextureAnisotropy: () => 16,
+  });
+  streamer.pump([{ tile: { id: '12-3-4', bbox: [0, 0, 1, 1] } }], {
+    isCovered: () => false,
+    onPlaceholder: () => assert.fail('unexpected placeholder'),
+    onTexture: result => { completed = result; },
+  });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(streamer.texSource.get('12-3-4'), 'dataforsyningen');
+  assert.equal(completed.tileId, '12-3-4');
+  assert.equal(completed.texture.generateMipmaps, true);
+  assert.equal(completed.texture.anisotropy, 8);
+});
+
+test('texture anisotropy supports both renderer APIs and fails safely', () => {
+  assert.equal(rendererTextureAnisotropy({ getMaxAnisotropy: () => 16 }), 16);
+  assert.equal(rendererTextureAnisotropy({
+    capabilities: { getMaxAnisotropy: () => 8 },
+  }), 8);
+  assert.equal(rendererTextureAnisotropy({ getMaxAnisotropy: () => { throw new Error('not ready'); } }), 1);
+});
+
+test('shared lifecycle keeps parent until all four quadrants are textured', () => {
+  const parent = {
+    isMesh: true,
+    userData: { tileId: '10-1-1', bbox: [0, 0, 10, 10] },
+    material: { map: null, dispose() {} },
+    geometry: { dispose() {} },
+  };
+  const children = ['11-2-2', '11-2-3', '11-3-2', '11-3-3'].map(tileId => ({
+    isMesh: true, userData: { tileId },
+    material: { map: {}, dispose() {} }, geometry: { dispose() {} },
+  }));
+  const root = {
+    children: [parent, children[0]],
+    remove(mesh) { this.children = this.children.filter(item => item !== mesh); },
+    add(mesh) { this.children.push(mesh); },
+  };
+  const lifecycle = createTileLifecycle({
+    terrainRoot: root, disposeScatter: () => {}, log: () => {},
+  });
+  assert.equal(lifecycle.sweepStaleParents([], new Set(['11-2-2'])), 0);
+  root.children.push(...children.slice(1));
+  assert.equal(lifecycle.sweepStaleParents([], new Set(children.map(c => c.userData.tileId))), 1);
+  assert.deepEqual(root.children, children);
+});
