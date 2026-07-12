@@ -6,6 +6,14 @@ export function createTerrainTuningControls({
 } = {}) {
   const definitions = [];
 
+  function section(text) {
+    const element = documentImpl.createElement('div');
+    element.style.cssText = 'margin:10px 0 4px;font-size:10px;text-transform:uppercase;color:#6889a8;letter-spacing:1px;border-bottom:1px solid #334;padding-bottom:3px';
+    element.textContent = text;
+    body.appendChild(element);
+    return element;
+  }
+
   function slider(label, options) {
     const saved = state[label];
     const initial = saved != null ? saved : options.value;
@@ -88,5 +96,5 @@ export function createTerrainTuningControls({
     definition.valueElement.textContent = definition.format(value);
   }
 
-  return { reset, setSliderValue, slider, toggle };
+  return { reset, section, setSliderValue, slider, toggle };
 }

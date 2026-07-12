@@ -8,7 +8,7 @@ import {
 } from './terrain-priority.js';
 import { compassHeading } from './terrain-hud.js';
 import { applyMapDrag } from './terrain-controls.js';
-import { normalizeSavedVehicleState, stepSuspension, stepVehicleDrive, vehicleLocalToLatLon, vehicleStateSnapshot } from './terrain-vehicle.js';
+import { createVehiclePersistenceRuntime, normalizeSavedVehicleState, stepSuspension, stepVehicleDrive, vehicleLocalToLatLon, vehicleStateSnapshot } from './terrain-vehicle.js';
 import { meshUsesTextureClassification, scoreTextureTiles, textureRetryDelay, tileDepthFromId } from './terrain-tile-runtime.js';
 import { createTextureStreamer, rendererTextureAnisotropy } from './terrain-texture-streamer.js';
 import { createTileLifecycle } from './terrain-tile-lifecycle.js';
@@ -26,6 +26,7 @@ import { createTerrainFpsCounter } from './terrain-fps-counter.js';
 import { loadTerrainStartupAssets, normalizeTerrainStartupAssets } from './terrain-startup-assets.js';
 import { createTerrainAtmosphereTextureRuntime } from './terrain-atmosphere-textures.js';
 import { createTerrainTuningControls } from './terrain-tuning-controls.js';
+import { bindTerrainCloudComposition, configureTerrainClouds, registerTerrainCloudTuning } from './terrain-cloud-runtime.js';
 import { createTerrainHouseConfiguration, createTerrainHouseMarkerRuntime, createTerrainHouseModelController, disposeTerrainHouseTree, markTerrainHousesNeedSnap, terrainHouseLocalPosition, terrainHouseShadowCoverage, terrainHouseZSummary } from './terrain-house-runtime.js';
 import {
   buildTerrainTilesRequest,
@@ -260,6 +261,8 @@ test('shared tuning controls initialize, persist, update, and reset widgets', ()
   const tuning = createTerrainTuningControls({
     body, state, documentImpl, save: () => { saves += 1; },
   });
+  const section = tuning.section('Clouds');
+  assert.equal(section.textContent, 'Clouds');
   const slider = tuning.slider('exposure', {
     value: 1, min: 0, max: 4, step: 0.1, decimals: 1,
     onChange: value => changes.push(['exposure', value]),
@@ -282,6 +285,74 @@ test('shared tuning controls initialize, persist, update, and reset widgets', ()
   assert.equal(slider.value, 1);
   assert.equal(toggle.checked, true);
   assert.deepEqual(changes.slice(-2), [['exposure', 1], ['clouds', true]]);
+});
+
+test('shared cloud runtime configures layers and synchronizes atmosphere composition', () => {
+  const vector = () => ({ values: [], set(...values) { this.values = values; } });
+  const listeners = new Map();
+  const effect = {
+    cloudLayers: Array.from({ length: 4 }, () => ({})),
+    localWeatherVelocity: vector(), shapeVelocity: vector(), shapeDetailVelocity: vector(),
+    shadow: {}, scatteringCoefficient: 2, absorptionCoefficient: 3,
+    atmosphereOverlay: 'overlay', atmosphereShadow: 'shadow', atmosphereShadowLength: 42,
+    events: {
+      addEventListener(type, listener) { listeners.set(type, listener); },
+      removeEventListener(type, listener) {
+        if (listeners.get(type) === listener) listeners.delete(type);
+      },
+    },
+  };
+  class LocalWeather {}
+  class CloudShape {}
+  class CloudShapeDetail {}
+  class Turbulence {}
+  assert.deepEqual(configureTerrainClouds({
+    effect, LocalWeather, CloudShape, CloudShapeDetail, Turbulence,
+  }), { scattering: 2, absorption: 3 });
+  assert.deepEqual(effect.cloudLayers.map(layer => layer.altitude), [1550, 1800, 8300, 9100]);
+  assert.equal(effect.cloudLayers[3].densityScale, 0);
+  assert.deepEqual(effect.localWeatherVelocity.values, [0.00004, 0]);
+  assert.ok(effect.localWeatherTexture instanceof LocalWeather);
+
+  const aerial = {};
+  const binding = bindTerrainCloudComposition(effect, aerial);
+  assert.deepEqual(aerial, { overlay: 'overlay', shadow: 'shadow', shadowLength: 42 });
+  effect.atmosphereShadowLength = 84;
+  listeners.get('change')({ property: 'atmosphereShadowLength' });
+  assert.equal(aerial.shadowLength, 84);
+  binding.dispose();
+  assert.equal(listeners.has('change'), false);
+});
+
+test('shared cloud tuning registers controls and applies altitude, cirrus, and drift changes', () => {
+  const definitions = new Map();
+  const sections = [];
+  const effect = {
+    coverage: 0.28,
+    cloudLayers: [1550, 1800, 8300, 9100].map(altitude => ({
+      altitude, densityScale: 0, weatherExponent: 1, shapeAmount: 0.3,
+    })),
+    localWeatherVelocity: { values: [], set(...values) { this.values = values; } },
+  };
+  const controls = {};
+  registerTerrainCloudTuning({
+    effect, controls,
+    section: label => sections.push(label),
+    slider: (label, options) => { definitions.set(label, options); return { label }; },
+    toggle: (label, options) => { definitions.set(label, options); return { label }; },
+  });
+  assert.deepEqual(sections, ['Clouds']);
+  assert.equal(definitions.size, 8);
+  assert.equal(controls._cirrusCheckbox.label, 'cirrus');
+
+  definitions.get('cloud altitude').onChange(-2000);
+  assert.deepEqual(effect.cloudLayers.map(layer => layer.altitude), [0, 0, 6300, 7100]);
+  definitions.get('cirrus').onChange(true);
+  assert.equal(effect.cloudLayers[3].densityScale, 0.004);
+  definitions.get('drift speed').onChange(0.001);
+  definitions.get('drift direction').onChange(90);
+  assert.ok(Math.abs(effect.localWeatherVelocity.values[0]) < 1e-12);
+  assert.ok(Math.abs(effect.localWeatherVelocity.values[1] - 0.001) < 1e-12);
 });
 
 test('shared house configuration and placement preserve terrain conventions', () => {
@@ -894,6 +965,57 @@ test('shared vehicle persistence helpers preserve coordinates and normalize save
     lat: 64, lon: -51, headingDeg: 0, z: 'bad', terrainDepth: -2,
   }), { lat: 64, lon: -51, headingDeg: 0, z: null, terrainDepth: 0 });
   assert.equal(normalizeSavedVehicleState({ lat: 64, lon: 'bad', headingDeg: 0 }), null);
+});
+
+test('shared vehicle persistence runtime posts snapshots, throttles saves, and cools down failures', async () => {
+  let dateMs = 1000;
+  let performanceMs = 6000;
+  let timerId = 0;
+  const timers = new Map();
+  const requests = [];
+  const logs = [];
+  let shouldFail = false;
+  const runtime = createVehiclePersistenceRuntime({
+    endpoint: '/vehicle', timeoutMs: 1500, failureCooldownMs: 5000,
+    throttleMs: 5000, trailingMs: 2000,
+    createSnapshot: () => ({ lat: 64, lon: -51, z: 8 }),
+    dateNow: () => dateMs,
+    performanceNow: () => performanceMs,
+    setTimeoutImpl(callback, delay) {
+      timerId += 1; timers.set(timerId, { callback, delay }); return timerId;
+    },
+    clearTimeoutImpl(id) { timers.delete(id); },
+    AbortControllerImpl: null,
+    bootLog: (...args) => logs.push(args),
+    async fetchImpl(url, options) {
+      requests.push([url, JSON.parse(options.body)]);
+      return shouldFail
+        ? { ok: false, status: 503, async text() { return 'offline'; } }
+        : { ok: true, status: 200 };
+    },
+  });
+
+  assert.equal(await runtime.save('manual'), true);
+  assert.deepEqual(requests[0], ['/vehicle', { lat: 64, lon: -51, z: 8, reason: 'manual' }]);
+  runtime.throttledSave();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(requests[1][1].reason, 'drive-throttle');
+  const trailing = [...timers.values()].find(timer => timer.delay === 2000);
+  performanceMs = 7000;
+  trailing.callback();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(requests[2][1].reason, 'drive-trailing');
+
+  shouldFail = true;
+  assert.equal(await runtime.save('failure'), false);
+  assert.equal(logs.at(-1)[0], 'vehicle.state.save.error');
+  const requestCount = requests.length;
+  assert.equal(await runtime.save('cooldown'), false);
+  assert.equal(requests.length, requestCount);
+  dateMs += 5001;
+  shouldFail = false;
+  assert.equal(await runtime.save('recovered'), true);
+  assert.equal(logs.at(-1)[0], 'vehicle.state.save.recovered');
 });
 
 test('suspension converges without exceeding velocity limit', () => {

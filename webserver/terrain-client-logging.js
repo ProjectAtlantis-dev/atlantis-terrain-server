@@ -2,6 +2,7 @@ export function createTerrainClientLogger({
   sceneMode,
   endpoint = '/api/client_log',
   enabled = true,
+  minLevel = 'info',
   batchSize = 40,
   maxQueue = 600,
   flushMs = 800,
@@ -10,6 +11,8 @@ export function createTerrainClientLogger({
   fetchImpl = fetch,
   performanceRef = performance,
 } = {}) {
+  const levelRanks = { debug: 10, info: 20, warn: 30, warning: 30, error: 40, critical: 50 };
+  const minLevelRank = levelRanks[minLevel] ?? levelRanks.info;
   const queue = [];
   const bootEvents = [];
   const bootStartMs = performanceRef.now();
@@ -77,7 +80,7 @@ export function createTerrainClientLogger({
   }
 
   function enqueue(level, phase, details) {
-    if (!enabled) return;
+    if (!enabled || (levelRanks[level] ?? levelRanks.info) < minLevelRank) return;
     const entry = { ts: new Date().toISOString(), level, phase };
     const normalized = safeDetails(details);
     if (normalized !== undefined) entry.details = normalized;

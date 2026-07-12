@@ -40,6 +40,88 @@ export function normalizeSavedVehicleState(state) {
   };
 }
 
+export function createVehiclePersistenceRuntime({
+  endpoint,
+  timeoutMs,
+  failureCooldownMs,
+  throttleMs = 5000,
+  trailingMs = 2000,
+  createSnapshot,
+  bootLog = () => {},
+  fetchImpl = (...args) => fetch(...args),
+  AbortControllerImpl = globalThis.AbortController,
+  dateNow = () => Date.now(),
+  performanceNow = () => performance.now(),
+  setTimeoutImpl = (...args) => setTimeout(...args),
+  clearTimeoutImpl = handle => clearTimeout(handle),
+} = {}) {
+  let trailingTimer = 0;
+  let lastSaveAt = 0;
+  let failureUntilMs = 0;
+  let failureReported = false;
+
+  async function save(reason = 'manual', options = {}) {
+    if (failureUntilMs > dateNow()) return false;
+    const state = createSnapshot(options);
+    if (state == null) return false;
+    try {
+      const controller = typeof AbortControllerImpl === 'function'
+        ? new AbortControllerImpl()
+        : null;
+      const timeoutHandle = controller != null
+        ? setTimeoutImpl(() => controller.abort(), timeoutMs)
+        : null;
+      const response = await fetchImpl(endpoint, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ...state, reason }),
+        signal: controller?.signal,
+      }).finally(() => {
+        if (timeoutHandle != null) clearTimeoutImpl(timeoutHandle);
+      });
+      if (!response.ok) {
+        const responseText = await response.text().catch(() => '');
+        const preview = responseText.slice(0, 180);
+        throw new Error(
+          `vehicle_state save status ${response.status}${preview ? ` body=${preview}` : ''}`,
+        );
+      }
+      if (failureReported) bootLog('vehicle.state.save.recovered', { reason });
+      failureUntilMs = 0;
+      failureReported = false;
+      return true;
+    } catch (error) {
+      failureUntilMs = dateNow() + failureCooldownMs;
+      if (!failureReported) {
+        bootLog('vehicle.state.save.error', {
+          reason,
+          timeoutMs,
+          timedOut: error?.name === 'AbortError',
+          cooldownMs: failureCooldownMs,
+          message: error?.message ?? String(error),
+        }, 'error');
+        failureReported = true;
+      }
+      return false;
+    }
+  }
+
+  function throttledSave() {
+    const now = performanceNow();
+    if (now - lastSaveAt >= throttleMs) {
+      lastSaveAt = now;
+      save('drive-throttle');
+    }
+    clearTimeoutImpl(trailingTimer);
+    trailingTimer = setTimeoutImpl(() => {
+      lastSaveAt = performanceNow();
+      save('drive-trailing');
+    }, trailingMs);
+  }
+
+  return { save, throttledSave };
+}
+
 /** Pure vehicle drive integration shared by both renderer entry points. */
 export function stepVehicleDrive({
   dt,

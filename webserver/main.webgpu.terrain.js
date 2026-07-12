@@ -55,7 +55,7 @@ import { createTerrainOceanClassifier } from './classifier/terrain-ocean.js';
 import { priorityHeading, terrainTilePriority } from './terrain-priority.js';
 import { compassHeading, createTerrainHud, renderGameClock, TERRAIN_HUD_LINKS } from './terrain-hud.js';
 import { installTerrainKeyboardControls, installTerrainPointerControls } from './terrain-controls.js';
-import { normalizeSavedVehicleState, stepSuspension, stepVehicleDrive, vehicleLocalToLatLon as terrainVehicleLocalToLatLon, vehicleStateSnapshot } from './terrain-vehicle.js';
+import { createVehiclePersistenceRuntime, normalizeSavedVehicleState, stepSuspension, stepVehicleDrive, vehicleLocalToLatLon as terrainVehicleLocalToLatLon, vehicleStateSnapshot } from './terrain-vehicle.js';
 import { createTileHistory, terrainFogDistance, terrainVisibilityDistance, tileDepthFromId } from './terrain-tile-runtime.js';
 import { createTextureStreamer, rendererTextureAnisotropy } from './terrain-texture-streamer.js';
 import { createTerrainMeshRuntime } from './terrain-mesh-runtime.js';
@@ -73,6 +73,7 @@ import { createTerrainFpsCounter } from './terrain-fps-counter.js';
 import { loadTerrainStartupAssets } from './terrain-startup-assets.js';
 import { createTerrainAtmosphereTextureRuntime } from './terrain-atmosphere-textures.js';
 import { createTerrainTuningControls } from './terrain-tuning-controls.js';
+import { bindTerrainCloudComposition, configureTerrainClouds, registerTerrainCloudTuning } from './terrain-cloud-runtime.js';
 import { createTerrainHouseConfiguration, createTerrainHouseMarkerRuntime, createTerrainHouseModelController, disposeTerrainHouseTree, markTerrainHousesNeedSnap, terrainHouseLocalPosition, terrainHouseShadowCoverage, terrainHouseZSummary } from './terrain-house-runtime.js';
 
 const USE_WEBGPU_RENDER_BACKEND = true;
@@ -793,6 +794,7 @@ let useRealtimeGameClock = !(hasSavedMonth || hasSavedHour);
 // Deferred binding: renderer-specific callbacks are wired after effects exist.
 const {
   reset: resetTuningUI,
+  section: tuningSectionLabel,
   setSliderValue: tuningSliderSetValue,
   slider: tuningSlider,
   toggle: tuningToggle,
@@ -801,13 +803,6 @@ const {
   state: _tuningState,
   save: saveTuning,
 });
-
-function tuningSectionLabel(text) {
-  const d = document.createElement('div');
-  d.style.cssText = 'margin:10px 0 4px;font-size:10px;text-transform:uppercase;color:#6889a8;letter-spacing:1px;border-bottom:1px solid #334;padding-bottom:3px';
-  d.textContent = text;
-  tuningBody.appendChild(d);
-}
 
 // We'll call this after aerialPerspective + cloudsEffect are created.
 function buildTuningControls(ap, ce) {
@@ -846,68 +841,11 @@ function buildTuningControls(ap, ce) {
     value: ap.inscatter,
     onChange: v => { ap.inscatter = v; }
   });
-  tuningSectionLabel('Clouds');
-  const defaultAltitudes = ce.cloudLayers.map(l => l.altitude);
-  tuningSlider('cloud altitude', {
-    min: -2000, max: 5000, step: 50, value: 0,
-    decimals: 0,
-    format: v => `${v > 0 ? '+' : ''}${v}m`,
-    onChange: v => {
-      for (let i = 0; i < ce.cloudLayers.length; i++) {
-        ce.cloudLayers[i].altitude = Math.max(0, defaultAltitudes[i] + v);
-      }
-    }
-  });
-  tuningSlider('coverage', {
-    min: 0, max: 1, step: 0.01, value: ce.coverage,
-    onChange: v => { ce.coverage = v; }
-  });
-  tuningSlider('cirrus density', {
-    min: 0, max: 0.002, step: 0.0001, value: ce.cloudLayers[3].densityScale,
-    decimals: 4,
-    onChange: v => { ce.cloudLayers[3].densityScale = v; }
-  });
-  tuningSlider('cirrus coverage', {
-    min: 0.1, max: 3, step: 0.05, value: ce.cloudLayers[3].weatherExponent,
-    decimals: 2,
-    format: v => v <= 0.1 ? 'full' : v >= 3 ? 'sparse' : v.toFixed(2),
-    onChange: v => { ce.cloudLayers[3].weatherExponent = v; }
-  });
-  const _cirrusDefaults = {
-    densityScale: 0.004,  // design value (startup is 0 / off)
-    coverageFilterWidth: ce.cloudLayers[3].coverageFilterWidth,
-    shapeAmount: ce.cloudLayers[3].shapeAmount,
-    weatherExponent: ce.cloudLayers[3].weatherExponent,
-  };
-  controls._cirrusCheckbox = tuningToggle('cirrus', {
-    value: false,
-    onChange: v => {
-      ce.cloudLayers[3].densityScale = v ? _cirrusDefaults.densityScale : 0;
-    }
-  });
-  tuningSlider('cirrus shape', {
-    min: 0, max: 1, step: 0.01, value: ce.cloudLayers[3].shapeAmount,
-    onChange: v => { ce.cloudLayers[3].shapeAmount = v; }
-  });
-  let _driftSpeed = 0.00004;
-  let _driftAngle = 0; // degrees, 0 = east, 90 = north
-  const _updateDrift = () => {
-    const rad = _driftAngle * Math.PI / 180;
-    ce.localWeatherVelocity.set(
-      Math.cos(rad) * _driftSpeed,
-      Math.sin(rad) * _driftSpeed
-    );
-  };
-  tuningSlider('drift speed', {
-    min: 0, max: 0.002, step: 0.00005, value: _driftSpeed,
-    decimals: 6,
-    onChange: v => { _driftSpeed = v; _updateDrift(); }
-  });
-  tuningSlider('drift direction', {
-    min: 0, max: 360, step: 5, value: _driftAngle,
-    decimals: 0,
-    format: v => `${v}°`,
-    onChange: v => { _driftAngle = v; _updateDrift(); }
+  registerTerrainCloudTuning({
+    effect: ce, controls,
+    section: tuningSectionLabel,
+    slider: tuningSlider,
+    toggle: tuningToggle,
   });
   }
   tuningSectionLabel('Terrain');
@@ -1115,7 +1053,8 @@ const seamStatusController = createTerrainSeamStatusController({});
 const EXAG = 1.0;
 
 // --- Procedural asset scatter (fable5-world-demo port, chain validation) ---
-const SCATTER_ENABLED = !USE_WEBGPU_RENDER_BACKEND;
+// Temporarily disabled; keep the procedural vegetation pipeline intact for re-enabling.
+const SCATTER_ENABLED = false;
 const SCATTER_SEED = 1337;
 let _scatterLib = null;   // built lazily on the first deep tile
 let _scatterLibFailed = false;
@@ -1901,107 +1840,32 @@ function updateVehicleSuspension(dt) {
   vehicleMarker.position.z = vehicleGroup.position.z + HOUSE_MARKER_BASE_LIFT;
 }
 
-let _vehicleSaveTrailingTimer = 0;
-let _vehicleLastSaveAt = 0;
-let _vehicleSaveFailureUntilMs = 0;
-let _vehicleSaveFailureReported = false;
-const VEHICLE_SAVE_THROTTLE_MS = 5000;
-const VEHICLE_SAVE_TRAILING_MS = 2000;
-function throttledVehicleSave() {
-  const now = performance.now();
-  // Throttle: save immediately if enough time has passed
-  if (now - _vehicleLastSaveAt >= VEHICLE_SAVE_THROTTLE_MS) {
-    _vehicleLastSaveAt = now;
-    saveVehicleState('drive-throttle');
-  }
-  // Trailing: always schedule a final save after movement stops
-  clearTimeout(_vehicleSaveTrailingTimer);
-  _vehicleSaveTrailingTimer = setTimeout(() => {
-    _vehicleLastSaveAt = performance.now();
-    saveVehicleState('drive-trailing');
-  }, VEHICLE_SAVE_TRAILING_MS);
-}
-
-async function saveVehicleState(reason = 'manual', options = {}) {
-  const {
-    snapToGround = false,
-    requireGroundedZ = false,
-    bypassSnapThrottle = false,
-  } = options;
-  let zGrounded = false;
-  const nowMs = Date.now();
-  if (_vehicleSaveFailureUntilMs > nowMs) {
-    return false;
-  }
+function createVehicleSaveSnapshot(options = {}) {
+  const { snapToGround = false, bypassSnapThrottle = false } = options;
   if (snapToGround && vehicleLoaded) {
     vehicleSnapPending = true;
     snapVehicleToTerrain({ forceImmediate: true, bypassThrottle: bypassSnapThrottle });
-    zGrounded = !vehicleSnapPending && Number.isFinite(vehicleGroundZTarget);
   }
   const state = getVehicleStateSnapshot();
-  if (state == null) return false;
+  if (state == null) return null;
   if (Number.isFinite(vehicleGroundZTarget)) {
     state.z = Number(vehicleGroundZTarget.toFixed(3));
   }
   const terrainSample = sampleBestVehicleTerrainHit();
-  if (terrainSample.depth >= 0) {
-    state.terrainDepth = terrainSample.depth;
-  }
-  if (terrainSample.tileId) {
-    state.terrainTileId = terrainSample.tileId;
-  }
-  if ((snapToGround || requireGroundedZ) && !zGrounded) {
-    // bootLog('vehicle.state.save.ungrounded', { reason, state }, 'warn');
-  }
-  try {
-    const controller = typeof AbortController !== 'undefined'
-      ? new AbortController()
-      : null;
-    const timeoutHandle = controller != null
-      ? window.setTimeout(() => controller.abort(), VEHICLE_SAVE_FETCH_TIMEOUT_MS)
-      : null;
-    const response = await fetch(VEHICLE_STATE_ENDPOINT, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ ...state, reason }),
-      signal: controller?.signal,
-    }).finally(() => {
-      if (timeoutHandle != null) {
-        window.clearTimeout(timeoutHandle);
-      }
-    });
-    if (!response.ok) {
-      const responseText = await response.text().catch(() => '');
-      const preview = responseText.slice(0, 180);
-      throw new Error(
-        `vehicle_state save status ${response.status}${preview ? ` body=${preview}` : ''}`
-      );
-    }
-    if (_vehicleSaveFailureReported) {
-      bootLog('vehicle.state.save.recovered', {
-        reason,
-      });
-    }
-    _vehicleSaveFailureUntilMs = 0;
-    _vehicleSaveFailureReported = false;
-    // bootLog('vehicle.state.save.success', { reason, state, zGrounded });
-    return true;
-  } catch (error) {
-    _vehicleSaveFailureUntilMs = Date.now() + VEHICLE_SAVE_FAILURE_COOLDOWN_MS;
-    if (!_vehicleSaveFailureReported) {
-      const timedOut = error?.name === 'AbortError';
-      bootLog('vehicle.state.save.error', {
-        reason,
-        timeoutMs: VEHICLE_SAVE_FETCH_TIMEOUT_MS,
-        timedOut,
-        cooldownMs: VEHICLE_SAVE_FAILURE_COOLDOWN_MS,
-        message: error?.message ?? String(error),
-      }, 'error');
-      _vehicleSaveFailureReported = true;
-    }
-    return false;
-  }
+  if (terrainSample.depth >= 0) state.terrainDepth = terrainSample.depth;
+  if (terrainSample.tileId) state.terrainTileId = terrainSample.tileId;
+  return state;
 }
+
+const vehiclePersistence = createVehiclePersistenceRuntime({
+  endpoint: VEHICLE_STATE_ENDPOINT,
+  timeoutMs: VEHICLE_SAVE_FETCH_TIMEOUT_MS,
+  failureCooldownMs: VEHICLE_SAVE_FAILURE_COOLDOWN_MS,
+  createSnapshot: createVehicleSaveSnapshot,
+  bootLog,
+});
+const saveVehicleState = vehiclePersistence.save;
+const throttledVehicleSave = vehiclePersistence.throttledSave;
 
 function loadVehicleState() {
   const state = ASSET_VEHICLE_INSTANCES.length > 0 ? ASSET_VEHICLE_INSTANCES[0] : null;
@@ -3173,36 +3037,13 @@ const updateHouseHotReload = houseModelController.updateHotReload;
 const normalPass = new NormalPass(scene, camera);
 
 const cloudsEffect = new CloudsEffect(camera, { resolutionScale: 1 });
-cloudsEffect.qualityPreset = 'high';
-cloudsEffect.coverage = 0.28;
-// Raise main cloud layers to ~800m above Takram defaults
-cloudsEffect.cloudLayers[0].altitude = 1550;  // default 750 + 800
-cloudsEffect.cloudLayers[1].altitude = 1800;  // default 1000 + 800
-cloudsEffect.cloudLayers[2].altitude = 8300;  // default 7500 + 800
-// Cirrus layer — configured but OFF at startup (toggle in tuning panel)
-cloudsEffect.cloudLayers[3].altitude = 9100;
-cloudsEffect.cloudLayers[3].height = 400;
-cloudsEffect.cloudLayers[3].densityScale = 0;
-cloudsEffect.cloudLayers[3].shapeAmount = 0.3;
-cloudsEffect.cloudLayers[3].shapeDetailAmount = 0;
-cloudsEffect.cloudLayers[3].weatherExponent = 1;
-cloudsEffect.cloudLayers[3].shapeAlteringBias = 0.35;
-cloudsEffect.cloudLayers[3].coverageFilterWidth = 0.5;
-cloudsEffect.localWeatherVelocity.set(0.00004, 0);
-cloudsEffect.shapeVelocity.set(0, 0, 0);
-cloudsEffect.shapeDetailVelocity.set(0, 0, 0);
-cloudsEffect.shadow.maxFar = 1e5;
-cloudsEffect.shadow.farScale = 0.25;
-cloudsEffect.shadow.minTransmittance = 1e-5;
-cloudsEffect.shadow.opticalDepthTailScale = 3;
-cloudsEffect.localWeatherTexture = new LocalWeather();
-cloudsEffect.shapeTexture = new CloudShape();
-cloudsEffect.shapeDetailTexture = new CloudShapeDetail();
-cloudsEffect.turbulenceTexture = new Turbulence();
-const cloudsDefaults = {
-  scattering: cloudsEffect.scatteringCoefficient,
-  absorption: cloudsEffect.absorptionCoefficient,
-};
+const cloudsDefaults = configureTerrainClouds({
+  effect: cloudsEffect,
+  LocalWeather,
+  CloudShape,
+  CloudShapeDetail,
+  Turbulence,
+});
 
 const aerialPerspective = new AerialPerspectiveEffect(camera);
 aerialPerspective.sky = true;
@@ -3247,28 +3088,7 @@ if (useRealtimeGameClock) {
   applyDate(getGameDateFromBrowserTime());
 }
 
-function syncCloudComposition() {
-  aerialPerspective.overlay = cloudsEffect.atmosphereOverlay;
-  aerialPerspective.shadow = cloudsEffect.atmosphereShadow;
-  aerialPerspective.shadowLength = cloudsEffect.atmosphereShadowLength;
-}
-
-cloudsEffect.events.addEventListener('change', event => {
-  switch (event.property) {
-    case 'atmosphereOverlay':
-      aerialPerspective.overlay = cloudsEffect.atmosphereOverlay;
-      break;
-    case 'atmosphereShadow':
-      aerialPerspective.shadow = cloudsEffect.atmosphereShadow;
-      break;
-    case 'atmosphereShadowLength':
-      aerialPerspective.shadowLength = cloudsEffect.atmosphereShadowLength;
-      break;
-    default:
-  }
-});
-
-syncCloudComposition();
+bindTerrainCloudComposition(cloudsEffect, aerialPerspective);
 
 bootLog('atmosphere.cache.load-sequence.invoke');
 createTerrainAtmosphereTextureRuntime({
