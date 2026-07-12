@@ -22,10 +22,13 @@ import {
   buildTerrainTilesRequest,
   adoptTerrainOrigin,
   diffTerrainTileIds,
+  evaluateTerrainRefetch,
   offsetTerrainPayload,
   prioritizeTerrainBuildCandidates,
   selectTerrainFrameOffset,
+  summarizeTerrainCamera,
   summarizeTerrainResponse,
+  terrainCameraCoordinates,
   terrainCameraStereoPosition,
   terrainPipelineStatus,
 } from './terrain-tile-fetch.js';
@@ -150,6 +153,46 @@ test('terrain origin and pipeline decisions preserve two-pass behavior', () => {
     latitude: 64, longitude: -51, anchorLatitude: 64, anchorLongitude: -51,
     originX: 12, originY: 34,
   }), { x: 12, y: 34 });
+});
+
+test('shared terrain refetch decision enforces distance and trigger interval', () => {
+  assert.deepEqual(evaluateTerrainRefetch({
+    cameraX: 6000, cameraY: 0, lastFetchX: 0, lastFetchY: 0,
+    nowMs: 1000, lastTriggerMs: 0, distanceThreshold: 5000, triggerIntervalMs: 500,
+  }), { distance: 6000, shouldFetch: true, nextTriggerMs: 1000 });
+  assert.equal(evaluateTerrainRefetch({
+    cameraX: 7000, cameraY: 0, lastFetchX: 0, lastFetchY: 0,
+    nowMs: 1200, lastTriggerMs: 1000, distanceThreshold: 5000, triggerIntervalMs: 500,
+  }).shouldFetch, false);
+  assert.equal(evaluateTerrainRefetch({
+    cameraX: 100, cameraY: 0, lastFetchX: 0, lastFetchY: 0,
+    nowMs: 5000, lastTriggerMs: 0, distanceThreshold: 5000, triggerIntervalMs: 500,
+  }).shouldFetch, false);
+});
+
+test('shared camera coordinates and log summary use one ENU conversion', () => {
+  const vector = (x, y, z) => ({
+    x, y, z,
+    clone() { return vector(this.x, this.y, this.z); },
+    sub(other) { this.x -= other.x; this.y -= other.y; this.z -= other.z; return this; },
+    dot(other) { return this.x * other.x + this.y * other.y + this.z * other.z; },
+  });
+  const coordinates = terrainCameraCoordinates({
+    position: vector(10, 20, 30), anchorPosition: vector(0, 0, 0),
+    east: vector(1, 0, 0), north: vector(0, 1, 0), up: vector(0, 0, 1),
+    anchorLatitude: 64, anchorLongitude: -51, originX: 100, originY: 200,
+  });
+  assert.equal(coordinates.eastM, 10);
+  assert.equal(coordinates.northM, 20);
+  assert.equal(coordinates.alt, 30);
+  const summary = summarizeTerrainCamera(coordinates, {
+    originX: 100, originY: 200, frameOffsetX: 10, frameOffsetY: 20,
+    frameOffsetReady: true,
+  });
+  assert.equal(summary.camEastM, 10);
+  assert.equal(summary.camNorthM, 20);
+  assert.equal(summary.camStereoApproxX, 110);
+  assert.equal(summary.camStereoApproxY, 220);
 });
 
 test('shared fetch scheduler serializes preview, full pass, and polling', async () => {

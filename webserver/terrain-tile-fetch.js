@@ -138,6 +138,51 @@ export function terrainCameraStereoPosition({
   };
 }
 
+export function evaluateTerrainRefetch({
+  cameraX, cameraY, lastFetchX, lastFetchY,
+  nowMs, lastTriggerMs, distanceThreshold, triggerIntervalMs,
+}) {
+  const distance = Math.hypot(cameraX - lastFetchX, cameraY - lastFetchY);
+  const shouldFetch = distance > distanceThreshold && nowMs - lastTriggerMs > triggerIntervalMs;
+  return {
+    distance,
+    shouldFetch,
+    nextTriggerMs: shouldFetch ? nowMs : lastTriggerMs,
+  };
+}
+
+export function terrainCameraCoordinates({
+  position, anchorPosition, east, north, up,
+  anchorLatitude, anchorLongitude, originX, originY,
+}) {
+  const relative = position.clone().sub(anchorPosition);
+  const eastM = relative.dot(east);
+  const northM = relative.dot(north);
+  const upM = relative.dot(up);
+  const latitude = anchorLatitude + northM / 111320;
+  const longitude = anchorLongitude + eastM / (111320 * Math.cos(anchorLatitude * Math.PI / 180));
+  const stereo = terrainCameraStereoPosition({
+    latitude, longitude, anchorLatitude, anchorLongitude, originX, originY,
+  });
+  return { lat: latitude, lon: longitude, alt: upM, eastM, northM, upM, stereoX: stereo.x, stereoY: stereo.y };
+}
+
+export function summarizeTerrainCamera(coordinates, {
+  originX, originY, frameOffsetX, frameOffsetY, frameOffsetReady,
+}) {
+  const number = (value, digits) => Number.isFinite(value) ? Number(value.toFixed(digits)) : null;
+  return {
+    camLat: number(coordinates.lat, 8), camLon: number(coordinates.lon, 8),
+    camAltM: number(coordinates.alt, 2), camEastM: number(coordinates.eastM, 1),
+    camNorthM: number(coordinates.northM, 1), camUpM: number(coordinates.upM, 1),
+    camStereoApproxX: number(coordinates.stereoX, 1),
+    camStereoApproxY: number(coordinates.stereoY, 1),
+    originX: number(originX, 1), originY: number(originY, 1),
+    tileFrameOffsetX: number(frameOffsetX, 1), tileFrameOffsetY: number(frameOffsetY, 1),
+    tileFrameOffsetReady: frameOffsetReady,
+  };
+}
+
 export function terrainPipelineStatus(data, wasFirstLoad) {
   const missing = data?.missing?.length ?? 0;
   const downloading = data?.downloading?.length ?? 0;

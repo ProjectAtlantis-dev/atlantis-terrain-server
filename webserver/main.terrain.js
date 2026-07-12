@@ -36,7 +36,7 @@ import { createTileHistory, terrainFogDistance, terrainVisibilityDistance, tileD
 import { createTextureStreamer } from './terrain-texture-streamer.js';
 import { createTerrainMeshRuntime } from './terrain-mesh-runtime.js';
 import { createTerrainTextureController } from './terrain-texture-controller.js';
-import { adoptTerrainOrigin, buildTerrainTilesRequest, offsetTerrainPayload, selectTerrainFrameOffset, summarizeTerrainResponse, terrainCameraStereoPosition, terrainPipelineStatus } from './terrain-tile-fetch.js';
+import { adoptTerrainOrigin, buildTerrainTilesRequest, evaluateTerrainRefetch, offsetTerrainPayload, selectTerrainFrameOffset, summarizeTerrainCamera, summarizeTerrainResponse, terrainCameraCoordinates, terrainCameraStereoPosition, terrainPipelineStatus } from './terrain-tile-fetch.js';
 import { reconcileTerrainTiles } from './terrain-tile-reconciler.js';
 import { createTerrainFetchScheduler } from './terrain-fetch-scheduler.js';
 import { createTerrainEnhancementController } from './terrain-enhancement-controller.js';
@@ -4230,41 +4230,31 @@ function updateEnhancement() {
 // --- Camera position → lat/lon conversion ---
 
 function getCameraLatLon() {
-  const rel = camera.position.clone().sub(anchorPosition);
-  const eastM = rel.dot(east);
-  const northM = rel.dot(north);
-  const altM = rel.dot(up);
-  const lat = anchorLat + northM / 111320;
-  const lon = anchorLon + eastM / (111320 * Math.cos(anchorLat * Math.PI / 180));
-  return { lat, lon, alt: altM };
+  const coordinates = terrainCameraCoordinates({
+    position: camera.position, anchorPosition, east, north, up,
+    anchorLatitude: anchorLat, anchorLongitude: anchorLon, originX, originY,
+  });
+  return { lat: coordinates.lat, lon: coordinates.lon, alt: coordinates.alt };
 }
 
 function getCameraLogSnapshot(camLL = null) {
-  const ll = camLL ?? getCameraLatLon();
-  const rel = camera.position.clone().sub(anchorPosition);
-  const eastM = rel.dot(east);
-  const northM = rel.dot(north);
-  const upM = rel.dot(up);
-  const camStereoApproxX = originX + (ll.lon - anchorLon) * 111320 * Math.cos(anchorLat * Math.PI / 180);
-  const camStereoApproxY = originY + (ll.lat - anchorLat) * 111320;
-  const num = (value, digits) => (
-    Number.isFinite(value) ? Number(value.toFixed(digits)) : null
-  );
-  return {
-    camLat: num(ll.lat, 8),
-    camLon: num(ll.lon, 8),
-    camAltM: num(ll.alt, 2),
-    camEastM: num(eastM, 1),
-    camNorthM: num(northM, 1),
-    camUpM: num(upM, 1),
-    camStereoApproxX: num(camStereoApproxX, 1),
-    camStereoApproxY: num(camStereoApproxY, 1),
-    originX: num(originX, 1),
-    originY: num(originY, 1),
-    tileFrameOffsetX: num(tileFrameOffsetX, 1),
-    tileFrameOffsetY: num(tileFrameOffsetY, 1),
-    tileFrameOffsetReady,
-  };
+  const coordinates = terrainCameraCoordinates({
+    position: camera.position, anchorPosition, east, north, up,
+    anchorLatitude: anchorLat, anchorLongitude: anchorLon, originX, originY,
+  });
+  if (camLL) {
+    Object.assign(coordinates, camLL);
+    const stereo = terrainCameraStereoPosition({
+      latitude: camLL.lat, longitude: camLL.lon,
+      anchorLatitude: anchorLat, anchorLongitude: anchorLon, originX, originY,
+    });
+    coordinates.stereoX = stereo.x;
+    coordinates.stereoY = stereo.y;
+  }
+  return summarizeTerrainCamera(coordinates, {
+    originX, originY, frameOffsetX: tileFrameOffsetX, frameOffsetY: tileFrameOffsetY,
+    frameOffsetReady: tileFrameOffsetReady,
+  });
 }
 
 // --- Tile fetching ---
@@ -5340,17 +5330,19 @@ function render() {
   // Terrain streaming: check if camera moved far enough to re-fetch
   if (!isFirstLoad) {
     const camLL = getCameraLatLon();
-    const approxStereoX = originX + (camLL.lon - anchorLon) * 111320 * Math.cos(anchorLat * Math.PI / 180);
-    const approxStereoY = originY + (camLL.lat - anchorLat) * 111320;
-    camStereoX = approxStereoX;
-    camStereoY = approxStereoY;
-    const fdx = camStereoX - lastFetchX;
-    const fdy = camStereoY - lastFetchY;
-    const fetchDist = Math.sqrt(fdx * fdx + fdy * fdy);
-    if (fetchDist > REFETCH_DIST && nowMs - _lastFetchTriggerMs > 500) {
-      _lastFetchTriggerMs = nowMs;
-      fetchTiles();
-    }
+    const stereo = terrainCameraStereoPosition({
+      latitude: camLL.lat, longitude: camLL.lon,
+      anchorLatitude: anchorLat, anchorLongitude: anchorLon, originX, originY,
+    });
+    camStereoX = stereo.x;
+    camStereoY = stereo.y;
+    const refetch = evaluateTerrainRefetch({
+      cameraX: camStereoX, cameraY: camStereoY, lastFetchX, lastFetchY,
+      nowMs, lastTriggerMs: _lastFetchTriggerMs,
+      distanceThreshold: REFETCH_DIST, triggerIntervalMs: 500,
+    });
+    _lastFetchTriggerMs = refetch.nextTriggerMs;
+    if (refetch.shouldFetch) fetchTiles();
   }
   // Periodic texture refresh (~1 Hz)
   if (lastTiles && clock.elapsedTime - lastTexRefresh > 1.0) {
