@@ -25,6 +25,7 @@ export function createTextureStreamer({
   const waterMaskCache = new Map();
   const waterMaskInflight = new Map();
   const ancestorLogged = new Set();
+  const demandClient = globalThis.crypto?.randomUUID?.() ?? `terrain-${Date.now()}-${Math.random()}`;
   let version = Date.now();
 
   function requestWaterMask(tileId) {
@@ -71,7 +72,7 @@ export function createTextureStreamer({
 
       const controller = new AbortController();
       texInflight.set(tileId, controller);
-      fetchImpl(`/api/texture/${tileId}.jpg?v=${version}${recolor ? '&stage=colorized' : ''}`, { signal: controller.signal })
+      fetchImpl(`/api/texture/${tileId}.jpg?v=${version}&demand=${version}&demandClient=${encodeURIComponent(demandClient)}${recolor ? '&stage=colorized' : ''}`, { signal: controller.signal })
         .then(response => {
           texInflight.delete(tileId);
           if (response.status === 202) {
@@ -148,10 +149,22 @@ export function createTextureStreamer({
     return version;
   }
 
+  function abortAll() {
+    for (const controller of texInflight.values()) controller.abort();
+    for (const controller of waterMaskInflight.values()) controller.abort();
+    texInflight.clear();
+    waterMaskInflight.clear();
+    texFetching.clear();
+    texRetryAtMs.clear();
+    texRetryCount.clear();
+    ancestorLogged.clear();
+    version = Date.now();
+  }
+
   return {
     texCache, texSource, texInflight, texFetching, texRetryAtMs, texRetryCount,
     waterMaskCache, waterMaskInflight, ancestorLogged,
-    requestWaterMask, pump, invalidate,
+    requestWaterMask, pump, invalidate, abortAll,
     get version() { return version; },
     bumpVersion() { version = Date.now(); return version; },
   };

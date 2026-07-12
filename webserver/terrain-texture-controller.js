@@ -11,6 +11,7 @@ export function createTerrainTextureController({
   const findMesh = tileId => terrainRoot.children.find(child => child.userData.tileId === tileId);
   const pendingApplications = new Map();
   let applicationFramePending = false;
+  let desiredTileIds = new Set();
 
   function applyTexture(mesh, tile, texture) {
     const rebuilt = meshRuntime.rebuildWithTexture(mesh, tile, texture);
@@ -27,6 +28,12 @@ export function createTerrainTextureController({
       if (remaining-- <= 0) break;
       pendingApplications.delete(tileId);
       const { tile, texture, logArrival } = pending;
+      if (!desiredTileIds.has(tileId)) {
+        if (textureStreamer.texCache.get(tileId) === texture) textureStreamer.texCache.delete(tileId);
+        textureStreamer.texSource.delete(tileId);
+        texture.dispose?.();
+        continue;
+      }
       if (deferredTiles.has(tileId)) {
         if (logArrival) log(tileId, 'cached + materialize (was deferred)');
         meshRuntime.materialize(tileId, texture);
@@ -51,11 +58,17 @@ export function createTerrainTextureController({
   }
 
   function enqueueApplication(tile, texture, logArrival = false) {
+    if (!desiredTileIds.has(tile.id)) {
+      if (textureStreamer.texCache.get(tile.id) === texture) textureStreamer.texCache.delete(tile.id);
+      textureStreamer.texSource.delete(tile.id);
+      texture.dispose?.();
+      return;
+    }
     pendingApplications.set(tile.id, { tile, texture, logArrival });
     scheduleApplicationFrame();
   }
 
-  return function updateTerrainTextures(tiles) {
+  function updateTerrainTextures(tiles) {
     const meshById = new Map();
     for (const child of terrainRoot.children) {
       if (child.userData.tileId) meshById.set(child.userData.tileId, child);
@@ -63,6 +76,7 @@ export function createTerrainTextureController({
     const { tileIds, scored } = scoreTextureTiles(
       tiles, priorityForTile, Math.log(getVisibilityDistance()),
     );
+    desiredTileIds = new Set(scored.map(item => item.tile.id));
 
     for (const id of [...deferredTiles.keys()]) {
       const texture = textureStreamer.texCache.get(id);
@@ -98,5 +112,13 @@ export function createTerrainTextureController({
       },
     });
     lifecycle.sweepStaleParents(tiles, tileIds);
+  }
+
+  updateTerrainTextures.reset = () => {
+    desiredTileIds.clear();
+    for (const { texture } of pendingApplications.values()) texture.dispose?.();
+    pendingApplications.clear();
+    applicationFramePending = false;
   };
+  return updateTerrainTextures;
 }

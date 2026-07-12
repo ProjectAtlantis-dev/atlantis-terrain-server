@@ -9,13 +9,15 @@ import {
 import { compassHeading } from './terrain-hud.js';
 import { applyMapDrag } from './terrain-controls.js';
 import { stepSuspension, stepVehicleDrive } from './terrain-vehicle.js';
-import { meshUsesTextureClassification, scoreTextureTiles, textureRetryDelay } from './terrain-tile-runtime.js';
+import { meshUsesTextureClassification, scoreTextureTiles, textureRetryDelay, tileDepthFromId } from './terrain-tile-runtime.js';
 import { createTextureStreamer } from './terrain-texture-streamer.js';
 import { createTileLifecycle } from './terrain-tile-lifecycle.js';
 import { reconcileTerrainTiles } from './terrain-tile-reconciler.js';
 import { createTerrainFetchScheduler } from './terrain-fetch-scheduler.js';
 import { createTerrainTextureController } from './terrain-texture-controller.js';
 import { createTerrainEnhancementController } from './terrain-enhancement-controller.js';
+import { createTerrainMeshBuilder, decodeTerrainHeightmap } from './terrain-mesh-builder.js';
+import { applyTerrainAvailabilityStatus, createTerrainSeamStatusController } from './terrain-status-controller.js';
 import {
   buildTerrainTilesRequest,
   adoptTerrainOrigin,
@@ -187,6 +189,24 @@ test('shared fetch scheduler rejects overlapping requests', async () => {
   await first;
 });
 
+test('reset aborts the active terrain generation and ignores its completion', async () => {
+  let activeSignal = null;
+  let release;
+  const scheduler = createTerrainFetchScheduler({
+    execute: ({ signal }) => {
+      activeSignal = signal;
+      return new Promise(resolve => { release = resolve; });
+    },
+  });
+  const request = scheduler.request();
+  scheduler.reset(1);
+  assert.equal(activeSignal.aborted, true);
+  release({ nextAction: 'poll' });
+  await request;
+  assert.equal(scheduler.pass, 1);
+  assert.equal(scheduler.fetching, false);
+});
+
 test('shared texture controller budgets scene applications per frame', () => {
   const tiles = [
     { id: 'a', bbox: [0, 0, 1, 1] },
@@ -220,6 +240,31 @@ test('shared texture controller budgets scene applications per frame', () => {
   assert.deepEqual(materialized, ['a', 'b']);
 });
 
+test('shared texture controller discards late arrivals outside current heatmap demand', () => {
+  let callbacks = null;
+  let disposed = 0;
+  const lateTexture = { dispose: () => { disposed += 1; } };
+  const textureCache = new Map([['late', lateTexture]]);
+  const textureSource = new Map([['late', 'source']]);
+  const controller = createTerrainTextureController({
+    terrainRoot: { children: [] }, deferredTiles: new Map(),
+    textureStreamer: {
+      texCache: textureCache, texSource: textureSource, requestWaterMask() {},
+      pump(_scored, nextCallbacks) { callbacks = nextCallbacks; },
+    },
+    meshRuntime: { materialize() {}, rebuildWithTexture: mesh => mesh },
+    lifecycle: { evictCoveredAncestors() {}, sweepStaleParents() {} },
+    priorityForTile: () => 0, getVisibilityDistance: () => 1000,
+    isCovered: () => false, applyMaterial() {}, getWaterMask: () => null, log() {},
+    scheduleFrame() {},
+  });
+  controller([{ id: 'wanted', bbox: [0, 0, 1, 1] }]);
+  callbacks.onTexture({ tileId: 'late', tile: { id: 'late' }, texture: lateTexture });
+  assert.equal(textureCache.has('late'), false);
+  assert.equal(textureSource.has('late'), false);
+  assert.equal(disposed, 1);
+});
+
 test('shared enhancement controller tracks 202 pending and 429 backoff', () => {
   let timestamp = 1000;
   const controller = createTerrainEnhancementController({
@@ -235,6 +280,60 @@ test('shared enhancement controller tracks 202 pending and 429 backoff', () => {
   assert.equal(controller.backoffUntil, 12000);
   assert.equal(controller.retryAfter.get('tile'), 12000);
   assert.deepEqual(controller.pending.get('tile'), { submitted: 1000, nextPollAt: 12000 });
+});
+
+test('shared terrain mesh builder preserves heightmap geometry and metadata', () => {
+  const source = new Float32Array([1, 2, 3, 4]);
+  const encoded = Buffer.from(source.buffer).toString('base64');
+  assert.deepEqual([...decodeTerrainHeightmap(encoded)], [1, 2, 3, 4]);
+  let scatterHeightmap = null;
+  const build = createTerrainMeshBuilder({
+    oceanClassifier: {
+      OCEAN_EDGE_SEED_MAX_M: 0,
+      sampleOceanBlueScore: () => 0,
+      classifyOceanMask: () => null,
+      adjustedSeabedElevation: elevation => elevation,
+    },
+    exaggeration: 2,
+    attachScatter: (_mesh, _tile, heightmap) => { scatterHeightmap = heightmap; },
+  });
+  const mesh = build({
+    id: '1-2-3', resolution: 2, bbox: [10, 20, 12, 22], heightmap: encoded,
+  });
+  assert.deepEqual([...mesh.geometry.attributes.position.array], [
+    10, 20, 2, 12, 20, 4, 10, 22, 6, 12, 22, 8,
+  ]);
+  assert.equal(mesh.userData.tileId, '1-2-3');
+  assert.equal(mesh.userData.oceanCoverage, 0);
+  assert.deepEqual([...scatterHeightmap], [1, 2, 3, 4]);
+});
+
+test('shared availability status skips textured meshes and prioritizes downloading', () => {
+  const meshes = ['downloading', 'missing', 'textured'].map(tileId => ({
+    isMesh: true, userData: { tileId }, material: { map: tileId === 'textured' ? {} : null },
+  }));
+  const applied = [];
+  const changed = applyTerrainAvailabilityStatus({
+    terrainRoot: { children: meshes },
+    missing: [{ id: 'downloading' }, { id: 'missing' }, { id: 'textured' }],
+    downloading: ['downloading'],
+    applyStatus: (mesh, status) => applied.push([mesh.userData.tileId, status]),
+  });
+  assert.equal(changed, 2);
+  assert.deepEqual(applied, [['downloading', 'downloading'], ['missing', 'missing']]);
+});
+
+test('shared seam status preserves priority and labels', () => {
+  const seams = createTerrainSeamStatusController({ now: () => 3000 });
+  seams.apply({
+    pending: ['pending', 'both'], running: ['running', 'both'],
+    done_recent: ['done'], failed: ['failed'],
+  });
+  assert.equal(seams.status('both'), 'running');
+  assert.match(seams.statusHtml('failed'), /FAILED/);
+  assert.match(seams.statusHtml('pending'), /PENDING/);
+  assert.match(seams.statusHtml('done'), /DONE/);
+  assert.equal(seams.statusHtml('none'), null);
 });
 
 test('cardinal headings use the vehicle convention', () => {
@@ -317,6 +416,12 @@ test('texture retries back off and cap', () => {
   assert.equal(textureRetryDelay(1), 2000);
   assert.equal(textureRetryDelay(2), 3000);
   assert.equal(textureRetryDelay(100), 30000);
+});
+
+test('shared tile depth parsing rejects malformed ids', () => {
+  assert.equal(tileDepthFromId('12-1400-700'), 12);
+  assert.equal(tileDepthFromId('bad'), -1);
+  assert.equal(tileDepthFromId(null), -1);
 });
 
 test('texture classification signature prevents redundant land mesh rebuilds', () => {

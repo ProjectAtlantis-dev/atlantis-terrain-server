@@ -4,6 +4,12 @@ export function terrainVisibilityDistance(altitude) {
   return Math.min(horizon, 30000 + alt * 12);
 }
 
+export function tileDepthFromId(tileId) {
+  if (typeof tileId !== 'string') return -1;
+  const depth = Number.parseInt(tileId.split('-')[0], 10);
+  return Number.isFinite(depth) ? depth : -1;
+}
+
 export function terrainFogDistance(altitude) {
   const alt = Math.max(25, altitude);
   const horizon = Math.sqrt(2 * 6371000 * alt);

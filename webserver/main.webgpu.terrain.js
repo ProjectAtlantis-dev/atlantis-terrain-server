@@ -56,7 +56,7 @@ import { priorityHeading, terrainTilePriority } from './terrain-priority.js';
 import { compassHeading, createTerrainHud, renderGameClock, TERRAIN_HUD_LINKS } from './terrain-hud.js';
 import { installTerrainKeyboardControls, installTerrainPointerControls } from './terrain-controls.js';
 import { stepSuspension, stepVehicleDrive } from './terrain-vehicle.js';
-import { createTileHistory, terrainFogDistance, terrainVisibilityDistance } from './terrain-tile-runtime.js';
+import { createTileHistory, terrainFogDistance, terrainVisibilityDistance, tileDepthFromId } from './terrain-tile-runtime.js';
 import { createTextureStreamer } from './terrain-texture-streamer.js';
 import { createTerrainMeshRuntime } from './terrain-mesh-runtime.js';
 import { createTerrainTextureController } from './terrain-texture-controller.js';
@@ -64,6 +64,8 @@ import { adoptTerrainOrigin, buildTerrainTilesRequest, offsetTerrainPayload, sel
 import { reconcileTerrainTiles } from './terrain-tile-reconciler.js';
 import { createTerrainFetchScheduler } from './terrain-fetch-scheduler.js';
 import { createTerrainEnhancementController } from './terrain-enhancement-controller.js';
+import { createTerrainMeshBuilder } from './terrain-mesh-builder.js';
+import { applyTerrainAvailabilityStatus, createTerrainSeamStatusController } from './terrain-status-controller.js';
 
 const USE_WEBGPU_RENDER_BACKEND = true;
 // Calibrated against the cloudless WebGL reference. WebGL uses exposure 10
@@ -1639,12 +1641,7 @@ enhancedOutlines.renderOrder = 997;
 terrainRoot.add(enhancedOutlines);
 let _lastEnhancedKey = '';
 
-let _seamPending = new Set();
-let _seamRunning = new Set();
-let _seamDoneRecent = new Set();
-let _seamFailed = new Set();
-let _lastSeamPoll = 0;
-const SEAM_POLL_MS = 2000;
+const seamStatusController = createTerrainSeamStatusController({});
 
 // --- Terrain streaming state ---
 const EXAG = 1.0;
@@ -2396,12 +2393,6 @@ function getVehicleStateSnapshot() {
     headingDeg: Number(headingDeg.toFixed(3)),
     z: Number(local.z.toFixed(3)),
   };
-}
-
-function tileDepthFromId(tileId) {
-  if (typeof tileId !== 'string') return -1;
-  const depth = Number.parseInt(tileId.split('-')[0], 10);
-  return Number.isFinite(depth) ? depth : -1;
 }
 
 function sampleBestVehicleTerrainHit(localX = vehicleGroup.position.x, localY = vehicleGroup.position.y, terrainMeshes = null) {
@@ -4356,106 +4347,13 @@ function rebuildWebGPUAtmosphere() {
 
 // --- Heightmap decode + mesh building (adapted for ENU frame) ---
 
-function decodeHM(b64) {
-  const r = atob(b64);
-  const b = new Uint8Array(r.length);
-  for (let i = 0; i < r.length; i++) b[i] = r.charCodeAt(i);
-  return new Float32Array(b.buffer);
-}
-
-function eColor(e) {
-  const s = [
-    { e: -50, r: 0.04, g: 0.15, b: 0.35 }, { e: 5, r: 0.06, g: 0.18, b: 0.38 },
-    { e: 15, r: 0.10, g: 0.35, b: 0.18 },
-    { e: 200, r: 0.35, g: 0.55, b: 0.22 }, { e: 500, r: 0.52, g: 0.48, b: 0.20 },
-    { e: 800, r: 0.55, g: 0.40, b: 0.25 }, { e: 1200, r: 0.58, g: 0.55, b: 0.50 },
-    { e: 2000, r: 0.80, g: 0.78, b: 0.75 }, { e: 3000, r: 0.97, g: 0.97, b: 0.98 }
-  ];
-  if (e <= s[0].e) return s[0];
-  if (e >= s[s.length - 1].e) return s[s.length - 1];
-  for (let i = 0; i < s.length - 1; i++) {
-    if (e >= s[i].e && e <= s[i + 1].e) {
-      const t = (e - s[i].e) / (s[i + 1].e - s[i].e);
-      return {
-        r: s[i].r + t * (s[i + 1].r - s[i].r),
-        g: s[i].g + t * (s[i + 1].g - s[i].g),
-        b: s[i].b + t * (s[i + 1].b - s[i].b)
-      };
-    }
-  }
-  return s[s.length - 1];
-}
-
 let oceanMapDebugEnabled = false;
-const { OCEAN_EDGE_SEED_MAX_M, sampleOceanBlueScore, classifyOceanMask, adjustedSeabedElevation } = createTerrainOceanClassifier({ THREE, paramNumber });
-function buildMesh(tile, oceanAssistTex = null) {
-  const res = tile.resolution, hm = decodeHM(tile.heightmap);
-  const [xMin, yMin, xMax, yMax] = tile.bbox;
-  const blueScore = sampleOceanBlueScore(oceanAssistTex, res);
-  const oceanClass = classifyOceanMask(hm, res, [xMin, yMin, xMax, yMax], tile.id, blueScore);
-  const oceanMask = oceanClass?.ocean ?? null;
-  const passableMask = oceanClass?.passable ?? null;
-  const seedMask = oceanClass?.seed ?? null;
-  const pos = new Float32Array(res * res * 3);
-  const col = new Float32Array(res * res * 3);
-  const uv = new Float32Array(res * res * 2);
-  let oceanCount = 0;
-
-  for (let r = 0; r < res; r++) for (let c = 0; c < res; c++) {
-    const i = r * res + c, e = hm[i];
-    const isOcean = oceanMask ? oceanMask[i] === 1 : e <= OCEAN_EDGE_SEED_MAX_M;
-    const isPassable = passableMask ? passableMask[i] === 1 : false;
-    const isSeed = seedMask ? seedMask[i] === 1 : false;
-    const adjusted = adjustedSeabedElevation(e, isOcean);
-    pos[i * 3]     = xMin + (c / (res - 1)) * (xMax - xMin);
-    pos[i * 3 + 1] = yMin + (r / (res - 1)) * (yMax - yMin);
-    pos[i * 3 + 2] = adjusted * EXAG;
-    uv[i * 2] = c / (res - 1);
-    uv[i * 2 + 1] = r / (res - 1);
-    if (isOcean) {
-      oceanCount += 1;
-      col[i * 3] = 0.04; col[i * 3 + 1] = 0.68; col[i * 3 + 2] = 0.95;
-    } else if (isSeed) {
-      col[i * 3] = 0.88; col[i * 3 + 1] = 0.16; col[i * 3 + 2] = 0.80;
-    } else if (isPassable) {
-      col[i * 3] = 0.96; col[i * 3 + 1] = 0.58; col[i * 3 + 2] = 0.12;
-    } else {
-      const cl = eColor(e); col[i * 3] = cl.r; col[i * 3 + 1] = cl.g; col[i * 3 + 2] = cl.b;
-    }
-  }
-  const idx = [];
-  for (let r = 0; r < res - 1; r++) for (let c = 0; c < res - 1; c++) {
-    const a = r * res + c, b = a + 1, d = a + res, f = d + 1;
-    idx.push(a, b, d); idx.push(b, f, d); // CW→CCW so normals point up
-  }
-  if (!idx.length) return null;
-  const g = new THREE.BufferGeometry();
-  g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
-  g.setAttribute('color', new THREE.BufferAttribute(col, 3));
-  g.setAttribute('uv', new THREE.BufferAttribute(uv, 2));
-  g.setIndex(idx);
-  g.computeVertexNormals();
-  // NOTE: Must be MeshBasicMaterial, NOT MeshStandardMaterial!
-  // MeshStandardMaterial needs scene lights to render — without them all textured
-  // tiles (water, lakes, etc.) turn grey. We tried MeshStandardMaterial to get
-  // vehicle headlights to illuminate terrain but it breaks everything else.
-  // If we revisit headlight-on-terrain lighting, add scene lights first.
-  const mat = new THREE.MeshBasicMaterial({
-    color: 0xffffff, side: THREE.FrontSide,
-    vertexColors: true,
-  });
-  const mesh = new THREE.Mesh(g, mat);
-  mesh.userData.tileId = tile.id;
-  mesh.userData.bbox = tile.bbox;
-  mesh.userData.isWater = oceanCount > 0;
-  mesh.userData.oceanCoverage = oceanCount / (res * res);
-  mesh.userData.oceanColorAssisted = Boolean(blueScore);
-  mesh.userData.oceanTextureSig = oceanAssistTex ? oceanAssistTex.uuid : null;
-  mesh.userData.waterMaskUrl = `/api/watermask/${tile.id}.png`;
-  mesh.userData.waterMask = null;
-  attachTileScatter(mesh, tile, hm);
-  return mesh;
-}
+const terrainOceanClassifier = createTerrainOceanClassifier({ THREE, paramNumber });
+const buildMesh = createTerrainMeshBuilder({
+  oceanClassifier: terrainOceanClassifier,
+  exaggeration: EXAG,
+  attachScatter: attachTileScatter,
+});
 
 // --- Status colors for untextured tiles ---
 
@@ -4490,25 +4388,15 @@ function applyWebGPUUntexturedTerrainMaterial(mesh) {
 }
 
 function markMissing(missing, downloading) {
-  const dlSet = new Set(downloading || []);
-  const missingSet = new Set((missing || []).map(t => t.id));
-  for (const child of terrainRoot.children) {
-    if (!child.isMesh) continue;
-    const tid = child.userData.tileId;
-    if (!tid) continue;
-    if (child.material && child.material.map) continue;
-    if (dlSet.has(tid)) {
-      child.material.color.copy(COLOR_DOWNLOADING);
-      child.material.vertexColors = false;
-      child.material.needsUpdate = true;
+  applyTerrainAvailabilityStatus({
+    terrainRoot, missing, downloading,
+    applyStatus: (mesh, status) => {
+      mesh.material.color.copy(status === 'downloading' ? COLOR_DOWNLOADING : COLOR_MISSING);
+      mesh.material.vertexColors = false;
+      mesh.material.needsUpdate = true;
       markSceneMutated();
-    } else if (missingSet.has(tid)) {
-      child.material.color.copy(COLOR_MISSING);
-      child.material.vertexColors = false;
-      child.material.needsUpdate = true;
-      markSceneMutated();
-    }
-  }
+    },
+  });
 }
 
 // --- Deferred tile system ---
@@ -4835,7 +4723,7 @@ function updateFpsCounter(nowMs) {
   fpsSampleStartMs = nowMs;
 }
 
-async function performTileFetch({ lat, lon, pass }) {
+async function performTileFetch({ lat, lon, pass, signal }) {
     _loadPass = pass;
     const t0 = performance.now();
     const heading = priorityHeading(vehicleControlActive, vehicleHeadingRad, controls.yaw);
@@ -4852,7 +4740,7 @@ async function performTileFetch({ lat, lon, pass }) {
     });
     enqueueClientLog('info', `fetchTiles.request[pass${_loadPass}]`, request.logDetails);
     const url = request.url;
-    const resp = await fetch(url);
+    const resp = await fetch(url, { signal });
     const data = await resp.json();
     const camRel = camera.position.clone().sub(anchorPosition);
     const camLocalX = camRel.dot(east);
@@ -5293,29 +5181,6 @@ function updateEnhancedOutlines() {
   }
 }
 
-function pollSeamStatus() {
-  const now = performance.now();
-  if (now - _lastSeamPoll < SEAM_POLL_MS) return;
-  _lastSeamPoll = now;
-  fetch('/api/seam_status')
-    .then(r => r.json())
-    .then(s => {
-      _seamPending = new Set(s.pending || []);
-      _seamRunning = new Set(s.running || []);
-      _seamDoneRecent = new Set(s.done_recent || []);
-      _seamFailed = new Set(s.failed || []);
-    })
-    .catch(() => {});
-}
-
-function getSeamStatus(tileId) {
-  if (_seamRunning.has(tileId)) return '<span style="color:#0f8">RUNNING</span>';
-  if (_seamFailed.has(tileId)) return '<span style="color:#f33">FAILED</span>';
-  if (_seamPending.has(tileId)) return '<span style="color:#fc0">PENDING</span>';
-  if (_seamDoneRecent.has(tileId)) return '<span style="color:#8f8">DONE</span>';
-  return null;
-}
-
 function hideTileInfo() {
   tileInfoEl.style.display = 'none';
   showTileBorder(null);
@@ -5635,6 +5500,9 @@ function resetView() {
   updateHud();
   // Re-fetch tiles around the reset camera position.
   isFirstLoad = true;
+  textureStreamer.abortAll();
+  updateTerrainTextures.reset();
+  abortAllEnhancements();
   tileFetchScheduler.reset(1);
   originX = 0; originY = 0;
   camStereoX = 0; camStereoY = 0;
@@ -5823,7 +5691,7 @@ renderer.domElement.addEventListener('mousemove', event => {
     ? `<span style="color:#0f0;font-weight:bold">ENHANCED</span>`
     : `<span style="color:#f80">${src || 'no texture'}</span>`;
   const matHex = info.color !== '-' ? info.color : '#ffffff';
-  const seamLabel = getSeamStatus(info.tileId);
+  const seamLabel = seamStatusController.statusHtml(info.tileId);
   tileInfoEl.innerHTML = [
     `<b style="color:${matHex}">${info.tileId}</b>`,
     `tex: ${info.hasTexture ? 'YES' : 'NO'} ${info.textureSize}  source: ${srcLabel}`,
@@ -6000,7 +5868,7 @@ function render() {
   enhancedOutlines.visible = controls.mapMode;
   if (controls.mapMode) {
     webgpuFogDensity.value = 0;
-    pollSeamStatus();
+    seamStatusController.poll();
     updateEnhanceOutlines();
     updateEnhancedOutlines();
     updateMapCamera();

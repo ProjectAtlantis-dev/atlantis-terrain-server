@@ -174,8 +174,25 @@ _enqueue_seam_jobs: Any = None
 _water_mask_model_id: str | None = None
 
 _tex_pool = ThreadPoolExecutor(max_workers=4)
-_tex_fetching: set[str] = set()
+_tex_fetching: dict[str, tuple[str, int]] = {}
 _tex_fetching_lock = threading.Lock()
+_tex_demand_generations: dict[str, int] = {}
+
+
+def _texture_demand_is_stale(client_id: str, generation: int) -> bool:
+  with _tex_fetching_lock:
+    return generation < _tex_demand_generations.get(client_id, 0)
+
+
+def _register_texture_demand(client_id: str, raw_generation: str | None) -> int:
+  try:
+    generation = int(raw_generation or 0)
+  except (TypeError, ValueError):
+    generation = 0
+  with _tex_fetching_lock:
+    if generation > _tex_demand_generations.get(client_id, 0):
+      _tex_demand_generations[client_id] = generation
+  return generation
 
 # --- Texture retry queue (transient Dataforsyningen failures) ---
 _TEX_RETRY_MAX = 3
@@ -879,17 +896,31 @@ def _tile_priority(bbox: list[float], qx: float, qy: float, fwd_x: float, fwd_y:
 
 
 
-def _queue_texture_fetch(tile_id: str, bbox: tuple[float, float, float, float]) -> None:
+def _queue_texture_fetch(
+  tile_id: str,
+  bbox: tuple[float, float, float, float],
+  demand_generation: int = 0,
+  demand_client: str = "server",
+) -> None:
+  if demand_generation <= 0:
+    with _tex_fetching_lock:
+      demand_generation = _tex_demand_generations.get(demand_client, 0)
   with _tex_fetching_lock:
-    if tile_id in _tex_fetching:
-      return
-    _tex_fetching.add(tile_id)
+    existing_demand = _tex_fetching.get(tile_id)
+    if existing_demand is not None:
+      existing_client, existing_generation = existing_demand
+      if existing_generation >= _tex_demand_generations.get(existing_client, 0):
+        return
+    _tex_fetching[tile_id] = (demand_client, demand_generation)
 
   _RE_FETCHABLE = {"sentinel2_crop", "ancestor_crop"}
 
   def _worker() -> None:
     db = None
     try:
+      if _texture_demand_is_stale(demand_client, demand_generation):
+        log_tex.debug(f"[tex-worker] {tile_id}: stale demand {demand_generation}, skipping")
+        return
       db = sqlite3.connect(str(DB_PATH), check_same_thread=False)
       db.execute("PRAGMA journal_mode=WAL")
       if _init_textures is not None:
@@ -915,6 +946,9 @@ def _queue_texture_fetch(tile_id: str, bbox: tuple[float, float, float, float]) 
       # Step 2: try Dataforsyningen. If it succeeds, overwrite ancestor_crop.
       log_tex.debug(f"[tex-worker] {tile_id}: fetching texture bbox={bbox}")
       jpeg, fail_reason = _fetch_dataforsyningen_texture(list(bbox), resolution=256)
+      if _texture_demand_is_stale(demand_client, demand_generation):
+        log_tex.debug(f"[tex-worker] {tile_id}: demand changed during fetch, discarding")
+        return
       if jpeg is not None:
         log_tex.debug(f"[tex-worker] {tile_id}: got {len(jpeg)} bytes from dataforsyningen")
         jpeg = _repair_white_ocean_jpeg(db, tile_id, jpeg)
@@ -942,7 +976,8 @@ def _queue_texture_fetch(tile_id: str, bbox: tuple[float, float, float, float]) 
       if db is not None:
         db.close()
       with _tex_fetching_lock:
-        _tex_fetching.discard(tile_id)
+        if _tex_fetching.get(tile_id) == (demand_client, demand_generation):
+          _tex_fetching.pop(tile_id, None)
 
   _tex_pool.submit(_worker)
 
@@ -1244,6 +1279,9 @@ def api_texture(tile_id: str):
   if unavailable is not None:
     return unavailable
 
+  demand_client = request.args.get("demandClient") or "legacy"
+  demand_generation = _register_texture_demand(demand_client, request.args.get("demand"))
+
   log_tex.debug(f"[/api/texture] tile_id={tile_id}")
 
   db = _get_db()
@@ -1316,7 +1354,7 @@ def api_texture(tile_id: str):
   # Skip for ancestor_crop_ratelimit — the retry queue already handles those.
   source = row[1] if row else None
   if source != "ancestor_crop_ratelimit":
-    _queue_texture_fetch(tile_id, _tile_bbox(d, c, r))
+    _queue_texture_fetch(tile_id, _tile_bbox(d, c, r), demand_generation, demand_client)
 
   if cached_crop is not None:
     return Response(

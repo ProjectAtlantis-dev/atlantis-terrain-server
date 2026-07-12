@@ -15,6 +15,8 @@ export function createTerrainFetchScheduler({
   let pass = initialPass;
   let fetching = false;
   let pollTimer = null;
+  let generation = 0;
+  let activeController = null;
 
   const emitState = () => onState({ pass, fetching });
 
@@ -24,9 +26,13 @@ export function createTerrainFetchScheduler({
       return;
     }
     fetching = true;
+    const requestGeneration = generation;
+    activeController = new AbortController();
     emitState();
     try {
-      const result = await execute({ lat, lon, pass });
+      const result = await execute({ lat, lon, pass, signal: activeController.signal });
+      if (requestGeneration !== generation) return;
+      activeController = null;
       if (pollTimer != null) {
         cancelPoll(pollTimer);
         pollTimer = null;
@@ -47,14 +53,19 @@ export function createTerrainFetchScheduler({
         }, pollMs);
       }
     } catch (error) {
+      if (requestGeneration !== generation || error?.name === 'AbortError') return;
       onError(error);
     }
+    activeController = null;
     fetching = false;
     emitState();
     onSettled();
   }
 
   function reset(nextPass = 1) {
+    generation += 1;
+    activeController?.abort();
+    activeController = null;
     if (pollTimer != null) cancelPoll(pollTimer);
     pollTimer = null;
     pass = nextPass;
