@@ -57,15 +57,21 @@ import { compassHeading, createTerrainHud, renderGameClock, TERRAIN_HUD_LINKS } 
 import { installTerrainKeyboardControls, installTerrainPointerControls } from './terrain-controls.js';
 import { stepSuspension, stepVehicleDrive } from './terrain-vehicle.js';
 import { createTileHistory, terrainFogDistance, terrainVisibilityDistance, tileDepthFromId } from './terrain-tile-runtime.js';
-import { createTextureStreamer } from './terrain-texture-streamer.js';
+import { createTextureStreamer, rendererTextureAnisotropy } from './terrain-texture-streamer.js';
 import { createTerrainMeshRuntime } from './terrain-mesh-runtime.js';
 import { createTerrainTextureController } from './terrain-texture-controller.js';
-import { adoptTerrainOrigin, buildTerrainTilesRequest, evaluateTerrainRefetch, offsetTerrainPayload, selectTerrainFrameOffset, summarizeTerrainCamera, summarizeTerrainResponse, terrainCameraCoordinates, terrainCameraStereoPosition, terrainPipelineStatus } from './terrain-tile-fetch.js';
-import { reconcileTerrainTiles } from './terrain-tile-reconciler.js';
+import { evaluateTerrainRefetch, summarizeTerrainCamera, terrainCameraCoordinates, terrainCameraStereoPosition } from './terrain-tile-fetch.js';
 import { createTerrainFetchScheduler } from './terrain-fetch-scheduler.js';
 import { createTerrainEnhancementController } from './terrain-enhancement-controller.js';
 import { createTerrainMeshBuilder } from './terrain-mesh-builder.js';
 import { applyTerrainAvailabilityStatus, createTerrainSeamStatusController } from './terrain-status-controller.js';
+import { collectTerrainDebugMeshes, createTerrainOutlineController, summarizeTerrainMesh } from './terrain-debug-runtime.js';
+import { createTerrainFetchExecutor } from './terrain-fetch-executor.js';
+import { restoreTerrainCameraState, terrainCameraState } from './terrain-camera-state.js';
+import { createTerrainClientLogger } from './terrain-client-logging.js';
+import { createTerrainFpsCounter } from './terrain-fps-counter.js';
+import { loadTerrainStartupAssets } from './terrain-startup-assets.js';
+import { createTerrainHouseConfiguration, terrainHouseLocalPosition, terrainHouseShadowCoverage } from './terrain-house-runtime.js';
 
 const USE_WEBGPU_RENDER_BACKEND = true;
 // Calibrated against the cloudless WebGL reference. WebGL uses exposure 10
@@ -108,7 +114,6 @@ if (window.location.search) {
   history.replaceState(null, '', `${window.location.pathname}${window.location.hash}`);
 }
 const _recolor = false;
-const CLIENT_LOG_ENDPOINT = '/api/client_log';
 const DEFAULT_ASSET_SERVER_BASE = 'http://127.0.0.1:8787';
 const ASSET_SERVER_BASE = DEFAULT_ASSET_SERVER_BASE;
 const VEHICLE_STATE_ENDPOINT = `${ASSET_SERVER_BASE}/api/vehicle_state`;
@@ -116,167 +121,9 @@ const ASSETS_ENDPOINT = `${ASSET_SERVER_BASE}/api/assets`;
 const ASSETS_FETCH_TIMEOUT_MS = 1500;
 const VEHICLE_SAVE_FETCH_TIMEOUT_MS = 1500;
 const VEHICLE_SAVE_FAILURE_COOLDOWN_MS = 15000;
-const CLIENT_LOG_ENABLED = true;
-const CLIENT_LOG_BATCH_SIZE = 40;
-const CLIENT_LOG_MAX_QUEUE = 600;
-const CLIENT_LOG_FLUSH_MS = 800;
-const clientLogQueue = [];
-let clientLogInFlight = false;
-let clientLogFlushTimer = null;
-
-function safeClientLogDetails(details) {
-  if (details === undefined) {
-    return undefined;
-  }
-  try {
-    return JSON.parse(JSON.stringify(details));
-  } catch (_) {
-    try {
-      return { nonSerializable: true, text: String(details) };
-    } catch (__ignored) {
-      return { nonSerializable: true };
-    }
-  }
-}
-
-function scheduleClientLogFlush(delayMs = CLIENT_LOG_FLUSH_MS) {
-  if (!CLIENT_LOG_ENABLED || clientLogFlushTimer != null) {
-    return;
-  }
-  clientLogFlushTimer = window.setTimeout(() => {
-    clientLogFlushTimer = null;
-    flushClientLogQueue();
-  }, delayMs);
-}
-
-function flushClientLogQueue({ useBeacon = false } = {}) {
-  if (!CLIENT_LOG_ENABLED || clientLogInFlight || clientLogQueue.length === 0) {
-    return;
-  }
-  const batch = clientLogQueue.splice(0, CLIENT_LOG_BATCH_SIZE);
-  const body = JSON.stringify({
-    sceneMode: 'clouds-terrain-managed-flask-ux-wip',
-    entries: batch
-  });
-  if (useBeacon && navigator.sendBeacon) {
-    const blob = new Blob([body], { type: 'application/json' });
-    const ok = navigator.sendBeacon(CLIENT_LOG_ENDPOINT, blob);
-    if (!ok) {
-      clientLogQueue.unshift(...batch);
-    }
-    return;
-  }
-  clientLogInFlight = true;
-  fetch(CLIENT_LOG_ENDPOINT, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body,
-    keepalive: true
-  })
-    .then(response => {
-      if (!response.ok) {
-        throw new Error(`client log status ${response.status}`);
-      }
-    })
-    .catch(err => {
-      console.error('[CLIENT LOG] post failed', {
-        endpoint: CLIENT_LOG_ENDPOINT,
-        error: err?.message ?? String(err),
-      });
-      clientLogQueue.unshift(...batch);
-      if (clientLogQueue.length > CLIENT_LOG_MAX_QUEUE) {
-        clientLogQueue.splice(0, clientLogQueue.length - CLIENT_LOG_MAX_QUEUE);
-      }
-    })
-    .finally(() => {
-      clientLogInFlight = false;
-      if (clientLogQueue.length > 0) {
-        scheduleClientLogFlush(250);
-      }
-    });
-}
-
-function enqueueClientLog(level, phase, details) {
-  if (!CLIENT_LOG_ENABLED) {
-    return;
-  }
-  const entry = {
-    ts: new Date().toISOString(),
-    level,
-    phase
-  };
-  const safeDetails = safeClientLogDetails(details);
-  if (safeDetails !== undefined) {
-    entry.details = safeDetails;
-  }
-  clientLogQueue.push(entry);
-  if (clientLogQueue.length > CLIENT_LOG_MAX_QUEUE) {
-    clientLogQueue.splice(0, clientLogQueue.length - CLIENT_LOG_MAX_QUEUE);
-  }
-  if (clientLogQueue.length >= CLIENT_LOG_BATCH_SIZE) {
-    flushClientLogQueue();
-  } else {
-    scheduleClientLogFlush();
-  }
-}
-
-window.addEventListener('beforeunload', () => {
-  flushClientLogQueue({ useBeacon: true });
-});
-
-const bootStartMs = performance.now();
-const bootEvents = [];
-
-function getBootMemorySnapshot() {
-  const mem = performance.memory;
-  if (!mem) return null;
-  return {
-    jsHeapMB: Number((mem.usedJSHeapSize / (1024 * 1024)).toFixed(1)),
-    jsHeapLimitMB: Number((mem.jsHeapSizeLimit / (1024 * 1024)).toFixed(1))
-  };
-}
-
-function bootLog(phase, details, level = 'info') {
-  const elapsedMs = Number((performance.now() - bootStartMs).toFixed(1));
-  const entry = { elapsedMs, phase, level };
-  if (details !== undefined) {
-    entry.details = details;
-  }
-  const mem = getBootMemorySnapshot();
-  if (mem != null) {
-    entry.memory = mem;
-  }
-  bootEvents.push(entry);
-  if (bootEvents.length > 300) {
-    bootEvents.shift();
-  }
-  const compactDetails = { elapsedMs };
-  if (details !== undefined) {
-    compactDetails.details = details;
-  }
-  if (mem != null) {
-    compactDetails.memory = mem;
-  }
-  enqueueClientLog(level, phase, compactDetails);
-}
-
-window.addEventListener('error', event => {
-  bootLog('window.error', {
-    message: event.message,
-    source: event.filename,
-    line: event.lineno,
-    column: event.colno,
-    stack: event.error?.stack ?? null
-  }, 'error');
-});
-
-window.addEventListener('unhandledrejection', event => {
-  const reason = event.reason;
-  bootLog('window.unhandledrejection', {
-    message: reason?.message ?? String(reason),
-    stack: reason?.stack ?? null
-  }, 'error');
-});
+const {
+  bootEvents, bootLog, enqueueClientLog, flushClientLogQueue,
+} = createTerrainClientLogger({ sceneMode: 'clouds-terrain-managed-flask-ux-wip' });
 bootLog('script.start', {
   href: window.location.href,
   userAgent: navigator.userAgent
@@ -311,108 +158,11 @@ const ATMOSPHERE_TEXTURE_FILES = [
 const anchorLon = DEFAULT_LOCATION.lon;
 const anchorLat = DEFAULT_LOCATION.lat;
 
-function defaultStartupAssets() {
-  return {
-    vehicle_definition: {},
-    structure_definition: {},
-    vehicle_instances: [],
-    structure_instances: [],
-  };
-}
-
-function normalizeStartupAssetsPayload(payload) {
-  const fallback = defaultStartupAssets();
-  if (payload == null || typeof payload !== 'object') {
-    return fallback;
-  }
-
-  const rawVehicleDef = payload.vehicle_definition;
-  if (rawVehicleDef != null && typeof rawVehicleDef === 'object') {
-    fallback.vehicle_definition = { ...rawVehicleDef };
-  }
-
-  const rawStructureDef = payload.structure_definition;
-  if (rawStructureDef != null && typeof rawStructureDef === 'object') {
-    fallback.structure_definition = { ...rawStructureDef };
-  }
-
-  if (Array.isArray(payload.vehicle_instances)) {
-    fallback.vehicle_instances = payload.vehicle_instances
-      .filter(v => v != null && typeof v === 'object')
-      .map(v => ({ ...v }));
-  }
-
-  if (Array.isArray(payload.structure_instances)) {
-    fallback.structure_instances = payload.structure_instances
-      .filter(s => s != null && typeof s === 'object')
-      .map(s => ({ ...s }));
-  }
-
-  return fallback;
-}
-
-async function loadStartupAssets() {
-  const fallback = {
-    source: 'defaults',
-    schemaVersion: 4,
-    seeded: null,
-    ...defaultStartupAssets(),
-  };
-  try {
-    const controller = typeof AbortController !== 'undefined'
-      ? new AbortController()
-      : null;
-    const timeoutHandle = controller != null
-      ? window.setTimeout(() => controller.abort(), ASSETS_FETCH_TIMEOUT_MS)
-      : null;
-    const response = await fetch(ASSETS_ENDPOINT, {
-      cache: 'no-store',
-      signal: controller?.signal,
-    }).finally(() => {
-      if (timeoutHandle != null) {
-        window.clearTimeout(timeoutHandle);
-      }
-    });
-    if (!response.ok) {
-      throw new Error(`assets endpoint status ${response.status}`);
-    }
-    const payload = await response.json();
-    const normalized = normalizeStartupAssetsPayload(payload);
-    const source = typeof payload?.source === 'string' ? payload.source : 'metadata';
-    const schemaVersion = Number.isFinite(payload?.schemaVersion) ? payload.schemaVersion : 4;
-    bootLog('assets.fetch.ok', {
-      endpoint: ASSETS_ENDPOINT,
-      status: response.status,
-      source,
-      schemaVersion,
-      structureCount: normalized.structure_instances.length,
-      vehicleCount: normalized.vehicle_instances.length,
-    });
-    return {
-      source,
-      schemaVersion,
-      seeded: payload?.seeded ?? null,
-      ...normalized,
-    };
-  } catch (error) {
-    const timedOut = error?.name === 'AbortError';
-    bootLog('assets.fetch.fallback', {
-      endpoint: ASSETS_ENDPOINT,
-      timeoutMs: ASSETS_FETCH_TIMEOUT_MS,
-      timedOut,
-      error: error?.message ?? String(error),
-    }, 'warn');
-    console.warn('[ASSETS] startup fallback', {
-      endpoint: ASSETS_ENDPOINT,
-      timeoutMs: ASSETS_FETCH_TIMEOUT_MS,
-      timedOut,
-      error: error?.message ?? String(error),
-    });
-    return fallback;
-  }
-}
-
-const startupAssetsResponse = await loadStartupAssets();
+const startupAssetsResponse = await loadTerrainStartupAssets({
+  endpoint: ASSETS_ENDPOINT,
+  timeoutMs: ASSETS_FETCH_TIMEOUT_MS,
+  bootLog,
+});
 const VEHICLE_DEFINITION = startupAssetsResponse.vehicle_definition;
 const STRUCTURE_DEFINITION = startupAssetsResponse.structure_definition;
 const VEHICLE_HEADLIGHTS = (
@@ -1711,31 +1461,15 @@ function paramNumber(_name, fallback) {
   return fallback;
 }
 
-const ASSET_STRUCTURE_INSTANCES = Array.isArray(startupAssetsResponse.structure_instances)
-  ? startupAssetsResponse.structure_instances
-  : [];
 const ASSET_VEHICLE_INSTANCES = Array.isArray(startupAssetsResponse.vehicle_instances)
   ? startupAssetsResponse.vehicle_instances
   : [];
-const HOUSE_MODEL = {
-  url: (typeof STRUCTURE_DEFINITION.url === 'string' && STRUCTURE_DEFINITION.url.trim() !== '')
-    ? STRUCTURE_DEFINITION.url
-    : '',
-  altOffsetM: Number.isFinite(STRUCTURE_DEFINITION.altOffsetM)
-    ? STRUCTURE_DEFINITION.altOffsetM
-    : 0.4,
-  hotReloadMs: Math.max(
-    500,
-    Number.isFinite(STRUCTURE_DEFINITION.hotReloadMs) ? STRUCTURE_DEFINITION.hotReloadMs : 2000
-  ),
-  enabled: Boolean(STRUCTURE_DEFINITION.enabled)
-};
-if (!HOUSE_MODEL.url) {
-  HOUSE_MODEL.enabled = false;
-  bootLog('house.config.missing_model_url', {
-    source: startupAssetsResponse.source,
-  }, 'warn');
-}
+const { model: HOUSE_MODEL, sites: houseSites } = createTerrainHouseConfiguration({
+  definition: STRUCTURE_DEFINITION,
+  instances: startupAssetsResponse.structure_instances,
+  source: startupAssetsResponse.source,
+  bootLog,
+});
 const HOUSE_SHADOW_MODE_RAW = 'shadowmap';
 const HOUSE_SHADOW_MODE = HOUSE_SHADOW_MODE_RAW === 'local' ? 'local' : 'shadowmap';
 const HOUSE_USE_LOCAL_SHADOWS = HOUSE_SHADOW_MODE === 'local';
@@ -1743,25 +1477,6 @@ const HOUSE_USE_SHADOW_MAP = HOUSE_SHADOW_MODE === 'shadowmap';
 const HOUSE_LOCAL_SHADOW_DEBUG = true;
 const HOUSE_SHADOW_SNAPSHOT_ENABLED = false;
 const HOUSE_PROBE_CONSOLE = false;
-const DEFAULT_NUUK_HOUSE_SITES = ASSET_STRUCTURE_INSTANCES;
-const singleHouseLat = NaN;
-const singleHouseLon = NaN;
-const houseCountParam = DEFAULT_NUUK_HOUSE_SITES.length;
-const houseCount = DEFAULT_NUUK_HOUSE_SITES.length === 0
-  ? 0
-  : Number.isFinite(houseCountParam)
-    ? Math.max(1, Math.min(DEFAULT_NUUK_HOUSE_SITES.length, Math.floor(houseCountParam)))
-    : DEFAULT_NUUK_HOUSE_SITES.length;
-const houseSites = (Number.isFinite(singleHouseLat) && Number.isFinite(singleHouseLon))
-  ? [{
-      id: 'nuuk-single',
-      lat: singleHouseLat,
-      lon: singleHouseLon,
-      headingDeg: paramNumber('houseHeadingDeg', 20),
-      scale: paramNumber('houseScale', 1.0),
-      tileId: 'override',
-    }]
-  : DEFAULT_NUUK_HOUSE_SITES.slice(0, houseCount);
 const houseLayer = new THREE.Group();
 houseLayer.name = 'nuuk-houses';
 terrainRoot.add(houseLayer);
@@ -1950,45 +1665,11 @@ function createHouseLocalShadowDebugMesh() {
   return group;
 }
 
-function computeHouseShadowCoverage(loadedHouses) {
-  if (loadedHouses.length === 0) {
-    return null;
-  }
-  let sumX = 0;
-  let sumY = 0;
-  let sumZ = 0;
-  let minX = Number.POSITIVE_INFINITY;
-  let minY = Number.POSITIVE_INFINITY;
-  let maxX = Number.NEGATIVE_INFINITY;
-  let maxY = Number.NEGATIVE_INFINITY;
-  for (const house of loadedHouses) {
-    const { x, y, z } = house.group.position;
-    sumX += x;
-    sumY += y;
-    sumZ += z;
-    if (x < minX) minX = x;
-    if (y < minY) minY = y;
-    if (x > maxX) maxX = x;
-    if (y > maxY) maxY = y;
-  }
-  const span = Math.max(maxX - minX, maxY - minY);
-  const shadowRadius = THREE.MathUtils.clamp(
-    HOUSE_SHADOW_BASE_RADIUS + span * 0.6 + HOUSE_SHADOW_RADIUS_PADDING,
-    HOUSE_SHADOW_BASE_RADIUS,
-    HOUSE_SHADOW_MAX_RADIUS
-  );
-  return {
-    centerX: sumX / loadedHouses.length,
-    centerY: sumY / loadedHouses.length,
-    centerZ: sumZ / loadedHouses.length,
-    minX,
-    minY,
-    maxX,
-    maxY,
-    shadowRadius,
-  };
-}
-
+const computeHouseShadowCoverage = loadedHouses => terrainHouseShadowCoverage(loadedHouses, {
+  baseRadius: HOUSE_SHADOW_BASE_RADIUS,
+  radiusPadding: HOUSE_SHADOW_RADIUS_PADDING,
+  maxRadius: HOUSE_SHADOW_MAX_RADIUS,
+});
 function createHouseLabelSprite(labelText, colorHex) {
   const cacheKey = `${labelText}:${colorHex}`;
   const cached = houseMarkerTextCache.get(cacheKey);
@@ -2129,7 +1810,7 @@ bootLog('assets.loaded', {
   seeded: startupAssetsResponse.seeded,
   headlightsOn: _vehicleSeedInstance.headlightsOn === true,
   headlightsParams: VEHICLE_HEADLIGHTS != null,
-  structureCount: ASSET_STRUCTURE_INSTANCES.length,
+  structureCount: houseSites.length,
   vehicleCount: ASSET_VEHICLE_INSTANCES.length,
 });
 const VEHICLE_TIRE_RADIUS_M = Math.max(
@@ -3380,9 +3061,7 @@ function updateHouseMarkerPosition(house) {
 }
 
 function houseLocalFromLatLon(lat, lon) {
-  const eastM = (lon - anchorLon) * 111320 * Math.cos(anchorLat * Math.PI / 180);
-  const northM = (lat - anchorLat) * 111320;
-  return { x: eastM, y: northM };
+  return terrainHouseLocalPosition(lat, lon, anchorLat, anchorLon);
 }
 
 function houseTerrainMeshes() {
@@ -4474,6 +4153,7 @@ const textureStreamer = createTextureStreamer({
   maxInflight: TEX_MAX, repollBatch: TEX_REPOLL_BATCH,
   retryBaseMs: TEX_RETRY_202_BASE_MS, retryMaxMs: TEX_RETRY_202_MAX_MS,
   retryErrorMs: TEX_RETRY_ERROR_MS,
+  getTextureAnisotropy: () => rendererTextureAnisotropy(renderer),
   onWaterMask: () => { markSceneMutated(); requestRender(); },
 });
 const {
@@ -4591,6 +4271,10 @@ const enhancementController = createTerrainEnhancementController({
 });
 const _enhanceInflight = enhancementController.inflight;
 const _enhancePending = enhancementController.pending;
+const terrainOutlineController = createTerrainOutlineController({
+  terrainRoot, pendingGroup: enhanceOutlines, enhancedGroup: enhancedOutlines,
+  pending: _enhancePending, inflight: _enhanceInflight, textureSource: texSource,
+});
 
 function abortAllEnhancements() {
   enhancementController.abortAll();
@@ -4638,11 +4322,8 @@ function getCameraLogSnapshot(camLL = null) {
 
 const PREVIEW_MAX_DEPTH = 10;
 const clock = new THREE.Clock();
-const FPS_SAMPLE_MS = 500;
 const STREAMING_MAINTENANCE_MS = 1000;
-let fpsSampleStartMs = performance.now();
-let fpsSampleFrames = 0;
-let fpsDisplay = '--';
+const fpsCounter = createTerrainFpsCounter();
 let animationLoopActive = false;
 let sceneMutationVersion = 0;
 let streamingMaintenanceTimer = null;
@@ -4671,6 +4352,7 @@ function startRenderLoop() {
   }
   animationLoopActive = true;
   clock.getDelta();
+  fpsCounter.start(performance.now());
   renderBackend.setAnimationLoop(render);
 }
 
@@ -4684,6 +4366,8 @@ function stopRenderLoopIfIdle() {
   }
   animationLoopActive = false;
   renderBackend.setAnimationLoop(null);
+  fpsCounter.idle();
+  updateHud();
 }
 
 function runStreamingMaintenance() {
@@ -4702,142 +4386,45 @@ function runStreamingMaintenance() {
   }
 }
 
-function updateFpsCounter(nowMs) {
-  fpsSampleFrames += 1;
-  const elapsedMs = nowMs - fpsSampleStartMs;
-  if (elapsedMs < FPS_SAMPLE_MS) {
-    return;
-  }
-  fpsDisplay = String(Math.round((fpsSampleFrames * 1000) / elapsedMs));
-  fpsSampleFrames = 0;
-  fpsSampleStartMs = nowMs;
-}
+const terrainFetchState = {
+  get pass() { return _loadPass; }, set pass(value) { _loadPass = value; },
+  get isFirstLoad() { return isFirstLoad; }, set isFirstLoad(value) { isFirstLoad = value; },
+  get frameOffsetReady() { return tileFrameOffsetReady; }, set frameOffsetReady(value) { tileFrameOffsetReady = value; },
+  get frameOffsetX() { return tileFrameOffsetX; }, set frameOffsetX(value) { tileFrameOffsetX = value; },
+  get frameOffsetY() { return tileFrameOffsetY; }, set frameOffsetY(value) { tileFrameOffsetY = value; },
+  get originX() { return originX; }, set originX(value) { originX = value; },
+  get originY() { return originY; }, set originY(value) { originY = value; },
+  get cameraX() { return camStereoX; }, set cameraX(value) { camStereoX = value; },
+  get cameraY() { return camStereoY; }, set cameraY(value) { camStereoY = value; },
+  get lastFetchX() { return lastFetchX; }, set lastFetchX(value) { lastFetchX = value; },
+  get lastFetchY() { return lastFetchY; }, set lastFetchY(value) { lastFetchY = value; },
+  get currentTileIds() { return currentTileIds; }, set currentTileIds(value) { currentTileIds = value; },
+  get lastTiles() { return lastTiles; }, set lastTiles(value) { lastTiles = value; },
+  get bootFetchLogged() { return bootFetchLogged; }, set bootFetchLogged(value) { bootFetchLogged = value; },
+  set pipeline(value) {
+    _hmMissing = value.missing; _hmDownloading = value.downloading;
+    _srvTexFetching = value.textureFetching; _srvTexRetry = value.textureRetryQueue;
+    _srvTexStatus = value.textureStatusCounts;
+  },
+};
 
-async function performTileFetch({ lat, lon, pass, signal }) {
-    _loadPass = pass;
-    const t0 = performance.now();
-    const heading = priorityHeading(vehicleControlActive, vehicleHeadingRad, controls.yaw);
-    const camLL = getCameraLatLon();
-    const camSnapshot = getCameraLogSnapshot(camLL);
-    const fetchLat = lat ?? camLL.lat;
-    const fetchLon = lon ?? camLL.lon;
-    const fetchAlt = camLL.alt;
-    const request = buildTerrainTilesRequest({
-      lat: fetchLat, lon: fetchLon, altitude: fetchAlt, heading,
-      range: _terrainRange, pass: _loadPass, previewMaxDepth: PREVIEW_MAX_DEPTH,
-      isFirstLoad, frameOffsetReady: tileFrameOffsetReady, originX, originY,
-      cameraSnapshot: camSnapshot,
-    });
-    enqueueClientLog('info', `fetchTiles.request[pass${_loadPass}]`, request.logDetails);
-    const url = request.url;
-    const resp = await fetch(url, { signal });
-    const data = await resp.json();
-    const camRel = camera.position.clone().sub(anchorPosition);
-    const camLocalX = camRel.dot(east);
-    const camLocalY = camRel.dot(north);
-    const frameOffset = selectTerrainFrameOffset({
-      isFirstLoad, frameOffsetReady: tileFrameOffsetReady,
-      cameraEast: camLocalX, cameraNorth: camLocalY,
-      offsetX: tileFrameOffsetX, offsetY: tileFrameOffsetY,
-    });
-    tileFrameOffsetX = frameOffset.offsetX;
-    tileFrameOffsetY = frameOffset.offsetY;
-    tileFrameOffsetReady = frameOffset.ready;
-    if (frameOffset.changed) {
-      enqueueClientLog('info', 'fetchTiles.frame.offset.set', {
-        pass: _loadPass,
-        passLabel: _loadPass === 1 ? 'preview' : 'full',
-        offsetX: Number(tileFrameOffsetX.toFixed(1)),
-        offsetY: Number(tileFrameOffsetY.toFixed(1)),
-        camEastM: camSnapshot.camEastM,
-        camNorthM: camSnapshot.camNorthM,
-      });
-    }
-    offsetTerrainPayload(data, tileFrameOffsetX, tileFrameOffsetY);
-    enqueueClientLog('info', `fetchTiles.response[pass${_loadPass}]`, summarizeTerrainResponse({
-      data, status: resp.status, pass: _loadPass, cameraX: camLocalX, cameraY: camLocalY,
-      frameOffsetX: tileFrameOffsetX, frameOffsetY: tileFrameOffsetY,
-      frameOffsetReady: tileFrameOffsetReady,
-    }));
-    if (!bootFetchLogged) {
-      bootFetchLogged = true;
-      bootLog('tiles.initial-fetch.response', {
-        status: resp.status,
-        tileCount: Array.isArray(data.tiles) ? data.tiles.length : -1
-      });
-    }
-
-    const wasFirstLoad = isFirstLoad;
-    if (isFirstLoad) {
-      const origin = adoptTerrainOrigin({ data, pass: _loadPass, cameraSnapshot: camSnapshot });
-      originX = origin.originX;
-      originY = origin.originY;
-      camStereoX = lastFetchX = origin.cameraX;
-      camStereoY = lastFetchY = origin.cameraY;
-      isFirstLoad = false;
-      enqueueClientLog('info', 'fetchTiles.origin.set', origin.logDetails);
-    }
-
-    const reconciliation = reconcileTerrainTiles({
-      tiles: data.tiles,
-      currentTileIds,
-      deferredTiles,
-      terrainRoot,
-      lifecycle: tileLifecycle,
-      priorityForTile: tilePriority,
-      isCoveredByEnhancedParent: _coveredByEnhancedParent,
-      textureCache: texCache,
-      materialize: materializeTile,
-      buildMesh,
-      log: tileLog,
-      prepareUntexturedMesh: applyWebGPUUntexturedTerrainMaterial,
-      onMeshAdded: markSceneMutated,
-      onDiff: details => enqueueClientLog('info', `fetchTiles.diff[pass${_loadPass}]`, {
-        pass: _loadPass, passLabel: _loadPass === 1 ? 'preview' : 'full', ...details,
-      }),
-    });
-    const { nextTileIds: newIds, staleRemoved } = reconciliation;
-    currentTileIds = newIds;
-    enqueueClientLog('info', `fetchTiles.built[pass${_loadPass}]`, {
-      pass: _loadPass, passLabel: _loadPass === 1 ? 'preview' : 'full',
-      meshesInScene: reconciliation.sceneMeshes,
-      deferred: reconciliation.deferred,
-      staleRemoved,
-    });
-
-    updateTextures(data.tiles);
-    markMissing(data.missing || [], data.downloading || []);
-    lastTiles = data.tiles;
-    requestRender();
-
-    // Update stereo position from camera
-    const camLLNow = getCameraLatLon();
-    const stereo = terrainCameraStereoPosition({
-      latitude: camLLNow.lat, longitude: camLLNow.lon,
-      anchorLatitude: anchorLat, anchorLongitude: anchorLon, originX, originY,
-    });
-    camStereoX = stereo.x;
-    camStereoY = stereo.y;
-    lastFetchX = camStereoX;
-    lastFetchY = camStereoY;
-
-    const pipeline = terrainPipelineStatus(data, wasFirstLoad);
-    _hmMissing = pipeline.missing;
-    _hmDownloading = pipeline.downloading;
-    _srvTexFetching = pipeline.textureFetching;
-    _srvTexRetry = pipeline.textureRetryQueue;
-    _srvTexStatus = pipeline.textureStatusCounts;
-
-    return {
-      nextAction: pipeline.nextAction,
-      previewDetails: {
-        pass: 1, previewTiles: data.tiles.length, maxDepth: PREVIEW_MAX_DEPTH,
-        meshesInScene: terrainRoot.children.filter(c => c.isMesh).length,
-        deferred: deferredTiles.size,
-        elapsedMs: Number((performance.now() - t0).toFixed(1)),
-      },
-    };
-}
+const performTileFetch = createTerrainFetchExecutor({
+  state: terrainFetchState, previewMaxDepth: PREVIEW_MAX_DEPTH,
+  getHeading: () => priorityHeading(vehicleControlActive, vehicleHeadingRad, controls.yaw),
+  getRange: () => _terrainRange, getCameraLatLon, getCameraSnapshot: getCameraLogSnapshot,
+  getCameraLocalPosition: () => {
+    const relative = camera.position.clone().sub(anchorPosition);
+    return { x: relative.dot(east), y: relative.dot(north) };
+  },
+  anchorLatitude: anchorLat, anchorLongitude: anchorLon, terrainRoot, deferredTiles,
+  lifecycle: tileLifecycle, priorityForTile: tilePriority,
+  isCoveredByEnhancedParent: _coveredByEnhancedParent, textureCache: texCache,
+  materialize: materializeTile, buildMesh, tileLog, applyMissing: markMissing, updateTextures,
+  prepareUntexturedMesh: applyWebGPUUntexturedTerrainMaterial,
+  onMeshAdded: markSceneMutated,
+  onResponseApplied: requestRender,
+  enqueueLog: enqueueClientLog, bootLog,
+});
 
 const tileFetchScheduler = createTerrainFetchScheduler({
   execute: performTileFetch,
@@ -4875,16 +4462,15 @@ function fetchTiles(lat, lon) {
 function savePosition() {
   if (isFirstLoad) return;
   const camLL = getCameraLatLon();
-  const saved = {
-    lat: camLL.lat, lon: camLL.lon, alt: camLL.alt,
-    yaw: controls.yaw, pitch: controls.pitch,
-    mapZoom: controls.mapZoom
-  };
-  if (tileFrameOffsetReady) {
-    saved.terrainFrame = {
-      originX, originY, offsetX: tileFrameOffsetX, offsetY: tileFrameOffsetY
-    };
-  }
+  const saved = terrainCameraState({
+    cameraLatLon: camLL,
+    yaw: controls.yaw,
+    pitch: controls.pitch,
+    mapZoom: controls.mapZoom,
+    terrainFrame: tileFrameOffsetReady
+      ? { originX, originY, offsetX: tileFrameOffsetX, offsetY: tileFrameOffsetY }
+      : null,
+  });
   localStorage.setItem('clouds-cam', JSON.stringify(saved));
 }
 setInterval(savePosition, 2000);
@@ -4893,27 +4479,22 @@ window.addEventListener('beforeunload', savePosition);
 // Restore saved camera position (lat/lon/alt are origin-independent)
 try {
   const saved = JSON.parse(localStorage.getItem('clouds-cam'));
-  if (saved && saved.lat != null && saved.lon != null) {
-    const dLat = saved.lat - anchorLat;
-    const dLon = saved.lon - anchorLon;
-    const eM = dLon * 111320 * Math.cos(anchorLat * Math.PI / 180);
-    const nM = dLat * 111320;
-    const alt = saved.alt ?? 700;
+  const restored = restoreTerrainCameraState(saved, { anchorLat, anchorLon });
+  if (restored) {
     camera.position.copy(anchorPosition)
-      .addScaledVector(east, eM)
-      .addScaledVector(north, nM)
-      .addScaledVector(up, alt);
-    if (saved.yaw != null) controls.yaw = saved.yaw;
-    if (saved.pitch != null) controls.pitch = saved.pitch;
+      .addScaledVector(east, restored.eastM)
+      .addScaledVector(north, restored.northM)
+      .addScaledVector(up, restored.alt);
+    if (restored.yaw != null) controls.yaw = restored.yaw;
+    if (restored.pitch != null) controls.pitch = restored.pitch;
     // A reload restores a pose, not an in-progress movement. Restoring the
     // old velocity made braking carry the camera several metres after boot,
     // which looked like a small coordinate-system offset.
     controls.speed = 0;
     controls.strafeSpeed = 0;
-    if (saved.mapZoom != null) controls.mapZoom = saved.mapZoom;
-    const frame = saved.terrainFrame;
-    if (frame && Number.isFinite(frame.originX) && Number.isFinite(frame.originY)
-        && Number.isFinite(frame.offsetX) && Number.isFinite(frame.offsetY)) {
+    if (restored.mapZoom != null) controls.mapZoom = restored.mapZoom;
+    const frame = restored.terrainFrame;
+    if (frame) {
       originX = frame.originX;
       originY = frame.originY;
       tileFrameOffsetX = frame.offsetX;
@@ -5095,81 +4676,8 @@ function showTileBorder(mesh) {
   return true;
 }
 
-function updateEnhanceOutlines() {
-  const pendingIds = new Set([..._enhancePending.keys(), ..._enhanceInflight.keys()]);
-  const key = [...pendingIds].sort().join(',');
-  if (key === _lastEnhanceKey) return;
-  _lastEnhanceKey = key;
-
-  // Clear old outlines
-  while (enhanceOutlines.children.length) {
-    const c = enhanceOutlines.children[0];
-    enhanceOutlines.remove(c);
-    c.geometry?.dispose?.();
-    c.material?.dispose?.();
-  }
-
-  for (const tid of pendingIds) {
-    const mesh = terrainRoot.children.find(c => c.userData?.tileId === tid);
-    if (!mesh) continue;
-    const bbox = mesh.userData?.bbox;
-    if (!Array.isArray(bbox) || bbox.length !== 4) continue;
-    const [xMin, yMin, xMax, yMax] = bbox;
-    const z = 50;
-    const points = [
-      new THREE.Vector3(xMin, yMin, z),
-      new THREE.Vector3(xMax, yMin, z),
-      new THREE.Vector3(xMax, yMax, z),
-      new THREE.Vector3(xMin, yMax, z),
-      new THREE.Vector3(xMin, yMin, z)
-    ];
-    const geom = new THREE.BufferGeometry().setFromPoints(points);
-    const line = new THREE.Line(geom,
-      new THREE.LineBasicMaterial({ color: 0xff88cc, depthTest: false })
-    );
-    line.renderOrder = 998;
-    enhanceOutlines.add(line);
-  }
-}
-
-function updateEnhancedOutlines() {
-  const enhancedIds = [];
-  for (const [tid, src] of texSource) {
-    if (src.includes('enhanced') || src === 'upscaled') enhancedIds.push(tid);
-  }
-  const key = enhancedIds.sort().join(',');
-  if (key === _lastEnhancedKey) return;
-  _lastEnhancedKey = key;
-
-  while (enhancedOutlines.children.length) {
-    const c = enhancedOutlines.children[0];
-    enhancedOutlines.remove(c);
-    c.geometry?.dispose?.();
-    c.material?.dispose?.();
-  }
-
-  for (const tid of enhancedIds) {
-    const mesh = terrainRoot.children.find(c => c.userData?.tileId === tid);
-    if (!mesh) continue;
-    const bbox = mesh.userData?.bbox;
-    if (!Array.isArray(bbox) || bbox.length !== 4) continue;
-    const [xMin, yMin, xMax, yMax] = bbox;
-    const z = 50;
-    const points = [
-      new THREE.Vector3(xMin, yMin, z),
-      new THREE.Vector3(xMax, yMin, z),
-      new THREE.Vector3(xMax, yMax, z),
-      new THREE.Vector3(xMin, yMax, z),
-      new THREE.Vector3(xMin, yMin, z)
-    ];
-    const geom = new THREE.BufferGeometry().setFromPoints(points);
-    const line = new THREE.Line(geom,
-      new THREE.LineBasicMaterial({ color: 0x44aaff, depthTest: false })
-    );
-    line.renderOrder = 997;
-    enhancedOutlines.add(line);
-  }
-}
+function updateEnhanceOutlines() { terrainOutlineController.updatePending(); }
+function updateEnhancedOutlines() { terrainOutlineController.updateEnhanced(); }
 
 function hideTileInfo() {
   tileInfoEl.style.display = 'none';
@@ -5177,29 +4685,11 @@ function hideTileInfo() {
 }
 
 function collectDebugMeshes(root) {
-  debugIntersectables.length = 0;
-  root.traverse(object => {
-    if (object.isMesh && object.userData?.tileId) {
-      debugIntersectables.push(object);
-    }
-  });
-  return debugIntersectables;
+  return collectTerrainDebugMeshes(root, debugIntersectables);
 }
 
 function meshDebugSummary(mesh) {
-  const tileId = mesh.userData?.tileId ?? '?';
-  const hasTexture = !!mesh.material?.map;
-  const textureImage = mesh.material?.map?.image;
-  const textureSize = textureImage != null ? `${textureImage.width}x${textureImage.height}` : '-';
-  const color = mesh.material?.color != null ? `#${mesh.material.color.getHexString()}` : '-';
-  const bbox = mesh.userData?.bbox;
-  return {
-    tileId,
-    hasTexture,
-    textureSize,
-    color,
-    bbox
-  };
+  return summarizeTerrainMesh(mesh);
 }
 
 function clampAltitude() {
@@ -5433,7 +4923,7 @@ function updateHud() {
   hud.innerHTML = [
     '<b>Clouds Terrain Managed Flask UX WIP</b>',
     `mode: <b>${modeHtml}</b>`,
-    `fps: <b>${fpsDisplay}</b>`,
+    `fps: <b>${fpsCounter.display}</b>`,
     `lat: ${(anchorLat + northM / 111320).toFixed(5)}°  lon: ${(anchorLon + eastM / (111320 * Math.cos(anchorLat * Math.PI / 180))).toFixed(5)}°  alt: ${altM.toFixed(0)}m`,
     `enu: E ${eastM.toFixed(0)}m  N ${northM.toFixed(0)}m  U ${altM.toFixed(0)}m`,
     `speed: ${speedKmh.toFixed(0)} km/h  heading: ${deg.toFixed(0)}° ${compass}`,
@@ -5753,7 +5243,7 @@ updateHud();
 function render() {
   const dt = Math.min(0.05, clock.getDelta());
   const nowMs = performance.now();
-  updateFpsCounter(nowMs);
+  fpsCounter.frame(nowMs);
   if (useRealtimeGameClock) {
     currentDate.setTime(getGameDateFromBrowserTime().getTime());
   }

@@ -2,6 +2,18 @@ import * as THREE from 'three';
 
 import { textureRetryDelay } from './terrain-tile-runtime.js';
 
+export function rendererTextureAnisotropy(renderer) {
+  try {
+    if (typeof renderer?.getMaxAnisotropy === 'function') {
+      return renderer.getMaxAnisotropy();
+    }
+    if (typeof renderer?.capabilities?.getMaxAnisotropy === 'function') {
+      return renderer.capabilities.getMaxAnisotropy();
+    }
+  } catch (_) {}
+  return 1;
+}
+
 export function createTextureStreamer({
   log,
   recolor = false,
@@ -14,6 +26,7 @@ export function createTextureStreamer({
   onWaterMask = () => {},
   fetchImpl = (...args) => fetch(...args),
   decodeImage = (...args) => createImageBitmap(...args),
+  getTextureAnisotropy = () => 1,
   now = () => performance.now(),
 }) {
   const texCache = new Map();
@@ -27,6 +40,19 @@ export function createTextureStreamer({
   const ancestorLogged = new Set();
   const demandClient = globalThis.crypto?.randomUUID?.() ?? `terrain-${Date.now()}-${Math.random()}`;
   let version = Date.now();
+
+  function configureTerrainTexture(texture) {
+    texture.generateMipmaps = true;
+    texture.minFilter = THREE.LinearMipmapLinearFilter;
+    texture.magFilter = THREE.LinearFilter;
+    let available = 1;
+    try {
+      available = Number(getTextureAnisotropy());
+    } catch (_) {}
+    texture.anisotropy = Number.isFinite(available)
+      ? Math.max(1, Math.min(8, available))
+      : 1;
+  }
 
   function requestWaterMask(tileId) {
     if (!enableWaterMasks || !tileId || waterMaskCache.has(tileId) || waterMaskInflight.has(tileId)) return;
@@ -103,6 +129,7 @@ export function createTextureStreamer({
           const texture = new THREE.Texture(bitmap);
           texture.flipY = false;
           texture.colorSpace = THREE.SRGBColorSpace;
+          configureTerrainTexture(texture);
           texture.needsUpdate = true;
           if (ancestorId) {
             const attempt = (texRetryCount.get(tileId) || 0) + 1;

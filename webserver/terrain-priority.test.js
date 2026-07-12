@@ -10,7 +10,7 @@ import { compassHeading } from './terrain-hud.js';
 import { applyMapDrag } from './terrain-controls.js';
 import { stepSuspension, stepVehicleDrive } from './terrain-vehicle.js';
 import { meshUsesTextureClassification, scoreTextureTiles, textureRetryDelay, tileDepthFromId } from './terrain-tile-runtime.js';
-import { createTextureStreamer } from './terrain-texture-streamer.js';
+import { createTextureStreamer, rendererTextureAnisotropy } from './terrain-texture-streamer.js';
 import { createTileLifecycle } from './terrain-tile-lifecycle.js';
 import { reconcileTerrainTiles } from './terrain-tile-reconciler.js';
 import { createTerrainFetchScheduler } from './terrain-fetch-scheduler.js';
@@ -18,6 +18,13 @@ import { createTerrainTextureController } from './terrain-texture-controller.js'
 import { createTerrainEnhancementController } from './terrain-enhancement-controller.js';
 import { createTerrainMeshBuilder, decodeTerrainHeightmap } from './terrain-mesh-builder.js';
 import { applyTerrainAvailabilityStatus, createTerrainSeamStatusController } from './terrain-status-controller.js';
+import { collectTerrainDebugMeshes, createTerrainOutlineController, summarizeTerrainMesh } from './terrain-debug-runtime.js';
+import { createTerrainFetchExecutor } from './terrain-fetch-executor.js';
+import { restoreTerrainCameraState, terrainCameraState } from './terrain-camera-state.js';
+import { createTerrainClientLogger } from './terrain-client-logging.js';
+import { createTerrainFpsCounter } from './terrain-fps-counter.js';
+import { loadTerrainStartupAssets, normalizeTerrainStartupAssets } from './terrain-startup-assets.js';
+import { createTerrainHouseConfiguration, terrainHouseLocalPosition, terrainHouseShadowCoverage } from './terrain-house-runtime.js';
 import {
   buildTerrainTilesRequest,
   adoptTerrainOrigin,
@@ -32,6 +39,187 @@ import {
   terrainCameraStereoPosition,
   terrainPipelineStatus,
 } from './terrain-tile-fetch.js';
+
+test('terrain camera persistence round-trips pose and frame state', () => {
+  const saved = terrainCameraState({
+    cameraLatLon: { lat: 64.1, lon: -51.2, alt: 123 },
+    yaw: 0.4,
+    pitch: -0.2,
+    mapZoom: 900,
+    terrainFrame: { originX: 1, originY: 2, offsetX: 3, offsetY: 4 },
+  });
+  const restored = restoreTerrainCameraState(saved, { anchorLat: 64, anchorLon: -51 });
+  assert.ok(Math.abs(restored.eastM - ((-0.2) * 111320 * Math.cos(64 * Math.PI / 180))) < 1e-9);
+  assert.ok(Math.abs(restored.northM - (0.1 * 111320)) < 1e-9);
+  assert.deepEqual({ ...restored, eastM: 0, northM: 0 }, {
+    eastM: 0,
+    northM: 0,
+    alt: 123,
+    yaw: 0.4,
+    pitch: -0.2,
+    mapZoom: 900,
+    terrainFrame: { originX: 1, originY: 2, offsetX: 3, offsetY: 4 },
+  });
+});
+
+test('terrain camera restore rejects corrupt poses and ignores corrupt frames', () => {
+  assert.equal(restoreTerrainCameraState({ lat: '64', lon: -51 }, {
+    anchorLat: 64, anchorLon: -51,
+  }), null);
+  const restored = restoreTerrainCameraState({
+    lat: 64, lon: -51, alt: null, yaw: 'bad',
+    terrainFrame: { originX: 1, originY: 2, offsetX: NaN, offsetY: 4 },
+  }, { anchorLat: 64, anchorLon: -51 });
+  assert.equal(restored.alt, 700);
+  assert.equal(restored.yaw, null);
+  assert.equal(restored.terrainFrame, null);
+});
+
+test('shared client logger batches transport and records boot diagnostics', async () => {
+  const listeners = new Map();
+  const requests = [];
+  let now = 100;
+  const logger = createTerrainClientLogger({
+    sceneMode: 'test-scene',
+    batchSize: 2,
+    windowRef: {
+      addEventListener(type, callback) { listeners.set(type, callback); },
+      setTimeout() { return 1; },
+    },
+    navigatorRef: {},
+    performanceRef: {
+      now: () => now,
+      memory: { usedJSHeapSize: 2 * 1024 * 1024, jsHeapSizeLimit: 8 * 1024 * 1024 },
+    },
+    fetchImpl: async (url, options) => {
+      requests.push({ url, options });
+      return { ok: true };
+    },
+  });
+  logger.enqueueClientLog('info', 'one', { value: 1 });
+  logger.enqueueClientLog('warn', 'two', { value: 2 });
+  await Promise.resolve();
+  assert.equal(requests.length, 1);
+  const payload = JSON.parse(requests[0].options.body);
+  assert.equal(payload.sceneMode, 'test-scene');
+  assert.deepEqual(payload.entries.map(entry => entry.phase), ['one', 'two']);
+  now = 112.5;
+  logger.bootLog('ready', { tiles: 4 });
+  assert.deepEqual(logger.bootEvents[0], {
+    elapsedMs: 12.5,
+    phase: 'ready',
+    level: 'info',
+    details: { tiles: 4 },
+    memory: { jsHeapMB: 2, jsHeapLimitMB: 8 },
+  });
+  assert.ok(listeners.has('error'));
+  assert.ok(listeners.has('unhandledrejection'));
+  assert.ok(listeners.has('beforeunload'));
+});
+
+test('shared FPS counter excludes idle time from its sample', () => {
+  const counter = createTerrainFpsCounter({ sampleMs: 500 });
+  counter.start(0);
+  for (let frame = 1; frame <= 31; frame += 1) counter.frame(frame * 16);
+  assert.equal(counter.display, '--');
+  counter.frame(512);
+  assert.equal(counter.display, '63');
+  counter.idle();
+  assert.equal(counter.display, 'idle');
+  counter.start(10_000);
+  counter.frame(10_016);
+  assert.equal(counter.display, '--');
+});
+
+test('startup asset normalization clones valid records and rejects junk', () => {
+  const vehicle = { id: 'v1' };
+  const normalized = normalizeTerrainStartupAssets({
+    vehicle_definition: { model: 'truck' },
+    structure_definition: null,
+    vehicle_instances: [vehicle, null, 'bad'],
+    structure_instances: [{ id: 's1' }, 4],
+  });
+  assert.deepEqual(normalized, {
+    vehicle_definition: { model: 'truck' },
+    structure_definition: {},
+    vehicle_instances: [{ id: 'v1' }],
+    structure_instances: [{ id: 's1' }],
+  });
+  assert.notEqual(normalized.vehicle_instances[0], vehicle);
+});
+
+test('shared startup asset loader preserves metadata and clears timeout', async () => {
+  const logs = [];
+  const cleared = [];
+  const result = await loadTerrainStartupAssets({
+    endpoint: '/assets',
+    timeoutMs: 25,
+    bootLog: (...args) => logs.push(args),
+    setTimeoutImpl: () => 7,
+    clearTimeoutImpl: handle => cleared.push(handle),
+    fetchImpl: async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        source: 'database', schemaVersion: 9, seeded: true,
+        vehicle_instances: [{ id: 'v1' }], structure_instances: [{ id: 's1' }],
+      }),
+    }),
+  });
+  assert.equal(result.source, 'database');
+  assert.equal(result.schemaVersion, 9);
+  assert.deepEqual(cleared, [7]);
+  assert.equal(logs[0][0], 'assets.fetch.ok');
+  assert.equal(logs[0][1].vehicleCount, 1);
+  assert.equal(logs[0][1].structureCount, 1);
+});
+
+test('shared startup asset loader returns complete defaults on failure', async () => {
+  const previousWarn = console.warn;
+  console.warn = () => {};
+  try {
+    const result = await loadTerrainStartupAssets({
+      endpoint: '/assets',
+      AbortControllerImpl: undefined,
+      fetchImpl: async () => ({ ok: false, status: 503 }),
+    });
+    assert.deepEqual(result, {
+      source: 'defaults', schemaVersion: 4, seeded: null,
+      vehicle_definition: {}, structure_definition: {},
+      vehicle_instances: [], structure_instances: [],
+    });
+  } finally {
+    console.warn = previousWarn;
+  }
+});
+
+test('shared house configuration and placement preserve terrain conventions', () => {
+  const logs = [];
+  const configured = createTerrainHouseConfiguration({
+    definition: { url: ' house.glb ', enabled: true, altOffsetM: 2, hotReloadMs: 100 },
+    instances: [{ id: 'h1' }], source: 'database', bootLog: (...args) => logs.push(args),
+  });
+  assert.deepEqual(configured.model, {
+    url: 'house.glb', altOffsetM: 2, hotReloadMs: 500, enabled: true,
+  });
+  assert.deepEqual(configured.sites, [{ id: 'h1' }]);
+  assert.equal(logs.length, 0);
+  const local = terrainHouseLocalPosition(64.1, -51.2, 64, -51);
+  assert.ok(Math.abs(local.y - 11132) < 1e-9);
+});
+
+test('shared house shadow coverage bounds loaded instances', () => {
+  const houses = [
+    { group: { position: { x: 0, y: 10, z: 2 } } },
+    { group: { position: { x: 100, y: 30, z: 4 } } },
+  ];
+  assert.deepEqual(terrainHouseShadowCoverage(houses, {
+    baseRadius: 50, radiusPadding: 10, maxRadius: 500,
+  }), {
+    centerX: 50, centerY: 20, centerZ: 3,
+    minX: 0, minY: 10, maxX: 100, maxY: 30, shadowRadius: 120,
+  });
+});
 
 test('terrain preview request preserves boot frame semantics', () => {
   const request = buildTerrainTilesRequest({
@@ -379,6 +567,79 @@ test('shared seam status preserves priority and labels', () => {
   assert.equal(seams.statusHtml('none'), null);
 });
 
+test('shared terrain debug metadata and outline selection remain deterministic', () => {
+  const mesh = {
+    isMesh: true,
+    userData: { tileId: 'tile', bbox: [0, 0, 1, 1] },
+    material: { map: { image: { width: 256, height: 128 } }, color: { getHexString: () => 'abcdef' } },
+  };
+  const root = {
+    children: [mesh],
+    traverse(callback) { callback(mesh); },
+  };
+  assert.deepEqual(collectTerrainDebugMeshes(root), [mesh]);
+  assert.deepEqual(summarizeTerrainMesh(mesh), {
+    tileId: 'tile', hasTexture: true, textureSize: '256x128',
+    color: '#abcdef', bbox: [0, 0, 1, 1],
+  });
+  const group = () => ({
+    children: [], add(child) { this.children.push(child); },
+    remove(child) { this.children = this.children.filter(item => item !== child); },
+  });
+  const pendingGroup = group(), enhancedGroup = group();
+  const outlines = createTerrainOutlineController({
+    terrainRoot: root, pendingGroup, enhancedGroup,
+    pending: new Map([['tile', {}]]), inflight: new Map(),
+    textureSource: new Map([['tile', 'dataforsyningen_enhanced']]),
+  });
+  assert.equal(outlines.updatePending(), true);
+  assert.equal(outlines.updatePending(), false);
+  assert.equal(pendingGroup.children.length, 1);
+  assert.equal(outlines.updateEnhanced(), true);
+  assert.equal(enhancedGroup.children.length, 1);
+});
+
+test('shared fetch executor preserves initial response transition ordering', async () => {
+  const events = [];
+  const state = {
+    pass: 1, isFirstLoad: true, frameOffsetReady: false,
+    frameOffsetX: 0, frameOffsetY: 0, originX: 0, originY: 0,
+    cameraX: 0, cameraY: 0, lastFetchX: 0, lastFetchY: 0,
+    currentTileIds: new Set(), lastTiles: null, bootFetchLogged: false,
+    set pipeline(value) { this.pipelineValue = value; },
+  };
+  const result = await createTerrainFetchExecutor({
+    state, previewMaxDepth: 10, getHeading: () => 0, getRange: () => 1000,
+    getCameraLatLon: () => ({ lat: 64, lon: -51, alt: 100 }),
+    getCameraSnapshot: () => ({ camEastM: 5, camNorthM: 6, camStereoApproxX: 10, camStereoApproxY: 20 }),
+    getCameraLocalPosition: () => ({ x: 5, y: 6 }),
+    anchorLatitude: 64, anchorLongitude: -51,
+    terrainRoot: { children: [] }, deferredTiles: new Map(),
+    lifecycle: { sweepStaleParents: () => 0 }, priorityForTile: () => 0,
+    isCoveredByEnhancedParent: () => false, textureCache: new Map(),
+    materialize() {}, buildMesh() {}, tileLog() {}, applyMissing() { events.push('missing'); },
+    updateTextures() { events.push('textures'); },
+    enqueueLog(_level, name) { events.push(name); }, bootLog(name) { events.push(name); },
+    fetchImpl: async () => ({
+      status: 200,
+      json: async () => ({
+        ox: 10, oy: 20, qx: 11, qy: 21, tiles: [], missing: [], downloading: [],
+        texFetching: 0, texRetryQueue: 0, texStatusCounts: {},
+      }),
+    }),
+    now: () => 100,
+  })({ pass: 1 });
+  assert.equal(result.nextAction, 'full-pass');
+  assert.equal(state.isFirstLoad, false);
+  assert.equal(state.originX, 10);
+  assert.deepEqual(events, [
+    'fetchTiles.request[pass1]', 'fetchTiles.frame.offset.set',
+    'fetchTiles.response[pass1]', 'tiles.initial-fetch.response',
+    'fetchTiles.origin.set', 'fetchTiles.diff[pass1]', 'fetchTiles.built[pass1]',
+    'textures', 'missing',
+  ]);
+});
+
 test('cardinal headings use the vehicle convention', () => {
   const cases = [
     [0, 0, 1],
@@ -512,6 +773,7 @@ test('shared texture pump caches successful exact texture', async () => {
       blob: async () => ({}),
     }),
     decodeImage: async () => ({ width: 256, height: 256 }),
+    getTextureAnisotropy: () => 16,
   });
   streamer.pump([{ tile: { id: '12-3-4', bbox: [0, 0, 1, 1] } }], {
     isCovered: () => false,
@@ -521,6 +783,16 @@ test('shared texture pump caches successful exact texture', async () => {
   await new Promise(resolve => setTimeout(resolve, 0));
   assert.equal(streamer.texSource.get('12-3-4'), 'dataforsyningen');
   assert.equal(completed.tileId, '12-3-4');
+  assert.equal(completed.texture.generateMipmaps, true);
+  assert.equal(completed.texture.anisotropy, 8);
+});
+
+test('texture anisotropy supports both renderer APIs and fails safely', () => {
+  assert.equal(rendererTextureAnisotropy({ getMaxAnisotropy: () => 16 }), 16);
+  assert.equal(rendererTextureAnisotropy({
+    capabilities: { getMaxAnisotropy: () => 8 },
+  }), 8);
+  assert.equal(rendererTextureAnisotropy({ getMaxAnisotropy: () => { throw new Error('not ready'); } }), 1);
 });
 
 test('shared lifecycle keeps parent until all four quadrants are textured', () => {
