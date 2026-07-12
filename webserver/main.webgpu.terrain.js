@@ -71,7 +71,7 @@ import { restoreTerrainCameraState, terrainCameraState } from './terrain-camera-
 import { createTerrainClientLogger } from './terrain-client-logging.js';
 import { createTerrainFpsCounter } from './terrain-fps-counter.js';
 import { loadTerrainStartupAssets } from './terrain-startup-assets.js';
-import { createTerrainHouseConfiguration, terrainHouseLocalPosition, terrainHouseShadowCoverage } from './terrain-house-runtime.js';
+import { createTerrainHouseConfiguration, createTerrainHouseMarkerRuntime, terrainHouseLocalPosition, terrainHouseShadowCoverage } from './terrain-house-runtime.js';
 
 const USE_WEBGPU_RENDER_BACKEND = true;
 // Calibrated against the cloudless WebGL reference. WebGL uses exposure 10
@@ -1711,77 +1711,16 @@ function createHouseLabelSprite(labelText, colorHex) {
   return sprite.clone();
 }
 
-function createHouseMarker(index, houseId) {
-  const color = HOUSE_MARKER_COLORS[index % HOUSE_MARKER_COLORS.length];
-  const marker = new THREE.Group();
-  marker.name = `house-marker-${houseId}`;
-  const line = new THREE.Line(
-    new THREE.BufferGeometry().setFromPoints([
-      new THREE.Vector3(0, 0, 0),
-      new THREE.Vector3(0, 0, HOUSE_MARKER_HEIGHT),
-    ]),
-    new THREE.LineBasicMaterial({
-      color,
-      depthTest: false,
-      depthWrite: false,
-      transparent: true,
-      opacity: 0.95,
-    })
-  );
-  line.renderOrder = 1002;
-  const halo = new THREE.Mesh(
-    houseMarkerHaloGeo,
-    new THREE.MeshBasicMaterial({
-      color,
-      depthTest: false,
-      depthWrite: false,
-      transparent: true,
-      opacity: 0.85,
-      side: THREE.DoubleSide,
-    })
-  );
-  halo.position.z = HOUSE_MARKER_HEIGHT;
-  halo.renderOrder = 1003;
-  const dot = new THREE.Mesh(
-    houseMarkerDotGeo,
-    new THREE.MeshBasicMaterial({
-      color,
-      depthTest: false,
-      depthWrite: false,
-    })
-  );
-  dot.position.z = HOUSE_MARKER_HEIGHT;
-  dot.renderOrder = 1004;
-  const label = createHouseLabelSprite(houseId.replace('nuuk-', ''), color);
-  label.position.set(0, 0, HOUSE_MARKER_HEIGHT + 900);
-  label.renderOrder = 1005;
-  marker.add(line, halo, dot, label);
-  return marker;
-}
-const houseInstances = houseSites.map((site, index) => {
-  const group = new THREE.Group();
-  group.name = `house-${site.id}`;
-  group.userData = {
-    houseId: site.id,
-    tileId: site.tileId,
-  };
-  houseLayer.add(group);
-  const marker = createHouseMarker(index, site.id);
-  marker.userData = {
-    houseId: site.id,
-  };
-  houseMarkerLayer.add(marker);
-  return {
-    site,
-    group,
-    marker,
-    localShadowMesh: null,
-    localShadowDebugMesh: null,
-    hasModel: false,
-    snapPending: true,
-  };
+const houseMarkerRuntime = createTerrainHouseMarkerRuntime({
+  markerHeight: HOUSE_MARKER_HEIGHT,
+  baseLift: HOUSE_MARKER_BASE_LIFT,
+  colors: HOUSE_MARKER_COLORS,
 });
-const houseById = new Map(houseInstances.map(house => [house.site.id, house]));
+const { instances: houseInstances, byId: houseById } = houseMarkerRuntime.createHouseInstances({
+  sites: houseSites,
+  houseLayer,
+  markerLayer: houseMarkerLayer,
+});
 let housesRuntimeVisible = HOUSE_MODEL.enabled;
 houseLayer.visible = housesRuntimeVisible;
 
@@ -3051,14 +2990,7 @@ function probeHouseShadowIntersections(event) {
   flushClientLogQueue();
 }
 
-function updateHouseMarkerPosition(house) {
-  if (house.marker == null) return;
-  house.marker.position.set(
-    house.group.position.x,
-    house.group.position.y,
-    house.group.position.z + HOUSE_MARKER_BASE_LIFT
-  );
-}
+const updateHouseMarkerPosition = houseMarkerRuntime.updateHouseMarkerPosition;
 
 function houseLocalFromLatLon(lat, lon) {
   return terrainHouseLocalPosition(lat, lon, anchorLat, anchorLon);

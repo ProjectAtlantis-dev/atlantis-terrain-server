@@ -24,7 +24,7 @@ import { restoreTerrainCameraState, terrainCameraState } from './terrain-camera-
 import { createTerrainClientLogger } from './terrain-client-logging.js';
 import { createTerrainFpsCounter } from './terrain-fps-counter.js';
 import { loadTerrainStartupAssets, normalizeTerrainStartupAssets } from './terrain-startup-assets.js';
-import { createTerrainHouseConfiguration, terrainHouseLocalPosition, terrainHouseShadowCoverage } from './terrain-house-runtime.js';
+import { createTerrainHouseConfiguration, createTerrainHouseMarkerRuntime, terrainHouseLocalPosition, terrainHouseShadowCoverage } from './terrain-house-runtime.js';
 import {
   buildTerrainTilesRequest,
   adoptTerrainOrigin,
@@ -219,6 +219,29 @@ test('shared house shadow coverage bounds loaded instances', () => {
     centerX: 50, centerY: 20, centerZ: 3,
     minX: 0, minY: 10, maxX: 100, maxY: 30, shadowRadius: 120,
   });
+});
+
+test('shared house marker runtime creates and updates instance records', () => {
+  const children = [];
+  const markerChildren = [];
+  const runtime = createTerrainHouseMarkerRuntime({
+    documentRef: { createElement: () => ({ width: 0, height: 0, getContext: () => null }) },
+    markerHeight: 100,
+    baseLift: 5,
+    colors: [0xff0000],
+  });
+  const { instances, byId } = runtime.createHouseInstances({
+    sites: [{ id: 'nuuk-h1', tileId: '12-1-2' }],
+    houseLayer: { add: value => children.push(value) },
+    markerLayer: { add: value => markerChildren.push(value) },
+  });
+  assert.equal(instances.length, 1);
+  assert.equal(byId.get('nuuk-h1'), instances[0]);
+  assert.equal(children[0].name, 'house-nuuk-h1');
+  assert.equal(markerChildren[0].name, 'house-marker-nuuk-h1');
+  instances[0].group.position.set(10, 20, 30);
+  runtime.updateHouseMarkerPosition(instances[0]);
+  assert.deepEqual(instances[0].marker.position.toArray(), [10, 20, 35]);
 });
 
 test('terrain preview request preserves boot frame semantics', () => {
