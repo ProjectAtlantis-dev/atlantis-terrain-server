@@ -19,7 +19,6 @@ export function createTerrainFetchExecutor({
   deferredTiles,
   lifecycle,
   priorityForTile,
-  isCoveredByEnhancedParent,
   textureCache,
   materialize,
   buildMesh,
@@ -95,7 +94,7 @@ export function createTerrainFetchExecutor({
     const reconciliation = reconcileTerrainTiles({
       tiles: data.tiles, currentTileIds: state.currentTileIds,
       deferredTiles, terrainRoot, lifecycle, priorityForTile,
-      isCoveredByEnhancedParent, textureCache, materialize, buildMesh, log: tileLog,
+      textureCache, materialize, buildMesh, log: tileLog,
       prepareUntexturedMesh, onMeshAdded,
       onDiff: details => enqueueLog('info', `fetchTiles.diff[pass${pass}]`, {
         pass, passLabel: pass === 1 ? 'preview' : 'full', ...details,

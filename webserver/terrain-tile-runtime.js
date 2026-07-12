@@ -24,16 +24,24 @@ export function meshUsesTextureClassification(mesh, texture) {
   return Boolean(mesh && texture && mesh.userData?.oceanTextureSig === texture.uuid);
 }
 
-export function scoreTextureTiles(tiles, priorityForTile, maxPriority) {
+export function scoreTextureTiles(tiles, priorityForTile, maxPriority, refinementBias = 0.12) {
   const tileIds = new Set();
   const scored = [];
   for (const tile of tiles) {
     if (!tile?.id || !tile?.bbox) continue;
     tileIds.add(tile.id);
     const priority = priorityForTile(tile);
-    if (priority <= maxPriority) scored.push({ tile, prio: priority });
+    if (priority <= maxPriority) {
+      scored.push({
+        tile,
+        prio: priority,
+        score: priority - Math.max(0, tileDepthFromId(tile.id)) * refinementBias,
+      });
+    }
   }
-  scored.sort((a, b) => a.prio - b.prio);
+  // Refine within a nearby heatmap band before spending capacity on another
+  // coarse covering tile. Spatial priority remains dominant over large gaps.
+  scored.sort((a, b) => a.score - b.score || a.prio - b.prio);
   return { tileIds, scored };
 }
 

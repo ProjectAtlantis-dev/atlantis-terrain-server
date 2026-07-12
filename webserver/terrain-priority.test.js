@@ -24,7 +24,7 @@ import { restoreTerrainCameraState, terrainCameraState } from './terrain-camera-
 import { createTerrainClientLogger } from './terrain-client-logging.js';
 import { createTerrainFpsCounter } from './terrain-fps-counter.js';
 import { loadTerrainStartupAssets, normalizeTerrainStartupAssets } from './terrain-startup-assets.js';
-import { createTerrainHouseConfiguration, createTerrainHouseMarkerRuntime, terrainHouseLocalPosition, terrainHouseShadowCoverage } from './terrain-house-runtime.js';
+import { createTerrainHouseConfiguration, createTerrainHouseMarkerRuntime, createTerrainHouseModelController, disposeTerrainHouseTree, markTerrainHousesNeedSnap, terrainHouseLocalPosition, terrainHouseShadowCoverage, terrainHouseZSummary } from './terrain-house-runtime.js';
 import {
   buildTerrainTilesRequest,
   adoptTerrainOrigin,
@@ -244,6 +244,55 @@ test('shared house marker runtime creates and updates instance records', () => {
   assert.deepEqual(instances[0].marker.position.toArray(), [10, 20, 35]);
 });
 
+test('shared house model controller rejects stale loads and reloads changed assets', async () => {
+  const loads = [];
+  const templates = [];
+  let signature = 'a';
+  const controller = createTerrainHouseModelController({
+    model: { enabled: true, url: '/house.glb', hotReloadMs: 10 },
+    loader: { load: (url, success) => loads.push({ url, success }) },
+    instanceCount: 2,
+    now: () => 123,
+    onTemplate: template => templates.push(template),
+    fetchImpl: async () => ({
+      ok: true,
+      headers: { get: name => name === 'etag' ? signature : '' },
+    }),
+  });
+  controller.load('first');
+  controller.load('second');
+  loads[0].success({ scene: 'stale' });
+  loads[1].success({ scene: 'current' });
+  assert.deepEqual(templates, ['current']);
+  await controller.updateHotReload(10);
+  signature = 'b';
+  await controller.updateHotReload(20);
+  assert.equal(loads.length, 3);
+  assert.equal(loads[2].url, '/house.glb?cb=123');
+});
+
+test('shared house disposal and snap summaries preserve lifecycle state', () => {
+  let geometryDisposals = 0;
+  let materialDisposals = 0;
+  const material = { dispose: () => { materialDisposals += 1; } };
+  const geometry = { dispose: () => { geometryDisposals += 1; } };
+  disposeTerrainHouseTree({
+    traverse(callback) {
+      callback({ isMesh: true, geometry, material });
+      callback({ isMesh: true, geometry, material });
+    },
+  }, new Set(), new Set());
+  assert.equal(geometryDisposals, 1);
+  assert.equal(materialDisposals, 1);
+  const houses = [{
+    site: { id: 'h1', lat: 1, lon: 2, tileId: '3-4-5' },
+    group: { position: { z: 7.125 } }, snapPending: false,
+  }];
+  assert.equal(terrainHouseZSummary(houses)[0].z, 7.125);
+  markTerrainHousesNeedSnap(houses);
+  assert.equal(houses[0].snapPending, true);
+});
+
 test('terrain preview request preserves boot frame semantics', () => {
   const request = buildTerrainTilesRequest({
     lat: 64.1, lon: -51.2, altitude: 120, heading: 0.5, range: 30000,
@@ -330,7 +379,6 @@ test('shared reconciler spends dirty-paint budget in heatmap order', () => {
     currentTileIds: new Set(), deferredTiles, terrainRoot,
     lifecycle: { sweepStaleParents: () => 0 },
     priorityForTile: tile => tile.priority,
-    isCoveredByEnhancedParent: () => false,
     textureCache: new Map(), materialize: () => assert.fail('unexpected materialize'),
     buildMesh: tile => {
       built.push(tile.id);
@@ -639,7 +687,7 @@ test('shared fetch executor preserves initial response transition ordering', asy
     anchorLatitude: 64, anchorLongitude: -51,
     terrainRoot: { children: [] }, deferredTiles: new Map(),
     lifecycle: { sweepStaleParents: () => 0 }, priorityForTile: () => 0,
-    isCoveredByEnhancedParent: () => false, textureCache: new Map(),
+    textureCache: new Map(),
     materialize() {}, buildMesh() {}, tileLog() {}, applyMissing() { events.push('missing'); },
     updateTextures() { events.push('textures'); },
     enqueueLog(_level, name) { events.push(name); }, bootLog(name) { events.push(name); },
@@ -766,6 +814,19 @@ test('texture candidates are filtered and priority sorted', () => {
   const result = scoreTextureTiles(tiles, tile => tile.priority, 10);
   assert.deepEqual(result.scored.map(item => item.tile.id), ['hot', 'far']);
   assert.deepEqual([...result.tileIds], ['far', 'hot', 'cold']);
+});
+
+test('texture heatmap refines equivalent coverage before coarse parents', () => {
+  const tiles = [
+    { id: '8-87-48', bbox: [0, 0, 4, 4], priority: 5.0 },
+    { id: '11-699-390', bbox: [1, 1, 3, 3], priority: 5.1 },
+    { id: '12-1398-780', bbox: [1, 1, 2, 2], priority: 5.2 },
+    { id: '12-2000-2000', bbox: [10, 10, 11, 11], priority: 5.6 },
+  ];
+  const result = scoreTextureTiles(tiles, tile => tile.priority, 10);
+  assert.deepEqual(result.scored.map(item => item.tile.id), [
+    '12-1398-780', '11-699-390', '8-87-48', '12-2000-2000',
+  ]);
 });
 
 test('shared texture pump records HTTP 202 retry state', async () => {

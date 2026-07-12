@@ -71,7 +71,8 @@ import { restoreTerrainCameraState, terrainCameraState } from './terrain-camera-
 import { createTerrainClientLogger } from './terrain-client-logging.js';
 import { createTerrainFpsCounter } from './terrain-fps-counter.js';
 import { loadTerrainStartupAssets } from './terrain-startup-assets.js';
-import { createTerrainHouseConfiguration, createTerrainHouseMarkerRuntime, terrainHouseLocalPosition, terrainHouseShadowCoverage } from './terrain-house-runtime.js';
+import { createTerrainAtmosphereTextureRuntime } from './terrain-atmosphere-textures.js';
+import { createTerrainHouseConfiguration, createTerrainHouseMarkerRuntime, createTerrainHouseModelController, disposeTerrainHouseTree, markTerrainHousesNeedSnap, terrainHouseLocalPosition, terrainHouseShadowCoverage, terrainHouseZSummary } from './terrain-house-runtime.js';
 
 const USE_WEBGPU_RENDER_BACKEND = true;
 // Calibrated against the cloudless WebGL reference. WebGL uses exposure 10
@@ -1500,10 +1501,6 @@ const houseShadowCenterLocal = new THREE.Vector3();
 const houseShadowLightDirection = new THREE.Vector3();
 const houseShadowLightDirectionLocal = new THREE.Vector3();
 let houseModelTemplate = null;
-let houseLoadSerial = 0;
-let houseModelSig = '';
-let housePollInFlight = false;
-let lastHousePollAt = 0;
 let shadowMapReadyLogged = false;
 let houseShadowGateReason = 'init';
 let lastHouseShadowGateReason = 'init';
@@ -3290,36 +3287,7 @@ function snapHouseToTerrain(house, terrainTargets) {
   return true;
 }
 
-function disposeHouseTree(root, seenGeometries, seenMaterials) {
-  root.traverse(object => {
-    if (!object.isMesh) return;
-    if (object.customDepthMaterial && !seenMaterials.has(object.customDepthMaterial)) {
-      seenMaterials.add(object.customDepthMaterial);
-      object.customDepthMaterial.dispose?.();
-      object.customDepthMaterial = null;
-    }
-    if (object.customDistanceMaterial && !seenMaterials.has(object.customDistanceMaterial)) {
-      seenMaterials.add(object.customDistanceMaterial);
-      object.customDistanceMaterial.dispose?.();
-      object.customDistanceMaterial = null;
-    }
-    if (object.geometry && !seenGeometries.has(object.geometry)) {
-      seenGeometries.add(object.geometry);
-      object.geometry.dispose();
-    }
-    if (Array.isArray(object.material)) {
-      for (const mat of object.material) {
-        if (mat && !seenMaterials.has(mat)) {
-          seenMaterials.add(mat);
-          mat.dispose();
-        }
-      }
-    } else if (object.material && !seenMaterials.has(object.material)) {
-      seenMaterials.add(object.material);
-      object.material.dispose();
-    }
-  });
-}
+const disposeHouseTree = disposeTerrainHouseTree;
 
 function clearHouseVisuals() {
   const seenGeometries = new Set();
@@ -3380,11 +3348,7 @@ function instantiateHousesFromTemplate() {
   }
 }
 
-function markHousesNeedSnap() {
-  for (const house of houseInstances) {
-    house.snapPending = true;
-  }
-}
+const markHousesNeedSnap = () => markTerrainHousesNeedSnap(houseInstances);
 
 function snapPendingHouses() {
   if (!HOUSE_MODEL.enabled || houseInstances.length === 0) {
@@ -3401,16 +3365,7 @@ function snapPendingHouses() {
   }
 }
 
-function houseZSummary() {
-  return houseInstances.map(house => ({
-    id: house.site.id,
-    lat: house.site.lat,
-    lon: house.site.lon,
-    tileId: house.site.tileId,
-    z: Number(house.group.position.z.toFixed(3)),
-    snapped: !house.snapPending,
-  }));
-}
+const houseZSummary = () => terrainHouseZSummary(houseInstances);
 
 function houseShadowDebugSummary() {
   const loadedHouses = houseInstances.filter(
@@ -3504,81 +3459,20 @@ function maybeLogHouseShadowSnapshot(nowMs) {
   bootLog('house.shadow.snapshot', houseShadowDebugSummary());
 }
 
-function parseSigHeaders(response) {
-  const etag = response.headers.get('etag') || '';
-  const modified = response.headers.get('last-modified') || '';
-  const length = response.headers.get('content-length') || '';
-  return `${etag}|${modified}|${length}`;
-}
-
-async function pollHouseModelSignature() {
-  try {
-    const response = await fetch(HOUSE_MODEL.url, { method: 'HEAD', cache: 'no-store' });
-    if (!response.ok) return '';
-    return parseSigHeaders(response);
-  } catch (_) {
-    return '';
-  }
-}
-
-function loadHouseModel(reason = 'manual') {
-  if (!HOUSE_MODEL.enabled) {
-    return;
-  }
-  const loadToken = ++houseLoadSerial;
-  const cacheBustedUrl = `${HOUSE_MODEL.url}?cb=${Date.now()}`;
-  bootLog('house.model.load.start', {
-    reason,
-    url: HOUSE_MODEL.url
-  });
-  houseLoader.load(
-    cacheBustedUrl,
-    gltf => {
-      if (loadToken !== houseLoadSerial) {
-        return;
-      }
-      houseModelTemplate = gltf.scene;
-      instantiateHousesFromTemplate();
-      snapPendingHouses();
-      bootLog('house.model.load.success', {
-        reason,
-        instances: houseInstances.length
-      });
-    },
-    undefined,
-    error => {
-      bootLog('house.model.load.error', {
-        reason,
-        message: error?.message ?? String(error),
-        stack: error?.stack ?? null
-      });
-      console.warn(`[HOUSE] load failed (${reason}):`, error);
-    }
-  );
-}
-
-async function updateHouseHotReload(nowMs) {
-  if (!HOUSE_MODEL.enabled) return;
-  if (housePollInFlight) return;
-  if (nowMs - lastHousePollAt < HOUSE_MODEL.hotReloadMs) return;
-  lastHousePollAt = nowMs;
-  housePollInFlight = true;
-  try {
-    const nextSig = await pollHouseModelSignature();
-    if (!nextSig) return;
-    if (!houseModelSig) {
-      houseModelSig = nextSig;
-      return;
-    }
-    if (nextSig !== houseModelSig) {
-      houseModelSig = nextSig;
-      loadHouseModel('asset-change');
-    }
-  } finally {
-    housePollInFlight = false;
-  }
-}
-
+const houseModelController = createTerrainHouseModelController({
+  model: HOUSE_MODEL,
+  loader: houseLoader,
+  instanceCount: houseInstances.length,
+  bootLog,
+  onTemplate: template => {
+    houseModelTemplate = template;
+    instantiateHousesFromTemplate();
+  },
+  onLoaded: snapPendingHouses,
+});
+const loadHouseModel = houseModelController.load;
+const pollHouseModelSignature = houseModelController.pollSignature;
+const updateHouseHotReload = houseModelController.updateHotReload;
 const normalPass = new NormalPass(scene, camera);
 
 const cloudsEffect = new CloudsEffect(camera, { resolutionScale: 1 });
@@ -3679,149 +3573,16 @@ cloudsEffect.events.addEventListener('change', event => {
 
 syncCloudComposition();
 
-function revokeObjectUrls(urlMap) {
-  for (const objectUrl of urlMap.values()) {
-    URL.revokeObjectURL(objectUrl);
-  }
-}
-
-function applyAtmosphereTextures(textures) {
-  bootLog('atmosphere.textures.apply', {
-    keys: Object.keys(textures || {})
-  });
-  Object.assign(aerialPerspective, textures);
-  Object.assign(cloudsEffect, textures);
-}
-
-function loadAtmosphereTextures(url, manager) {
-  bootLog('atmosphere.loader.start', {
-    url,
-    viaManager: Boolean(manager)
-  });
-  new PrecomputedTexturesLoader({}, manager).load(
-    url,
-    textures => {
-      bootLog('atmosphere.loader.success', { url });
-      applyAtmosphereTextures(textures);
-    },
-    undefined,
-    error => {
-      bootLog('atmosphere.loader.error', {
-        url,
-        message: error?.message ?? String(error),
-        stack: error?.stack ?? null
-      });
-    }
-  );
-}
-
-async function prepareAtmosphereTextureUrlMap(baseUrl) {
-  bootLog('atmosphere.cache.prepare.start', {
-    baseUrl,
-    fileCount: ATMOSPHERE_TEXTURE_FILES.length
-  });
-  if (!('caches' in window)) {
-    bootLog('atmosphere.cache.prepare.no-cache-api');
-    return null;
-  }
-  const cache = await caches.open(ATMOSPHERE_CACHE_NAME);
-  const urlMap = new Map();
-  let cacheHits = 0;
-  let networkHits = 0;
-
-  for (const fileName of ATMOSPHERE_TEXTURE_FILES) {
-    const sourceUrl = `${baseUrl}/${fileName}`;
-    let response = await cache.match(sourceUrl);
-    let source = 'cache';
-    if (response != null) {
-      cacheHits += 1;
-    } else {
-      source = 'network';
-      response = await fetch(sourceUrl);
-      if (!response.ok) {
-        throw new Error(`atmosphere texture fetch failed: ${response.status} ${sourceUrl}`);
-      }
-      await cache.put(sourceUrl, response.clone());
-      networkHits += 1;
-    }
-    const blob = await response.blob();
-    bootLog('atmosphere.cache.file.ready', {
-      fileName,
-      source,
-      bytes: blob.size
-    });
-    urlMap.set(sourceUrl, URL.createObjectURL(blob));
-  }
-
-  bootLog('atmosphere.cache.prepare.done', { cacheHits, networkHits });
-  return { urlMap, cacheHits, networkHits };
-}
-
-function loadAtmosphereTexturesWithLocalCache() {
-  bootLog('atmosphere.cache.load-sequence.start');
-  prepareAtmosphereTextureUrlMap(DEFAULT_PRECOMPUTED_TEXTURES_URL)
-    .then(result => {
-      if (result == null) {
-        bootLog('atmosphere.cache.load-sequence.fallback-direct');
-        loadAtmosphereTextures(DEFAULT_PRECOMPUTED_TEXTURES_URL);
-        return;
-      }
-
-      const manager = new THREE.LoadingManager();
-      // Loader requests still use source URLs; URLModifier swaps them for cached blobs.
-      manager.setURLModifier(url => result.urlMap.get(url) ?? url);
-      console.info(
-        '[clouds-terrain-managed-flask-ux-wip] Atmosphere LUT cache prepared. ' +
-          `cacheHits=${result.cacheHits} network=${result.networkHits}`
-      );
-      bootLog('atmosphere.cache.manager.ready', {
-        cacheHits: result.cacheHits,
-        networkHits: result.networkHits
-      });
-
-      let released = false;
-      const release = () => {
-        if (!released) {
-          released = true;
-          revokeObjectUrls(result.urlMap);
-          bootLog('atmosphere.cache.object-urls.revoked');
-        }
-      };
-
-      bootLog('atmosphere.cache.loader.start');
-      new PrecomputedTexturesLoader({}, manager).load(
-        DEFAULT_PRECOMPUTED_TEXTURES_URL,
-        textures => {
-          bootLog('atmosphere.cache.loader.success');
-          applyAtmosphereTextures(textures);
-          release();
-        },
-        undefined,
-        error => {
-          bootLog('atmosphere.cache.loader.error', {
-            message: error?.message ?? String(error),
-            stack: error?.stack ?? null
-          });
-          release();
-          loadAtmosphereTextures(DEFAULT_PRECOMPUTED_TEXTURES_URL);
-        }
-      );
-    })
-    .catch(error => {
-      const message = error instanceof Error ? error.message : String(error);
-      bootLog('atmosphere.cache.load-sequence.error', {
-        message,
-        stack: error?.stack ?? null
-      });
-      console.warn(
-        `[clouds-terrain-managed-flask-ux-wip] Atmosphere cache setup failed: ${message}`
-      );
-      loadAtmosphereTextures(DEFAULT_PRECOMPUTED_TEXTURES_URL);
-    });
-}
-
 bootLog('atmosphere.cache.load-sequence.invoke');
-loadAtmosphereTexturesWithLocalCache();
+createTerrainAtmosphereTextureRuntime({
+  baseUrl: DEFAULT_PRECOMPUTED_TEXTURES_URL,
+  cacheName: ATMOSPHERE_CACHE_NAME,
+  fileNames: ATMOSPHERE_TEXTURE_FILES,
+  LoadingManager: THREE.LoadingManager,
+  PrecomputedTexturesLoader,
+  targets: [aerialPerspective, cloudsEffect],
+  bootLog,
+}).loadWithLocalCache();
 
 // MSAA on the composer — the renderer's antialias:true does nothing when
 // postprocessing renders to its own framebuffers. Without this, everything
@@ -4117,7 +3878,6 @@ const updateTerrainTextures = createTerrainTextureController({
   lifecycle: tileLifecycle,
   priorityForTile: tilePriority,
   getVisibilityDistance: getTileLoadDistance,
-  isCovered: _coveredByEnhancedParent,
   applyMaterial: applyTerrainMaterialMode,
   getWaterMask: tileId => waterMaskCache.get(tileId),
   isMaterialOverlayActive: () => oceanMapDebugEnabled && controls.mapMode,
@@ -4159,28 +3919,6 @@ function updateTextures(tiles) {
 
 let _lastCamMoveTime = performance.now();
 let _enhanceStatus = { total: 0, eligible: 0, done: 0, in_progress: 0 };
-
-// Check if a tile is fully contained by a parent mesh that has an enhanced texture.
-function _coveredByEnhancedParent(tile) {
-  const tb = tile.bbox;
-  if (!tb) return false;
-  const tileDepth = parseInt(tile.id.split('-')[0]);
-  for (const child of terrainRoot.children) {
-    if (!child.isMesh) continue;
-    const cid = child.userData.tileId;
-    if (!cid) continue;
-    const parentDepth = parseInt(cid.split('-')[0]);
-    if (parentDepth >= tileDepth) continue;
-    const src = texSource.get(cid);
-    if (!src || !src.includes('enhanced')) continue;
-    const sb = child.userData.bbox;
-    if (!sb) continue;
-    if (sb[0] <= tb[0] && sb[2] >= tb[2] && sb[1] <= tb[1] && sb[3] >= tb[3]) {
-      return true;
-    }
-  }
-  return false;
-}
 
 const enhancementController = createTerrainEnhancementController({
   log: tileLog,
@@ -4350,7 +4088,7 @@ const performTileFetch = createTerrainFetchExecutor({
   },
   anchorLatitude: anchorLat, anchorLongitude: anchorLon, terrainRoot, deferredTiles,
   lifecycle: tileLifecycle, priorityForTile: tilePriority,
-  isCoveredByEnhancedParent: _coveredByEnhancedParent, textureCache: texCache,
+  textureCache: texCache,
   materialize: materializeTile, buildMesh, tileLog, applyMissing: markMissing, updateTextures,
   prepareUntexturedMesh: applyWebGPUUntexturedTerrainMaterial,
   onMeshAdded: markSceneMutated,
@@ -4454,7 +4192,7 @@ if (HOUSE_MODEL.enabled && housesRuntimeVisible) {
   markHousesNeedSnap();
   loadHouseModel('initial');
   pollHouseModelSignature().then(sig => {
-    houseModelSig = sig;
+    houseModelController.adoptSignature(sig);
   });
 }
 loadVehicleState();

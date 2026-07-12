@@ -16,7 +16,6 @@ export function reconcileTerrainTiles({
   terrainRoot,
   lifecycle,
   priorityForTile,
-  isCoveredByEnhancedParent,
   textureCache,
   materialize,
   buildMesh,
@@ -59,10 +58,6 @@ export function reconcileTerrainTiles({
     let built = 0;
     for (const { tile } of candidates) {
       if (existingIds.has(tile.id)) continue;
-      if (isCoveredByEnhancedParent(tile)) {
-        log(tile.id, 'skipped — covered by enhanced parent');
-        continue;
-      }
       const cachedTexture = textureCache.get(tile.id);
       if (cachedTexture) {
         deferredTiles.set(tile.id, tile);

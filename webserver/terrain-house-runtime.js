@@ -156,3 +156,120 @@ export function createTerrainHouseMarkerRuntime({
 
   return { createBeaconMarker, createHouseInstances, updateHouseMarkerPosition };
 }
+
+export function disposeTerrainHouseTree(root, seenGeometries, seenMaterials) {
+  root.traverse(object => {
+    if (!object.isMesh) return;
+    for (const key of ['customDepthMaterial', 'customDistanceMaterial']) {
+      const material = object[key];
+      if (material && !seenMaterials.has(material)) {
+        seenMaterials.add(material);
+        material.dispose?.();
+        object[key] = null;
+      }
+    }
+    if (object.geometry && !seenGeometries.has(object.geometry)) {
+      seenGeometries.add(object.geometry);
+      object.geometry.dispose();
+    }
+    const materials = Array.isArray(object.material) ? object.material : [object.material];
+    for (const material of materials) {
+      if (material && !seenMaterials.has(material)) {
+        seenMaterials.add(material);
+        material.dispose();
+      }
+    }
+  });
+}
+
+export function markTerrainHousesNeedSnap(houses) {
+  for (const house of houses) house.snapPending = true;
+}
+
+export function terrainHouseZSummary(houses) {
+  return houses.map(house => ({
+    id: house.site.id,
+    lat: house.site.lat,
+    lon: house.site.lon,
+    tileId: house.site.tileId,
+    z: Number(house.group.position.z.toFixed(3)),
+    snapped: !house.snapPending,
+  }));
+}
+
+export function createTerrainHouseModelController({
+  model,
+  loader,
+  instanceCount,
+  bootLog = () => {},
+  onTemplate,
+  onLoaded = () => {},
+  fetchImpl = (...args) => fetch(...args),
+  now = () => Date.now(),
+} = {}) {
+  let loadSerial = 0;
+  let modelSignature = '';
+  let pollInFlight = false;
+  let lastPollAt = 0;
+
+  function load(reason = 'manual') {
+    if (!model.enabled) return;
+    const token = ++loadSerial;
+    bootLog('house.model.load.start', { reason, url: model.url });
+    loader.load(
+      `${model.url}?cb=${now()}`,
+      gltf => {
+        if (token !== loadSerial) return;
+        onTemplate(gltf.scene);
+        onLoaded();
+        bootLog('house.model.load.success', { reason, instances: instanceCount });
+      },
+      undefined,
+      error => {
+        bootLog('house.model.load.error', {
+          reason,
+          message: error?.message ?? String(error),
+          stack: error?.stack ?? null,
+        });
+        console.warn(`[HOUSE] load failed (${reason}):`, error);
+      },
+    );
+  }
+
+  async function pollSignature() {
+    try {
+      const response = await fetchImpl(model.url, { method: 'HEAD', cache: 'no-store' });
+      if (!response.ok) return '';
+      const etag = response.headers.get('etag') || '';
+      const modified = response.headers.get('last-modified') || '';
+      const length = response.headers.get('content-length') || '';
+      return `${etag}|${modified}|${length}`;
+    } catch (_) {
+      return '';
+    }
+  }
+
+  async function updateHotReload(nowMs) {
+    if (!model.enabled || pollInFlight || nowMs - lastPollAt < model.hotReloadMs) return;
+    lastPollAt = nowMs;
+    pollInFlight = true;
+    try {
+      const nextSignature = await pollSignature();
+      if (!nextSignature) return;
+      if (!modelSignature) {
+        modelSignature = nextSignature;
+      } else if (nextSignature !== modelSignature) {
+        modelSignature = nextSignature;
+        load('asset-change');
+      }
+    } finally {
+      pollInFlight = false;
+    }
+  }
+
+  function adoptSignature(signature) {
+    modelSignature = signature || '';
+  }
+
+  return { adoptSignature, load, pollSignature, updateHotReload };
+}

@@ -2,7 +2,7 @@ import { scoreTextureTiles } from './terrain-tile-runtime.js';
 
 export function createTerrainTextureController({
   terrainRoot, deferredTiles, textureStreamer, meshRuntime, lifecycle,
-  priorityForTile, getVisibilityDistance, isCovered, applyMaterial,
+  priorityForTile, getVisibilityDistance, applyMaterial,
   getWaterMask, isMaterialOverlayActive = () => false, log,
   onMaterialApplied = () => {},
   scheduleFrame = callback => requestAnimationFrame(callback),
@@ -100,7 +100,7 @@ export function createTerrainTextureController({
     }
 
     textureStreamer.pump(scored, {
-      isCovered,
+      isCovered: () => false,
       onPlaceholder: ({ tileId, texture }) => {
         const mesh = findMesh(tileId);
         if (!mesh) return;
