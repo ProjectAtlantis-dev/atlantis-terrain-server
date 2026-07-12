@@ -464,7 +464,10 @@ def fix_tile_in_db(db, tile_id, jpeg_bytes, force=False) -> bool:
     Tiles already at the current version are skipped unless ``force``.
     Returns True if the stored tile changed.
     """
-    from database import CONFIDENCE, GRID_N, write_tile, _decompress_float32, _decompress_uint8
+    from database import (
+        CONFIDENCE, GRID_N, ensure_water_flag_columns, set_tile_water_flags, write_tile,
+        _decompress_float32, _decompress_uint8,
+    )
 
     try:
         depth = int(tile_id.split("-")[0])
@@ -472,8 +475,10 @@ def fix_tile_in_db(db, tile_id, jpeg_bytes, force=False) -> bool:
         return False
     if depth < MIN_FIX_DEPTH:
         return False
+    ensure_water_flag_columns(db)
     row = db.execute(
-        "SELECT heightmap, confidence_map, source FROM tiles WHERE tile_id = ?",
+        "SELECT heightmap, confidence_map, source, has_sealevel_water, "
+        "has_flattened_water FROM tiles WHERE tile_id = ?",
         (tile_id,),
     ).fetchone()
     if not row or row[0] is None:
@@ -488,7 +493,8 @@ def fix_tile_in_db(db, tile_id, jpeg_bytes, force=False) -> bool:
         " FROM bathy_originals WHERE tile_id = ?", (tile_id,),
     ).fetchone()
     if orow is not None:
-        if orow[3] >= BATHY_ALGO_VERSION and not force:
+        flags_known = row[3] is not None and row[4] is not None
+        if orow[3] >= BATHY_ALGO_VERSION and flags_known and not force:
             return False
         hm = _decompress_float32(orow[0], (GRID_N, GRID_N))
         cm = (_decompress_uint8(orow[1], (GRID_N, GRID_N)) if orow[1] is not None
@@ -515,6 +521,9 @@ def fix_tile_in_db(db, tile_id, jpeg_bytes, force=False) -> bool:
     hm_m[ctr, ctr] = hm  # center uses the same original we recompute from
     _, cap_m = flatten_fake_bathymetry(hm_m, px_m, peelable=pl_m)
     captured = cap_m[ctr, ctr]
+    sealevel_water = (
+        (hm_m <= OCEAN_LEVEL_M) & water_mask(px_m)
+    )[ctr, ctr]
     new_hm = np.where(captured, np.float32(OCEAN_LEVEL_M), hm)
 
     if orow is None:
@@ -537,12 +546,22 @@ def fix_tile_in_db(db, tile_id, jpeg_bytes, force=False) -> bool:
     cm_out[captured] = CONFIDENCE['bathymetry']
     hm_out = np.where(np.isnan(new_hm), 0.0, new_hm).astype(np.float32)
     if np.array_equal(hm_out, cur_hm) and np.array_equal(cm_out, cur_cm):
+        set_tile_water_flags(
+            db, tile_id,
+            has_sealevel_water=sealevel_water.any(),
+            has_flattened_water=captured.any(),
+        )
         return False
     # Generic confidence-based reconciliation is not bathymetry-aware: it can
     # copy a sea-level confidence-7 edge sample into a neighbor beside high
     # terrain after the mask passed _erode_cliffs. Cross-tile bathymetry is
     # handled by explicit neighbor seeding; never mutate either tile here.
     write_tile(db, tile_id, hm_out, cm_out, source, reconcile=False, allow_overwrite=True)
+    set_tile_water_flags(
+        db, tile_id,
+        has_sealevel_water=sealevel_water.any(),
+        has_flattened_water=captured.any(),
+    )
     log_bathy.info(
         f"[bathy] {tile_id}: flattened {captured.mean():.0%} fake bathymetry"
         f" (v{BATHY_ALGO_VERSION})")

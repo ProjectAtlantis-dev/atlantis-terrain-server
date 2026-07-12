@@ -97,7 +97,9 @@ CREATE TABLE IF NOT EXISTS tiles (
     source          TEXT NOT NULL DEFAULT 'empty',
     updated_at      TEXT NOT NULL,
     heightmap       BLOB,
-    confidence_map  BLOB
+    confidence_map  BLOB,
+    has_sealevel_water  INTEGER CHECK (has_sealevel_water IN (0, 1)),
+    has_flattened_water INTEGER CHECK (has_flattened_water IN (0, 1))
 );
 
 CREATE TABLE IF NOT EXISTS metadata (
@@ -126,6 +128,17 @@ def open_db(path=None):
     db.execute("PRAGMA synchronous=NORMAL")
     existing = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
     db.executescript(_SCHEMA)
+    tile_columns = {r[1] for r in db.execute("PRAGMA table_info(tiles)")}
+    if "has_sealevel_water" not in tile_columns:
+        db.execute(
+            "ALTER TABLE tiles ADD COLUMN has_sealevel_water INTEGER "
+            "CHECK (has_sealevel_water IN (0, 1))"
+        )
+    if "has_flattened_water" not in tile_columns:
+        db.execute(
+            "ALTER TABLE tiles ADD COLUMN has_flattened_water INTEGER "
+            "CHECK (has_flattened_water IN (0, 1))"
+        )
     db.commit()
     for tbl in ("tiles", "metadata"):
         if tbl not in existing:
@@ -136,6 +149,35 @@ def open_db(path=None):
     init_textures(db)
 
     return db
+
+
+def ensure_water_flag_columns(db):
+    """Add canonical tile water flags to databases opened outside open_db."""
+    columns = {r[1] for r in db.execute("PRAGMA table_info(tiles)")}
+    if "has_sealevel_water" not in columns:
+        db.execute(
+            "ALTER TABLE tiles ADD COLUMN has_sealevel_water INTEGER "
+            "CHECK (has_sealevel_water IN (0, 1))"
+        )
+    if "has_flattened_water" not in columns:
+        db.execute(
+            "ALTER TABLE tiles ADD COLUMN has_flattened_water INTEGER "
+            "CHECK (has_flattened_water IN (0, 1))"
+        )
+    db.commit()
+
+
+def set_tile_water_flags(db, tile_id, *, has_sealevel_water, has_flattened_water):
+    """Persist water classification on the canonical tile row."""
+    ensure_water_flag_columns(db)
+    cursor = db.execute(
+        "UPDATE tiles SET has_sealevel_water = ?, has_flattened_water = ? "
+        "WHERE tile_id = ?",
+        (int(bool(has_sealevel_water)), int(bool(has_flattened_water)), tile_id),
+    )
+    if cursor.rowcount == 0:
+        raise KeyError(f"Unknown tile_id: {tile_id}")
+    db.commit()
 
 
 # ---------------------------------------------------------------------------
@@ -361,7 +403,9 @@ def _reconcile_edges(db, tile_id, heightmap, confidence_map):
             now = datetime.datetime.now(datetime.timezone.utc).isoformat()
             db.execute(
                 "UPDATE tiles SET heightmap = ?, confidence_map = ?, "
-                "geometric_error = ?, updated_at = ? WHERE tile_id = ?",
+                "geometric_error = ?, updated_at = ?, "
+                "has_sealevel_water = NULL, has_flattened_water = NULL "
+                "WHERE tile_id = ?",
                 (_compress_array(nbr_hm), _compress_array(nbr_cm),
                  nbr_error, now, nbr_id)
             )
@@ -409,6 +453,8 @@ def write_tile(
     assert heightmap.dtype == np.float32
     assert confidence_map.dtype == np.uint8
 
+    ensure_water_flag_columns(db)
+
     # Make copies so we don't mutate caller's arrays
     heightmap = heightmap.copy()
     confidence_map = confidence_map.copy()
@@ -426,7 +472,8 @@ def write_tile(
     if allow_overwrite:
         cursor = db.execute(
             "UPDATE tiles SET heightmap = ?, confidence_map = ?, "
-            "geometric_error = ?, source = ?, updated_at = ? "
+            "geometric_error = ?, source = ?, updated_at = ?, "
+            "has_sealevel_water = NULL, has_flattened_water = NULL "
             "WHERE tile_id = ?",
             (hm_blob, cm_blob, error, source, now, tile_id)
         )
@@ -438,7 +485,8 @@ def write_tile(
     # Atomic no-clobber write: only populate tiles that do not yet have payloads.
     cursor = db.execute(
         "UPDATE tiles SET heightmap = ?, confidence_map = ?, "
-        "geometric_error = ?, source = ?, updated_at = ? "
+        "geometric_error = ?, source = ?, updated_at = ?, "
+        "has_sealevel_water = NULL, has_flattened_water = NULL "
         "WHERE tile_id = ? AND heightmap IS NULL AND confidence_map IS NULL",
         (hm_blob, cm_blob, error, source, now, tile_id)
     )

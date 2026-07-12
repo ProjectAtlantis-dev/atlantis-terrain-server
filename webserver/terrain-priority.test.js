@@ -12,10 +12,20 @@ import { stepSuspension, stepVehicleDrive } from './terrain-vehicle.js';
 import { meshUsesTextureClassification, scoreTextureTiles, textureRetryDelay } from './terrain-tile-runtime.js';
 import { createTextureStreamer } from './terrain-texture-streamer.js';
 import { createTileLifecycle } from './terrain-tile-lifecycle.js';
+import { reconcileTerrainTiles } from './terrain-tile-reconciler.js';
+import { createTerrainFetchScheduler } from './terrain-fetch-scheduler.js';
+import { createTerrainTextureController } from './terrain-texture-controller.js';
+import { createTerrainEnhancementController } from './terrain-enhancement-controller.js';
 import {
   buildTerrainTilesRequest,
+  adoptTerrainOrigin,
   diffTerrainTileIds,
+  offsetTerrainPayload,
   prioritizeTerrainBuildCandidates,
+  selectTerrainFrameOffset,
+  summarizeTerrainResponse,
+  terrainCameraStereoPosition,
+  terrainPipelineStatus,
 } from './terrain-tile-fetch.js';
 
 test('terrain preview request preserves boot frame semantics', () => {
@@ -57,6 +67,174 @@ test('terrain tile diff and dirty-paint demand are deterministic', () => {
     tiles, new Set(diff.added), tile => tile.priority,
   );
   assert.deepEqual(candidates.map(item => item.tile.id), ['new-hot', 'new-far']);
+});
+
+test('terrain response normalization preserves frame and log semantics', () => {
+  assert.deepEqual(selectTerrainFrameOffset({
+    isFirstLoad: true, frameOffsetReady: false,
+    cameraEast: 100.25, cameraNorth: -20.5, offsetX: 0, offsetY: 0,
+  }), { offsetX: 100.25, offsetY: -20.5, ready: true, changed: true });
+  const data = {
+    qx: 1.26, qy: 2.34, ox: 3.45, oy: 4.56,
+    tiles: [
+      { id: 'near', bbox: [0, 0, 2, 2], heightmap: 'hm' },
+      { id: 'far', bbox: [10, 10, 12, 12], heightmap: null },
+    ],
+    missing: [{ id: 'missing', bbox: [2, 2, 3, 3] }],
+    downloading: ['x'],
+  };
+  offsetTerrainPayload(data, 100, -20);
+  assert.deepEqual(data.tiles[0].bbox, [100, -20, 102, -18]);
+  assert.deepEqual(data.missing[0].bbox, [102, -18, 103, -17]);
+  assert.deepEqual(summarizeTerrainResponse({
+    data, status: 200, pass: 2, cameraX: 101, cameraY: -19,
+    frameOffsetX: 100, frameOffsetY: -20, frameOffsetReady: true,
+  }), {
+    pass: 2, passLabel: 'full', status: 200, tiles: 2, withHm: 1, noHm: 1,
+    missing: 1, downloading: 1, qx: 1.3, qy: 2.3, ox: 3.5, oy: 4.6,
+    closestTileId: 'near', closestTileDistM: 0,
+    closestTileCx: 101, closestTileCy: -19,
+    tileFrameOffsetX: 100, tileFrameOffsetY: -20, tileFrameOffsetReady: true,
+  });
+});
+
+test('shared reconciler spends dirty-paint budget in heatmap order', () => {
+  const built = [];
+  const deferredTiles = new Map();
+  const terrainRoot = {
+    children: [],
+    add(mesh) { this.children.push(mesh); },
+  };
+  let diffDetails = null;
+  const result = reconcileTerrainTiles({
+    tiles: [
+      { id: 'far', bbox: [10, 10, 11, 11], heightmap: 'hm', priority: 9 },
+      { id: 'hot', bbox: [0, 0, 1, 1], heightmap: 'hm', priority: 1 },
+    ],
+    currentTileIds: new Set(), deferredTiles, terrainRoot,
+    lifecycle: { sweepStaleParents: () => 0 },
+    priorityForTile: tile => tile.priority,
+    isCoveredByEnhancedParent: () => false,
+    textureCache: new Map(), materialize: () => assert.fail('unexpected materialize'),
+    buildMesh: tile => {
+      built.push(tile.id);
+      return {
+        isMesh: true, userData: { tileId: tile.id, bbox: tile.bbox },
+        material: { map: null },
+      };
+    },
+    log: () => {}, buildBudget: 1,
+    onDiff: details => { diffDetails = details; },
+  });
+  assert.deepEqual(built, ['hot']);
+  assert.deepEqual([...deferredTiles.keys()], ['hot', 'far']);
+  assert.equal(result.sceneMeshes, 1);
+  assert.deepEqual(diffDetails, { added: 2, removed: 0, purgedDeferred: 0, sceneMeshes: 0 });
+});
+
+test('terrain origin and pipeline decisions preserve two-pass behavior', () => {
+  const origin = adoptTerrainOrigin({
+    data: { ox: -100.25, oy: 200.25, qx: -90, qy: 210 },
+    pass: 1,
+    cameraSnapshot: { camStereoApproxX: -95, camStereoApproxY: 205 },
+  });
+  assert.equal(origin.originX, -100.25);
+  assert.equal(origin.cameraY, 210);
+  assert.equal(origin.logDetails.originDeltaX, -5.3);
+  assert.equal(terrainPipelineStatus({ missing: [], downloading: [], texFetching: 0 }, true).nextAction, 'full-pass');
+  assert.equal(terrainPipelineStatus({ missing: [{}], downloading: [], texFetching: 0 }, false).nextAction, 'poll');
+  assert.equal(terrainPipelineStatus({ missing: [], downloading: [], texFetching: 0 }, false).nextAction, 'idle');
+  assert.deepEqual(terrainCameraStereoPosition({
+    latitude: 64, longitude: -51, anchorLatitude: 64, anchorLongitude: -51,
+    originX: 12, originY: 34,
+  }), { x: 12, y: 34 });
+});
+
+test('shared fetch scheduler serializes preview, full pass, and polling', async () => {
+  const passes = [];
+  let frameCallback = null;
+  let pollCallback = null;
+  const scheduler = createTerrainFetchScheduler({
+    execute: async ({ pass }) => {
+      passes.push(pass);
+      return { nextAction: pass === 1 ? 'full-pass' : 'poll' };
+    },
+    scheduleFrame: callback => { frameCallback = callback; },
+    schedulePoll: callback => { pollCallback = callback; return 7; },
+    cancelPoll: () => {},
+  });
+  await scheduler.request();
+  assert.deepEqual(passes, [1]);
+  assert.equal(scheduler.pass, 2);
+  await frameCallback();
+  assert.deepEqual(passes, [1, 2]);
+  assert.equal(typeof pollCallback, 'function');
+  await pollCallback();
+  assert.deepEqual(passes, [1, 2, 2]);
+});
+
+test('shared fetch scheduler rejects overlapping requests', async () => {
+  let release;
+  let skips = 0;
+  const scheduler = createTerrainFetchScheduler({
+    execute: () => new Promise(resolve => { release = resolve; }),
+    onSkip: () => { skips += 1; },
+  });
+  const first = scheduler.request();
+  await scheduler.request();
+  assert.equal(skips, 1);
+  release({ nextAction: 'idle' });
+  await first;
+});
+
+test('shared texture controller budgets scene applications per frame', () => {
+  const tiles = [
+    { id: 'a', bbox: [0, 0, 1, 1] },
+    { id: 'b', bbox: [1, 0, 2, 1] },
+  ];
+  const textures = new Map(tiles.map(tile => [tile.id, { image: { width: 1, height: 1 } }]));
+  const deferredTiles = new Map(tiles.map(tile => [tile.id, tile]));
+  const frames = [];
+  const materialized = [];
+  const controller = createTerrainTextureController({
+    terrainRoot: { children: [] }, deferredTiles,
+    textureStreamer: {
+      texCache: textures, texSource: new Map(), requestWaterMask() {},
+      pump() {},
+    },
+    meshRuntime: {
+      materialize(id) { materialized.push(id); deferredTiles.delete(id); },
+      rebuildWithTexture: mesh => mesh,
+    },
+    lifecycle: { evictCoveredAncestors() {}, sweepStaleParents() {} },
+    priorityForTile: () => 0, getVisibilityDistance: () => 1000,
+    isCovered: () => false, applyMaterial() {}, getWaterMask: () => null,
+    log() {}, applicationsPerFrame: 1,
+    scheduleFrame: callback => frames.push(callback),
+  });
+  controller(tiles);
+  assert.deepEqual(materialized, []);
+  frames.shift()();
+  assert.deepEqual(materialized, ['a']);
+  frames.shift()();
+  assert.deepEqual(materialized, ['a', 'b']);
+});
+
+test('shared enhancement controller tracks 202 pending and 429 backoff', () => {
+  let timestamp = 1000;
+  const controller = createTerrainEnhancementController({
+    log() {}, applyEnhancedTexture() {}, requestWaterMask() {},
+    textureCache: new Map(), textureSource: new Map(),
+    hasTextureWork: () => false, getLastCameraMoveTime: () => 0,
+    hasTiles: () => true, now: () => timestamp,
+  });
+  controller.handleResponse('tile', { status: 202 });
+  assert.deepEqual(controller.pending.get('tile'), { submitted: 1000, nextPollAt: 6000 });
+  timestamp = 2000;
+  controller.handleResponse('tile', { status: 429 }, true);
+  assert.equal(controller.backoffUntil, 12000);
+  assert.equal(controller.retryAfter.get('tile'), 12000);
+  assert.deepEqual(controller.pending.get('tile'), { submitted: 1000, nextPollAt: 12000 });
 });
 
 test('cardinal headings use the vehicle convention', () => {

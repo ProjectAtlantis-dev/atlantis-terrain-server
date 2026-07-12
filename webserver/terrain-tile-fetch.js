@@ -47,3 +47,109 @@ export function prioritizeTerrainBuildCandidates(tiles, addedIds, priorityForTil
     .map(tile => ({ tile, prio: priorityForTile(tile) }))
     .sort((a, b) => a.prio - b.prio);
 }
+
+export function selectTerrainFrameOffset({
+  isFirstLoad, frameOffsetReady, cameraEast, cameraNorth, offsetX, offsetY,
+}) {
+  if (isFirstLoad && !frameOffsetReady) {
+    return { offsetX: cameraEast, offsetY: cameraNorth, ready: true, changed: true };
+  }
+  return { offsetX, offsetY, ready: frameOffsetReady, changed: false };
+}
+
+export function offsetTerrainPayload(data, offsetX, offsetY) {
+  if (!data) return data;
+  for (const collection of [data.tiles, data.missing]) {
+    if (!Array.isArray(collection)) continue;
+    for (const item of collection) {
+      if (!Array.isArray(item?.bbox) || item.bbox.length !== 4) continue;
+      item.bbox = [
+        item.bbox[0] + offsetX, item.bbox[1] + offsetY,
+        item.bbox[2] + offsetX, item.bbox[3] + offsetY,
+      ];
+    }
+  }
+  return data;
+}
+
+const rounded = value => Number.isFinite(value) ? Number(value.toFixed(1)) : null;
+
+export function summarizeTerrainResponse({
+  data, status, pass, cameraX, cameraY, frameOffsetX, frameOffsetY, frameOffsetReady,
+}) {
+  const tiles = Array.isArray(data?.tiles) ? data.tiles : [];
+  const withHm = tiles.filter(tile => tile.heightmap).length;
+  let closest = null;
+  for (const tile of tiles) {
+    if (!Array.isArray(tile?.bbox) || tile.bbox.length !== 4) continue;
+    const cx = (tile.bbox[0] + tile.bbox[2]) * 0.5;
+    const cy = (tile.bbox[1] + tile.bbox[3]) * 0.5;
+    const distance = Math.hypot(cx - cameraX, cy - cameraY);
+    if (!closest || distance < closest.distance) closest = { tile, cx, cy, distance };
+  }
+  return {
+    pass,
+    passLabel: pass === 1 ? 'preview' : 'full',
+    status,
+    tiles: tiles.length,
+    withHm,
+    noHm: tiles.length - withHm,
+    missing: data?.missing?.length ?? 0,
+    downloading: data?.downloading?.length ?? 0,
+    qx: rounded(data?.qx), qy: rounded(data?.qy),
+    ox: rounded(data?.ox), oy: rounded(data?.oy),
+    closestTileId: closest?.tile.id ?? null,
+    closestTileDistM: closest ? rounded(closest.distance) : null,
+    closestTileCx: closest ? rounded(closest.cx) : null,
+    closestTileCy: closest ? rounded(closest.cy) : null,
+    tileFrameOffsetX: rounded(frameOffsetX),
+    tileFrameOffsetY: rounded(frameOffsetY),
+    tileFrameOffsetReady: frameOffsetReady,
+  };
+}
+
+export function adoptTerrainOrigin({ data, pass, cameraSnapshot }) {
+  return {
+    originX: data.ox,
+    originY: data.oy,
+    cameraX: data.qx,
+    cameraY: data.qy,
+    logDetails: {
+      pass,
+      passLabel: pass === 1 ? 'preview' : 'full',
+      qx: rounded(data.qx), qy: rounded(data.qy),
+      ox: rounded(data.ox), oy: rounded(data.oy),
+      requestCamStereoApproxX: cameraSnapshot.camStereoApproxX,
+      requestCamStereoApproxY: cameraSnapshot.camStereoApproxY,
+      originDeltaX: Number.isFinite(data.ox) && Number.isFinite(cameraSnapshot.camStereoApproxX)
+        ? rounded(data.ox - cameraSnapshot.camStereoApproxX) : null,
+      originDeltaY: Number.isFinite(data.oy) && Number.isFinite(cameraSnapshot.camStereoApproxY)
+        ? rounded(data.oy - cameraSnapshot.camStereoApproxY) : null,
+    },
+  };
+}
+
+export function terrainCameraStereoPosition({
+  latitude, longitude, anchorLatitude, anchorLongitude, originX, originY,
+}) {
+  return {
+    x: originX + (longitude - anchorLongitude) * 111320 * Math.cos(anchorLatitude * Math.PI / 180),
+    y: originY + (latitude - anchorLatitude) * 111320,
+  };
+}
+
+export function terrainPipelineStatus(data, wasFirstLoad) {
+  const missing = data?.missing?.length ?? 0;
+  const downloading = data?.downloading?.length ?? 0;
+  const textureFetching = data?.texFetching ?? 0;
+  return {
+    missing,
+    downloading,
+    textureFetching,
+    textureRetryQueue: data?.texRetryQueue ?? 0,
+    textureStatusCounts: data?.texStatusCounts || {},
+    nextAction: wasFirstLoad
+      ? 'full-pass'
+      : (missing > 0 || downloading > 0 || textureFetching > 0 ? 'poll' : 'idle'),
+  };
+}

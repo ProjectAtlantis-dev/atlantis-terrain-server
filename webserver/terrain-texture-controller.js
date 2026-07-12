@@ -5,8 +5,12 @@ export function createTerrainTextureController({
   priorityForTile, getVisibilityDistance, isCovered, applyMaterial,
   getWaterMask, isMaterialOverlayActive = () => false, log,
   onMaterialApplied = () => {},
+  scheduleFrame = callback => requestAnimationFrame(callback),
+  applicationsPerFrame = 4,
 }) {
   const findMesh = tileId => terrainRoot.children.find(child => child.userData.tileId === tileId);
+  const pendingApplications = new Map();
+  let applicationFramePending = false;
 
   function applyTexture(mesh, tile, texture) {
     const rebuilt = meshRuntime.rebuildWithTexture(mesh, tile, texture);
@@ -14,6 +18,41 @@ export function createTerrainTextureController({
     rebuilt.userData.waterMask = getWaterMask(tile.id) || null;
     onMaterialApplied(rebuilt);
     return rebuilt;
+  }
+
+  function drainApplications() {
+    applicationFramePending = false;
+    let remaining = applicationsPerFrame;
+    for (const [tileId, pending] of pendingApplications) {
+      if (remaining-- <= 0) break;
+      pendingApplications.delete(tileId);
+      const { tile, texture, logArrival } = pending;
+      if (deferredTiles.has(tileId)) {
+        if (logArrival) log(tileId, 'cached + materialize (was deferred)');
+        meshRuntime.materialize(tileId, texture);
+      } else {
+        const mesh = findMesh(tileId);
+        if (mesh) {
+          if (logArrival) log(tileId, 'cached + applied to existing mesh');
+          applyTexture(mesh, tile, texture);
+        } else if (logArrival) {
+          log(tileId, 'cached but NO mesh in scene');
+        }
+      }
+      lifecycle.evictCoveredAncestors(tileId);
+    }
+    if (pendingApplications.size > 0) scheduleApplicationFrame();
+  }
+
+  function scheduleApplicationFrame() {
+    if (applicationFramePending) return;
+    applicationFramePending = true;
+    scheduleFrame(drainApplications);
+  }
+
+  function enqueueApplication(tile, texture, logArrival = false) {
+    pendingApplications.set(tile.id, { tile, texture, logArrival });
+    scheduleApplicationFrame();
   }
 
   return function updateTerrainTextures(tiles) {
@@ -27,7 +66,9 @@ export function createTerrainTextureController({
 
     for (const id of [...deferredTiles.keys()]) {
       const texture = textureStreamer.texCache.get(id);
-      if (texture) meshRuntime.materialize(id, texture);
+      if (!texture || pendingApplications.has(id)) continue;
+      const tile = deferredTiles.get(id);
+      if (tile) enqueueApplication(tile, texture);
     }
 
     for (const tile of tiles) {
@@ -35,6 +76,7 @@ export function createTerrainTextureController({
       const texture = textureStreamer.texCache.get(tile.id);
       if (!texture) continue;
       textureStreamer.requestWaterMask(tile.id);
+      if (deferredTiles.has(tile.id) || pendingApplications.has(tile.id)) continue;
       const mesh = meshById.get(tile.id);
       if (!mesh) continue;
       if (!isMaterialOverlayActive() && mesh.material.map !== texture) {
@@ -52,19 +94,7 @@ export function createTerrainTextureController({
         onMaterialApplied(mesh);
       },
       onTexture: ({ tileId, tile, texture }) => {
-        if (deferredTiles.has(tileId)) {
-          log(tileId, 'cached + materialize (was deferred)');
-          meshRuntime.materialize(tileId, texture);
-        } else {
-          const mesh = findMesh(tileId);
-          if (mesh) {
-            log(tileId, 'cached + applied to existing mesh');
-            applyTexture(mesh, tile, texture);
-          } else {
-            log(tileId, 'cached but NO mesh in scene');
-          }
-        }
-        lifecycle.evictCoveredAncestors(tileId);
+        enqueueApplication(tile, texture, true);
       },
     });
     lifecycle.sweepStaleParents(tiles, tileIds);

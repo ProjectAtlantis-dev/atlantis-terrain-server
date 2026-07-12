@@ -36,7 +36,10 @@ import { createTileHistory, terrainFogDistance, terrainVisibilityDistance } from
 import { createTextureStreamer } from './terrain-texture-streamer.js';
 import { createTerrainMeshRuntime } from './terrain-mesh-runtime.js';
 import { createTerrainTextureController } from './terrain-texture-controller.js';
-import { buildTerrainTilesRequest } from './terrain-tile-fetch.js';
+import { adoptTerrainOrigin, buildTerrainTilesRequest, offsetTerrainPayload, selectTerrainFrameOffset, summarizeTerrainResponse, terrainCameraStereoPosition, terrainPipelineStatus } from './terrain-tile-fetch.js';
+import { reconcileTerrainTiles } from './terrain-tile-reconciler.js';
+import { createTerrainFetchScheduler } from './terrain-fetch-scheduler.js';
+import { createTerrainEnhancementController } from './terrain-enhancement-controller.js';
 
 // The main view is controlled entirely through its UI. Discard stale query
 // parameters instead of exposing URL state that does not stay in sync.
@@ -553,17 +556,10 @@ enhanceDialogEl.addEventListener('click', (e) => {
   enhanceDialogEl.style.display = 'none';
   localStorage.setItem('enhance_positive_prompt', posTA.value);
   localStorage.setItem('enhance_negative_prompt', negTA.value);
-  _enhancePending.set(tid, { submitted: performance.now(), nextPollAt: performance.now() + 5000 });
-  fetch(`/api/texture/${tid}/enhance`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ positive_prompt: posTA.value, negative_prompt: negTA.value }),
-    })
-    .then(r => _handleEnhanceResponse(tid, r))
-    .catch(err => {
-      console.error(`[ENHANCE] ${tid} fetch failed:`, err);
-      _enhancePending.delete(tid);
-    });
+  enhancementController.submit(tid, {
+    positive_prompt: posTA.value,
+    negative_prompt: negTA.value,
+  });
 });
 
 function showEnhanceDialog(tileId) {
@@ -4284,21 +4280,8 @@ function updateTextures(tiles) {
 
 // --- Deferred enhancement (idle-time upgrade) ---
 
-const ENHANCE_MAX = 4;
-const ENHANCE_IDLE_MS = 2000;
-const ENHANCE_POLL_MS = 5000;
-const ENHANCE_STATUS_POLL_MS = 3000;
-const ENHANCE_BACKOFF_MS = 10000;
-const ENHANCE_POLL_BATCH = 1;
-const ENHANCE_SUBMIT_BATCH = 2;
-const _enhanceInflight = new Map();
-const _enhancePending = new Map();  // tid -> {submitted: ts, nextPollAt: ts} — server is working on it
-const _enhanceRetryAfter = new Map(); // tid -> ts
-const _enhanceFailed = new Set();
 let _lastCamMoveTime = performance.now();
 let _enhanceStatus = { total: 0, eligible: 0, done: 0, in_progress: 0 };
-let _lastStatusPoll = 0;
-let _enhanceBackoffUntil = 0;
 
 // Check if a tile is fully contained by a parent mesh that has an enhanced texture.
 function _coveredByEnhancedParent(tile) {
@@ -4322,115 +4305,37 @@ function _coveredByEnhancedParent(tile) {
   return false;
 }
 
+const enhancementController = createTerrainEnhancementController({
+  log: tileLog,
+  textureCache: texCache,
+  textureSource: texSource,
+  requestWaterMask,
+  hasTextureWork: () => texInflight.size > 0 || texFetching.size > 0,
+  getLastCameraMoveTime: () => _lastCamMoveTime,
+  hasTiles: () => Boolean(lastTiles),
+  onStatus: status => { _enhanceStatus = status; },
+  applyEnhancedTexture: (tileId, texture) => {
+    for (const child of terrainRoot.children) {
+      if (!child.isMesh || child.userData.tileId !== tileId) continue;
+      applyTerrainMaterialMode(child, texture);
+      child.userData.waterMask = waterMaskCache.get(tileId) || null;
+      break;
+    }
+  },
+});
+const _enhanceInflight = enhancementController.inflight;
+const _enhancePending = enhancementController.pending;
+
 function abortAllEnhancements() {
-  if (_enhanceInflight.size === 0) return;
-  for (const [tid, ac] of _enhanceInflight) {
-    tileLog(tid, 'enhance aborted — camera moved');
-    ac.abort();
-  }
-  _enhanceInflight.clear();
+  enhancementController.abortAll();
 }
 
 function _enhanceBusyCount() {
-  return _enhanceInflight.size + _enhancePending.size;
-}
-
-function _handleEnhanceResponse(tid, r, fromPending = false) {
-  _enhanceInflight.delete(tid);
-  const now = performance.now();
-  if (r.status === 202) {
-    const pending = _enhancePending.get(tid);
-    if (!pending) {
-      tileLog(tid, 'enhance queued on server');
-    }
-    _enhancePending.set(tid, { submitted: now, nextPollAt: now + ENHANCE_POLL_MS });
-    _enhanceRetryAfter.delete(tid);
-    return;
-  }
-  if (r.status === 429) {
-    _enhanceBackoffUntil = now + ENHANCE_BACKOFF_MS;
-    _enhanceRetryAfter.set(tid, _enhanceBackoffUntil);
-    if (fromPending || _enhancePending.has(tid)) {
-      const pending = _enhancePending.get(tid);
-      _enhancePending.set(tid, {
-        submitted: pending?.submitted ?? now,
-        nextPollAt: _enhanceBackoffUntil
-      });
-    }
-    tileLog(tid, 'enhance throttled (429)');
-    return;
-  }
-  _enhancePending.delete(tid);
-  _enhanceRetryAfter.delete(tid);
-  if (!r.ok || r.status === 204) {
-    const reason = r.headers.get('X-Tex-Status') || `status ${r.status}`;
-    console.warn(`[ENHANCE] ${tid} rejected: ${reason}`);
-    tileLog(tid, `enhance rejected: ${reason}`);
-    _enhanceFailed.add(tid);
-    _enhancePending.delete(tid);
-    return;
-  }
-  const newSrc = r.headers.get('X-Tex-Source') || 'sentinel2_enhanced';
-  return r.blob()
-    .then(blob => createImageBitmap(blob, { imageOrientation: 'flipY' }))
-    .then(bmp => {
-      const tex = new THREE.Texture(bmp);
-      tex.flipY = false;
-      tex.colorSpace = THREE.SRGBColorSpace;
-      tex.needsUpdate = true;
-      texCache.set(tid, tex);
-      texSource.set(tid, newSrc);
-      requestWaterMask(tid);
-      tileLog(tid, `enhanced: sentinel2 -> ${newSrc}`);
-      // Apply enhanced texture to existing mesh
-      for (const child of terrainRoot.children) {
-        if (!child.isMesh) continue;
-        if (child.userData.tileId === tid) {
-          applyTerrainMaterialMode(child, tex);
-          child.userData.waterMask = waterMaskCache.get(tid) || null;
-          break;
-        }
-      }
-      // Don't evict deeper children here — let the LOD system handle it
-      // naturally. Immediate eviction causes visible flashing.
-    });
+  return enhancementController.busyCount();
 }
 
 function updateEnhancement() {
-  const now = performance.now();
-  // Poll server-side enhance status periodically
-  if (now - _lastStatusPoll > ENHANCE_STATUS_POLL_MS) {
-    _lastStatusPoll = now;
-    fetch('/api/enhance/status').then(r => r.json()).then(s => { _enhanceStatus = s; }).catch(() => {});
-  }
-
-  if (texInflight.size > 0 || texFetching.size > 0) return;
-  if (now - _lastCamMoveTime < ENHANCE_IDLE_MS) return;
-  if (!lastTiles) return;
-  if (now < _enhanceBackoffUntil) return;
-
-  // Poll pending tiles that the server is working on
-  let pollBudget = Math.min(ENHANCE_POLL_BATCH, Math.max(0, ENHANCE_MAX - _enhanceInflight.size));
-  for (const [tid, info] of _enhancePending) {
-    if (pollBudget <= 0) break;
-    if (_enhanceInflight.has(tid)) continue;
-    const retryAt = _enhanceRetryAfter.get(tid) ?? 0;
-    if (now < retryAt) continue;
-    const nextPollAt = info.nextPollAt ?? (info.submitted + ENHANCE_POLL_MS);
-    if (now < nextPollAt) continue;
-    info.submitted = now;
-    info.nextPollAt = now + ENHANCE_POLL_MS;
-    const ac = new AbortController();
-    _enhanceInflight.set(tid, ac);
-    pollBudget--;
-    fetch(`/api/texture/${tid}/enhance`, { method: 'POST', signal: ac.signal })
-      .then(r => _handleEnhanceResponse(tid, r, true))
-      .catch(err => {
-        _enhanceInflight.delete(tid);
-        if (err.name !== 'AbortError') tileLog(tid, `enhance poll error: ${err.message}`);
-      });
-  }
-
+  enhancementController.update();
 }
 
 // --- Camera position → lat/lon conversion ---
@@ -4473,35 +4378,7 @@ function getCameraLogSnapshot(camLL = null) {
   };
 }
 
-function applyTileFrameOffsetToPayload(data) {
-  if (!tileFrameOffsetReady || !data) return;
-  if (Array.isArray(data.tiles)) {
-    for (const tile of data.tiles) {
-      if (!Array.isArray(tile?.bbox) || tile.bbox.length !== 4) continue;
-      tile.bbox = [
-        tile.bbox[0] + tileFrameOffsetX,
-        tile.bbox[1] + tileFrameOffsetY,
-        tile.bbox[2] + tileFrameOffsetX,
-        tile.bbox[3] + tileFrameOffsetY,
-      ];
-    }
-  }
-  if (Array.isArray(data.missing)) {
-    for (const miss of data.missing) {
-      if (!Array.isArray(miss?.bbox) || miss.bbox.length !== 4) continue;
-      miss.bbox = [
-        miss.bbox[0] + tileFrameOffsetX,
-        miss.bbox[1] + tileFrameOffsetY,
-        miss.bbox[2] + tileFrameOffsetX,
-        miss.bbox[3] + tileFrameOffsetY,
-      ];
-    }
-  }
-}
-
 // --- Tile fetching ---
-
-let pollTimer = null;
 
 const PREVIEW_MAX_DEPTH = 10;
 const clock = new THREE.Clock();
@@ -4521,16 +4398,8 @@ function updateFpsCounter(nowMs) {
   fpsSampleStartMs = nowMs;
 }
 
-async function fetchTiles(lat, lon) {
-  if (fetching) {
-    enqueueClientLog('debug', 'fetchTiles.skip', {
-      reason: 'already fetching',
-      ...getCameraLogSnapshot(),
-    });
-    return;
-  }
-  fetching = true;
-  try {
+async function performTileFetch({ lat, lon, pass }) {
+    _loadPass = pass;
     const t0 = performance.now();
     const heading = priorityHeading(vehicleControlActive, vehicleHeadingRad, controls.yaw);
     const camLL = getCameraLatLon();
@@ -4548,11 +4417,18 @@ async function fetchTiles(lat, lon) {
     const url = request.url;
     const resp = await fetch(url);
     const data = await resp.json();
-    if (isFirstLoad && !tileFrameOffsetReady) {
-      const rel = camera.position.clone().sub(anchorPosition);
-      tileFrameOffsetX = rel.dot(east);
-      tileFrameOffsetY = rel.dot(north);
-      tileFrameOffsetReady = true;
+    const camRel = camera.position.clone().sub(anchorPosition);
+    const camLocalX = camRel.dot(east);
+    const camLocalY = camRel.dot(north);
+    const frameOffset = selectTerrainFrameOffset({
+      isFirstLoad, frameOffsetReady: tileFrameOffsetReady,
+      cameraEast: camLocalX, cameraNorth: camLocalY,
+      offsetX: tileFrameOffsetX, offsetY: tileFrameOffsetY,
+    });
+    tileFrameOffsetX = frameOffset.offsetX;
+    tileFrameOffsetY = frameOffset.offsetY;
+    tileFrameOffsetReady = frameOffset.ready;
+    if (frameOffset.changed) {
       enqueueClientLog('info', 'fetchTiles.frame.offset.set', {
         pass: _loadPass,
         passLabel: _loadPass === 1 ? 'preview' : 'full',
@@ -4562,51 +4438,12 @@ async function fetchTiles(lat, lon) {
         camNorthM: camSnapshot.camNorthM,
       });
     }
-    applyTileFrameOffsetToPayload(data);
-    const withHm = data.tiles.filter(t => t.heightmap).length;
-    const noHm = data.tiles.length - withHm;
-    const camRel = camera.position.clone().sub(anchorPosition);
-    const camLocalX = camRel.dot(east);
-    const camLocalY = camRel.dot(north);
-    let closestTileId = null;
-    let closestTileDist = Infinity;
-    let closestTileCx = null;
-    let closestTileCy = null;
-    for (const tile of data.tiles) {
-      if (!Array.isArray(tile?.bbox) || tile.bbox.length !== 4) continue;
-      const cx = (tile.bbox[0] + tile.bbox[2]) * 0.5;
-      const cy = (tile.bbox[1] + tile.bbox[3]) * 0.5;
-      const dx = cx - camLocalX;
-      const dy = cy - camLocalY;
-      const dist = Math.hypot(dx, dy);
-      if (dist < closestTileDist) {
-        closestTileDist = dist;
-        closestTileId = tile.id ?? null;
-        closestTileCx = cx;
-        closestTileCy = cy;
-      }
-    }
-    enqueueClientLog('info', `fetchTiles.response[pass${_loadPass}]`, {
-      pass: _loadPass,
-      passLabel: _loadPass === 1 ? 'preview' : 'full',
-      status: resp.status,
-      tiles: data.tiles.length,
-      withHm,
-      noHm,
-      missing: data.missing?.length ?? 0,
-      downloading: data.downloading?.length ?? 0,
-      qx: Number.isFinite(data.qx) ? Number(data.qx.toFixed(1)) : null,
-      qy: Number.isFinite(data.qy) ? Number(data.qy.toFixed(1)) : null,
-      ox: Number.isFinite(data.ox) ? Number(data.ox.toFixed(1)) : null,
-      oy: Number.isFinite(data.oy) ? Number(data.oy.toFixed(1)) : null,
-      closestTileId,
-      closestTileDistM: Number.isFinite(closestTileDist) ? Number(closestTileDist.toFixed(1)) : null,
-      closestTileCx: Number.isFinite(closestTileCx) ? Number(closestTileCx.toFixed(1)) : null,
-      closestTileCy: Number.isFinite(closestTileCy) ? Number(closestTileCy.toFixed(1)) : null,
-      tileFrameOffsetX: Number(tileFrameOffsetX.toFixed(1)),
-      tileFrameOffsetY: Number(tileFrameOffsetY.toFixed(1)),
-      tileFrameOffsetReady,
-    });
+    offsetTerrainPayload(data, tileFrameOffsetX, tileFrameOffsetY);
+    enqueueClientLog('info', `fetchTiles.response[pass${_loadPass}]`, summarizeTerrainResponse({
+      data, status: resp.status, pass: _loadPass, cameraX: camLocalX, cameraY: camLocalY,
+      frameOffsetX: tileFrameOffsetX, frameOffsetY: tileFrameOffsetY,
+      frameOffsetReady: tileFrameOffsetReady,
+    }));
     if (!bootFetchLogged) {
       bootFetchLogged = true;
       bootLog('tiles.initial-fetch.response', {
@@ -4617,140 +4454,39 @@ async function fetchTiles(lat, lon) {
 
     const wasFirstLoad = isFirstLoad;
     if (isFirstLoad) {
-      originX = data.ox;
-      originY = data.oy;
-      camStereoX = data.qx;
-      camStereoY = data.qy;
-      lastFetchX = data.qx;
-      lastFetchY = data.qy;
+      const origin = adoptTerrainOrigin({ data, pass: _loadPass, cameraSnapshot: camSnapshot });
+      originX = origin.originX;
+      originY = origin.originY;
+      camStereoX = lastFetchX = origin.cameraX;
+      camStereoY = lastFetchY = origin.cameraY;
       isFirstLoad = false;
-      enqueueClientLog('info', 'fetchTiles.origin.set', {
-        pass: _loadPass,
-        passLabel: _loadPass === 1 ? 'preview' : 'full',
-        qx: Number.isFinite(data.qx) ? Number(data.qx.toFixed(1)) : null,
-        qy: Number.isFinite(data.qy) ? Number(data.qy.toFixed(1)) : null,
-        ox: Number.isFinite(data.ox) ? Number(data.ox.toFixed(1)) : null,
-        oy: Number.isFinite(data.oy) ? Number(data.oy.toFixed(1)) : null,
-        requestCamStereoApproxX: camSnapshot.camStereoApproxX,
-        requestCamStereoApproxY: camSnapshot.camStereoApproxY,
-        originDeltaX: Number.isFinite(data.ox) && Number.isFinite(camSnapshot.camStereoApproxX)
-          ? Number((data.ox - camSnapshot.camStereoApproxX).toFixed(1))
-          : null,
-        originDeltaY: Number.isFinite(data.oy) && Number.isFinite(camSnapshot.camStereoApproxY)
-          ? Number((data.oy - camSnapshot.camStereoApproxY).toFixed(1))
-          : null,
-      });
+      enqueueClientLog('info', 'fetchTiles.origin.set', origin.logDetails);
     }
 
-    const newIds = new Set(data.tiles.map(t => t.id));
-    const added = [...newIds].filter(id => !currentTileIds.has(id));
-    const removed = [...currentTileIds].filter(id => !newIds.has(id));
+    const reconciliation = reconcileTerrainTiles({
+      tiles: data.tiles,
+      currentTileIds,
+      deferredTiles,
+      terrainRoot,
+      lifecycle: tileLifecycle,
+      priorityForTile: tilePriority,
+      isCoveredByEnhancedParent: _coveredByEnhancedParent,
+      textureCache: texCache,
+      materialize: materializeTile,
+      buildMesh,
+      log: tileLog,
+      onDiff: details => enqueueClientLog('info', `fetchTiles.diff[pass${_loadPass}]`, {
+        pass: _loadPass, passLabel: _loadPass === 1 ? 'preview' : 'full', ...details,
+      }),
+    });
+    const { nextTileIds: newIds, staleRemoved } = reconciliation;
     currentTileIds = newIds;
-
-    // Purge stale deferred tiles
-    let purged = 0;
-    for (const id of deferredTiles.keys()) {
-      if (!newIds.has(id)) { deferredTiles.delete(id); purged++; }
-    }
-
-    // Index current meshes by tile ID for overlap/coverage checks below.
-    const meshMap = new Map();
-    for (const child of terrainRoot.children) {
-      if (child.userData.tileId) meshMap.set(child.userData.tileId, child);
-    }
-
-    const staleRemoved = tileLifecycle.sweepStaleParents(data.tiles, newIds);
-    for (const child of terrainRoot.children) {
-      if (!child.isMesh) continue;
-      const tid = child.userData.tileId;
-      if (!tid) continue;
-      if (newIds.has(tid) && child.material?.map && !child.material.polygonOffset) {
-        const depth = parseInt(tid.split('-')[0]);
-        child.material.polygonOffset = true;
-        child.material.polygonOffsetFactor = -depth;
-        child.material.polygonOffsetUnits = -depth;
-        child.material.needsUpdate = true;
-      }
-    }
-    enqueueClientLog('info', `fetchTiles.diff[pass${_loadPass}]`, { pass: _loadPass, passLabel: _loadPass === 1 ? 'preview' : 'full', added: added.length, removed: removed.length, purgedDeferred: purged, sceneMeshes: terrainRoot.children.filter(c => c.isMesh).length });
-
-    if (added.length > 0) {
-      const existingIds = new Set();
-      for (const c of terrainRoot.children) {
-        if (c.userData.tileId) existingIds.add(c.userData.tileId);
-      }
-      const addedSet = new Set(added);
-      let built = 0, deferred = 0;
-      const MESH_BUILD_BUDGET = 200; // max meshes to build per fetch
-      // The build budget is visible demand: spend it in the same heatmap order
-      // as texture streaming, never in arbitrary API response order.
-      const buildCandidates = data.tiles
-        .filter(tile => addedSet.has(tile.id) && tile.heightmap)
-        .map(tile => ({ tile, prio: tilePriority(tile) }))
-        .sort((a, b) => a.prio - b.prio);
-      for (const { tile } of buildCandidates) {
-        if (existingIds.has(tile.id)) continue;
-        // Skip children whose parent is already enhanced — the parent covers this area
-        if (_coveredByEnhancedParent(tile)) {
-          tileLog(tile.id, 'skipped — covered by enhanced parent');
-          continue;
-        }
-        const cachedTex = texCache.get(tile.id);
-        if (cachedTex) {
-          if (built < MESH_BUILD_BUDGET) {
-            tileLog(tile.id, 'added — immediate build (cached tex)');
-            deferredTiles.set(tile.id, tile);
-            materializeTile(tile.id, cachedTex);
-            built++;
-          } else {
-            // Over budget — defer to next frame cycle
-            tileLog(tile.id, `added — deferred (build budget exceeded, built=${built}/${MESH_BUILD_BUDGET})`);
-            deferredTiles.set(tile.id, tile);
-            deferred++;
-          }
-        } else {
-          // No texture yet — defer until texture arrives.
-          deferredTiles.set(tile.id, tile);
-          // If a stale textured mesh covers this area, skip the untextured
-          // fallback — the stale texture looks better than a blank mesh.
-          // materializeTile() will swap in the real textured mesh when ready.
-          const tb = tile.bbox;
-          let hasCoverage = false;
-          for (const child of terrainRoot.children) {
-            if (!child.isMesh || !child.material || !child.material.map) continue;
-            const sb = child.userData.bbox;
-            if (!sb) continue;
-            if (sb[0] < tb[2] && sb[2] > tb[0] && sb[1] < tb[3] && sb[3] > tb[1]) {
-              hasCoverage = true;
-              break;
-            }
-          }
-          if (hasCoverage) {
-            // Textured parent covers this area — defer until our texture
-            // arrives so we don't z-fight with the parent.
-            tileLog(tile.id, 'added — deferred (stale coverage exists)');
-            deferred++;
-          } else if (built < MESH_BUILD_BUDGET) {
-            tileLog(tile.id, 'added — untextured fallback (no stale coverage)');
-            const mesh = buildMesh(tile);
-            if (mesh) {
-              const depth = parseInt(tile.id.split('-')[0]);
-              mesh.material.polygonOffset = true;
-              mesh.material.polygonOffsetFactor = -depth;
-              mesh.material.polygonOffsetUnits = -depth;
-              terrainRoot.add(mesh);
-            }
-            built++;
-          } else {
-            deferredTiles.set(tile.id, tile);
-            deferred++;
-          }
-        }
-      }
-    }
-
-    const meshesAfter = terrainRoot.children.filter(c => c.isMesh).length;
-    enqueueClientLog('info', `fetchTiles.built[pass${_loadPass}]`, { pass: _loadPass, passLabel: _loadPass === 1 ? 'preview' : 'full', meshesInScene: meshesAfter, deferred: deferredTiles.size, staleRemoved });
+    enqueueClientLog('info', `fetchTiles.built[pass${_loadPass}]`, {
+      pass: _loadPass, passLabel: _loadPass === 1 ? 'preview' : 'full',
+      meshesInScene: reconciliation.sceneMeshes,
+      deferred: reconciliation.deferred,
+      staleRemoved,
+    });
 
     updateTextures(data.tiles);
     markMissing(data.missing || [], data.downloading || []);
@@ -4758,52 +4494,59 @@ async function fetchTiles(lat, lon) {
 
     // Update stereo position from camera
     const camLLNow = getCameraLatLon();
-    camStereoX = originX + (camLLNow.lon - anchorLon) * 111320 * Math.cos(anchorLat * Math.PI / 180);
-    camStereoY = originY + (camLLNow.lat - anchorLat) * 111320;
+    const stereo = terrainCameraStereoPosition({
+      latitude: camLLNow.lat, longitude: camLLNow.lon,
+      anchorLatitude: anchorLat, anchorLongitude: anchorLon, originX, originY,
+    });
+    camStereoX = stereo.x;
+    camStereoY = stereo.y;
     lastFetchX = camStereoX;
     lastFetchY = camStereoY;
 
-    const nm = _hmMissing = (data.missing || []).length;
-    const nd = _hmDownloading = (data.downloading || []).length;
-    const texInFlight = (data.texFetching || 0);
-    _srvTexFetching = data.texFetching || 0;
-    _srvTexRetry = data.texRetryQueue || 0;
-    _srvTexStatus = data.texStatusCounts || {};
+    const pipeline = terrainPipelineStatus(data, wasFirstLoad);
+    _hmMissing = pipeline.missing;
+    _hmDownloading = pipeline.downloading;
+    _srvTexFetching = pipeline.textureFetching;
+    _srvTexRetry = pipeline.textureRetryQueue;
+    _srvTexStatus = pipeline.textureStatusCounts;
 
-    if (pollTimer) clearTimeout(pollTimer);
-    if (wasFirstLoad) {
-      // Preview pass done — immediately fetch full-depth tiles.
-      // The normal eviction/replacement logic will upgrade the low-LOD
-      // preview tiles as higher-detail children arrive with textures.
-      bootLog('tiles.pass1-preview-done', {
-        pass: 1,
-        previewTiles: data.tiles.length,
-        maxDepth: PREVIEW_MAX_DEPTH,
+    return {
+      nextAction: pipeline.nextAction,
+      previewDetails: {
+        pass: 1, previewTiles: data.tiles.length, maxDepth: PREVIEW_MAX_DEPTH,
         meshesInScene: terrainRoot.children.filter(c => c.isMesh).length,
         deferred: deferredTiles.size,
-        elapsedMs: Number((performance.now() - t0).toFixed(1))
-      });
-      fetching = false;
-      _loadPass = 2;
-      requestAnimationFrame(() => fetchTiles());
-      return;
-    } else if (nd > 0 || nm > 0 || texInFlight > 0) {
-      pollTimer = setTimeout(() => fetchTiles(), 3000);
-    }
+        elapsedMs: Number((performance.now() - t0).toFixed(1)),
+      },
+    };
+}
 
-  } catch (err) {
+const tileFetchScheduler = createTerrainFetchScheduler({
+  execute: performTileFetch,
+  onSkip: () => enqueueClientLog('debug', 'fetchTiles.skip', {
+    reason: 'already fetching', ...getCameraLogSnapshot(),
+  }),
+  onState: state => { fetching = state.fetching; _loadPass = state.pass; },
+  onPreviewComplete: result => {
+    bootLog('tiles.pass1-preview-done', result.previewDetails);
+  },
+  onError: err => {
     if (!bootFetchLogged) {
       bootLog('tiles.initial-fetch.error', {
-        message: err?.message ?? String(err),
-        stack: err?.stack ?? null
+        message: err?.message ?? String(err), stack: err?.stack ?? null,
       });
       bootFetchLogged = true;
     }
     console.error('Fetch error:', err);
-  }
-  fetching = false;
-  // Drain accumulated dt so the next render frame doesn't lurch the camera
-  clock.getDelta();
+  },
+  onSettled: () => {
+    // Drain accumulated dt so the next render frame doesn't lurch the camera.
+    clock.getDelta();
+  },
+});
+
+function fetchTiles(lat, lon) {
+  return tileFetchScheduler.request(lat, lon);
 }
 
 // --- Save/restore camera position ---
@@ -5429,7 +5172,7 @@ function resetView() {
   updateHud();
   // Re-fetch tiles around the reset camera position.
   isFirstLoad = true;
-  _loadPass = 1;
+  tileFetchScheduler.reset(1);
   originX = 0; originY = 0;
   camStereoX = 0; camStereoY = 0;
   lastFetchX = 0; lastFetchY = 0;

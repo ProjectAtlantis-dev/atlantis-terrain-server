@@ -13,6 +13,10 @@ Phases (scoped by --tiles / --bbox when given):
 2. PROPAGATE: push corrected tiles up their ancestor chains
    (propagate_to_ancestors also heals stale confidence-7 parent samples
    left behind by earlier algorithm versions).
+3. SEAM SYNC: adjacent mosaics see one ring of different context, so rare
+   single-sample verdict disagreements survive on seams. Where the two
+   sides of a shared edge differ by more than CLIFF_TOL, both take the max
+   (restore, never carve) so the mesh has no cracks.
 
 Usage:
     venv/bin/python fix_fjord_bathymetry.py [--refetch]
@@ -31,12 +35,13 @@ import numpy as np
 
 from bathymetry import (
     BATHY_ALGO_VERSION,
+    CLIFF_TOL_M,
     MIN_FIX_DEPTH,
     _ensure_originals_table,
     fix_tile_in_db,
     propagate_to_ancestors,
 )
-from database import CONFIDENCE, GRID_N, write_tile, _decompress_uint8
+from database import CONFIDENCE, GRID_N, write_tile, _decompress_float32, _decompress_uint8
 
 TEX_REAL_SOURCES = ("dataforsyningen", "dataforsyningen_enhanced", "upscaled")
 MAX_PASSES = 8
@@ -189,6 +194,50 @@ def main() -> None:
         total += propagate_to_ancestors(db, tid)
         _progress(i, len(order), t0, "propagate")
     print(f"Phase 2 done: {total} ancestor updates", flush=True)
+
+    print("Phase 3: seam sync", flush=True)
+    synced = 0
+    for tid in sorted(candidates):
+        d, c, r = (int(p) for p in tid.split("-"))
+        row = db.execute(
+            "SELECT heightmap, confidence_map, source FROM tiles WHERE tile_id = ?",
+            (tid,)).fetchone()
+        if not row or row[0] is None:
+            continue
+        hm = _decompress_float32(row[0], (GRID_N, GRID_N))
+        cm = _decompress_uint8(row[1], (GRID_N, GRID_N))
+        touched = False
+        # scan E and N seams only — each shared edge visited once
+        for nid, ours, theirs, axis in (
+            (f"{d}-{c + 1}-{r}", GRID_N - 1, 0, 'col'),
+            (f"{d}-{c}-{r + 1}", GRID_N - 1, 0, 'row'),
+        ):
+            nrow = db.execute(
+                "SELECT heightmap, confidence_map, source FROM tiles WHERE tile_id = ?",
+                (nid,)).fetchone()
+            if not nrow or nrow[0] is None:
+                continue
+            nhm = _decompress_float32(nrow[0], (GRID_N, GRID_N))
+            ncm = _decompress_uint8(nrow[1], (GRID_N, GRID_N))
+            a = hm[:, ours] if axis == 'col' else hm[ours, :]
+            b = nhm[:, theirs] if axis == 'col' else nhm[theirs, :]
+            bad = np.abs(a - b) > CLIFF_TOL_M
+            if not bad.any():
+                continue
+            hi = np.maximum(a, b)
+            ca = cm[:, ours] if axis == 'col' else cm[ours, :]
+            nc = ncm[:, theirs] if axis == 'col' else ncm[theirs, :]
+            hic = np.where(a >= b, ca, nc)  # confidence follows the winner
+            a[bad], b[bad] = hi[bad], hi[bad]
+            ca[bad], nc[bad] = hic[bad], hic[bad]
+            write_tile(db, nid, nhm, ncm, nrow[2], reconcile=False, allow_overwrite=True)
+            propagate_to_ancestors(db, nid)
+            touched = True
+            synced += int(bad.sum())
+        if touched:
+            write_tile(db, tid, hm, cm, row[2], reconcile=False, allow_overwrite=True)
+            propagate_to_ancestors(db, tid)
+    print(f"Phase 3 done: {synced} seam samples synced", flush=True)
 
 
 if __name__ == "__main__":
