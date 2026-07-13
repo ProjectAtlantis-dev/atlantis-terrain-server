@@ -119,11 +119,17 @@ const referenceDate = new Date('2025-07-01T12:00:00Z');
 const GAME_TIME_SCALE = 1;
 const SUN_DIRECTION_SYNC_INTERVAL_MS = 60 * 1000;
 const GAME_CLOCK_STORAGE_KEY = 'game-clock-ms';
-const _savedGameClockMs = Number(localStorage.getItem(GAME_CLOCK_STORAGE_KEY));
-let gameClockStartMs = _savedGameClockMs || referenceDate.getTime();
-let browserTimeStartMs = Date.now();
-const currentDate = new Date(gameClockStartMs);
-let _lastGameClockSave = 0;
+const savedGameClockMs = Number(localStorage.getItem(GAME_CLOCK_STORAGE_KEY));
+const gameClockState = {
+  anchorGameTimeMs: savedGameClockMs || referenceDate.getTime(),
+  anchorBrowserTimeMs: Date.now(),
+  lastSavedAtMs: 0,
+  running: true,
+  renderedDate: null,
+  lastSunSyncTimeMs: NaN,
+};
+const currentDate = new Date(gameClockState.anchorGameTimeMs);
+gameClockState.renderedDate = new Date(currentDate);
 
 const DEFAULT_LOCATION = {
   // Nuuk, Greenland
@@ -172,7 +178,7 @@ Ellipsoid.WGS84.getEastNorthUpVectors(anchorPosition, east, north, up);
 
 // --- View distance constants ---
 const MAX_VIEW_DIST = 50000;       // 50km — camera far, fog, map extents
-let _terrainRange = 20000;         // terrain tile fetch range (meters), slider-controlled
+let terrainRange = 20000;         // terrain tile fetch range (meters), slider-controlled
 const MAP_CAM_ALT = MAX_VIEW_DIST; // map camera altitude above target
 
 const camera = new THREE.PerspectiveCamera(
@@ -267,45 +273,45 @@ renderer.domElement.addEventListener('contextmenu', event => event.preventDefaul
 const { hud, alt, gameClock: gameClockEl } = createTerrainHud({
   onToggleMapMode: () => toggleMapMode(),
   onClockAction: action => {
-    if (action === 'rw') _gcRewind();
-    else if (action === 'stop') _gcStop();
-    else if (action === 'play') _gcPlay();
-    else if (action === 'ff') _gcFfwd();
+    if (action === 'rw') rewindGameClock();
+    else if (action === 'stop') stopGameClock();
+    else if (action === 'play') playGameClock();
+    else if (action === 'ff') fastForwardGameClock();
     requestRender();
   },
 });
 const HUD_LINKS = TERRAIN_HUD_LINKS;
 
 // Transport control handlers for game clock HUD
-function _gcRewind() {
-  if (useRealtimeGameClock) {
+function rewindGameClock() {
+  if (gameClockState.running) {
     currentDate.setTime(getGameDateFromBrowserTime().getTime());
   }
-  useRealtimeGameClock = false;
+  gameClockState.running = false;
   currentDate.setTime(currentDate.getTime() - 15 * 60 * 1000);
   applyDate(currentDate);
   maybeLogWebGPUSun(currentDate, 'clock-rewind', true);
 }
-function _gcStop() {
-  if (useRealtimeGameClock) {
+function stopGameClock() {
+  if (gameClockState.running) {
     currentDate.setTime(getGameDateFromBrowserTime().getTime());
   }
-  useRealtimeGameClock = false;
+  gameClockState.running = false;
   maybeLogWebGPUSun(currentDate, 'clock-stop', true);
 }
-function _gcPlay() {
-  if (!useRealtimeGameClock) {
-    gameClockStartMs = currentDate.getTime();
-    browserTimeStartMs = Date.now();
-    useRealtimeGameClock = true;
+function playGameClock() {
+  if (!gameClockState.running) {
+    gameClockState.anchorGameTimeMs = currentDate.getTime();
+    gameClockState.anchorBrowserTimeMs = Date.now();
+    gameClockState.running = true;
   }
   maybeLogWebGPUSun(currentDate, 'clock-play', true);
 }
-function _gcFfwd() {
-  if (useRealtimeGameClock) {
+function fastForwardGameClock() {
+  if (gameClockState.running) {
     currentDate.setTime(getGameDateFromBrowserTime().getTime());
   }
-  useRealtimeGameClock = false;
+  gameClockState.running = false;
   currentDate.setTime(currentDate.getTime() + 15 * 60 * 1000);
   applyDate(currentDate);
   maybeLogWebGPUSun(currentDate, 'clock-forward', true);
@@ -370,58 +376,56 @@ const tuningBody = document.createElement('div');
 tuningBody.style.cssText = 'padding:0 12px 10px;display:none';
 tuningPanel.appendChild(tuningBody);
 
-let tuningOpen = false;
+let tuningPanelOpen = false;
 tuningHeader.onclick = () => {
-  tuningOpen = !tuningOpen;
-  tuningBody.style.display = tuningOpen ? 'block' : 'none';
-  document.getElementById('tuning-toggle').innerHTML = tuningOpen ? '&#9650;' : '&#9660;';
+  tuningPanelOpen = !tuningPanelOpen;
+  tuningBody.style.display = tuningPanelOpen ? 'block' : 'none';
+  document.getElementById('tuning-toggle').innerHTML = tuningPanelOpen ? '&#9650;' : '&#9660;';
   requestRender();
 };
 
 // --- Tuning panel persistence ---
 const TUNING_STORAGE_KEY = 'clouds-tuning';
-const _tuningState = JSON.parse(localStorage.getItem(TUNING_STORAGE_KEY) || '{}');
+const tuningState = JSON.parse(localStorage.getItem(TUNING_STORAGE_KEY) || '{}');
 const WEBGPU_CALIBRATION_VERSION = 3;
-if (_tuningState.webgpuCalibrationVersion !== WEBGPU_CALIBRATION_VERSION) {
-  if (_tuningState['webgpu exposure'] == null || _tuningState['webgpu exposure'] === 1.5) {
-    _tuningState['webgpu exposure'] = WEBGPU_TONE_MAPPING_EXPOSURE;
+if (tuningState.webgpuCalibrationVersion !== WEBGPU_CALIBRATION_VERSION) {
+  if (tuningState['webgpu exposure'] == null || tuningState['webgpu exposure'] === 1.5) {
+    tuningState['webgpu exposure'] = WEBGPU_TONE_MAPPING_EXPOSURE;
   }
-  if (_tuningState['webgpu luminance'] == null || _tuningState['webgpu luminance'] === 3.8) {
-    _tuningState['webgpu luminance'] = WEBGPU_ATMOSPHERE_LUMINANCE_SCALE;
+  if (tuningState['webgpu luminance'] == null || tuningState['webgpu luminance'] === 3.8) {
+    tuningState['webgpu luminance'] = WEBGPU_ATMOSPHERE_LUMINANCE_SCALE;
   }
-  if (_tuningState.brightness == null || _tuningState.brightness === 2.2) {
-    _tuningState.brightness = WEBGPU_TONE_MAPPING_EXPOSURE;
+  if (tuningState.brightness == null || tuningState.brightness === 2.2) {
+    tuningState.brightness = WEBGPU_TONE_MAPPING_EXPOSURE;
   }
-  if (_tuningState.haze == null || _tuningState.haze === 4.5) {
-    _tuningState.haze = WEBGPU_DEFAULT_HAZE;
+  if (tuningState.haze == null || tuningState.haze === 4.5) {
+    tuningState.haze = WEBGPU_DEFAULT_HAZE;
   }
-  _tuningState.webgpuCalibrationVersion = WEBGPU_CALIBRATION_VERSION;
-  localStorage.setItem(TUNING_STORAGE_KEY, JSON.stringify(_tuningState));
+  tuningState.webgpuCalibrationVersion = WEBGPU_CALIBRATION_VERSION;
 }
-if (_tuningState.brightness == null && _tuningState['webgpu exposure'] != null) {
-  _tuningState.brightness = _tuningState['webgpu exposure'];
+if (tuningState.brightness == null && tuningState['webgpu exposure'] != null) {
+  tuningState.brightness = tuningState['webgpu exposure'];
 }
-if (_tuningState.haze == null && _tuningState['fog strength'] != null) {
-  _tuningState.haze = _tuningState['fog strength'];
+if (tuningState.haze == null && tuningState['fog strength'] != null) {
+  tuningState.haze = tuningState['fog strength'];
 }
-localStorage.setItem(TUNING_STORAGE_KEY, JSON.stringify(_tuningState));
+localStorage.setItem(TUNING_STORAGE_KEY, JSON.stringify(tuningState));
 function saveTuning() {
-  localStorage.setItem(TUNING_STORAGE_KEY, JSON.stringify(_tuningState));
+  localStorage.setItem(TUNING_STORAGE_KEY, JSON.stringify(tuningState));
 }
-const hasSavedMonth = Object.prototype.hasOwnProperty.call(_tuningState, 'month');
-const hasSavedHour = Object.prototype.hasOwnProperty.call(_tuningState, 'hour (UTC)');
-let useRealtimeGameClock = !(hasSavedMonth || hasSavedHour);
+const hasSavedMonth = Object.prototype.hasOwnProperty.call(tuningState, 'month');
+const hasSavedHour = Object.prototype.hasOwnProperty.call(tuningState, 'hour (UTC)');
+gameClockState.running = !(hasSavedMonth || hasSavedHour);
 
 // Deferred binding: renderer-specific callbacks are wired after effects exist.
 const {
   reset: resetTuningUI,
   section: tuningSectionLabel,
-  setSliderValue: tuningSliderSetValue,
   slider: tuningSlider,
   toggle: tuningToggle,
 } = createTerrainTuningControls({
   body: tuningBody,
-  state: _tuningState,
+  state: tuningState,
   save: saveTuning,
 });
 
@@ -434,7 +438,7 @@ function buildTuningControls(ap, ce) {
     decimals: 0,
     format: v => monthNames[v - 1],
     onChange: v => {
-      useRealtimeGameClock = false;
+      gameClockState.running = false;
       currentDate.setUTCMonth(v - 1);
       applyDate(currentDate);
     }
@@ -471,11 +475,11 @@ function buildTuningControls(ap, ce) {
   }
   tuningSectionLabel('Terrain');
   tuningSlider('terrain range', {
-    min: 10000, max: 50000, step: 1000, value: _terrainRange,
+    min: 10000, max: 50000, step: 1000, value: terrainRange,
     decimals: 0,
     format: v => `${(v/1000).toFixed(0)}km`,
     onChange: v => {
-      _terrainRange = v;
+      terrainRange = v;
       if (terrainPipelineState.ready) fetchTiles();
     }
   });
@@ -500,7 +504,7 @@ function buildTuningControls(ap, ce) {
       decimals: 1,
       onChange: applyWebGPUHaze
     });
-    applyWebGPUHaze(Number(_tuningState.haze ?? WEBGPU_DEFAULT_HAZE));
+    applyWebGPUHaze(Number(tuningState.haze ?? WEBGPU_DEFAULT_HAZE));
   } else {
   tuningSlider('fog strength', {
     min: 1, max: 10, step: 0.5, value: 4.5,
@@ -819,20 +823,18 @@ aerialPerspective.shadowSampleCount = 12;
 
 // Wire up tuning panel now that effects exist
 const sunDirection = new THREE.Vector3();
-let lastRenderedDate = new Date(currentDate);
-let lastSunDirectionSyncDateMs = NaN;
 
 function applyDate(date, { force = true } = {}) {
   const dateMs = date.getTime();
   if (
     !force &&
-    Number.isFinite(lastSunDirectionSyncDateMs) &&
-    Math.abs(dateMs - lastSunDirectionSyncDateMs) < SUN_DIRECTION_SYNC_INTERVAL_MS
+    Number.isFinite(gameClockState.lastSunSyncTimeMs) &&
+    Math.abs(dateMs - gameClockState.lastSunSyncTimeMs) < SUN_DIRECTION_SYNC_INTERVAL_MS
   ) {
     return false;
   }
-  lastSunDirectionSyncDateMs = dateMs;
-  lastRenderedDate = new Date(date);
+  gameClockState.lastSunSyncTimeMs = dateMs;
+  gameClockState.renderedDate = new Date(date);
   getSunDirectionECEF(date, sunDirection);
   aerialPerspective.sunDirection.copy(sunDirection);
   cloudsEffect.sunDirection.copy(sunDirection);
@@ -840,13 +842,13 @@ function applyDate(date, { force = true } = {}) {
   return true;
 }
 function getGameDateFromBrowserTime(nowMs = Date.now()) {
-  const elapsedMs = nowMs - browserTimeStartMs;
-  return new Date(gameClockStartMs + elapsedMs * GAME_TIME_SCALE);
+  const elapsedMs = nowMs - gameClockState.anchorBrowserTimeMs;
+  return new Date(gameClockState.anchorGameTimeMs + elapsedMs * GAME_TIME_SCALE);
 }
 buildTuningControls(aerialPerspective, cloudsEffect);
 // Only apply the default referenceDate if no saved tuning overrides month/hour.
 // buildTuningControls already calls applyDate() when restoring saved values.
-if (useRealtimeGameClock) {
+if (gameClockState.running) {
   applyDate(getGameDateFromBrowserTime());
 }
 
@@ -864,8 +866,7 @@ createTerrainAtmosphereTextureRuntime({
 }).loadWithLocalCache();
 
 function applyWebGPUAtmosphereLiveSettings() { webgpuAtmosphere?.applyLiveSettings(); }
-function applyWebGPUCloudShadowLiveSettings() { webgpuAtmosphere?.applyCloudShadowSettings(); }
-function rebuildWebGPUAtmosphere() { webgpuAtmosphere?.rebuild(lastRenderedDate); }
+function rebuildWebGPUAtmosphere() { webgpuAtmosphere?.rebuild(gameClockState.renderedDate); }
 if (renderBackend.isWebGPU) {
   renderBackend.setComposer(null);
   rebuildWebGPUAtmosphere();
@@ -1194,7 +1195,7 @@ renderBackend.configureDemandRendering({
 function runStreamingMaintenance() {
   const before = renderBackend.sceneMutationVersion;
   let dateChanged = false;
-  if (useRealtimeGameClock) {
+  if (gameClockState.running) {
     currentDate.setTime(getGameDateFromBrowserTime().getTime());
     dateChanged = applyDate(currentDate, { force: false });
   }
@@ -1232,7 +1233,7 @@ const terrainFetchState = {
 const performTileFetch = createTerrainFetchExecutor({
   state: terrainFetchState, previewMaxDepth: PREVIEW_MAX_DEPTH,
   getHeading: () => priorityHeading(vehicleRuntime.vehicleControlActive, vehicleRuntime.vehicleHeadingRad, controls.yaw),
-  getRange: () => _terrainRange, getCameraLatLon, getCameraSnapshot: getCameraLogSnapshot,
+  getRange: () => terrainRange, getCameraLatLon, getCameraSnapshot: getCameraLogSnapshot,
   getCameraLocalPosition: () => {
     const relative = camera.position.clone().sub(anchorPosition);
     return { x: relative.dot(east), y: relative.dot(north) };
@@ -1735,14 +1736,14 @@ function updateHud() {
     : modeLabel;
 
   // Game clock display (bottom-left) — always show the date actually being rendered
-  const gameDate = lastRenderedDate;
+  const gameDate = gameClockState.renderedDate;
   // Persist game clock to localStorage ~every 5s
   const _now = performance.now();
-  if (_now - _lastGameClockSave > 5000) {
-    _lastGameClockSave = _now;
+  if (_now - gameClockState.lastSavedAtMs > 5000) {
+    gameClockState.lastSavedAtMs = _now;
     localStorage.setItem(GAME_CLOCK_STORAGE_KEY, String(gameDate.getTime()));
   }
-  renderGameClock(gameClockEl, gameDate, useRealtimeGameClock);
+  renderGameClock(gameClockEl, gameDate, gameClockState.running);
 
   hud.innerHTML = [
     '<b>Clouds Terrain Managed Flask UX WIP</b>',
@@ -1774,7 +1775,7 @@ function resetView() {
   localStorage.removeItem('clouds-cam');
   localStorage.removeItem(TUNING_STORAGE_KEY);
   localStorage.removeItem(GAME_CLOCK_STORAGE_KEY);
-  for (const k of Object.keys(_tuningState)) delete _tuningState[k];
+  for (const k of Object.keys(tuningState)) delete tuningState[k];
   controls.yaw = defaultYaw;
   controls.pitch = defaultPitch;
   controls.speed = 0;
@@ -1798,7 +1799,7 @@ function resetView() {
   camera.far = MAX_VIEW_DIST;
   camera.updateProjectionMatrix();
   // Close atmosphere panel
-  tuningOpen = false;
+  tuningPanelOpen = false;
   tuningBody.style.display = 'none';
   document.getElementById('tuning-toggle').innerHTML = '&#9660;';
   updateHud();
@@ -2072,7 +2073,7 @@ function render() {
   const dt = Math.min(0.05, clock.getDelta());
   const nowMs = performance.now();
   fpsCounter.frame(nowMs);
-  if (useRealtimeGameClock) {
+  if (gameClockState.running) {
     currentDate.setTime(getGameDateFromBrowserTime().getTime());
   }
   applyDate(currentDate, { force: false });
