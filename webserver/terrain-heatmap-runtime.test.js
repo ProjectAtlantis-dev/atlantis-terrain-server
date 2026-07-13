@@ -18,7 +18,7 @@ class FakeElement {
   getContext() { return this.context; }
 }
 
-test('heatmap runtime swaps between grey hoverable edges and filled heatmap', async () => {
+test('heatmap runtime keeps the embedded edge mode hidden and renders filled heatmap', async () => {
   const strokes = [];
   let fills = 0;
   const context = {
@@ -59,18 +59,13 @@ test('heatmap runtime swaps between grey hoverable edges and filled heatmap', as
   runtime.setPresentation('edges');
   await Promise.resolve();
   await Promise.resolve();
-  animationFrames.shift()(0);
   assert.equal(runtime.presentation, 'edges');
-  assert.equal(runtime.layer.style.background, 'transparent');
-  assert.equal(runtime.layer.style.pointerEvents, 'none');
+  assert.equal(runtime.layer.style.display, 'none');
   assert.equal(fills, 0);
-  assert.deepEqual(strokes, ['rgba(190,200,210,0.55)']);
-
-  runtime.setHoveredTile('1-0-0');
-  animationFrames.shift()(8);
-  assert.deepEqual(strokes.slice(-2), ['rgba(190,200,210,0.55)', '#ff2020']);
 
   runtime.setPresentation('heatmap');
+  await Promise.resolve();
+  await Promise.resolve();
   animationFrames.shift()(16);
   assert.equal(runtime.active, true);
   assert.equal(runtime.layer.style.background, '#060a10');

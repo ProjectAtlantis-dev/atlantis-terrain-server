@@ -14,9 +14,17 @@ export function createTerrainHud({ onToggleMapMode, onToggleHeatmap, onClockActi
     'position:absolute', 'top:12px', 'left:12px', 'padding:10px 12px',
     'background:rgba(0,0,0,0.7)', 'color:#dbe5f1',
     'font:13px/1.45 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace',
-    'border-radius:8px', 'pointer-events:none', 'z-index:5',
+    'border-radius:8px', 'pointer-events:auto', 'user-select:text',
+    'cursor:text', 'z-index:5',
   ]);
+  hud.id = 'terrain-hud';
   hud.addEventListener('mousedown', event => {
+    const isLink = (
+      event.target.id === 'mapModeLink' ||
+      event.target.id === 'heatmapModeLink' ||
+      TERRAIN_HUD_LINKS[event.target.id]
+    );
+    if (!isLink) hud.dataset.selecting = 'true';
     if (event.target.id === 'mapModeLink') {
       event.stopPropagation();
       event.preventDefault();
@@ -35,6 +43,9 @@ export function createTerrainHud({ onToggleMapMode, onToggleHeatmap, onClockActi
       event.preventDefault();
       window.open(url, '_blank');
     }
+  });
+  window.addEventListener('mouseup', () => {
+    hud.dataset.selecting = 'false';
   });
   hud.addEventListener('click', event => {
     if (

@@ -59,9 +59,11 @@ The camera starts facing north at Nuuk (64.18°N, 51.72°W). You can override th
 
 Press **M** to toggle a 2D map view (no clouds/atmosphere) for navigation and tile debugging. Right-click on a tile to inspect its metadata or open it in the tile inspector.
 
-Press **H** to swap the map canvas for the live tile-priority heatmap. Press **H** again to return to the regular map; both views retain the same heading, pan, and zoom. Regular map mode shows the same tile boundaries as a thin grey grid, with the tile under the pointer outlined in red.
+Press **H** to swap the map canvas for the live tile-priority heatmap. Press **H** again to return to the regular map; both views retain the same heading, pan, and zoom. Regular map mode outlines the terrain meshes currently being rendered as a thin grey grid, with the tile under the pointer outlined in red.
 
 In 3D mode, atmosphere sliders allow adjusting cloud density, coverage, and lighting parameters. (WIP — still working out some bugs.)
+
+Press **G** to open Google Maps' satellite 3D view at the current camera position, heading, tilt, height above ground, and field of view. This is a debugging reference and opens in a new tab.
 
 ## Setup
 

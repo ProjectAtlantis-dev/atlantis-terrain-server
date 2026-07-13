@@ -63,7 +63,6 @@ export function createTerrainHeatmapRuntime({
   let dragButton = 0;
   let dragged = false;
   let lastView = null;
-  let hoveredTileId = null;
 
   function resize() {
     width = windowImpl.innerWidth;
@@ -119,7 +118,6 @@ export function createTerrainHeatmapRuntime({
     const maxPriority = priorities.length ? Math.max(...priorities) : 0;
     const scale = (height / 2) / Math.max(500, view.zoom);
     const labels = [];
-    let hoveredRect = null;
 
     context.save();
     context.translate(width / 2, height / 2);
@@ -151,9 +149,6 @@ export function createTerrainHeatmapRuntime({
         context.globalAlpha = 1;
         context.lineWidth = 1;
       }
-      if (presentation === 'edges' && tile.id === hoveredTileId) {
-        hoveredRect = [x, y, tileWidth, tileHeight];
-      }
       if (
         presentation === 'heatmap' && tile.order != null &&
         tileWidth > 26 && tileHeight > 16
@@ -165,13 +160,6 @@ export function createTerrainHeatmapRuntime({
           size: Math.min(tileWidth, tileHeight),
         });
       }
-    }
-    if (hoveredRect) {
-      context.strokeStyle = '#ff2020';
-      context.globalAlpha = 1;
-      context.lineWidth = 2;
-      context.strokeRect(...hoveredRect);
-      context.lineWidth = 1;
     }
     context.restore();
 
@@ -246,14 +234,14 @@ export function createTerrainHeatmapRuntime({
   function setPresentation(next) {
     if (!['hidden', 'edges', 'heatmap'].includes(next)) return;
     if (next === presentation) return;
-    const wasVisible = presentation !== 'hidden';
+    const wasVisible = presentation === 'heatmap';
     presentation = next;
-    const visible = presentation !== 'hidden';
+    const visible = presentation === 'heatmap';
     layer.style.display = visible ? 'block' : 'none';
-    layer.style.background = presentation === 'heatmap' ? '#060a10' : 'transparent';
-    layer.style.pointerEvents = presentation === 'heatmap' ? 'auto' : 'none';
-    canvas.style.pointerEvents = presentation === 'heatmap' ? 'auto' : 'none';
-    meta.style.display = presentation === 'heatmap' ? 'block' : 'none';
+    layer.style.background = '#060a10';
+    layer.style.pointerEvents = 'auto';
+    canvas.style.pointerEvents = 'auto';
+    meta.style.display = 'block';
     tip.style.display = 'none';
     if (visible && !wasVisible) {
       resize();
@@ -311,7 +299,7 @@ export function createTerrainHeatmapRuntime({
     if (tile) onTileClick?.(tile);
   });
   windowImpl.addEventListener('resize', () => {
-    if (presentation !== 'hidden') resize();
+    if (presentation === 'heatmap') resize();
   });
 
   return {
@@ -321,7 +309,6 @@ export function createTerrainHeatmapRuntime({
     get presentation() { return presentation; },
     setActive,
     setPresentation,
-    setHoveredTile(tileId) { hoveredTileId = tileId || null; },
     toggle() { setActive(presentation !== 'heatmap'); },
   };
 }

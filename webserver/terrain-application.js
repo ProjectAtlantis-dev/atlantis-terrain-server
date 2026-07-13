@@ -27,7 +27,7 @@ import { createTextureStreamer, rendererTextureAnisotropy } from './terrain-text
 import { evaluateTerrainRefetch, summarizeTerrainCamera, terrainCameraCoordinates, terrainCameraGridPosition, terrainCameraStereoPosition } from './terrain-tile-fetch.js';
 import { createTerrainEnhancementController } from './terrain-enhancement-controller.js';
 import { applyTerrainAvailabilityStatus, createTerrainSeamStatusController } from './terrain-status-controller.js';
-import { collectTerrainDebugMeshes, createTerrainHoverOutlineController, createTerrainOutlineController, summarizeTerrainMesh } from './terrain-debug-runtime.js';
+import { collectTerrainDebugMeshes, createTerrainHoverOutlineController, createTerrainMapGridController, createTerrainOutlineController, summarizeTerrainMesh } from './terrain-debug-runtime.js';
 import { createTerrainFetchRuntime } from './terrain-fetch-runtime.js';
 import { createTerrainTileSet } from './terrain-tile-set.js';
 import { restoreTerrainCameraState, terrainCameraState } from './terrain-camera-state.js';
@@ -40,6 +40,8 @@ import { bindTerrainCloudComposition, configureTerrainClouds, registerTerrainClo
 import { createTerrainHouseSceneRuntime } from './terrain-house-scene-runtime.js';
 import { createTerrainTileMenuRuntime } from './terrain-tile-menu-runtime.js';
 import { createTerrainHeatmapRuntime } from './terrain-heatmap-runtime.js';
+import { googleMaps3dUrl } from './terrain-google-maps.js';
+import { epsg3413DirectionBearing, epsg3413ToWgs84 } from './terrain-polar-stereo.js';
 
 export async function startTerrainApplication({ backend = 'webgl' } = {}) {
 if (backend !== 'webgl' && backend !== 'webgpu') {
@@ -646,6 +648,7 @@ const hoverOutlineController = createTerrainHoverOutlineController({
   terrainRoot,
   onChanged: () => { markSceneMutated(); requestRender(); },
 });
+const mapGridController = createTerrainMapGridController({ terrainRoot });
 
 const enhanceOutlines = new THREE.Group();
 enhanceOutlines.visible = false;
@@ -968,13 +971,104 @@ const terrainOutlineController = createTerrainOutlineController({
 
 // --- Camera position → lat/lon conversion ---
 
-function getCameraLatLon() {
+function getCameraLatLon(position = camera.position) {
   const coordinates = terrainCameraCoordinates({
-    position: camera.position, anchorPosition, east, north, up,
+    position, anchorPosition, east, north, up,
     anchorLatitude: anchorLat, anchorLongitude: anchorLon,
     originX: terrainPipelineState.originX, originY: terrainPipelineState.originY,
   });
   return { lat: coordinates.lat, lon: coordinates.lon, alt: coordinates.alt };
+}
+
+const exactCameraGeodetic = new Geodetic();
+
+function getExactCameraLatLon(position = camera.position) {
+  exactCameraGeodetic.setFromECEF(position);
+  return {
+    lat: exactCameraGeodetic.latitude * 180 / Math.PI,
+    lon: exactCameraGeodetic.longitude * 180 / Math.PI,
+    alt: exactCameraGeodetic.height,
+  };
+}
+
+function getRenderedTerrainLatLon(position = camera.position) {
+  if (!terrainPipelineState.frameOffsetReady) return getExactCameraLatLon(position);
+  const coordinates = terrainCameraCoordinates({
+    position, anchorPosition, east, north, up,
+    anchorLatitude: anchorLat, anchorLongitude: anchorLon,
+    originX: terrainPipelineState.originX, originY: terrainPipelineState.originY,
+  });
+  const grid = terrainCameraGridPosition({
+    eastM: coordinates.eastM,
+    northM: coordinates.northM,
+    originX: terrainPipelineState.originX,
+    originY: terrainPipelineState.originY,
+    frameOffsetX: terrainPipelineState.frameOffsetX,
+    frameOffsetY: terrainPipelineState.frameOffsetY,
+  });
+  return { ...epsg3413ToWgs84(grid.x, grid.y), alt: coordinates.alt, grid };
+}
+
+const googleMapsDirection = new THREE.Vector3();
+const googleMapsEast = new THREE.Vector3();
+const googleMapsNorth = new THREE.Vector3();
+const googleMapsUp = new THREE.Vector3();
+let lastGoogleCoordinateComparison = null;
+
+function openGoogleMapsView() {
+  camera.getWorldDirection(googleMapsDirection);
+  const exactPosition = getExactCameraLatLon();
+  const renderedPosition = getRenderedTerrainLatLon();
+  const linearPosition = getCameraLatLon();
+  Ellipsoid.WGS84.getEastNorthUpVectors(
+    camera.position,
+    googleMapsEast,
+    googleMapsNorth,
+    googleMapsUp,
+  );
+  raycaster.set(camera.position, googleMapsDirection);
+  const centerHit = raycaster.intersectObjects(
+    collectTerrainDebugMeshes(terrainRoot, debugIntersectables),
+    false,
+  )[0];
+  const aimPosition = centerHit ? getRenderedTerrainLatLon(centerHit.point) : null;
+  const gridBearing = renderedPosition.grid
+    ? epsg3413DirectionBearing({
+        x: renderedPosition.grid.x,
+        y: renderedPosition.grid.y,
+        directionX: googleMapsDirection.dot(east),
+        directionY: googleMapsDirection.dot(north),
+      })
+    : null;
+  const url = googleMaps3dUrl({
+    lat: renderedPosition.lat,
+    lon: renderedPosition.lon,
+    alt: cameraRuntimeState.agl,
+    directionEast: gridBearing == null ? googleMapsDirection.dot(googleMapsEast) : Math.sin(gridBearing * Math.PI / 180),
+    directionNorth: gridBearing == null ? googleMapsDirection.dot(googleMapsNorth) : Math.cos(gridBearing * Math.PI / 180),
+    directionUp: googleMapsDirection.dot(googleMapsUp),
+    fov: camera.fov,
+  });
+  const latitudeRadians = exactPosition.lat * Math.PI / 180;
+  lastGoogleCoordinateComparison = {
+    camera: renderedPosition,
+    aim: aimPosition,
+  };
+  console.info('[google-3d] camera coordinate comparison', {
+    cameraWgs84: exactPosition,
+    renderedTerrainWgs84: renderedPosition,
+    centerAimWgs84: aimPosition,
+    gridBearing,
+    linearEnu: linearPosition,
+    linearMinusExactMeters: {
+      east: (linearPosition.lon - exactPosition.lon) * 111320 * Math.cos(latitudeRadians),
+      north: (linearPosition.lat - exactPosition.lat) * 111320,
+    },
+    agl: cameraRuntimeState.agl,
+    url,
+  });
+  updateHud();
+  window.open(url, '_blank', 'noopener,noreferrer');
 }
 
 function getCameraLogSnapshot(camLL = null) {
@@ -1245,7 +1339,6 @@ function updateMapCamera() {
 function hideTileInfo() {
   tileInfoEl.style.display = 'none';
   hoverOutlineController.show(null);
-  heatmapRuntime?.setHoveredTile(null);
 }
 
 function clampAltitude() {
@@ -1416,6 +1509,7 @@ function updateHud() {
   const eastM = rel.dot(east);
   const northM = rel.dot(north);
   const altM = rel.dot(up);
+  const exactPosition = getRenderedTerrainLatLon();
   const speedKmh = Math.hypot(controls.speed, controls.strafeSpeed) * 3.6;
   const headingForHud = vehicleRuntime.vehicleControlActive ? vehicleRuntime.vehicleHeadingRad : controls.yaw;
   const { degrees: deg, compass } = compassHeading(headingForHud);
@@ -1463,7 +1557,7 @@ function updateHud() {
     ? 'HEATMAP'
     : controls.mapMode
       ? 'MAP'
-    : (vehicleRuntime.vehicleControlActive ? 'VEHICLE' : 'FLIGHT');
+      : (vehicleRuntime.vehicleControlActive ? 'VEHICLE' : 'FLIGHT');
   const modeHtml = vehicleRuntime.vehicleControlActive
     ? '<span style="color:#ff3b30">VEHICLE</span>'
     : modeLabel;
@@ -1477,11 +1571,17 @@ function updateHud() {
   }
   renderGameClock(gameClockEl, gameDate, gameClockState.running);
 
-  hud.innerHTML = [
+  const hudHtml = [
     '<b>Clouds Terrain Managed Flask UX WIP</b>',
     `mode: <b>${modeHtml}</b>`,
     `fps: <b>${fpsCounter.display}</b>`,
-    `lat: ${(anchorLat + northM / 111320).toFixed(5)}°  lon: ${(anchorLon + eastM / (111320 * Math.cos(anchorLat * Math.PI / 180))).toFixed(5)}°  alt: ${altM.toFixed(0)}m`,
+    `lat: ${exactPosition.lat.toFixed(7)}°  lon: ${exactPosition.lon.toFixed(7)}°  alt: ${altM.toFixed(0)}m`,
+    lastGoogleCoordinateComparison
+      ? `Google compare · camera ${lastGoogleCoordinateComparison.camera.lat.toFixed(7)}, ${lastGoogleCoordinateComparison.camera.lon.toFixed(7)}` +
+        (lastGoogleCoordinateComparison.aim
+          ? ` · aim ${lastGoogleCoordinateComparison.aim.lat.toFixed(7)}, ${lastGoogleCoordinateComparison.aim.lon.toFixed(7)}`
+          : ' · aim: no terrain hit')
+      : '',
     `enu: E ${eastM.toFixed(0)}m  N ${northM.toFixed(0)}m  U ${altM.toFixed(0)}m`,
     `speed: ${speedKmh.toFixed(0)} km/h  heading: ${deg.toFixed(0)}° ${compass}`,
     hmLine,
@@ -1492,8 +1592,18 @@ function updateHud() {
     'map: left-drag rotate, right-drag pan, wheel zoom',
     '<span id="mapModeLink" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">map mode</span> (M)' +
       ` · <span id="heatmapModeLink" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">${heatmapRuntime?.active ? 'regular map' : 'heatmap'}</span> (H)` +
+      ' · Google 3D (G)' +
       ' · R reset · <span id="debugLogLink" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">debug log</span>'
   ].join('<br>');
+  const selection = window.getSelection();
+  const selectionInsideHud = Boolean(
+    selection && !selection.isCollapsed && (
+      hud.contains(selection.anchorNode) || hud.contains(selection.focusNode)
+    )
+  );
+  if (hud.dataset.selecting !== 'true' && !selectionInsideHud) {
+    hud.innerHTML = hudHtml;
+  }
   alt.textContent =
     `${altM.toFixed(0)}m / ${(altM * 3.28084).toFixed(0)}ft  ${deg.toFixed(0)}° ${compass}` +
     `  FOV ${camera.fov.toFixed(0)}°` +
@@ -1618,6 +1728,7 @@ installTerrainKeyboardControls({
     vehicleRuntime.setVehicleControlActive(false, 'escape', { skipExitSave: true });
   },
   onToggleMap: toggleMapMode,
+  onOpenGoogleMaps: openGoogleMapsView,
   onToggleHeatmap: toggleHeatmap,
   onReset: resetView,
   onHouseAction: load => load
@@ -1742,7 +1853,6 @@ renderer.domElement.addEventListener('mousemove', event => {
   const mesh = hits[0].object;
   hoverOutlineController.show(mesh);
   const info = summarizeTerrainMesh(mesh);
-  heatmapRuntime.setHoveredTile(info.tileId);
   const overlappingMeshes = [...new Map(hits
     .filter(hit => hit.object.userData?.tileId && hit.object.userData.tileId !== info.tileId)
     .map(hit => [hit.object.userData.tileId, hit.object])).values()];
@@ -1893,7 +2003,11 @@ function render() {
   vehicleRuntime.vehicleMarkerLayer.visible = controls.mapMode;
   enhanceOutlines.visible = controls.mapMode;
   enhancedOutlines.visible = controls.mapMode;
+  mapGridController.setVisible(controls.mapMode && !heatmapRuntime.active);
   if (controls.mapMode) {
+    if (!heatmapRuntime.active) {
+      mapGridController.update(collectTerrainDebugMeshes(terrainRoot, debugIntersectables));
+    }
     seamStatusController.poll();
     terrainOutlineController.updatePending();
     terrainOutlineController.updateEnhanced();

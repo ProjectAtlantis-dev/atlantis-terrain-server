@@ -21,7 +21,7 @@ import {
 import { createTerrainEnhancementController } from './terrain-enhancement-controller.js';
 import { createTerrainMeshBuilder, decodeTerrainHeightmap } from './terrain-mesh-builder.js';
 import { applyTerrainAvailabilityStatus, createTerrainSeamStatusController } from './terrain-status-controller.js';
-import { collectTerrainDebugMeshes, createTerrainHoverOutlineController, createTerrainOutlineController, summarizeTerrainMesh } from './terrain-debug-runtime.js';
+import { collectTerrainDebugMeshes, createTerrainHoverOutlineController, createTerrainMapGridController, createTerrainOutlineController, summarizeTerrainMesh } from './terrain-debug-runtime.js';
 import { createTerrainFetchRuntime } from './terrain-fetch-runtime.js';
 import { restoreTerrainCameraState, terrainCameraState } from './terrain-camera-state.js';
 import { createTerrainClientLogger } from './terrain-client-logging.js';
@@ -1021,6 +1021,28 @@ test('shared terrain hover outline owns replacement and cleanup', () => {
   assert.equal(hover.show(null), true);
   assert.equal(root.children.length, 0);
   assert.equal(changes, 2);
+});
+
+test('map grid uses the exact rendered mesh bounds', () => {
+  const root = {
+    children: [],
+    add(child) { this.children.push(child); },
+    remove(child) { this.children = this.children.filter(item => item !== child); },
+  };
+  const grid = createTerrainMapGridController({ terrainRoot: root });
+  const meshes = [
+    { userData: { tileId: 'parent', bbox: [0, 0, 8, 8] } },
+    { userData: { tileId: 'child', bbox: [8, 0, 12, 4] } },
+  ];
+  grid.setVisible(true);
+  assert.equal(grid.update(meshes), true);
+  assert.equal(grid.lines.geometry.attributes.position.count, 16);
+  assert.equal(grid.lines.visible, true);
+  assert.equal(grid.update(meshes), false);
+  grid.setVisible(false);
+  assert.equal(grid.lines.visible, false);
+  grid.dispose();
+  assert.equal(root.children.length, 0);
 });
 
 test('shared fetch runtime preserves initial response transition ordering', async () => {
