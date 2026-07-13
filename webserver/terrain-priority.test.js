@@ -18,7 +18,7 @@ import { createTerrainTextureController } from './terrain-texture-controller.js'
 import { createTerrainEnhancementController } from './terrain-enhancement-controller.js';
 import { createTerrainMeshBuilder, decodeTerrainHeightmap } from './terrain-mesh-builder.js';
 import { applyTerrainAvailabilityStatus, createTerrainSeamStatusController } from './terrain-status-controller.js';
-import { collectTerrainDebugMeshes, createTerrainOutlineController, summarizeTerrainMesh } from './terrain-debug-runtime.js';
+import { collectTerrainDebugMeshes, createTerrainHoverOutlineController, createTerrainOutlineController, summarizeTerrainMesh } from './terrain-debug-runtime.js';
 import { createTerrainFetchExecutor } from './terrain-fetch-executor.js';
 import { restoreTerrainCameraState, terrainCameraState } from './terrain-camera-state.js';
 import { createTerrainClientLogger } from './terrain-client-logging.js';
@@ -830,6 +830,27 @@ test('shared terrain debug metadata and outline selection remain deterministic',
   assert.equal(pendingGroup.children.length, 1);
   assert.equal(outlines.updateEnhanced(), true);
   assert.equal(enhancedGroup.children.length, 1);
+});
+
+test('shared terrain hover outline owns replacement and cleanup', () => {
+  const root = {
+    children: [],
+    add(child) { this.children.push(child); },
+    remove(child) { this.children = this.children.filter(item => item !== child); },
+  };
+  let changes = 0;
+  const hover = createTerrainHoverOutlineController({
+    terrainRoot: root,
+    onChanged: () => { changes += 1; },
+  });
+  const mesh = { userData: { tileId: 'tile', bbox: [0, 0, 10, 20] } };
+  assert.equal(hover.show(mesh), true);
+  assert.equal(root.children.length, 1);
+  assert.equal(hover.show(mesh), false);
+  assert.equal(changes, 1);
+  assert.equal(hover.show(null), true);
+  assert.equal(root.children.length, 0);
+  assert.equal(changes, 2);
 });
 
 test('shared fetch executor preserves initial response transition ordering', async () => {

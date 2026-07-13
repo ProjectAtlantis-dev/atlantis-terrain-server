@@ -33,7 +33,7 @@ import { createTerrainFetchScheduler } from './terrain-fetch-scheduler.js';
 import { createTerrainEnhancementController } from './terrain-enhancement-controller.js';
 import { createTerrainMeshBuilder } from './terrain-mesh-builder.js';
 import { applyTerrainAvailabilityStatus, createTerrainSeamStatusController } from './terrain-status-controller.js';
-import { collectTerrainDebugMeshes, createTerrainOutlineController, summarizeTerrainMesh } from './terrain-debug-runtime.js';
+import { collectTerrainDebugMeshes, createTerrainHoverOutlineController, createTerrainOutlineController, summarizeTerrainMesh } from './terrain-debug-runtime.js';
 import { createTerrainFetchExecutor } from './terrain-fetch-executor.js';
 import { restoreTerrainCameraState, terrainCameraState } from './terrain-camera-state.js';
 import { createTerrainClientLogger } from './terrain-client-logging.js';
@@ -284,18 +284,14 @@ const HUD_LINKS = TERRAIN_HUD_LINKS;
 
 // Transport control handlers for game clock HUD
 function rewindGameClock() {
-  if (gameClockState.running) {
-    currentDate.setTime(getGameDateFromBrowserTime().getTime());
-  }
+  if (gameClockState.running) currentDate.setTime(getGameDateFromBrowserTime().getTime());
   gameClockState.running = false;
   currentDate.setTime(currentDate.getTime() - 15 * 60 * 1000);
   applyDate(currentDate);
   maybeLogWebGPUSun(currentDate, 'clock-rewind', true);
 }
 function stopGameClock() {
-  if (gameClockState.running) {
-    currentDate.setTime(getGameDateFromBrowserTime().getTime());
-  }
+  if (gameClockState.running) currentDate.setTime(getGameDateFromBrowserTime().getTime());
   gameClockState.running = false;
   maybeLogWebGPUSun(currentDate, 'clock-stop', true);
 }
@@ -308,9 +304,7 @@ function playGameClock() {
   maybeLogWebGPUSun(currentDate, 'clock-play', true);
 }
 function fastForwardGameClock() {
-  if (gameClockState.running) {
-    currentDate.setTime(getGameDateFromBrowserTime().getTime());
-  }
+  if (gameClockState.running) currentDate.setTime(getGameDateFromBrowserTime().getTime());
   gameClockState.running = false;
   currentDate.setTime(currentDate.getTime() + 15 * 60 * 1000);
   applyDate(currentDate);
@@ -676,8 +670,10 @@ const movementRight = new THREE.Vector3();
 const raycaster = new THREE.Raycaster();
 const mouseNDC = new THREE.Vector2();
 const debugIntersectables = [];
-let hoverOutline = null;
-let hoverOutlineTileId = null;
+const hoverOutlineController = createTerrainHoverOutlineController({
+  terrainRoot,
+  onChanged: () => { markSceneMutated(); requestRender(); },
+});
 
 const enhanceOutlines = new THREE.Group();
 enhanceOutlines.visible = false;
@@ -1420,93 +1416,12 @@ function updateMapCamera() {
   mapCam.lookAt(target);
 }
 
-function disposeObjectMaterial(material) {
-  if (material == null) {
-    return;
-  }
-  if (Array.isArray(material)) {
-    for (const value of material) {
-      value.dispose?.();
-    }
-    return;
-  }
-  material.dispose?.();
-}
-
-function showTileBorder(mesh) {
-  const nextTileId = mesh?.userData?.tileId ?? null;
-  if (nextTileId != null && nextTileId === hoverOutlineTileId && hoverOutline != null) {
-    return false;
-  }
-  let changed = false;
-  if (hoverOutline != null) {
-    terrainRoot.remove(hoverOutline);
-    hoverOutline.geometry?.dispose?.();
-    disposeObjectMaterial(hoverOutline.material);
-    hoverOutline = null;
-    hoverOutlineTileId = null;
-    changed = true;
-  }
-  if (mesh == null) {
-    if (changed) {
-      markSceneMutated();
-      requestRender();
-    }
-    return changed;
-  }
-  let xMin = 0;
-  let yMin = 0;
-  let xMax = 0;
-  let yMax = 0;
-
-  const bbox = mesh.userData?.bbox;
-  if (Array.isArray(bbox) && bbox.length === 4 && bbox.every(Number.isFinite)) {
-    xMin = Number(bbox[0]);
-    yMin = Number(bbox[1]);
-    xMax = Number(bbox[2]);
-    yMax = Number(bbox[3]);
-  } else {
-    const box = new THREE.Box3().setFromObject(mesh);
-    if (box.isEmpty()) {
-      if (changed) {
-        markSceneMutated();
-        requestRender();
-      }
-      return changed;
-    }
-    xMin = box.min.x;
-    yMin = box.min.y;
-    xMax = box.max.x;
-    yMax = box.max.y;
-  }
-
-  const z = 50;
-  const points = [
-    new THREE.Vector3(xMin, yMin, z),
-    new THREE.Vector3(xMax, yMin, z),
-    new THREE.Vector3(xMax, yMax, z),
-    new THREE.Vector3(xMin, yMax, z),
-    new THREE.Vector3(xMin, yMin, z)
-  ];
-  const geometry = new THREE.BufferGeometry().setFromPoints(points);
-  hoverOutline = new THREE.Line(
-    geometry,
-    new THREE.LineBasicMaterial({ color: 0xff0000, depthTest: false })
-  );
-  hoverOutline.renderOrder = 999;
-  terrainRoot.add(hoverOutline);
-  hoverOutlineTileId = nextTileId;
-  markSceneMutated();
-  requestRender();
-  return true;
-}
-
 function updateEnhanceOutlines() { terrainOutlineController.updatePending(); }
 function updateEnhancedOutlines() { terrainOutlineController.updateEnhanced(); }
 
 function hideTileInfo() {
   tileInfoEl.style.display = 'none';
-  showTileBorder(null);
+  hoverOutlineController.show(null);
 }
 
 function collectDebugMeshes(root) {
@@ -1737,10 +1652,9 @@ function updateHud() {
 
   // Game clock display (bottom-left) — always show the date actually being rendered
   const gameDate = gameClockState.renderedDate;
-  // Persist game clock to localStorage ~every 5s
-  const _now = performance.now();
-  if (_now - gameClockState.lastSavedAtMs > 5000) {
-    gameClockState.lastSavedAtMs = _now;
+  const now = performance.now();
+  if (now - gameClockState.lastSavedAtMs > 5000) {
+    gameClockState.lastSavedAtMs = now;
     localStorage.setItem(GAME_CLOCK_STORAGE_KEY, String(gameDate.getTime()));
   }
   renderGameClock(gameClockEl, gameDate, gameClockState.running);
@@ -1982,7 +1896,7 @@ renderer.domElement.addEventListener('mousemove', event => {
   }
 
   const mesh = hits[0].object;
-  showTileBorder(mesh);
+  hoverOutlineController.show(mesh);
   const info = meshDebugSummary(mesh);
   const overlappingMeshes = [...new Map(hits
     .filter(hit => hit.object.userData?.tileId && hit.object.userData.tileId !== info.tileId)
