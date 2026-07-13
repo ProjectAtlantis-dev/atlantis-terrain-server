@@ -173,7 +173,6 @@ Ellipsoid.WGS84.getEastNorthUpVectors(anchorPosition, east, north, up);
 // --- View distance constants ---
 const MAX_VIEW_DIST = 50000;       // 50km — camera far, fog, map extents
 let _terrainRange = 20000;         // terrain tile fetch range (meters), slider-controlled
-let tileFetchingReady = false;
 const MAP_CAM_ALT = MAX_VIEW_DIST; // map camera altitude above target
 
 const camera = new THREE.PerspectiveCamera(
@@ -218,13 +217,17 @@ const MIN_FLIGHT_ALT = paramNumber('minFlightAlt', 2);
 // AGL-based speed scaling: full speed at AGL_FULL_SPEED_M, minimum factor at ground level
 const AGL_FULL_SPEED_M = 500;
 const AGL_MIN_FACTOR = 0.05;
-let cameraAGL = AGL_FULL_SPEED_M; // assume high until first raycast
 const aglRaycaster = new THREE.Raycaster();
 const MOUSE_SENS = 0.003;
 const MAP_PAN_FACTOR = 1.2;
 
 const defaultCameraPosition = camera.position.clone();
-const _lastGoodCamPos = camera.position.clone();
+const cameraRuntimeState = {
+  agl: AGL_FULL_SPEED_M, // Assume high until the first terrain raycast.
+  lastGoodPosition: camera.position.clone(),
+  lastMoveTime: performance.now(),
+  driftMode: false,
+};
 const initialForward = anchorPosition.clone().sub(camera.position).normalize();
 const defaultYaw = Math.atan2(-initialForward.dot(east), initialForward.dot(north));
 const defaultPitch = Math.asin(Math.max(-1, Math.min(1, initialForward.dot(up))));
@@ -330,10 +333,9 @@ const tileMenuRuntime = createTerrainTileMenuRuntime({
   toggleOcean: () => { oceanMapDebugEnabled = !oceanMapDebugEnabled; },
   getBathyEnabled: USE_WEBGPU_RENDER_BACKEND ? null : () => bathymetryOverlay.enabled,
   toggleBathy: USE_WEBGPU_RENDER_BACKEND ? null : () => bathymetryOverlay.toggle(),
-  refreshTextures: () => { if (lastTiles) updateTextures(lastTiles); },
+  refreshTextures: () => { if (terrainPipelineState.lastTiles) updateTextures(terrainPipelineState.lastTiles); },
   submitEnhancement: (tileId, options) => enhancementController.submit(tileId, options),
   getTextureStreamer: () => textureStreamer,
-  onEnhancedDiscarded: streamer => { _lastEnhancedKey = ''; _texV = streamer.version; },
   onTerrainMutated: () => { markSceneMutated(); requestRender(); },
 });
 const showEnhanceDialog = tileMenuRuntime.showEnhance;
@@ -474,7 +476,7 @@ function buildTuningControls(ap, ce) {
     format: v => `${(v/1000).toFixed(0)}km`,
     onChange: v => {
       _terrainRange = v;
-      if (tileFetchingReady) fetchTiles();
+      if (terrainPipelineState.ready) fetchTiles();
     }
   });
   tuningSectionLabel('Atmosphere');
@@ -677,13 +679,11 @@ const enhanceOutlines = new THREE.Group();
 enhanceOutlines.visible = false;
 enhanceOutlines.renderOrder = 998;
 terrainRoot.add(enhanceOutlines);
-let _lastEnhanceKey = '';
 
 const enhancedOutlines = new THREE.Group();
 enhancedOutlines.visible = false;
 enhancedOutlines.renderOrder = 997;
 terrainRoot.add(enhancedOutlines);
-let _lastEnhancedKey = '';
 
 const seamStatusController = createTerrainSeamStatusController({});
 
@@ -733,24 +733,30 @@ function attachTileScatter(mesh, tile, hm) {
 
 let tileLifecycle;
 const REFETCH_DIST = 5000;
-let originX = 0, originY = 0;        // stereo scene origin from server
-let camStereoX = 0, camStereoY = 0;  // current cam position in stereo
-let lastFetchX = 0, lastFetchY = 0;
-let tileFrameOffsetX = 0;            // shift server stereo-local bboxes into camera ENU-local frame
-let tileFrameOffsetY = 0;
-let tileFrameOffsetReady = false;
-let _lastFetchTriggerMs = 0;
-let fetching = false;
-let isFirstLoad = true;
-let _loadPass = 1;  // 1 = preview (low-LOD), 2 = full-depth
-let bootFetchLogged = false;
-let currentTileIds = new Set();
-let lastTiles = null;
-let _hmMissing = 0;   // heightmaps the server hasn't started
-let _hmDownloading = 0; // heightmaps the server is fetching
-let _srvTexFetching = 0;   // server-side: textures being fetched from dataforsyningen
-let _srvTexRetry = 0;      // server-side: textures in retry queue (rate-limited)
-let _srvTexStatus = {};    // server-side: {ready, ancestor_fallback, fetching, missing}
+const terrainPipelineState = {
+  ready: false,
+  originX: 0,
+  originY: 0,
+  cameraStereoX: 0,
+  cameraStereoY: 0,
+  lastFetchX: 0,
+  lastFetchY: 0,
+  frameOffsetX: 0,
+  frameOffsetY: 0,
+  frameOffsetReady: false,
+  lastFetchTriggerMs: 0,
+  fetching: false,
+  firstLoad: true,
+  loadPass: 1,
+  bootFetchLogged: false,
+  currentTileIds: new Set(),
+  lastTiles: null,
+  heightmapsMissing: 0,
+  heightmapsDownloading: 0,
+  serverTexturesFetching: 0,
+  serverTexturesRetrying: 0,
+  serverTextureStatus: {},
+}; // end terrain pipeline state
 
 function paramNumber(_name, fallback) {
   return fallback;
@@ -876,7 +882,7 @@ const bathymetryOverlay = createTerrainBathymetryOverlay({
   THREE,
   enabled: !USE_WEBGPU_RENDER_BACKEND,
   onReady: () => {
-    if (lastTiles) updateTextures(lastTiles);
+    if (terrainPipelineState.lastTiles) updateTextures(terrainPipelineState.lastTiles);
   },
 });
 const terrainOceanClassifier = createTerrainOceanClassifier({ THREE, paramNumber });
@@ -933,7 +939,7 @@ function markMissing(missing, downloading) {
 // --- Deferred tile system ---
 const deferredTiles = new Map();
 const { history: tileHistory, log: tileLog } = createTileHistory({
-  getPass: () => _loadPass,
+  getPass: () => terrainPipelineState.loadPass,
   emit: details => enqueueClientLog('debug', 'tile', details),
 });
 tileLifecycle = createTileLifecycle({
@@ -1014,11 +1020,8 @@ const textureStreamer = createTextureStreamer({
   onWaterMask: () => { markSceneMutated(); requestRender(); },
 });
 const {
-  texCache, texSource, texInflight, texFetching, texRetryAtMs, texRetryCount,
-  waterMaskCache, waterMaskInflight, ancestorLogged: _ancestorLogged,
-  requestWaterMask,
+  texCache, texSource, texInflight, texFetching, waterMaskCache, requestWaterMask,
 } = textureStreamer;
-let _texV = textureStreamer.version;
 terrainMeshRuntime = createTerrainMeshRuntime({
   terrainRoot,
   deferredTiles,
@@ -1027,7 +1030,7 @@ terrainMeshRuntime = createTerrainMeshRuntime({
   lifecycle: tileLifecycle,
   log: tileLog,
   getWaterMask: tileId => waterMaskCache.get(tileId),
-  getCurrentTileIds: () => currentTileIds,
+  getCurrentTileIds: () => terrainPipelineState.currentTileIds,
   tileDepth: tileDepthFromId,
   onMeshAdded: markSceneMutated,
   vehicleNearTile: vehicleRuntime.vehicleNearTileBbox,
@@ -1081,18 +1084,14 @@ function updateTextures(tiles) {
 
 // --- Deferred enhancement (idle-time upgrade) ---
 
-let _lastCamMoveTime = performance.now();
-let _enhanceStatus = { total: 0, eligible: 0, done: 0, in_progress: 0 };
-
 const enhancementController = createTerrainEnhancementController({
   log: tileLog,
   textureCache: texCache,
   textureSource: texSource,
   requestWaterMask,
   hasTextureWork: () => texInflight.size > 0 || texFetching.size > 0,
-  getLastCameraMoveTime: () => _lastCamMoveTime,
-  hasTiles: () => Boolean(lastTiles),
-  onStatus: status => { _enhanceStatus = status; },
+  getLastCameraMoveTime: () => cameraRuntimeState.lastMoveTime,
+  hasTiles: () => Boolean(terrainPipelineState.lastTiles),
   applyEnhancedTexture: (tileId, texture) => {
     for (const child of terrainRoot.children) {
       if (!child.isMesh || child.userData.tileId !== tileId) continue;
@@ -1103,19 +1102,15 @@ const enhancementController = createTerrainEnhancementController({
     }
   },
 });
-const _enhanceInflight = enhancementController.inflight;
-const _enhancePending = enhancementController.pending;
 const terrainOutlineController = createTerrainOutlineController({
   terrainRoot, pendingGroup: enhanceOutlines, enhancedGroup: enhancedOutlines,
-  pending: _enhancePending, inflight: _enhanceInflight, textureSource: texSource,
+  pending: enhancementController.pending,
+  inflight: enhancementController.inflight,
+  textureSource: texSource,
 });
 
 function abortAllEnhancements() {
   enhancementController.abortAll();
-}
-
-function _enhanceBusyCount() {
-  return enhancementController.busyCount();
 }
 
 function updateEnhancement() {
@@ -1127,7 +1122,8 @@ function updateEnhancement() {
 function getCameraLatLon() {
   const coordinates = terrainCameraCoordinates({
     position: camera.position, anchorPosition, east, north, up,
-    anchorLatitude: anchorLat, anchorLongitude: anchorLon, originX, originY,
+    anchorLatitude: anchorLat, anchorLongitude: anchorLon,
+    originX: terrainPipelineState.originX, originY: terrainPipelineState.originY,
   });
   return { lat: coordinates.lat, lon: coordinates.lon, alt: coordinates.alt };
 }
@@ -1135,20 +1131,23 @@ function getCameraLatLon() {
 function getCameraLogSnapshot(camLL = null) {
   const coordinates = terrainCameraCoordinates({
     position: camera.position, anchorPosition, east, north, up,
-    anchorLatitude: anchorLat, anchorLongitude: anchorLon, originX, originY,
+    anchorLatitude: anchorLat, anchorLongitude: anchorLon,
+    originX: terrainPipelineState.originX, originY: terrainPipelineState.originY,
   });
   if (camLL) {
     Object.assign(coordinates, camLL);
     const stereo = terrainCameraStereoPosition({
       latitude: camLL.lat, longitude: camLL.lon,
-      anchorLatitude: anchorLat, anchorLongitude: anchorLon, originX, originY,
+      anchorLatitude: anchorLat, anchorLongitude: anchorLon,
+      originX: terrainPipelineState.originX, originY: terrainPipelineState.originY,
     });
     coordinates.stereoX = stereo.x;
     coordinates.stereoY = stereo.y;
   }
   return summarizeTerrainCamera(coordinates, {
-    originX, originY, frameOffsetX: tileFrameOffsetX, frameOffsetY: tileFrameOffsetY,
-    frameOffsetReady: tileFrameOffsetReady,
+    originX: terrainPipelineState.originX, originY: terrainPipelineState.originY,
+    frameOffsetX: terrainPipelineState.frameOffsetX, frameOffsetY: terrainPipelineState.frameOffsetY,
+    frameOffsetReady: terrainPipelineState.frameOffsetReady,
   });
 }
 
@@ -1158,7 +1157,6 @@ const PREVIEW_MAX_DEPTH = 10;
 const clock = new THREE.Clock();
 const STREAMING_MAINTENANCE_MS = 1000;
 const fpsCounter = createTerrainFpsCounter();
-let streamingMaintenanceTimer = null;
 
 function markSceneMutated() { renderBackend.markSceneMutated(); }
 
@@ -1200,8 +1198,8 @@ function runStreamingMaintenance() {
     currentDate.setTime(getGameDateFromBrowserTime().getTime());
     dateChanged = applyDate(currentDate, { force: false });
   }
-  if (lastTiles) {
-    updateTextures(lastTiles);
+  if (terrainPipelineState.lastTiles) {
+    updateTextures(terrainPipelineState.lastTiles);
   }
   updateEnhancement();
   if (dateChanged || renderBackend.sceneMutationVersion !== before) {
@@ -1210,24 +1208,24 @@ function runStreamingMaintenance() {
 }
 
 const terrainFetchState = {
-  get pass() { return _loadPass; }, set pass(value) { _loadPass = value; },
-  get isFirstLoad() { return isFirstLoad; }, set isFirstLoad(value) { isFirstLoad = value; },
-  get frameOffsetReady() { return tileFrameOffsetReady; }, set frameOffsetReady(value) { tileFrameOffsetReady = value; },
-  get frameOffsetX() { return tileFrameOffsetX; }, set frameOffsetX(value) { tileFrameOffsetX = value; },
-  get frameOffsetY() { return tileFrameOffsetY; }, set frameOffsetY(value) { tileFrameOffsetY = value; },
-  get originX() { return originX; }, set originX(value) { originX = value; },
-  get originY() { return originY; }, set originY(value) { originY = value; },
-  get cameraX() { return camStereoX; }, set cameraX(value) { camStereoX = value; },
-  get cameraY() { return camStereoY; }, set cameraY(value) { camStereoY = value; },
-  get lastFetchX() { return lastFetchX; }, set lastFetchX(value) { lastFetchX = value; },
-  get lastFetchY() { return lastFetchY; }, set lastFetchY(value) { lastFetchY = value; },
-  get currentTileIds() { return currentTileIds; }, set currentTileIds(value) { currentTileIds = value; },
-  get lastTiles() { return lastTiles; }, set lastTiles(value) { lastTiles = value; },
-  get bootFetchLogged() { return bootFetchLogged; }, set bootFetchLogged(value) { bootFetchLogged = value; },
+  get pass() { return terrainPipelineState.loadPass; }, set pass(value) { terrainPipelineState.loadPass = value; },
+  get isFirstLoad() { return terrainPipelineState.firstLoad; }, set isFirstLoad(value) { terrainPipelineState.firstLoad = value; },
+  get frameOffsetReady() { return terrainPipelineState.frameOffsetReady; }, set frameOffsetReady(value) { terrainPipelineState.frameOffsetReady = value; },
+  get frameOffsetX() { return terrainPipelineState.frameOffsetX; }, set frameOffsetX(value) { terrainPipelineState.frameOffsetX = value; },
+  get frameOffsetY() { return terrainPipelineState.frameOffsetY; }, set frameOffsetY(value) { terrainPipelineState.frameOffsetY = value; },
+  get originX() { return terrainPipelineState.originX; }, set originX(value) { terrainPipelineState.originX = value; },
+  get originY() { return terrainPipelineState.originY; }, set originY(value) { terrainPipelineState.originY = value; },
+  get cameraX() { return terrainPipelineState.cameraStereoX; }, set cameraX(value) { terrainPipelineState.cameraStereoX = value; },
+  get cameraY() { return terrainPipelineState.cameraStereoY; }, set cameraY(value) { terrainPipelineState.cameraStereoY = value; },
+  get lastFetchX() { return terrainPipelineState.lastFetchX; }, set lastFetchX(value) { terrainPipelineState.lastFetchX = value; },
+  get lastFetchY() { return terrainPipelineState.lastFetchY; }, set lastFetchY(value) { terrainPipelineState.lastFetchY = value; },
+  get currentTileIds() { return terrainPipelineState.currentTileIds; }, set currentTileIds(value) { terrainPipelineState.currentTileIds = value; },
+  get lastTiles() { return terrainPipelineState.lastTiles; }, set lastTiles(value) { terrainPipelineState.lastTiles = value; },
+  get bootFetchLogged() { return terrainPipelineState.bootFetchLogged; }, set bootFetchLogged(value) { terrainPipelineState.bootFetchLogged = value; },
   set pipeline(value) {
-    _hmMissing = value.missing; _hmDownloading = value.downloading;
-    _srvTexFetching = value.textureFetching; _srvTexRetry = value.textureRetryQueue;
-    _srvTexStatus = value.textureStatusCounts;
+    terrainPipelineState.heightmapsMissing = value.missing; terrainPipelineState.heightmapsDownloading = value.downloading;
+    terrainPipelineState.serverTexturesFetching = value.textureFetching; terrainPipelineState.serverTexturesRetrying = value.textureRetryQueue;
+    terrainPipelineState.serverTextureStatus = value.textureStatusCounts;
   },
 };
 
@@ -1254,18 +1252,18 @@ const tileFetchScheduler = createTerrainFetchScheduler({
   onSkip: () => enqueueClientLog('debug', 'fetchTiles.skip', {
     reason: 'already fetching', ...getCameraLogSnapshot(),
   }),
-  onState: state => { fetching = state.fetching; _loadPass = state.pass; },
+  onState: state => { terrainPipelineState.fetching = state.fetching; terrainPipelineState.loadPass = state.pass; },
   onPreviewComplete: result => {
     bootLog('tiles.pass1-preview-done', result.previewDetails);
     requestRender();
   },
   onPoll: requestRender,
   onError: err => {
-    if (!bootFetchLogged) {
+    if (!terrainPipelineState.bootFetchLogged) {
       bootLog('tiles.initial-fetch.error', {
         message: err?.message ?? String(err), stack: err?.stack ?? null,
       });
-      bootFetchLogged = true;
+      terrainPipelineState.bootFetchLogged = true;
     }
     console.error('Fetch error:', err);
   },
@@ -1283,15 +1281,18 @@ function fetchTiles(lat, lon) {
 // --- Save/restore camera position ---
 
 function savePosition() {
-  if (isFirstLoad) return;
+  if (terrainPipelineState.firstLoad) return;
   const camLL = getCameraLatLon();
   const saved = terrainCameraState({
     cameraLatLon: camLL,
     yaw: controls.yaw,
     pitch: controls.pitch,
     mapZoom: controls.mapZoom,
-    terrainFrame: tileFrameOffsetReady
-      ? { originX, originY, offsetX: tileFrameOffsetX, offsetY: tileFrameOffsetY }
+    terrainFrame: terrainPipelineState.frameOffsetReady
+      ? {
+          originX: terrainPipelineState.originX, originY: terrainPipelineState.originY,
+          offsetX: terrainPipelineState.frameOffsetX, offsetY: terrainPipelineState.frameOffsetY,
+        }
       : null,
   });
   localStorage.setItem('clouds-cam', JSON.stringify(saved));
@@ -1318,11 +1319,11 @@ try {
     if (restored.mapZoom != null) controls.mapZoom = restored.mapZoom;
     const frame = restored.terrainFrame;
     if (frame) {
-      originX = frame.originX;
-      originY = frame.originY;
-      tileFrameOffsetX = frame.offsetX;
-      tileFrameOffsetY = frame.offsetY;
-      tileFrameOffsetReady = true;
+      terrainPipelineState.originX = frame.originX;
+      terrainPipelineState.originY = frame.originY;
+      terrainPipelineState.frameOffsetX = frame.offsetX;
+      terrainPipelineState.frameOffsetY = frame.offsetY;
+      terrainPipelineState.frameOffsetReady = true;
     }
     applyCameraOrientation();
   }
@@ -1336,7 +1337,7 @@ bootLog('tiles.initial-fetch.start', {
   anchorLat,
   anchorLon
 });
-tileFetchingReady = true;
+terrainPipelineState.ready = true;
 fetchTiles();
 if (houseRuntime.HOUSE_MODEL.enabled && houseRuntime.housesRuntimeVisible) {
   bootLog('house.initial-load.start', {
@@ -1380,7 +1381,7 @@ window.takramDebug = {
   waterMaskCache,
   deferredTiles,
   tileHistory,
-  currentTileIds,
+  currentTileIds: terrainPipelineState.currentTileIds,
   getSunDirection: () => sunDirection.clone()
 };
 
@@ -1535,12 +1536,12 @@ function updateCameraAGL() {
   aglRaycaster.set(camera.position, up.clone().negate());
   const hits = aglRaycaster.intersectObjects(terrainMeshes);
   if (hits.length > 0) {
-    cameraAGL = hits[0].distance;
+    cameraRuntimeState.agl = hits[0].distance;
   }
 }
 
 function aglSpeedFactor() {
-  const t = Math.min(1, Math.max(0, cameraAGL / AGL_FULL_SPEED_M));
+  const t = Math.min(1, Math.max(0, cameraRuntimeState.agl / AGL_FULL_SPEED_M));
   return AGL_MIN_FACTOR + (1 - AGL_MIN_FACTOR) * t;
 }
 
@@ -1574,7 +1575,7 @@ function updateMovement(dt) {
       vehicleRuntime.vehicleMarker.position.y = vehicleRuntime.vehicleGroup.position.y;
       vehicleRuntime.vehicleSnapPending = true;
       vehicleRuntime.throttledVehicleSave();
-      _lastCamMoveTime = performance.now();
+      cameraRuntimeState.lastMoveTime = performance.now();
       abortAllEnhancements();
     }
     return;
@@ -1595,7 +1596,7 @@ function updateMovement(dt) {
     controls.speed = Math.min(controls.speed + ACCEL * dt, MAX_SPEED);
   } else if (backPressed) {
     controls.speed = Math.max(controls.speed - ACCEL * dt, -MAX_SPEED);
-  } else if (!driftMode) {
+  } else if (!cameraRuntimeState.driftMode) {
     if (controls.speed > 0) {
       controls.speed = Math.max(controls.speed - BRAKE * dt, 0);
     } else if (controls.speed < 0) {
@@ -1609,7 +1610,7 @@ function updateMovement(dt) {
     controls.strafeSpeed = Math.min(controls.strafeSpeed + ACCEL * dt, STRAFE_SPEED);
   } else if (leftPressed) {
     controls.strafeSpeed = Math.max(controls.strafeSpeed - ACCEL * dt, -STRAFE_SPEED);
-  } else if (!driftMode) {
+  } else if (!cameraRuntimeState.driftMode) {
     if (controls.strafeSpeed > 0) {
       controls.strafeSpeed = Math.max(controls.strafeSpeed - BRAKE * dt, 0);
     } else if (controls.strafeSpeed < 0) {
@@ -1661,7 +1662,7 @@ function updateMovement(dt) {
     move.addScaledVector(up, -STRAFE_SPEED * dt * 0.5);
   }
   if (move.lengthSq() > 0) {
-    _lastCamMoveTime = performance.now();
+    cameraRuntimeState.lastMoveTime = performance.now();
     abortAllEnhancements();
   }
   camera.position.add(move);
@@ -1669,11 +1670,11 @@ function updateMovement(dt) {
   // or degenerate lookAt), snap back to last known good position.
   if (isNaN(camera.position.x) || isNaN(camera.position.y) || isNaN(camera.position.z)) {
     console.warn('[CAM] NaN detected — restoring last good position');
-    camera.position.copy(_lastGoodCamPos);
+    camera.position.copy(cameraRuntimeState.lastGoodPosition);
     controls.speed = 0;
     controls.strafeSpeed = 0;
   } else {
-    _lastGoodCamPos.copy(camera.position);
+    cameraRuntimeState.lastGoodPosition.copy(camera.position);
   }
   clampAltitude();
 }
@@ -1687,20 +1688,20 @@ function updateHud() {
   const headingForHud = vehicleRuntime.vehicleControlActive ? vehicleRuntime.vehicleHeadingRad : controls.yaw;
   const { degrees: deg, compass } = compassHeading(headingForHud);
   // Heightmap line — always present, stable width
-  const hmPending = _hmMissing + _hmDownloading;
-  const passLabel = _loadPass === 1
+  const hmPending = terrainPipelineState.heightmapsMissing + terrainPipelineState.heightmapsDownloading;
+  const passLabel = terrainPipelineState.loadPass === 1
     ? '<span style="color:#ff0">PASS 1 (preview)</span>'
     : '<span style="color:#8f8">PASS 2 (full)</span>';
-  const hmLine = `${passLabel}  hm: ${currentTileIds.size} tiles`
+  const hmLine = `${passLabel}  hm: ${terrainPipelineState.currentTileIds.size} tiles`
     + (hmPending > 0
-      ? `  <span style="color:#fc8">${_hmDownloading} downloading  ${_hmMissing} queued</span>`
+      ? `  <span style="color:#fc8">${terrainPipelineState.heightmapsDownloading} downloading  ${terrainPipelineState.heightmapsMissing} queued</span>`
       : '');
 
   // Texture line: client fetch status + server-side pipeline
-  const srvReady = _srvTexStatus.ready || 0;
-  const srvFetching = _srvTexStatus.fetching || 0;
-  const srvMissing = _srvTexStatus.missing || 0;
-  const srvAncestor = _srvTexStatus.ancestor_fallback || 0;
+  const srvReady = terrainPipelineState.serverTextureStatus.ready || 0;
+  const srvFetching = terrainPipelineState.serverTextureStatus.fetching || 0;
+  const srvMissing = terrainPipelineState.serverTextureStatus.missing || 0;
+  const srvAncestor = terrainPipelineState.serverTextureStatus.ancestor_fallback || 0;
   let texLine = `tex: ${texCache.size} cached`;
   // Client fetch pipeline
   if (texInflight.size > 0 || texFetching.size > 0) {
@@ -1708,12 +1709,12 @@ function updateHud() {
     texLine += `  <span style="color:#fc8">poll: ${texFetching.size}</span>`;
   }
   // Server-side pipeline — show when there's work happening
-  if (_srvTexFetching > 0 || _srvTexRetry > 0 || srvMissing > 0) {
-    texLine += `  <span style="color:#f8c">srv: ${_srvTexFetching} fetching</span>`;
-    if (_srvTexRetry > 0) texLine += `  <span style="color:#f66">${_srvTexRetry} retry</span>`;
+  if (terrainPipelineState.serverTexturesFetching > 0 || terrainPipelineState.serverTexturesRetrying > 0 || srvMissing > 0) {
+    texLine += `  <span style="color:#f8c">srv: ${terrainPipelineState.serverTexturesFetching} fetching</span>`;
+    if (terrainPipelineState.serverTexturesRetrying > 0) texLine += `  <span style="color:#f66">${terrainPipelineState.serverTexturesRetrying} retry</span>`;
     if (srvMissing > 0) texLine += `  <span style="color:#999">${srvMissing} missing</span>`;
   }
-  const es = _enhanceStatus;
+  const es = enhancementController.status;
   const enhDone = es.done || 0;
   const enhTotal = es.total || 0;
   const enhInProg = es.in_progress || 0;
@@ -1802,21 +1803,19 @@ function resetView() {
   document.getElementById('tuning-toggle').innerHTML = '&#9660;';
   updateHud();
   // Re-fetch tiles around the reset camera position.
-  isFirstLoad = true;
+  terrainPipelineState.firstLoad = true;
   textureStreamer.abortAll();
   updateTerrainTextures.reset();
   abortAllEnhancements();
   tileFetchScheduler.reset(1);
-  originX = 0; originY = 0;
-  camStereoX = 0; camStereoY = 0;
-  lastFetchX = 0; lastFetchY = 0;
-  tileFrameOffsetX = 0; tileFrameOffsetY = 0;
-  tileFrameOffsetReady = false;
+  terrainPipelineState.originX = 0; terrainPipelineState.originY = 0;
+  terrainPipelineState.cameraStereoX = 0; terrainPipelineState.cameraStereoY = 0;
+  terrainPipelineState.lastFetchX = 0; terrainPipelineState.lastFetchY = 0;
+  terrainPipelineState.frameOffsetX = 0; terrainPipelineState.frameOffsetY = 0;
+  terrainPipelineState.frameOffsetReady = false;
   houseRuntime.markHousesNeedSnap();
   fetchTiles();
 }
-
-let driftMode = false;
 
 function syncMapModePresentation() {
   // Map-only presentation belongs to one state boundary. The world-space
@@ -1828,7 +1827,7 @@ function syncMapModePresentation() {
 
 function toggleMapMode() {
   controls.mapMode = !controls.mapMode;
-  driftMode = false;
+  cameraRuntimeState.driftMode = false;
   controls.strafeSpeed = 0;
   if (controls.mapMode) {
     vehicleRuntime.setVehicleControlActive(false, 'map-mode');
@@ -1842,8 +1841,8 @@ function toggleMapMode() {
     hideTileInfo();
     hideTileMenu();
   }
-  if (lastTiles) {
-    updateTextures(lastTiles);
+  if (terrainPipelineState.lastTiles) {
+    updateTextures(terrainPipelineState.lastTiles);
   }
 }
 
@@ -1851,8 +1850,8 @@ installTerrainKeyboardControls({
   controls,
   isVehicleActive: () => vehicleRuntime.vehicleControlActive,
   onForwardDoubleTap: () => {
-    driftMode = !driftMode;
-    console.log(`[drift] ${driftMode ? 'ON' : 'OFF'}`);
+    cameraRuntimeState.driftMode = !cameraRuntimeState.driftMode;
+    console.log(`[drift] ${cameraRuntimeState.driftMode ? 'ON' : 'OFF'}`);
   },
   onEscapeVehicle: () => {
     vehicleRuntime.saveVehicleState('escape', { snapToGround: true, requireGroundedZ: false, bypassSnapThrottle: true });
@@ -2096,20 +2095,22 @@ function render() {
   waterMesh.visible = !renderBackend.isWebGPU && !controls.mapMode;
 
   // Terrain streaming: check if camera moved far enough to re-fetch
-  if (!isFirstLoad) {
+  if (!terrainPipelineState.firstLoad) {
     const camLL = getCameraLatLon();
     const stereo = terrainCameraStereoPosition({
       latitude: camLL.lat, longitude: camLL.lon,
-      anchorLatitude: anchorLat, anchorLongitude: anchorLon, originX, originY,
+      anchorLatitude: anchorLat, anchorLongitude: anchorLon,
+      originX: terrainPipelineState.originX, originY: terrainPipelineState.originY,
     });
-    camStereoX = stereo.x;
-    camStereoY = stereo.y;
+    terrainPipelineState.cameraStereoX = stereo.x;
+    terrainPipelineState.cameraStereoY = stereo.y;
     const refetch = evaluateTerrainRefetch({
-      cameraX: camStereoX, cameraY: camStereoY, lastFetchX, lastFetchY,
-      nowMs, lastTriggerMs: _lastFetchTriggerMs,
+      cameraX: terrainPipelineState.cameraStereoX, cameraY: terrainPipelineState.cameraStereoY,
+      lastFetchX: terrainPipelineState.lastFetchX, lastFetchY: terrainPipelineState.lastFetchY,
+      nowMs, lastTriggerMs: terrainPipelineState.lastFetchTriggerMs,
       distanceThreshold: REFETCH_DIST, triggerIntervalMs: 500,
     });
-    _lastFetchTriggerMs = refetch.nextTriggerMs;
+    terrainPipelineState.lastFetchTriggerMs = refetch.nextTriggerMs;
     if (refetch.shouldFetch) fetchTiles();
   }
   vehicleRuntime.snapVehicleToTerrain();
@@ -2200,6 +2201,6 @@ function render() {
   stopRenderLoopIfIdle();
 }
 
-streamingMaintenanceTimer = window.setInterval(runStreamingMaintenance, STREAMING_MAINTENANCE_MS);
+window.setInterval(runStreamingMaintenance, STREAMING_MAINTENANCE_MS);
 startRenderLoop();
 }
