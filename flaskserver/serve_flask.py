@@ -1402,9 +1402,8 @@ def api_terrain_channel(tile_id: str, chan: str):
 @app.get("/api/heatmap")
 def api_heatmap():
   """Quadtree grid and cached terrain diagnostics for the last /api/tiles
-  camera. Drives the heatmap in webserver/coverage.html. hasTexture marks
-  tiles whose own texture is already cached (safe to pull /api/texture without
-  triggering an upstream fetch)."""
+  camera. hasTexture marks tiles whose own texture is already cached (safe to
+  pull /api/texture without triggering an upstream fetch)."""
   import numpy as np
   from database import CONFIDENCE, GRID_N, _decompress_uint8
   from tiles import build_lod_tree, get_leaves
@@ -1545,8 +1544,8 @@ def api_pipeline(tile_id: str):
 @app.get("/api/coverage/index.json")
 def api_coverage_index():
   """Every tile with a REAL cached texture (placeholder crops excluded) —
-  drives coverage.html's coverage mode. ?maxdepth caps the depth (default 12,
-  the contract level); deeper tiles are detail, not coverage."""
+  ?maxdepth caps the depth (default 12, the contract level); deeper tiles are
+  detail, not coverage."""
   try:
     maxdepth = int(request.args.get("maxdepth", "12"))
   except ValueError:
@@ -2297,6 +2296,16 @@ def client_log_page():
 @app.get("/")
 def index():
   return send_from_directory(STATIC_DIR, "index.html")
+
+
+@app.get("/coverage.html")
+def retired_coverage_page():
+  return Response(
+    "Not found",
+    status=404,
+    mimetype="text/plain",
+    headers={"Cache-Control": "no-store"},
+  )
 
 
 @app.get("/<path:path>")

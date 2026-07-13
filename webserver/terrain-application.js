@@ -18,7 +18,7 @@ import { NormalPass } from 'postprocessing';
 import { buildAssetLibrary } from './procgen/library.ts';
 import { buildTileScatter, updateScatterVisibility, SCATTER_MIN_DEPTH } from './procgen/scatter.ts';
 import { priorityHeading } from './terrain-priority.js';
-import { compassHeading, createTerrainHud, renderGameClock, TERRAIN_HUD_LINKS } from './terrain-hud.js';
+import { compassHeading, createTerrainHud, renderGameClock } from './terrain-hud.js';
 import { installTerrainKeyboardControls, installTerrainPointerControls } from './terrain-controls.js';
 import { stepVehicleDrive } from './terrain-vehicle.js';
 import { createTerrainVehicleRuntime } from './terrain-vehicle-runtime.js';
@@ -266,7 +266,6 @@ const { hud, alt, gameClock: gameClockEl } = createTerrainHud({
     requestRender();
   },
 });
-const HUD_LINKS = TERRAIN_HUD_LINKS;
 
 // Transport control handlers for game clock HUD
 function rewindGameClock() {
@@ -622,8 +621,8 @@ mapLocationMarkerEl.style.cssText = [
   'transform:translate(-50%,-50%)',
   'pointer-events:none', 'z-index:18', 'display:none',
 ].join(';');
-// Match coverage.html exactly: centered, heading-up ship silhouette with the
-// same warm-yellow fill and ochre two-pixel outline.
+// Centered, heading-up ship silhouette with a warm-yellow fill and ochre
+// two-pixel outline.
 mapLocationMarkerEl.innerHTML = [
   '<svg viewBox="-9 -13 18 25" width="18" height="25" aria-hidden="true">',
   '<path d="M 0 -12 L 8 10 L 0 5 L -8 10 Z" ',
@@ -1459,8 +1458,6 @@ function updateHud() {
       ? `ocean overlay: ${terrainTileSet.oceanOverlayEnabled ? 'ON' : 'OFF'}  (right-click menu; cyan=ocean, magenta=seed, orange=passable)`
       : '',
     '<span id="mapModeLink" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">map mode</span> (M), R reset · <span id="debugLogLink" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">debug log</span>'
-    + ' · <span id="pipelineMapLink" title="2D radar in pipeline-map mode — click any tile to open its tile inspector" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">pipeline map</span> (P)'
-    + ' · <span id="radarHeatmapLink" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">heatmap</span> (H)'
   ].join('<br>');
   alt.textContent =
     `${altM.toFixed(0)}m / ${(altM * 3.28084).toFixed(0)}ft  ${deg.toFixed(0)}° ${compass}` +
@@ -1556,8 +1553,6 @@ installTerrainKeyboardControls({
     vehicleRuntime.setVehicleControlActive(false, 'escape', { skipExitSave: true });
   },
   onToggleMap: toggleMapMode,
-  onOpenPipeline: () => window.open(HUD_LINKS.pipelineMapLink, '_blank'),
-  onOpenHeatmap: () => window.open(HUD_LINKS.radarHeatmapLink, '_blank'),
   onReset: resetView,
   onHouseAction: load => load
     ? houseRuntime.loadHouseModel('keyboard')

@@ -59,8 +59,6 @@ The camera starts facing north at Nuuk (64.18°N, 51.72°W). You can override th
 
 Press **M** to toggle a 2D map view (no clouds/atmosphere) for navigation and tile debugging. Right-click on a tile to inspect its metadata or open it in the tile inspector.
 
-Press **P** to open the **pipeline map** — the radar (`coverage.html`) showing every tile with a cached texture — in a new tab. Click any tile there to open it in the tile inspector (`pipeline.html`). The radar's other tab, **heatmap**, shows the live fetch queue colored by priority.
-
 In 3D mode, atmosphere sliders allow adjusting cloud density, coverage, and lighting parameters. (WIP — still working out some bugs.)
 
 ## Setup

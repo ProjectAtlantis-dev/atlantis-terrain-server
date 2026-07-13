@@ -1,7 +1,5 @@
 export const TERRAIN_HUD_LINKS = Object.freeze({
   debugLogLink: '/client_log.html',
-  radarHeatmapLink: '/coverage.html?mode=heatmap',
-  pipelineMapLink: '/coverage.html?mode=coverage',
 });
 
 function appendPanel(cssText) {
