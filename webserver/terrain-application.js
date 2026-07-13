@@ -56,6 +56,7 @@ import { createTerrainTileMenuRuntime } from './terrain-tile-menu-runtime.js';
 import { createWebGPUTerrainBackend } from './render-backends/webgpu-backend.js';
 import { createWebGPUAtmosphereController } from './render-backends/webgpu-atmosphere.js';
 import { createWebGLTerrainBackend } from './render-backends/webgl-backend.js';
+import { createTerrainBathymetryOverlay } from './terrain-bathymetry-overlay.js';
 
 const USE_WEBGPU_RENDER_BACKEND = globalThis.__TERRAIN_BACKEND__ === 'webgpu';
 // Calibrated against the cloudless WebGL reference. WebGL uses exposure 10
@@ -332,6 +333,8 @@ const tileMenuRuntime = createTerrainTileMenuRuntime({
   controls, tileInfoElement: tileInfoEl, getTerrainRoot: () => terrainRoot,
   getOceanEnabled: () => oceanMapDebugEnabled,
   toggleOcean: () => { oceanMapDebugEnabled = !oceanMapDebugEnabled; },
+  getBathyEnabled: USE_WEBGPU_RENDER_BACKEND ? null : () => bathymetryOverlay.enabled,
+  toggleBathy: USE_WEBGPU_RENDER_BACKEND ? null : () => bathymetryOverlay.toggle(),
   refreshTextures: () => { if (lastTiles) updateTextures(lastTiles); },
   submitEnhancement: (tileId, options) => enhancementController.submit(tileId, options),
   getTextureStreamer: () => textureStreamer,
@@ -644,6 +647,25 @@ camMarker.layers.set(0);
 camMarker.frustumCulled = false;
 camMarker.renderOrder = 1000;
 terrainRoot.add(camMarker);
+// The centered map-location arrow is UI, not world geometry. Keep a DOM
+// presentation as the authoritative marker so backend depth/post-processing
+// changes cannot make the navigation indicator disappear.
+const mapLocationMarkerEl = document.createElement('div');
+mapLocationMarkerEl.setAttribute('aria-label', 'Current camera location');
+mapLocationMarkerEl.style.cssText = [
+  'position:fixed', 'left:50%', 'top:50%', 'width:18px', 'height:24px',
+  'transform:translate(-50%,-50%)',
+  'pointer-events:none', 'z-index:18', 'display:none',
+].join(';');
+// Match coverage.html exactly: centered, heading-up ship silhouette with the
+// same warm-yellow fill and ochre two-pixel outline.
+mapLocationMarkerEl.innerHTML = [
+  '<svg viewBox="-9 -13 18 25" width="18" height="25" aria-hidden="true">',
+  '<path d="M 0 -12 L 8 10 L 0 5 L -8 10 Z" ',
+  'fill="#ffe14a" stroke="#806c00" stroke-width="2" stroke-linejoin="round"/>',
+  '</svg>',
+].join('');
+document.body.appendChild(mapLocationMarkerEl);
 const markerCameraRel = new THREE.Vector3();
 const mapScreenUp = new THREE.Vector3();
 const markerForwardLocal = new THREE.Vector3(0, 1, 0);
@@ -857,6 +879,13 @@ if (renderBackend.isWebGPU) {
 // --- Heightmap decode + mesh building (adapted for ENU frame) ---
 
 let oceanMapDebugEnabled = false;
+const bathymetryOverlay = createTerrainBathymetryOverlay({
+  THREE,
+  enabled: !USE_WEBGPU_RENDER_BACKEND,
+  onReady: () => {
+    if (lastTiles) updateTextures(lastTiles);
+  },
+});
 const terrainOceanClassifier = createTerrainOceanClassifier({ THREE, paramNumber });
 const buildMesh = createTerrainMeshBuilder({
   oceanClassifier: terrainOceanClassifier,
@@ -941,11 +970,16 @@ function applyTerrainMaterialMode(mesh, tex) {
     }
     return;
   }
-  if (tex && mesh.material.map !== tex) {
-    mesh.material.map = tex;
+  const resolvedTexture = bathymetryOverlay.resolveTexture(
+    mesh,
+    tex,
+    controls.mapMode,
+  );
+  if (resolvedTexture && mesh.material.map !== resolvedTexture) {
+    mesh.material.map = resolvedTexture;
     needsUpdate = true;
   }
-  if (!tex && USE_WEBGPU_RENDER_BACKEND) {
+  if (!resolvedTexture && USE_WEBGPU_RENDER_BACKEND) {
     applyWebGPUUntexturedTerrainMaterial(mesh);
     return;
   }
@@ -1761,7 +1795,7 @@ function resetView() {
   camera.position.copy(defaultCameraPosition);
   camera.fov = 60;
   camera.updateProjectionMatrix();
-  camMarker.visible = false;
+  syncMapModePresentation();
   hideTileInfo();
   applyCameraOrientation();
   updateMapCamera();
@@ -1791,6 +1825,14 @@ function resetView() {
 
 let driftMode = false;
 
+function syncMapModePresentation() {
+  // Map-only presentation belongs to one state boundary. The world-space
+  // marker remains disabled; the centered DOM arrow is backend-independent.
+  camMarker.visible = false;
+  mapLocationMarkerEl.style.display = controls.mapMode ? 'block' : 'none';
+  tuningPanel.style.display = controls.mapMode ? 'none' : '';
+}
+
 function toggleMapMode() {
   controls.mapMode = !controls.mapMode;
   driftMode = false;
@@ -1798,8 +1840,7 @@ function toggleMapMode() {
   if (controls.mapMode) {
     vehicleRuntime.setVehicleControlActive(false, 'map-mode');
   }
-  camMarker.visible = controls.mapMode;
-  tuningPanel.style.display = controls.mapMode ? 'none' : '';
+  syncMapModePresentation();
   controls.mapPanEast = 0;
   controls.mapPanNorth = 0;
   if (controls.mapMode) {
@@ -2046,6 +2087,7 @@ function render() {
   updateMovement(dt);
   applyCameraOrientation();
   updateHud();
+  syncMapModePresentation();
 
   // Update fog density from slider
   const fogStrength = controls._fogStrength ?? (
