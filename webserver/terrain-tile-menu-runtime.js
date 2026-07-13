@@ -136,12 +136,6 @@ export function createTerrainTileMenuRuntime({
         terrainTiles.toggleOceanOverlay();
         hide();
       });
-      if (terrainTiles.bathymetryAvailable) {
-        addAction(`Flatten Overlay: ${terrainTiles.bathymetryEnabled ? 'ON' : 'OFF'}`, () => {
-          terrainTiles.toggleBathymetry();
-          hide();
-        });
-      }
     }
     addAction('Tile inspector', () => {
       hide();

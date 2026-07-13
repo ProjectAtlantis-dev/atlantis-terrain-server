@@ -491,7 +491,6 @@ export function createTerrainTileSet({
   textureStreamer,
   terrain,
   renderBackend,
-  bathymetryOverlay,
   view,
   log,
   vehicle = {},
@@ -550,9 +549,7 @@ export function createTerrainTileSet({
       }
       mesh.material.color.set(0xffffff);
     } else {
-      const resolvedTexture = bathymetryOverlay?.resolveTexture(
-        mesh, texture, view.controls.mapMode,
-      ) ?? texture;
+      const resolvedTexture = texture;
       if (resolvedTexture && mesh.material.map !== resolvedTexture) {
         mesh.material.map = resolvedTexture;
         needsUpdate = true;
@@ -649,13 +646,6 @@ export function createTerrainTileSet({
     onMutated();
   }
 
-  function toggleBathymetry() {
-    if (!renderBackend?.supportsBathymetry) return;
-    bathymetryOverlay.toggle();
-    refreshTextures();
-    onMutated();
-  }
-
   function applyEnhancedTexture(tileId, texture) {
     const mesh = terrainRoot.children.find(
       child => child.isMesh && child.userData?.tileId === tileId,
@@ -682,14 +672,11 @@ export function createTerrainTileSet({
   return {
     get currentTileIds() { return currentTileIds; },
     get oceanOverlayEnabled() { return oceanOverlayEnabled; },
-    get bathymetryAvailable() { return Boolean(renderBackend?.supportsBathymetry); },
-    get bathymetryEnabled() { return Boolean(renderBackend?.supportsBathymetry && bathymetryOverlay.enabled); },
     deferredTiles,
     reconcile,
     updateTextures,
     refreshTextures,
     toggleOceanOverlay,
-    toggleBathymetry,
     applyEnhancedTexture,
     discardEnhancedTexture,
     resetTextureApplications: updateTextureDemand.reset,

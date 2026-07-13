@@ -39,7 +39,6 @@ import { createTerrainTuningControls } from './terrain-tuning-controls.js';
 import { bindTerrainCloudComposition, configureTerrainClouds, registerTerrainCloudTuning } from './terrain-cloud-runtime.js';
 import { createTerrainHouseSceneRuntime } from './terrain-house-scene-runtime.js';
 import { createTerrainTileMenuRuntime } from './terrain-tile-menu-runtime.js';
-import { createTerrainBathymetryOverlay } from './terrain-bathymetry-overlay.js';
 
 export async function startTerrainApplication({ backend = 'webgl' } = {}) {
 if (backend !== 'webgl' && backend !== 'webgpu') {
@@ -88,7 +87,6 @@ const webgpuCloudShadowSettings = {
 if (window.location.search) {
   history.replaceState(null, '', `${window.location.pathname}${window.location.hash}`);
 }
-const _recolor = false;
 const DEFAULT_ASSET_SERVER_BASE = 'http://127.0.0.1:8787';
 const ASSET_SERVER_BASE = DEFAULT_ASSET_SERVER_BASE;
 const VEHICLE_STATE_ENDPOINT = `${ASSET_SERVER_BASE}/api/vehicle_state`;
@@ -836,13 +834,6 @@ if (renderBackend.isWebGPU) {
 
 // --- Heightmap decode + mesh building (adapted for ENU frame) ---
 
-const bathymetryOverlay = createTerrainBathymetryOverlay({
-  THREE,
-  enabled: renderBackend.supportsBathymetry,
-  onReady: () => {
-    terrainTileSet.refreshTextures();
-  },
-});
 // --- Status colors for untextured tiles ---
 
 function priorityColor(priority, minP, maxP) {
@@ -883,7 +874,7 @@ const TEX_RETRY_202_MAX_MS = 30000;   // cap backoff at 30s
 const TEX_RETRY_ERROR_MS = 3000;
 const TEX_REPOLL_BATCH = 8;           // max 202 re-polls fired per frame
 const textureStreamer = createTextureStreamer({
-  log: tileLog, recolor: _recolor, enableWaterMasks: ENABLE_WATER_MASKS,
+  log: tileLog, enableWaterMasks: ENABLE_WATER_MASKS,
   maxInflight: TEX_MAX, repollBatch: TEX_REPOLL_BATCH,
   retryBaseMs: TEX_RETRY_202_BASE_MS, retryMaxMs: TEX_RETRY_202_MAX_MS,
   retryErrorMs: TEX_RETRY_ERROR_MS,
@@ -901,7 +892,6 @@ const terrainTileSet = createTerrainTileSet({
     attachScatter: attachTileScatter,
   },
   renderBackend,
-  bathymetryOverlay,
   view: { camera, anchorPosition, east, north, up, controls },
   log: tileLog,
   vehicle: vehicleRuntime,

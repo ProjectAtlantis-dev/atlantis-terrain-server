@@ -56,7 +56,6 @@ export function createWebGPUTerrainBackend({
   const backend = {
     kind: 'webgpu',
     isWebGPU: true,
-    supportsBathymetry: false,
     renderer,
     get ready() { return ready; },
     get animationLoopActive() { return animationLoopActive; },

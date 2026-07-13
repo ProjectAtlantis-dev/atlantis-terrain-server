@@ -1,7 +1,0 @@
-[
- {"tile": "12-1373-784", "note": "coastal; fjord flipped to rock along a Google exposure-block seam"},
- {"tile": "13-2770-1562", "note": "glacier; shadowed snow/ice classified as rock, painted near-black"},
- {"tile": "11-703-385", "note": "Ameralik; bathy carve — shadowed SE rock is water-colored, old flatten carved it and pushed a 100m cliff onto the tile seam"},
- {"tile": "11-704-385", "note": "Ameralik; bathy miss — fake shore berm (0.5-99m) survived because the old cliff peel collapsed the whole capture"},
- {"tile": "12-1408-770", "note": "Ameralik; bathy miss — fake apron with 20-38m seawall in open water; moat floor sits above CLIFF_TOL so naive peels eat the capture"}
-]

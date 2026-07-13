@@ -1,1 +1,1 @@
-"""Terrain classification, training, and regression tooling."""
+"""Terrain classification helpers."""

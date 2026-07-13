@@ -38,7 +38,6 @@ CONFIDENCE = {
     'external':   4,
     'arcticdem':  5,
     'arcticdem_10m': 6,
-    'bathymetry': 7,   # fake-seamount flatten (bathymetry.py) — must win edges
 }
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
@@ -97,9 +96,7 @@ CREATE TABLE IF NOT EXISTS tiles (
     source          TEXT NOT NULL DEFAULT 'empty',
     updated_at      TEXT NOT NULL,
     heightmap       BLOB,
-    confidence_map  BLOB,
-    has_sealevel_water  INTEGER CHECK (has_sealevel_water IN (0, 1)),
-    has_flattened_water INTEGER CHECK (has_flattened_water IN (0, 1))
+    confidence_map  BLOB
 );
 
 CREATE TABLE IF NOT EXISTS metadata (
@@ -109,6 +106,59 @@ CREATE TABLE IF NOT EXISTS metadata (
 """
 
 # see texture.py for the texture table
+
+
+def _retire_legacy_terrain_data(db):
+    """Discard data produced or retained by retired terrain pipelines.
+
+    Bathymetry rewrote the canonical heightmap and kept a second copy in
+    ``bathy_originals``.  Neither copy is trustworthy: reset every tile the
+    old pipeline touched so the normal missing-tile path reloads it from the
+    source COG, then remove the obsolete storage.
+    """
+    tables = {
+        row[0]
+        for row in db.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        )
+    }
+    reload_ids = set()
+
+    if "bathy_originals" in tables:
+        reload_ids.update(
+            row[0] for row in db.execute("SELECT tile_id FROM bathy_originals")
+        )
+
+    for tile_id, blob in db.execute(
+        "SELECT tile_id, confidence_map FROM tiles WHERE confidence_map IS NOT NULL"
+    ):
+        try:
+            confidence = np.frombuffer(zlib.decompress(blob), dtype=np.uint8)
+        except (TypeError, ValueError, zlib.error):
+            continue
+        if np.any(confidence >= 7):
+            reload_ids.add(tile_id)
+
+    if reload_ids:
+        now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        db.executemany(
+            "UPDATE tiles SET heightmap = NULL, confidence_map = NULL, "
+            "geometric_error = 0.0, source = 'empty', updated_at = ? "
+            "WHERE tile_id = ?",
+            ((now, tile_id) for tile_id in reload_ids),
+        )
+        log_db.info(
+            f"Reset {len(reload_ids)} retired terrain tiles for cloud reload"
+        )
+
+    db.execute("DROP TABLE IF EXISTS bathy_originals")
+    db.execute("DROP TABLE IF EXISTS google_refs")
+
+    columns = {row[1] for row in db.execute("PRAGMA table_info(tiles)")}
+    for column in ("has_sealevel_water", "has_flattened_water"):
+        if column in columns:
+            db.execute(f"ALTER TABLE tiles DROP COLUMN {column}")
+
 
 def open_db(path=None):
     """Create or open the terrain database.
@@ -128,17 +178,7 @@ def open_db(path=None):
     db.execute("PRAGMA synchronous=NORMAL")
     existing = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
     db.executescript(_SCHEMA)
-    tile_columns = {r[1] for r in db.execute("PRAGMA table_info(tiles)")}
-    if "has_sealevel_water" not in tile_columns:
-        db.execute(
-            "ALTER TABLE tiles ADD COLUMN has_sealevel_water INTEGER "
-            "CHECK (has_sealevel_water IN (0, 1))"
-        )
-    if "has_flattened_water" not in tile_columns:
-        db.execute(
-            "ALTER TABLE tiles ADD COLUMN has_flattened_water INTEGER "
-            "CHECK (has_flattened_water IN (0, 1))"
-        )
+    _retire_legacy_terrain_data(db)
     db.commit()
     for tbl in ("tiles", "metadata"):
         if tbl not in existing:
@@ -149,35 +189,6 @@ def open_db(path=None):
     init_textures(db)
 
     return db
-
-
-def ensure_water_flag_columns(db):
-    """Add canonical tile water flags to databases opened outside open_db."""
-    columns = {r[1] for r in db.execute("PRAGMA table_info(tiles)")}
-    if "has_sealevel_water" not in columns:
-        db.execute(
-            "ALTER TABLE tiles ADD COLUMN has_sealevel_water INTEGER "
-            "CHECK (has_sealevel_water IN (0, 1))"
-        )
-    if "has_flattened_water" not in columns:
-        db.execute(
-            "ALTER TABLE tiles ADD COLUMN has_flattened_water INTEGER "
-            "CHECK (has_flattened_water IN (0, 1))"
-        )
-    db.commit()
-
-
-def set_tile_water_flags(db, tile_id, *, has_sealevel_water, has_flattened_water):
-    """Persist water classification on the canonical tile row."""
-    ensure_water_flag_columns(db)
-    cursor = db.execute(
-        "UPDATE tiles SET has_sealevel_water = ?, has_flattened_water = ? "
-        "WHERE tile_id = ?",
-        (int(bool(has_sealevel_water)), int(bool(has_flattened_water)), tile_id),
-    )
-    if cursor.rowcount == 0:
-        raise KeyError(f"Unknown tile_id: {tile_id}")
-    db.commit()
 
 
 # ---------------------------------------------------------------------------
@@ -403,9 +414,7 @@ def _reconcile_edges(db, tile_id, heightmap, confidence_map):
             now = datetime.datetime.now(datetime.timezone.utc).isoformat()
             db.execute(
                 "UPDATE tiles SET heightmap = ?, confidence_map = ?, "
-                "geometric_error = ?, updated_at = ?, "
-                "has_sealevel_water = NULL, has_flattened_water = NULL "
-                "WHERE tile_id = ?",
+                "geometric_error = ?, updated_at = ? WHERE tile_id = ?",
                 (_compress_array(nbr_hm), _compress_array(nbr_cm),
                  nbr_error, now, nbr_id)
             )
@@ -453,8 +462,6 @@ def write_tile(
     assert heightmap.dtype == np.float32
     assert confidence_map.dtype == np.uint8
 
-    ensure_water_flag_columns(db)
-
     # Make copies so we don't mutate caller's arrays
     heightmap = heightmap.copy()
     confidence_map = confidence_map.copy()
@@ -472,9 +479,7 @@ def write_tile(
     if allow_overwrite:
         cursor = db.execute(
             "UPDATE tiles SET heightmap = ?, confidence_map = ?, "
-            "geometric_error = ?, source = ?, updated_at = ?, "
-            "has_sealevel_water = NULL, has_flattened_water = NULL "
-            "WHERE tile_id = ?",
+            "geometric_error = ?, source = ?, updated_at = ? WHERE tile_id = ?",
             (hm_blob, cm_blob, error, source, now, tile_id)
         )
         if cursor.rowcount == 0:
@@ -485,8 +490,7 @@ def write_tile(
     # Atomic no-clobber write: only populate tiles that do not yet have payloads.
     cursor = db.execute(
         "UPDATE tiles SET heightmap = ?, confidence_map = ?, "
-        "geometric_error = ?, source = ?, updated_at = ?, "
-        "has_sealevel_water = NULL, has_flattened_water = NULL "
+        "geometric_error = ?, source = ?, updated_at = ? "
         "WHERE tile_id = ? AND heightmap IS NULL AND confidence_map IS NULL",
         (hm_blob, cm_blob, error, source, now, tile_id)
     )

@@ -2,8 +2,8 @@
  * scatter — per-tile deterministic placement of library assets on terrain.
  *
  * First-pass chain validation: density is gated by DEM facts only (elevation,
- * slope, southness from the tile heightmap) — the class-map (classifier/biomes.py
- * buckets) hookup comes next. Placement is seeded from the tile id, so a
+ * slope and southness from the tile heightmap); the classifier hookup comes
+ * next. Placement is seeded from the tile id, so a
  * revisit rebuilds the identical scatter.
  *
  * Frame: tile meshes are flat grids in EPSG:3413 stereo meters, z-up.

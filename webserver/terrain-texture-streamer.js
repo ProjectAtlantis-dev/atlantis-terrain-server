@@ -16,7 +16,6 @@ export function rendererTextureAnisotropy(renderer) {
 
 export function createTextureStreamer({
   log,
-  recolor = false,
   enableWaterMasks = false,
   maxInflight = 120,
   repollBatch = 8,
@@ -98,7 +97,7 @@ export function createTextureStreamer({
 
       const controller = new AbortController();
       texInflight.set(tileId, controller);
-      fetchImpl(`/api/texture/${tileId}.jpg?v=${version}&demand=${version}&demandClient=${encodeURIComponent(demandClient)}${recolor ? '&stage=colorized' : ''}`, { signal: controller.signal })
+      fetchImpl(`/api/texture/${tileId}.jpg?v=${version}&demand=${version}&demandClient=${encodeURIComponent(demandClient)}`, { signal: controller.signal })
         .then(response => {
           texInflight.delete(tileId);
           if (response.status === 202) {

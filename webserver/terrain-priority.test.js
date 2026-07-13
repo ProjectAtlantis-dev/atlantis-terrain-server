@@ -593,17 +593,11 @@ test('terrain tile set owns reconciliation, scene residency, and texture demand'
     requestWaterMask() {},
     pump(scored) { textureRequests.push(...scored.map(item => item.tile.id)); },
   };
-  const bathymetryOverlay = {
-    enabled: false,
-    resolveTexture: (_mesh, texture) => texture,
-    toggle() { this.enabled = !this.enabled; },
-  };
   const tileSet = createTerrainTileSet({
     terrainRoot,
     textureStreamer,
     terrain: {},
-    renderBackend: { supportsBathymetry: true },
-    bathymetryOverlay,
+    renderBackend: {},
     view: { controls: { mapMode: false } },
     log() {},
     testOverrides: {
@@ -632,9 +626,6 @@ test('terrain tile set owns reconciliation, scene residency, and texture demand'
   const enhancedTexture = { disposed: false, dispose() { this.disposed = true; } };
   assert.equal(tileSet.applyEnhancedTexture(tile.id, enhancedTexture), true);
   assert.equal(terrainRoot.children[0].material.map, enhancedTexture);
-  assert.equal(tileSet.bathymetryAvailable, true);
-  tileSet.toggleBathymetry();
-  assert.equal(tileSet.bathymetryEnabled, true);
   assert.equal(tileSet.discardEnhancedTexture(tile.id), true);
   assert.deepEqual(invalidated, [tile.id]);
   assert.equal(enhancedTexture.disposed, true);

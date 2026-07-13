@@ -71,9 +71,6 @@
   <button id="go">Go</button>
   <button id="up" title="parent tile ([)">&minus; depth</button>
   <button id="down" title="child tile (])">+ depth</button>
-  <button id="refresh-google" title="re-fetch the Google reference, bypassing the cache">refresh google</button>
-  <button id="flag" title="add this tile to the classifier regression cases, with a note about what is wrong">&#9873; flag regression</button>
-  <a href="/api/regression/" target="_blank" style="color:#5af">regression cases</a>
   <span id="meta"></span>
 </div>
 <div id="flow"></div>
@@ -113,25 +110,8 @@ const STAGES = [
       : '<span class="bad">not fetched yet</span>'
   },
   {
-    key: 'google', name: '4 google ref',
-    what: 'labeling reference only — sharper imagery that grades our classes; never shipped',
-    img: (tid, _o, refresh) => `/api/google/${tid}.jpg?res=${RES}${refresh ? '&refresh=1' : ''}`,
-    info: m => m.google_ref.ok
-      ? `<span class="ok">cached</span> · z${m.google_ref.zoom} · ${(m.google_ref.bytes / 1024).toFixed(0)} kB`
-      : 'not cached — first view fetches'
-  },
-  {
-    key: 'buckets', name: '5 buckets',
-    what: 'what goes where: water / grey / dark / green / white — the contract procgen paints from',
-    img: tid => `/api/classes/${tid}/coarse.png?res=${RES}`,
-    legend: { grey: '#9669d2', green: '#96e13c', dark: '#ff8c00', white: '#ffffff', water: '#285aff' },
-    info: m => (m.heightmap.ok
-      ? '<span class="ok">computed from google + DEM</span>'
-      : 'computed from google only (no DEM gates)')
-  },
-  {
-    key: 'procgen', name: '6 procgen',
-    what: 'below-d12 synthesis: invented detail from buckets + DEM + seed — gorgeous, deterministic',
+    key: 'procgen', name: '4 procgen',
+    what: 'below-d12 synthesis from classifier output + DEM + seed — deterministic',
     img: null,
     info: () => '<span class="bad">not built yet</span> — this is the next thing'
   },
@@ -213,30 +193,6 @@ async function load() {
 }
 
 $('go').addEventListener('click', () => { if (parseTile($('tile-input').value)) load(); });
-$('refresh-google').addEventListener('click', () => {
-  const g = STAGES.find(s => s.key === 'google');
-  loadStageImage(g, true);
-  // buckets classify off the google ref — recompute them too
-  loadStageImage(STAGES.find(s => s.key === 'buckets'));
-});
-$('flag').addEventListener('click', async () => {
-  const note = prompt(`What is wrong on tile ${tileId()}? (one line — becomes the regression note)`);
-  if (!note || !note.trim()) return;
-  $('meta').textContent = 'flagging + baking regression case…';
-  try {
-    const resp = await fetch('/api/regression/cases', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ tile: tileId(), note: note.trim() })
-    });
-    const j = await resp.json().catch(() => ({}));
-    $('meta').textContent = resp.ok
-      ? `flagged ${tileId()} — ${j.cases} case${j.cases === 1 ? '' : 's'} total`
-      : `flag failed: ${j.error || `HTTP ${resp.status}`}`;
-  } catch (err) {
-    $('meta').textContent = `flag failed: ${err}`;
-  }
-});
 $('tile-input').addEventListener('keydown', e => {
   if (e.key === 'Enter') $('go').click();
   e.stopPropagation();

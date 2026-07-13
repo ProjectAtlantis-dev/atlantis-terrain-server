@@ -43,7 +43,6 @@ export function createWebGLTerrainBackend({
   const backend = {
     kind: 'webgl',
     isWebGPU: false,
-    supportsBathymetry: true,
     renderer,
     get sceneMutationVersion() { return sceneMutationVersion; },
     setFogDensity(value) { sceneFog.density = value; },
