@@ -13,13 +13,12 @@ import { meshUsesTextureClassification, scoreTextureTiles, textureRetryDelay, ti
 import { createTextureStreamer, rendererTextureAnisotropy } from './terrain-texture-streamer.js';
 import { createTileLifecycle } from './terrain-tile-lifecycle.js';
 import { reconcileTerrainTiles } from './terrain-tile-reconciler.js';
-import { createTerrainFetchScheduler } from './terrain-fetch-scheduler.js';
 import { createTerrainTextureController } from './terrain-texture-controller.js';
 import { createTerrainEnhancementController } from './terrain-enhancement-controller.js';
 import { createTerrainMeshBuilder, decodeTerrainHeightmap } from './terrain-mesh-builder.js';
 import { applyTerrainAvailabilityStatus, createTerrainSeamStatusController } from './terrain-status-controller.js';
 import { collectTerrainDebugMeshes, createTerrainHoverOutlineController, createTerrainOutlineController, summarizeTerrainMesh } from './terrain-debug-runtime.js';
-import { createTerrainFetchExecutor } from './terrain-fetch-executor.js';
+import { createTerrainFetchRuntime } from './terrain-fetch-runtime.js';
 import { restoreTerrainCameraState, terrainCameraState } from './terrain-camera-state.js';
 import { createTerrainClientLogger } from './terrain-client-logging.js';
 import { createTerrainFpsCounter } from './terrain-fps-counter.js';
@@ -616,22 +615,49 @@ test('shared camera coordinates and log summary use one ENU conversion', () => {
   assert.equal(summary.camStereoApproxY, 220);
 });
 
-test('shared fetch scheduler serializes preview, full pass, and polling', async () => {
+function createTestFetchRuntime({ fetchImpl, ...options } = {}) {
+  const state = {
+    loadPass: 1, fetching: false, firstLoad: true, frameOffsetReady: false,
+    frameOffsetX: 0, frameOffsetY: 0, originX: 0, originY: 0,
+    cameraStereoX: 0, cameraStereoY: 0, lastFetchX: 0, lastFetchY: 0,
+    currentTileIds: new Set(), lastTiles: null, bootFetchLogged: false,
+  };
+  const runtime = createTerrainFetchRuntime({
+    state, previewMaxDepth: 10, getHeading: () => 0, getRange: () => 1000,
+    getCameraLatLon: () => ({ lat: 64, lon: -51, alt: 100 }),
+    getCameraSnapshot: () => ({ camEastM: 0, camNorthM: 0 }),
+    getCameraLocalPosition: () => ({ x: 0, y: 0 }),
+    anchorLatitude: 64, anchorLongitude: -51,
+    terrainRoot: { children: [] }, deferredTiles: new Map(),
+    lifecycle: { sweepStaleParents: () => 0 }, priorityForTile: () => 0,
+    textureCache: new Map(), materialize() {}, buildMesh() {}, tileLog() {},
+    applyMissing() {}, updateTextures() {}, enqueueLog() {}, bootLog() {},
+    fetchImpl,
+    ...options,
+  });
+  return { runtime, state };
+}
+
+test('shared fetch runtime serializes preview, full pass, and polling', async () => {
   const passes = [];
   let frameCallback = null;
   let pollCallback = null;
-  const scheduler = createTerrainFetchScheduler({
-    execute: async ({ pass }) => {
-      passes.push(pass);
-      return { nextAction: pass === 1 ? 'full-pass' : 'poll' };
+  const responseData = () => ({
+    ox: 0, oy: 0, qx: 0, qy: 0, tiles: [],
+    missing: passes.length > 1 ? [{}] : [], downloading: [], texFetching: 0,
+  });
+  const { runtime, state } = createTestFetchRuntime({
+    fetchImpl: async () => {
+      passes.push(state.loadPass);
+      return { status: 200, json: async () => responseData() };
     },
     scheduleFrame: callback => { frameCallback = callback; },
     schedulePoll: callback => { pollCallback = callback; return 7; },
     cancelPoll: () => {},
   });
-  await scheduler.request();
+  await runtime.request();
   assert.deepEqual(passes, [1]);
-  assert.equal(scheduler.pass, 2);
+  assert.equal(state.loadPass, 2);
   await frameCallback();
   assert.deepEqual(passes, [1, 2]);
   assert.equal(typeof pollCallback, 'function');
@@ -639,36 +665,40 @@ test('shared fetch scheduler serializes preview, full pass, and polling', async 
   assert.deepEqual(passes, [1, 2, 2]);
 });
 
-test('shared fetch scheduler rejects overlapping requests', async () => {
+test('shared fetch runtime rejects overlapping requests', async () => {
   let release;
   let skips = 0;
-  const scheduler = createTerrainFetchScheduler({
-    execute: () => new Promise(resolve => { release = resolve; }),
+  const { runtime } = createTestFetchRuntime({
+    fetchImpl: () => new Promise(resolve => { release = resolve; }),
     onSkip: () => { skips += 1; },
   });
-  const first = scheduler.request();
-  await scheduler.request();
+  const first = runtime.request();
+  await runtime.request();
   assert.equal(skips, 1);
-  release({ nextAction: 'idle' });
+  release({ status: 200, json: async () => ({
+    ox: 0, oy: 0, qx: 0, qy: 0, tiles: [], missing: [], downloading: [], texFetching: 0,
+  }) });
   await first;
 });
 
 test('reset aborts the active terrain generation and ignores its completion', async () => {
   let activeSignal = null;
   let release;
-  const scheduler = createTerrainFetchScheduler({
-    execute: ({ signal }) => {
+  const { runtime, state } = createTestFetchRuntime({
+    fetchImpl: (_url, { signal }) => {
       activeSignal = signal;
       return new Promise(resolve => { release = resolve; });
     },
   });
-  const request = scheduler.request();
-  scheduler.reset(1);
+  const request = runtime.request();
+  runtime.reset(1);
   assert.equal(activeSignal.aborted, true);
-  release({ nextAction: 'poll' });
+  release({ status: 200, json: async () => ({
+    ox: 0, oy: 0, qx: 0, qy: 0, tiles: [], missing: [], downloading: [], texFetching: 0,
+  }) });
   await request;
-  assert.equal(scheduler.pass, 1);
-  assert.equal(scheduler.fetching, false);
+  assert.equal(state.loadPass, 1);
+  assert.equal(state.fetching, false);
 });
 
 test('shared texture controller budgets scene applications per frame', () => {
@@ -853,16 +883,17 @@ test('shared terrain hover outline owns replacement and cleanup', () => {
   assert.equal(changes, 2);
 });
 
-test('shared fetch executor preserves initial response transition ordering', async () => {
+test('shared fetch runtime preserves initial response transition ordering', async () => {
   const events = [];
   const state = {
-    pass: 1, isFirstLoad: true, frameOffsetReady: false,
+    loadPass: 1, firstLoad: true, frameOffsetReady: false,
     frameOffsetX: 0, frameOffsetY: 0, originX: 0, originY: 0,
-    cameraX: 0, cameraY: 0, lastFetchX: 0, lastFetchY: 0,
+    cameraStereoX: 0, cameraStereoY: 0, lastFetchX: 0, lastFetchY: 0,
     currentTileIds: new Set(), lastTiles: null, bootFetchLogged: false,
-    set pipeline(value) { this.pipelineValue = value; },
+    heightmapsMissing: 0, heightmapsDownloading: 0,
+    serverTexturesFetching: 0, serverTexturesRetrying: 0, serverTextureStatus: {},
   };
-  const result = await createTerrainFetchExecutor({
+  const runtime = createTerrainFetchRuntime({
     state, previewMaxDepth: 10, getHeading: () => 0, getRange: () => 1000,
     getCameraLatLon: () => ({ lat: 64, lon: -51, alt: 100 }),
     getCameraSnapshot: () => ({ camEastM: 5, camNorthM: 6, camStereoApproxX: 10, camStereoApproxY: 20 }),
@@ -882,9 +913,10 @@ test('shared fetch executor preserves initial response transition ordering', asy
       }),
     }),
     now: () => 100,
-  })({ pass: 1 });
+  });
+  const result = await runtime.execute({ pass: 1 });
   assert.equal(result.nextAction, 'full-pass');
-  assert.equal(state.isFirstLoad, false);
+  assert.equal(state.firstLoad, false);
   assert.equal(state.originX, 10);
   assert.deepEqual(events, [
     'fetchTiles.request[pass1]', 'fetchTiles.frame.offset.set',

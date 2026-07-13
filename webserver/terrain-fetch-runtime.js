@@ -5,7 +5,7 @@ import {
 } from './terrain-tile-fetch.js';
 import { reconcileTerrainTiles } from './terrain-tile-reconciler.js';
 
-export function createTerrainFetchExecutor({
+export function createTerrainFetchRuntime({
   state,
   previewMaxDepth,
   getHeading,
@@ -32,16 +32,29 @@ export function createTerrainFetchExecutor({
   bootLog,
   fetchImpl = (...args) => fetch(...args),
   now = () => performance.now(),
+  pollMs = 3000,
+  scheduleFrame = callback => requestAnimationFrame(callback),
+  schedulePoll = (callback, delay) => setTimeout(callback, delay),
+  cancelPoll = timer => clearTimeout(timer),
+  onSkip = () => {},
+  onError = () => {},
+  onPreviewComplete = () => {},
+  onPoll = () => {},
+  onSettled = () => {},
 }) {
-  return async function executeTerrainFetch({ lat, lon, pass, signal }) {
-    state.pass = pass;
+  let pollTimer = null;
+  let generation = 0;
+  let activeController = null;
+
+  async function execute({ lat, lon, pass, signal }) {
+    state.loadPass = pass;
     const started = now();
     const camera = getCameraLatLon();
     const cameraSnapshot = getCameraSnapshot(camera);
     const request = buildTerrainTilesRequest({
       lat: lat ?? camera.lat, lon: lon ?? camera.lon, altitude: camera.alt,
       heading: getHeading(), range: getRange(), pass,
-      previewMaxDepth, isFirstLoad: state.isFirstLoad,
+      previewMaxDepth, isFirstLoad: state.firstLoad,
       frameOffsetReady: state.frameOffsetReady,
       originX: state.originX, originY: state.originY,
       cameraSnapshot,
@@ -51,7 +64,7 @@ export function createTerrainFetchExecutor({
     const data = await response.json();
     const local = getCameraLocalPosition();
     const frameOffset = selectTerrainFrameOffset({
-      isFirstLoad: state.isFirstLoad, frameOffsetReady: state.frameOffsetReady,
+      isFirstLoad: state.firstLoad, frameOffsetReady: state.frameOffsetReady,
       cameraEast: local.x, cameraNorth: local.y,
       offsetX: state.frameOffsetX, offsetY: state.frameOffsetY,
     });
@@ -80,14 +93,14 @@ export function createTerrainFetchExecutor({
       });
     }
 
-    const wasFirstLoad = state.isFirstLoad;
+    const wasFirstLoad = state.firstLoad;
     if (wasFirstLoad) {
       const origin = adoptTerrainOrigin({ data, pass, cameraSnapshot });
       state.originX = origin.originX;
       state.originY = origin.originY;
-      state.cameraX = state.lastFetchX = origin.cameraX;
-      state.cameraY = state.lastFetchY = origin.cameraY;
-      state.isFirstLoad = false;
+      state.cameraStereoX = state.lastFetchX = origin.cameraX;
+      state.cameraStereoY = state.lastFetchY = origin.cameraY;
+      state.firstLoad = false;
       enqueueLog('info', 'fetchTiles.origin.set', origin.logDetails);
     }
 
@@ -119,10 +132,14 @@ export function createTerrainFetchExecutor({
       anchorLatitude, anchorLongitude,
       originX: state.originX, originY: state.originY,
     });
-    state.cameraX = state.lastFetchX = stereo.x;
-    state.cameraY = state.lastFetchY = stereo.y;
+    state.cameraStereoX = state.lastFetchX = stereo.x;
+    state.cameraStereoY = state.lastFetchY = stereo.y;
     const pipeline = terrainPipelineStatus(data, wasFirstLoad);
-    state.pipeline = pipeline;
+    state.heightmapsMissing = pipeline.missing;
+    state.heightmapsDownloading = pipeline.downloading;
+    state.serverTexturesFetching = pipeline.textureFetching;
+    state.serverTexturesRetrying = pipeline.textureRetryQueue;
+    state.serverTextureStatus = pipeline.textureStatusCounts;
     return {
       nextAction: pipeline.nextAction,
       previewDetails: {
@@ -131,5 +148,58 @@ export function createTerrainFetchExecutor({
         elapsedMs: Number((now() - started).toFixed(1)),
       },
     };
-  };
+  }
+
+  async function request(lat, lon) {
+    if (state.fetching) {
+      onSkip();
+      return;
+    }
+    state.fetching = true;
+    const requestGeneration = generation;
+    activeController = new AbortController();
+    try {
+      const result = await execute({
+        lat, lon, pass: state.loadPass, signal: activeController.signal,
+      });
+      if (requestGeneration !== generation) return;
+      activeController = null;
+      if (pollTimer != null) {
+        cancelPoll(pollTimer);
+        pollTimer = null;
+      }
+      if (result.nextAction === 'full-pass') {
+        state.fetching = false;
+        state.loadPass = 2;
+        onPreviewComplete(result);
+        scheduleFrame(() => request());
+        return;
+      }
+      if (result.nextAction === 'poll') {
+        pollTimer = schedulePoll(() => {
+          pollTimer = null;
+          onPoll();
+          request();
+        }, pollMs);
+      }
+    } catch (error) {
+      if (requestGeneration !== generation || error?.name === 'AbortError') return;
+      onError(error);
+    }
+    activeController = null;
+    state.fetching = false;
+    onSettled();
+  }
+
+  function reset(nextPass = 1) {
+    generation += 1;
+    activeController?.abort();
+    activeController = null;
+    if (pollTimer != null) cancelPoll(pollTimer);
+    pollTimer = null;
+    state.loadPass = nextPass;
+    state.fetching = false;
+  }
+
+  return { execute, request, reset };
 }

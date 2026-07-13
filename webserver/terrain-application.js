@@ -29,12 +29,11 @@ import { createTextureStreamer, rendererTextureAnisotropy } from './terrain-text
 import { createTerrainMeshRuntime } from './terrain-mesh-runtime.js';
 import { createTerrainTextureController } from './terrain-texture-controller.js';
 import { evaluateTerrainRefetch, summarizeTerrainCamera, terrainCameraCoordinates, terrainCameraStereoPosition } from './terrain-tile-fetch.js';
-import { createTerrainFetchScheduler } from './terrain-fetch-scheduler.js';
 import { createTerrainEnhancementController } from './terrain-enhancement-controller.js';
 import { createTerrainMeshBuilder } from './terrain-mesh-builder.js';
 import { applyTerrainAvailabilityStatus, createTerrainSeamStatusController } from './terrain-status-controller.js';
 import { collectTerrainDebugMeshes, createTerrainHoverOutlineController, createTerrainOutlineController, summarizeTerrainMesh } from './terrain-debug-runtime.js';
-import { createTerrainFetchExecutor } from './terrain-fetch-executor.js';
+import { createTerrainFetchRuntime } from './terrain-fetch-runtime.js';
 import { restoreTerrainCameraState, terrainCameraState } from './terrain-camera-state.js';
 import { createTerrainClientLogger } from './terrain-client-logging.js';
 import { createTerrainFpsCounter } from './terrain-fps-counter.js';
@@ -1204,30 +1203,8 @@ function runStreamingMaintenance() {
   }
 }
 
-const terrainFetchState = {
-  get pass() { return terrainPipelineState.loadPass; }, set pass(value) { terrainPipelineState.loadPass = value; },
-  get isFirstLoad() { return terrainPipelineState.firstLoad; }, set isFirstLoad(value) { terrainPipelineState.firstLoad = value; },
-  get frameOffsetReady() { return terrainPipelineState.frameOffsetReady; }, set frameOffsetReady(value) { terrainPipelineState.frameOffsetReady = value; },
-  get frameOffsetX() { return terrainPipelineState.frameOffsetX; }, set frameOffsetX(value) { terrainPipelineState.frameOffsetX = value; },
-  get frameOffsetY() { return terrainPipelineState.frameOffsetY; }, set frameOffsetY(value) { terrainPipelineState.frameOffsetY = value; },
-  get originX() { return terrainPipelineState.originX; }, set originX(value) { terrainPipelineState.originX = value; },
-  get originY() { return terrainPipelineState.originY; }, set originY(value) { terrainPipelineState.originY = value; },
-  get cameraX() { return terrainPipelineState.cameraStereoX; }, set cameraX(value) { terrainPipelineState.cameraStereoX = value; },
-  get cameraY() { return terrainPipelineState.cameraStereoY; }, set cameraY(value) { terrainPipelineState.cameraStereoY = value; },
-  get lastFetchX() { return terrainPipelineState.lastFetchX; }, set lastFetchX(value) { terrainPipelineState.lastFetchX = value; },
-  get lastFetchY() { return terrainPipelineState.lastFetchY; }, set lastFetchY(value) { terrainPipelineState.lastFetchY = value; },
-  get currentTileIds() { return terrainPipelineState.currentTileIds; }, set currentTileIds(value) { terrainPipelineState.currentTileIds = value; },
-  get lastTiles() { return terrainPipelineState.lastTiles; }, set lastTiles(value) { terrainPipelineState.lastTiles = value; },
-  get bootFetchLogged() { return terrainPipelineState.bootFetchLogged; }, set bootFetchLogged(value) { terrainPipelineState.bootFetchLogged = value; },
-  set pipeline(value) {
-    terrainPipelineState.heightmapsMissing = value.missing; terrainPipelineState.heightmapsDownloading = value.downloading;
-    terrainPipelineState.serverTexturesFetching = value.textureFetching; terrainPipelineState.serverTexturesRetrying = value.textureRetryQueue;
-    terrainPipelineState.serverTextureStatus = value.textureStatusCounts;
-  },
-};
-
-const performTileFetch = createTerrainFetchExecutor({
-  state: terrainFetchState, previewMaxDepth: PREVIEW_MAX_DEPTH,
+const terrainFetchRuntime = createTerrainFetchRuntime({
+  state: terrainPipelineState, previewMaxDepth: PREVIEW_MAX_DEPTH,
   getHeading: () => priorityHeading(vehicleRuntime.vehicleControlActive, vehicleRuntime.vehicleHeadingRad, controls.yaw),
   getRange: () => terrainRange, getCameraLatLon, getCameraSnapshot: getCameraLogSnapshot,
   getCameraLocalPosition: () => {
@@ -1241,15 +1218,11 @@ const performTileFetch = createTerrainFetchExecutor({
   prepareUntexturedMesh: applyWebGPUUntexturedTerrainMaterial,
   onMeshAdded: markSceneMutated,
   onResponseApplied: requestRender,
-  enqueueLog: enqueueClientLog, bootLog,
-});
-
-const tileFetchScheduler = createTerrainFetchScheduler({
-  execute: performTileFetch,
+  enqueueLog: enqueueClientLog,
+  bootLog,
   onSkip: () => enqueueClientLog('debug', 'fetchTiles.skip', {
     reason: 'already fetching', ...getCameraLogSnapshot(),
   }),
-  onState: state => { terrainPipelineState.fetching = state.fetching; terrainPipelineState.loadPass = state.pass; },
   onPreviewComplete: result => {
     bootLog('tiles.pass1-preview-done', result.previewDetails);
     requestRender();
@@ -1272,7 +1245,7 @@ const tileFetchScheduler = createTerrainFetchScheduler({
 });
 
 function fetchTiles(lat, lon) {
-  return tileFetchScheduler.request(lat, lon);
+  return terrainFetchRuntime.request(lat, lon);
 }
 
 // --- Save/restore camera position ---
@@ -1722,7 +1695,7 @@ function resetView() {
   textureStreamer.abortAll();
   updateTerrainTextures.reset();
   abortAllEnhancements();
-  tileFetchScheduler.reset(1);
+  terrainFetchRuntime.reset(1);
   terrainPipelineState.originX = 0; terrainPipelineState.originY = 0;
   terrainPipelineState.cameraStereoX = 0; terrainPipelineState.cameraStereoY = 0;
   terrainPipelineState.lastFetchX = 0; terrainPipelineState.lastFetchY = 0;
