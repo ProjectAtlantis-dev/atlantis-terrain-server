@@ -40,12 +40,14 @@ Real imagery down to depth 12, invented detail below it.
 1. **Bootstrap**: On first run, the server seeds the tile grid as empty skeletons (no heightmaps, no textures). These define the quadtree structure up to the target depth.
 2. **tex-worker** fetches from Dataforsyningen WMS (SPOT 6/7 1.6m, EPSG:3184) on demand. If it fails (rate limit, timeout, no coverage), the tile stays uncached and an ancestor texture is cropped and served as a placeholder until the next request retries.
 3. Dataforsyningen WMS requires EPSG:3184 (not 3413). The fetch reprojects 3413→3184 for the request, then warps the result back to 3413 with Lanczos resampling.
-4. Dataforsyningen runs out of detail around depth 13 (SPOT is 1.6 m/px). Below that, accuracy vs reality stops mattering: **depth 12 already tells us what goes where**. A coarse class map at d12 scale (water / grey / dark slopes & shadows / green / white — see `flaskserver/classifier/biomes.py`) is the entire semantic contract.
+4. Dataforsyningen runs out of detail around depth 13 (SPOT is 1.6 m/px). Below that, accuracy vs reality stops mattering: **depth 12 already tells us what goes where**. A coarse class map at d12 scale (water / grey / dark slopes & shadows / green / white — see `flaskserver/classifier/storage.py`) is the entire semantic contract.
 5. **Everything below depth 12 is procedural** (work in progress): per-class texture and asset synthesis, seeded from absolute EPSG:3413 coordinates so every visit renders identical detail, color-anchored to the real d12 imagery so the transition doesn't pop. Judged on looks, not fidelity. Google imagery is a labeling/measurement reference only and never ships.
 
-Retired approaches, kept in git history only: SUPIR/ComfyUI enhance (`dataforsyningen_enhanced`/`upscaled` sources — never worked right) and the learned recoloring model (`classifier/train_color.py`/`classifier/colorize.py`, served as `?stage=colorized` — RGB imitation of Google produced unstable garbage).
+Retired approaches, kept in git history only: SUPIR/ComfyUI enhance (`dataforsyningen_enhanced`/`upscaled` sources — never worked right), bathymetry flattening, and learned recoloring from external reference imagery.
 
-The eyeball harness is the **tile inspector** (`pipeline.html?tile=<id>`): a tile's progress through every stage — heightmap → southness → texture → google ref → buckets → procgen — with per-stage status, keyboard navigation across tiles and depths, and a flag button that files the tile as a classifier regression case.
+The eyeball harness is the **tile inspector** (`pipeline.html?tile=<id>`): a tile's progress through heightmap → southness → texture → procgen, with per-stage status and keyboard navigation across tiles and depths.
+
+Classifier output lives in `terrain.db`'s `classifier_tiles` table as a zlib-compressed, image-oriented `uint8` label raster plus a class-schema name, dimensions, optional confidence raster, source/model identifier, and timestamp. A fresh database contains no classifier rows. In the 3D view, press **C** to toggle classifier presentation: missing tiles keep their satellite imagery but desaturate it, while available `coarse_v1` tiles are painted as grey / green / dark / white / water classes. Grayscale elevation is used only while a satellite texture is still loading. Deeper terrain tiles inherit a nearest-neighbor crop from the closest classified ancestor.
 
 ## Troubleshooting
 
@@ -59,9 +61,11 @@ The camera starts facing north at Nuuk (64.18°N, 51.72°W). You can override th
 
 Press **M** to toggle a 2D map view (no clouds/atmosphere) for navigation and tile debugging. Right-click on a tile to inspect its metadata or open it in the tile inspector.
 
-Press **P** to open the **pipeline map** — the radar (`coverage.html`) showing every tile with a cached texture — in a new tab. Click any tile there to open it in the tile inspector (`pipeline.html`). The radar's other tab, **heatmap**, shows the live fetch queue colored by priority.
+Press **H** to swap the map canvas for the live tile-priority heatmap. Press **H** again to return to the regular map; both views retain the same heading, pan, and zoom. Regular map mode outlines the terrain meshes currently being rendered as a thin grey grid, with the tile under the pointer outlined in red.
 
 In 3D mode, atmosphere sliders allow adjusting cloud density, coverage, and lighting parameters. (WIP — still working out some bugs.)
+
+Press **G** to open Google Maps' satellite 3D view at the current camera position, heading, tilt, height above ground, and field of view. This is a debugging reference and opens in a new tab.
 
 ## Setup
 

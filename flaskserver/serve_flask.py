@@ -162,16 +162,12 @@ _tile_bbox: Any = None
 _texture_ids_in: Any = None
 _read_texture: Any = None
 _write_texture: Any = None
-_water_mask_ids_in: Any = None
-_read_water_mask: Any = None
-_write_water_mask: Any = None
-_build_water_mask: Any = None
 _fetch_sentinel2_texture: Any = None
 _fetch_dataforsyningen_texture: Any = None
 _fetch_enhanced_texture: Any = None
 _init_textures: Any = None
+_init_classifier_tiles: Any = None
 _enqueue_seam_jobs: Any = None
-_water_mask_model_id: str | None = None
 
 _tex_pool = ThreadPoolExecutor(max_workers=4)
 _tex_fetching: dict[str, tuple[str, int]] = {}
@@ -252,8 +248,6 @@ def _tex_retry_worker() -> None:
       if jpeg is not None:
         jpeg = _repair_white_ocean_jpeg(db, tile_id, jpeg)
         _write_texture(db, tile_id, jpeg, "dataforsyningen")
-        _apply_bathymetry_fix(db, tile_id, jpeg)
-        # _update_water_mask_for_tile(db, tile_id, jpeg, "dataforsyningen")  # disabled — SAM too expensive during load
         log_tex.info(f"[tex-retry] {tile_id}: SUCCESS on attempt {attempt + 1}")
       elif fail_reason == 'no_coverage':
         _resolve_no_coverage(db, tile_id, cur_row[1] if cur_row else None, "[tex-retry]")
@@ -422,7 +416,6 @@ def _recover_worker(prompt_id: str, tile_id: str):
             if _init_textures is not None:
               _init_textures(wdb)
             _write_texture(wdb, tile_id, jpeg_bytes, "dataforsyningen_enhanced")
-            _update_water_mask_for_tile(wdb, tile_id, jpeg_bytes, "dataforsyningen_enhanced")
             log_tex.info(f"[ENHANCE RECOVERY] {tile_id} saved ({len(jpeg_bytes)} bytes)")
             return
         log_tex.warning(f"[ENHANCE RECOVERY] {tile_id} completed but no output images")
@@ -440,9 +433,7 @@ def _bootstrap_backend() -> None:
   global _backend_ready, _backend_error
   global _np, _Image, _to_stereo, _query_tiles_stereo, _load_no_data_cache
   global _GRID_N, _tile_bbox, _texture_ids_in, _read_texture, _write_texture
-  global _water_mask_ids_in, _read_water_mask, _write_water_mask, _build_water_mask
-  global _fetch_sentinel2_texture, _fetch_dataforsyningen_texture, _fetch_enhanced_texture, _init_textures, _enqueue_seam_jobs
-  global _water_mask_model_id
+  global _fetch_sentinel2_texture, _fetch_dataforsyningen_texture, _fetch_enhanced_texture, _init_textures, _init_classifier_tiles, _enqueue_seam_jobs
 
   if _backend_ready or _backend_error is not None:
     return
@@ -452,6 +443,7 @@ def _bootstrap_backend() -> None:
     from PIL import Image  # type: ignore
 
     from coords import to_stereo
+    from classifier.storage import init_classifier_tiles
     from database import GRID_N, _tile_bbox as terrain_tile_bbox, seed_tiles, open_db
     from seam_queue import enqueue_tile_and_neighbors
     from serve import load_no_data_cache, query_tiles_stereo
@@ -459,14 +451,9 @@ def _bootstrap_backend() -> None:
       fetch_dataforsyningen_texture,
       fetch_enhanced_texture,
       fetch_sentinel2_texture,
-      build_water_mask,
       init_textures,
-      read_water_mask,
       read_texture,
       texture_ids_in,
-      water_mask_ids_in,
-      water_mask_model_id,
-      write_water_mask,
       write_texture,
     )
 
@@ -511,20 +498,15 @@ def _bootstrap_backend() -> None:
     _texture_ids_in = texture_ids_in
     _read_texture = read_texture
     _write_texture = write_texture
-    _water_mask_ids_in = water_mask_ids_in
-    _read_water_mask = read_water_mask
-    _write_water_mask = write_water_mask
-    _build_water_mask = build_water_mask
     _fetch_sentinel2_texture = fetch_sentinel2_texture
     _fetch_dataforsyningen_texture = fetch_dataforsyningen_texture
     _fetch_enhanced_texture = fetch_enhanced_texture
     _init_textures = init_textures
+    _init_classifier_tiles = init_classifier_tiles
     _enqueue_seam_jobs = enqueue_tile_and_neighbors
-    _water_mask_model_id = str(water_mask_model_id())
 
     _backend_ready = True
     log.info(f"Terrain backend ready. DB={DB_PATH}")
-    log_tex.info(f"[WATER MASK] startup model={_water_mask_model_id}")
     log_db.info(f"No-data cache: {no_data_count} tiles")
     _recover_comfy_jobs()
 
@@ -549,69 +531,6 @@ def _queue_seam_jobs_for_tile(db: sqlite3.Connection, tile_id: str) -> None:
     log_tex.warning(f"[SEAM] failed to queue jobs for {tile_id}: {type(exc).__name__}: {exc}")
 
 
-def _update_water_mask_for_tile(
-  db: sqlite3.Connection,
-  tile_id: str,
-  texture_jpeg: bytes,
-  texture_source: str,
-) -> None:
-  ok, reason, coverage = _generate_water_mask_for_tile(
-    db,
-    tile_id,
-    texture_jpeg,
-    texture_source,
-  )
-  if not ok:
-    log_tex.debug(f"[WATER MASK] {tile_id}: skipped ({reason})")
-  if ok and coverage is not None:
-    log_tex.debug(f"[WATER MASK] {tile_id}: cached coverage={coverage * 100:.1f}% source={texture_source}")
-
-
-def _generate_water_mask_for_tile(
-  db: sqlite3.Connection,
-  tile_id: str,
-  texture_jpeg: bytes,
-  texture_source: str,
-) -> tuple[bool, str, float | None]:
-  if _build_water_mask is None or _write_water_mask is None:
-    return False, "backend_unavailable", None
-  tile_row = db.execute(
-    "SELECT x_min, y_min, x_max, y_max, heightmap FROM tiles WHERE tile_id = ?",
-    (tile_id,),
-  ).fetchone()
-  if tile_row is None:
-    return False, "tile_missing", None
-  hm_blob = tile_row[4]
-  if hm_blob is None:
-    return False, "heightmap_missing", None
-  try:
-    hm = _np.frombuffer(zlib.decompress(hm_blob), dtype=_np.float32).reshape((_GRID_N, _GRID_N))
-  except Exception as exc:
-    log_tex.warning(f"[WATER MASK] {tile_id}: failed to decode heightmap: {type(exc).__name__}: {exc}")
-    return False, "heightmap_decode_failed", None
-
-  bbox = (float(tile_row[0]), float(tile_row[1]), float(tile_row[2]), float(tile_row[3]))
-  try:
-    built = _build_water_mask(texture_jpeg, hm, bbox, resolution=256)
-  except Exception as exc:
-    log_tex.warning(f"[WATER MASK] {tile_id}: build failed: {type(exc).__name__}: {exc}")
-    return False, "build_exception", None
-  if built is None:
-    return False, "build_failed", None
-  if not isinstance(built, tuple) or len(built) != 2:
-    return False, "build_invalid_result", None
-  mask_png, coverage = built
-  if mask_png is None:
-    return False, "build_empty_mask", None
-  try:
-    coverage = float(coverage)
-  except Exception:
-    return False, "build_invalid_coverage", None
-  from texture import _SAM_MODEL_ID
-  _write_water_mask(db, tile_id, mask_png, _SAM_MODEL_ID, coverage)
-  return True, "ok", coverage
-
-
 def _terrain_unavailable_response(status: int = 503):
   _bootstrap_backend()
   if _backend_ready:
@@ -627,6 +546,8 @@ def _get_db() -> sqlite3.Connection:
     db.execute("PRAGMA journal_mode=WAL")
     if _init_textures is not None:
       _init_textures(db)
+    if _init_classifier_tiles is not None:
+      _init_classifier_tiles(db)
     g.terrain_db = db
   return db
 
@@ -705,33 +626,6 @@ def _repair_white_ocean_jpeg(db, tile_id: str, jpeg: bytes) -> bytes:
     log_tex.info(f"[tex-repair] {tile_id}: filled white ocean pixels with OCEAN_RGB")
     return repaired
   return jpeg
-
-
-def _apply_bathymetry_fix(db, tile_id: str, jpeg: bytes) -> None:
-  """Flatten fake fjord seamounts once real imagery is available.
-
-  Fine depths only (bathymetry.MIN_FIX_DEPTH); corrected samples propagate
-  up the ancestor chain so coarse fjord views (d7/d8) agree. A changed tile
-  also re-fixes its neighbors once: aprons span tile seams, and a neighbor's
-  earlier protected-land edge decisions may depend on this tile's new
-  heights. Failures are logged, never fatal to the texture path.
-  """
-  try:
-    from bathymetry import fix_tile_in_db, propagate_to_ancestors
-    if not fix_tile_in_db(db, tile_id, jpeg):
-      return
-    propagate_to_ancestors(db, tile_id)
-    d, c, r = (int(p) for p in tile_id.split("-"))
-    for dc, dr in ((0, 1), (0, -1), (1, 0), (-1, 0)):
-      nid = f"{d}-{c + dc}-{r + dr}"
-      nrow = db.execute(
-        "SELECT texture FROM textures WHERE tile_id = ? AND source = 'dataforsyningen'",
-        (nid,),
-      ).fetchone()
-      if nrow and fix_tile_in_db(db, nid, nrow[0], force=True):
-        propagate_to_ancestors(db, nid)
-  except Exception as exc:
-    log_tex.warning(f"[bathy] {tile_id}: fix failed: {type(exc).__name__}: {exc}")
 
 
 def _resolve_no_coverage(db, tile_id: str, existing_jpeg, log_prefix: str) -> None:
@@ -953,8 +847,6 @@ def _queue_texture_fetch(
         log_tex.debug(f"[tex-worker] {tile_id}: got {len(jpeg)} bytes from dataforsyningen")
         jpeg = _repair_white_ocean_jpeg(db, tile_id, jpeg)
         _write_texture(db, tile_id, jpeg, "dataforsyningen")
-        _apply_bathymetry_fix(db, tile_id, jpeg)
-        # _update_water_mask_for_tile(db, tile_id, jpeg, "dataforsyningen")  # disabled — SAM too expensive during load
       elif fail_reason == 'no_coverage':
         # Permanent — mark so we never retry automatically.
         existing = db.execute(
@@ -993,7 +885,7 @@ def api_tiles():
     return unavailable
 
   error = _arg_float("error", 0.0005)
-  max_depth = _arg_int("maxDepth", 13)
+  max_depth = min(_arg_int("maxDepth", ENHANCE_DEPTH), ENHANCE_DEPTH)
   max_range = _arg_float("range", 16000.0)
 
   if "sx" in request.args and "sy" in request.args:
@@ -1048,7 +940,6 @@ def api_tiles():
       check_ids.add(f"{d}-{c}-{r}")
 
   texture_ids = _texture_ids_in(_get_db(), list(check_ids))
-  water_mask_ids = _water_mask_ids_in(_get_db(), list(check_ids)) if _water_mask_ids_in else set()
   with _tex_fetching_lock:
     tex_fetching = list(_tex_fetching)
   tex_fetching_set = set(tex_fetching)
@@ -1091,8 +982,6 @@ def api_tiles():
         "texIsPlaceholder": bool(tex_flags["is_placeholder"]),
         "texAncestorId": tex_flags["ancestor_id"],
         "texIsFetching": bool(tex_flags["is_fetching"]),
-        "hasWaterMask": tid in water_mask_ids,
-        "waterMaskUrl": f"/api/watermask/{tid}.png",
         "texPriority": math.log(max(priority, 1.0)),
       }
     )
@@ -1215,62 +1104,12 @@ def api_tiles():
       "ox": ox,
       "oy": oy,
       "texCached": len(texture_ids),
-      "waterMaskCached": len(water_mask_ids),
       "texFetching": len(tex_fetching),
       "texQueued": len(tex_fetching),
       "texRetryQueue": len(_tex_retry_queue),
       "texStatusCounts": tex_status_counts,
     }
   )
-
-
-def _colorized_jpeg(tile_id: str, resolution: int = 256):
-  """resolution² JPEG of the model-painted texture for a tile, or None.
-
-  colorize.py writes full-res PNGs at the model's native 0.32 m/px (a d12
-  tile -> 2048²). That output IS the upscaled texture: a tile without its own
-  colorized PNG is cut from the nearest colorized ancestor — native detail
-  down to depth 15 from a d12 source, and deep tiles get painted texture even
-  where dataforsyningen was never fetched that deep. Never upsamples past the
-  crop's native pixels (a d15 crop of a d12 source is 256² — sending it as
-  1024² would be 16x the bytes for zero detail). Results are cached as
-  <tile>/colorized_<res>.jpg so each crop is computed once.
-  """
-  from pathlib import Path as _Path
-  root = _Path(__file__).parent / "sample" / "colorized"
-  parsed = _parse_tile_id(tile_id)
-  if parsed is None:
-    return None
-  d, c, r = parsed
-  for up in range(0, 5):  # own tile, then up to 4 ancestor levels (d12->d16)
-    ad, ac, ar = d - up, c >> up, r >> up
-    if ad < 0:
-      break
-    src = root / f"{ad}-{ac}-{ar}" / "colorized.png"
-    if not src.is_file():
-      continue
-    from PIL import Image as _Image
-    with _Image.open(src) as probe:
-      native = max(1, probe.size[0] >> up)   # crop size before any resampling
-    res = max(256, min(resolution, native))
-    cached = root / tile_id / f"colorized_{res}.jpg"
-    if cached.is_file():
-      return cached.read_bytes()
-    im = _Image.open(src).convert("RGB")
-    if up:
-      # PNG row 0 = north, tile row index grows northward — flip the
-      # quadrant's row position (same convention as api_classes' band crop)
-      n = 1 << up
-      qx, qy = c - (ac << up), r - (ar << up)
-      w, h = im.size
-      ix0, iy0 = qx * w // n, (n - 1 - qy) * h // n
-      im = im.crop((ix0, iy0, ix0 + max(1, w // n), iy0 + max(1, h // n)))
-    if im.size != (res, res):
-      im = im.resize((res, res), _Image.Resampling.LANCZOS)
-    cached.parent.mkdir(parents=True, exist_ok=True)
-    im.save(cached, format="JPEG", quality=88)
-    return cached.read_bytes()
-  return None
 
 
 @app.get("/api/texture/<tile_id>.jpg")
@@ -1289,36 +1128,6 @@ def api_texture(tile_id: str):
     "SELECT texture, source FROM textures WHERE tile_id = ?",
     (tile_id,),
   ).fetchone()
-
-  # colorized stage (?stage=colorized, on by default in the frontend): the
-  # model-painted UPSCALE from colorize.py output — own tile or a native-res
-  # crop of a colorized ancestor (see _colorized_jpeg). It must never clobber
-  # real imagery that out-resolves it: painted output is 0.32 m/px, so it
-  # only wins where a 256² chain tile is starved for source detail — depth >=
-  # 13, where SPOT's 1.6 m no longer fills the tile. Shallower tiles, and
-  # tiles already enhanced/upscaled by SUPIR, always serve the real chain.
-  _COLORIZED_MIN_DEPTH = 13
-  if request.args.get("stage") == "colorized":
-    _p = _parse_tile_id(tile_id)
-    _src = row[1] if row else None
-    if (_p is not None and _p[0] >= _COLORIZED_MIN_DEPTH
-        and _src not in ("dataforsyningen_enhanced", "upscaled")):
-      # 1024² at d13 = 0.32 m/px — the model's native detail, Google-z18
-      # class. The 256² chain textures at d13 are 1.3 m/px; serving the
-      # paint at 256² made it indistinguishable from SPOT.
-      painted = _colorized_jpeg(tile_id, resolution=1024)
-      if painted is not None:
-        return Response(
-          painted,
-          mimetype="image/jpeg",
-          headers={
-            "Cache-Control": "no-store",
-            "X-Tex-Source": "colorized",
-            "X-Tex-Status": "ready",
-            "X-Tex-Quality": "full",
-            "X-Tex-Temporary": "0",
-          },
-        )
 
   cached_crop = None
   # Sources that are temporary placeholders — serve them but let client re-fetch
@@ -1427,78 +1236,6 @@ def api_texture(tile_id: str):
   )
 
 
-@app.get("/api/bathyfix/<tile_id>.png")
-def api_bathyfix(tile_id: str):
-  """Magenta translucent mask of bathymetry-corrected samples (map-mode
-  debug overlay). 204 when the tile has no corrected samples."""
-  unavailable = _terrain_unavailable_response()
-  if unavailable is not None:
-    return unavailable
-  from database import CONFIDENCE
-  db = _get_db()
-  row = db.execute(
-    "SELECT confidence_map FROM tiles WHERE tile_id = ?", (tile_id,)
-  ).fetchone()
-  if not row or row[0] is None:
-    return Response(b"", status=204, headers={"Cache-Control": "no-store"})
-  cm = _np.frombuffer(zlib.decompress(row[0]), dtype=_np.uint8).reshape(_GRID_N, _GRID_N)
-  mask = cm >= CONFIDENCE['bathymetry']
-  if not mask.any():
-    return Response(b"", status=204, headers={"Cache-Control": "no-store"})
-  rgba = _np.zeros((_GRID_N, _GRID_N, 4), dtype=_np.uint8)
-  rgba[..., 0] = 255
-  rgba[..., 2] = 255
-  rgba[..., 3] = _np.flipud(mask).astype(_np.uint8) * 150  # row 0 = north
-  buf = io.BytesIO()
-  _Image.fromarray(rgba, mode="RGBA").save(buf, format="PNG")
-  return Response(buf.getvalue(), mimetype="image/png",
-                  headers={"Cache-Control": "no-store"})
-
-
-@app.get("/api/google/<tile_id>.jpg")
-def api_google_ref(tile_id: str):
-  """Google satellite reference for a tile, warped to its exact 3413 bbox.
-
-  Pixel-aligned with /api/texture/<tile_id>.jpg for side-by-side comparison.
-  Debug/QA only — never fed into the texture pipeline. Cached in google_refs.
-  Query params: res (output px, default 512), z (force zoom), refresh=1.
-  """
-  unavailable = _terrain_unavailable_response()
-  if unavailable is not None:
-    return unavailable
-
-  parsed = _parse_tile_id(tile_id)
-  if parsed is None:
-    return Response(b"", status=400)
-  d, c, r = parsed
-
-  try:
-    res = max(64, min(2048, int(request.args.get("res", "512"))))
-  except ValueError:
-    return Response(b"", status=400)
-  zoom_arg = request.args.get("z")
-  zoom = int(zoom_arg) if zoom_arg and zoom_arg.isdigit() else None
-  refresh = request.args.get("refresh") == "1"
-
-  from google_ref import get_google_ref, init_google_refs
-
-  db = _get_db()
-  init_google_refs(db)
-  jpeg, z = get_google_ref(db, tile_id, _tile_bbox(d, c, r),
-                           resolution=res, zoom=zoom, refresh=refresh)
-  if jpeg is None:
-    return Response(b"", status=502, headers={"X-Tex-Status": "google_fetch_failed"})
-  return Response(
-    jpeg,
-    mimetype="image/jpeg",
-    headers={
-      "Cache-Control": "public, max-age=86400",
-      "X-Google-Zoom": str(z),
-      "X-Tex-Source": "google_ref",
-    },
-  )
-
-
 def _heightmap_ancestor_crop(db, d: int, c: int, r: int, max_up: int = 4):
   """Tile heightmap, cropped out of the nearest ancestor's when the tile
   itself was never seeded/flown (pipeline.html can ask for any tile id; tile
@@ -1537,7 +1274,7 @@ def _heightmap_ancestor_crop(db, d: int, c: int, r: int, max_up: int = 4):
 def api_terrain_channel(tile_id: str, chan: str):
   """DEM-derived conditioning channel (elev/slope/southness/sun) as a debug
   PNG, computed on the fly from the tile heightmap and pixel-aligned with
-  /api/texture and /api/google. Southness renders diverging blue (north-
+  /api/texture. Southness renders diverging blue (north-
   facing) / red (south-facing). Query params: res (default 512).
   """
   if chan not in ("elev", "slope", "southness", "sun"):
@@ -1557,7 +1294,7 @@ def api_terrain_channel(tile_id: str, chan: str):
   import numpy as np
   from PIL import Image as _Image
 
-  from classifier.training_data import render_channel, terrain_channels
+  from classifier.terrain_channels import render_channel, terrain_channels
 
   db = _get_db()
   hm, hm_source, hm_depth = _heightmap_ancestor_crop(db, d, c, r)
@@ -1579,12 +1316,94 @@ def api_terrain_channel(tile_id: str, chan: str):
   )
 
 
+@app.get("/api/classifier/<tile_id>.png")
+def api_classifier_tile(tile_id: str):
+  """Colorized semantic labels for a terrain tile.
+
+  The database stores raw uint8 labels. Exact rows are preferred; descendants
+  can reuse the nearest classified ancestor through a nearest-neighbor crop so
+  class boundaries and label identities are never blended.
+  """
+  unavailable = _terrain_unavailable_response()
+  if unavailable is not None:
+    return unavailable
+  parsed = _parse_tile_id(tile_id)
+  if parsed is None:
+    return Response(b"", status=400)
+  try:
+    resolution = max(16, min(2048, int(request.args.get("res", "512"))))
+  except ValueError:
+    return Response(b"", status=400)
+
+  import io as _io
+
+  from PIL import Image as _Image
+  from classifier.storage import colorize_class_map, decode_class_map
+
+  child_depth, child_col, child_row = parsed
+  depth, col, row = parsed
+  found = None
+  db = _get_db()
+  while depth >= 0:
+    candidate_id = f"{depth}-{col}-{row}"
+    found = db.execute(
+      "SELECT class_schema, width, height, class_map, source "
+      "FROM classifier_tiles WHERE tile_id = ?",
+      (candidate_id,),
+    ).fetchone()
+    if found is not None:
+      break
+    if depth == 0:
+      return Response(
+        b"", status=404,
+        headers={"Cache-Control": "no-store", "X-Classifier-Status": "missing"},
+      )
+    depth -= 1
+    col //= 2
+    row //= 2
+
+  class_schema, width, height, class_blob, source = found
+  try:
+    labels = decode_class_map(class_blob, width, height)
+    label_image = _Image.fromarray(labels, mode="L")
+    if depth != child_depth:
+      levels = child_depth - depth
+      divisions = 1 << levels
+      sub_col = child_col % divisions
+      sub_row = child_row % divisions
+      x0 = sub_col * width // divisions
+      x1 = (sub_col + 1) * width // divisions
+      # Class maps are image-oriented: row zero is north.
+      y0 = (divisions - 1 - sub_row) * height // divisions
+      y1 = (divisions - sub_row) * height // divisions
+      label_image = label_image.crop((x0, y0, x1, y1))
+    label_image = label_image.resize(
+      (resolution, resolution), _Image.Resampling.NEAREST,
+    )
+    rgb = colorize_class_map(_np.asarray(label_image), class_schema)
+  except (TypeError, ValueError, zlib.error):
+    return Response(
+      b"", status=500,
+      headers={"Cache-Control": "no-store", "X-Classifier-Status": "invalid"},
+    )
+  buf = _io.BytesIO()
+  _Image.fromarray(rgb, mode="RGB").save(buf, format="PNG")
+  headers = {
+    "Cache-Control": "public, max-age=86400",
+    "X-Classifier-Status": "ready",
+    "X-Classifier-Schema": str(class_schema),
+    "X-Classifier-Source": str(source),
+  }
+  if depth != child_depth:
+    headers["X-Classifier-Ancestor"] = f"{depth}-{col}-{row}"
+  return Response(buf.getvalue(), mimetype="image/png", headers=headers)
+
+
 @app.get("/api/heatmap")
 def api_heatmap():
   """Quadtree grid and cached terrain diagnostics for the last /api/tiles
-  camera. Drives the heatmap in webserver/coverage.html. hasTexture marks
-  tiles whose own texture is already cached (safe to pull /api/texture without
-  triggering an upstream fetch)."""
+  camera. hasTexture marks tiles whose own texture is already cached (safe to
+  pull /api/texture without triggering an upstream fetch)."""
   import numpy as np
   from database import CONFIDENCE, GRID_N, _decompress_uint8
   from tiles import build_lod_tree, get_leaves
@@ -1597,7 +1416,12 @@ def api_heatmap():
   qy = _arg_float("qy", cam["qy"])
   alt = _arg_float("alt", cam["alt"])
   heading = _arg_float("heading", cam["heading"])
-  max_depth = _arg_int("maxDepth", int(cam["maxDepth"]))
+  # This is a diagnostic view of the terrain traversal, not a speculative
+  # quadtree. Never advertise leaves deeper than the renderer can request.
+  max_depth = min(
+    _arg_int("maxDepth", int(cam["maxDepth"])),
+    ENHANCE_DEPTH,
+  )
   lod_factor = _arg_float("lod", 2.0)
 
   root = build_lod_tree(qx, qy, max_depth=max_depth, lod_factor=lod_factor)
@@ -1665,21 +1489,6 @@ def api_heatmap():
   })
 
 
-@app.get("/api/regression/")
-@app.get("/api/regression/<path:name>")
-def api_regression(name: str = "index.html"):
-  """Classifier regression gallery — regression_cases.py output on disk.
-  Rebuild with `venv/bin/python -m classifier.regression_cases` after classifier
-  changes; the frontend pages link here (vite proxies /api to us)."""
-  from pathlib import Path as _Path
-  root = _Path(__file__).parent / "sample" / "regression"
-  if not (root / "index.html").is_file():
-    return Response(
-      b"no regression gallery yet - run: venv/bin/python -m classifier.regression_cases",
-      status=404, mimetype="text/plain")
-  return send_from_directory(root, name)
-
-
 @app.get("/api/pipeline/at.json")
 def api_pipeline_at():
   """Resolve lat/lon (e.g. the 3D camera position) to the deepest tile that
@@ -1721,11 +1530,6 @@ def api_pipeline(tile_id: str):
   x = db.execute(
     "SELECT source, LENGTH(texture), updated_at FROM textures WHERE tile_id = ?",
     (tile_id,)).fetchone()
-  from google_ref import init_google_refs
-  init_google_refs(db)
-  g = db.execute(
-    "SELECT zoom, resolution, LENGTH(texture), updated_at FROM google_refs "
-    "WHERE tile_id = ?", (tile_id,)).fetchone()
   return jsonify({
     "tile": tile_id,
     "depth": t[0],
@@ -1734,39 +1538,14 @@ def api_pipeline(tile_id: str):
     "heightmap": {"ok": bool(t[5]), "source": t[6], "updated": t[7]},
     "texture": ({"ok": True, "source": x[0], "bytes": x[1], "updated": x[2]}
                 if x else {"ok": False}),
-    "google_ref": ({"ok": True, "zoom": g[0], "res": g[1], "bytes": g[2],
-                    "updated": g[3]} if g else
-                   {"ok": False, "note": "fetches+caches on first use"}),
   })
-
-
-@app.post("/api/regression/cases")
-def api_regression_add():
-  """Flag a tile as a regression case (pipeline.html's flag button): appends
-  {tile, note} to regression_cases.json, bakes the case (classifier steps +
-  overlay) and rebuilds the gallery."""
-  from google_ref import init_google_refs
-  from classifier.regression_cases import add_case, bake
-
-  data = request.get_json(silent=True) or {}
-  tile_id = str(data.get("tile", "")).strip()
-  note = str(data.get("note", "")).strip()
-  if _parse_tile_id(tile_id) is None:
-    return jsonify({"error": f"bad tile id: {tile_id!r}"}), 400
-  if not note:
-    return jsonify({"error": "note is required — say what is wrong"}), 400
-  count = add_case(tile_id, note)
-  db = _get_db()
-  init_google_refs(db)
-  bake(db, [tile_id])
-  return jsonify({"ok": True, "cases": count, "tile": tile_id})
 
 
 @app.get("/api/coverage/index.json")
 def api_coverage_index():
   """Every tile with a REAL cached texture (placeholder crops excluded) —
-  drives coverage.html's coverage mode. ?maxdepth caps the depth (default 12,
-  the contract level); deeper tiles are detail, not coverage."""
+  ?maxdepth caps the depth (default 12, the contract level); deeper tiles are
+  detail, not coverage."""
   try:
     maxdepth = int(request.args.get("maxdepth", "12"))
   except ValueError:
@@ -1782,174 +1561,6 @@ def api_coverage_index():
       "'ancestor_crop_nodata') ORDER BY t.depth", (maxdepth,))
   ]
   return jsonify({"tiles": tiles})
-
-
-@app.get("/api/colorized/index.json")
-def api_colorized_index():
-  """Coverage index of model-painted tiles (colorize.py output on disk):
-  tile id, bbox (EPSG:3413) and depth for every tile with its own colorized
-  PNG. Drives webserver/coverage.html's map view."""
-  from pathlib import Path as _Path
-  root = _Path(__file__).parent / "sample" / "colorized"
-  db = _get_db()
-  tiles = []
-  for p in sorted(root.glob("*/colorized.png")):
-    tid = p.parent.name
-    row = db.execute(
-      "SELECT x_min, y_min, x_max, y_max, depth FROM tiles WHERE tile_id = ?",
-      (tid,)).fetchone()
-    if row is not None:
-      tiles.append({"tile": tid, "bbox": list(row[:4]), "depth": row[4]})
-  return jsonify({"tiles": tiles})
-
-
-@app.get("/api/colorized/<tile_id>/thumb.jpg")
-def api_colorized_thumb(tile_id: str):
-  """256² JPEG of the model-painted texture (own tile or ancestor crop, see
-  _colorized_jpeg). Drives the imagery layer of webserver/coverage.html."""
-  if _parse_tile_id(tile_id) is None:
-    return Response(b"", status=400)
-  data = _colorized_jpeg(tile_id)
-  if data is None:
-    return Response(b"", status=404)
-  return Response(data, mimetype="image/jpeg",
-                  headers={"Cache-Control": "no-store"})
-
-
-@app.get("/api/colorized/<tile_id>/<name>.png")
-def api_colorized_file(tile_id: str, name: str):
-  """Serve a colorize.py output image (composite/colorized/coarse/google/
-  classes) for the coverage map's click-through."""
-  if name not in ("composite", "colorized", "coarse", "google", "classes"):
-    return Response(b"", status=400)
-  if _parse_tile_id(tile_id) is None:
-    return Response(b"", status=400)
-  from pathlib import Path as _Path
-  p = _Path(__file__).parent / "sample" / "colorized" / tile_id / f"{name}.png"
-  if not p.is_file():
-    return Response(b"", status=404)
-  return Response(p.read_bytes(), mimetype="image/png",
-                  headers={"Cache-Control": "no-store"})
-
-
-@app.get("/api/classes/<tile_id>/<stage>.png")
-def api_classes(tile_id: str, stage: str):
-  """Heuristic classifier overlay on the Google reference, as a debug PNG
-  pixel-aligned with /api/texture and /api/google. stage `coarse` is the
-  5-bucket d12-contract labeler (biomes.classify_coarse); `field` is the
-  legacy 6-class labeler; `refined` adds the fixed-scale rock hard/loose
-  split (slope from the tile heightmap when available) plus detected boulder
-  instances; `bands` renders rock-banding orientation/coherence segments
-  (structure tensor — hue = band direction, opacity = coherence). Google refs
-  are cached, so the first hit on an unflown tile pays the upstream fetch.
-  Query params: res (default 512), alpha (overlay strength 0..1, default .55).
-  """
-  if stage not in ("coarse", "field", "refined", "bands"):
-    return Response(b"", status=400)
-  unavailable = _terrain_unavailable_response()
-  if unavailable is not None:
-    return unavailable
-  parsed = _parse_tile_id(tile_id)
-  if parsed is None:
-    return Response(b"", status=400)
-  d, c, r = parsed
-
-  try:
-    res = max(64, min(2048, int(request.args.get("res", "512"))))
-    alpha = max(0.0, min(1.0, float(request.args.get("alpha", "0.55"))))
-  except ValueError:
-    return Response(b"", status=400)
-
-  import io as _io
-
-  import numpy as np
-  from PIL import Image as _Image
-
-  from classifier.biomes import (BAND_MAX_DEPTH, BAND_ZOOM, BOULDER_MIN_ZOOM,
-                      COARSE_NAMES, FIELD_NAMES, REFINED_NAMES, band_overlay,
-                      band_structure, class_overlay, classify_coarse,
-                      classify_field, refine_rock)
-  from google_ref import get_google_ref, init_google_refs
-  from classifier.training_data import _upsample_f32, terrain_channels
-
-  db = _get_db()
-  init_google_refs(db)
-  bbox = _tile_bbox(d, c, r)
-  # banding is measured at z16 (signal lives at 30-100 m wavelength); the
-  # refined stage needs z18 — boulder shadows don't resolve below that, and
-  # the depth-default zoom at the refined band (12-13) is only z16/17, which
-  # silently disabled the boulder detector for the whole refined view
-  zoom = {"bands": BAND_ZOOM, "refined": BOULDER_MIN_ZOOM}.get(stage)
-  jpeg, z = get_google_ref(db, tile_id, bbox, resolution=res, zoom=zoom)
-  if jpeg is None:
-    return Response(b"", status=502, headers={"X-Tex-Status": "google_fetch_failed"})
-  rgb = np.array(_Image.open(_io.BytesIO(jpeg)).convert("RGB")
-                 .resize((res, res), _Image.Resampling.LANCZOS))
-
-  if stage == "bands":
-    if d > BAND_MAX_DEPTH:
-      # aerial-scale fact: measure on the BAND_MAX_DEPTH ancestor and crop
-      # this tile's quadrant, so deep tiles show the same formations instead
-      # of tensor noise (a deep tile spans too few band wavelengths)
-      shift = d - BAND_MAX_DEPTH
-      ac, ar = c >> shift, r >> shift
-      abox = _tile_bbox(BAND_MAX_DEPTH, ac, ar)
-      ajpeg, _az = get_google_ref(db, f"{BAND_MAX_DEPTH}-{ac}-{ar}", abox,
-                                  resolution=res, zoom=BAND_ZOOM)
-      if ajpeg is None:
-        return Response(b"", status=502,
-                        headers={"X-Tex-Status": "google_fetch_failed"})
-      argb = np.array(_Image.open(_io.BytesIO(ajpeg)).convert("RGB")
-                      .resize((res, res), _Image.Resampling.LANCZOS))
-      theta, coh = band_structure(argb, (abox[2] - abox[0]) / res)
-      # tile row index grows northward, image row 0 is north — flip the
-      # quadrant's row position (same convention as _heightmap_ancestor_crop)
-      n = 1 << shift
-      qx, qy = c - (ac << shift), r - (ar << shift)
-      bh, bw = theta.shape
-      iy0, ix0 = (n - 1 - qy) * bh // n, qx * bw // n
-      theta = theta[iy0:iy0 + max(1, bh // n), ix0:ix0 + max(1, bw // n)]
-      coh = coh[iy0:iy0 + max(1, bh // n), ix0:ix0 + max(1, bw // n)]
-    else:
-      theta, coh = band_structure(rgb, (bbox[2] - bbox[0]) / res)
-    buf = _io.BytesIO()
-    _Image.fromarray(band_overlay(rgb, theta, coh)).save(buf, format="PNG")
-    return Response(
-      buf.getvalue(), mimetype="image/png",
-      headers={"Cache-Control": "no-store", "X-Google-Zoom": str(z),
-               "X-Tex-Source": "classes_bands"})
-
-  slope = southness = elev = None
-  hm, _hm_src, _hm_d = _heightmap_ancestor_crop(db, d, c, r)
-  if hm is not None:
-    chans = terrain_channels(hm, bbox[2] - bbox[0])
-    # DB heightmaps are row 0 = south; flip to image orientation
-    slope = _upsample_f32(chans["slope"], res)[::-1]
-    southness = _upsample_f32(chans["southness"], res)[::-1]
-    elev = _upsample_f32(chans["elev"], res)[::-1]
-  if stage == "coarse":
-    cls = classify_coarse(rgb, slope=slope, elev=elev)
-    names = COARSE_NAMES
-  else:
-    cls = classify_field(rgb, southness=southness, slope=slope,
-                         mpp=(bbox[2] - bbox[0]) / res, elev=elev)
-    names = FIELD_NAMES
-  if stage == "refined":
-    cls = refine_rock(rgb, (bbox[2] - bbox[0]) / res, cls, slope=slope,
-                      google_zoom=z, tile_depth=d)
-    names = REFINED_NAMES
-
-  buf = _io.BytesIO()
-  _Image.fromarray(class_overlay(rgb, cls, names=names, alpha=alpha)).save(buf, format="PNG")
-  return Response(
-    buf.getvalue(),
-    mimetype="image/png",
-    headers={
-      "Cache-Control": "no-store",
-      "X-Google-Zoom": str(z),
-      "X-Tex-Source": f"classes_{stage}",
-    },
-  )
 
 
 @app.post("/api/texture/<tile_id>/enhance")
@@ -2042,7 +1653,6 @@ def api_texture_enhance(tile_id: str):
       )
       if enhanced is not None:
         _write_texture(wdb, tile_id, enhanced, esrc)
-        _update_water_mask_for_tile(wdb, tile_id, enhanced, esrc)
         log_tex.info(f"[ENHANCE] {tile_id}: done, wrote {len(enhanced)} bytes as {esrc}")
       else:
         log_tex.warning(f"[ENHANCE] {tile_id}: upscaler returned None")
@@ -2082,189 +1692,10 @@ def api_texture_discard_enhanced(tile_id: str):
     return jsonify({"error": f"not enhanced (source={source})"}), 400
 
   db.execute("DELETE FROM textures WHERE tile_id = ?", (tile_id,))
-  db.execute("DELETE FROM water_masks WHERE tile_id = ?", (tile_id,))
   db.commit()
 
   log_tex.info(f"[DISCARD] {tile_id}: discarded {source}")
   return jsonify({"ok": True, "discarded": source})
-
-
-@app.get("/api/watermask/<tile_id>.png")
-def api_watermask(tile_id: str):
-  unavailable = _terrain_unavailable_response()
-  if unavailable is not None:
-    return unavailable
-
-  db = _get_db()
-  cached = _read_water_mask(db, tile_id)
-  if cached is not None:
-    mask_png, source, coverage = cached
-    return Response(
-      mask_png,
-      mimetype="image/png",
-      headers={
-        "Cache-Control": "public, max-age=86400",
-        "X-WaterMask-Source": source,
-        "X-WaterMask-Coverage": f"{coverage:.4f}",
-        "X-WaterMask-Status": "ready",
-      },
-    )
-  tex_row = db.execute(
-    "SELECT texture, source FROM textures WHERE tile_id = ?",
-    (tile_id,),
-  ).fetchone()
-  if tex_row is not None:
-    texture_jpeg, texture_source = tex_row[0], str(tex_row[1])
-    _update_water_mask_for_tile(db, tile_id, texture_jpeg, texture_source)
-    cached = _read_water_mask(db, tile_id)
-    if cached is not None:
-      mask_png, source, coverage = cached
-      return Response(
-        mask_png,
-        mimetype="image/png",
-        headers={
-          "Cache-Control": "public, max-age=86400",
-          "X-WaterMask-Source": source,
-          "X-WaterMask-Coverage": f"{coverage:.4f}",
-          "X-WaterMask-Status": "ready",
-        },
-      )
-
-  parsed = _parse_tile_id(tile_id)
-  if parsed is None:
-    return Response(b"", status=400)
-  d, c, r = parsed
-  _queue_texture_fetch(tile_id, _tile_bbox(d, c, r))
-  return Response(
-    b"",
-    status=202,
-    headers={"Cache-Control": "no-store", "X-WaterMask-Status": "fetching"},
-  )
-
-
-@app.post("/api/watermask/<tile_id>/generate")
-def api_watermask_generate(tile_id: str):
-  unavailable = _terrain_unavailable_response()
-  if unavailable is not None:
-    return unavailable
-
-  db = _get_db()
-  tex_row = db.execute(
-    "SELECT texture, source FROM textures WHERE tile_id = ?",
-    (tile_id,),
-  ).fetchone()
-  if tex_row is None:
-    parsed = _parse_tile_id(tile_id)
-    if parsed is None:
-      return jsonify({"error": "bad tile id"}), 400
-    d, c, r = parsed
-    _queue_texture_fetch(tile_id, _tile_bbox(d, c, r))
-    return jsonify({"ok": False, "status": "fetching_texture", "tileId": tile_id}), 202
-
-  texture_jpeg, texture_source = tex_row[0], str(tex_row[1])
-  ok, reason, coverage = _generate_water_mask_for_tile(
-    db,
-    tile_id,
-    texture_jpeg,
-    texture_source,
-  )
-  if not ok:
-    status = 409 if reason in ("tile_missing", "heightmap_missing") else 422
-    return jsonify({"ok": False, "status": reason, "tileId": tile_id}), status
-
-  return jsonify(
-    {
-      "ok": True,
-      "status": "ready",
-      "tileId": tile_id,
-      "source": texture_source,
-      "coverage": coverage,
-      "waterMaskUrl": f"/api/watermask/{tile_id}.png",
-    }
-  )
-
-
-@app.post("/api/watermask/from_texture.png")
-def api_watermask_from_texture():
-  """Basic standalone water-mask endpoint from a provided texture image."""
-  unavailable = _terrain_unavailable_response()
-  if unavailable is not None:
-    return unavailable
-  if _build_water_mask is None or _np is None:
-    raise RuntimeError("water mask backend unavailable")
-
-  resolution = _arg_int("resolution", 256)
-  if resolution < 32 or resolution > 2048:
-    return jsonify({"error": "resolution must be in [32, 2048]"}), 400
-
-  texture_jpeg: bytes | None = None
-  if "texture" in request.files:
-    texture_jpeg = request.files["texture"].read()
-  elif request.data:
-    texture_jpeg = bytes(request.data)
-  else:
-    payload = request.get_json(silent=True) or {}
-    encoded = payload.get("textureBase64")
-    if encoded:
-      try:
-        texture_jpeg = base64.b64decode(str(encoded), validate=True)
-      except Exception:
-        return jsonify({"error": "invalid textureBase64"}), 400
-
-  if not texture_jpeg:
-    return (
-      jsonify(
-        {
-          "error": (
-            "missing texture input: send multipart field 'texture', "
-            "raw image bytes in body, or JSON field textureBase64"
-          )
-        }
-      ),
-      400,
-    )
-
-  # Treat uniform white frames as invalid input (provider no-data artifact).
-  from texture import is_white_fill
-  try:
-    img = _Image.open(io.BytesIO(texture_jpeg)).convert("RGB")
-    arr = _np.asarray(img, dtype=_np.uint8)
-    if is_white_fill(arr):
-      raise ValueError(
-        "DATA_ERROR: flat-white texture input (likely no-data source image)"
-      )
-  except ValueError:
-    raise
-  except Exception as exc:
-    raise RuntimeError(
-      f"PROCESSING_ERROR: failed to decode texture input: {type(exc).__name__}: {exc}"
-    )
-
-  # The standalone service is texture-driven; height/bbox are placeholders.
-  hm = _np.zeros((_GRID_N, _GRID_N), dtype=_np.float32)
-  bbox = (0.0, 0.0, 1.0, 1.0)
-  built = _build_water_mask(
-    texture_jpeg,
-    hm,
-    bbox,
-    resolution=resolution,
-  )
-  if built is None:
-    raise RuntimeError("water mask segmentation failed to produce output")
-  mask_png, coverage = built
-  if mask_png is None:
-    raise RuntimeError("water mask segmentation returned empty mask")
-
-  return Response(
-    mask_png,
-    mimetype="image/png",
-    headers={
-      "Cache-Control": "no-store",
-      "X-WaterMask-Coverage": f"{float(coverage):.4f}",
-      "X-WaterMask-SAM-Model": _water_mask_model_id or "facebook/sam2-hiera-small",
-      "X-WaterMask-Status": "ready",
-    },
-  )
 
 
 @app.get("/api/enhance/status")
@@ -2480,19 +1911,6 @@ def api_tile_inspect():
     if ancestor:
       log_tex.info(f"  tex fallback: using ancestor {ancestor}")
 
-  wm_row = db.execute(
-    "SELECT source, coverage, length(mask_png), updated_at FROM water_masks WHERE tile_id = ?",
-    (tid,),
-  ).fetchone()
-  if wm_row:
-    wm_src, wm_cov, wm_size, wm_updated = wm_row
-    log_tex.info(
-      f"  water_mask: source={wm_src} coverage={float(wm_cov) * 100:.1f}% "
-      f"size={wm_size} bytes updated={wm_updated}"
-    )
-  else:
-    log_tex.info("  water_mask: NOT IN DB")
-
   hist = data.get("history", [])
   if hist:
     log_db.info(f"  history ({len(hist)} events):")
@@ -2663,11 +2081,6 @@ def terrain_health():
   )
 
 
-@app.get("/test/watermask")
-def test_watermask_page():
-  return send_from_directory(str(ROOT), "watermask_results.html")
-
-
 @app.get("/client_log.html")
 def client_log_page():
   if CLIENT_LOG_HTML_PATH.is_file():
@@ -2685,6 +2098,16 @@ def client_log_page():
 @app.get("/")
 def index():
   return send_from_directory(STATIC_DIR, "index.html")
+
+
+@app.get("/coverage.html")
+def retired_coverage_page():
+  return Response(
+    "Not found",
+    status=404,
+    mimetype="text/plain",
+    headers={"Cache-Control": "no-store"},
+  )
 
 
 @app.get("/<path:path>")

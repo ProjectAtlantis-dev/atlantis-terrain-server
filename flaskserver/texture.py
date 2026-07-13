@@ -42,12 +42,10 @@ import io
 import json
 import math
 import os
-import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections import deque
 
 import numpy as np
 from PIL import Image, ImageFilter
@@ -146,22 +144,6 @@ def _env_bool(name, default=False):
     if raw is None:
         return default
     return raw.strip().lower() in {"1", "true", "yes", "on"}
-
-
-# SAM-only water mask backend (no heuristic fallback).
-# Fixed to SAM2 for the water-mask service.
-_SAM_MODEL_ID = "facebook/sam2-hiera-small"
-_SAM_POINTS_PER_BATCH = int(os.environ.get("WATER_MASK_SAM_POINTS_PER_BATCH", "64"))
-_SAM_SEED_PRECISION_MIN = float(os.environ.get("WATER_MASK_SAM_SEED_PRECISION_MIN", "0.30"))
-_SAM_EDGE_BOTTOM_MIN = float(os.environ.get("WATER_MASK_SAM_EDGE_BOTTOM_MIN", "0.08"))
-_sam_pipeline = None
-_sam_init_lock = threading.Lock()
-_sam_infer_lock = threading.Lock()
-_sam_supports_points_per_batch = None
-
-
-def water_mask_model_id():
-    return _SAM_MODEL_ID
 
 
 # ---------------------------------------------------------------------------
@@ -280,26 +262,14 @@ CREATE TABLE IF NOT EXISTS textures (
 );
 """
 
-_WATER_MASK_SCHEMA = """
-CREATE TABLE IF NOT EXISTS water_masks (
-    tile_id    TEXT PRIMARY KEY,
-    source     TEXT NOT NULL,
-    mask_png   BLOB NOT NULL,
-    coverage   REAL NOT NULL,
-    updated_at TEXT NOT NULL
-);
-"""
-
 def init_textures(db):
-    """Create texture + water mask tables if they don't exist."""
+    """Create texture tables if they don't exist."""
     existing = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
-    db.executescript(_TEXTURE_SCHEMA + _WATER_MASK_SCHEMA)
+    db.executescript(_TEXTURE_SCHEMA)
     init_seam_jobs(db)
     db.commit()
     if "textures" not in existing:
         log_tex.info("Created table: textures")
-    if "water_masks" not in existing:
-        log_tex.info("Created table: water_masks")
 
 
 def write_texture(db, tile_id, jpeg_bytes, source):
@@ -362,242 +332,6 @@ def texture_ids_in(db, tile_ids):
         list(tile_ids)
     ).fetchall()
     return {r[0] for r in rows}
-
-
-def write_water_mask(db, tile_id, mask_png, source, coverage):
-    """Store water mask PNG (L8) for a tile."""
-    now = datetime.datetime.now(datetime.timezone.utc).isoformat()
-    db.execute(
-        "INSERT OR REPLACE INTO water_masks (tile_id, source, mask_png, coverage, updated_at) "
-        "VALUES (?, ?, ?, ?, ?)",
-        (tile_id, source, mask_png, float(coverage), now)
-    )
-    db.commit()
-
-
-def read_water_mask(db, tile_id):
-    """Read cached water mask tuple: (png_bytes, source, coverage) or None."""
-    row = db.execute(
-        "SELECT mask_png, source, coverage FROM water_masks WHERE tile_id = ?",
-        (tile_id,)
-    ).fetchone()
-    return (row[0], row[1], float(row[2])) if row else None
-
-
-def water_mask_ids_in(db, tile_ids):
-    """Return set of tile_ids that have cached water masks."""
-    if not tile_ids:
-        return set()
-    placeholders = ",".join("?" for _ in tile_ids)
-    rows = db.execute(
-        f"SELECT tile_id FROM water_masks WHERE tile_id IN ({placeholders})",
-        list(tile_ids)
-    ).fetchall()
-    return {r[0] for r in rows}
-
-
-def _resample_heightmap(heightmap, resolution):
-    """Upsample terrain heightmap to texture resolution."""
-    hm_img = Image.fromarray(heightmap.astype(np.float32), mode="F")
-    hm_up = hm_img.resize((resolution, resolution), Image.Resampling.BILINEAR)
-    return np.array(hm_up, dtype=np.float32)
-
-
-def _box3_sum(values):
-    """3x3 neighborhood sum with edge clamping."""
-    h, w = values.shape
-    padded = np.pad(values, ((1, 1), (1, 1)), mode="edge")
-    out = np.zeros((h, w), dtype=np.float32)
-    for dy in range(3):
-        for dx in range(3):
-            out += padded[dy:dy + h, dx:dx + w]
-    return out
-
-
-def _flood_connected(seed, passable):
-    """4-neighbor flood fill from seed within passable mask."""
-    h, w = passable.shape
-    out = np.zeros((h, w), dtype=bool)
-    q = deque()
-
-    ys, xs = np.nonzero(seed & passable)
-    for y, x in zip(ys.tolist(), xs.tolist()):
-        out[y, x] = True
-        q.append((y, x))
-
-    while q:
-        y, x = q.popleft()
-        if y > 0 and passable[y - 1, x] and not out[y - 1, x]:
-            out[y - 1, x] = True
-            q.append((y - 1, x))
-        if y + 1 < h and passable[y + 1, x] and not out[y + 1, x]:
-            out[y + 1, x] = True
-            q.append((y + 1, x))
-        if x > 0 and passable[y, x - 1] and not out[y, x - 1]:
-            out[y, x - 1] = True
-            q.append((y, x - 1))
-        if x + 1 < w and passable[y, x + 1] and not out[y, x + 1]:
-            out[y, x + 1] = True
-            q.append((y, x + 1))
-    return out
-
-
-def _get_sam_pipeline():
-    global _sam_pipeline
-    if _sam_pipeline is not None:
-        return _sam_pipeline
-    with _sam_init_lock:
-        if _sam_pipeline is None:
-            from transformers import pipeline as hf_pipeline
-
-            log_tex.info(f"[WATER MASK][SAM2] loading model={_SAM_MODEL_ID}")
-            base_kwargs = {
-                "task": "mask-generation",
-                "model": _SAM_MODEL_ID,
-                "device": "cpu",
-            }
-            try:
-                _sam_pipeline = hf_pipeline(use_fast=True, **base_kwargs)
-            except Exception as exc:
-                msg = str(exc).lower()
-                if "use_fast" not in msg and "fast image processor" not in msg:
-                    raise
-                log_tex.warning(
-                    f"[WATER MASK][SAM2] model={_SAM_MODEL_ID} does not support use_fast; "
-                    "retrying without use_fast"
-                )
-                _sam_pipeline = hf_pipeline(**base_kwargs)
-    return _sam_pipeline
-
-
-def _run_sam_mask_generation(pipe, tex):
-    global _sam_supports_points_per_batch
-    if _sam_supports_points_per_batch is not False:
-        try:
-            out = pipe(tex, points_per_batch=_SAM_POINTS_PER_BATCH)
-            _sam_supports_points_per_batch = True
-            return out
-        except Exception as exc:
-            msg = str(exc).lower()
-            if "points_per_batch" not in msg and "unexpected keyword" not in msg:
-                raise
-            _sam_supports_points_per_batch = False
-            log_tex.warning(
-                "[WATER MASK][SAM2] points_per_batch unsupported by current pipeline; "
-                "retrying without it"
-            )
-    return pipe(tex)
-
-
-def _sam_mask_to_bool(mask):
-    arr = mask.detach().cpu().numpy() if hasattr(mask, "detach") else np.asarray(mask)
-    if arr.ndim == 3:
-        arr = arr[:, :, 0]
-    if arr.dtype == np.bool_:
-        return arr
-    if arr.dtype.kind in {"f", "c"}:
-        return arr > 0.5
-    return arr > 0
-
-
-def _water_seed_from_rgb(rgb_u8):
-    rgb = rgb_u8.astype(np.float32) / 255.0
-    r = rgb[:, :, 0]
-    g = rgb[:, :, 1]
-    b = rgb[:, :, 2]
-    mx = np.maximum(np.maximum(r, g), b)
-    mn = np.minimum(np.minimum(r, g), b)
-    sat = (mx - mn) / np.maximum(mx, 1e-6)
-    blue_dom = b - np.maximum(r, g)
-    blue_cyan = b - 0.5 * r - 0.35 * g
-    lum = 0.299 * r + 0.587 * g + 0.114 * b
-    return (np.maximum(blue_dom, blue_cyan) > 0.03) & (sat > 0.03) & (lum < 0.72)
-
-
-def _score_sam_masks(masks, sam_scores, seed, rgb_u8):
-    rgb = rgb_u8.astype(np.float32) / 255.0
-    blue_strength = np.maximum(
-        rgb[:, :, 2] - np.maximum(rgb[:, :, 0], rgb[:, :, 1]),
-        rgb[:, :, 2] - 0.5 * rgb[:, :, 0] - 0.35 * rgb[:, :, 1],
-    )
-    seed_total = int(seed.sum())
-    rows = []
-    for i, m in enumerate(masks):
-        area = int(m.sum())
-        if area <= 0:
-            continue
-        overlap = int((m & seed).sum())
-        precision = overlap / area
-        edge_bottom = float(m[-1, :].mean())
-        blue_mean = float(blue_strength[m].mean())
-        sam = float(sam_scores[i]) if i < len(sam_scores) else 0.0
-        score = 2.2 * precision + 1.0 * edge_bottom + 0.8 * blue_mean + 0.05 * sam
-        rows.append(
-            {
-                "mask_index": i,
-                "area_px": area,
-                "seed_precision": precision,
-                "seed_recall": overlap / max(seed_total, 1),
-                "edge_bottom": edge_bottom,
-                "blue_mean": blue_mean,
-                "sam_score": sam,
-                "water_score": score,
-            }
-        )
-    rows.sort(key=lambda r: r["water_score"], reverse=True)
-    return rows
-
-
-def build_water_mask(texture_jpeg, heightmap, bbox, resolution=256):
-    """Build an L8 water mask using SAM (no heuristic fallback)."""
-    _ = heightmap, bbox  # kept for call signature compatibility
-    tex = Image.open(io.BytesIO(texture_jpeg)).convert("RGB")
-    if tex.size != (resolution, resolution):
-        tex = tex.resize((resolution, resolution), Image.Resampling.BILINEAR)
-    rgb_u8 = np.asarray(tex, dtype=np.uint8)
-
-    seed = _water_seed_from_rgb(rgb_u8)
-    pipe = _get_sam_pipeline()
-    with _sam_infer_lock:
-        out = _run_sam_mask_generation(pipe, tex)
-
-    if isinstance(out, list):
-        if not out:
-            raise RuntimeError("SAM returned empty output list")
-        out = out[0]
-    if not isinstance(out, dict):
-        raise RuntimeError(f"SAM returned unsupported output type: {type(out).__name__}")
-
-    raw_masks = out.get("masks")
-    if raw_masks is None:
-        raise RuntimeError("SAM output missing 'masks'")
-    masks = [_sam_mask_to_bool(m) for m in raw_masks]
-    if not masks:
-        raise RuntimeError("SAM returned no masks")
-
-    scores_tensor = out.get("scores", [])
-    sam_scores = (
-        scores_tensor.detach().cpu().numpy()
-        if hasattr(scores_tensor, "detach")
-        else np.asarray(scores_tensor)
-    )
-    ranked = _score_sam_masks(masks, sam_scores, seed, rgb_u8)
-
-    selected_ids = [
-        int(r["mask_index"])
-        for r in ranked
-        if r["seed_precision"] >= _SAM_SEED_PRECISION_MIN
-        and r["edge_bottom"] >= _SAM_EDGE_BOTTOM_MIN
-    ]
-    water = np.zeros((resolution, resolution), dtype=bool)
-    for idx in selected_ids:
-        water |= masks[idx]
-
-    mask_u8 = (water.astype(np.uint8) * 255).astype(np.uint8)
-    coverage = float(np.mean(water))
-    buf = io.BytesIO()
-    Image.fromarray(mask_u8, mode="L").save(buf, format="PNG", optimize=True)
-    return buf.getvalue(), coverage
 
 
 # ---------------------------------------------------------------------------

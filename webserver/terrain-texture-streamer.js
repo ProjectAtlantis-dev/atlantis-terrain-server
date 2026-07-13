@@ -16,14 +16,11 @@ export function rendererTextureAnisotropy(renderer) {
 
 export function createTextureStreamer({
   log,
-  recolor = false,
-  enableWaterMasks = false,
   maxInflight = 120,
   repollBatch = 8,
   retryBaseMs = 2000,
   retryMaxMs = 30000,
   retryErrorMs = 3000,
-  onWaterMask = () => {},
   fetchImpl = (...args) => fetch(...args),
   decodeImage = (...args) => createImageBitmap(...args),
   getTextureAnisotropy = () => 1,
@@ -35,8 +32,6 @@ export function createTextureStreamer({
   const texFetching = new Set();
   const texRetryAtMs = new Map();
   const texRetryCount = new Map();
-  const waterMaskCache = new Map();
-  const waterMaskInflight = new Map();
   const ancestorLogged = new Set();
   const demandClient = globalThis.crypto?.randomUUID?.() ?? `terrain-${Date.now()}-${Math.random()}`;
   let version = Date.now();
@@ -52,32 +47,6 @@ export function createTextureStreamer({
     texture.anisotropy = Number.isFinite(available)
       ? Math.max(1, Math.min(8, available))
       : 1;
-  }
-
-  function requestWaterMask(tileId) {
-    if (!enableWaterMasks || !tileId || waterMaskCache.has(tileId) || waterMaskInflight.has(tileId)) return;
-    const controller = new AbortController();
-    waterMaskInflight.set(tileId, controller);
-    fetchImpl(`/api/watermask/${tileId}.png?v=${version}`, { signal: controller.signal })
-      .then(response => {
-        waterMaskInflight.delete(tileId);
-        if (response.status === 202 || !response.ok) return null;
-        return response.blob();
-      })
-      .then(blob => blob && decodeImage(blob, { imageOrientation: 'flipY' }))
-      .then(bitmap => {
-        if (!bitmap) return;
-        const texture = new THREE.Texture(bitmap);
-        texture.flipY = false;
-        texture.colorSpace = THREE.NoColorSpace;
-        texture.needsUpdate = true;
-        waterMaskCache.set(tileId, texture);
-        onWaterMask(tileId, texture);
-      })
-      .catch(error => {
-        waterMaskInflight.delete(tileId);
-        if (error.name !== 'AbortError') console.warn(`[WATER MASK] ${tileId}:`, error.message);
-      });
   }
 
   function pump(scored, { isCovered, onPlaceholder, onTexture }) {
@@ -98,7 +67,7 @@ export function createTextureStreamer({
 
       const controller = new AbortController();
       texInflight.set(tileId, controller);
-      fetchImpl(`/api/texture/${tileId}.jpg?v=${version}&demand=${version}&demandClient=${encodeURIComponent(demandClient)}${recolor ? '&stage=colorized' : ''}`, { signal: controller.signal })
+      fetchImpl(`/api/texture/${tileId}.jpg?v=${version}&demand=${version}&demandClient=${encodeURIComponent(demandClient)}`, { signal: controller.signal })
         .then(response => {
           texInflight.delete(tileId);
           if (response.status === 202) {
@@ -146,7 +115,6 @@ export function createTextureStreamer({
           texRetryCount.delete(tileId);
           texCache.set(tileId, texture);
           texSource.set(tileId, source);
-          requestWaterMask(tileId);
           onTexture({ tileId, tile, texture, source });
         })
         .catch(error => {
@@ -162,25 +130,20 @@ export function createTextureStreamer({
 
   function invalidate(tileId) {
     texInflight.get(tileId)?.abort();
-    waterMaskInflight.get(tileId)?.abort();
     texInflight.delete(tileId);
-    waterMaskInflight.delete(tileId);
     texFetching.delete(tileId);
     texRetryAtMs.delete(tileId);
     texRetryCount.delete(tileId);
     ancestorLogged.delete(tileId);
     texCache.delete(tileId);
     texSource.delete(tileId);
-    waterMaskCache.delete(tileId);
     version = Date.now();
     return version;
   }
 
   function abortAll() {
     for (const controller of texInflight.values()) controller.abort();
-    for (const controller of waterMaskInflight.values()) controller.abort();
     texInflight.clear();
-    waterMaskInflight.clear();
     texFetching.clear();
     texRetryAtMs.clear();
     texRetryCount.clear();
@@ -190,8 +153,7 @@ export function createTextureStreamer({
 
   return {
     texCache, texSource, texInflight, texFetching, texRetryAtMs, texRetryCount,
-    waterMaskCache, waterMaskInflight, ancestorLogged,
-    requestWaterMask, pump, invalidate, abortAll,
+    ancestorLogged, pump, invalidate, abortAll,
     get version() { return version; },
     bumpVersion() { version = Date.now(); return version; },
   };

@@ -2,8 +2,8 @@
  * scatter — per-tile deterministic placement of library assets on terrain.
  *
  * First-pass chain validation: density is gated by DEM facts only (elevation,
- * slope, southness from the tile heightmap) — the class-map (classifier/biomes.py
- * buckets) hookup comes next. Placement is seeded from the tile id, so a
+ * slope and southness from the tile heightmap); the classifier hookup comes
+ * next. Placement is seeded from the tile id, so a
  * revisit rebuilds the identical scatter.
  *
  * Frame: tile meshes are flat grids in EPSG:3413 stereo meters, z-up.
@@ -19,7 +19,6 @@ import {
   Group,
   InstancedMesh,
   Matrix4,
-  Mesh,
   Quaternion,
   Vector3,
   type Object3D,
@@ -231,16 +230,6 @@ export function updateScatterVisibility(terrainRoot: Object3D, camera: Object3D)
         const d = _cullWp.distanceTo(_cullCp) - s.radius;
         im.visible = d < ((im.userData.maxDist as number) ?? Infinity);
       }
-    }
-  }
-}
-
-/** dispose every scatter child (shared geometry/material stay alive) */
-export function disposeTileScatter(tileMesh: Mesh | Group): void {
-  for (const child of tileMesh.children) {
-    if (!child.userData?.isScatter) continue;
-    for (const m of child.children) {
-      if ((m as InstancedMesh).isInstancedMesh) (m as InstancedMesh).dispose();
     }
   }
 }
