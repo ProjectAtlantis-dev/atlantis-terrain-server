@@ -4,16 +4,8 @@ const DEFAULT_NEGATIVE = 'bad quality, blurry, messy, lowres, artifacts, flat, o
 export function createTerrainTileMenuRuntime({
   controls,
   tileInfoElement,
-  getTerrainRoot,
-  getOceanEnabled,
-  toggleOcean,
-  getBathyEnabled,
-  toggleBathy,
-  refreshTextures,
-  submitEnhancement,
-  getTextureStreamer,
-  onEnhancedDiscarded = () => {},
-  onTerrainMutated = () => {},
+  terrainTiles,
+  enhancementController,
   documentImpl = globalThis.document,
   windowImpl = globalThis.window,
   storage = globalThis.localStorage,
@@ -58,7 +50,7 @@ export function createTerrainTileMenuRuntime({
     dialog.style.display = 'none';
     storage.setItem('enhance_positive_prompt', positive.value);
     storage.setItem('enhance_negative_prompt', negative.value);
-    submitEnhancement(button.dataset.tileId, {
+    enhancementController.submit(button.dataset.tileId, {
       positive_prompt: positive.value,
       negative_prompt: negative.value,
     });
@@ -128,20 +120,7 @@ export function createTerrainTileMenuRuntime({
           consoleImpl.warn(`[DISCARD] ${tileId}:`, data.error);
           return;
         }
-        const streamer = getTextureStreamer();
-        streamer.invalidate(tileId);
-        onEnhancedDiscarded(streamer);
-        for (const child of getTerrainRoot().children) {
-          if (child.userData.tileId !== tileId) continue;
-          if (child.material.map) {
-            child.material.map.dispose();
-            child.material.map = null;
-          }
-          child.material.color.set(child.userData.debugColor || 0x888888);
-          child.material.needsUpdate = true;
-          onTerrainMutated();
-          break;
-        }
+        terrainTiles.discardEnhancedTexture(tileId);
       })
       .catch(error => consoleImpl.error(`[DISCARD] ${tileId}:`, error));
   }
@@ -153,12 +132,14 @@ export function createTerrainTileMenuRuntime({
     header.textContent = tileId;
     menu.appendChild(header);
     if (controls.mapMode) {
-      addAction(`Ocean Overlay: ${getOceanEnabled() ? 'ON' : 'OFF'}`, () => {
-        toggleOcean(); hide(); refreshTextures(); onTerrainMutated();
+      addAction(`Ocean Overlay: ${terrainTiles.oceanOverlayEnabled ? 'ON' : 'OFF'}`, () => {
+        terrainTiles.toggleOceanOverlay();
+        hide();
       });
-      if (getBathyEnabled && toggleBathy) {
-        addAction(`Flatten Overlay: ${getBathyEnabled() ? 'ON' : 'OFF'}`, () => {
-          toggleBathy(); hide(); refreshTextures(); onTerrainMutated();
+      if (terrainTiles.bathymetryAvailable) {
+        addAction(`Flatten Overlay: ${terrainTiles.bathymetryEnabled ? 'ON' : 'OFF'}`, () => {
+          terrainTiles.toggleBathymetry();
+          hide();
         });
       }
     }

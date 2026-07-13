@@ -315,23 +315,6 @@ tileInfoEl.style.cssText = [
 ].join(';');
 document.body.appendChild(tileInfoEl);
 
-const tileMenuRuntime = createTerrainTileMenuRuntime({
-  controls, tileInfoElement: tileInfoEl, getTerrainRoot: () => terrainRoot,
-  getOceanEnabled: () => oceanMapDebugEnabled,
-  toggleOcean: () => { oceanMapDebugEnabled = !oceanMapDebugEnabled; },
-  getBathyEnabled: renderBackend.supportsBathymetry ? () => bathymetryOverlay.enabled : null,
-  toggleBathy: renderBackend.supportsBathymetry ? () => bathymetryOverlay.toggle() : null,
-  refreshTextures: () => {
-    if (terrainPipelineState.lastTiles) terrainTileSet.updateTextures(terrainPipelineState.lastTiles);
-  },
-  submitEnhancement: (tileId, options) => enhancementController.submit(tileId, options),
-  getTextureStreamer: () => textureStreamer,
-  onTerrainMutated: () => { markSceneMutated(); requestRender(); },
-});
-const showEnhanceDialog = tileMenuRuntime.showEnhance;
-const showTileMenu = tileMenuRuntime.show;
-const hideTileMenu = tileMenuRuntime.hide;
-
 // --- Atmosphere / Clouds tuning panel ---
 const tuningPanel = document.createElement('div');
 tuningPanel.style.cssText = [
@@ -853,12 +836,11 @@ if (renderBackend.isWebGPU) {
 
 // --- Heightmap decode + mesh building (adapted for ENU frame) ---
 
-let oceanMapDebugEnabled = false;
 const bathymetryOverlay = createTerrainBathymetryOverlay({
   THREE,
   enabled: renderBackend.supportsBathymetry,
   onReady: () => {
-    if (terrainPipelineState.lastTiles) terrainTileSet.updateTextures(terrainPipelineState.lastTiles);
+    terrainTileSet.refreshTextures();
   },
 });
 // --- Status colors for untextured tiles ---
@@ -892,50 +874,6 @@ const { history: tileHistory, log: tileLog } = createTileHistory({
   emit: details => enqueueClientLog('debug', 'tile', details),
 });
 
-function applyTerrainMaterialMode(mesh, tex) {
-  if (!mesh || !mesh.material) return;
-  let needsUpdate = false;
-  const useOceanOverlay = oceanMapDebugEnabled && controls.mapMode;
-  if (useOceanOverlay) {
-    if (mesh.material.map !== null) {
-      mesh.material.map = null;
-      needsUpdate = true;
-    }
-    if (!mesh.material.vertexColors) {
-      mesh.material.vertexColors = true;
-      needsUpdate = true;
-    }
-    mesh.material.color.set(0xffffff);
-    if (needsUpdate) {
-      mesh.material.needsUpdate = true;
-      markSceneMutated();
-    }
-    return;
-  }
-  const resolvedTexture = bathymetryOverlay.resolveTexture(
-    mesh,
-    tex,
-    controls.mapMode,
-  );
-  if (resolvedTexture && mesh.material.map !== resolvedTexture) {
-    mesh.material.map = resolvedTexture;
-    needsUpdate = true;
-  }
-  if (!resolvedTexture && renderBackend.prepareUntexturedTerrain) {
-    renderBackend.prepareUntexturedTerrain(mesh);
-    return;
-  }
-  if (mesh.material.vertexColors) {
-    mesh.material.vertexColors = false;
-    needsUpdate = true;
-  }
-  mesh.material.color.set(0xffffff);
-  if (needsUpdate) {
-    mesh.material.needsUpdate = true;
-    markSceneMutated();
-  }
-}
-
 // --- Texture streaming ---
 
 const ENABLE_WATER_MASKS = false;
@@ -962,11 +900,8 @@ const terrainTileSet = createTerrainTileSet({
     exaggeration: EXAG,
     attachScatter: attachTileScatter,
   },
-  material: {
-    apply: applyTerrainMaterialMode,
-    prepareUntextured: renderBackend.prepareUntexturedTerrain,
-    isOverlayActive: () => oceanMapDebugEnabled && controls.mapMode,
-  },
+  renderBackend,
+  bathymetryOverlay,
   view: { camera, anchorPosition, east, north, up, controls },
   log: tileLog,
   vehicle: vehicleRuntime,
@@ -990,16 +925,17 @@ const enhancementController = createTerrainEnhancementController({
   hasTextureWork: () => texInflight.size > 0 || texFetching.size > 0,
   getLastCameraMoveTime: () => cameraRuntimeState.lastMoveTime,
   hasTiles: () => Boolean(terrainPipelineState.lastTiles),
-  applyEnhancedTexture: (tileId, texture) => {
-    for (const child of terrainRoot.children) {
-      if (!child.isMesh || child.userData.tileId !== tileId) continue;
-      applyTerrainMaterialMode(child, texture);
-      child.userData.waterMask = waterMaskCache.get(tileId) || null;
-        requestRender();
-      break;
-    }
-  },
+  applyEnhancedTexture: terrainTileSet.applyEnhancedTexture,
 });
+const tileMenuRuntime = createTerrainTileMenuRuntime({
+  controls,
+  tileInfoElement: tileInfoEl,
+  terrainTiles: terrainTileSet,
+  enhancementController,
+});
+const showEnhanceDialog = tileMenuRuntime.showEnhance;
+const showTileMenu = tileMenuRuntime.show;
+const hideTileMenu = tileMenuRuntime.hide;
 const terrainOutlineController = createTerrainOutlineController({
   terrainRoot, pendingGroup: enhanceOutlines, enhancedGroup: enhancedOutlines,
   pending: enhancementController.pending,
@@ -1513,7 +1449,7 @@ function updateHud() {
       : 'WASD or Arrows move, Q/Z altitude, drag look',
     'map: left-drag rotate, right-drag pan, wheel zoom',
     controls.mapMode
-      ? `ocean overlay: ${oceanMapDebugEnabled ? 'ON' : 'OFF'}  (right-click menu; cyan=ocean, magenta=seed, orange=passable)`
+      ? `ocean overlay: ${terrainTileSet.oceanOverlayEnabled ? 'ON' : 'OFF'}  (right-click menu; cyan=ocean, magenta=seed, orange=passable)`
       : '',
     '<span id="mapModeLink" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">map mode</span> (M), R reset · <span id="debugLogLink" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">debug log</span>'
     + ' · <span id="pipelineMapLink" title="2D radar in pipeline-map mode — click any tile to open its tile inspector" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">pipeline map</span> (P)'
@@ -1597,7 +1533,7 @@ function toggleMapMode() {
     hideTileMenu();
   }
   if (terrainPipelineState.lastTiles) {
-    terrainTileSet.updateTextures(terrainPipelineState.lastTiles);
+    terrainTileSet.refreshTextures();
   }
 }
 

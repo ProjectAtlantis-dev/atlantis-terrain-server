@@ -576,25 +576,37 @@ test('terrain tile set owns reconciliation, scene residency, and texture demand'
     remove(mesh) { this.children = this.children.filter(child => child !== mesh); },
   };
   const textureRequests = [];
+  const invalidated = [];
   const textureStreamer = {
     texCache: new Map(),
     texSource: new Map(),
     waterMaskCache: new Map(),
+    invalidate(tileId) { invalidated.push(tileId); },
     requestWaterMask() {},
     pump(scored) { textureRequests.push(...scored.map(item => item.tile.id)); },
+  };
+  const bathymetryOverlay = {
+    enabled: false,
+    resolveTexture: (_mesh, texture) => texture,
+    toggle() { this.enabled = !this.enabled; },
   };
   const tileSet = createTerrainTileSet({
     terrainRoot,
     textureStreamer,
     terrain: {},
-    material: { apply() {} },
-    view: {},
+    renderBackend: { supportsBathymetry: true },
+    bathymetryOverlay,
+    view: { controls: { mapMode: false } },
     log() {},
     testOverrides: {
       buildMesh: tile => ({
         isMesh: true,
         userData: { tileId: tile.id, bbox: tile.bbox },
-        material: { map: null, dispose() {} },
+        material: {
+          map: null,
+          color: { value: null, set(value) { this.value = value; } },
+          dispose() {},
+        },
         geometry: { dispose() {} },
       }),
       priorityForTile: () => 0,
@@ -608,6 +620,17 @@ test('terrain tile set owns reconciliation, scene residency, and texture demand'
   assert.equal(tileSet.deferredTiles.get(tile.id), tile);
   assert.equal(tileSet.currentTileIds, reconciliation.nextTileIds);
   assert.deepEqual(textureRequests, [tile.id]);
+
+  const enhancedTexture = { disposed: false, dispose() { this.disposed = true; } };
+  assert.equal(tileSet.applyEnhancedTexture(tile.id, enhancedTexture), true);
+  assert.equal(terrainRoot.children[0].material.map, enhancedTexture);
+  assert.equal(tileSet.bathymetryAvailable, true);
+  tileSet.toggleBathymetry();
+  assert.equal(tileSet.bathymetryEnabled, true);
+  assert.equal(tileSet.discardEnhancedTexture(tile.id), true);
+  assert.deepEqual(invalidated, [tile.id]);
+  assert.equal(enhancedTexture.disposed, true);
+  assert.equal(terrainRoot.children[0].material.map, null);
 });
 
 test('terrain origin and pipeline decisions preserve two-pass behavior', () => {

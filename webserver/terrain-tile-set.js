@@ -465,18 +465,14 @@ export function createTerrainTileSet({
   terrainRoot,
   textureStreamer,
   terrain,
-  material,
+  renderBackend,
+  bathymetryOverlay,
   view,
   log,
   vehicle = {},
   events = {},
   testOverrides = {},
 }) {
-  const {
-    apply: applyMaterial,
-    prepareUntextured: prepareUntexturedMesh,
-    isOverlayActive: isMaterialOverlayActive = () => false,
-  } = material;
   const {
     onMutated = () => {},
     onMaterialApplied = () => {},
@@ -512,6 +508,49 @@ export function createTerrainTileSet({
   const buildBudget = testOverrides.buildBudget ?? 200;
   const deferredTiles = new Map();
   let currentTileIds = new Set();
+  let lastTiles = null;
+  let oceanOverlayEnabled = false;
+
+  function applyMaterial(mesh, texture) {
+    if (!mesh?.material) return;
+    let needsUpdate = false;
+    if (oceanOverlayEnabled && view.controls.mapMode) {
+      if (mesh.material.map !== null) {
+        mesh.material.map = null;
+        needsUpdate = true;
+      }
+      if (!mesh.material.vertexColors) {
+        mesh.material.vertexColors = true;
+        needsUpdate = true;
+      }
+      mesh.material.color.set(0xffffff);
+    } else {
+      const resolvedTexture = bathymetryOverlay?.resolveTexture(
+        mesh, texture, view.controls.mapMode,
+      ) ?? texture;
+      if (resolvedTexture && mesh.material.map !== resolvedTexture) {
+        mesh.material.map = resolvedTexture;
+        needsUpdate = true;
+      }
+      if (!resolvedTexture && renderBackend?.prepareUntexturedTerrain) {
+        renderBackend.prepareUntexturedTerrain(mesh);
+        return;
+      }
+      if (mesh.material.vertexColors) {
+        mesh.material.vertexColors = false;
+        needsUpdate = true;
+      }
+      mesh.material.color.set(0xffffff);
+    }
+    if (needsUpdate) {
+      mesh.material.needsUpdate = true;
+      onMutated();
+    }
+  }
+
+  function prepareUntexturedMesh(mesh) {
+    renderBackend?.prepareUntexturedTerrain?.(mesh);
+  }
   const lifecycle = createTileLifecycle({
     terrainRoot, disposeScatter: disposeTileScatter, log, onSceneMutated: onMutated,
   });
@@ -530,7 +569,7 @@ export function createTerrainTileSet({
     getVehicleDepth: () => vehicle.vehicleLastContactDepth,
     requestVehicleResnap: vehicle.requestVehicleTerrainResnap,
   });
-  const updateTextures = createTerrainTextureController({
+  const updateTextureDemand = createTerrainTextureController({
     terrainRoot,
     deferredTiles,
     textureStreamer,
@@ -540,7 +579,7 @@ export function createTerrainTileSet({
     getVisibilityDistance,
     applyMaterial,
     getWaterMask: tileId => textureStreamer.waterMaskCache.get(tileId),
-    isMaterialOverlayActive,
+    isMaterialOverlayActive: () => oceanOverlayEnabled && view.controls.mapMode,
     log,
     onMaterialApplied,
     ...(testOverrides.scheduleFrame == null ? {} : { scheduleFrame: testOverrides.scheduleFrame }),
@@ -549,6 +588,7 @@ export function createTerrainTileSet({
       : { applicationsPerFrame: testOverrides.applicationsPerFrame }),
   });
   function reconcile(tiles, { onDiff = () => {} } = {}) {
+    lastTiles = tiles;
     const result = reconcileTerrainTiles({
       tiles,
       currentTileIds,
@@ -569,11 +609,64 @@ export function createTerrainTileSet({
     return result;
   }
 
+  function updateTextures(tiles) {
+    lastTiles = tiles;
+    updateTextureDemand(tiles);
+  }
+
+  function refreshTextures() {
+    if (lastTiles) updateTextureDemand(lastTiles);
+  }
+
+  function toggleOceanOverlay() {
+    oceanOverlayEnabled = !oceanOverlayEnabled;
+    refreshTextures();
+    onMutated();
+  }
+
+  function toggleBathymetry() {
+    if (!renderBackend?.supportsBathymetry) return;
+    bathymetryOverlay.toggle();
+    refreshTextures();
+    onMutated();
+  }
+
+  function applyEnhancedTexture(tileId, texture) {
+    const mesh = terrainRoot.children.find(
+      child => child.isMesh && child.userData?.tileId === tileId,
+    );
+    if (!mesh) return false;
+    applyMaterial(mesh, texture);
+    mesh.userData.waterMask = textureStreamer.waterMaskCache.get(tileId) || null;
+    onMaterialApplied(mesh);
+    return true;
+  }
+
+  function discardEnhancedTexture(tileId) {
+    textureStreamer.invalidate(tileId);
+    const mesh = terrainRoot.children.find(child => child.userData?.tileId === tileId);
+    if (!mesh) return false;
+    mesh.material.map?.dispose?.();
+    mesh.material.map = null;
+    mesh.material.color.set(mesh.userData.debugColor || 0x888888);
+    mesh.material.needsUpdate = true;
+    onMutated();
+    return true;
+  }
+
   return {
     get currentTileIds() { return currentTileIds; },
+    get oceanOverlayEnabled() { return oceanOverlayEnabled; },
+    get bathymetryAvailable() { return Boolean(renderBackend?.supportsBathymetry); },
+    get bathymetryEnabled() { return Boolean(renderBackend?.supportsBathymetry && bathymetryOverlay.enabled); },
     deferredTiles,
     reconcile,
     updateTextures,
-    resetTextureApplications: updateTextures.reset,
+    refreshTextures,
+    toggleOceanOverlay,
+    toggleBathymetry,
+    applyEnhancedTexture,
+    discardEnhancedTexture,
+    resetTextureApplications: updateTextureDemand.reset,
   };
 }
