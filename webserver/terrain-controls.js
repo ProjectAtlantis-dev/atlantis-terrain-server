@@ -79,6 +79,7 @@ export function installTerrainKeyboardControls({
   onForwardDoubleTap,
   onEscapeVehicle,
   onToggleMap,
+  onToggleHeatmap = () => {},
   onReset,
   onHouseAction,
   onToggleHeadlights,
@@ -109,7 +110,10 @@ export function installTerrainKeyboardControls({
     }
     if (event.code === 'KeyM') return onToggleMap();
     if (event.code === 'KeyR') return onReset();
-    if (event.code === 'KeyH' && event.shiftKey) return onHouseAction(true);
+    if (event.code === 'KeyH') {
+      if (event.shiftKey) return onHouseAction(true);
+      return onToggleHeatmap();
+    }
     if (event.code === 'KeyL' && isVehicleActive()) onToggleHeadlights();
   };
   const onKeyUp = event => {

@@ -19,7 +19,7 @@ import { buildAssetLibrary } from './procgen/library.ts';
 import { buildTileScatter, updateScatterVisibility, SCATTER_MIN_DEPTH } from './procgen/scatter.ts';
 import { priorityHeading } from './terrain-priority.js';
 import { compassHeading, createTerrainHud, renderGameClock } from './terrain-hud.js';
-import { installTerrainKeyboardControls, installTerrainPointerControls } from './terrain-controls.js';
+import { applyMapDrag, installTerrainKeyboardControls, installTerrainPointerControls } from './terrain-controls.js';
 import { stepVehicleDrive } from './terrain-vehicle.js';
 import { createTerrainVehicleRuntime } from './terrain-vehicle-runtime.js';
 import { createTileHistory, terrainFogDistance, tileDepthFromId } from './terrain-tile-runtime.js';
@@ -39,6 +39,7 @@ import { createTerrainTuningControls } from './terrain-tuning-controls.js';
 import { bindTerrainCloudComposition, configureTerrainClouds, registerTerrainCloudTuning } from './terrain-cloud-runtime.js';
 import { createTerrainHouseSceneRuntime } from './terrain-house-scene-runtime.js';
 import { createTerrainTileMenuRuntime } from './terrain-tile-menu-runtime.js';
+import { createTerrainHeatmapRuntime } from './terrain-heatmap-runtime.js';
 
 export async function startTerrainApplication({ backend = 'webgl' } = {}) {
 if (backend !== 'webgl' && backend !== 'webgpu') {
@@ -255,9 +256,11 @@ const maybeLogWebGPUSun = (...args) => webgpuAtmosphere?.maybeLogSun(...args);
 const renderer = renderBackend.renderer;
 document.body.appendChild(renderer.domElement);
 renderer.domElement.addEventListener('contextmenu', event => event.preventDefault());
+let heatmapRuntime = null;
 
 const { hud, alt, gameClock: gameClockEl } = createTerrainHud({
   onToggleMapMode: () => toggleMapMode(),
+  onToggleHeatmap: () => toggleHeatmap(),
   onClockAction: action => {
     if (action === 'rw') rewindGameClock();
     else if (action === 'stop') stopGameClock();
@@ -724,6 +727,40 @@ const terrainPipelineState = {
   serverTexturesRetrying: 0,
   serverTextureStatus: {},
 }; // end terrain pipeline state
+
+heatmapRuntime = createTerrainHeatmapRuntime({
+  getView: () => {
+    if (terrainPipelineState.firstLoad) return null;
+    const cosine = Math.cos(controls.yaw);
+    const sine = Math.sin(controls.yaw);
+    const panX = controls.mapPanEast * cosine - controls.mapPanNorth * sine;
+    const panY = controls.mapPanEast * sine + controls.mapPanNorth * cosine;
+    const relative = camera.position.clone().sub(anchorPosition);
+    return {
+      x: terrainPipelineState.cameraStereoX + panX,
+      y: terrainPipelineState.cameraStereoY + panY,
+      cameraX: terrainPipelineState.cameraStereoX,
+      cameraY: terrainPipelineState.cameraStereoY,
+      alt: relative.dot(up),
+      yaw: controls.yaw,
+      zoom: controls.mapZoom,
+    };
+  },
+  onWheel: deltaY => {
+    controls.mapZoom *= deltaY < 0 ? 0.85 : 1.18;
+    controls.mapZoom = Math.max(500, Math.min(40000, controls.mapZoom));
+    savePosition();
+    updateMapCamera();
+    requestRender();
+  },
+  onDrag: (event, button) => {
+    controls.dragButton = button;
+    const action = applyMapDrag(controls, event, MOUSE_SENS, MAP_PAN_FACTOR);
+    if (action === 'pan') updateMapCamera();
+    requestRender();
+  },
+  onTileClick: tile => window.open(`/pipeline.html?tile=${tile.id}`, '_blank'),
+});
 
 function paramNumber(_name, fallback) {
   return fallback;
@@ -1208,6 +1245,7 @@ function updateMapCamera() {
 function hideTileInfo() {
   tileInfoEl.style.display = 'none';
   hoverOutlineController.show(null);
+  heatmapRuntime?.setHoveredTile(null);
 }
 
 function clampAltitude() {
@@ -1421,8 +1459,10 @@ function updateHud() {
     if (enhEligible > 0) enhParts.push(`<span style="color:#fc8">${enhEligible} eligible</span>`);
     texLine += '  ' + enhParts.join('  ');
   }
-  const modeLabel = controls.mapMode
-    ? 'MAP'
+  const modeLabel = heatmapRuntime?.active
+    ? 'HEATMAP'
+    : controls.mapMode
+      ? 'MAP'
     : (vehicleRuntime.vehicleControlActive ? 'VEHICLE' : 'FLIGHT');
   const modeHtml = vehicleRuntime.vehicleControlActive
     ? '<span style="color:#ff3b30">VEHICLE</span>'
@@ -1450,12 +1490,16 @@ function updateHud() {
       ? 'W/S drive, A/D steer, mouse orbit camera, Esc exits vehicle control'
       : 'WASD or Arrows move, Q/Z altitude, drag look',
     'map: left-drag rotate, right-drag pan, wheel zoom',
-    '<span id="mapModeLink" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">map mode</span> (M), R reset · <span id="debugLogLink" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">debug log</span>'
+    '<span id="mapModeLink" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">map mode</span> (M)' +
+      ` · <span id="heatmapModeLink" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">${heatmapRuntime?.active ? 'regular map' : 'heatmap'}</span> (H)` +
+      ' · R reset · <span id="debugLogLink" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">debug log</span>'
   ].join('<br>');
   alt.textContent =
     `${altM.toFixed(0)}m / ${(altM * 3.28084).toFixed(0)}ft  ${deg.toFixed(0)}° ${compass}` +
     `  FOV ${camera.fov.toFixed(0)}°` +
-    (controls.mapMode ? '  [MAP]' : (vehicleRuntime.vehicleControlActive ? '  [VEHICLE]' : ''));
+    (heatmapRuntime?.active
+      ? '  [HEATMAP]'
+      : (controls.mapMode ? '  [MAP]' : (vehicleRuntime.vehicleControlActive ? '  [VEHICLE]' : '')));
 }
 
 function resetView() {
@@ -1470,6 +1514,7 @@ function resetView() {
   controls.dragging = false;
   controls.dragButton = 0;
   controls.mapMode = false;
+  heatmapRuntime?.setPresentation('hidden');
   vehicleRuntime.setVehicleControlActive(false, 'reset');
   controls.mapPanEast = 0;
   controls.mapPanNorth = 0;
@@ -1509,12 +1554,39 @@ function syncMapModePresentation() {
   // Map-only presentation belongs to one state boundary. The world-space
   // marker remains disabled; the centered DOM arrow is backend-independent.
   camMarker.visible = false;
-  mapLocationMarkerEl.style.display = controls.mapMode ? 'block' : 'none';
+  const heatmapActive = Boolean(heatmapRuntime?.active);
+  if (heatmapRuntime) {
+    heatmapRuntime.setPresentation(
+      controls.mapMode ? (heatmapActive ? 'heatmap' : 'edges') : 'hidden',
+    );
+  }
+  mapLocationMarkerEl.style.display = controls.mapMode && !heatmapActive ? 'block' : 'none';
+  renderer.domElement.style.visibility = heatmapActive ? 'hidden' : 'visible';
   tuningPanel.style.display = controls.mapMode ? 'none' : '';
+}
+
+function toggleHeatmap() {
+  const next = !heatmapRuntime.active;
+  if (next && !controls.mapMode) {
+    controls.mapMode = true;
+    cameraRuntimeState.driftMode = false;
+    controls.strafeSpeed = 0;
+    vehicleRuntime.setVehicleControlActive(false, 'heatmap-mode');
+    controls.mapPanEast = 0;
+    controls.mapPanNorth = 0;
+    updateMapCamera();
+  }
+  heatmapRuntime.setPresentation(next ? 'heatmap' : 'edges');
+  hideTileInfo();
+  hideTileMenu();
+  syncMapModePresentation();
+  updateHud();
+  requestRender();
 }
 
 function toggleMapMode() {
   controls.mapMode = !controls.mapMode;
+  if (!controls.mapMode) heatmapRuntime.setPresentation('hidden');
   cameraRuntimeState.driftMode = false;
   controls.strafeSpeed = 0;
   if (controls.mapMode) {
@@ -1546,6 +1618,7 @@ installTerrainKeyboardControls({
     vehicleRuntime.setVehicleControlActive(false, 'escape', { skipExitSave: true });
   },
   onToggleMap: toggleMapMode,
+  onToggleHeatmap: toggleHeatmap,
   onReset: resetView,
   onHouseAction: load => load
     ? houseRuntime.loadHouseModel('keyboard')
@@ -1669,6 +1742,7 @@ renderer.domElement.addEventListener('mousemove', event => {
   const mesh = hits[0].object;
   hoverOutlineController.show(mesh);
   const info = summarizeTerrainMesh(mesh);
+  heatmapRuntime.setHoveredTile(info.tileId);
   const overlappingMeshes = [...new Map(hits
     .filter(hit => hit.object.userData?.tileId && hit.object.userData.tileId !== info.tileId)
     .map(hit => [hit.object.userData.tileId, hit.object])).values()];
