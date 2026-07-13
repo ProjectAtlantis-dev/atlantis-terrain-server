@@ -866,22 +866,20 @@ const { history: tileHistory, log: tileLog } = createTileHistory({
 
 // --- Texture streaming ---
 
-const ENABLE_WATER_MASKS = false;
 const TEX_MAX = 120; // max concurrent HTTP texture requests (texFetching 202s don't count)
 const TEX_RETRY_202_BASE_MS = 2000;   // initial 202 retry delay
 const TEX_RETRY_202_MAX_MS = 30000;   // cap backoff at 30s
 const TEX_RETRY_ERROR_MS = 3000;
 const TEX_REPOLL_BATCH = 8;           // max 202 re-polls fired per frame
 const textureStreamer = createTextureStreamer({
-  log: tileLog, enableWaterMasks: ENABLE_WATER_MASKS,
+  log: tileLog,
   maxInflight: TEX_MAX, repollBatch: TEX_REPOLL_BATCH,
   retryBaseMs: TEX_RETRY_202_BASE_MS, retryMaxMs: TEX_RETRY_202_MAX_MS,
   retryErrorMs: TEX_RETRY_ERROR_MS,
   getTextureAnisotropy: () => rendererTextureAnisotropy(renderer),
-  onWaterMask: () => { markSceneMutated(); requestRender(); },
 });
 const {
-  texCache, texSource, texInflight, texFetching, waterMaskCache, requestWaterMask,
+  texCache, texSource, texInflight, texFetching,
 } = textureStreamer;
 const terrainTileSet = createTerrainTileSet({
   terrainRoot,
@@ -910,7 +908,6 @@ const enhancementController = createTerrainEnhancementController({
   log: tileLog,
   textureCache: texCache,
   textureSource: texSource,
-  requestWaterMask,
   hasTextureWork: () => texInflight.size > 0 || texFetching.size > 0,
   getLastCameraMoveTime: () => cameraRuntimeState.lastMoveTime,
   hasTiles: () => Boolean(terrainPipelineState.lastTiles),
@@ -1168,7 +1165,6 @@ window.takramDebug = {
   houseShadowDebugSummary: houseRuntime.houseShadowDebugSummary,
   terrainRoot,
   texCache,
-  waterMaskCache,
   deferredTiles: terrainTileSet.deferredTiles,
   tileHistory,
   get currentTileIds() { return terrainTileSet.currentTileIds; },
@@ -1454,9 +1450,6 @@ function updateHud() {
       ? 'W/S drive, A/D steer, mouse orbit camera, Esc exits vehicle control'
       : 'WASD or Arrows move, Q/Z altitude, drag look',
     'map: left-drag rotate, right-drag pan, wheel zoom',
-    controls.mapMode
-      ? `ocean overlay: ${terrainTileSet.oceanOverlayEnabled ? 'ON' : 'OFF'}  (right-click menu; cyan=ocean, magenta=seed, orange=passable)`
-      : '',
     '<span id="mapModeLink" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">map mode</span> (M), R reset · <span id="debugLogLink" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">debug log</span>'
   ].join('<br>');
   alt.textContent =

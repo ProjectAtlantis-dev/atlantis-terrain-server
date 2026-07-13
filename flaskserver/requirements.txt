@@ -8,6 +8,3 @@ rasterio
 shapely
 Pillow
 noise
-torch
-torchvision
-transformers>=4.56.0

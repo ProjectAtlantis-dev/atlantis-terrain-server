@@ -131,12 +131,6 @@ export function createTerrainTileMenuRuntime({
     header.style.cssText = 'padding:4px 12px;color:#aaa;font-size:11px;border-bottom:1px solid #444';
     header.textContent = tileId;
     menu.appendChild(header);
-    if (controls.mapMode) {
-      addAction(`Ocean Overlay: ${terrainTiles.oceanOverlayEnabled ? 'ON' : 'OFF'}`, () => {
-        terrainTiles.toggleOceanOverlay();
-        hide();
-      });
-    }
     addAction('Tile inspector', () => {
       hide();
       windowImpl.open(`/pipeline.html?tile=${tileId}`, '_blank');

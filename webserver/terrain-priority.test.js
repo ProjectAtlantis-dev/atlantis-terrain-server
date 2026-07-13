@@ -9,7 +9,7 @@ import {
 import { compassHeading } from './terrain-hud.js';
 import { applyMapDrag } from './terrain-controls.js';
 import { createVehiclePersistenceRuntime, normalizeSavedVehicleState, stepSuspension, stepVehicleDrive, vehicleLocalToLatLon, vehicleStateSnapshot } from './terrain-vehicle.js';
-import { meshUsesTextureClassification, scoreTextureTiles, textureRetryDelay, tileDepthFromId } from './terrain-tile-runtime.js';
+import { scoreTextureTiles, textureRetryDelay, tileDepthFromId } from './terrain-tile-runtime.js';
 import { createTextureStreamer, rendererTextureAnisotropy } from './terrain-texture-streamer.js';
 import {
   createTerrainTextureController,
@@ -588,9 +588,7 @@ test('terrain tile set owns reconciliation, scene residency, and texture demand'
   const textureStreamer = {
     texCache: new Map(),
     texSource: new Map(),
-    waterMaskCache: new Map(),
     invalidate(tileId) { invalidated.push(tileId); },
-    requestWaterMask() {},
     pump(scored) { textureRequests.push(...scored.map(item => item.tile.id)); },
   };
   const tileSet = createTerrainTileSet({
@@ -808,16 +806,15 @@ test('shared texture controller budgets scene applications per frame', () => {
   const controller = createTerrainTextureController({
     terrainRoot: { children: [] }, deferredTiles,
     textureStreamer: {
-      texCache: textures, texSource: new Map(), requestWaterMask() {},
+      texCache: textures, texSource: new Map(),
       pump() {},
     },
     meshRuntime: {
       materialize(id) { materialized.push(id); deferredTiles.delete(id); },
-      rebuildWithTexture: mesh => mesh,
     },
     lifecycle: { evictCoveredAncestors() {}, sweepStaleParents() {} },
     priorityForTile: () => 0, getVisibilityDistance: () => 1000,
-    isCovered: () => false, applyMaterial() {}, getWaterMask: () => null,
+    isCovered: () => false, applyMaterial() {},
     log() {}, applicationsPerFrame: 1,
     scheduleFrame: callback => frames.push(callback),
   });
@@ -838,13 +835,13 @@ test('shared texture controller discards late arrivals outside current heatmap d
   const controller = createTerrainTextureController({
     terrainRoot: { children: [] }, deferredTiles: new Map(),
     textureStreamer: {
-      texCache: textureCache, texSource: textureSource, requestWaterMask() {},
+      texCache: textureCache, texSource: textureSource,
       pump(_scored, nextCallbacks) { callbacks = nextCallbacks; },
     },
-    meshRuntime: { materialize() {}, rebuildWithTexture: mesh => mesh },
+    meshRuntime: { materialize() {} },
     lifecycle: { evictCoveredAncestors() {}, sweepStaleParents() {} },
     priorityForTile: () => 0, getVisibilityDistance: () => 1000,
-    isCovered: () => false, applyMaterial() {}, getWaterMask: () => null, log() {},
+    isCovered: () => false, applyMaterial() {}, log() {},
     scheduleFrame() {},
   });
   controller([{ id: 'wanted', bbox: [0, 0, 1, 1] }]);
@@ -874,7 +871,6 @@ test('ancestor crops materialize deferred child slots and yield to exact texture
     textureStreamer: {
       texCache: textureCache,
       texSource: new Map(),
-      requestWaterMask() {},
       pump(_scored, nextCallbacks) { callbacks = nextCallbacks; },
     },
     meshRuntime: {
@@ -884,7 +880,6 @@ test('ancestor crops materialize deferred child slots and yield to exact texture
         terrainRoot.children.push(mesh);
         return mesh;
       },
-      rebuildWithTexture: mesh => mesh,
     },
     lifecycle: {
       evictCoveredAncestors() { ancestorEvictions += 1; },
@@ -893,7 +888,6 @@ test('ancestor crops materialize deferred child slots and yield to exact texture
     priorityForTile: () => 0,
     getVisibilityDistance: () => 1000,
     applyMaterial,
-    getWaterMask: () => null,
     log() {},
     scheduleFrame: callback => frames.push(callback),
   });
@@ -915,7 +909,7 @@ test('ancestor crops materialize deferred child slots and yield to exact texture
 test('shared enhancement controller tracks 202 pending and 429 backoff', () => {
   let timestamp = 1000;
   const controller = createTerrainEnhancementController({
-    log() {}, applyEnhancedTexture() {}, requestWaterMask() {},
+    log() {}, applyEnhancedTexture() {},
     textureCache: new Map(), textureSource: new Map(),
     hasTextureWork: () => false, getLastCameraMoveTime: () => 0,
     hasTiles: () => true, now: () => timestamp,
@@ -935,12 +929,6 @@ test('shared terrain mesh builder preserves heightmap geometry and metadata', ()
   assert.deepEqual([...decodeTerrainHeightmap(encoded)], [1, 2, 3, 4]);
   let scatterHeightmap = null;
   const build = createTerrainMeshBuilder({
-    oceanClassifier: {
-      OCEAN_EDGE_SEED_MAX_M: 0,
-      sampleOceanBlueScore: () => 0,
-      classifyOceanMask: () => null,
-      adjustedSeabedElevation: elevation => elevation,
-    },
     exaggeration: 2,
     attachScatter: (_mesh, _tile, heightmap) => { scatterHeightmap = heightmap; },
   });
@@ -951,7 +939,6 @@ test('shared terrain mesh builder preserves heightmap geometry and metadata', ()
     10, 20, 2, 12, 20, 4, 10, 22, 6, 12, 22, 8,
   ]);
   assert.equal(mesh.userData.tileId, '1-2-3');
-  assert.equal(mesh.userData.oceanCoverage, 0);
   assert.deepEqual([...scatterHeightmap], [1, 2, 3, 4]);
 });
 
@@ -1259,12 +1246,6 @@ test('shared tile depth parsing rejects malformed ids', () => {
   assert.equal(tileDepthFromId('12-1400-700'), 12);
   assert.equal(tileDepthFromId('bad'), -1);
   assert.equal(tileDepthFromId(null), -1);
-});
-
-test('texture classification signature prevents redundant land mesh rebuilds', () => {
-  const texture = { uuid: 'texture-1' };
-  const mesh = { userData: { oceanColorAssisted: false, oceanTextureSig: 'texture-1' } };
-  assert.equal(meshUsesTextureClassification(mesh, texture), true);
 });
 
 test('texture candidates are filtered and priority sorted', () => {

@@ -30,50 +30,25 @@ function elevationColor(elevation) {
   return stops.at(-1);
 }
 
-export function createTerrainMeshBuilder({ oceanClassifier, exaggeration, attachScatter }) {
-  const {
-    OCEAN_EDGE_SEED_MAX_M, sampleOceanBlueScore,
-    classifyOceanMask, adjustedSeabedElevation,
-  } = oceanClassifier;
-
-  return function buildTerrainMesh(tile, oceanAssistTexture = null) {
+export function createTerrainMeshBuilder({ exaggeration, attachScatter }) {
+  return function buildTerrainMesh(tile) {
     const resolution = tile.resolution;
     const heightmap = decodeTerrainHeightmap(tile.heightmap);
     const [xMin, yMin, xMax, yMax] = tile.bbox;
-    const blueScore = sampleOceanBlueScore(oceanAssistTexture, resolution);
-    const oceanClass = classifyOceanMask(
-      heightmap, resolution, tile.bbox, tile.id, blueScore,
-    );
-    const oceanMask = oceanClass?.ocean ?? null;
-    const passableMask = oceanClass?.passable ?? null;
-    const seedMask = oceanClass?.seed ?? null;
     const positions = new Float32Array(resolution * resolution * 3);
     const colors = new Float32Array(resolution * resolution * 3);
     const uvs = new Float32Array(resolution * resolution * 2);
-    let oceanCount = 0;
 
     for (let row = 0; row < resolution; row++) for (let column = 0; column < resolution; column++) {
       const index = row * resolution + column;
       const elevation = heightmap[index];
-      const isOcean = oceanMask ? oceanMask[index] === 1 : elevation <= OCEAN_EDGE_SEED_MAX_M;
-      const isPassable = passableMask ? passableMask[index] === 1 : false;
-      const isSeed = seedMask ? seedMask[index] === 1 : false;
       positions[index * 3] = xMin + (column / (resolution - 1)) * (xMax - xMin);
       positions[index * 3 + 1] = yMin + (row / (resolution - 1)) * (yMax - yMin);
-      positions[index * 3 + 2] = adjustedSeabedElevation(elevation, isOcean) * exaggeration;
+      positions[index * 3 + 2] = elevation * exaggeration;
       uvs[index * 2] = column / (resolution - 1);
       uvs[index * 2 + 1] = row / (resolution - 1);
-      if (isOcean) {
-        oceanCount += 1;
-        colors.set([0.04, 0.68, 0.95], index * 3);
-      } else if (isSeed) {
-        colors.set([0.88, 0.16, 0.80], index * 3);
-      } else if (isPassable) {
-        colors.set([0.96, 0.58, 0.12], index * 3);
-      } else {
-        const color = elevationColor(elevation);
-        colors.set([color.r, color.g, color.b], index * 3);
-      }
+      const color = elevationColor(elevation);
+      colors.set([color.r, color.g, color.b], index * 3);
     }
 
     const indices = [];
@@ -93,11 +68,7 @@ export function createTerrainMeshBuilder({ oceanClassifier, exaggeration, attach
     });
     const mesh = new THREE.Mesh(geometry, material);
     Object.assign(mesh.userData, {
-      tileId: tile.id, bbox: tile.bbox, isWater: oceanCount > 0,
-      oceanCoverage: oceanCount / (resolution * resolution),
-      oceanColorAssisted: Boolean(blueScore),
-      oceanTextureSig: oceanAssistTexture ? oceanAssistTexture.uuid : null,
-      waterMaskUrl: `/api/watermask/${tile.id}.png`, waterMask: null,
+      tileId: tile.id, bbox: tile.bbox,
     });
     attachScatter(mesh, tile, heightmap);
     return mesh;

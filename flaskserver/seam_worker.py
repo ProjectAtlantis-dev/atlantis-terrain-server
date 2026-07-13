@@ -7,7 +7,6 @@ import io
 import os
 import sqlite3
 import time
-import zlib
 from pathlib import Path
 from typing import Any
 
@@ -23,11 +22,9 @@ from seam_queue import (
     parse_tile_id,
 )
 from terrain_config import ENHANCE_DEPTH
-from texture import build_water_mask, init_textures, write_texture, write_water_mask
+from texture import init_textures, write_texture
 
 log = get_logger("terrain.seam")
-
-ENABLE_WATER_MASKS = os.environ.get("ENABLE_WATER_MASKS", "").strip().lower() in {"1", "true", "yes", "on"}
 
 ENHANCED_SOURCES = {"dataforsyningen_enhanced", "sentinel2_enhanced", "upscaled"}
 TARGET_DEPTH = ENHANCE_DEPTH
@@ -69,24 +66,6 @@ def _load_tile_texture(db: sqlite3.Connection, tile_id: str) -> dict[str, Any] |
         "bbox": (float(row[5]), float(row[6]), float(row[7]), float(row[8])),
         "heightmap_blob": row[9],
     }
-
-
-def _update_water_mask_for_tile(db: sqlite3.Connection, rec: dict[str, Any], jpeg: bytes) -> None:
-    if not ENABLE_WATER_MASKS:
-        return
-    hm_blob = rec.get("heightmap_blob")
-    if hm_blob is None:
-        return
-    try:
-        hm = np.frombuffer(zlib.decompress(hm_blob), dtype=np.float32).reshape((65, 65))
-    except Exception as exc:
-        log.warning(f"[WATER MASK] {rec['tile_id']}: heightmap decode failed: {type(exc).__name__}: {exc}")
-        return
-    built = build_water_mask(jpeg, hm, rec["bbox"], resolution=256)
-    if built is None:
-        return
-    mask_png, coverage = built
-    write_water_mask(db, rec["tile_id"], mask_png, str(rec["source"]), coverage)
 
 
 def _decode_jpeg(blob: bytes) -> np.ndarray:
@@ -366,13 +345,11 @@ def _process_tile(db: sqlite3.Connection, tile_id: str) -> str:
         if c_neighbor:
             out_jpeg = _encode_jpeg(neighbor_img)
             write_texture(db, nid, out_jpeg, nrec["source"])
-            _update_water_mask_for_tile(db, nrec, out_jpeg)
             neighbor_writes += 1
 
     if changed_self:
         out_jpeg = _encode_jpeg(self_img)
         write_texture(db, tile_id, out_jpeg, rec["source"])
-        _update_water_mask_for_tile(db, rec, out_jpeg)
 
     if changed_self or neighbor_writes:
         return (

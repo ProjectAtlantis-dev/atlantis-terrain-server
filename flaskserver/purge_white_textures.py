@@ -124,7 +124,6 @@ def main() -> None:
     if doomed:
         params = [(t,) for t in doomed]
         db.executemany("DELETE FROM textures WHERE tile_id = ?", params)
-        db.executemany("DELETE FROM water_masks WHERE tile_id = ?", params)
     if repaired:
         db.executemany("UPDATE textures SET texture = ? WHERE tile_id = ?", repaired)
     db.commit()

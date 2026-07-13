@@ -20,10 +20,6 @@ export function textureRetryDelay(attempt, baseMs = 2000, maxMs = 30000) {
   return Math.min(baseMs * Math.pow(1.5, Math.max(0, attempt - 1)), maxMs);
 }
 
-export function meshUsesTextureClassification(mesh, texture) {
-  return Boolean(mesh && texture && mesh.userData?.oceanTextureSig === texture.uuid);
-}
-
 export function scoreTextureTiles(tiles, priorityForTile, maxPriority, refinementBias = 0.12) {
   const tileIds = new Set();
   const scored = [];

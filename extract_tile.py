@@ -79,18 +79,6 @@ def main():
     else:
         print("Texture: not available")
 
-    # ── water mask ──
-    wm = db.execute(
-        "SELECT mask_png, source, coverage FROM water_masks WHERE tile_id = ?",
-        (tile_id,),
-    ).fetchone()
-    if wm:
-        with open(out_dir / "water_mask.png", "wb") as f:
-            f.write(wm["mask_png"])
-        print(f"Water mask: source={wm['source']} coverage={wm['coverage']:.2%}")
-    else:
-        print("Water mask: not in DB")
-
     # ── metadata ──
     bbox = [tile["x_min"], tile["y_min"], tile["x_max"], tile["y_max"]]
     size_m = tile["x_max"] - tile["x_min"]

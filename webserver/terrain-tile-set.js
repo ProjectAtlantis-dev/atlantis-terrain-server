@@ -1,5 +1,4 @@
 import * as THREE from 'three';
-import { createTerrainOceanClassifier } from './classifier/terrain-ocean.js';
 import { findCoveredTileAncestors } from './tile-coverage.js';
 import { createTerrainMeshBuilder } from './terrain-mesh-builder.js';
 import { priorityHeading, terrainTilePriority } from './terrain-priority.js';
@@ -8,7 +7,6 @@ import {
   prioritizeTerrainBuildCandidates,
 } from './terrain-tile-fetch.js';
 import {
-  meshUsesTextureClassification,
   scoreTextureTiles,
   tileDepthFromId,
   terrainVisibilityDistance,
@@ -154,7 +152,6 @@ export function createTerrainMeshRuntime({
   applyMaterial,
   lifecycle,
   log,
-  getWaterMask,
   getCurrentTileIds,
   tileDepth,
   onMeshAdded = () => {},
@@ -162,19 +159,6 @@ export function createTerrainMeshRuntime({
   getVehicleDepth = () => -1,
   requestVehicleResnap = () => {},
 }) {
-  function rebuildWithTexture(mesh, tile, texture) {
-    if (!mesh || !tile?.heightmap || !texture) return mesh;
-    if (meshUsesTextureClassification(mesh, texture)) return mesh;
-    const rebuilt = buildMesh(tile, texture);
-    if (!rebuilt) return mesh;
-    applyDepthOffset(rebuilt, tileDepth(tile.id));
-    rebuilt.userData.waterMask = mesh.userData?.waterMask ?? null;
-    terrainRoot.add(rebuilt);
-    onMeshAdded(rebuilt);
-    lifecycle.evict(mesh);
-    return rebuilt;
-  }
-
   function materialize(tileId, texture) {
     const tile = deferredTiles.get(tileId);
     if (!tile) return null;
@@ -183,7 +167,6 @@ export function createTerrainMeshRuntime({
     const mesh = buildMesh(tile, texture);
     if (!mesh) return null;
     applyMaterial(mesh, texture);
-    mesh.userData.waterMask = getWaterMask(tileId) || null;
     const depth = tileDepth(tileId);
     applyDepthOffset(mesh, depth);
     lifecycle.replaceForMaterialized(mesh, getCurrentTileIds());
@@ -197,7 +180,7 @@ export function createTerrainMeshRuntime({
     return mesh;
   }
 
-  return { rebuildWithTexture, materialize };
+  return { materialize };
 }
 
 export function createTerrainTextureController({
@@ -209,8 +192,6 @@ export function createTerrainTextureController({
   priorityForTile,
   getVisibilityDistance,
   applyMaterial,
-  getWaterMask,
-  isMaterialOverlayActive = () => false,
   log,
   onMaterialApplied = () => {},
   scheduleFrame = callback => requestAnimationFrame(callback),
@@ -224,12 +205,10 @@ export function createTerrainTextureController({
   function applyTexture(mesh, tile, texture) {
     const placeholderTexture = mesh.userData?.terrainPlaceholderTexture;
     if (mesh.userData) delete mesh.userData.terrainPlaceholderTexture;
-    const rebuilt = meshRuntime.rebuildWithTexture(mesh, tile, texture);
-    applyMaterial(rebuilt, texture);
-    rebuilt.userData.waterMask = getWaterMask(tile.id) || null;
+    applyMaterial(mesh, texture);
     if (placeholderTexture && placeholderTexture !== texture) placeholderTexture.dispose?.();
-    onMaterialApplied(rebuilt);
-    return rebuilt;
+    onMaterialApplied(mesh);
+    return mesh;
   }
 
   function applyPlaceholder(tile, texture) {
@@ -325,11 +304,10 @@ export function createTerrainTextureController({
       if (!tile.id) continue;
       const texture = textureStreamer.texCache.get(tile.id);
       if (!texture) continue;
-      textureStreamer.requestWaterMask(tile.id);
       if (deferredTiles.has(tile.id) || pendingApplications.has(tile.id)) continue;
       const mesh = meshById.get(tile.id);
       if (!mesh) continue;
-      if (!isMaterialOverlayActive() && mesh.material.map !== texture) {
+      if (mesh.material.map !== texture) {
         log(tile.id, `apply cached tex (src=${textureStreamer.texSource.get(tile.id) || '?'})`);
       }
       meshById.set(tile.id, applyTexture(mesh, tile, texture));
@@ -501,11 +479,7 @@ export function createTerrainTileSet({
     onMutated = () => {},
     onMaterialApplied = () => {},
   } = events;
-  const oceanClassifier = testOverrides.buildMesh == null
-    ? createTerrainOceanClassifier({ THREE, paramNumber: (_name, fallback) => fallback })
-    : null;
   const buildMesh = testOverrides.buildMesh ?? createTerrainMeshBuilder({
-    oceanClassifier,
     exaggeration: terrain.exaggeration,
     attachScatter: terrain.attachScatter,
   });
@@ -533,37 +507,24 @@ export function createTerrainTileSet({
   const deferredTiles = new Map();
   let currentTileIds = new Set();
   let lastTiles = null;
-  let oceanOverlayEnabled = false;
 
   function applyMaterial(mesh, texture) {
     if (!mesh?.material) return;
     let needsUpdate = false;
-    if (oceanOverlayEnabled && view.controls.mapMode) {
-      if (mesh.material.map !== null) {
-        mesh.material.map = null;
-        needsUpdate = true;
-      }
-      if (!mesh.material.vertexColors) {
-        mesh.material.vertexColors = true;
-        needsUpdate = true;
-      }
-      mesh.material.color.set(0xffffff);
-    } else {
-      const resolvedTexture = texture;
-      if (resolvedTexture && mesh.material.map !== resolvedTexture) {
-        mesh.material.map = resolvedTexture;
-        needsUpdate = true;
-      }
-      if (!resolvedTexture && renderBackend?.prepareUntexturedTerrain) {
-        renderBackend.prepareUntexturedTerrain(mesh);
-        return;
-      }
-      if (mesh.material.vertexColors) {
-        mesh.material.vertexColors = false;
-        needsUpdate = true;
-      }
-      mesh.material.color.set(0xffffff);
+    const resolvedTexture = texture;
+    if (resolvedTexture && mesh.material.map !== resolvedTexture) {
+      mesh.material.map = resolvedTexture;
+      needsUpdate = true;
     }
+    if (!resolvedTexture && renderBackend?.prepareUntexturedTerrain) {
+      renderBackend.prepareUntexturedTerrain(mesh);
+      return;
+    }
+    if (mesh.material.vertexColors) {
+      mesh.material.vertexColors = false;
+      needsUpdate = true;
+    }
+    mesh.material.color.set(0xffffff);
     if (needsUpdate) {
       mesh.material.needsUpdate = true;
       onMutated();
@@ -583,7 +544,6 @@ export function createTerrainTileSet({
     applyMaterial,
     lifecycle,
     log,
-    getWaterMask: tileId => textureStreamer.waterMaskCache.get(tileId),
     getCurrentTileIds: () => currentTileIds,
     tileDepth: tileDepthFromId,
     onMeshAdded: onMutated,
@@ -600,8 +560,6 @@ export function createTerrainTileSet({
     priorityForTile,
     getVisibilityDistance,
     applyMaterial,
-    getWaterMask: tileId => textureStreamer.waterMaskCache.get(tileId),
-    isMaterialOverlayActive: () => oceanOverlayEnabled && view.controls.mapMode,
     log,
     onMaterialApplied,
     ...(testOverrides.scheduleFrame == null ? {} : { scheduleFrame: testOverrides.scheduleFrame }),
@@ -640,19 +598,12 @@ export function createTerrainTileSet({
     if (lastTiles) updateTextureDemand(lastTiles);
   }
 
-  function toggleOceanOverlay() {
-    oceanOverlayEnabled = !oceanOverlayEnabled;
-    refreshTextures();
-    onMutated();
-  }
-
   function applyEnhancedTexture(tileId, texture) {
     const mesh = terrainRoot.children.find(
       child => child.isMesh && child.userData?.tileId === tileId,
     );
     if (!mesh) return false;
     applyMaterial(mesh, texture);
-    mesh.userData.waterMask = textureStreamer.waterMaskCache.get(tileId) || null;
     onMaterialApplied(mesh);
     return true;
   }
@@ -671,12 +622,10 @@ export function createTerrainTileSet({
 
   return {
     get currentTileIds() { return currentTileIds; },
-    get oceanOverlayEnabled() { return oceanOverlayEnabled; },
     deferredTiles,
     reconcile,
     updateTextures,
     refreshTextures,
-    toggleOceanOverlay,
     applyEnhancedTexture,
     discardEnhancedTexture,
     resetTextureApplications: updateTextureDemand.reset,

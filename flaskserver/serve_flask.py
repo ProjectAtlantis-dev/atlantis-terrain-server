@@ -162,16 +162,11 @@ _tile_bbox: Any = None
 _texture_ids_in: Any = None
 _read_texture: Any = None
 _write_texture: Any = None
-_water_mask_ids_in: Any = None
-_read_water_mask: Any = None
-_write_water_mask: Any = None
-_build_water_mask: Any = None
 _fetch_sentinel2_texture: Any = None
 _fetch_dataforsyningen_texture: Any = None
 _fetch_enhanced_texture: Any = None
 _init_textures: Any = None
 _enqueue_seam_jobs: Any = None
-_water_mask_model_id: str | None = None
 
 _tex_pool = ThreadPoolExecutor(max_workers=4)
 _tex_fetching: dict[str, tuple[str, int]] = {}
@@ -252,7 +247,6 @@ def _tex_retry_worker() -> None:
       if jpeg is not None:
         jpeg = _repair_white_ocean_jpeg(db, tile_id, jpeg)
         _write_texture(db, tile_id, jpeg, "dataforsyningen")
-        # _update_water_mask_for_tile(db, tile_id, jpeg, "dataforsyningen")  # disabled — SAM too expensive during load
         log_tex.info(f"[tex-retry] {tile_id}: SUCCESS on attempt {attempt + 1}")
       elif fail_reason == 'no_coverage':
         _resolve_no_coverage(db, tile_id, cur_row[1] if cur_row else None, "[tex-retry]")
@@ -421,7 +415,6 @@ def _recover_worker(prompt_id: str, tile_id: str):
             if _init_textures is not None:
               _init_textures(wdb)
             _write_texture(wdb, tile_id, jpeg_bytes, "dataforsyningen_enhanced")
-            _update_water_mask_for_tile(wdb, tile_id, jpeg_bytes, "dataforsyningen_enhanced")
             log_tex.info(f"[ENHANCE RECOVERY] {tile_id} saved ({len(jpeg_bytes)} bytes)")
             return
         log_tex.warning(f"[ENHANCE RECOVERY] {tile_id} completed but no output images")
@@ -439,9 +432,7 @@ def _bootstrap_backend() -> None:
   global _backend_ready, _backend_error
   global _np, _Image, _to_stereo, _query_tiles_stereo, _load_no_data_cache
   global _GRID_N, _tile_bbox, _texture_ids_in, _read_texture, _write_texture
-  global _water_mask_ids_in, _read_water_mask, _write_water_mask, _build_water_mask
   global _fetch_sentinel2_texture, _fetch_dataforsyningen_texture, _fetch_enhanced_texture, _init_textures, _enqueue_seam_jobs
-  global _water_mask_model_id
 
   if _backend_ready or _backend_error is not None:
     return
@@ -458,14 +449,9 @@ def _bootstrap_backend() -> None:
       fetch_dataforsyningen_texture,
       fetch_enhanced_texture,
       fetch_sentinel2_texture,
-      build_water_mask,
       init_textures,
-      read_water_mask,
       read_texture,
       texture_ids_in,
-      water_mask_ids_in,
-      water_mask_model_id,
-      write_water_mask,
       write_texture,
     )
 
@@ -510,20 +496,14 @@ def _bootstrap_backend() -> None:
     _texture_ids_in = texture_ids_in
     _read_texture = read_texture
     _write_texture = write_texture
-    _water_mask_ids_in = water_mask_ids_in
-    _read_water_mask = read_water_mask
-    _write_water_mask = write_water_mask
-    _build_water_mask = build_water_mask
     _fetch_sentinel2_texture = fetch_sentinel2_texture
     _fetch_dataforsyningen_texture = fetch_dataforsyningen_texture
     _fetch_enhanced_texture = fetch_enhanced_texture
     _init_textures = init_textures
     _enqueue_seam_jobs = enqueue_tile_and_neighbors
-    _water_mask_model_id = str(water_mask_model_id())
 
     _backend_ready = True
     log.info(f"Terrain backend ready. DB={DB_PATH}")
-    log_tex.info(f"[WATER MASK] startup model={_water_mask_model_id}")
     log_db.info(f"No-data cache: {no_data_count} tiles")
     _recover_comfy_jobs()
 
@@ -546,69 +526,6 @@ def _queue_seam_jobs_for_tile(db: sqlite3.Connection, tile_id: str) -> None:
     log_tex.info(f"[SEAM] queued blend jobs for {tile_id} and neighbors")
   except Exception as exc:
     log_tex.warning(f"[SEAM] failed to queue jobs for {tile_id}: {type(exc).__name__}: {exc}")
-
-
-def _update_water_mask_for_tile(
-  db: sqlite3.Connection,
-  tile_id: str,
-  texture_jpeg: bytes,
-  texture_source: str,
-) -> None:
-  ok, reason, coverage = _generate_water_mask_for_tile(
-    db,
-    tile_id,
-    texture_jpeg,
-    texture_source,
-  )
-  if not ok:
-    log_tex.debug(f"[WATER MASK] {tile_id}: skipped ({reason})")
-  if ok and coverage is not None:
-    log_tex.debug(f"[WATER MASK] {tile_id}: cached coverage={coverage * 100:.1f}% source={texture_source}")
-
-
-def _generate_water_mask_for_tile(
-  db: sqlite3.Connection,
-  tile_id: str,
-  texture_jpeg: bytes,
-  texture_source: str,
-) -> tuple[bool, str, float | None]:
-  if _build_water_mask is None or _write_water_mask is None:
-    return False, "backend_unavailable", None
-  tile_row = db.execute(
-    "SELECT x_min, y_min, x_max, y_max, heightmap FROM tiles WHERE tile_id = ?",
-    (tile_id,),
-  ).fetchone()
-  if tile_row is None:
-    return False, "tile_missing", None
-  hm_blob = tile_row[4]
-  if hm_blob is None:
-    return False, "heightmap_missing", None
-  try:
-    hm = _np.frombuffer(zlib.decompress(hm_blob), dtype=_np.float32).reshape((_GRID_N, _GRID_N))
-  except Exception as exc:
-    log_tex.warning(f"[WATER MASK] {tile_id}: failed to decode heightmap: {type(exc).__name__}: {exc}")
-    return False, "heightmap_decode_failed", None
-
-  bbox = (float(tile_row[0]), float(tile_row[1]), float(tile_row[2]), float(tile_row[3]))
-  try:
-    built = _build_water_mask(texture_jpeg, hm, bbox, resolution=256)
-  except Exception as exc:
-    log_tex.warning(f"[WATER MASK] {tile_id}: build failed: {type(exc).__name__}: {exc}")
-    return False, "build_exception", None
-  if built is None:
-    return False, "build_failed", None
-  if not isinstance(built, tuple) or len(built) != 2:
-    return False, "build_invalid_result", None
-  mask_png, coverage = built
-  if mask_png is None:
-    return False, "build_empty_mask", None
-  try:
-    coverage = float(coverage)
-  except Exception:
-    return False, "build_invalid_coverage", None
-  from texture import _SAM_MODEL_ID
-  _write_water_mask(db, tile_id, mask_png, _SAM_MODEL_ID, coverage)
-  return True, "ok", coverage
 
 
 def _terrain_unavailable_response(status: int = 503):
@@ -925,7 +842,6 @@ def _queue_texture_fetch(
         log_tex.debug(f"[tex-worker] {tile_id}: got {len(jpeg)} bytes from dataforsyningen")
         jpeg = _repair_white_ocean_jpeg(db, tile_id, jpeg)
         _write_texture(db, tile_id, jpeg, "dataforsyningen")
-        # _update_water_mask_for_tile(db, tile_id, jpeg, "dataforsyningen")  # disabled — SAM too expensive during load
       elif fail_reason == 'no_coverage':
         # Permanent — mark so we never retry automatically.
         existing = db.execute(
@@ -1019,7 +935,6 @@ def api_tiles():
       check_ids.add(f"{d}-{c}-{r}")
 
   texture_ids = _texture_ids_in(_get_db(), list(check_ids))
-  water_mask_ids = _water_mask_ids_in(_get_db(), list(check_ids)) if _water_mask_ids_in else set()
   with _tex_fetching_lock:
     tex_fetching = list(_tex_fetching)
   tex_fetching_set = set(tex_fetching)
@@ -1062,8 +977,6 @@ def api_tiles():
         "texIsPlaceholder": bool(tex_flags["is_placeholder"]),
         "texAncestorId": tex_flags["ancestor_id"],
         "texIsFetching": bool(tex_flags["is_fetching"]),
-        "hasWaterMask": tid in water_mask_ids,
-        "waterMaskUrl": f"/api/watermask/{tid}.png",
         "texPriority": math.log(max(priority, 1.0)),
       }
     )
@@ -1186,7 +1099,6 @@ def api_tiles():
       "ox": ox,
       "oy": oy,
       "texCached": len(texture_ids),
-      "waterMaskCached": len(water_mask_ids),
       "texFetching": len(tex_fetching),
       "texQueued": len(tex_fetching),
       "texRetryQueue": len(_tex_retry_queue),
@@ -1653,7 +1565,6 @@ def api_texture_enhance(tile_id: str):
       )
       if enhanced is not None:
         _write_texture(wdb, tile_id, enhanced, esrc)
-        _update_water_mask_for_tile(wdb, tile_id, enhanced, esrc)
         log_tex.info(f"[ENHANCE] {tile_id}: done, wrote {len(enhanced)} bytes as {esrc}")
       else:
         log_tex.warning(f"[ENHANCE] {tile_id}: upscaler returned None")
@@ -1693,189 +1604,10 @@ def api_texture_discard_enhanced(tile_id: str):
     return jsonify({"error": f"not enhanced (source={source})"}), 400
 
   db.execute("DELETE FROM textures WHERE tile_id = ?", (tile_id,))
-  db.execute("DELETE FROM water_masks WHERE tile_id = ?", (tile_id,))
   db.commit()
 
   log_tex.info(f"[DISCARD] {tile_id}: discarded {source}")
   return jsonify({"ok": True, "discarded": source})
-
-
-@app.get("/api/watermask/<tile_id>.png")
-def api_watermask(tile_id: str):
-  unavailable = _terrain_unavailable_response()
-  if unavailable is not None:
-    return unavailable
-
-  db = _get_db()
-  cached = _read_water_mask(db, tile_id)
-  if cached is not None:
-    mask_png, source, coverage = cached
-    return Response(
-      mask_png,
-      mimetype="image/png",
-      headers={
-        "Cache-Control": "public, max-age=86400",
-        "X-WaterMask-Source": source,
-        "X-WaterMask-Coverage": f"{coverage:.4f}",
-        "X-WaterMask-Status": "ready",
-      },
-    )
-  tex_row = db.execute(
-    "SELECT texture, source FROM textures WHERE tile_id = ?",
-    (tile_id,),
-  ).fetchone()
-  if tex_row is not None:
-    texture_jpeg, texture_source = tex_row[0], str(tex_row[1])
-    _update_water_mask_for_tile(db, tile_id, texture_jpeg, texture_source)
-    cached = _read_water_mask(db, tile_id)
-    if cached is not None:
-      mask_png, source, coverage = cached
-      return Response(
-        mask_png,
-        mimetype="image/png",
-        headers={
-          "Cache-Control": "public, max-age=86400",
-          "X-WaterMask-Source": source,
-          "X-WaterMask-Coverage": f"{coverage:.4f}",
-          "X-WaterMask-Status": "ready",
-        },
-      )
-
-  parsed = _parse_tile_id(tile_id)
-  if parsed is None:
-    return Response(b"", status=400)
-  d, c, r = parsed
-  _queue_texture_fetch(tile_id, _tile_bbox(d, c, r))
-  return Response(
-    b"",
-    status=202,
-    headers={"Cache-Control": "no-store", "X-WaterMask-Status": "fetching"},
-  )
-
-
-@app.post("/api/watermask/<tile_id>/generate")
-def api_watermask_generate(tile_id: str):
-  unavailable = _terrain_unavailable_response()
-  if unavailable is not None:
-    return unavailable
-
-  db = _get_db()
-  tex_row = db.execute(
-    "SELECT texture, source FROM textures WHERE tile_id = ?",
-    (tile_id,),
-  ).fetchone()
-  if tex_row is None:
-    parsed = _parse_tile_id(tile_id)
-    if parsed is None:
-      return jsonify({"error": "bad tile id"}), 400
-    d, c, r = parsed
-    _queue_texture_fetch(tile_id, _tile_bbox(d, c, r))
-    return jsonify({"ok": False, "status": "fetching_texture", "tileId": tile_id}), 202
-
-  texture_jpeg, texture_source = tex_row[0], str(tex_row[1])
-  ok, reason, coverage = _generate_water_mask_for_tile(
-    db,
-    tile_id,
-    texture_jpeg,
-    texture_source,
-  )
-  if not ok:
-    status = 409 if reason in ("tile_missing", "heightmap_missing") else 422
-    return jsonify({"ok": False, "status": reason, "tileId": tile_id}), status
-
-  return jsonify(
-    {
-      "ok": True,
-      "status": "ready",
-      "tileId": tile_id,
-      "source": texture_source,
-      "coverage": coverage,
-      "waterMaskUrl": f"/api/watermask/{tile_id}.png",
-    }
-  )
-
-
-@app.post("/api/watermask/from_texture.png")
-def api_watermask_from_texture():
-  """Basic standalone water-mask endpoint from a provided texture image."""
-  unavailable = _terrain_unavailable_response()
-  if unavailable is not None:
-    return unavailable
-  if _build_water_mask is None or _np is None:
-    raise RuntimeError("water mask backend unavailable")
-
-  resolution = _arg_int("resolution", 256)
-  if resolution < 32 or resolution > 2048:
-    return jsonify({"error": "resolution must be in [32, 2048]"}), 400
-
-  texture_jpeg: bytes | None = None
-  if "texture" in request.files:
-    texture_jpeg = request.files["texture"].read()
-  elif request.data:
-    texture_jpeg = bytes(request.data)
-  else:
-    payload = request.get_json(silent=True) or {}
-    encoded = payload.get("textureBase64")
-    if encoded:
-      try:
-        texture_jpeg = base64.b64decode(str(encoded), validate=True)
-      except Exception:
-        return jsonify({"error": "invalid textureBase64"}), 400
-
-  if not texture_jpeg:
-    return (
-      jsonify(
-        {
-          "error": (
-            "missing texture input: send multipart field 'texture', "
-            "raw image bytes in body, or JSON field textureBase64"
-          )
-        }
-      ),
-      400,
-    )
-
-  # Treat uniform white frames as invalid input (provider no-data artifact).
-  from texture import is_white_fill
-  try:
-    img = _Image.open(io.BytesIO(texture_jpeg)).convert("RGB")
-    arr = _np.asarray(img, dtype=_np.uint8)
-    if is_white_fill(arr):
-      raise ValueError(
-        "DATA_ERROR: flat-white texture input (likely no-data source image)"
-      )
-  except ValueError:
-    raise
-  except Exception as exc:
-    raise RuntimeError(
-      f"PROCESSING_ERROR: failed to decode texture input: {type(exc).__name__}: {exc}"
-    )
-
-  # The standalone service is texture-driven; height/bbox are placeholders.
-  hm = _np.zeros((_GRID_N, _GRID_N), dtype=_np.float32)
-  bbox = (0.0, 0.0, 1.0, 1.0)
-  built = _build_water_mask(
-    texture_jpeg,
-    hm,
-    bbox,
-    resolution=resolution,
-  )
-  if built is None:
-    raise RuntimeError("water mask segmentation failed to produce output")
-  mask_png, coverage = built
-  if mask_png is None:
-    raise RuntimeError("water mask segmentation returned empty mask")
-
-  return Response(
-    mask_png,
-    mimetype="image/png",
-    headers={
-      "Cache-Control": "no-store",
-      "X-WaterMask-Coverage": f"{float(coverage):.4f}",
-      "X-WaterMask-SAM-Model": _water_mask_model_id or "facebook/sam2-hiera-small",
-      "X-WaterMask-Status": "ready",
-    },
-  )
 
 
 @app.get("/api/enhance/status")
@@ -2091,19 +1823,6 @@ def api_tile_inspect():
     if ancestor:
       log_tex.info(f"  tex fallback: using ancestor {ancestor}")
 
-  wm_row = db.execute(
-    "SELECT source, coverage, length(mask_png), updated_at FROM water_masks WHERE tile_id = ?",
-    (tid,),
-  ).fetchone()
-  if wm_row:
-    wm_src, wm_cov, wm_size, wm_updated = wm_row
-    log_tex.info(
-      f"  water_mask: source={wm_src} coverage={float(wm_cov) * 100:.1f}% "
-      f"size={wm_size} bytes updated={wm_updated}"
-    )
-  else:
-    log_tex.info("  water_mask: NOT IN DB")
-
   hist = data.get("history", [])
   if hist:
     log_db.info(f"  history ({len(hist)} events):")
@@ -2272,11 +1991,6 @@ def terrain_health():
       "tileRows": tile_rows,
     }
   )
-
-
-@app.get("/test/watermask")
-def test_watermask_page():
-  return send_from_directory(str(ROOT), "watermask_results.html")
 
 
 @app.get("/client_log.html")

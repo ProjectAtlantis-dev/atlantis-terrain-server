@@ -3,7 +3,6 @@ import * as THREE from 'three';
 export function createTerrainEnhancementController({
   log,
   applyEnhancedTexture,
-  requestWaterMask,
   textureCache,
   textureSource,
   hasTextureWork,
@@ -82,7 +81,6 @@ export function createTerrainEnhancementController({
         texture.needsUpdate = true;
         textureCache.set(tileId, texture);
         textureSource.set(tileId, source);
-        requestWaterMask(tileId);
         log(tileId, `enhanced: sentinel2 -> ${source}`);
         applyEnhancedTexture(tileId, texture);
       });
