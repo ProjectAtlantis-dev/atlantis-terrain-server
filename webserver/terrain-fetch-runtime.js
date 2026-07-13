@@ -1,68 +1,92 @@
 import {
   adoptTerrainOrigin, buildTerrainTilesRequest, offsetTerrainPayload,
   selectTerrainFrameOffset, summarizeTerrainResponse,
+  summarizeTerrainCamera, terrainCameraCoordinates,
   terrainCameraStereoPosition, terrainPipelineStatus,
 } from './terrain-tile-fetch.js';
-import { reconcileTerrainTiles } from './terrain-tile-reconciler.js';
+import { priorityHeading } from './terrain-priority.js';
 
 export function createTerrainFetchRuntime({
   state,
   previewMaxDepth,
-  getHeading,
-  getRange,
-  getCameraLatLon,
-  getCameraSnapshot,
-  getCameraLocalPosition,
-  anchorLatitude,
-  anchorLongitude,
-  terrainRoot,
-  deferredTiles,
-  lifecycle,
-  priorityForTile,
-  textureCache,
-  materialize,
-  buildMesh,
-  tileLog,
-  applyMissing,
-  updateTextures,
-  prepareUntexturedMesh,
-  onMeshAdded,
-  onResponseApplied = () => {},
-  enqueueLog,
-  bootLog,
+  view,
+  vehicle,
+  terrain,
+  logger,
   fetchImpl = (...args) => fetch(...args),
   now = () => performance.now(),
   pollMs = 3000,
   scheduleFrame = callback => requestAnimationFrame(callback),
   schedulePoll = (callback, delay) => setTimeout(callback, delay),
   cancelPoll = timer => clearTimeout(timer),
-  onSkip = () => {},
-  onError = () => {},
-  onPreviewComplete = () => {},
-  onPoll = () => {},
-  onSettled = () => {},
+  events = {},
+  testOverrides = {},
 }) {
+  const {
+    onResponseApplied = () => {},
+    onAvailability = () => {},
+    onSkip = () => {},
+    onError = () => {},
+    onPreviewComplete = () => {},
+    onPoll = () => {},
+    onSettled = () => {},
+  } = events;
   let pollTimer = null;
   let generation = 0;
   let activeController = null;
 
+  function getCameraCoordinates() {
+    return testOverrides.getCameraCoordinates?.() ?? terrainCameraCoordinates({
+      position: view.camera.position,
+      anchorPosition: view.anchorPosition,
+      east: view.east,
+      north: view.north,
+      up: view.up,
+      anchorLatitude: view.anchorLatitude,
+      anchorLongitude: view.anchorLongitude,
+      originX: state.originX,
+      originY: state.originY,
+    });
+  }
+
+  function getCameraSnapshot(coordinates) {
+    return testOverrides.getCameraSnapshot?.(coordinates) ?? summarizeTerrainCamera(coordinates, {
+      originX: state.originX,
+      originY: state.originY,
+      frameOffsetX: state.frameOffsetX,
+      frameOffsetY: state.frameOffsetY,
+      frameOffsetReady: state.frameOffsetReady,
+    });
+  }
+
   async function execute({ lat, lon, pass, signal }) {
     state.loadPass = pass;
     const started = now();
-    const camera = getCameraLatLon();
-    const cameraSnapshot = getCameraSnapshot(camera);
+    const cameraCoordinates = getCameraCoordinates();
+    const cameraSnapshot = getCameraSnapshot(cameraCoordinates);
     const request = buildTerrainTilesRequest({
-      lat: lat ?? camera.lat, lon: lon ?? camera.lon, altitude: camera.alt,
-      heading: getHeading(), range: getRange(), pass,
+      lat: lat ?? cameraCoordinates.lat,
+      lon: lon ?? cameraCoordinates.lon,
+      altitude: cameraCoordinates.alt,
+      heading: testOverrides.getHeading?.() ?? priorityHeading(
+        vehicle.vehicleControlActive,
+        vehicle.vehicleHeadingRad,
+        view.controls.yaw,
+      ),
+      range: testOverrides.getRange?.() ?? view.controls.terrainRange,
+      pass,
       previewMaxDepth, isFirstLoad: state.firstLoad,
       frameOffsetReady: state.frameOffsetReady,
       originX: state.originX, originY: state.originY,
       cameraSnapshot,
     });
-    enqueueLog('info', `fetchTiles.request[pass${pass}]`, request.logDetails);
+    logger.enqueue('info', `fetchTiles.request[pass${pass}]`, request.logDetails);
     const response = await fetchImpl(request.url, { signal });
     const data = await response.json();
-    const local = getCameraLocalPosition();
+    const local = testOverrides.getCameraLocalPosition?.() ?? {
+      x: cameraCoordinates.eastM,
+      y: cameraCoordinates.northM,
+    };
     const frameOffset = selectTerrainFrameOffset({
       isFirstLoad: state.firstLoad, frameOffsetReady: state.frameOffsetReady,
       cameraEast: local.x, cameraNorth: local.y,
@@ -72,7 +96,7 @@ export function createTerrainFetchRuntime({
     state.frameOffsetY = frameOffset.offsetY;
     state.frameOffsetReady = frameOffset.ready;
     if (frameOffset.changed) {
-      enqueueLog('info', 'fetchTiles.frame.offset.set', {
+      logger.enqueue('info', 'fetchTiles.frame.offset.set', {
         pass, passLabel: pass === 1 ? 'preview' : 'full',
         offsetX: Number(frameOffset.offsetX.toFixed(1)),
         offsetY: Number(frameOffset.offsetY.toFixed(1)),
@@ -80,14 +104,14 @@ export function createTerrainFetchRuntime({
       });
     }
     offsetTerrainPayload(data, frameOffset.offsetX, frameOffset.offsetY);
-    enqueueLog('info', `fetchTiles.response[pass${pass}]`, summarizeTerrainResponse({
+    logger.enqueue('info', `fetchTiles.response[pass${pass}]`, summarizeTerrainResponse({
       data, status: response.status, pass, cameraX: local.x, cameraY: local.y,
       frameOffsetX: frameOffset.offsetX, frameOffsetY: frameOffset.offsetY,
       frameOffsetReady: frameOffset.ready,
     }));
     if (!state.bootFetchLogged) {
       state.bootFetchLogged = true;
-      bootLog('tiles.initial-fetch.response', {
+      logger.boot('tiles.initial-fetch.response', {
         status: response.status,
         tileCount: Array.isArray(data.tiles) ? data.tiles.length : -1,
       });
@@ -101,35 +125,30 @@ export function createTerrainFetchRuntime({
       state.cameraStereoX = state.lastFetchX = origin.cameraX;
       state.cameraStereoY = state.lastFetchY = origin.cameraY;
       state.firstLoad = false;
-      enqueueLog('info', 'fetchTiles.origin.set', origin.logDetails);
+      logger.enqueue('info', 'fetchTiles.origin.set', origin.logDetails);
     }
 
-    const reconciliation = reconcileTerrainTiles({
-      tiles: data.tiles, currentTileIds: state.currentTileIds,
-      deferredTiles, terrainRoot, lifecycle, priorityForTile,
-      textureCache, materialize, buildMesh, log: tileLog,
-      prepareUntexturedMesh, onMeshAdded,
-      onDiff: details => enqueueLog('info', `fetchTiles.diff[pass${pass}]`, {
+    const reconciliation = terrain.reconcile(data.tiles, {
+      onDiff: details => logger.enqueue('info', `fetchTiles.diff[pass${pass}]`, {
         pass, passLabel: pass === 1 ? 'preview' : 'full', ...details,
       }),
     });
-    state.currentTileIds = reconciliation.nextTileIds;
-    enqueueLog('info', `fetchTiles.built[pass${pass}]`, {
+    logger.enqueue('info', `fetchTiles.built[pass${pass}]`, {
       pass, passLabel: pass === 1 ? 'preview' : 'full',
       meshesInScene: reconciliation.sceneMeshes,
       deferred: reconciliation.deferred,
       staleRemoved: reconciliation.staleRemoved,
     });
 
-    updateTextures(data.tiles);
-    applyMissing(data.missing || [], data.downloading || []);
+    terrain.updateTextures(data.tiles);
+    onAvailability(data.missing || [], data.downloading || []);
     state.lastTiles = data.tiles;
     onResponseApplied();
 
-    const currentCamera = getCameraLatLon();
+    const currentCamera = getCameraCoordinates();
     const stereo = terrainCameraStereoPosition({
       latitude: currentCamera.lat, longitude: currentCamera.lon,
-      anchorLatitude, anchorLongitude,
+      anchorLatitude: view.anchorLatitude, anchorLongitude: view.anchorLongitude,
       originX: state.originX, originY: state.originY,
     });
     state.cameraStereoX = state.lastFetchX = stereo.x;
@@ -144,7 +163,7 @@ export function createTerrainFetchRuntime({
       nextAction: pipeline.nextAction,
       previewDetails: {
         pass: 1, previewTiles: data.tiles.length, maxDepth: previewMaxDepth,
-        meshesInScene: reconciliation.sceneMeshes, deferred: deferredTiles.size,
+        meshesInScene: reconciliation.sceneMeshes, deferred: reconciliation.deferred,
         elapsedMs: Number((now() - started).toFixed(1)),
       },
     };

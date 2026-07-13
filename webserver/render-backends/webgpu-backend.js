@@ -1,7 +1,7 @@
 import * as THREE from 'three';
 import { WebGPURenderer } from 'three/webgpu';
 import { color, densityFogFactor, fog, uniform } from 'three/tsl';
-import { NormalPass } from 'postprocessing';
+import { createWebGPUAtmosphereController } from './webgpu-atmosphere.js';
 
 /**
  * Create the WebGPU renderer adapter used by the shared terrain application.
@@ -13,6 +13,7 @@ export function createWebGPUTerrainBackend({
   height,
   pixelRatio,
   toneMappingExposure,
+  scene,
   bootLog = () => {},
 } = {}) {
   const renderer = new WebGPURenderer({
@@ -27,50 +28,65 @@ export function createWebGPUTerrainBackend({
   renderer.shadowMap.autoUpdate = true;
   renderer.toneMapping = THREE.AgXToneMapping;
   renderer.toneMappingExposure = toneMappingExposure;
-  let composer = null;
   let postProcessing = null;
+  let atmosphere = null;
   let ready = false;
   let animationLoopActive = false;
   let sceneMutationVersion = 0;
   let demandRendering = null;
+  const fogDensity = uniform(0).setName('webgpuDistanceFogDensity');
+  scene.fog = null;
+  scene.fogNode = fog(color(0x000000), densityFogFactor(fogDensity));
 
   bootLog('renderer.ready', {
     backend: 'webgpu', width, height, pixelRatio,
     shadowMap: renderer.shadowMap.type,
   });
 
+  renderer.init().then(() => {
+    ready = true;
+    bootLog('renderer.webgpu.ready');
+  }).catch(error => {
+    bootLog('renderer.webgpu.error', {
+      message: error?.message ?? String(error),
+      stack: error?.stack ?? null,
+    }, 'error');
+  });
+
   const backend = {
     kind: 'webgpu',
     isWebGPU: true,
+    supportsBathymetry: false,
     renderer,
     get ready() { return ready; },
     get animationLoopActive() { return animationLoopActive; },
     get sceneMutationVersion() { return sceneMutationVersion; },
-    setComposer(nextComposer) { composer = nextComposer; },
-    setPostProcessing(nextPostProcessing) { postProcessing = nextPostProcessing; },
-    createNormalPass(scene, camera) { return new NormalPass(scene, camera); },
-    configureFog(scene) {
-      const density = uniform(0).setName('webgpuDistanceFogDensity');
-      scene.fog = null;
-      scene.fogNode = fog(color(0x000000), densityFogFactor(density));
-      return density;
+    createAtmosphere(options) {
+      atmosphere = createWebGPUAtmosphereController({
+        ...options,
+        renderer,
+        setPostProcessing(nextPostProcessing) { postProcessing = nextPostProcessing; },
+      });
+      return atmosphere;
     },
-    prepareAerialPerspective() {},
-    async initialize() {
-      try {
-        await renderer.init();
-        ready = true;
-        bootLog('renderer.webgpu.ready');
-      } catch (error) {
-        bootLog('renderer.webgpu.error', {
-          message: error?.message ?? String(error),
-          stack: error?.stack ?? null,
-        }, 'error');
+    setFogDensity(value) { fogDensity.value = value; },
+    setMapMode(active) { fogDensity.value = active ? 0 : fogDensity.value; },
+    setWaterVisibility(mesh) { mesh.visible = false; },
+    prepareUntexturedTerrain(mesh) {
+      if (!mesh?.material || mesh.material.map) return;
+      let needsUpdate = false;
+      if (mesh.material.vertexColors) {
+        mesh.material.vertexColors = false;
+        needsUpdate = true;
+      }
+      mesh.material.color.set(0x29313a);
+      if (needsUpdate) {
+        mesh.material.needsUpdate = true;
+        backend.markSceneMutated();
       }
     },
     resize(nextWidth, nextHeight) {
       renderer.setSize(nextWidth, nextHeight);
-      composer?.setSize(nextWidth, nextHeight);
     },
     renderMap(scene, camera) {
       if (ready) renderer.render(scene, camera);
@@ -79,9 +95,6 @@ export function createWebGPUTerrainBackend({
       if (!ready) return;
       if (postProcessing != null) postProcessing.render();
       else renderer.render(scene, camera);
-    },
-    setAnimationLoop(callback) {
-      renderer.setAnimationLoop(callback);
     },
     configureDemandRendering(configuration) {
       demandRendering = configuration;
@@ -112,8 +125,8 @@ export function createWebGPUTerrainBackend({
     dispose() {
       renderer.setAnimationLoop(null);
       animationLoopActive = false;
+      atmosphere?.dispose?.();
       postProcessing?.dispose?.();
-      composer?.dispose?.();
       renderer.dispose();
     },
   };

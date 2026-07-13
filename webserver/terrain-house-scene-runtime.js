@@ -267,6 +267,7 @@ export function createTerrainHouseSceneRuntime({
     markerLayer: houseMarkerLayer,
   });
   let housesRuntimeVisible = HOUSE_MODEL.enabled;
+  houseLayer.visible = housesRuntimeVisible;
   
   function setHousesRuntimeVisible(nextVisible, reason = 'manual') {
     housesRuntimeVisible = Boolean(nextVisible);
@@ -907,26 +908,64 @@ export function createTerrainHouseSceneRuntime({
     },
     onLoaded: snapPendingHouses,
   });
-  const loadHouseModel = houseModelController.load;
-  const pollHouseModelSignature = houseModelController.pollSignature;
-  const updateHouseHotReload = houseModelController.updateHotReload;
-  const runtime = {
-    HOUSE_MODEL, HOUSE_SHADOW_MODE, HOUSE_USE_SHADOW_MAP,
+  function start() {
+    if (!HOUSE_MODEL.enabled || !housesRuntimeVisible) return;
+    bootLog('house.initial-load.start', { instanceCount: houseInstances.length });
+    markHousesNeedSnap();
+    houseModelController.load('initial');
+    houseModelController.pollSignature().then(signature => {
+      houseModelController.adoptSignature(signature);
+    });
+  }
+
+  function update(nowMs, mapMode) {
+    if (housesRuntimeVisible) {
+      houseLayer.visible = true;
+      houseModelController.updateHotReload(nowMs);
+      snapPendingHouses();
+      if (HOUSE_USE_SHADOW_MAP) {
+        syncHouseShadowReceivers();
+        updateHouseShadowSystem();
+        renderer.shadowMap.autoUpdate = true;
+        if (
+          !shadowMapReadyLogged &&
+          houseShadowCasterLight.visible &&
+          houseShadowCasterLight.shadow.map != null
+        ) {
+          shadowMapReadyLogged = true;
+          bootLog('house.shadow.map.ready', {
+            width: houseShadowCasterLight.shadow.map.width,
+            height: houseShadowCasterLight.shadow.map.height,
+            receiverCount: houseShadowReceivers.size,
+          });
+        }
+      } else {
+        updateHouseLocalShadows();
+        houseShadowReceiverLayer.visible = false;
+        houseShadowCasterLight.visible = false;
+      }
+      maybeLogHouseShadowSnapshot(nowMs);
+    } else {
+      houseLayer.visible = false;
+      houseShadowReceiverLayer.visible = false;
+      houseShadowCasterLight.visible = false;
+    }
+    houseMarkerLayer.visible = mapMode && housesRuntimeVisible;
+  }
+
+  function setMarkerScale(scale) {
+    for (const house of houseInstances) house.marker.scale.setScalar(scale);
+  }
+
+  return {
+    HOUSE_SHADOW_MODE,
     HOUSE_MARKER_HEIGHT, HOUSE_MARKER_BASE_LIFT,
-    houseLayer, houseShadowReceiverLayer, houseMarkerLayer,
-    houseShadowReceivers, houseShadowCasterLight,
     houseMarkerDotGeo, houseMarkerHaloGeo, houseSites, houseInstances,
     createHouseLabelSprite, houseLocalFromLatLon, houseTerrainMeshes,
-    setHousesRuntimeVisible, markHousesNeedSnap, loadHouseModel,
-    pollHouseModelSignature, updateHouseHotReload, snapPendingHouses,
-    syncHouseShadowReceivers, updateHouseShadowSystem, updateHouseLocalShadows,
+    setHousesRuntimeVisible, markHousesNeedSnap,
+    loadHouseModel: houseModelController.load,
     probeHouseShadowIntersections, houseZSummary, houseShadowDebugSummary,
-    maybeLogHouseShadowSnapshot, houseModelController,
+    start, update, setMarkerScale,
+    get housesRuntimeVisible() { return housesRuntimeVisible; },
   };
-  Object.defineProperties(runtime, {
-    housesRuntimeVisible: { get: () => housesRuntimeVisible, set: value => { housesRuntimeVisible = Boolean(value); } },
-    shadowMapReadyLogged: { get: () => shadowMapReadyLogged, set: value => { shadowMapReadyLogged = Boolean(value); } },
-  });
-  return runtime;
 }
-

@@ -28,7 +28,6 @@ export function createTerrainVehicleRuntime({
   up, east, north, anchorLat, anchorLon,
   paramNumber, bootLog, enqueueClientLog,
   houseTerrainMeshes, houseLocalFromLatLon,
-  applyCameraOrientation, fetchTiles,
   getSunDirection,
   windowImpl = globalThis.window,
 } = {}) {

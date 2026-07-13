@@ -19,7 +19,6 @@ import {
   Group,
   InstancedMesh,
   Matrix4,
-  Mesh,
   Quaternion,
   Vector3,
   type Object3D,
@@ -231,16 +230,6 @@ export function updateScatterVisibility(terrainRoot: Object3D, camera: Object3D)
         const d = _cullWp.distanceTo(_cullCp) - s.radius;
         im.visible = d < ((im.userData.maxDist as number) ?? Infinity);
       }
-    }
-  }
-}
-
-/** dispose every scatter child (shared geometry/material stay alive) */
-export function disposeTileScatter(tileMesh: Mesh | Group): void {
-  for (const child of tileMesh.children) {
-    if (!child.userData?.isScatter) continue;
-    for (const m of child.children) {
-      if ((m as InstancedMesh).isInstancedMesh) (m as InstancedMesh).dispose();
     }
   }
 }

@@ -17,7 +17,7 @@ import { CloudShadowAtmosphereLightNode, WebGPUCloudShadows } from '../webgpu-cl
 import { cloudShadowAerialPerspective } from '../webgpu-cloud-shadow-aerial-perspective.js';
 
 export function createWebGPUAtmosphereController({
-  renderer, backend, scene, camera, anchor, east, north, up, maxViewDistance,
+  renderer, setPostProcessing, scene, camera, anchor, east, north, up, maxViewDistance,
   settings, cloudShadowSettings, bootLog = () => {}, enqueueLog = () => {},
   flushLog = () => {}, performanceImpl = globalThis.performance,
 } = {}) {
@@ -145,7 +145,7 @@ export function createWebGPUAtmosphereController({
       cloudShadows,
     );
     postProcessing.outputNode = atmosphereNode;
-    backend.setPostProcessing(postProcessing);
+    setPostProcessing(postProcessing);
     applyLiveSettings();
     bootLog('renderer.webgpu.atmosphere.ready');
   }

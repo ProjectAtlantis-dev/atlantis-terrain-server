@@ -13,6 +13,7 @@ export function createWebGLTerrainBackend({
   width,
   height,
   pixelRatio,
+  scene,
   bootLog = () => {},
 } = {}) {
   const renderer = new THREE.WebGLRenderer({
@@ -31,6 +32,8 @@ export function createWebGLTerrainBackend({
   let demandRendering = null;
   let animationLoopActive = false;
   let sceneMutationVersion = 0;
+  const sceneFog = new THREE.FogExp2(0x000000, 0.00009);
+  scene.fog = sceneFog;
 
   bootLog('renderer.ready', {
     backend: 'webgl', width, height, pixelRatio,
@@ -40,14 +43,13 @@ export function createWebGLTerrainBackend({
   const backend = {
     kind: 'webgl',
     isWebGPU: false,
+    supportsBathymetry: true,
     renderer,
     get sceneMutationVersion() { return sceneMutationVersion; },
-    initialize() {},
-    createNormalPass(scene, camera) {
-      return new NormalPass(scene, camera);
-    },
-    configureFog() { return { value: 0 }; },
-    prepareAerialPerspective(aerialPerspective) {
+    setFogDensity(value) { sceneFog.density = value; },
+    setMapMode(active) { scene.fog = active ? null : sceneFog; },
+    setWaterVisibility(mesh, visible) { mesh.visible = visible; },
+    configureScenePipeline({ scene, camera, normalPass, cloudsEffect, aerialPerspective }) {
       // IMPORTANT — verified visual regression fix:
       // postprocessing decodes logarithmic depth in readDepth(), while the
       // pinned three-geospatial shader applies reverseLogDepth() again. Keep
@@ -61,8 +63,6 @@ export function createWebGLTerrainBackend({
           '',
         ),
       );
-    },
-    configureScenePipeline({ scene, camera, normalPass, cloudsEffect, aerialPerspective }) {
       composer = new EffectComposer(renderer, {
         frameBufferType: THREE.HalfFloatType,
         multisampling: Math.min(4, renderer.capabilities.maxSamples),
@@ -86,9 +86,6 @@ export function createWebGLTerrainBackend({
     },
     renderScene() {
       composer?.render();
-    },
-    setAnimationLoop(callback) {
-      renderer.setAnimationLoop(callback);
     },
     configureDemandRendering(configuration) { demandRendering = configuration; },
     startRenderLoop() {

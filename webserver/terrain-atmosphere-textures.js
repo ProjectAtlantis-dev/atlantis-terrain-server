@@ -1,17 +1,23 @@
+import { PrecomputedTexturesLoader } from '@takram/three-atmosphere';
+import { LoadingManager } from 'three';
+
 export function createTerrainAtmosphereTextureRuntime({
   baseUrl,
   cacheName,
   fileNames,
-  LoadingManager,
-  PrecomputedTexturesLoader,
   targets,
   bootLog = () => {},
-  windowImpl = globalThis.window,
-  cachesImpl = globalThis.caches,
-  fetchImpl = (...args) => fetch(...args),
-  URLImpl = globalThis.URL,
-  consoleImpl = globalThis.console,
+  testOverrides = {},
 } = {}) {
+  const {
+    LoadingManager: LoadingManagerImpl = LoadingManager,
+    PrecomputedTexturesLoader: PrecomputedTexturesLoaderImpl = PrecomputedTexturesLoader,
+    window: windowImpl = globalThis.window,
+    caches: cachesImpl = globalThis.caches,
+    fetch: fetchImpl = (...args) => fetch(...args),
+    URL: URLImpl = globalThis.URL,
+    console: consoleImpl = globalThis.console,
+  } = testOverrides;
   function revokeObjectUrls(urlMap) {
     for (const objectUrl of urlMap.values()) URLImpl.revokeObjectURL(objectUrl);
   }
@@ -23,7 +29,7 @@ export function createTerrainAtmosphereTextureRuntime({
 
   function load(url = baseUrl, manager) {
     bootLog('atmosphere.loader.start', { url, viaManager: Boolean(manager) });
-    new PrecomputedTexturesLoader({}, manager).load(
+    new PrecomputedTexturesLoaderImpl({}, manager).load(
       url,
       textures => {
         bootLog('atmosphere.loader.success', { url });
@@ -82,7 +88,7 @@ export function createTerrainAtmosphereTextureRuntime({
         return;
       }
 
-      const manager = new LoadingManager();
+      const manager = new LoadingManagerImpl();
       manager.setURLModifier(url => result.urlMap.get(url) ?? url);
       consoleImpl.info(
         '[clouds-terrain-managed-flask-ux-wip] Atmosphere LUT cache prepared. ' +
@@ -102,7 +108,7 @@ export function createTerrainAtmosphereTextureRuntime({
       };
 
       bootLog('atmosphere.cache.loader.start');
-      new PrecomputedTexturesLoader({}, manager).load(
+      new PrecomputedTexturesLoaderImpl({}, manager).load(
         baseUrl,
         textures => {
           bootLog('atmosphere.cache.loader.success');

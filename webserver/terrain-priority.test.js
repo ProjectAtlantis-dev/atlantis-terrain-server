@@ -11,9 +11,13 @@ import { applyMapDrag } from './terrain-controls.js';
 import { createVehiclePersistenceRuntime, normalizeSavedVehicleState, stepSuspension, stepVehicleDrive, vehicleLocalToLatLon, vehicleStateSnapshot } from './terrain-vehicle.js';
 import { meshUsesTextureClassification, scoreTextureTiles, textureRetryDelay, tileDepthFromId } from './terrain-tile-runtime.js';
 import { createTextureStreamer, rendererTextureAnisotropy } from './terrain-texture-streamer.js';
-import { createTileLifecycle } from './terrain-tile-lifecycle.js';
-import { reconcileTerrainTiles } from './terrain-tile-reconciler.js';
-import { createTerrainTextureController } from './terrain-texture-controller.js';
+import {
+  createTerrainTextureController,
+  createTerrainTileReconciler,
+  createTerrainTileSet,
+  createTileLifecycle,
+  reconcileTerrainTiles,
+} from './terrain-tile-set.js';
 import { createTerrainEnhancementController } from './terrain-enhancement-controller.js';
 import { createTerrainMeshBuilder, decodeTerrainHeightmap } from './terrain-mesh-builder.js';
 import { applyTerrainAvailabilityStatus, createTerrainSeamStatusController } from './terrain-status-controller.js';
@@ -212,22 +216,26 @@ test('shared atmosphere texture runtime caches LUTs and applies them to both tar
   const targets = [{}, {}];
   const runtime = createTerrainAtmosphereTextureRuntime({
     baseUrl: '/atmosphere', cacheName: 'lut-cache', fileNames: ['a.exr', 'b.exr'],
-    LoadingManager: class {}, PrecomputedTexturesLoader: class {}, targets,
-    windowImpl: { caches: true },
-    cachesImpl: { async open(name) {
-      assert.equal(name, 'lut-cache');
-      return {
-        async match(url) { return url.endsWith('/a.exr') ? cachedResponse : null; },
-        async put(url, response) { stored.push([url, response]); },
-      };
-    } },
-    async fetchImpl(url) {
-      assert.equal(url, '/atmosphere/b.exr');
-      return networkResponse;
-    },
-    URLImpl: {
-      createObjectURL(blob) { const url = `blob:${blob.size}`; objectUrls.push(url); return url; },
-      revokeObjectURL(url) { revoked.push(url); },
+    targets,
+    testOverrides: {
+      LoadingManager: class {},
+      PrecomputedTexturesLoader: class {},
+      window: { caches: true },
+      caches: { async open(name) {
+        assert.equal(name, 'lut-cache');
+        return {
+          async match(url) { return url.endsWith('/a.exr') ? cachedResponse : null; },
+          async put(url, response) { stored.push([url, response]); },
+        };
+      } },
+      async fetch(url) {
+        assert.equal(url, '/atmosphere/b.exr');
+        return networkResponse;
+      },
+      URL: {
+        createObjectURL(blob) { const url = `blob:${blob.size}`; objectUrls.push(url); return url; },
+        revokeObjectURL(url) { revoked.push(url); },
+      },
     },
   });
 
@@ -532,15 +540,13 @@ test('shared reconciler spends dirty-paint budget in heatmap order', () => {
     add(mesh) { this.children.push(mesh); },
   };
   let diffDetails = null;
-  const result = reconcileTerrainTiles({
-    tiles: [
-      { id: 'far', bbox: [10, 10, 11, 11], heightmap: 'hm', priority: 9 },
-      { id: 'hot', bbox: [0, 0, 1, 1], heightmap: 'hm', priority: 1 },
-    ],
-    currentTileIds: new Set(), deferredTiles, terrainRoot,
+  const reconcile = createTerrainTileReconciler({
+    terrainRoot,
+    deferredTiles,
     lifecycle: { sweepStaleParents: () => 0 },
     priorityForTile: tile => tile.priority,
-    textureCache: new Map(), materialize: () => assert.fail('unexpected materialize'),
+    textureCache: new Map(),
+    meshRuntime: { materialize: () => assert.fail('unexpected materialize') },
     buildMesh: tile => {
       built.push(tile.id);
       return {
@@ -548,13 +554,60 @@ test('shared reconciler spends dirty-paint budget in heatmap order', () => {
         material: { map: null },
       };
     },
-    log: () => {}, buildBudget: 1,
+    log: () => {},
+    buildBudget: 1,
+  });
+  const result = reconcile([
+      { id: 'far', bbox: [10, 10, 11, 11], heightmap: 'hm', priority: 9 },
+      { id: 'hot', bbox: [0, 0, 1, 1], heightmap: 'hm', priority: 1 },
+    ], new Set(), {
     onDiff: details => { diffDetails = details; },
   });
   assert.deepEqual(built, ['hot']);
   assert.deepEqual([...deferredTiles.keys()], ['hot', 'far']);
   assert.equal(result.sceneMeshes, 1);
   assert.deepEqual(diffDetails, { added: 2, removed: 0, purgedDeferred: 0, sceneMeshes: 0 });
+});
+
+test('terrain tile set owns reconciliation, scene residency, and texture demand', () => {
+  const terrainRoot = {
+    children: [],
+    add(mesh) { this.children.push(mesh); },
+    remove(mesh) { this.children = this.children.filter(child => child !== mesh); },
+  };
+  const textureRequests = [];
+  const textureStreamer = {
+    texCache: new Map(),
+    texSource: new Map(),
+    waterMaskCache: new Map(),
+    requestWaterMask() {},
+    pump(scored) { textureRequests.push(...scored.map(item => item.tile.id)); },
+  };
+  const tileSet = createTerrainTileSet({
+    terrainRoot,
+    textureStreamer,
+    terrain: {},
+    material: { apply() {} },
+    view: {},
+    log() {},
+    testOverrides: {
+      buildMesh: tile => ({
+        isMesh: true,
+        userData: { tileId: tile.id, bbox: tile.bbox },
+        material: { map: null, dispose() {} },
+        geometry: { dispose() {} },
+      }),
+      priorityForTile: () => 0,
+      getVisibilityDistance: () => 1000,
+    },
+  });
+  const tile = { id: '1-0-0', bbox: [0, 0, 1, 1], heightmap: 'hm' };
+  const reconciliation = tileSet.reconcile([tile]);
+  tileSet.updateTextures([tile]);
+  assert.equal(terrainRoot.children.length, 1);
+  assert.equal(tileSet.deferredTiles.get(tile.id), tile);
+  assert.equal(tileSet.currentTileIds, reconciliation.nextTileIds);
+  assert.deepEqual(textureRequests, [tile.id]);
 });
 
 test('terrain origin and pipeline decisions preserve two-pass behavior', () => {
@@ -615,23 +668,38 @@ test('shared camera coordinates and log summary use one ENU conversion', () => {
   assert.equal(summary.camStereoApproxY, 220);
 });
 
-function createTestFetchRuntime({ fetchImpl, ...options } = {}) {
+function createTestFetchRuntime({ fetchImpl, onSkip, ...options } = {}) {
   const state = {
     loadPass: 1, fetching: false, firstLoad: true, frameOffsetReady: false,
     frameOffsetX: 0, frameOffsetY: 0, originX: 0, originY: 0,
     cameraStereoX: 0, cameraStereoY: 0, lastFetchX: 0, lastFetchY: 0,
     currentTileIds: new Set(), lastTiles: null, bootFetchLogged: false,
   };
+  const terrainRoot = { children: [] };
+  const deferredTiles = new Map();
   const runtime = createTerrainFetchRuntime({
-    state, previewMaxDepth: 10, getHeading: () => 0, getRange: () => 1000,
-    getCameraLatLon: () => ({ lat: 64, lon: -51, alt: 100 }),
-    getCameraSnapshot: () => ({ camEastM: 0, camNorthM: 0 }),
-    getCameraLocalPosition: () => ({ x: 0, y: 0 }),
-    anchorLatitude: 64, anchorLongitude: -51,
-    terrainRoot: { children: [] }, deferredTiles: new Map(),
-    lifecycle: { sweepStaleParents: () => 0 }, priorityForTile: () => 0,
-    textureCache: new Map(), materialize() {}, buildMesh() {}, tileLog() {},
-    applyMissing() {}, updateTextures() {}, enqueueLog() {}, bootLog() {},
+    state,
+    previewMaxDepth: 10,
+    view: { anchorLatitude: 64, anchorLongitude: -51 },
+    vehicle: {},
+    testOverrides: {
+      getCameraCoordinates: () => ({ lat: 64, lon: -51, alt: 100 }),
+      getCameraSnapshot: () => ({ camEastM: 0, camNorthM: 0 }),
+      getCameraLocalPosition: () => ({ x: 0, y: 0 }),
+      getHeading: () => 0,
+      getRange: () => 1000,
+    },
+    terrain: {
+      reconcile: (tiles, { onDiff }) => reconcileTerrainTiles({
+        tiles, currentTileIds: state.currentTileIds, terrainRoot, deferredTiles,
+        lifecycle: { sweepStaleParents: () => 0 },
+        priorityForTile: () => 0, textureCache: new Map(),
+        materialize() {}, buildMesh() {}, log() {}, onDiff,
+      }),
+      updateTextures() {},
+    },
+    logger: { enqueue() {}, boot() {} },
+    events: { onSkip },
     fetchImpl,
     ...options,
   });
@@ -893,18 +961,34 @@ test('shared fetch runtime preserves initial response transition ordering', asyn
     heightmapsMissing: 0, heightmapsDownloading: 0,
     serverTexturesFetching: 0, serverTexturesRetrying: 0, serverTextureStatus: {},
   };
+  const terrainRoot = { children: [] };
+  const deferredTiles = new Map();
   const runtime = createTerrainFetchRuntime({
-    state, previewMaxDepth: 10, getHeading: () => 0, getRange: () => 1000,
-    getCameraLatLon: () => ({ lat: 64, lon: -51, alt: 100 }),
-    getCameraSnapshot: () => ({ camEastM: 5, camNorthM: 6, camStereoApproxX: 10, camStereoApproxY: 20 }),
-    getCameraLocalPosition: () => ({ x: 5, y: 6 }),
-    anchorLatitude: 64, anchorLongitude: -51,
-    terrainRoot: { children: [] }, deferredTiles: new Map(),
-    lifecycle: { sweepStaleParents: () => 0 }, priorityForTile: () => 0,
-    textureCache: new Map(),
-    materialize() {}, buildMesh() {}, tileLog() {}, applyMissing() { events.push('missing'); },
-    updateTextures() { events.push('textures'); },
-    enqueueLog(_level, name) { events.push(name); }, bootLog(name) { events.push(name); },
+    state,
+    previewMaxDepth: 10,
+    view: { anchorLatitude: 64, anchorLongitude: -51 },
+    vehicle: {},
+    testOverrides: {
+      getCameraCoordinates: () => ({ lat: 64, lon: -51, alt: 100 }),
+      getCameraSnapshot: () => ({ camEastM: 5, camNorthM: 6, camStereoApproxX: 10, camStereoApproxY: 20 }),
+      getCameraLocalPosition: () => ({ x: 5, y: 6 }),
+      getHeading: () => 0,
+      getRange: () => 1000,
+    },
+    terrain: {
+      reconcile: (tiles, { onDiff }) => reconcileTerrainTiles({
+        tiles, currentTileIds: state.currentTileIds, terrainRoot, deferredTiles,
+        lifecycle: { sweepStaleParents: () => 0 },
+        priorityForTile: () => 0, textureCache: new Map(),
+        materialize() {}, buildMesh() {}, log() {}, onDiff,
+      }),
+      updateTextures() { events.push('textures'); },
+    },
+    logger: {
+      enqueue(_level, name) { events.push(name); },
+      boot(name) { events.push(name); },
+    },
+    events: { onAvailability() { events.push('missing'); } },
     fetchImpl: async () => ({
       status: 200,
       json: async () => ({

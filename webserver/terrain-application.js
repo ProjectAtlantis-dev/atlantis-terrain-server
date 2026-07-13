@@ -3,8 +3,7 @@ import * as THREE from 'three';
 import {
   AerialPerspectiveEffect,
   DEFAULT_PRECOMPUTED_TEXTURES_URL,
-  getSunDirectionECEF,
-  PrecomputedTexturesLoader
+  getSunDirectionECEF
 } from '@takram/three-atmosphere';
 import {
   CloudShape,
@@ -15,25 +14,22 @@ import {
 } from '@takram/three-clouds';
 import { Ellipsoid, Geodetic, radians } from '@takram/three-geospatial';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
+import { NormalPass } from 'postprocessing';
 import { buildAssetLibrary } from './procgen/library.ts';
-import { buildTileScatter, disposeTileScatter, updateScatterVisibility, SCATTER_MIN_DEPTH } from './procgen/scatter.ts';
-import { createTileLifecycle } from './terrain-tile-lifecycle.js';
-import { createTerrainOceanClassifier } from './classifier/terrain-ocean.js';
-import { priorityHeading, terrainTilePriority } from './terrain-priority.js';
+import { buildTileScatter, updateScatterVisibility, SCATTER_MIN_DEPTH } from './procgen/scatter.ts';
+import { priorityHeading } from './terrain-priority.js';
 import { compassHeading, createTerrainHud, renderGameClock, TERRAIN_HUD_LINKS } from './terrain-hud.js';
 import { installTerrainKeyboardControls, installTerrainPointerControls } from './terrain-controls.js';
 import { stepVehicleDrive } from './terrain-vehicle.js';
 import { createTerrainVehicleRuntime } from './terrain-vehicle-runtime.js';
-import { createTileHistory, terrainFogDistance, terrainVisibilityDistance, tileDepthFromId } from './terrain-tile-runtime.js';
+import { createTileHistory, terrainFogDistance, tileDepthFromId } from './terrain-tile-runtime.js';
 import { createTextureStreamer, rendererTextureAnisotropy } from './terrain-texture-streamer.js';
-import { createTerrainMeshRuntime } from './terrain-mesh-runtime.js';
-import { createTerrainTextureController } from './terrain-texture-controller.js';
 import { evaluateTerrainRefetch, summarizeTerrainCamera, terrainCameraCoordinates, terrainCameraStereoPosition } from './terrain-tile-fetch.js';
 import { createTerrainEnhancementController } from './terrain-enhancement-controller.js';
-import { createTerrainMeshBuilder } from './terrain-mesh-builder.js';
 import { applyTerrainAvailabilityStatus, createTerrainSeamStatusController } from './terrain-status-controller.js';
 import { collectTerrainDebugMeshes, createTerrainHoverOutlineController, createTerrainOutlineController, summarizeTerrainMesh } from './terrain-debug-runtime.js';
 import { createTerrainFetchRuntime } from './terrain-fetch-runtime.js';
+import { createTerrainTileSet } from './terrain-tile-set.js';
 import { restoreTerrainCameraState, terrainCameraState } from './terrain-camera-state.js';
 import { createTerrainClientLogger } from './terrain-client-logging.js';
 import { createTerrainFpsCounter } from './terrain-fps-counter.js';
@@ -53,9 +49,6 @@ const USE_WEBGPU_RENDER_BACKEND = backend === 'webgpu';
 const backendModule = USE_WEBGPU_RENDER_BACKEND
   ? await import('./render-backends/webgpu-backend.js')
   : await import('./render-backends/webgl-backend.js');
-const atmosphereModule = USE_WEBGPU_RENDER_BACKEND
-  ? await import('./render-backends/webgpu-atmosphere.js')
-  : null;
 // Calibrated against the cloudless WebGL reference. WebGL uses exposure 10
 // after relative-luminance normalization; this pair gives the WebGPU AgX path
 // a comparable pre-tone-map scale without changing physical scattering.
@@ -161,10 +154,6 @@ const VEHICLE_HEADLIGHTS = (
   : null;
 
 const scene = new THREE.Scene();
-// Black fog — aerial perspective inscatter fills in the natural sky color at distance.
-scene.fog = new THREE.FogExp2(0x000000, 0.00009);
-const _sceneFog = scene.fog;
-let webgpuFogDensity = null;
 const _mapBg = new THREE.Color(0x222222);
 
 // Geospatial scenes use a local ENU frame anchored at the target geodetic point.
@@ -177,7 +166,6 @@ Ellipsoid.WGS84.getEastNorthUpVectors(anchorPosition, east, north, up);
 
 // --- View distance constants ---
 const MAX_VIEW_DIST = 50000;       // 50km — camera far, fog, map extents
-let terrainRange = 20000;         // terrain tile fetch range (meters), slider-controlled
 const MAP_CAM_ALT = MAX_VIEW_DIST; // map camera altitude above target
 
 const camera = new THREE.PerspectiveCamera(
@@ -211,6 +199,7 @@ const controls = {
   mapZoom: DEFAULT_MAP_ZOOM,
   mapPanEast: 0,
   mapPanNorth: 0,
+  terrainRange: 20000,
   keys: {}
 };
 const BASE_ACCEL = 1200;
@@ -245,18 +234,19 @@ const renderBackend = USE_WEBGPU_RENDER_BACKEND
       height: window.innerHeight,
       pixelRatio: window.devicePixelRatio,
       toneMappingExposure: WEBGPU_TONE_MAPPING_EXPOSURE,
+      scene,
       bootLog,
     })
   : backendModule.createWebGLTerrainBackend({
       width: window.innerWidth,
       height: window.innerHeight,
       pixelRatio: window.devicePixelRatio,
+      scene,
       bootLog,
     });
-webgpuFogDensity = renderBackend.configureFog(scene);
 const webgpuAtmosphere = USE_WEBGPU_RENDER_BACKEND
-  ? atmosphereModule.createWebGPUAtmosphereController({
-      renderer: renderBackend.renderer, backend: renderBackend, scene, camera,
+  ? renderBackend.createAtmosphere({
+      scene, camera,
       anchor: anchorPosition, east, north, up, maxViewDistance: MAX_VIEW_DIST,
       settings: webgpuAtmosphereSettings,
       cloudShadowSettings: webgpuCloudShadowSettings,
@@ -265,7 +255,6 @@ const webgpuAtmosphere = USE_WEBGPU_RENDER_BACKEND
   : null;
 const maybeLogWebGPUSun = (...args) => webgpuAtmosphere?.maybeLogSun(...args);
 const renderer = renderBackend.renderer;
-renderBackend.initialize();
 document.body.appendChild(renderer.domElement);
 renderer.domElement.addEventListener('contextmenu', event => event.preventDefault());
 
@@ -330,9 +319,11 @@ const tileMenuRuntime = createTerrainTileMenuRuntime({
   controls, tileInfoElement: tileInfoEl, getTerrainRoot: () => terrainRoot,
   getOceanEnabled: () => oceanMapDebugEnabled,
   toggleOcean: () => { oceanMapDebugEnabled = !oceanMapDebugEnabled; },
-  getBathyEnabled: USE_WEBGPU_RENDER_BACKEND ? null : () => bathymetryOverlay.enabled,
-  toggleBathy: USE_WEBGPU_RENDER_BACKEND ? null : () => bathymetryOverlay.toggle(),
-  refreshTextures: () => { if (terrainPipelineState.lastTiles) updateTextures(terrainPipelineState.lastTiles); },
+  getBathyEnabled: renderBackend.supportsBathymetry ? () => bathymetryOverlay.enabled : null,
+  toggleBathy: renderBackend.supportsBathymetry ? () => bathymetryOverlay.toggle() : null,
+  refreshTextures: () => {
+    if (terrainPipelineState.lastTiles) terrainTileSet.updateTextures(terrainPipelineState.lastTiles);
+  },
   submitEnhancement: (tileId, options) => enhancementController.submit(tileId, options),
   getTextureStreamer: () => textureStreamer,
   onTerrainMutated: () => { markSceneMutated(); requestRender(); },
@@ -468,12 +459,12 @@ function buildTuningControls(ap, ce) {
   }
   tuningSectionLabel('Terrain');
   tuningSlider('terrain range', {
-    min: 10000, max: 50000, step: 1000, value: terrainRange,
+    min: 10000, max: 50000, step: 1000, value: controls.terrainRange,
     decimals: 0,
     format: v => `${(v/1000).toFixed(0)}km`,
     onChange: v => {
-      terrainRange = v;
-      if (terrainPipelineState.ready) fetchTiles();
+      controls.terrainRange = v;
+      if (terrainPipelineState.ready) terrainFetchRuntime.request();
     }
   });
   tuningSectionLabel('Atmosphere');
@@ -484,13 +475,12 @@ function buildTuningControls(ap, ce) {
       decimals: 2,
       onChange: v => {
         webgpuAtmosphereSettings.toneMappingExposure = v;
-        applyWebGPUAtmosphereLiveSettings();
+        webgpuAtmosphere?.applyLiveSettings();
       }
     });
     const applyWebGPUHaze = value => {
       controls._fogStrength = value;
-      _sceneFog.density = value / getFogDistance();
-      webgpuFogDensity.value = _sceneFog.density;
+      renderBackend.setFogDensity(value / getFogDistance());
     };
     tuningSlider('haze', {
       min: 0, max: 10, step: 0.5, value: WEBGPU_DEFAULT_HAZE,
@@ -730,7 +720,6 @@ function attachTileScatter(mesh, tile, hm) {
   }
 }
 
-let tileLifecycle;
 const REFETCH_DIST = 5000;
 const terrainPipelineState = {
   ready: false,
@@ -748,7 +737,6 @@ const terrainPipelineState = {
   firstLoad: true,
   loadPass: 1,
   bootFetchLogged: false,
-  currentTileIds: new Set(),
   lastTiles: null,
   heightmapsMissing: 0,
   heightmapsDownloading: 0,
@@ -770,8 +758,6 @@ const houseRuntime = createTerrainHouseSceneRuntime({
   up, east, north, anchorLat, anchorLon, paramNumber, bootLog,
   getSunDirection: () => sunDirection,
 });
-houseRuntime.houseLayer.visible = houseRuntime.housesRuntimeVisible;
-
 const vehicleRuntime = createTerrainVehicleRuntime({
   vehicleDefinition: VEHICLE_DEFINITION,
   vehicleHeadlights: VEHICLE_HEADLIGHTS,
@@ -791,10 +777,10 @@ const vehicleRuntime = createTerrainVehicleRuntime({
   paramNumber, bootLog, enqueueClientLog,
   houseTerrainMeshes: houseRuntime.houseTerrainMeshes,
   houseLocalFromLatLon: houseRuntime.houseLocalFromLatLon,
-  applyCameraOrientation, fetchTiles, getSunDirection: () => sunDirection,
+  getSunDirection: () => sunDirection,
 });
 
-const normalPass = renderBackend.createNormalPass(scene, camera);
+const normalPass = new NormalPass(scene, camera);
 
 const cloudsEffect = new CloudsEffect(camera, { resolutionScale: 1 });
 const cloudsDefaults = configureTerrainClouds({
@@ -806,7 +792,6 @@ const cloudsDefaults = configureTerrainClouds({
 });
 
 const aerialPerspective = new AerialPerspectiveEffect(camera);
-renderBackend.prepareAerialPerspective(aerialPerspective);
 aerialPerspective.sky = true;
 aerialPerspective.sun = true;
 aerialPerspective.sunIrradiance = true; // shadows a bit strong but needed
@@ -854,17 +839,12 @@ createTerrainAtmosphereTextureRuntime({
   baseUrl: DEFAULT_PRECOMPUTED_TEXTURES_URL,
   cacheName: ATMOSPHERE_CACHE_NAME,
   fileNames: ATMOSPHERE_TEXTURE_FILES,
-  LoadingManager: THREE.LoadingManager,
-  PrecomputedTexturesLoader,
   targets: [aerialPerspective, cloudsEffect],
   bootLog,
 }).loadWithLocalCache();
 
-function applyWebGPUAtmosphereLiveSettings() { webgpuAtmosphere?.applyLiveSettings(); }
-function rebuildWebGPUAtmosphere() { webgpuAtmosphere?.rebuild(gameClockState.renderedDate); }
 if (renderBackend.isWebGPU) {
-  renderBackend.setComposer(null);
-  rebuildWebGPUAtmosphere();
+  webgpuAtmosphere.rebuild(gameClockState.renderedDate);
 } else {
   renderBackend.configureScenePipeline({
     scene, camera, normalPass, cloudsEffect, aerialPerspective,
@@ -876,18 +856,11 @@ if (renderBackend.isWebGPU) {
 let oceanMapDebugEnabled = false;
 const bathymetryOverlay = createTerrainBathymetryOverlay({
   THREE,
-  enabled: !USE_WEBGPU_RENDER_BACKEND,
+  enabled: renderBackend.supportsBathymetry,
   onReady: () => {
-    if (terrainPipelineState.lastTiles) updateTextures(terrainPipelineState.lastTiles);
+    if (terrainPipelineState.lastTiles) terrainTileSet.updateTextures(terrainPipelineState.lastTiles);
   },
 });
-const terrainOceanClassifier = createTerrainOceanClassifier({ THREE, paramNumber });
-const buildMesh = createTerrainMeshBuilder({
-  oceanClassifier: terrainOceanClassifier,
-  exaggeration: EXAG,
-  attachScatter: attachTileScatter,
-});
-
 // --- Status colors for untextured tiles ---
 
 function priorityColor(priority, minP, maxP) {
@@ -900,25 +873,6 @@ function priorityColor(priority, minP, maxP) {
 
 const COLOR_DOWNLOADING = new THREE.Color(0xff2200);
 const COLOR_MISSING = new THREE.Color(0x666666);
-const COLOR_WEBGPU_UNTEXTURED = new THREE.Color(0x29313a);
-
-function applyWebGPUUntexturedTerrainMaterial(mesh) {
-  if (!USE_WEBGPU_RENDER_BACKEND || !mesh?.material || mesh.material.map) {
-    return;
-  }
-  let needsUpdate = false;
-  if (mesh.material.vertexColors) {
-    mesh.material.vertexColors = false;
-    needsUpdate = true;
-  }
-  if (!mesh.material.color.equals(COLOR_WEBGPU_UNTEXTURED)) {
-    mesh.material.color.copy(COLOR_WEBGPU_UNTEXTURED);
-  }
-  if (needsUpdate) {
-    mesh.material.needsUpdate = true;
-    markSceneMutated();
-  }
-}
 
 function markMissing(missing, downloading) {
   applyTerrainAvailabilityStatus({
@@ -933,16 +887,9 @@ function markMissing(missing, downloading) {
 }
 
 // --- Deferred tile system ---
-const deferredTiles = new Map();
 const { history: tileHistory, log: tileLog } = createTileHistory({
   getPass: () => terrainPipelineState.loadPass,
   emit: details => enqueueClientLog('debug', 'tile', details),
-});
-tileLifecycle = createTileLifecycle({
-  terrainRoot,
-  disposeScatter: disposeTileScatter,
-  log: tileLog,
-  onSceneMutated: markSceneMutated,
 });
 
 function applyTerrainMaterialMode(mesh, tex) {
@@ -974,8 +921,8 @@ function applyTerrainMaterialMode(mesh, tex) {
     mesh.material.map = resolvedTexture;
     needsUpdate = true;
   }
-  if (!resolvedTexture && USE_WEBGPU_RENDER_BACKEND) {
-    applyWebGPUUntexturedTerrainMaterial(mesh);
+  if (!resolvedTexture && renderBackend.prepareUntexturedTerrain) {
+    renderBackend.prepareUntexturedTerrain(mesh);
     return;
   }
   if (mesh.material.vertexColors) {
@@ -987,16 +934,6 @@ function applyTerrainMaterialMode(mesh, tex) {
     mesh.material.needsUpdate = true;
     markSceneMutated();
   }
-}
-
-let terrainMeshRuntime;
-
-function rebuildTileMeshWithTexture(mesh, tile, tex) {
-  return terrainMeshRuntime.rebuildWithTexture(mesh, tile, tex);
-}
-
-function materializeTile(tileId, tex) {
-  return terrainMeshRuntime.materialize(tileId, tex);
 }
 
 // --- Texture streaming ---
@@ -1018,64 +955,29 @@ const textureStreamer = createTextureStreamer({
 const {
   texCache, texSource, texInflight, texFetching, waterMaskCache, requestWaterMask,
 } = textureStreamer;
-terrainMeshRuntime = createTerrainMeshRuntime({
+const terrainTileSet = createTerrainTileSet({
   terrainRoot,
-  deferredTiles,
-  buildMesh,
-  applyMaterial: applyTerrainMaterialMode,
-  lifecycle: tileLifecycle,
-  log: tileLog,
-  getWaterMask: tileId => waterMaskCache.get(tileId),
-  getCurrentTileIds: () => terrainPipelineState.currentTileIds,
-  tileDepth: tileDepthFromId,
-  onMeshAdded: markSceneMutated,
-  vehicleNearTile: vehicleRuntime.vehicleNearTileBbox,
-  getVehicleDepth: () => vehicleRuntime.vehicleLastContactDepth,
-  requestVehicleResnap: vehicleRuntime.requestVehicleTerrainResnap,
-});
-const updateTerrainTextures = createTerrainTextureController({
-  terrainRoot,
-  deferredTiles,
   textureStreamer,
-  meshRuntime: terrainMeshRuntime,
-  lifecycle: tileLifecycle,
-  priorityForTile: tilePriority,
-  getVisibilityDistance: getTileLoadDistance,
-  applyMaterial: applyTerrainMaterialMode,
-  getWaterMask: tileId => waterMaskCache.get(tileId),
-  isMaterialOverlayActive: () => oceanMapDebugEnabled && controls.mapMode,
+  terrain: {
+    exaggeration: EXAG,
+    attachScatter: attachTileScatter,
+  },
+  material: {
+    apply: applyTerrainMaterialMode,
+    prepareUntextured: renderBackend.prepareUntexturedTerrain,
+    isOverlayActive: () => oceanMapDebugEnabled && controls.mapMode,
+  },
+  view: { camera, anchorPosition, east, north, up, controls },
   log: tileLog,
-  onMaterialApplied: requestRender,
+  vehicle: vehicleRuntime,
+  events: {
+    onMutated: markSceneMutated,
+    onMaterialApplied: requestRender,
+  },
 });
-
-// Visibility distance from camera altitude.
-// Geometric horizon: sqrt(2 * R_earth * h), clamped to practical atmosphere limits.
-// Low alt → ~15km (haze-limited), high alt → scales toward horizon.
-function getTileLoadDistance() {
-  return terrainVisibilityDistance(getCameraLatLon().alt);
-}
 
 function getFogDistance() {
   return terrainFogDistance(getCameraLatLon().alt);
-}
-
-function tilePriority(tile) {
-  const rel = camera.position.clone().sub(anchorPosition);
-  const camLocalX = rel.dot(east);
-  const camLocalY = rel.dot(north);
-  return terrainTilePriority(tile, {
-    cameraX: camLocalX,
-    cameraY: camLocalY,
-    heading: priorityHeading(vehicleRuntime.vehicleControlActive, vehicleRuntime.vehicleHeadingRad, controls.yaw),
-    pitch: controls.pitch,
-    usePitch: !vehicleRuntime.vehicleControlActive,
-    fovDeg: camera.fov,
-    aspect: camera.aspect,
-  });
-}
-
-function updateTextures(tiles) {
-  updateTerrainTextures(tiles);
 }
 
 // --- Deferred enhancement (idle-time upgrade) ---
@@ -1104,14 +1006,6 @@ const terrainOutlineController = createTerrainOutlineController({
   inflight: enhancementController.inflight,
   textureSource: texSource,
 });
-
-function abortAllEnhancements() {
-  enhancementController.abortAll();
-}
-
-function updateEnhancement() {
-  enhancementController.update();
-}
 
 // --- Camera position → lat/lon conversion ---
 
@@ -1170,9 +1064,7 @@ function needsContinuousRender() {
   );
 }
 
-function startRenderLoop() { renderBackend.startRenderLoop(); }
 function requestRender() { renderBackend.requestRender(); }
-function stopRenderLoopIfIdle() { renderBackend.stopRenderLoopIfIdle(); }
 
 renderBackend.configureDemandRendering({
   render,
@@ -1195,58 +1087,53 @@ function runStreamingMaintenance() {
     dateChanged = applyDate(currentDate, { force: false });
   }
   if (terrainPipelineState.lastTiles) {
-    updateTextures(terrainPipelineState.lastTiles);
+    terrainTileSet.updateTextures(terrainPipelineState.lastTiles);
   }
-  updateEnhancement();
+  enhancementController.update();
   if (dateChanged || renderBackend.sceneMutationVersion !== before) {
     requestRender();
   }
 }
 
-const terrainFetchRuntime = createTerrainFetchRuntime({
-  state: terrainPipelineState, previewMaxDepth: PREVIEW_MAX_DEPTH,
-  getHeading: () => priorityHeading(vehicleRuntime.vehicleControlActive, vehicleRuntime.vehicleHeadingRad, controls.yaw),
-  getRange: () => terrainRange, getCameraLatLon, getCameraSnapshot: getCameraLogSnapshot,
-  getCameraLocalPosition: () => {
-    const relative = camera.position.clone().sub(anchorPosition);
-    return { x: relative.dot(east), y: relative.dot(north) };
-  },
-  anchorLatitude: anchorLat, anchorLongitude: anchorLon, terrainRoot, deferredTiles,
-  lifecycle: tileLifecycle, priorityForTile: tilePriority,
-  textureCache: texCache,
-  materialize: materializeTile, buildMesh, tileLog, applyMissing: markMissing, updateTextures,
-  prepareUntexturedMesh: applyWebGPUUntexturedTerrainMaterial,
-  onMeshAdded: markSceneMutated,
+const terrainFetchEvents = {
   onResponseApplied: requestRender,
-  enqueueLog: enqueueClientLog,
-  bootLog,
+  onAvailability: markMissing,
   onSkip: () => enqueueClientLog('debug', 'fetchTiles.skip', {
     reason: 'already fetching', ...getCameraLogSnapshot(),
   }),
-  onPreviewComplete: result => {
+  onPreviewComplete(result) {
     bootLog('tiles.pass1-preview-done', result.previewDetails);
     requestRender();
   },
   onPoll: requestRender,
-  onError: err => {
+  onError(error) {
     if (!terrainPipelineState.bootFetchLogged) {
       bootLog('tiles.initial-fetch.error', {
-        message: err?.message ?? String(err), stack: err?.stack ?? null,
+        message: error?.message ?? String(error), stack: error?.stack ?? null,
       });
       terrainPipelineState.bootFetchLogged = true;
     }
-    console.error('Fetch error:', err);
+    console.error('Fetch error:', error);
   },
-  onSettled: () => {
+  onSettled() {
     // Drain accumulated dt so the next render frame doesn't lurch the camera.
     clock.getDelta();
     requestRender();
   },
+};
+const terrainFetchRuntime = createTerrainFetchRuntime({
+  state: terrainPipelineState,
+  previewMaxDepth: PREVIEW_MAX_DEPTH,
+  view: {
+    camera, anchorPosition, east, north, up, controls,
+    anchorLatitude: anchorLat,
+    anchorLongitude: anchorLon,
+  },
+  vehicle: vehicleRuntime,
+  terrain: terrainTileSet,
+  logger: { enqueue: enqueueClientLog, boot: bootLog },
+  events: terrainFetchEvents,
 });
-
-function fetchTiles(lat, lon) {
-  return terrainFetchRuntime.request(lat, lon);
-}
 
 // --- Save/restore camera position ---
 
@@ -1308,17 +1195,8 @@ bootLog('tiles.initial-fetch.start', {
   anchorLon
 });
 terrainPipelineState.ready = true;
-fetchTiles();
-if (houseRuntime.HOUSE_MODEL.enabled && houseRuntime.housesRuntimeVisible) {
-  bootLog('house.initial-load.start', {
-    instanceCount: houseRuntime.houseInstances.length
-  });
-  houseRuntime.markHousesNeedSnap();
-  houseRuntime.loadHouseModel('initial');
-  houseRuntime.pollHouseModelSignature().then(sig => {
-    houseRuntime.houseModelController.adoptSignature(sig);
-  });
-}
+terrainFetchRuntime.request();
+houseRuntime.start();
 vehicleRuntime.loadVehicleState();
 vehicleRuntime.loadVehicleModel();
 
@@ -1335,7 +1213,7 @@ window.takramDebug = {
   getBootEvents: () => bootEvents.slice(),
   getCloudShadowDebugSummary: () => webgpuAtmosphere?.debugSummary() ?? null,
   flushClientLogQueue: () => flushClientLogQueue(),
-  fetchTiles,
+  fetchTiles: terrainFetchRuntime.request,
   loadHouseModel: houseRuntime.loadHouseModel,
   setHousesVisible: visible => houseRuntime.setHousesRuntimeVisible(Boolean(visible), 'debug-api'),
   getHousesVisible: () => houseRuntime.housesRuntimeVisible,
@@ -1349,9 +1227,9 @@ window.takramDebug = {
   terrainRoot,
   texCache,
   waterMaskCache,
-  deferredTiles,
+  deferredTiles: terrainTileSet.deferredTiles,
   tileHistory,
-  currentTileIds: terrainPipelineState.currentTileIds,
+  get currentTileIds() { return terrainTileSet.currentTileIds; },
   getSunDirection: () => sunDirection.clone()
 };
 
@@ -1389,20 +1267,9 @@ function updateMapCamera() {
   mapCam.lookAt(target);
 }
 
-function updateEnhanceOutlines() { terrainOutlineController.updatePending(); }
-function updateEnhancedOutlines() { terrainOutlineController.updateEnhanced(); }
-
 function hideTileInfo() {
   tileInfoEl.style.display = 'none';
   hoverOutlineController.show(null);
-}
-
-function collectDebugMeshes(root) {
-  return collectTerrainDebugMeshes(root, debugIntersectables);
-}
-
-function meshDebugSummary(mesh) {
-  return summarizeTerrainMesh(mesh);
 }
 
 function clampAltitude() {
@@ -1465,7 +1332,7 @@ function updateMovement(dt) {
       vehicleRuntime.vehicleSnapPending = true;
       vehicleRuntime.throttledVehicleSave();
       cameraRuntimeState.lastMoveTime = performance.now();
-      abortAllEnhancements();
+      enhancementController.abortAll();
     }
     return;
   }
@@ -1552,7 +1419,7 @@ function updateMovement(dt) {
   }
   if (move.lengthSq() > 0) {
     cameraRuntimeState.lastMoveTime = performance.now();
-    abortAllEnhancements();
+    enhancementController.abortAll();
   }
   camera.position.add(move);
   // NaN guard — if camera position gets corrupted (e.g. bad terrain data
@@ -1581,7 +1448,7 @@ function updateHud() {
   const passLabel = terrainPipelineState.loadPass === 1
     ? '<span style="color:#ff0">PASS 1 (preview)</span>'
     : '<span style="color:#8f8">PASS 2 (full)</span>';
-  const hmLine = `${passLabel}  hm: ${terrainPipelineState.currentTileIds.size} tiles`
+  const hmLine = `${passLabel}  hm: ${terrainTileSet.currentTileIds.size} tiles`
     + (hmPending > 0
       ? `  <span style="color:#fc8">${terrainPipelineState.heightmapsDownloading} downloading  ${terrainPipelineState.heightmapsMissing} queued</span>`
       : '');
@@ -1693,8 +1560,8 @@ function resetView() {
   // Re-fetch tiles around the reset camera position.
   terrainPipelineState.firstLoad = true;
   textureStreamer.abortAll();
-  updateTerrainTextures.reset();
-  abortAllEnhancements();
+  terrainTileSet.resetTextureApplications();
+  enhancementController.abortAll();
   terrainFetchRuntime.reset(1);
   terrainPipelineState.originX = 0; terrainPipelineState.originY = 0;
   terrainPipelineState.cameraStereoX = 0; terrainPipelineState.cameraStereoY = 0;
@@ -1702,7 +1569,7 @@ function resetView() {
   terrainPipelineState.frameOffsetX = 0; terrainPipelineState.frameOffsetY = 0;
   terrainPipelineState.frameOffsetReady = false;
   houseRuntime.markHousesNeedSnap();
-  fetchTiles();
+  terrainFetchRuntime.request();
 }
 
 function syncMapModePresentation() {
@@ -1730,7 +1597,7 @@ function toggleMapMode() {
     hideTileMenu();
   }
   if (terrainPipelineState.lastTiles) {
-    updateTextures(terrainPipelineState.lastTiles);
+    terrainTileSet.updateTextures(terrainPipelineState.lastTiles);
   }
 }
 
@@ -1811,7 +1678,7 @@ renderer.domElement.addEventListener('click', event => {
   if (!controls.mapMode) {
     return;
   }
-  const targets = collectDebugMeshes(terrainRoot);
+  const targets = collectTerrainDebugMeshes(terrainRoot, debugIntersectables);
   if (targets.length === 0) {
     return;
   }
@@ -1823,12 +1690,12 @@ renderer.domElement.addEventListener('click', event => {
     return;
   }
   // Show context menu for the top-most hit
-  const topInfo = meshDebugSummary(hits[0].object);
+  const topInfo = summarizeTerrainMesh(hits[0].object);
   const topSrc = texSource.get(topInfo.tileId) || '';
   showTileMenu(event.clientX, event.clientY, topInfo.tileId, topSrc);
 
   hits.forEach((hit, index) => {
-    const info = meshDebugSummary(hit.object);
+    const info = summarizeTerrainMesh(hit.object);
     const vertexColors = !!hit.object.material?.vertexColors;
     const polygonOffset = !!hit.object.material?.polygonOffset;
     const polygonOffsetFactor = hit.object.material?.polygonOffsetFactor ?? null;
@@ -1854,7 +1721,7 @@ renderer.domElement.addEventListener('mousemove', event => {
     hideTileInfo();
     return;
   }
-  const targets = collectDebugMeshes(terrainRoot);
+  const targets = collectTerrainDebugMeshes(terrainRoot, debugIntersectables);
   if (targets.length === 0) {
     hideTileInfo();
     return;
@@ -1870,13 +1737,13 @@ renderer.domElement.addEventListener('mousemove', event => {
 
   const mesh = hits[0].object;
   hoverOutlineController.show(mesh);
-  const info = meshDebugSummary(mesh);
+  const info = summarizeTerrainMesh(mesh);
   const overlappingMeshes = [...new Map(hits
     .filter(hit => hit.object.userData?.tileId && hit.object.userData.tileId !== info.tileId)
     .map(hit => [hit.object.userData.tileId, hit.object])).values()];
   const overlapLines = overlappingMeshes.slice(0, 12)
     .map(overlapMesh => {
-      const row = meshDebugSummary(overlapMesh);
+      const row = summarizeTerrainMesh(overlapMesh);
       const rsrc = texSource.get(row.tileId) || '';
       return `${row.tileId} ${rsrc || (row.hasTexture ? 'tex' : 'noTex')}`;
     });
@@ -1904,14 +1771,14 @@ renderer.domElement.addEventListener('contextmenu', event => {
     vehicleRuntime.tryEnterVehicleControlFromPointer(event);
     return;
   }
-  const targets = collectDebugMeshes(terrainRoot);
+  const targets = collectTerrainDebugMeshes(terrainRoot, debugIntersectables);
   if (targets.length === 0) return;
   mouseNDC.x = (event.clientX / window.innerWidth) * 2 - 1;
   mouseNDC.y = -(event.clientY / window.innerHeight) * 2 + 1;
   raycaster.setFromCamera(mouseNDC, mapCam);
   const hits = raycaster.intersectObjects(targets);
   if (hits.length === 0) return;
-  const info = meshDebugSummary(hits[0].object);
+  const info = summarizeTerrainMesh(hits[0].object);
   const src = texSource.get(info.tileId) || '';
   showTileMenu(event.clientX, event.clientY, info.tileId, src);
 });
@@ -1973,14 +1840,14 @@ function render() {
   const fogStrength = controls._fogStrength ?? (
     renderBackend.isWebGPU ? WEBGPU_DEFAULT_HAZE : 4.5
   );
-  _sceneFog.density = fogStrength / getFogDistance();
-  webgpuFogDensity.value = renderBackend.isWebGPU ? _sceneFog.density : 0;
+  renderBackend.setFogDensity(fogStrength / getFogDistance());
+  renderBackend.setMapMode(controls.mapMode);
 
   // Animate water
   waterMat.uniforms.time.value = clock.elapsedTime * 0.4;
   waterMat.uniforms.sunDirection.value.copy(sunDirection);
   // The GLSL water material is not supported by WebGPURenderer.
-  waterMesh.visible = !renderBackend.isWebGPU && !controls.mapMode;
+  renderBackend.setWaterVisibility(waterMesh, !controls.mapMode);
 
   // Terrain streaming: check if camera moved far enough to re-fetch
   if (!terrainPipelineState.firstLoad) {
@@ -1999,7 +1866,7 @@ function render() {
       distanceThreshold: REFETCH_DIST, triggerIntervalMs: 500,
     });
     terrainPipelineState.lastFetchTriggerMs = refetch.nextTriggerMs;
-    if (refetch.shouldFetch) fetchTiles();
+    if (refetch.shouldFetch) terrainFetchRuntime.request();
   }
   vehicleRuntime.snapVehicleToTerrain();
   vehicleRuntime.updateDieselVolume();
@@ -2010,47 +1877,14 @@ function render() {
   vehicleRuntime.syncVehicleSunLight();
   vehicleRuntime.syncVehicleShadowReceivers();
   vehicleRuntime.updateVehicleShadowSystem();
-  if (houseRuntime.housesRuntimeVisible) {
-    houseRuntime.houseLayer.visible = true;
-    houseRuntime.updateHouseHotReload(nowMs);
-    houseRuntime.snapPendingHouses();
-    if (houseRuntime.HOUSE_USE_SHADOW_MAP) {
-      houseRuntime.syncHouseShadowReceivers();
-      houseRuntime.updateHouseShadowSystem();
-      renderer.shadowMap.autoUpdate = true;
-      if (
-        !houseRuntime.shadowMapReadyLogged &&
-        houseRuntime.houseShadowCasterLight.visible &&
-        houseRuntime.houseShadowCasterLight.shadow.map != null
-      ) {
-        houseRuntime.shadowMapReadyLogged = true;
-        bootLog('house.shadow.map.ready', {
-          width: houseRuntime.houseShadowCasterLight.shadow.map.width,
-          height: houseRuntime.houseShadowCasterLight.shadow.map.height,
-          receiverCount: houseRuntime.houseShadowReceivers.size
-        });
-      }
-    } else {
-      houseRuntime.updateHouseLocalShadows();
-      houseRuntime.houseShadowReceiverLayer.visible = false;
-      houseRuntime.houseShadowCasterLight.visible = false;
-    }
-    houseRuntime.maybeLogHouseShadowSnapshot(nowMs);
-  } else {
-    houseRuntime.houseLayer.visible = false;
-    houseRuntime.houseMarkerLayer.visible = false;
-    houseRuntime.houseShadowReceiverLayer.visible = false;
-    houseRuntime.houseShadowCasterLight.visible = false;
-  }
-  houseRuntime.houseMarkerLayer.visible = controls.mapMode && houseRuntime.housesRuntimeVisible;
+  houseRuntime.update(nowMs, controls.mapMode);
   vehicleRuntime.vehicleMarkerLayer.visible = controls.mapMode;
   enhanceOutlines.visible = controls.mapMode;
   enhancedOutlines.visible = controls.mapMode;
   if (controls.mapMode) {
-    webgpuFogDensity.value = 0;
     seamStatusController.poll();
-    updateEnhanceOutlines();
-    updateEnhancedOutlines();
+    terrainOutlineController.updatePending();
+    terrainOutlineController.updateEnhanced();
     updateMapCamera();
     markerCameraRel.copy(camera.position).sub(anchorPosition);
     camMarker.position.set(
@@ -2071,24 +1905,20 @@ function render() {
     camMarker.quaternion.setFromUnitVectors(markerForwardLocal, markerHeadingLocal);
     const markerScale = controls.mapZoom / DEFAULT_MAP_ZOOM;
     camMarker.scale.setScalar(markerScale);
-    for (const house of houseRuntime.houseInstances) {
-      house.marker.scale.setScalar(markerScale);
-    }
+    houseRuntime.setMarkerScale(markerScale);
     vehicleRuntime.vehicleMarker.scale.setScalar(markerScale * vehicleRuntime.VEHICLE_MARKER_MAP_SCALE);
-    scene.fog = null;
     scene.background = _mapBg;
     renderBackend.renderMap(scene, mapCam);
     scene.background = null;
-    scene.fog = renderBackend.isWebGPU ? null : _sceneFog;
-    stopRenderLoopIfIdle();
+    renderBackend.stopRenderLoopIfIdle();
     return;
   }
   if (SCATTER_ENABLED && _scatterLib) updateScatterVisibility(terrainRoot, camera);
   webgpuAtmosphere?.updateCloudShadows(clock.elapsedTime);
   renderBackend.renderScene(scene, camera);
-  stopRenderLoopIfIdle();
+  renderBackend.stopRenderLoopIfIdle();
 }
 
 window.setInterval(runStreamingMaintenance, STREAMING_MAINTENANCE_MS);
-startRenderLoop();
+renderBackend.startRenderLoop();
 }
