@@ -55,8 +55,9 @@ import { createTerrainHouseSceneRuntime } from './terrain-house-scene-runtime.js
 import { createTerrainTileMenuRuntime } from './terrain-tile-menu-runtime.js';
 import { createWebGPUTerrainBackend } from './render-backends/webgpu-backend.js';
 import { createWebGPUAtmosphereController } from './render-backends/webgpu-atmosphere.js';
+import { createWebGLTerrainBackend } from './render-backends/webgl-backend.js';
 
-const USE_WEBGPU_RENDER_BACKEND = true;
+const USE_WEBGPU_RENDER_BACKEND = globalThis.__TERRAIN_BACKEND__ === 'webgpu';
 // Calibrated against the cloudless WebGL reference. WebGL uses exposure 10
 // after relative-luminance normalization; this pair gives the WebGPU AgX path
 // a comparable pre-tone-map scale without changing physical scattering.
@@ -235,30 +236,30 @@ const defaultPitch = Math.asin(Math.max(-1, Math.min(1, initialForward.dot(up)))
 controls.yaw = defaultYaw;
 controls.pitch = defaultPitch;
 
-const renderBackend = createWebGPUTerrainBackend({
-  width: window.innerWidth,
-  height: window.innerHeight,
-  pixelRatio: window.devicePixelRatio,
-  toneMappingExposure: WEBGPU_TONE_MAPPING_EXPOSURE,
-  bootLog,
-});
-const webgpuAtmosphere = createWebGPUAtmosphereController({
-  renderer: renderBackend.renderer,
-  backend: renderBackend,
-  scene,
-  camera,
-  anchor: anchorPosition,
-  east,
-  north,
-  up,
-  maxViewDistance: MAX_VIEW_DIST,
-  settings: webgpuAtmosphereSettings,
-  cloudShadowSettings: webgpuCloudShadowSettings,
-  bootLog,
-  enqueueLog: enqueueClientLog,
-  flushLog: flushClientLogQueue,
-});
-const maybeLogWebGPUSun = (...args) => webgpuAtmosphere.maybeLogSun(...args);
+const renderBackend = USE_WEBGPU_RENDER_BACKEND
+  ? createWebGPUTerrainBackend({
+      width: window.innerWidth,
+      height: window.innerHeight,
+      pixelRatio: window.devicePixelRatio,
+      toneMappingExposure: WEBGPU_TONE_MAPPING_EXPOSURE,
+      bootLog,
+    })
+  : createWebGLTerrainBackend({
+      width: window.innerWidth,
+      height: window.innerHeight,
+      pixelRatio: window.devicePixelRatio,
+      bootLog,
+    });
+const webgpuAtmosphere = USE_WEBGPU_RENDER_BACKEND
+  ? createWebGPUAtmosphereController({
+      renderer: renderBackend.renderer, backend: renderBackend, scene, camera,
+      anchor: anchorPosition, east, north, up, maxViewDistance: MAX_VIEW_DIST,
+      settings: webgpuAtmosphereSettings,
+      cloudShadowSettings: webgpuCloudShadowSettings,
+      bootLog, enqueueLog: enqueueClientLog, flushLog: flushClientLogQueue,
+    })
+  : null;
+const maybeLogWebGPUSun = (...args) => webgpuAtmosphere?.maybeLogSun(...args);
 const renderer = renderBackend.renderer;
 renderBackend.initialize();
 document.body.appendChild(renderer.domElement);
@@ -771,7 +772,9 @@ const vehicleRuntime = createTerrainVehicleRuntime({
   applyCameraOrientation, fetchTiles, getSunDirection: () => sunDirection,
 });
 
-const normalPass = new NormalPass(scene, camera);
+const normalPass = renderBackend.isWebGPU
+  ? new NormalPass(scene, camera)
+  : renderBackend.createNormalPass(scene, camera);
 
 const cloudsEffect = new CloudsEffect(camera, { resolutionScale: 1 });
 const cloudsDefaults = configureTerrainClouds({
@@ -783,6 +786,7 @@ const cloudsDefaults = configureTerrainClouds({
 });
 
 const aerialPerspective = new AerialPerspectiveEffect(camera);
+renderBackend.prepareAerialPerspective(aerialPerspective);
 aerialPerspective.sky = true;
 aerialPerspective.sun = true;
 aerialPerspective.sunIrradiance = true; // shadows a bit strong but needed
@@ -811,7 +815,7 @@ function applyDate(date, { force = true } = {}) {
   getSunDirectionECEF(date, sunDirection);
   aerialPerspective.sunDirection.copy(sunDirection);
   cloudsEffect.sunDirection.copy(sunDirection);
-  webgpuAtmosphere.updateDate(date, sunDirection);
+  webgpuAtmosphere?.updateDate(date, sunDirection);
   return true;
 }
 function getGameDateFromBrowserTime(nowMs = Date.now()) {
@@ -838,11 +842,17 @@ createTerrainAtmosphereTextureRuntime({
   bootLog,
 }).loadWithLocalCache();
 
-function applyWebGPUAtmosphereLiveSettings() { webgpuAtmosphere.applyLiveSettings(); }
-function applyWebGPUCloudShadowLiveSettings() { webgpuAtmosphere.applyCloudShadowSettings(); }
-function rebuildWebGPUAtmosphere() { webgpuAtmosphere.rebuild(lastRenderedDate); }
-renderBackend.setComposer(null);
-rebuildWebGPUAtmosphere();
+function applyWebGPUAtmosphereLiveSettings() { webgpuAtmosphere?.applyLiveSettings(); }
+function applyWebGPUCloudShadowLiveSettings() { webgpuAtmosphere?.applyCloudShadowSettings(); }
+function rebuildWebGPUAtmosphere() { webgpuAtmosphere?.rebuild(lastRenderedDate); }
+if (renderBackend.isWebGPU) {
+  renderBackend.setComposer(null);
+  rebuildWebGPUAtmosphere();
+} else {
+  renderBackend.configureScenePipeline({
+    scene, camera, normalPass, cloudsEffect, aerialPerspective,
+  });
+}
 
 // --- Heightmap decode + mesh building (adapted for ENU frame) ---
 
@@ -1325,7 +1335,7 @@ window.takramDebug = {
   applyDate,
   bootEvents,
   getBootEvents: () => bootEvents.slice(),
-  getCloudShadowDebugSummary: () => webgpuAtmosphere.debugSummary(),
+  getCloudShadowDebugSummary: () => webgpuAtmosphere?.debugSummary() ?? null,
   flushClientLogQueue: () => flushClientLogQueue(),
   fetchTiles,
   loadHouseModel: houseRuntime.loadHouseModel,
@@ -2150,7 +2160,7 @@ function render() {
     return;
   }
   if (SCATTER_ENABLED && _scatterLib) updateScatterVisibility(terrainRoot, camera);
-  webgpuAtmosphere.updateCloudShadows(clock.elapsedTime);
+  webgpuAtmosphere?.updateCloudShadows(clock.elapsedTime);
   renderBackend.renderScene(scene, camera);
   stopRenderLoopIfIdle();
 }

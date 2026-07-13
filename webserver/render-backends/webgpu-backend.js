@@ -46,6 +46,7 @@ export function createWebGPUTerrainBackend({
     get sceneMutationVersion() { return sceneMutationVersion; },
     setComposer(nextComposer) { composer = nextComposer; },
     setPostProcessing(nextPostProcessing) { postProcessing = nextPostProcessing; },
+    prepareAerialPerspective() {},
     async initialize() {
       try {
         await renderer.init();
