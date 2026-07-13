@@ -6,6 +6,7 @@ function finiteOrNull(value) {
 
 export function terrainCameraState({
   cameraLatLon,
+  cameraGrid = null,
   yaw,
   pitch,
   mapZoom,
@@ -21,6 +22,10 @@ export function terrainCameraState({
   };
   if (terrainFrame) {
     state.terrainFrame = { ...terrainFrame };
+  }
+  if (Number.isFinite(cameraGrid?.x) && Number.isFinite(cameraGrid?.y)) {
+    state.gridX = cameraGrid.x;
+    state.gridY = cameraGrid.y;
   }
   return state;
 }

@@ -50,10 +50,15 @@ import {
 test('terrain camera persistence round-trips pose and frame state', () => {
   const saved = terrainCameraState({
     cameraLatLon: { lat: 64.1, lon: -51.2, alt: 123 },
+    cameraGrid: { x: -317228.7, y: -2834379.7 },
     yaw: 0.4,
     pitch: -0.2,
     mapZoom: 900,
     terrainFrame: { originX: 1, originY: 2, offsetX: 3, offsetY: 4 },
+  });
+  assert.deepEqual({ gridX: saved.gridX, gridY: saved.gridY }, {
+    gridX: -317228.7,
+    gridY: -2834379.7,
   });
   const restored = restoreTerrainCameraState(saved, { anchorLat: 64, anchorLon: -51 });
   assert.ok(Math.abs(restored.eastM - ((-0.2) * 111320 * Math.cos(64 * Math.PI / 180))) < 1e-9);

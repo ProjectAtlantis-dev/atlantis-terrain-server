@@ -1075,10 +1075,27 @@ const terrainFetchRuntime = createTerrainFetchRuntime({
 
 function savePosition() {
   if (terrainPipelineState.firstLoad) return;
-  const camLL = getCameraLatLon();
+  const coordinates = terrainCameraCoordinates({
+    position: camera.position, anchorPosition, east, north, up,
+    anchorLatitude: anchorLat, anchorLongitude: anchorLon,
+    originX: terrainPipelineState.originX, originY: terrainPipelineState.originY,
+  });
+  const cameraGrid = terrainCameraGridPosition({
+    eastM: coordinates.eastM,
+    northM: coordinates.northM,
+    originX: terrainPipelineState.originX,
+    originY: terrainPipelineState.originY,
+    frameOffsetX: terrainPipelineState.frameOffsetX,
+    frameOffsetY: terrainPipelineState.frameOffsetY,
+  });
   const saved = terrainCameraState({
-    cameraLatLon: camLL,
-    yaw: controls.yaw,
+    cameraLatLon: { lat: coordinates.lat, lon: coordinates.lon, alt: coordinates.alt },
+    cameraGrid,
+    yaw: priorityHeading(
+      vehicleRuntime.vehicleControlActive,
+      vehicleRuntime.vehicleHeadingRad,
+      controls.yaw,
+    ),
     pitch: controls.pitch,
     mapZoom: controls.mapZoom,
     terrainFrame: terrainPipelineState.frameOffsetReady
@@ -1090,7 +1107,7 @@ function savePosition() {
   });
   localStorage.setItem('clouds-cam', JSON.stringify(saved));
 }
-setInterval(savePosition, 2000);
+setInterval(savePosition, 250);
 window.addEventListener('beforeunload', savePosition);
 
 // Restore saved camera position (lat/lon/alt are origin-independent)

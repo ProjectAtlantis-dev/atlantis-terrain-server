@@ -92,7 +92,9 @@ function pollCamera() {
   try {
     const c = JSON.parse(localStorage.getItem('clouds-cam'));
     if (!c || c.lat == null || c.lon == null) return;
-    const [x, y] = toStereo(c.lat, c.lon);
+    const [fallbackX, fallbackY] = toStereo(c.lat, c.lon);
+    const x = Number.isFinite(c.gridX) ? c.gridX : fallbackX;
+    const y = Number.isFinite(c.gridY) ? c.gridY : fallbackY;
     target = { x, y, yaw: c.yaw || 0, lat: c.lat, lon: c.lon, alt: c.alt || 0 };
     if (!smooth) smooth = { ...target };
   } catch (_) { /* no saved camera yet */ }
@@ -238,15 +240,14 @@ function frame(now) {
   const dt = Math.min(0.25, (now - lastT) / 1000);
   lastT = now;
 
-  // ease toward the last saved camera so 2s save ticks look continuous
+  // Ease position between persistence ticks, but heading is live state: any
+  // interpolation here makes the radar visibly rotate after the ship stops.
   if (target && smooth) {
     const k = 1 - Math.exp(-dt / 0.35);
     smooth.x += (target.x - smooth.x) * k;
     smooth.y += (target.y - smooth.y) * k;
     smooth.lon += (target.lon - smooth.lon) * k;
-    let dyaw = target.yaw - smooth.yaw;
-    dyaw = Math.atan2(Math.sin(dyaw), Math.cos(dyaw));
-    smooth.yaw += dyaw * k;
+    smooth.yaw = target.yaw;
   }
 
   ctx.clearRect(0, 0, W, H);
@@ -406,7 +407,14 @@ let heatBackoff = 2000;
 async function pollHeat() {
   if (mode === 'coverage') { setTimeout(pollHeat, 2000); return; }
   try {
-    const resp = await fetch('/api/heatmap');
+    const params = new URLSearchParams();
+    if (target) {
+      params.set('qx', String(target.x));
+      params.set('qy', String(target.y));
+      params.set('alt', String(target.alt));
+      params.set('heading', String(target.yaw));
+    }
+    const resp = await fetch(`/api/heatmap?${params}`);
     if (!resp.ok) throw new Error(resp.status);
     const d = await resp.json();
     if (d) heat = d;

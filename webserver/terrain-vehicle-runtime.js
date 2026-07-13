@@ -946,7 +946,6 @@ export function createTerrainVehicleRuntime({
   
   function setVehicleControlActive(nextActive, reason = 'manual', options = {}) {
     const { skipExitSave = false } = options;
-    driftMode = false;
     const requested = Boolean(nextActive);
     if (requested && (!vehicleLoaded || controls.mapMode)) {
       return false;
