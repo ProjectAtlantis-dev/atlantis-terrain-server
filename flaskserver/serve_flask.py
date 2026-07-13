@@ -166,6 +166,7 @@ _fetch_sentinel2_texture: Any = None
 _fetch_dataforsyningen_texture: Any = None
 _fetch_enhanced_texture: Any = None
 _init_textures: Any = None
+_init_classifier_tiles: Any = None
 _enqueue_seam_jobs: Any = None
 
 _tex_pool = ThreadPoolExecutor(max_workers=4)
@@ -432,7 +433,7 @@ def _bootstrap_backend() -> None:
   global _backend_ready, _backend_error
   global _np, _Image, _to_stereo, _query_tiles_stereo, _load_no_data_cache
   global _GRID_N, _tile_bbox, _texture_ids_in, _read_texture, _write_texture
-  global _fetch_sentinel2_texture, _fetch_dataforsyningen_texture, _fetch_enhanced_texture, _init_textures, _enqueue_seam_jobs
+  global _fetch_sentinel2_texture, _fetch_dataforsyningen_texture, _fetch_enhanced_texture, _init_textures, _init_classifier_tiles, _enqueue_seam_jobs
 
   if _backend_ready or _backend_error is not None:
     return
@@ -442,6 +443,7 @@ def _bootstrap_backend() -> None:
     from PIL import Image  # type: ignore
 
     from coords import to_stereo
+    from classifier.storage import init_classifier_tiles
     from database import GRID_N, _tile_bbox as terrain_tile_bbox, seed_tiles, open_db
     from seam_queue import enqueue_tile_and_neighbors
     from serve import load_no_data_cache, query_tiles_stereo
@@ -500,6 +502,7 @@ def _bootstrap_backend() -> None:
     _fetch_dataforsyningen_texture = fetch_dataforsyningen_texture
     _fetch_enhanced_texture = fetch_enhanced_texture
     _init_textures = init_textures
+    _init_classifier_tiles = init_classifier_tiles
     _enqueue_seam_jobs = enqueue_tile_and_neighbors
 
     _backend_ready = True
@@ -543,6 +546,8 @@ def _get_db() -> sqlite3.Connection:
     db.execute("PRAGMA journal_mode=WAL")
     if _init_textures is not None:
       _init_textures(db)
+    if _init_classifier_tiles is not None:
+      _init_classifier_tiles(db)
     g.terrain_db = db
   return db
 
@@ -1309,6 +1314,89 @@ def api_terrain_channel(tile_id: str, chan: str):
     headers={"Cache-Control": "no-store", "X-Tex-Source": f"channel_{chan}",
              "X-DEM-Depth": str(hm_depth), "X-DEM-Source": str(hm_source)},
   )
+
+
+@app.get("/api/classifier/<tile_id>.png")
+def api_classifier_tile(tile_id: str):
+  """Colorized semantic labels for a terrain tile.
+
+  The database stores raw uint8 labels. Exact rows are preferred; descendants
+  can reuse the nearest classified ancestor through a nearest-neighbor crop so
+  class boundaries and label identities are never blended.
+  """
+  unavailable = _terrain_unavailable_response()
+  if unavailable is not None:
+    return unavailable
+  parsed = _parse_tile_id(tile_id)
+  if parsed is None:
+    return Response(b"", status=400)
+  try:
+    resolution = max(16, min(2048, int(request.args.get("res", "512"))))
+  except ValueError:
+    return Response(b"", status=400)
+
+  import io as _io
+
+  from PIL import Image as _Image
+  from classifier.storage import colorize_class_map, decode_class_map
+
+  child_depth, child_col, child_row = parsed
+  depth, col, row = parsed
+  found = None
+  db = _get_db()
+  while depth >= 0:
+    candidate_id = f"{depth}-{col}-{row}"
+    found = db.execute(
+      "SELECT class_schema, width, height, class_map, source "
+      "FROM classifier_tiles WHERE tile_id = ?",
+      (candidate_id,),
+    ).fetchone()
+    if found is not None:
+      break
+    if depth == 0:
+      return Response(
+        b"", status=404,
+        headers={"Cache-Control": "no-store", "X-Classifier-Status": "missing"},
+      )
+    depth -= 1
+    col //= 2
+    row //= 2
+
+  class_schema, width, height, class_blob, source = found
+  try:
+    labels = decode_class_map(class_blob, width, height)
+    label_image = _Image.fromarray(labels, mode="L")
+    if depth != child_depth:
+      levels = child_depth - depth
+      divisions = 1 << levels
+      sub_col = child_col % divisions
+      sub_row = child_row % divisions
+      x0 = sub_col * width // divisions
+      x1 = (sub_col + 1) * width // divisions
+      # Class maps are image-oriented: row zero is north.
+      y0 = (divisions - 1 - sub_row) * height // divisions
+      y1 = (divisions - sub_row) * height // divisions
+      label_image = label_image.crop((x0, y0, x1, y1))
+    label_image = label_image.resize(
+      (resolution, resolution), _Image.Resampling.NEAREST,
+    )
+    rgb = colorize_class_map(_np.asarray(label_image), class_schema)
+  except (TypeError, ValueError, zlib.error):
+    return Response(
+      b"", status=500,
+      headers={"Cache-Control": "no-store", "X-Classifier-Status": "invalid"},
+    )
+  buf = _io.BytesIO()
+  _Image.fromarray(rgb, mode="RGB").save(buf, format="PNG")
+  headers = {
+    "Cache-Control": "public, max-age=86400",
+    "X-Classifier-Status": "ready",
+    "X-Classifier-Schema": str(class_schema),
+    "X-Classifier-Source": str(source),
+  }
+  if depth != child_depth:
+    headers["X-Classifier-Ancestor"] = f"{depth}-{col}-{row}"
+  return Response(buf.getvalue(), mimetype="image/png", headers=headers)
 
 
 @app.get("/api/heatmap")

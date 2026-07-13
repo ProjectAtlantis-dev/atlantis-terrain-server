@@ -37,6 +37,7 @@ export function createTerrainMeshBuilder({ exaggeration, attachScatter }) {
     const [xMin, yMin, xMax, yMax] = tile.bbox;
     const positions = new Float32Array(resolution * resolution * 3);
     const colors = new Float32Array(resolution * resolution * 3);
+    const classifierFallbackColors = new Float32Array(resolution * resolution * 3);
     const uvs = new Float32Array(resolution * resolution * 2);
 
     for (let row = 0; row < resolution; row++) for (let column = 0; column < resolution; column++) {
@@ -49,6 +50,8 @@ export function createTerrainMeshBuilder({ exaggeration, attachScatter }) {
       uvs[index * 2 + 1] = row / (resolution - 1);
       const color = elevationColor(elevation);
       colors.set([color.r, color.g, color.b], index * 3);
+      const gray = Math.max(0.03, Math.min(1, (elevation + 50) / 3050));
+      classifierFallbackColors.set([gray, gray, gray], index * 3);
     }
 
     const indices = [];
@@ -59,7 +62,9 @@ export function createTerrainMeshBuilder({ exaggeration, attachScatter }) {
     if (indices.length === 0) return null;
     const geometry = new THREE.BufferGeometry();
     geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-    geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+    const terrainColorAttribute = new THREE.BufferAttribute(colors, 3);
+    const classifierColorAttribute = new THREE.BufferAttribute(classifierFallbackColors, 3);
+    geometry.setAttribute('color', terrainColorAttribute);
     geometry.setAttribute('uv', new THREE.BufferAttribute(uvs, 2));
     geometry.setIndex(indices);
     geometry.computeVertexNormals();
@@ -68,7 +73,10 @@ export function createTerrainMeshBuilder({ exaggeration, attachScatter }) {
     });
     const mesh = new THREE.Mesh(geometry, material);
     Object.assign(mesh.userData, {
-      tileId: tile.id, bbox: tile.bbox,
+      tileId: tile.id,
+      bbox: tile.bbox,
+      terrainColorAttribute,
+      classifierColorAttribute,
     });
     attachScatter(mesh, tile, heightmap);
     return mesh;

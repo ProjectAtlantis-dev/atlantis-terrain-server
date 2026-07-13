@@ -611,6 +611,7 @@ test('terrain tile set owns reconciliation, scene residency, and texture demand'
       }),
       priorityForTile: () => 0,
       getVisibilityDistance: () => 1000,
+      createDesaturatedTexture: source => ({ source, desaturated: true, dispose() {} }),
     },
   });
   const tile = { id: '1-0-0', bbox: [0, 0, 1, 1], heightmap: 'hm' };
@@ -623,6 +624,16 @@ test('terrain tile set owns reconciliation, scene residency, and texture demand'
 
   const enhancedTexture = { disposed: false, dispose() { this.disposed = true; } };
   assert.equal(tileSet.applyEnhancedTexture(tile.id, enhancedTexture), true);
+  assert.equal(terrainRoot.children[0].material.map, enhancedTexture);
+  assert.equal(tileSet.setClassifierMode(true), true);
+  assert.equal(terrainRoot.children[0].material.map.desaturated, true);
+  assert.equal(terrainRoot.children[0].material.map.source, enhancedTexture);
+  const classifierTexture = { classifier: true };
+  tileSet.setClassifierTexture(tile.id, classifierTexture);
+  assert.equal(terrainRoot.children[0].material.map, classifierTexture);
+  tileSet.setClassifierTexture(tile.id, null);
+  assert.equal(terrainRoot.children[0].material.map.desaturated, true);
+  assert.equal(tileSet.setClassifierMode(false), false);
   assert.equal(terrainRoot.children[0].material.map, enhancedTexture);
   assert.equal(tileSet.discardEnhancedTexture(tile.id), true);
   assert.deepEqual(invalidated, [tile.id]);

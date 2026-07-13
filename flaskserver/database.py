@@ -188,6 +188,11 @@ def open_db(path=None):
     from texture import init_textures
     init_textures(db)
 
+    # Semantic classifier output is deliberately a separate, initially empty
+    # tile store. Heightmaps remain the canonical geometry payload.
+    from classifier.storage import init_classifier_tiles
+    init_classifier_tiles(db)
+
     return db
 
 

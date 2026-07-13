@@ -33,6 +33,7 @@ test('G key opens Google Maps once and ignores key repeat', () => {
     removeEventListener(type) { listeners.delete(type); },
   };
   let opens = 0;
+  let classifierToggles = 0;
   const noop = () => {};
   const dispose = installTerrainKeyboardControls({
     controls: { keys: {} },
@@ -41,6 +42,7 @@ test('G key opens Google Maps once and ignores key repeat', () => {
     onEscapeVehicle: noop,
     onToggleMap: noop,
     onOpenGoogleMaps: () => { opens += 1; },
+    onToggleClassifier: () => { classifierToggles += 1; },
     onReset: noop,
     onHouseAction: noop,
     onToggleHeadlights: noop,
@@ -48,7 +50,10 @@ test('G key opens Google Maps once and ignores key repeat', () => {
   try {
     listeners.get('keydown')({ code: 'KeyG', repeat: false });
     listeners.get('keydown')({ code: 'KeyG', repeat: true });
+    listeners.get('keydown')({ code: 'KeyC', repeat: false });
+    listeners.get('keydown')({ code: 'KeyC', repeat: true });
     assert.equal(opens, 1);
+    assert.equal(classifierToggles, 1);
   } finally {
     dispose();
     globalThis.window = previousWindow;

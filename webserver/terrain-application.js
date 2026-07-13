@@ -30,6 +30,7 @@ import { applyTerrainAvailabilityStatus, createTerrainSeamStatusController } fro
 import { collectTerrainDebugMeshes, createTerrainHoverOutlineController, createTerrainMapGridController, createTerrainOutlineController, summarizeTerrainMesh } from './terrain-debug-runtime.js';
 import { createTerrainFetchRuntime } from './terrain-fetch-runtime.js';
 import { createTerrainTileSet } from './terrain-tile-set.js';
+import { createTerrainClassifierRuntime } from './terrain-classifier-runtime.js';
 import { restoreTerrainCameraState, terrainCameraState } from './terrain-camera-state.js';
 import { createTerrainClientLogger } from './terrain-client-logging.js';
 import { createTerrainFpsCounter } from './terrain-fps-counter.js';
@@ -937,6 +938,13 @@ const terrainTileSet = createTerrainTileSet({
     onMaterialApplied: requestRender,
   },
 });
+const classifierRuntime = createTerrainClassifierRuntime({
+  terrainTiles: terrainTileSet,
+  onChanged: () => {
+    updateHud();
+    requestRender();
+  },
+});
 
 function getFogDistance() {
   return terrainFogDistance(getCameraLatLon().alt);
@@ -1141,6 +1149,7 @@ function runStreamingMaintenance() {
   }
   if (terrainPipelineState.lastTiles) {
     terrainTileSet.updateTextures(terrainPipelineState.lastTiles);
+    classifierRuntime.update(terrainPipelineState.lastTiles);
   }
   enhancementController.update();
   if (dateChanged || renderBackend.sceneMutationVersion !== before) {
@@ -1561,6 +1570,9 @@ function updateHud() {
   const modeHtml = vehicleRuntime.vehicleControlActive
     ? '<span style="color:#ff3b30">VEHICLE</span>'
     : modeLabel;
+  const classifierLine = classifierRuntime.active
+    ? `classifier: <span style="color:#8f8">ON</span>  ${classifierRuntime.textures.size} painted  ${classifierRuntime.missing.size} grayscale`
+    : 'classifier: off (C)';
 
   // Game clock display (bottom-left) — always show the date actually being rendered
   const gameDate = gameClockState.renderedDate;
@@ -1586,6 +1598,7 @@ function updateHud() {
     `speed: ${speedKmh.toFixed(0)} km/h  heading: ${deg.toFixed(0)}° ${compass}`,
     hmLine,
     texLine,
+    classifierLine,
     vehicleRuntime.vehicleControlActive
       ? 'W/S drive, A/D steer, mouse orbit camera, Esc exits vehicle control'
       : 'WASD or Arrows move, Q/Z altitude, drag look',
@@ -1716,6 +1729,11 @@ function toggleMapMode() {
   }
 }
 
+function toggleClassifierMode() {
+  if (controls.mapMode) return;
+  classifierRuntime.toggle(terrainPipelineState.lastTiles ?? []);
+}
+
 installTerrainKeyboardControls({
   controls,
   isVehicleActive: () => vehicleRuntime.vehicleControlActive,
@@ -1730,6 +1748,7 @@ installTerrainKeyboardControls({
   onToggleMap: toggleMapMode,
   onOpenGoogleMaps: openGoogleMapsView,
   onToggleHeatmap: toggleHeatmap,
+  onToggleClassifier: toggleClassifierMode,
   onReset: resetView,
   onHouseAction: load => load
     ? houseRuntime.loadHouseModel('keyboard')

@@ -26,6 +26,40 @@ function disposeTileScatter(tileMesh) {
   }
 }
 
+export function createDesaturatedTerrainTexture(texture, documentImpl = globalThis.document) {
+  const image = texture?.image;
+  const width = Number(image?.naturalWidth ?? image?.videoWidth ?? image?.width);
+  const height = Number(image?.naturalHeight ?? image?.videoHeight ?? image?.height);
+  if (!documentImpl?.createElement || !image || width <= 0 || height <= 0) return null;
+  const canvas = documentImpl.createElement('canvas');
+  canvas.width = width;
+  canvas.height = height;
+  const context = canvas.getContext('2d', { willReadFrequently: true });
+  if (!context) return null;
+  context.drawImage(image, 0, 0, width, height);
+  const pixels = context.getImageData(0, 0, width, height);
+  for (let index = 0; index < pixels.data.length; index += 4) {
+    const gray = Math.round(
+      pixels.data[index] * 0.299
+      + pixels.data[index + 1] * 0.587
+      + pixels.data[index + 2] * 0.114,
+    );
+    pixels.data[index] = gray;
+    pixels.data[index + 1] = gray;
+    pixels.data[index + 2] = gray;
+  }
+  context.putImageData(pixels, 0, 0);
+  const desaturated = new THREE.CanvasTexture(canvas);
+  desaturated.flipY = texture.flipY;
+  desaturated.colorSpace = texture.colorSpace;
+  desaturated.generateMipmaps = texture.generateMipmaps;
+  desaturated.minFilter = texture.minFilter;
+  desaturated.magFilter = texture.magFilter;
+  desaturated.anisotropy = texture.anisotropy;
+  desaturated.needsUpdate = true;
+  return desaturated;
+}
+
 export function createTileLifecycle({
   terrainRoot,
   disposeScatter,
@@ -504,20 +538,91 @@ export function createTerrainTileSet({
     return terrainVisibilityDistance(altitude);
   });
   const buildBudget = testOverrides.buildBudget ?? 200;
+  const desaturateTexture = testOverrides.createDesaturatedTexture
+    ?? createDesaturatedTerrainTexture;
   const deferredTiles = new Map();
   let currentTileIds = new Set();
   let lastTiles = null;
+  let classifierMode = false;
+  const classifierTextures = new Map();
+  const desaturatedTextures = new Map();
+
+  function selectVertexColors(mesh, attribute) {
+    if (!mesh?.geometry || !attribute) return false;
+    if (mesh.geometry.getAttribute?.('color') === attribute) return false;
+    mesh.geometry.setAttribute?.('color', attribute);
+    return true;
+  }
+
+  function applyClassifierPresentation(mesh) {
+    if (!mesh?.material) return;
+    const classifierTexture = classifierTextures.get(mesh.userData?.tileId) ?? null;
+    const baseTexture = mesh.userData?.terrainBaseTexture ?? null;
+    let fallbackTexture = null;
+    if (!classifierTexture && baseTexture) {
+      const cached = desaturatedTextures.get(mesh.userData.tileId);
+      if (cached?.source === baseTexture) {
+        fallbackTexture = cached.texture;
+      } else {
+        cached?.texture?.dispose?.();
+        fallbackTexture = desaturateTexture(baseTexture);
+        if (fallbackTexture) {
+          desaturatedTextures.set(mesh.userData.tileId, {
+            source: baseTexture,
+            texture: fallbackTexture,
+          });
+        } else {
+          desaturatedTextures.delete(mesh.userData.tileId);
+        }
+      }
+    }
+    const presentationTexture = classifierTexture ?? fallbackTexture;
+    let needsUpdate = false;
+    if (mesh.material.map !== presentationTexture) {
+      mesh.material.map = presentationTexture;
+      needsUpdate = true;
+    }
+    const useFallbackColors = !presentationTexture;
+    if (useFallbackColors) {
+      needsUpdate = selectVertexColors(mesh, mesh.userData?.classifierColorAttribute) || needsUpdate;
+    }
+    if (mesh.material.vertexColors !== useFallbackColors) {
+      mesh.material.vertexColors = useFallbackColors;
+      needsUpdate = true;
+    }
+    mesh.material.color.set(0xffffff);
+    if (needsUpdate) mesh.material.needsUpdate = true;
+    onMutated();
+  }
 
   function applyMaterial(mesh, texture) {
     if (!mesh?.material) return;
+    mesh.userData.terrainBaseTexture = texture ?? null;
+    if (classifierMode) {
+      applyClassifierPresentation(mesh);
+      return;
+    }
     let needsUpdate = false;
     const resolvedTexture = texture;
-    if (resolvedTexture && mesh.material.map !== resolvedTexture) {
+    if (mesh.material.map !== resolvedTexture) {
       mesh.material.map = resolvedTexture;
       needsUpdate = true;
     }
-    if (!resolvedTexture && renderBackend?.prepareUntexturedTerrain) {
-      renderBackend.prepareUntexturedTerrain(mesh);
+    if (!resolvedTexture) {
+      needsUpdate = selectVertexColors(mesh, mesh.userData?.terrainColorAttribute) || needsUpdate;
+      if (renderBackend?.prepareUntexturedTerrain) {
+        renderBackend.prepareUntexturedTerrain(mesh);
+        return;
+      }
+      if (!mesh.material.vertexColors) {
+        mesh.material.vertexColors = true;
+        needsUpdate = true;
+      }
+      mesh.material.color.set(0xffffff);
+      if (needsUpdate) {
+        mesh.material.needsUpdate = true;
+        onMutated();
+      }
       return;
     }
     if (mesh.material.vertexColors) {
@@ -533,6 +638,7 @@ export function createTerrainTileSet({
 
   function prepareUntexturedMesh(mesh) {
     renderBackend?.prepareUntexturedTerrain?.(mesh);
+    if (classifierMode) applyClassifierPresentation(mesh);
   }
   const lifecycle = createTileLifecycle({
     terrainRoot, disposeScatter: disposeTileScatter, log, onSceneMutated: onMutated,
@@ -586,6 +692,11 @@ export function createTerrainTileSet({
       onDiff,
     });
     currentTileIds = result.nextTileIds;
+    for (const [tileId, cached] of desaturatedTextures) {
+      if (currentTileIds.has(tileId)) continue;
+      cached.texture?.dispose?.();
+      desaturatedTextures.delete(tileId);
+    }
     return result;
   }
 
@@ -612,22 +723,52 @@ export function createTerrainTileSet({
     textureStreamer.invalidate(tileId);
     const mesh = terrainRoot.children.find(child => child.userData?.tileId === tileId);
     if (!mesh) return false;
-    mesh.material.map?.dispose?.();
-    mesh.material.map = null;
-    mesh.material.color.set(mesh.userData.debugColor || 0x888888);
-    mesh.material.needsUpdate = true;
-    onMutated();
+    desaturatedTextures.get(tileId)?.texture?.dispose?.();
+    desaturatedTextures.delete(tileId);
+    mesh.userData.terrainBaseTexture?.dispose?.();
+    mesh.userData.terrainBaseTexture = null;
+    applyMaterial(mesh, null);
     return true;
+  }
+
+  function setClassifierMode(enabled) {
+    const next = Boolean(enabled);
+    if (classifierMode === next) return classifierMode;
+    classifierMode = next;
+    for (const mesh of terrainRoot.children) {
+      if (!mesh.isMesh || !mesh.userData?.tileId) continue;
+      if (classifierMode) {
+        applyClassifierPresentation(mesh);
+      } else {
+        const baseTexture = mesh.userData.terrainBaseTexture
+          ?? textureStreamer.texCache.get(mesh.userData.tileId)
+          ?? null;
+        applyMaterial(mesh, baseTexture);
+      }
+    }
+    return classifierMode;
+  }
+
+  function setClassifierTexture(tileId, texture) {
+    if (texture) classifierTextures.set(tileId, texture);
+    else classifierTextures.delete(tileId);
+    const mesh = terrainRoot.children.find(
+      child => child.isMesh && child.userData?.tileId === tileId,
+    );
+    if (classifierMode && mesh) applyClassifierPresentation(mesh);
   }
 
   return {
     get currentTileIds() { return currentTileIds; },
+    get classifierMode() { return classifierMode; },
     deferredTiles,
     reconcile,
     updateTextures,
     refreshTextures,
     applyEnhancedTexture,
     discardEnhancedTexture,
+    setClassifierMode,
+    setClassifierTexture,
     resetTextureApplications: updateTextureDemand.reset,
   };
 }
