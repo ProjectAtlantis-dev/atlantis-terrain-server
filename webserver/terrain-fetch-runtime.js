@@ -1,7 +1,7 @@
 import {
   adoptTerrainOrigin, buildTerrainTilesRequest, offsetTerrainPayload,
   selectTerrainFrameOffset, summarizeTerrainResponse,
-  summarizeTerrainCamera, terrainCameraCoordinates,
+  summarizeTerrainCamera, terrainCameraCoordinates, terrainCameraGridPosition,
   terrainCameraStereoPosition, terrainPipelineStatus,
 } from './terrain-tile-fetch.js';
 import { priorityHeading } from './terrain-priority.js';
@@ -64,6 +64,16 @@ export function createTerrainFetchRuntime({
     const started = now();
     const cameraCoordinates = getCameraCoordinates();
     const cameraSnapshot = getCameraSnapshot(cameraCoordinates);
+    const gridPosition = state.frameOffsetReady
+      ? terrainCameraGridPosition({
+          eastM: cameraCoordinates.eastM,
+          northM: cameraCoordinates.northM,
+          originX: state.originX,
+          originY: state.originY,
+          frameOffsetX: state.frameOffsetX,
+          frameOffsetY: state.frameOffsetY,
+        })
+      : null;
     const request = buildTerrainTilesRequest({
       lat: lat ?? cameraCoordinates.lat,
       lon: lon ?? cameraCoordinates.lon,
@@ -78,6 +88,7 @@ export function createTerrainFetchRuntime({
       previewMaxDepth, isFirstLoad: state.firstLoad,
       frameOffsetReady: state.frameOffsetReady,
       originX: state.originX, originY: state.originY,
+      queryX: gridPosition?.x, queryY: gridPosition?.y,
       cameraSnapshot,
     });
     logger.enqueue('info', `fetchTiles.request[pass${pass}]`, request.logDetails);
@@ -145,14 +156,8 @@ export function createTerrainFetchRuntime({
     state.lastTiles = data.tiles;
     onResponseApplied();
 
-    const currentCamera = getCameraCoordinates();
-    const stereo = terrainCameraStereoPosition({
-      latitude: currentCamera.lat, longitude: currentCamera.lon,
-      anchorLatitude: view.anchorLatitude, anchorLongitude: view.anchorLongitude,
-      originX: state.originX, originY: state.originY,
-    });
-    state.cameraStereoX = state.lastFetchX = stereo.x;
-    state.cameraStereoY = state.lastFetchY = stereo.y;
+    state.cameraStereoX = state.lastFetchX = data.qx;
+    state.cameraStereoY = state.lastFetchY = data.qy;
     const pipeline = terrainPipelineStatus(data, wasFirstLoad);
     state.heightmapsMissing = pipeline.missing;
     state.heightmapsDownloading = pipeline.downloading;

@@ -24,7 +24,7 @@ import { stepVehicleDrive } from './terrain-vehicle.js';
 import { createTerrainVehicleRuntime } from './terrain-vehicle-runtime.js';
 import { createTileHistory, terrainFogDistance, tileDepthFromId } from './terrain-tile-runtime.js';
 import { createTextureStreamer, rendererTextureAnisotropy } from './terrain-texture-streamer.js';
-import { evaluateTerrainRefetch, summarizeTerrainCamera, terrainCameraCoordinates, terrainCameraStereoPosition } from './terrain-tile-fetch.js';
+import { evaluateTerrainRefetch, summarizeTerrainCamera, terrainCameraCoordinates, terrainCameraGridPosition, terrainCameraStereoPosition } from './terrain-tile-fetch.js';
 import { createTerrainEnhancementController } from './terrain-enhancement-controller.js';
 import { applyTerrainAvailabilityStatus, createTerrainSeamStatusController } from './terrain-status-controller.js';
 import { collectTerrainDebugMeshes, createTerrainHoverOutlineController, createTerrainOutlineController, summarizeTerrainMesh } from './terrain-debug-runtime.js';
@@ -1787,14 +1787,21 @@ function render() {
 
   // Terrain streaming: check if camera moved far enough to re-fetch
   if (!terrainPipelineState.firstLoad) {
-    const camLL = getCameraLatLon();
-    const stereo = terrainCameraStereoPosition({
-      latitude: camLL.lat, longitude: camLL.lon,
+    const coordinates = terrainCameraCoordinates({
+      position: camera.position, anchorPosition, east, north, up,
       anchorLatitude: anchorLat, anchorLongitude: anchorLon,
       originX: terrainPipelineState.originX, originY: terrainPipelineState.originY,
     });
-    terrainPipelineState.cameraStereoX = stereo.x;
-    terrainPipelineState.cameraStereoY = stereo.y;
+    const gridPosition = terrainCameraGridPosition({
+      eastM: coordinates.eastM,
+      northM: coordinates.northM,
+      originX: terrainPipelineState.originX,
+      originY: terrainPipelineState.originY,
+      frameOffsetX: terrainPipelineState.frameOffsetX,
+      frameOffsetY: terrainPipelineState.frameOffsetY,
+    });
+    terrainPipelineState.cameraStereoX = gridPosition.x;
+    terrainPipelineState.cameraStereoY = gridPosition.y;
     const refetch = evaluateTerrainRefetch({
       cameraX: terrainPipelineState.cameraStereoX, cameraY: terrainPipelineState.cameraStereoY,
       lastFetchX: terrainPipelineState.lastFetchX, lastFetchY: terrainPipelineState.lastFetchY,

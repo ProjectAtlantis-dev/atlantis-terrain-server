@@ -38,6 +38,8 @@ export function createTileLifecycle({
     if (!mesh) return;
     terrainRoot.remove(mesh);
     disposeScatter(mesh);
+    mesh.userData?.terrainPlaceholderTexture?.dispose?.();
+    if (mesh.userData) delete mesh.userData.terrainPlaceholderTexture;
     mesh.geometry?.dispose();
     if (Array.isArray(mesh.material)) {
       for (const material of mesh.material) material?.dispose?.();
@@ -220,11 +222,39 @@ export function createTerrainTextureController({
   let desiredTileIds = new Set();
 
   function applyTexture(mesh, tile, texture) {
+    const placeholderTexture = mesh.userData?.terrainPlaceholderTexture;
+    if (mesh.userData) delete mesh.userData.terrainPlaceholderTexture;
     const rebuilt = meshRuntime.rebuildWithTexture(mesh, tile, texture);
     applyMaterial(rebuilt, texture);
     rebuilt.userData.waterMask = getWaterMask(tile.id) || null;
+    if (placeholderTexture && placeholderTexture !== texture) placeholderTexture.dispose?.();
     onMaterialApplied(rebuilt);
     return rebuilt;
+  }
+
+  function applyPlaceholder(tile, texture) {
+    if (!desiredTileIds.has(tile.id)) {
+      texture.dispose?.();
+      return;
+    }
+    let mesh;
+    if (deferredTiles.has(tile.id)) {
+      mesh = meshRuntime.materialize(tile.id, texture);
+    } else {
+      mesh = findMesh(tile.id);
+      if (mesh) {
+        const previousPlaceholder = mesh.userData?.terrainPlaceholderTexture;
+        applyMaterial(mesh, texture);
+        if (previousPlaceholder && previousPlaceholder !== texture) previousPlaceholder.dispose?.();
+      }
+    }
+    if (!mesh) {
+      texture.dispose?.();
+      return;
+    }
+    mesh.userData.terrainPlaceholderTexture = texture;
+    onMaterialApplied(mesh);
+    lifecycle.evictCoveredAncestors(tile.id);
   }
 
   function drainApplications() {
@@ -307,12 +337,7 @@ export function createTerrainTextureController({
 
     textureStreamer.pump(scored, {
       isCovered: () => false,
-      onPlaceholder: ({ tileId, texture }) => {
-        const mesh = findMesh(tileId);
-        if (!mesh) return;
-        applyMaterial(mesh, texture);
-        onMaterialApplied(mesh);
-      },
+      onPlaceholder: ({ tile, texture }) => applyPlaceholder(tile, texture),
       onTexture: ({ tile, texture }) => enqueueApplication(tile, texture, true),
     });
     lifecycle.sweepStaleParents(tiles, tileIds);

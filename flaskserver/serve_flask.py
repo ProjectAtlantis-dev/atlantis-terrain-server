@@ -993,7 +993,7 @@ def api_tiles():
     return unavailable
 
   error = _arg_float("error", 0.0005)
-  max_depth = _arg_int("maxDepth", 13)
+  max_depth = min(_arg_int("maxDepth", ENHANCE_DEPTH), ENHANCE_DEPTH)
   max_range = _arg_float("range", 16000.0)
 
   if "sx" in request.args and "sy" in request.args:
@@ -1597,7 +1597,12 @@ def api_heatmap():
   qy = _arg_float("qy", cam["qy"])
   alt = _arg_float("alt", cam["alt"])
   heading = _arg_float("heading", cam["heading"])
-  max_depth = _arg_int("maxDepth", int(cam["maxDepth"]))
+  # This is a diagnostic view of the terrain traversal, not a speculative
+  # quadtree. Never advertise leaves deeper than the renderer can request.
+  max_depth = min(
+    _arg_int("maxDepth", int(cam["maxDepth"])),
+    ENHANCE_DEPTH,
+  )
   lod_factor = _arg_float("lod", 2.0)
 
   root = build_lod_tree(qx, qy, max_depth=max_depth, lod_factor=lod_factor)

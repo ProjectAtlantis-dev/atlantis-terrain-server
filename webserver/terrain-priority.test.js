@@ -42,6 +42,7 @@ import {
   summarizeTerrainCamera,
   summarizeTerrainResponse,
   terrainCameraCoordinates,
+  terrainCameraGridPosition,
   terrainCameraStereoPosition,
   terrainPipelineStatus,
 } from './terrain-tile-fetch.js';
@@ -473,6 +474,7 @@ test('terrain preview request preserves boot frame semantics', () => {
   assert.deepEqual(request.logDetails, {
     pass: 1, passLabel: 'preview', isFirstLoad: true,
     requestLat: 64.1, requestLon: -51.2, requestAltM: 120,
+    requestGridX: null, requestGridY: null,
     headingRad: 0.5, maxDepth: 10, camEastM: 3,
   });
 });
@@ -482,8 +484,9 @@ test('terrain full request reuses a restored frame', () => {
     lat: 64, lon: -51, altitude: 50, heading: 0, range: 40000,
     pass: 2, previewMaxDepth: 10, isFirstLoad: true,
     frameOffsetReady: true, originX: -12.5, originY: 99.25,
+    queryX: 123.5, queryY: -456.25,
   });
-  assert.equal(request.url, '/api/tiles?lat=64&lon=-51&alt=50&heading=0&range=40000&ox=-12.5&oy=99.25');
+  assert.equal(request.url, '/api/tiles?sx=123.5&sy=-456.25&alt=50&heading=0&range=40000&ox=-12.5&oy=99.25');
   assert.equal(request.logDetails.maxDepth, null);
 });
 
@@ -649,6 +652,11 @@ test('terrain origin and pipeline decisions preserve two-pass behavior', () => {
     latitude: 64, longitude: -51, anchorLatitude: 64, anchorLongitude: -51,
     originX: 12, originY: 34,
   }), { x: 12, y: 34 });
+  assert.deepEqual(terrainCameraGridPosition({
+    eastM: 16009.6, northM: -11162.2,
+    originX: -335838.3, originY: -2826817.5,
+    frameOffsetX: -2600, frameOffsetY: -3600,
+  }), { x: -317228.7, y: -2834379.7 });
 });
 
 test('shared terrain refetch decision enforces distance and trigger interval', () => {
@@ -848,6 +856,64 @@ test('shared texture controller discards late arrivals outside current heatmap d
   assert.equal(textureCache.has('late'), false);
   assert.equal(textureSource.has('late'), false);
   assert.equal(disposed, 1);
+});
+
+test('ancestor crops materialize deferred child slots and yield to exact textures', () => {
+  const tile = { id: '12-2-2', bbox: [0, 0, 1, 1] };
+  const deferredTiles = new Map([[tile.id, tile]]);
+  const terrainRoot = { children: [] };
+  const textureCache = new Map();
+  const frames = [];
+  let callbacks;
+  let ancestorEvictions = 0;
+  const placeholder = {
+    disposed: false,
+    dispose() { this.disposed = true; },
+  };
+  const exact = {};
+  const applyMaterial = (mesh, texture) => { mesh.material.map = texture; };
+  const controller = createTerrainTextureController({
+    terrainRoot,
+    deferredTiles,
+    textureStreamer: {
+      texCache: textureCache,
+      texSource: new Map(),
+      requestWaterMask() {},
+      pump(_scored, nextCallbacks) { callbacks = nextCallbacks; },
+    },
+    meshRuntime: {
+      materialize(tileId, texture) {
+        const mesh = { userData: { tileId }, material: { map: texture } };
+        deferredTiles.delete(tileId);
+        terrainRoot.children.push(mesh);
+        return mesh;
+      },
+      rebuildWithTexture: mesh => mesh,
+    },
+    lifecycle: {
+      evictCoveredAncestors() { ancestorEvictions += 1; },
+      sweepStaleParents() {},
+    },
+    priorityForTile: () => 0,
+    getVisibilityDistance: () => 1000,
+    applyMaterial,
+    getWaterMask: () => null,
+    log() {},
+    scheduleFrame: callback => frames.push(callback),
+  });
+
+  controller([tile]);
+  callbacks.onPlaceholder({ tileId: tile.id, tile, texture: placeholder });
+  assert.equal(deferredTiles.has(tile.id), false);
+  assert.equal(terrainRoot.children[0].material.map, placeholder);
+  assert.equal(ancestorEvictions, 1);
+
+  textureCache.set(tile.id, exact);
+  callbacks.onTexture({ tileId: tile.id, tile, texture: exact });
+  frames.shift()();
+  assert.equal(terrainRoot.children[0].material.map, exact);
+  assert.equal(placeholder.disposed, true);
+  assert.equal(terrainRoot.children[0].userData.terrainPlaceholderTexture, undefined);
 });
 
 test('shared enhancement controller tracks 202 pending and 429 backoff', () => {

@@ -10,10 +10,16 @@ export function buildTerrainTilesRequest({
   frameOffsetReady,
   originX,
   originY,
+  queryX,
+  queryY,
   cameraSnapshot = {},
 }) {
   const preview = pass === 1;
-  let url = `/api/tiles?lat=${lat}&lon=${lon}&alt=${altitude}&heading=${heading}&range=${range}`;
+  const hasGridPosition = Number.isFinite(queryX) && Number.isFinite(queryY);
+  const positionQuery = hasGridPosition
+    ? `sx=${queryX}&sy=${queryY}`
+    : `lat=${lat}&lon=${lon}`;
+  let url = `/api/tiles?${positionQuery}&alt=${altitude}&heading=${heading}&range=${range}`;
   if (preview) url += `&maxDepth=${previewMaxDepth}`;
   if (!isFirstLoad || frameOffsetReady) url += `&ox=${originX}&oy=${originY}`;
   return {
@@ -24,6 +30,8 @@ export function buildTerrainTilesRequest({
       isFirstLoad,
       requestLat: lat,
       requestLon: lon,
+      requestGridX: hasGridPosition ? queryX : null,
+      requestGridY: hasGridPosition ? queryY : null,
       requestAltM: altitude,
       headingRad: heading,
       maxDepth: preview ? previewMaxDepth : null,
@@ -135,6 +143,16 @@ export function terrainCameraStereoPosition({
   return {
     x: originX + (longitude - anchorLongitude) * 111320 * Math.cos(anchorLatitude * Math.PI / 180),
     y: originY + (latitude - anchorLatitude) * 111320,
+  };
+}
+
+/** Map a local scene position back into the EPSG grid used by tile bboxes. */
+export function terrainCameraGridPosition({
+  eastM, northM, originX, originY, frameOffsetX, frameOffsetY,
+}) {
+  return {
+    x: originX + eastM - frameOffsetX,
+    y: originY + northM - frameOffsetY,
   };
 }
 
