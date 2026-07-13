@@ -52,6 +52,7 @@ import { createTerrainAtmosphereTextureRuntime } from './terrain-atmosphere-text
 import { createTerrainTuningControls } from './terrain-tuning-controls.js';
 import { bindTerrainCloudComposition, configureTerrainClouds, registerTerrainCloudTuning } from './terrain-cloud-runtime.js';
 import { createTerrainHouseSceneRuntime } from './terrain-house-scene-runtime.js';
+import { createTerrainTileMenuRuntime } from './terrain-tile-menu-runtime.js';
 
 // The main view is controlled entirely through its UI. Discard stale query
 // parameters instead of exposing URL state that does not stay in sync.
@@ -271,223 +272,20 @@ tileInfoEl.style.cssText = [
 ].join(';');
 document.body.appendChild(tileInfoEl);
 
-// --- Tile context menu (map mode) ---
-const tileMenuEl = document.createElement('div');
-tileMenuEl.style.cssText = [
-  'position:absolute', 'display:none', 'z-index:20',
-  'background:rgba(0,0,0,0.9)', 'border:1px solid #555', 'border-radius:6px',
-  'padding:4px 0', 'min-width:180px',
-  'font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace',
-  'color:#fff', 'cursor:default'
-].join(';');
-document.body.appendChild(tileMenuEl);
-
-// --- Enhance prompt dialog ---
-let enhanceDialogEl = document.getElementById('enhance-dialog');
-if (!enhanceDialogEl) {
-  enhanceDialogEl = document.createElement('div');
-  enhanceDialogEl.id = 'enhance-dialog';
-  enhanceDialogEl.style.cssText = [
-    'position:fixed', 'display:none', 'z-index:30',
-    'top:50%', 'left:50%', 'transform:translate(-50%,-50%)',
-    'background:rgba(0,0,0,0.95)', 'border:1px solid #555', 'border-radius:8px',
-    'padding:16px', 'min-width:400px',
-    'font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace',
-    'color:#fff'
-  ].join(';');
-  document.body.appendChild(enhanceDialogEl);
-}
-
-const ENHANCE_DEFAULT_POSITIVE = 'sharpen details on this satellite photo of some mountaineous terrain, high resolution aerial orthophoto';
-const ENHANCE_DEFAULT_NEGATIVE = 'bad quality, blurry, messy, lowres, artifacts, flat, oversaturated, boring, trees, haze';
-
-// Single delegated click handler — survives innerHTML rebuilds and HMR
-enhanceDialogEl.addEventListener('click', (e) => {
-  const btn = e.target.closest('[data-action="enhance-submit"]');
-  if (!btn) return;
-  const tid = btn.dataset.tileId;
-  const posTA = enhanceDialogEl.querySelector('[data-role="pos-prompt"]');
-  const negTA = enhanceDialogEl.querySelector('[data-role="neg-prompt"]');
-  if (!tid || !posTA || !negTA) return;
-  enhanceDialogEl.style.display = 'none';
-  localStorage.setItem('enhance_positive_prompt', posTA.value);
-  localStorage.setItem('enhance_negative_prompt', negTA.value);
-  enhancementController.submit(tid, {
-    positive_prompt: posTA.value,
-    negative_prompt: negTA.value,
-  });
+const tileMenuRuntime = createTerrainTileMenuRuntime({
+  controls, tileInfoElement: tileInfoEl, getTerrainRoot: () => terrainRoot,
+  getOceanEnabled: () => oceanMapDebugEnabled,
+  toggleOcean: () => { oceanMapDebugEnabled = !oceanMapDebugEnabled; },
+  getBathyEnabled: () => bathyFixDebugEnabled,
+  toggleBathy: () => { bathyFixDebugEnabled = !bathyFixDebugEnabled; },
+  refreshTextures: () => { if (lastTiles) updateTextures(lastTiles); },
+  submitEnhancement: (tileId, options) => enhancementController.submit(tileId, options),
+  getTextureStreamer: () => textureStreamer,
+  onEnhancedDiscarded: streamer => { _lastEnhancedKey = ''; _texV = streamer.version; },
 });
-
-function showEnhanceDialog(tileId) {
-  enhanceDialogEl.innerHTML = '';
-
-  const title = document.createElement('div');
-  title.style.cssText = 'font-size:14px;font-weight:bold;margin-bottom:12px';
-  title.textContent = `Enhance ${tileId}`;
-  enhanceDialogEl.appendChild(title);
-
-  const mkLabel = (text) => {
-    const lbl = document.createElement('div');
-    lbl.style.cssText = 'color:#aaa;font-size:11px;margin-bottom:4px';
-    lbl.textContent = text;
-    return lbl;
-  };
-  const mkTextarea = (value) => {
-    const ta = document.createElement('textarea');
-    ta.style.cssText = 'width:100%;height:60px;background:#1a1a1a;color:#fff;border:1px solid #444;border-radius:4px;padding:6px;font:12px/1.4 inherit;resize:vertical;box-sizing:border-box;margin-bottom:10px';
-    ta.value = value;
-    return ta;
-  };
-
-  enhanceDialogEl.appendChild(mkLabel('Positive prompt'));
-  const posTA = mkTextarea(localStorage.getItem('enhance_positive_prompt') ?? ENHANCE_DEFAULT_POSITIVE);
-  posTA.dataset.role = 'pos-prompt';
-  enhanceDialogEl.appendChild(posTA);
-
-  enhanceDialogEl.appendChild(mkLabel('Negative prompt'));
-  const negTA = mkTextarea(localStorage.getItem('enhance_negative_prompt') ?? ENHANCE_DEFAULT_NEGATIVE);
-  negTA.dataset.role = 'neg-prompt';
-  enhanceDialogEl.appendChild(negTA);
-
-  const btnRow = document.createElement('div');
-  btnRow.style.cssText = 'display:flex;gap:8px;justify-content:flex-end;margin-top:4px';
-
-  const cancelBtn = document.createElement('button');
-  cancelBtn.style.cssText = 'padding:6px 14px;background:#333;color:#ccc;border:1px solid #555;border-radius:4px;cursor:pointer;font:inherit';
-  cancelBtn.textContent = 'Cancel';
-  cancelBtn.addEventListener('click', () => { enhanceDialogEl.style.display = 'none'; });
-
-  const submitBtn = document.createElement('button');
-  submitBtn.style.cssText = 'padding:6px 14px;background:#2a6;color:#fff;border:none;border-radius:4px;cursor:pointer;font:inherit;font-weight:bold';
-  submitBtn.textContent = 'Enhance';
-  submitBtn.dataset.action = 'enhance-submit';
-  submitBtn.dataset.tileId = tileId;
-
-  btnRow.appendChild(cancelBtn);
-  btnRow.appendChild(submitBtn);
-  enhanceDialogEl.appendChild(btnRow);
-
-  enhanceDialogEl.style.display = 'block';
-  // Clear any stuck keys so camera movement doesn't abort the enhance
-  for (const k of Object.keys(controls.keys)) controls.keys[k] = false;
-  posTA.focus();
-}
-
-function showTileMenu(x, y, tileId, source) {
-  tileMenuEl.innerHTML = '';
-  const header = document.createElement('div');
-  header.style.cssText = 'padding:4px 12px;color:#aaa;font-size:11px;border-bottom:1px solid #444';
-  header.textContent = tileId;
-  tileMenuEl.appendChild(header);
-
-  if (controls.mapMode) {
-    const oceanToggleBtn = document.createElement('div');
-    oceanToggleBtn.style.cssText = 'padding:6px 12px;cursor:pointer';
-    oceanToggleBtn.textContent = `Ocean Overlay: ${oceanMapDebugEnabled ? 'ON' : 'OFF'}`;
-    oceanToggleBtn.addEventListener('mouseenter', () => oceanToggleBtn.style.background = 'rgba(255,255,255,0.15)');
-    oceanToggleBtn.addEventListener('mouseleave', () => oceanToggleBtn.style.background = 'none');
-    oceanToggleBtn.addEventListener('click', () => {
-      oceanMapDebugEnabled = !oceanMapDebugEnabled;
-      hideTileMenu();
-      if (lastTiles) {
-        updateTextures(lastTiles);
-      }
-    });
-    tileMenuEl.appendChild(oceanToggleBtn);
-
-    const bathyToggleBtn = document.createElement('div');
-    bathyToggleBtn.style.cssText = 'padding:6px 12px;cursor:pointer';
-    bathyToggleBtn.textContent = `Flatten Overlay: ${bathyFixDebugEnabled ? 'ON' : 'OFF'}`;
-    bathyToggleBtn.addEventListener('mouseenter', () => bathyToggleBtn.style.background = 'rgba(255,255,255,0.15)');
-    bathyToggleBtn.addEventListener('mouseleave', () => bathyToggleBtn.style.background = 'none');
-    bathyToggleBtn.addEventListener('click', () => {
-      bathyFixDebugEnabled = !bathyFixDebugEnabled;
-      hideTileMenu();
-      if (lastTiles) {
-        updateTextures(lastTiles);
-      }
-    });
-    tileMenuEl.appendChild(bathyToggleBtn);
-  }
-
-  // Per-tile pipeline X-ray (pipeline.html: heightmap → texture → google →
-  // buckets → procgen)
-  const compareBtn = document.createElement('div');
-  compareBtn.style.cssText = 'padding:6px 12px;cursor:pointer';
-  compareBtn.textContent = 'Tile inspector';
-  compareBtn.addEventListener('mouseenter', () => compareBtn.style.background = 'rgba(255,255,255,0.15)');
-  compareBtn.addEventListener('mouseleave', () => compareBtn.style.background = 'none');
-  compareBtn.addEventListener('click', () => {
-    hideTileMenu();
-    window.open(`/pipeline.html?tile=${tileId}`, '_blank');
-  });
-  tileMenuEl.appendChild(compareBtn);
-
-  const isEnhanced = source && (source.includes('enhanced') || source === 'upscaled');
-
-  if (isEnhanced) {
-    // Discard enhanced texture — reverts to the original source
-    const regenBtn = document.createElement('div');
-    regenBtn.style.cssText = 'padding:6px 12px;cursor:pointer';
-    regenBtn.textContent = 'Discard';
-    regenBtn.addEventListener('mouseenter', () => regenBtn.style.background = 'rgba(255,255,255,0.15)');
-    regenBtn.addEventListener('mouseleave', () => regenBtn.style.background = 'none');
-    regenBtn.addEventListener('click', () => {
-      hideTileMenu();
-      fetch(`/api/texture/${tileId}/discard_enhanced`, { method: 'POST' })
-        .then(r => r.json())
-        .then(data => {
-          if (data.ok) {
-            textureStreamer.invalidate(tileId);
-            _lastEnhancedKey = '';
-            _texV = textureStreamer.version;
-            for (const child of terrainRoot.children) {
-              if (child.userData.tileId === tileId) {
-                if (child.material.map) {
-                  child.material.map.dispose();
-                  child.material.map = null;
-                }
-                child.material.color.set(child.userData.debugColor || 0x888888);
-                child.material.needsUpdate = true;
-                break;
-              }
-            }
-          } else {
-            console.warn(`[DISCARD] ${tileId}:`, data.error);
-          }
-        })
-        .catch(err => console.error(`[DISCARD] ${tileId}:`, err));
-    });
-    tileMenuEl.appendChild(regenBtn);
-  } else if (source && (source === 'sentinel2' || source === 'dataforsyningen')) {
-    // Enhance — opt-in upscaling for eligible non-enhanced tiles
-    const enhBtn = document.createElement('div');
-    enhBtn.style.cssText = 'padding:6px 12px;cursor:pointer';
-    enhBtn.textContent = 'Enhance';
-    enhBtn.addEventListener('mouseenter', () => enhBtn.style.background = 'rgba(255,255,255,0.15)');
-    enhBtn.addEventListener('mouseleave', () => enhBtn.style.background = 'none');
-    enhBtn.addEventListener('click', () => {
-      hideTileMenu();
-      showEnhanceDialog(tileId);
-    });
-    tileMenuEl.appendChild(enhBtn);
-  }
-
-  if (!isEnhanced && !source) {
-    const note = document.createElement('div');
-    note.style.cssText = 'padding:6px 12px;color:#888;font-style:italic';
-    note.textContent = 'no texture';
-    tileMenuEl.appendChild(note);
-  }
-
-  tileMenuEl.style.left = x + 'px';
-  tileMenuEl.style.top = y + 'px';
-  tileMenuEl.style.display = 'block';
-}
-
-function hideTileMenu() { tileMenuEl.style.display = 'none'; tileInfoEl.style.display = 'none'; }
-document.addEventListener('click', e => { if (!tileMenuEl.contains(e.target)) hideTileMenu(); });
-document.addEventListener('mousedown', e => { if (enhanceDialogEl.style.display !== 'none' && !enhanceDialogEl.contains(e.target)) enhanceDialogEl.style.display = 'none'; });
+const showEnhanceDialog = tileMenuRuntime.showEnhance;
+const showTileMenu = tileMenuRuntime.show;
+const hideTileMenu = tileMenuRuntime.hide;
 
 // --- Atmosphere / Clouds tuning panel ---
 const tuningPanel = document.createElement('div');
