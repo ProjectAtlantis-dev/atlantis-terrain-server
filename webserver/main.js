@@ -1,2 +1,3 @@
-globalThis.__TERRAIN_BACKEND__ = 'webgl';
-await import('./terrain-application.js');
+import { startTerrainApplication } from './terrain-application.js';
+
+await startTerrainApplication({ backend: 'webgl' });

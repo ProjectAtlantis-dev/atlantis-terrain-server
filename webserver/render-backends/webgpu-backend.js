@@ -1,5 +1,7 @@
 import * as THREE from 'three';
 import { WebGPURenderer } from 'three/webgpu';
+import { color, densityFogFactor, fog, uniform } from 'three/tsl';
+import { NormalPass } from 'postprocessing';
 
 /**
  * Create the WebGPU renderer adapter used by the shared terrain application.
@@ -46,6 +48,13 @@ export function createWebGPUTerrainBackend({
     get sceneMutationVersion() { return sceneMutationVersion; },
     setComposer(nextComposer) { composer = nextComposer; },
     setPostProcessing(nextPostProcessing) { postProcessing = nextPostProcessing; },
+    createNormalPass(scene, camera) { return new NormalPass(scene, camera); },
+    configureFog(scene) {
+      const density = uniform(0).setName('webgpuDistanceFogDensity');
+      scene.fog = null;
+      scene.fogNode = fog(color(0x000000), densityFogFactor(density));
+      return density;
+    },
     prepareAerialPerspective() {},
     async initialize() {
       try {

@@ -46,6 +46,7 @@ export function createWebGLTerrainBackend({
     createNormalPass(scene, camera) {
       return new NormalPass(scene, camera);
     },
+    configureFog() { return { value: 0 }; },
     prepareAerialPerspective(aerialPerspective) {
       // IMPORTANT — verified visual regression fix:
       // postprocessing decodes logarithmic depth in readDepth(), while the

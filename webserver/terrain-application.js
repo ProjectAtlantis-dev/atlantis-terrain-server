@@ -1,15 +1,6 @@
 // UX WIP scene: preserve baseline rendering, layer in map mode + movement + HUD.
 import * as THREE from 'three';
 import {
-  color,
-  densityFogFactor,
-  fog,
-  uniform
-} from 'three/tsl';
-import {
-  NormalPass
-} from 'postprocessing';
-import {
   AerialPerspectiveEffect,
   DEFAULT_PRECOMPUTED_TEXTURES_URL,
   getSunDirectionECEF,
@@ -53,12 +44,19 @@ import { createTerrainTuningControls } from './terrain-tuning-controls.js';
 import { bindTerrainCloudComposition, configureTerrainClouds, registerTerrainCloudTuning } from './terrain-cloud-runtime.js';
 import { createTerrainHouseSceneRuntime } from './terrain-house-scene-runtime.js';
 import { createTerrainTileMenuRuntime } from './terrain-tile-menu-runtime.js';
-import { createWebGPUTerrainBackend } from './render-backends/webgpu-backend.js';
-import { createWebGPUAtmosphereController } from './render-backends/webgpu-atmosphere.js';
-import { createWebGLTerrainBackend } from './render-backends/webgl-backend.js';
 import { createTerrainBathymetryOverlay } from './terrain-bathymetry-overlay.js';
 
-const USE_WEBGPU_RENDER_BACKEND = globalThis.__TERRAIN_BACKEND__ === 'webgpu';
+export async function startTerrainApplication({ backend = 'webgl' } = {}) {
+if (backend !== 'webgl' && backend !== 'webgpu') {
+  throw new TypeError(`unsupported terrain backend: ${backend}`);
+}
+const USE_WEBGPU_RENDER_BACKEND = backend === 'webgpu';
+const backendModule = USE_WEBGPU_RENDER_BACKEND
+  ? await import('./render-backends/webgpu-backend.js')
+  : await import('./render-backends/webgl-backend.js');
+const atmosphereModule = USE_WEBGPU_RENDER_BACKEND
+  ? await import('./render-backends/webgpu-atmosphere.js')
+  : null;
 // Calibrated against the cloudless WebGL reference. WebGL uses exposure 10
 // after relative-luminance normalization; this pair gives the WebGPU AgX path
 // a comparable pre-tone-map scale without changing physical scattering.
@@ -161,11 +159,7 @@ const scene = new THREE.Scene();
 // Black fog — aerial perspective inscatter fills in the natural sky color at distance.
 scene.fog = new THREE.FogExp2(0x000000, 0.00009);
 const _sceneFog = scene.fog;
-const webgpuFogDensity = uniform(0).setName('webgpuDistanceFogDensity');
-if (USE_WEBGPU_RENDER_BACKEND) {
-  scene.fog = null;
-  scene.fogNode = fog(color(0x000000), densityFogFactor(webgpuFogDensity));
-}
+let webgpuFogDensity = null;
 const _mapBg = new THREE.Color(0x222222);
 
 // Geospatial scenes use a local ENU frame anchored at the target geodetic point.
@@ -238,21 +232,22 @@ controls.yaw = defaultYaw;
 controls.pitch = defaultPitch;
 
 const renderBackend = USE_WEBGPU_RENDER_BACKEND
-  ? createWebGPUTerrainBackend({
+  ? backendModule.createWebGPUTerrainBackend({
       width: window.innerWidth,
       height: window.innerHeight,
       pixelRatio: window.devicePixelRatio,
       toneMappingExposure: WEBGPU_TONE_MAPPING_EXPOSURE,
       bootLog,
     })
-  : createWebGLTerrainBackend({
+  : backendModule.createWebGLTerrainBackend({
       width: window.innerWidth,
       height: window.innerHeight,
       pixelRatio: window.devicePixelRatio,
       bootLog,
     });
+webgpuFogDensity = renderBackend.configureFog(scene);
 const webgpuAtmosphere = USE_WEBGPU_RENDER_BACKEND
-  ? createWebGPUAtmosphereController({
+  ? atmosphereModule.createWebGPUAtmosphereController({
       renderer: renderBackend.renderer, backend: renderBackend, scene, camera,
       anchor: anchorPosition, east, north, up, maxViewDistance: MAX_VIEW_DIST,
       settings: webgpuAtmosphereSettings,
@@ -794,9 +789,7 @@ const vehicleRuntime = createTerrainVehicleRuntime({
   applyCameraOrientation, fetchTiles, getSunDirection: () => sunDirection,
 });
 
-const normalPass = renderBackend.isWebGPU
-  ? new NormalPass(scene, camera)
-  : renderBackend.createNormalPass(scene, camera);
+const normalPass = renderBackend.createNormalPass(scene, camera);
 
 const cloudsEffect = new CloudsEffect(camera, { resolutionScale: 1 });
 const cloudsDefaults = configureTerrainClouds({
@@ -2209,3 +2202,4 @@ function render() {
 
 streamingMaintenanceTimer = window.setInterval(runStreamingMaintenance, STREAMING_MAINTENANCE_MS);
 startRenderLoop();
+}
