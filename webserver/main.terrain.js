@@ -1,14 +1,6 @@
 // UX WIP scene: preserve baseline rendering, layer in map mode + movement + HUD.
 import * as THREE from 'three';
 import {
-  EffectComposer,
-  EffectPass,
-  NormalPass,
-  RenderPass,
-  ToneMappingEffect,
-  ToneMappingMode
-} from 'postprocessing';
-import {
   AerialPerspectiveEffect,
   DEFAULT_PRECOMPUTED_TEXTURES_URL,
   getSunDirectionECEF,
@@ -21,7 +13,6 @@ import {
   LocalWeather,
   Turbulence
 } from '@takram/three-clouds';
-import { DitheringEffect } from './three-geospatial/packages/effects/src/index.ts';
 import { Ellipsoid, Geodetic, radians } from '@takram/three-geospatial';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { buildAssetLibrary } from './procgen/library.ts';
@@ -53,6 +44,7 @@ import { createTerrainTuningControls } from './terrain-tuning-controls.js';
 import { bindTerrainCloudComposition, configureTerrainClouds, registerTerrainCloudTuning } from './terrain-cloud-runtime.js';
 import { createTerrainHouseSceneRuntime } from './terrain-house-scene-runtime.js';
 import { createTerrainTileMenuRuntime } from './terrain-tile-menu-runtime.js';
+import { createWebGLTerrainBackend } from './render-backends/webgl-backend.js';
 
 // The main view is controlled entirely through its UI. Discard stale query
 // parameters instead of exposing URL state that does not stay in sync.
@@ -192,25 +184,13 @@ const defaultPitch = Math.asin(Math.max(-1, Math.min(1, initialForward.dot(up)))
 controls.yaw = defaultYaw;
 controls.pitch = defaultPitch;
 
-const renderer = new THREE.WebGLRenderer({
-  antialias: true,
-  depth: false,
-  logarithmicDepthBuffer: true
-});
-renderer.setSize(window.innerWidth, window.innerHeight);
-renderer.setPixelRatio(window.devicePixelRatio);
-renderer.shadowMap.enabled = true;
-renderer.shadowMap.type = THREE.PCFSoftShadowMap;
-renderer.shadowMap.autoUpdate = true;
-// Tone mapping is handled in post-processing; avoid applying it twice here.
-renderer.toneMapping = THREE.NoToneMapping;
-renderer.toneMappingExposure = 10;
-bootLog('renderer.ready', {
+const renderBackend = createWebGLTerrainBackend({
   width: window.innerWidth,
   height: window.innerHeight,
   pixelRatio: window.devicePixelRatio,
-  shadowMap: renderer.shadowMap.type
+  bootLog,
 });
+const renderer = renderBackend.renderer;
 document.body.appendChild(renderer.domElement);
 renderer.domElement.addEventListener('contextmenu', event => event.preventDefault());
 
@@ -664,7 +644,7 @@ const vehicleRuntime = createTerrainVehicleRuntime({
   applyCameraOrientation, fetchTiles, getSunDirection: () => sunDirection,
 });
 
-const normalPass = new NormalPass(scene, camera);
+const normalPass = renderBackend.createNormalPass(scene, camera);
 
 const cloudsEffect = new CloudsEffect(camera, { resolutionScale: 1 });
 const cloudsDefaults = configureTerrainClouds({
@@ -730,26 +710,12 @@ createTerrainAtmosphereTextureRuntime({
   bootLog,
 }).loadWithLocalCache();
 
-// MSAA on the composer — the renderer's antialias:true does nothing when
-// postprocessing renders to its own framebuffers. Without this, everything
-// (terrain, vehicle, mountains) gets zero anti-aliasing.
-const composer = new EffectComposer(renderer, {
-  frameBufferType: THREE.HalfFloatType,
-  multisampling: Math.min(4, renderer.capabilities.maxSamples)
-});
-composer.addPass(new RenderPass(scene, camera));
-composer.addPass(normalPass);
-// Keep clouds + atmosphere in one effect pass to avoid render-target feedback issues.
-composer.addPass(new EffectPass(camera, cloudsEffect, aerialPerspective));
-composer.addPass(
-  new EffectPass(
-    camera,
-    new ToneMappingEffect({ mode: ToneMappingMode.AGX }),
-    new DitheringEffect()
-  )
-);
-bootLog('composer.ready', {
-  passCount: composer.passes.length
+renderBackend.configureScenePipeline({
+  scene,
+  camera,
+  normalPass,
+  cloudsEffect,
+  aerialPerspective,
 });
 
 // --- Heightmap decode + mesh building (adapted for ENU frame) ---
@@ -1861,8 +1827,7 @@ renderer.domElement.addEventListener(
 window.addEventListener('resize', () => {
   camera.aspect = window.innerWidth / window.innerHeight;
   camera.updateProjectionMatrix();
-  renderer.setSize(window.innerWidth, window.innerHeight);
-  composer.setSize(window.innerWidth, window.innerHeight);
+  renderBackend.resize(window.innerWidth, window.innerHeight);
   updateMapCamera();
 });
 
@@ -1993,13 +1958,13 @@ function render() {
     vehicleRuntime.vehicleMarker.scale.setScalar(markerScale * vehicleRuntime.VEHICLE_MARKER_MAP_SCALE);
     scene.fog = null;
     scene.background = _mapBg;
-    renderer.render(scene, mapCam);
+    renderBackend.renderMap(scene, mapCam);
     scene.background = null;
     scene.fog = _sceneFog;
     return;
   }
   if (SCATTER_ENABLED && _scatterLib) updateScatterVisibility(terrainRoot, camera);
-  composer.render();
+  renderBackend.renderScene(scene, camera);
 }
 
-renderer.setAnimationLoop(render);
+renderBackend.setAnimationLoop(render);

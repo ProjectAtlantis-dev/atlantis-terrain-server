@@ -4,35 +4,17 @@ import {
   color,
   densityFogFactor,
   fog,
-  mrt,
-  normalView,
-  output,
-  pass,
   uniform
 } from 'three/tsl';
-import { PostProcessing, WebGPURenderer } from 'three/webgpu';
 import {
-  EffectComposer,
-  EffectPass,
-  NormalPass,
-  RenderPass,
-  ToneMappingEffect,
-  ToneMappingMode
+  NormalPass
 } from 'postprocessing';
 import {
   AerialPerspectiveEffect,
   DEFAULT_PRECOMPUTED_TEXTURES_URL,
-  getECIToECEFRotationMatrix,
-  getMoonDirectionECEF,
   getSunDirectionECEF,
   PrecomputedTexturesLoader
 } from '@takram/three-atmosphere';
-import {
-  AtmosphereContextNode,
-  AtmosphereLight,
-  AtmosphereParameters as WebGPUAtmosphereParameters,
-  skyBackground
-} from '@takram/three-atmosphere/webgpu';
 import {
   CloudShape,
   CloudShapeDetail,
@@ -40,14 +22,8 @@ import {
   LocalWeather,
   Turbulence
 } from '@takram/three-clouds';
-import { DitheringEffect } from './three-geospatial/packages/effects/src/index.ts';
 import { Ellipsoid, Geodetic, radians } from '@takram/three-geospatial';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
-import {
-  CloudShadowAtmosphereLightNode,
-  WebGPUCloudShadows
-} from './webgpu-cloud-shadows.js';
-import { cloudShadowAerialPerspective } from './webgpu-cloud-shadow-aerial-perspective.js';
 import { buildAssetLibrary } from './procgen/library.ts';
 import { buildTileScatter, disposeTileScatter, updateScatterVisibility, SCATTER_MIN_DEPTH } from './procgen/scatter.ts';
 import { createTileLifecycle } from './terrain-tile-lifecycle.js';
@@ -77,6 +53,8 @@ import { createTerrainTuningControls } from './terrain-tuning-controls.js';
 import { bindTerrainCloudComposition, configureTerrainClouds, registerTerrainCloudTuning } from './terrain-cloud-runtime.js';
 import { createTerrainHouseSceneRuntime } from './terrain-house-scene-runtime.js';
 import { createTerrainTileMenuRuntime } from './terrain-tile-menu-runtime.js';
+import { createWebGPUTerrainBackend } from './render-backends/webgpu-backend.js';
+import { createWebGPUAtmosphereController } from './render-backends/webgpu-atmosphere.js';
 
 const USE_WEBGPU_RENDER_BACKEND = true;
 // Calibrated against the cloudless WebGL reference. WebGL uses exposure 10
@@ -222,109 +200,6 @@ mapCam.up.copy(north);
 mapCam.layers.enable(0);
 const DEFAULT_MAP_ZOOM = 20000;
 
-let webgpuAtmosphereParameters = null;
-let webgpuAtmosphereContext = null;
-let webgpuSkyBackgroundNode = null;
-let webgpuAtmosphereLight = null;
-let webgpuAtmosphereNode = null;
-let webgpuAtmospherePostProcessing = null;
-let webgpuCloudShadows = null;
-let webgpuAtmospherePostProcessingReady = false;
-let webgpuSunLastLogMs = 0;
-let webgpuSunLastLogDateMs = NaN;
-
-function createWebGPUAtmosphereContext() {
-  if (!USE_WEBGPU_RENDER_BACKEND) {
-    return null;
-  }
-  webgpuAtmosphereParameters = new WebGPUAtmosphereParameters();
-  webgpuAtmosphereParameters.luminanceScale *= webgpuAtmosphereSettings.luminanceScale;
-  webgpuAtmosphereParameters.rayleighScattering.multiplyScalar(webgpuAtmosphereSettings.rayleighScale);
-  webgpuAtmosphereParameters.mieScattering.multiplyScalar(webgpuAtmosphereSettings.mieScale);
-  webgpuAtmosphereParameters.mieExtinction.multiplyScalar(webgpuAtmosphereSettings.mieScale);
-  webgpuAtmosphereParameters.groundAlbedo.setScalar(webgpuAtmosphereSettings.groundAlbedo);
-
-  const context = new AtmosphereContextNode(webgpuAtmosphereParameters);
-  context.camera = camera;
-  context.ellipsoid = Ellipsoid.WGS84;
-  // The scene's world coordinates are already ECEF. terrainRoot is the object
-  // that carries the local ENU transform for terrain children.
-  context.matrixWorldToECEF.value.identity();
-  return context;
-}
-
-function formatWebGPUSunDebug(date, source = 'update') {
-  const sun = webgpuAtmosphereContext?.sunDirectionECEF?.value;
-  if (sun == null) {
-    return { source, date: date?.toISOString?.() ?? String(date), hasSun: false };
-  }
-  const eastDot = sun.dot(east);
-  const northDot = sun.dot(north);
-  const upDot = sun.dot(up);
-  const azimuthDeg = (Math.atan2(eastDot, northDot) * 180 / Math.PI + 360) % 360;
-  const elevationDeg = Math.asin(THREE.MathUtils.clamp(upDot, -1, 1)) * 180 / Math.PI;
-  return {
-    source,
-    date: date.toISOString(),
-    ecef: {
-      x: Number(sun.x.toFixed(6)),
-      y: Number(sun.y.toFixed(6)),
-      z: Number(sun.z.toFixed(6))
-    },
-    local: {
-      east: Number(eastDot.toFixed(6)),
-      north: Number(northDot.toFixed(6)),
-      up: Number(upDot.toFixed(6)),
-      azimuthDeg: Number(azimuthDeg.toFixed(2)),
-      elevationDeg: Number(elevationDeg.toFixed(2))
-    }
-  };
-}
-
-function maybeLogWebGPUSun(date, source = 'update', force = false) {
-  if (!USE_WEBGPU_RENDER_BACKEND || webgpuAtmosphereContext == null) {
-    return;
-  }
-  const now = performance.now();
-  const dateMs = date.getTime();
-  if (
-    !force &&
-    now - webgpuSunLastLogMs < 5000 &&
-    Math.abs(dateMs - webgpuSunLastLogDateMs) < 10 * 60 * 1000
-  ) {
-    return;
-  }
-  webgpuSunLastLogMs = now;
-  webgpuSunLastLogDateMs = dateMs;
-  enqueueClientLog('info', 'webgpu.sun', formatWebGPUSunDebug(date, source));
-  if (force) {
-    flushClientLogQueue();
-  }
-}
-
-webgpuAtmosphereContext = createWebGPUAtmosphereContext();
-if (webgpuAtmosphereContext != null) {
-  webgpuSkyBackgroundNode = skyBackground(webgpuAtmosphereContext);
-  webgpuSkyBackgroundNode.sunNode.angularRadius.value = webgpuAtmosphereSettings.sunAngularRadius;
-  webgpuSkyBackgroundNode.sunNode.intensity.value = webgpuAtmosphereSettings.sunIntensity;
-  scene.backgroundNode = webgpuSkyBackgroundNode;
-}
-
-function updateWebGPUAtmosphereDate(date, sunDirectionECEFSource = null) {
-  if (webgpuAtmosphereContext == null) {
-    return;
-  }
-  const { matrixECIToECEF, sunDirectionECEF, moonDirectionECEF } = webgpuAtmosphereContext;
-  const matrix = getECIToECEFRotationMatrix(date, matrixECIToECEF.value);
-  if (sunDirectionECEFSource != null) {
-    sunDirectionECEF.value.copy(sunDirectionECEFSource);
-  } else {
-    getSunDirectionECEF(date, sunDirectionECEF.value);
-  }
-  getMoonDirectionECEF(date, moonDirectionECEF.value);
-  maybeLogWebGPUSun(date);
-}
-
 const controls = {
   yaw: 0,
   pitch: -0.32,
@@ -360,94 +235,30 @@ const defaultPitch = Math.asin(Math.max(-1, Math.min(1, initialForward.dot(up)))
 controls.yaw = defaultYaw;
 controls.pitch = defaultPitch;
 
-function createRenderBackend() {
-  const isWebGPU = USE_WEBGPU_RENDER_BACKEND;
-  const renderer = isWebGPU
-    ? new WebGPURenderer({
-        antialias: true,
-        samples: 4,
-        depth: true,
-        logarithmicDepthBuffer: false
-      })
-    : new THREE.WebGLRenderer({
-        antialias: true,
-        depth: false,
-        logarithmicDepthBuffer: true
-      });
-  renderer.setSize(window.innerWidth, window.innerHeight);
-  renderer.setPixelRatio(window.devicePixelRatio);
-  renderer.shadowMap.enabled = true;
-  if (!isWebGPU) {
-    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
-  }
-  renderer.shadowMap.autoUpdate = true;
-  // WebGL tone mapping is handled in post-processing. The WebGPU path uses
-  // Three's node post-processing output transform.
-  renderer.toneMapping = isWebGPU ? THREE.AgXToneMapping : THREE.NoToneMapping;
-  renderer.toneMappingExposure = isWebGPU ? WEBGPU_TONE_MAPPING_EXPOSURE : 10;
-  bootLog('renderer.ready', {
-    backend: isWebGPU ? 'webgpu' : 'webgl',
-    width: window.innerWidth,
-    height: window.innerHeight,
-    pixelRatio: window.devicePixelRatio,
-    shadowMap: renderer.shadowMap.type
-  });
-
-  return {
-    isWebGPU,
-    renderer,
-    composer: null,
-    postProcessing: null,
-    ready: !isWebGPU,
-    setComposer(composer) {
-      this.composer = composer;
-    },
-    setPostProcessing(postProcessing) {
-      this.postProcessing = postProcessing;
-    },
-    initialize() {
-      if (!isWebGPU) {
-        return;
-      }
-      renderer.init()
-        .then(() => {
-          this.ready = true;
-          bootLog('renderer.webgpu.ready');
-        })
-        .catch(error => {
-          bootLog('renderer.webgpu.error', {
-            message: error?.message ?? String(error),
-            stack: error?.stack ?? null
-          }, 'error');
-        });
-    },
-    resize(width, height) {
-      renderer.setSize(width, height);
-      this.composer?.setSize(width, height);
-    },
-    renderMap(scene, camera) {
-      if (!this.ready) return;
-      renderer.render(scene, camera);
-    },
-    renderScene(scene, camera) {
-      if (!this.ready) return;
-      if (isWebGPU) {
-        if (this.postProcessing != null) {
-          this.postProcessing.render();
-        } else {
-          renderer.render(scene, camera);
-        }
-      } else {
-        this.composer?.render();
-      }
-    },
-    setAnimationLoop(callback) {
-      renderer.setAnimationLoop(callback);
-    }
-  };
-}
-
-const renderBackend = createRenderBackend();
+const renderBackend = createWebGPUTerrainBackend({
+  width: window.innerWidth,
+  height: window.innerHeight,
+  pixelRatio: window.devicePixelRatio,
+  toneMappingExposure: WEBGPU_TONE_MAPPING_EXPOSURE,
+  bootLog,
+});
+const webgpuAtmosphere = createWebGPUAtmosphereController({
+  renderer: renderBackend.renderer,
+  backend: renderBackend,
+  scene,
+  camera,
+  anchor: anchorPosition,
+  east,
+  north,
+  up,
+  maxViewDistance: MAX_VIEW_DIST,
+  settings: webgpuAtmosphereSettings,
+  cloudShadowSettings: webgpuCloudShadowSettings,
+  bootLog,
+  enqueueLog: enqueueClientLog,
+  flushLog: flushClientLogQueue,
+});
+const maybeLogWebGPUSun = (...args) => webgpuAtmosphere.maybeLogSun(...args);
 const renderer = renderBackend.renderer;
 renderBackend.initialize();
 document.body.appendChild(renderer.domElement);
@@ -1000,7 +811,7 @@ function applyDate(date, { force = true } = {}) {
   getSunDirectionECEF(date, sunDirection);
   aerialPerspective.sunDirection.copy(sunDirection);
   cloudsEffect.sunDirection.copy(sunDirection);
-  updateWebGPUAtmosphereDate(date, sunDirection);
+  webgpuAtmosphere.updateDate(date, sunDirection);
   return true;
 }
 function getGameDateFromBrowserTime(nowMs = Date.now()) {
@@ -1027,138 +838,11 @@ createTerrainAtmosphereTextureRuntime({
   bootLog,
 }).loadWithLocalCache();
 
-// MSAA on the composer — the renderer's antialias:true does nothing when
-// postprocessing renders to its own framebuffers. Without this, everything
-// (terrain, vehicle, mountains) gets zero anti-aliasing.
-function createSceneComposer(renderer) {
-  const composer = new EffectComposer(renderer, {
-    frameBufferType: THREE.HalfFloatType,
-    multisampling: Math.min(4, renderer.capabilities.maxSamples)
-  });
-  composer.addPass(new RenderPass(scene, camera));
-  composer.addPass(normalPass);
-  // Keep clouds + atmosphere in one effect pass to avoid render-target feedback issues.
-  composer.addPass(new EffectPass(camera, cloudsEffect, aerialPerspective));
-  composer.addPass(
-    new EffectPass(
-      camera,
-      new ToneMappingEffect({ mode: ToneMappingMode.AGX }),
-      new DitheringEffect()
-    )
-  );
-  bootLog('composer.ready', {
-    passCount: composer.passes.length
-  });
-  return composer;
-}
-
-function createWebGPUAtmospherePostProcessing(renderer) {
-  if (webgpuAtmosphereContext == null) {
-    return null;
-  }
-  renderer.library.addLight(CloudShadowAtmosphereLightNode, AtmosphereLight);
-  const atmosphereLight = new AtmosphereLight(webgpuAtmosphereContext, MAX_VIEW_DIST);
-  atmosphereLight.name = 'webgpu-atmosphere-light';
-  webgpuCloudShadows = new WebGPUCloudShadows({
-    anchor: anchorPosition,
-    east,
-    north,
-    up,
-    camera,
-    atmosphereContext: webgpuAtmosphereContext
-  });
-  applyWebGPUCloudShadowLiveSettings();
-  atmosphereLight.cloudShadow = webgpuCloudShadows;
-  scene.add(atmosphereLight);
-  scene.add(atmosphereLight.target);
-  webgpuAtmosphereLight = atmosphereLight;
-
-  const scenePass = pass(scene, camera, { samples: 4 });
-  scenePass.setMRT(mrt({
-    output,
-    normal: normalView
-  }));
-  const colorNode = scenePass.getTextureNode('output');
-  const depthNode = scenePass.getTextureNode('depth');
-  const normalNode = scenePass.getTextureNode('normal');
-  const postProcessing = new PostProcessing(renderer);
-  const atmosphereNode = cloudShadowAerialPerspective(
-    webgpuAtmosphereContext,
-    colorNode,
-    depthNode,
-    normalNode,
-    webgpuCloudShadows
-  );
-  atmosphereNode.skyNode.sunNode.angularRadius.value = webgpuAtmosphereSettings.sunAngularRadius;
-  atmosphereNode.skyNode.sunNode.intensity.value = webgpuAtmosphereSettings.sunIntensity;
-  webgpuAtmosphereNode = atmosphereNode;
-  postProcessing.outputNode = atmosphereNode;
-  bootLog('renderer.webgpu.atmosphere.ready');
-  return postProcessing;
-}
-
-const composer = renderBackend.isWebGPU ? null : createSceneComposer(renderer);
-renderBackend.setComposer(composer);
-webgpuAtmospherePostProcessingReady = true;
-if (renderBackend.isWebGPU) {
-  rebuildWebGPUAtmosphere();
-} else {
-  renderBackend.setPostProcessing(null);
-}
-
-function applyWebGPUAtmosphereLiveSettings() {
-  if (!renderBackend.isWebGPU) {
-    return;
-  }
-  renderer.toneMappingExposure = webgpuAtmosphereSettings.toneMappingExposure;
-  if (webgpuSkyBackgroundNode?.sunNode != null) {
-    webgpuSkyBackgroundNode.sunNode.angularRadius.value = webgpuAtmosphereSettings.sunAngularRadius;
-    webgpuSkyBackgroundNode.sunNode.intensity.value = webgpuAtmosphereSettings.sunIntensity;
-  }
-  const postSun = webgpuAtmosphereNode?.skyNode?.sunNode;
-  if (postSun != null) {
-    postSun.angularRadius.value = webgpuAtmosphereSettings.sunAngularRadius;
-    postSun.intensity.value = webgpuAtmosphereSettings.sunIntensity;
-  }
-}
-
-function applyWebGPUCloudShadowLiveSettings() {
-  if (webgpuCloudShadows == null) {
-    return;
-  }
-  webgpuCloudShadows.enabled.value = false;
-  webgpuCloudShadows.debugSurface.value = webgpuCloudShadowSettings.debugSurface;
-  webgpuCloudShadows.coverage.value = webgpuCloudShadowSettings.coverage;
-  webgpuCloudShadows.density.value = webgpuCloudShadowSettings.density;
-  webgpuCloudShadows.strength.value = webgpuCloudShadowSettings.strength;
-}
-
-function rebuildWebGPUAtmosphere() {
-  if (!renderBackend.isWebGPU || !webgpuAtmospherePostProcessingReady) {
-    return;
-  }
-  if (webgpuAtmosphereLight != null) {
-    scene.remove(webgpuAtmosphereLight.target);
-    scene.remove(webgpuAtmosphereLight);
-    webgpuAtmosphereLight = null;
-  }
-  webgpuCloudShadows?.dispose();
-  webgpuCloudShadows = null;
-  webgpuAtmospherePostProcessing?.dispose?.();
-  webgpuAtmosphereNode = null;
-  webgpuAtmosphereContext?.dispose?.();
-  webgpuAtmosphereContext = createWebGPUAtmosphereContext();
-  if (webgpuAtmosphereContext != null) {
-    webgpuSkyBackgroundNode = skyBackground(webgpuAtmosphereContext);
-    scene.backgroundNode = webgpuSkyBackgroundNode;
-    updateWebGPUAtmosphereDate(lastRenderedDate);
-  } else {
-    webgpuSkyBackgroundNode = null;
-  }
-  webgpuAtmospherePostProcessing = createWebGPUAtmospherePostProcessing(renderer);
-  renderBackend.setPostProcessing(webgpuAtmospherePostProcessing);
-  applyWebGPUAtmosphereLiveSettings();
-}
+const applyWebGPUAtmosphereLiveSettings = () => webgpuAtmosphere.applyLiveSettings();
+const applyWebGPUCloudShadowLiveSettings = () => webgpuAtmosphere.applyCloudShadowSettings();
+const rebuildWebGPUAtmosphere = () => webgpuAtmosphere.rebuild(lastRenderedDate);
+renderBackend.setComposer(null);
+rebuildWebGPUAtmosphere();
 
 // --- Heightmap decode + mesh building (adapted for ENU frame) ---
 
@@ -1437,13 +1121,9 @@ const PREVIEW_MAX_DEPTH = 10;
 const clock = new THREE.Clock();
 const STREAMING_MAINTENANCE_MS = 1000;
 const fpsCounter = createTerrainFpsCounter();
-let animationLoopActive = false;
-let sceneMutationVersion = 0;
 let streamingMaintenanceTimer = null;
 
-function markSceneMutated() {
-  sceneMutationVersion++;
-}
+const markSceneMutated = () => renderBackend.markSceneMutated();
 
 function hasActiveKeyInput() {
   return Object.values(controls.keys).some(Boolean);
@@ -1459,32 +1139,25 @@ function needsContinuousRender() {
   );
 }
 
-function startRenderLoop() {
-  if (animationLoopActive) {
-    return;
-  }
-  animationLoopActive = true;
-  clock.getDelta();
-  fpsCounter.start(performance.now());
-  renderBackend.setAnimationLoop(render);
-}
+const startRenderLoop = () => renderBackend.startRenderLoop();
+const requestRender = () => renderBackend.requestRender();
+const stopRenderLoopIfIdle = () => renderBackend.stopRenderLoopIfIdle();
 
-function requestRender() {
-  startRenderLoop();
-}
-
-function stopRenderLoopIfIdle() {
-  if (!animationLoopActive || needsContinuousRender()) {
-    return;
-  }
-  animationLoopActive = false;
-  renderBackend.setAnimationLoop(null);
-  fpsCounter.idle();
-  updateHud();
-}
+renderBackend.configureDemandRendering({
+  render,
+  needsContinuousRender,
+  onStart: () => {
+    clock.getDelta();
+    fpsCounter.start(performance.now());
+  },
+  onIdle: () => {
+    fpsCounter.idle();
+    updateHud();
+  },
+});
 
 function runStreamingMaintenance() {
-  const before = sceneMutationVersion;
+  const before = renderBackend.sceneMutationVersion;
   let dateChanged = false;
   if (useRealtimeGameClock) {
     currentDate.setTime(getGameDateFromBrowserTime().getTime());
@@ -1494,7 +1167,7 @@ function runStreamingMaintenance() {
     updateTextures(lastTiles);
   }
   updateEnhancement();
-  if (dateChanged || sceneMutationVersion !== before) {
+  if (dateChanged || renderBackend.sceneMutationVersion !== before) {
     requestRender();
   }
 }
@@ -1652,7 +1325,7 @@ window.takramDebug = {
   applyDate,
   bootEvents,
   getBootEvents: () => bootEvents.slice(),
-  getCloudShadowDebugSummary: () => webgpuCloudShadows?.debugSummary() ?? null,
+  getCloudShadowDebugSummary: () => webgpuAtmosphere.debugSummary(),
   flushClientLogQueue: () => flushClientLogQueue(),
   fetchTiles,
   loadHouseModel: houseRuntime.loadHouseModel,
@@ -2477,9 +2150,7 @@ function render() {
     return;
   }
   if (SCATTER_ENABLED && _scatterLib) updateScatterVisibility(terrainRoot, camera);
-  if (renderBackend.isWebGPU && webgpuCloudShadows != null) {
-    webgpuCloudShadows.update(renderer, clock.elapsedTime);
-  }
+  webgpuAtmosphere.updateCloudShadows(clock.elapsedTime);
   renderBackend.renderScene(scene, camera);
   stopRenderLoopIfIdle();
 }
