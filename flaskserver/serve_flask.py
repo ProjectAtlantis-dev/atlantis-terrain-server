@@ -1579,6 +1579,56 @@ def api_terrain_channel(tile_id: str, chan: str):
   )
 
 
+@app.get("/api/fields/<tile_id>")
+def api_tile_fields(tile_id: str):
+  """Packed per-tile scatter FIELD set — veg/rock/snow/water (summer texture) +
+  slope/southness/sun/altitude/moisture (ArcticDEM) — as a zlib blob (see
+  fields.py pack format; north-up, row 0 = north edge). Cached in the `fields`
+  table, computed on miss from the tile's texture + heightmap. The client unpacks
+  and bilinear-samples it to drive deterministic scatter. Query: res (default
+  FIELD_RES). Channel order is in the X-Field-Keys header."""
+  parsed = _parse_tile_id(tile_id)
+  if parsed is None:
+    return Response(b"", status=400)
+  d, c, r = parsed
+
+  from fields import (FIELD_KEYS, FIELD_RES, compute_fields, init_fields_cache,
+                      pack_fields, read_fields_cache, write_fields_cache)
+  try:
+    res = max(32, min(256, int(request.args.get("res", str(FIELD_RES)))))
+  except ValueError:
+    return Response(b"", status=400)
+
+  db = _get_db()
+  init_fields_cache(db)
+  hdrs = {"Cache-Control": "no-store", "X-Field-Keys": ",".join(FIELD_KEYS)}
+  cached = read_fields_cache(db, tile_id, res)
+  if cached is not None:
+    return Response(cached, mimetype="application/octet-stream",
+                    headers={**hdrs, "X-Fields": "cache"})
+
+  hm, hm_source, hm_depth = _heightmap_ancestor_crop(db, d, c, r)
+  if hm is None:
+    return Response(b"", status=404, headers={"X-Tex-Status": "no_heightmap"})
+  from texture import read_texture
+  tex = read_texture(db, tile_id)
+  if tex is None:
+    return Response(b"", status=202, headers={"X-Tex-Status": "no_texture"})
+
+  import io as _io
+
+  import numpy as np
+  from PIL import Image as _Image
+
+  rgb = np.asarray(_Image.open(_io.BytesIO(tex)).convert("RGB"), np.uint8)
+  bbox = _tile_bbox(d, c, r)
+  fields = compute_fields(rgb, hm, bbox[2] - bbox[0])
+  blob = pack_fields(fields, res)
+  write_fields_cache(db, tile_id, res, blob)
+  return Response(blob, mimetype="application/octet-stream",
+                  headers={**hdrs, "X-Fields": "computed", "X-DEM-Source": str(hm_source)})
+
+
 @app.get("/api/heatmap")
 def api_heatmap():
   """Quadtree grid and cached terrain diagnostics for the last /api/tiles

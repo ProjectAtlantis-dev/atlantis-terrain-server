@@ -768,7 +768,7 @@ const EXAG = 1.0;
 
 // --- Procedural asset scatter (fable5-world-demo port, chain validation) ---
 // Temporarily disabled; keep the procedural vegetation pipeline intact for re-enabling.
-const SCATTER_ENABLED = false;
+const SCATTER_ENABLED = true;
 const SCATTER_SEED = 1337;
 let _scatterLib = null;   // built lazily on the first deep tile
 let _scatterLibFailed = false;
@@ -786,12 +786,39 @@ function scatterLibrary() {
   return _scatterLib;
 }
 
-function attachTileScatter(mesh, tile, hm) {
+// classifier field channels, in the pack order emitted by flaskserver/fields.py
+const FIELD_KEYS = ['veg', 'rock', 'snow', 'water', 'slope', 'southness', 'sun', 'altitude', 'moisture'];
+
+// Fetch + decode the per-tile classifier field set (GET /api/fields → zlib
+// "FLD1" blob). Returns { res, chans:{veg,rock,water,...} } or null (no texture
+// yet / error) — in which case scatter falls back to DEM-only gating.
+async function fetchTileFields(tileId) {
+  try {
+    const resp = await fetch(`/api/fields/${tileId}`);
+    if (!resp.ok) return null; // 202 = no texture cached yet, 404 = no heightmap
+    const gz = await resp.arrayBuffer();
+    const ds = new DecompressionStream('deflate'); // Python zlib.compress = zlib format
+    const raw = new Uint8Array(await new Response(new Blob([gz]).stream().pipeThrough(ds)).arrayBuffer());
+    if (raw[0] !== 0x46 || raw[1] !== 0x4c || raw[2] !== 0x44 || raw[3] !== 0x31) return null; // 'FLD1'
+    const res = raw[4] | (raw[5] << 8);
+    const nf = raw[6];
+    const chans = {};
+    let off = 8;
+    for (let i = 0; i < nf; i++) { chans[FIELD_KEYS[i]] = raw.subarray(off, off + res * res); off += res * res; }
+    return { res, chans };
+  } catch { return null; }
+}
+
+async function attachTileScatter(mesh, tile, hm) {
   if (!SCATTER_ENABLED || !mesh || !tile?.id) return;
   const depth = tileDepthFromId(tile.id);
   if (depth < SCATTER_MIN_DEPTH) return;
   const lib = scatterLibrary();
   if (!lib) return;
+  // classifier: fetch the tile's field set so placement follows the satellite
+  // (water excluded, plants only where vegetated) — not DEM slope alone.
+  const fields = await fetchTileFields(tile.id);
+  if (!mesh.parent) return; // tile was evicted while the fields were in flight
   try {
     const group = buildTileScatter({
       tileId: tile.id,
@@ -799,7 +826,8 @@ function attachTileScatter(mesh, tile, hm) {
       hm,
       res: tile.resolution,
       lib,
-      exag: EXAG
+      exag: EXAG,
+      fields
     });
     if (group) mesh.add(group);
   } catch (err) {

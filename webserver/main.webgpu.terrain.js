@@ -48,8 +48,11 @@ import {
   WebGPUCloudShadows
 } from './webgpu-cloud-shadows.js';
 import { cloudShadowAerialPerspective } from './webgpu-cloud-shadow-aerial-perspective.js';
-import { buildAssetLibrary } from './procgen/library.ts';
-import { buildTileScatter, disposeTileScatter, updateScatterVisibility, SCATTER_MIN_DEPTH } from './procgen/scatter.ts';
+import { buildBackupScatterLibrary } from './laas-scatter-adapter.js';
+import { GreenlandPatch } from './laas-terrain-patch.js';
+import { installMaterialKeyMemo } from './laas/render/ThreePatches.ts';
+import { installPositionInvariance } from './laas/render/VegPrepass.ts';
+import { buildTileScatter, disposeTileScatter, updateScatterVisibility } from './procgen/scatter.ts';
 import { createTileLifecycle } from './terrain-tile-lifecycle.js';
 import { createTerrainOceanClassifier } from './classifier/terrain-ocean.js';
 import { priorityHeading, terrainTilePriority } from './terrain-priority.js';
@@ -110,6 +113,17 @@ const webgpuCloudShadowSettings = {
   enabled: window.location.hash !== '#no-cloud-shadows',
   debugSurface: window.location.hash === '#shadow-mask'
 };
+
+// Preserve the small set of boot-only diagnostics before cleaning the visible
+// URL. Runtime tuning remains UI-owned; these values exist solely for
+// reproducible camera/procgen verification runs.
+const BOOT_QUERY = new URLSearchParams(window.location.search);
+function bootQueryNumber(name, fallback) {
+  const raw = BOOT_QUERY.get(name);
+  if (raw == null || raw.trim() === '') return fallback;
+  const value = Number(raw);
+  return Number.isFinite(value) ? value : fallback;
+}
 
 // The main view is controlled entirely through its UI. Discard stale query
 // parameters instead of exposing URL state that does not stay in sync.
@@ -409,6 +423,13 @@ function createRenderBackend() {
       }
       renderer.init()
         .then(() => {
+          // GroundRing's shaded grass uses an EqualDepth pass behind an
+          // identical depth-only twin. LAAS installs @invariant on every
+          // WebGPU vertex position before creating those materials; without
+          // it Metal can produce last-bit depth differences and leave the
+          // camera-following black/transparent holes seen in the terrain.
+          installPositionInvariance(renderer);
+          installMaterialKeyMemo(renderer);
           this.ready = true;
           bootLog('renderer.webgpu.ready');
         })
@@ -927,6 +948,18 @@ Ellipsoid.WGS84
   .decompose(terrainRoot.position, terrainRoot.quaternion, terrainRoot.scale);
 scene.add(terrainRoot);
 
+// Experimental LAAS GroundRing graft. Disabled by default because its depth
+// prepass assumes the original y-up LAAS render graph; under this ECEF/ENU
+// terrain scene it punches a camera-following circular hole through the real
+// satellite terrain. Keep it opt-in for isolated diagnostics only. Production
+// procgen must decorate the existing terrain chunks, never draw a second world.
+if (typeof window !== 'undefined') window.__enqueueClientLog = enqueueClientLog;
+const PROCGEN_PATCH_DIAGNOSTIC =
+  BOOT_QUERY.get('procgenPatch') === '1';
+const greenlandPatch = PROCGEN_PATCH_DIAGNOSTIC
+  ? new GreenlandPatch(terrainRoot, 1337)
+  : null;
+
 // --- Water plane ---
 // Large flat water surface at z=0.5 in terrainRoot local coords.
 // Ocean terrain is shaped below sea level, so water floats above the seabed.
@@ -1054,43 +1087,125 @@ const EXAG = 1.0;
 
 // --- Procedural asset scatter (fable5-world-demo port, chain validation) ---
 // Temporarily disabled; keep the procedural vegetation pipeline intact for re-enabling.
+// DISABLED: the old procgen near-field scatter (per-tile build/dispose on camera
+// move) was the source of the lag, popping, camera stutter and "unnatural
+// placement". The backup GroundRing patch (laas-terrain-patch.js) + Forests
+// (next) replace it. Keep the code for the WebGL client; off for WebGPU.
 const SCATTER_ENABLED = false;
 const SCATTER_SEED = 1337;
-let _scatterLib = null;   // built lazily on the first deep tile
-let _scatterLibFailed = false;
+let _scatterLib = null;          // resolved library (for updateScatterVisibility)
+let _scatterLibPromise = null;   // memoized async build (backup VegLibrary bakes on the GPU)
+// WebGPU client uses the FULL backup vegetation (webserver/laas: 30 species, TSL
+// node materials) via the adapter — NOT the stripped GLSL procgen/library (WebGL).
 function scatterLibrary() {
-  if (_scatterLib || _scatterLibFailed || !SCATTER_ENABLED) return _scatterLib;
-  try {
-    _scatterLib = buildAssetLibrary(renderer, SCATTER_SEED);
-    console.log('[scatter] asset library built', _scatterLib.stats);
-    enqueueClientLog('info', 'scatter.library', _scatterLib.stats);
-  } catch (err) {
-    _scatterLibFailed = true;
-    console.error('[scatter] library build failed — scatter disabled', err);
-    enqueueClientLog('error', 'scatter.library', { error: String(err) });
+  if (!SCATTER_ENABLED) return Promise.resolve(null);
+  if (!_scatterLibPromise) {
+    _scatterLibPromise = buildBackupScatterLibrary(renderer, SCATTER_SEED)
+      .then((lib) => {
+        _scatterLib = lib;
+        console.log('[scatter] laas veg library built', lib.stats);
+        enqueueClientLog('info', 'scatter.library', lib.stats);
+        return lib;
+      })
+      .catch((err) => {
+        _scatterLibFailed = true;
+        console.error('[scatter] laas library build failed — scatter disabled', err);
+        enqueueClientLog('error', 'scatter.library', { error: String(err), stack: String(err?.stack ?? '') });
+        return null;
+      });
   }
-  return _scatterLib;
+  return _scatterLibPromise;
+}
+let _scatterLibFailed = false;
+
+// classifier field channels, in the pack order emitted by flaskserver/fields.py
+const FIELD_KEYS = ['veg', 'rock', 'snow', 'water', 'slope', 'southness', 'sun', 'altitude', 'moisture'];
+
+// Fetch + decode the per-tile classifier field set (GET /api/fields → zlib
+// "FLD1" blob). Returns { res, chans:{veg,rock,water,...} } or null (no texture
+// yet / error) — in which case scatter falls back to DEM-only gating.
+async function fetchTileFields(tileId) {
+  try {
+    const resp = await fetch(`/api/fields/${tileId}`);
+    if (!resp.ok) return null; // 202 = no texture cached yet, 404 = no heightmap
+    const gz = await resp.arrayBuffer();
+    const ds = new DecompressionStream('deflate'); // Python zlib.compress = zlib format
+    const raw = new Uint8Array(await new Response(new Blob([gz]).stream().pipeThrough(ds)).arrayBuffer());
+    if (raw[0] !== 0x46 || raw[1] !== 0x4c || raw[2] !== 0x44 || raw[3] !== 0x31) return null; // 'FLD1'
+    const res = raw[4] | (raw[5] << 8);
+    const nf = raw[6];
+    const chans = {};
+    let off = 8;
+    for (let i = 0; i < nf; i++) { chans[FIELD_KEYS[i]] = raw.subarray(off, off + res * res); off += res * res; }
+    return { res, chans };
+  } catch { return null; }
 }
 
 function attachTileScatter(mesh, tile, hm) {
-  if (!SCATTER_ENABLED || !mesh || !tile?.id) return;
-  const depth = tileDepthFromId(tile.id);
-  if (depth < SCATTER_MIN_DEPTH) return;
-  const lib = scatterLibrary();
-  if (!lib) return;
+  if (!mesh || !tile?.id) return;
+  // Store per-tile height data UNCONDITIONALLY — the GroundRing patch consumes it
+  // (collectTiles) to seed its Heightfield. Building scatter *geometry* is gated
+  // separately by SCATTER_ENABLED (updateNearFieldScatter), so this is not the
+  // scatter; it's just the terrain heightmap the grass needs to sit on the ground.
+  // Store the input only. The actual build/dispose is CAMERA-FOLLOWING (see
+  // updateNearFieldScatter) — only tiles near the camera carry plants. Tiles are
+  // ~659 m, so we do NOT scatter miles of terrain; that's what keeps it fast (the
+  // backup does the same with near-field rings).
+  mesh.userData.scatterInput = { tileId: tile.id, bbox: tile.bbox, hm, res: tile.resolution };
+}
+
+// near-field radii (m): build scatter inside NEAR_BUILD, drop past NEAR_DROP
+// (hysteresis so it doesn't thrash at the edge). ~1–2 tiles of plants around the
+// camera; everything beyond is bare terrain.
+const NEAR_BUILD = 650;
+const NEAR_DROP = 950;
+const _scatterBuilding = new Set();
+const _tileCtr = new THREE.Vector3();
+const _camCtr = new THREE.Vector3();
+
+async function buildScatterForTile(mesh, inp) {
   try {
+    const lib = await scatterLibrary();
+    if (!lib || !mesh.parent) return;
+    const fields = await fetchTileFields(inp.tileId);
+    if (!mesh.parent) return;
     const group = buildTileScatter({
-      tileId: tile.id,
-      bbox: tile.bbox,
-      hm,
-      res: tile.resolution,
-      lib,
-      exag: EXAG
+      tileId: inp.tileId, bbox: inp.bbox, hm: inp.hm, res: inp.res, lib, exag: EXAG, fields,
     });
-    if (group) mesh.add(group);
+    if (group && mesh.parent) mesh.add(group);
   } catch (err) {
-    enqueueClientLog('error', 'scatter.tile', { tileId: tile.id, error: String(err) });
+    enqueueClientLog('error', 'scatter.tile', { tileId: inp.tileId, error: String(err) });
+  } finally {
+    _scatterBuilding.delete(inp.tileId);
   }
+}
+
+// Per-frame: build scatter for near tiles, dispose it for far ones, then the
+// per-instance max-dist cull. Keeps plant/rock geometry to a small
+// camera-following area instead of the whole streamed world.
+function updateNearFieldScatter() {
+  if (!SCATTER_ENABLED) return;
+  camera.getWorldPosition(_camCtr);
+  for (const mesh of terrainRoot.children) {
+    const inp = mesh.userData?.scatterInput;
+    if (!inp) continue;
+    let bs = mesh.geometry?.boundingSphere;
+    if (!bs) { mesh.geometry?.computeBoundingSphere?.(); bs = mesh.geometry?.boundingSphere; }
+    if (!bs) continue;
+    _tileCtr.copy(bs.center).applyMatrix4(mesh.matrixWorld);
+    const dist = _tileCtr.distanceTo(_camCtr) - bs.radius;
+    const hasScatter = mesh.children.some((c) => c.userData?.isScatter);
+    if (dist < NEAR_BUILD && !hasScatter && !_scatterBuilding.has(inp.tileId)) {
+      _scatterBuilding.add(inp.tileId);
+      buildScatterForTile(mesh, inp);
+    } else if (dist > NEAR_DROP && hasScatter) {
+      disposeTileScatter(mesh);
+      for (let i = mesh.children.length - 1; i >= 0; i--) {
+        if (mesh.children[i].userData?.isScatter) mesh.remove(mesh.children[i]);
+      }
+    }
+  }
+  if (_scatterLib) updateScatterVisibility(terrainRoot, camera);
 }
 
 let tileLifecycle;
@@ -3665,7 +3780,25 @@ window.addEventListener('beforeunload', savePosition);
 
 // Restore saved camera position (lat/lon/alt are origin-independent)
 try {
-  const saved = JSON.parse(localStorage.getItem('clouds-cam'));
+  // Reproducible visual-verification pose. Query values deliberately override
+  // localStorage so a screenshot/test run can revisit the exact same Greenland
+  // location and AGL without mutating the user's saved camera.
+  const camLatOverride = bootQueryNumber('camLat', NaN);
+  const camLonOverride = bootQueryNumber('camLon', NaN);
+  const camAltOverride = bootQueryNumber('camAlt', NaN);
+  const hasCameraOverride = Number.isFinite(camLatOverride)
+    && Number.isFinite(camLonOverride)
+    && Number.isFinite(camAltOverride);
+  const saved = hasCameraOverride
+    ? {
+        lat: camLatOverride,
+        lon: camLonOverride,
+        alt: camAltOverride,
+        yaw: bootQueryNumber('camYaw', controls.yaw),
+        pitch: bootQueryNumber('camPitch', controls.pitch),
+        mapZoom: controls.mapZoom,
+      }
+    : JSON.parse(localStorage.getItem('clouds-cam'));
   const restored = restoreTerrainCameraState(saved, { anchorLat, anchorLon });
   if (restored) {
     camera.position.copy(anchorPosition)
@@ -4550,7 +4683,13 @@ function render() {
     stopRenderLoopIfIdle();
     return;
   }
-  if (SCATTER_ENABLED && _scatterLib) updateScatterVisibility(terrainRoot, camera);
+  updateNearFieldScatter();
+  if (renderBackend.isWebGPU && greenlandPatch) {
+    if (!greenlandPatch.ready && !greenlandPatch.building) {
+      void greenlandPatch.build(renderer, camera, cameraAGL);
+    }
+    greenlandPatch.update(renderer, camera, cameraAGL);
+  }
   if (renderBackend.isWebGPU && webgpuCloudShadows != null) {
     webgpuCloudShadows.update(renderer, clock.elapsedTime);
   }
