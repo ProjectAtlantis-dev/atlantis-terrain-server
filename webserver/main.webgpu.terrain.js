@@ -83,6 +83,7 @@ import { GreenlandPatch } from './laas-terrain-patch.js';
 import { installMaterialKeyMemo } from './laas/render/ThreePatches.ts';
 import { installPositionInvariance } from './laas/render/VegPrepass.ts';
 import { vegViewPos } from './laas/render/VegInstance.ts';
+import { createGroundingNode } from './webgpu-ground-post.js';
 import { buildTerrainShading } from './laas/render/TerrainMaterial.ts';
 import { buildTileScatter, disposeTileScatter, updateScatterVisibility } from './procgen/scatter.ts';
 import { createTileLifecycle } from './terrain-tile-lifecycle.js';
@@ -3497,7 +3498,23 @@ function createWebGPUAtmospherePostProcessing(renderer) {
   const shadowLengthNode = shadowLength(csmShadowNode, viewZUnitNode);
   webgpuShadowLengthNode = shadowLengthNode;
 
-  const atmosphereNode = webgpuAerialPerspective(colorNode, depthNode, shadowLengthNode);
+  // Screen-space grounding (GTAO + contact shadows) on the scene color
+  // before aerial perspective. LAAS excludes understory plants from the CSM
+  // caster set on the assumption these two layers ground them instead;
+  // without this they float. ?gtao=0 / ?contact=0 compile the layers out;
+  // grounding.uAoStrength/.uContactStrength (0..1) toggle live for A/B.
+  const grounding = createGroundingNode({
+    colorNode,
+    depthNode,
+    camera,
+    getSunDirectionECEF: () => webgpuAtmosphereContext?.sunDirectionECEF?.value ?? null,
+    enabled: {
+      gtao: BOOT_QUERY.get('gtao') !== '0',
+      contact: BOOT_QUERY.get('contact') !== '0'
+    }
+  });
+
+  const atmosphereNode = webgpuAerialPerspective(grounding.node, depthNode, shadowLengthNode);
   atmosphereNode.skyNode.sunNode.angularRadius.value = webgpuAtmosphereSettings.sunAngularRadius;
   atmosphereNode.skyNode.sunNode.intensity.value = webgpuAtmosphereSettings.sunIntensity;
   webgpuAtmosphereNode = atmosphereNode;
@@ -3604,7 +3621,8 @@ function createWebGPUAtmospherePostProcessing(renderer) {
     THREE,
     MeshLambertNodeMaterial,
     cloudDensityField: webgpuCloudDensityField,
-    beerShadowMap: webgpuCloudShadows
+    beerShadowMap: webgpuCloudShadows,
+    grounding: grounding.uniforms
   };
   bootLog('renderer.webgpu.atmosphere.ready', {
     godRays: true,
