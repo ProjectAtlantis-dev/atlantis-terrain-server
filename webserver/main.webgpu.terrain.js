@@ -1,16 +1,18 @@
 // UX WIP scene: preserve baseline rendering, layer in map mode + movement + HUD.
 import * as THREE from 'three';
 import {
+  bool,
   color,
+  context,
   densityFogFactor,
   fog,
   mrt,
-  normalView,
   output,
   pass,
+  toneMapping,
   uniform
 } from 'three/tsl';
-import { PostProcessing, WebGPURenderer } from 'three/webgpu';
+import { MeshLambertNodeMaterial, PostProcessing, WebGPURenderer } from 'three/webgpu';
 import {
   EffectComposer,
   EffectPass,
@@ -28,11 +30,21 @@ import {
   PrecomputedTexturesLoader
 } from '@takram/three-atmosphere';
 import {
-  AtmosphereContextNode,
+  aerialPerspective as webgpuAerialPerspective,
+  AtmosphereContext,
   AtmosphereLight,
   AtmosphereParameters as WebGPUAtmosphereParameters,
-  skyBackground
+  shadowLength,
+  skyBackground,
+  viewZUnit
 } from '@takram/three-atmosphere/webgpu';
+import {
+  CascadedShadowMapsNode,
+  dithering,
+  highpVelocity,
+  lensFlare,
+  temporalAntialias
+} from '@takram/three-geospatial/webgpu';
 import {
   CloudShape,
   CloudShapeDetail,
@@ -47,7 +59,6 @@ import {
   CloudShadowAtmosphereLightNode,
   WebGPUCloudShadows
 } from './webgpu-cloud-shadows.js';
-import { cloudShadowAerialPerspective } from './webgpu-cloud-shadow-aerial-perspective.js';
 import { buildBackupScatterLibrary } from './laas-scatter-adapter.js';
 import { GreenlandPatch } from './laas-terrain-patch.js';
 import { installMaterialKeyMemo } from './laas/render/ThreePatches.ts';
@@ -94,7 +105,10 @@ const WEBGPU_ATMOSPHERE_DEFAULTS = Object.freeze({
   sunIntensity: 1,
   rayleighScale: 1,
   mieScale: 1.4,
-  groundAlbedo: 0.3
+  groundAlbedo: 0.3,
+  // Epipolar god rays (volumetric shadow length fed into the inscatter).
+  godRays: true,
+  godRaySlices: 512
 });
 const WEBGPU_CLOUD_SHADOW_DEFAULTS = Object.freeze({
   // WebGPU clouds are intentionally unavailable for now. Takram CloudsEffect
@@ -194,6 +208,9 @@ const scene = new THREE.Scene();
 scene.fog = new THREE.FogExp2(0x000000, 0.00009);
 const _sceneFog = scene.fog;
 const webgpuFogDensity = uniform(0).setName('webgpuDistanceFogDensity');
+// Exposure for the explicit AgX tone-mapping node in the WebGPU post chain
+// (the renderer's own tone mapping is disabled there).
+const webgpuToneMappingExposure = uniform(WEBGPU_TONE_MAPPING_EXPOSURE).setName('webgpuToneMappingExposure');
 if (USE_WEBGPU_RENDER_BACKEND) {
   scene.fog = null;
   scene.fogNode = fog(color(0x000000), densityFogFactor(webgpuFogDensity));
@@ -241,6 +258,8 @@ let webgpuAtmosphereLight = null;
 let webgpuAtmosphereNode = null;
 let webgpuAtmospherePostProcessing = null;
 let webgpuCloudShadows = null;
+let webgpuCsmShadowNode = null;
+let webgpuShadowLengthNode = null;
 let webgpuAtmospherePostProcessingReady = false;
 let webgpuSunLastLogMs = 0;
 let webgpuSunLastLogDateMs = NaN;
@@ -256,13 +275,17 @@ function createWebGPUAtmosphereContext() {
   webgpuAtmosphereParameters.mieExtinction.multiplyScalar(webgpuAtmosphereSettings.mieScale);
   webgpuAtmosphereParameters.groundAlbedo.setScalar(webgpuAtmosphereSettings.groundAlbedo);
 
-  const context = new AtmosphereContextNode(webgpuAtmosphereParameters);
-  context.camera = camera;
-  context.ellipsoid = Ellipsoid.WGS84;
+  const atmosphereContext = new AtmosphereContext(webgpuAtmosphereParameters);
+  atmosphereContext.camera = camera;
+  atmosphereContext.ellipsoid = Ellipsoid.WGS84;
+  // Raymarch the inscattered light between camera and surface, accounting for
+  // shadowed segments (feeds the epipolar god-ray shadow length).
+  atmosphereContext.raymarchScattering = true;
+  atmosphereContext.accurateShadowScattering = true;
   // The scene's world coordinates are already ECEF. terrainRoot is the object
   // that carries the local ENU transform for terrain children.
-  context.matrixWorldToECEF.value.identity();
-  return context;
+  atmosphereContext.matrixWorldToECEF.value.identity();
+  return atmosphereContext;
 }
 
 function formatWebGPUSunDebug(date, source = 'update') {
@@ -316,7 +339,9 @@ function maybeLogWebGPUSun(date, source = 'update', force = false) {
 
 webgpuAtmosphereContext = createWebGPUAtmosphereContext();
 if (webgpuAtmosphereContext != null) {
-  webgpuSkyBackgroundNode = skyBackground(webgpuAtmosphereContext);
+  // v0.19: the context flows to every atmosphere node through the renderer's
+  // node context (registered on the renderer right after it is created).
+  webgpuSkyBackgroundNode = skyBackground();
   webgpuSkyBackgroundNode.sunNode.angularRadius.value = webgpuAtmosphereSettings.sunAngularRadius;
   webgpuSkyBackgroundNode.sunNode.intensity.value = webgpuAtmosphereSettings.sunIntensity;
   scene.backgroundNode = webgpuSkyBackgroundNode;
@@ -393,9 +418,10 @@ function createRenderBackend() {
     renderer.shadowMap.type = THREE.PCFSoftShadowMap;
   }
   renderer.shadowMap.autoUpdate = true;
-  // WebGL tone mapping is handled in post-processing. The WebGPU path uses
-  // Three's node post-processing output transform.
-  renderer.toneMapping = isWebGPU ? THREE.AgXToneMapping : THREE.NoToneMapping;
+  // Tone mapping is applied explicitly in post-processing on both backends:
+  // WebGL via ToneMappingEffect, WebGPU via a toneMapping() node in the post
+  // chain (an AgX renderer.toneMapping here would double-tone-map).
+  renderer.toneMapping = THREE.NoToneMapping;
   renderer.toneMappingExposure = isWebGPU ? WEBGPU_TONE_MAPPING_EXPOSURE : 10;
   bootLog('renderer.ready', {
     backend: isWebGPU ? 'webgpu' : 'webgl',
@@ -446,14 +472,31 @@ function createRenderBackend() {
     },
     renderMap(scene, camera) {
       if (!this.ready) return;
+      // Map mode renders directly, so the sky must come from the scene
+      // background here.
+      if (isWebGPU && scene.backgroundNode !== webgpuSkyBackgroundNode) {
+        scene.backgroundNode = webgpuSkyBackgroundNode;
+      }
       renderer.render(scene, camera);
     },
     renderScene(scene, camera) {
       if (!this.ready) return;
       if (isWebGPU) {
         if (this.postProcessing != null) {
+          // The sky is composited by the aerial perspective's sky node in
+          // post. The scene pass must NOT render a background: sky pixels
+          // must keep the MRT clear value (viewZUnit = 0) that the epipolar
+          // god-ray shadow length uses as its "no geometry" sentinel — a
+          // background mesh writes its own positionView.z there and corrupts
+          // the whole shadow-length buffer (renders as a black world).
+          if (scene.backgroundNode != null) {
+            scene.backgroundNode = null;
+          }
           this.postProcessing.render();
         } else {
+          if (scene.backgroundNode == null && webgpuSkyBackgroundNode != null) {
+            scene.backgroundNode = webgpuSkyBackgroundNode;
+          }
           renderer.render(scene, camera);
         }
       } else {
@@ -468,6 +511,15 @@ function createRenderBackend() {
 
 const renderBackend = createRenderBackend();
 const renderer = renderBackend.renderer;
+if (renderBackend.isWebGPU && webgpuAtmosphereContext != null) {
+  // v0.19 atmosphere nodes resolve their AtmosphereContext through the
+  // renderer's node context. The closure reads the module variable, so
+  // rebuilds that swap the context need no re-registration.
+  renderer.contextNode = context({
+    ...renderer.contextNode.value,
+    getAtmosphere: () => webgpuAtmosphereContext
+  });
+}
 renderBackend.initialize();
 document.body.appendChild(renderer.domElement);
 renderer.domElement.addEventListener('contextmenu', event => event.preventDefault());
@@ -901,6 +953,23 @@ function buildTuningControls(ap, ce) {
       onChange: applyWebGPUHaze
     });
     applyWebGPUHaze(Number(_tuningState.haze ?? WEBGPU_DEFAULT_HAZE));
+    tuningSectionLabel('God Rays');
+    tuningToggle('god rays', {
+      value: WEBGPU_ATMOSPHERE_DEFAULTS.godRays,
+      onChange: v => {
+        webgpuAtmosphereSettings.godRays = v;
+        applyWebGPUAtmosphereLiveSettings();
+      }
+    });
+    tuningSlider('god ray quality', {
+      min: 128, max: 1024, step: 64,
+      value: WEBGPU_ATMOSPHERE_DEFAULTS.godRaySlices,
+      decimals: 0,
+      onChange: v => {
+        webgpuAtmosphereSettings.godRaySlices = v;
+        applyWebGPUAtmosphereLiveSettings();
+      }
+    });
   } else {
   tuningSlider('fog strength', {
     min: 1, max: 10, step: 0.5, value: 4.5,
@@ -948,16 +1017,17 @@ Ellipsoid.WGS84
   .decompose(terrainRoot.position, terrainRoot.quaternion, terrainRoot.scale);
 scene.add(terrainRoot);
 
-// Experimental LAAS GroundRing graft. Disabled by default because its depth
-// prepass assumes the original y-up LAAS render graph; under this ECEF/ENU
-// terrain scene it punches a camera-following circular hole through the real
-// satellite terrain. Keep it opt-in for isolated diagnostics only. Production
-// procgen must decorate the existing terrain chunks, never draw a second world.
+// Production LAAS near-field vegetation. GreenlandPatch only mounts GroundRing
+// draws over the streamed terrain; the ArcticDEM meshes remain the ground and
+// keep ownership of imagery, picking, collision, and tile lifecycle.
 if (typeof window !== 'undefined') window.__enqueueClientLog = enqueueClientLog;
-const PROCGEN_PATCH_DIAGNOSTIC =
-  BOOT_QUERY.get('procgenPatch') === '1';
-const greenlandPatch = PROCGEN_PATCH_DIAGNOSTIC
-  ? new GreenlandPatch(terrainRoot, 1337)
+const PROCGEN_PATCH_ENABLED = BOOT_QUERY.get('procgenPatch') !== '0';
+const greenlandPatch = PROCGEN_PATCH_ENABLED
+  ? new GreenlandPatch(terrainRoot, 1337, {
+      loadFields: fetchTileFields,
+      getCSM: () => webgpuCsmShadowNode,
+      getSunLight: () => webgpuAtmosphereLight,
+    })
   : null;
 
 // --- Water plane ---
@@ -1085,20 +1155,18 @@ const seamStatusController = createTerrainSeamStatusController({});
 // --- Terrain streaming state ---
 const EXAG = 1.0;
 
-// --- Procedural asset scatter (fable5-world-demo port, chain validation) ---
-// Temporarily disabled; keep the procedural vegetation pipeline intact for re-enabling.
-// DISABLED: the old procgen near-field scatter (per-tile build/dispose on camera
-// move) was the source of the lag, popping, camera stutter and "unnatural
-// placement". The backup GroundRing patch (laas-terrain-patch.js) + Forests
-// (next) replace it. Keep the code for the WebGL client; off for WebGPU.
-const SCATTER_ENABLED = false;
+// --- Retired per-tile scatter adapter ---------------------------------------
+// WebGPU production vegetation now runs through GreenlandPatch → Heightfield
+// → GreenlandFlora/runScatter → Forests. Keep this older tile-instancing path
+// available for comparison, but never run both populations at once.
+const LEGACY_TILE_SCATTER_ENABLED = false;
 const SCATTER_SEED = 1337;
 let _scatterLib = null;          // resolved library (for updateScatterVisibility)
 let _scatterLibPromise = null;   // memoized async build (backup VegLibrary bakes on the GPU)
 // WebGPU client uses the FULL backup vegetation (webserver/laas: 30 species, TSL
 // node materials) via the adapter — NOT the stripped GLSL procgen/library (WebGL).
 function scatterLibrary() {
-  if (!SCATTER_ENABLED) return Promise.resolve(null);
+  if (!LEGACY_TILE_SCATTER_ENABLED) return Promise.resolve(null);
   if (!_scatterLibPromise) {
     _scatterLibPromise = buildBackupScatterLibrary(renderer, SCATTER_SEED)
       .then((lib) => {
@@ -1121,13 +1189,29 @@ let _scatterLibFailed = false;
 // classifier field channels, in the pack order emitted by flaskserver/fields.py
 const FIELD_KEYS = ['veg', 'rock', 'snow', 'water', 'slope', 'southness', 'sun', 'altitude', 'moisture'];
 
+const _tileFieldsCache = new Map();
+const _tileFieldsPending = new Map();
+const _tileFieldsRetryAfter = new Map();
+const TILE_FIELDS_RETRY_MS = 2000;
+
 // Fetch + decode the per-tile classifier field set (GET /api/fields → zlib
-// "FLD1" blob). Returns { res, chans:{veg,rock,water,...} } or null (no texture
-// yet / error) — in which case scatter falls back to DEM-only gating.
+// "FLD1" blob). Returns { res, chans:{veg,rock,water,...} } or null while the
+// first-visit texture/classifier is unavailable. Legacy scatter can use null;
+// GreenlandPatch waits and retries rather than inventing vegetation coverage.
 async function fetchTileFields(tileId) {
-  try {
+  if (_tileFieldsCache.has(tileId)) return _tileFieldsCache.get(tileId);
+  if (_tileFieldsPending.has(tileId)) return _tileFieldsPending.get(tileId);
+  if (performance.now() < (_tileFieldsRetryAfter.get(tileId) ?? 0)) return null;
+
+  const pending = (async () => {
     const resp = await fetch(`/api/fields/${tileId}`);
-    if (!resp.ok) return null; // 202 = no texture cached yet, 404 = no heightmap
+    if (!resp.ok) {
+      // 202 is normal while the first-visit satellite texture is still being
+      // fetched. Do not cache the miss: GreenlandPatch retries and comes alive
+      // as soon as the classifier is available.
+      _tileFieldsRetryAfter.set(tileId, performance.now() + TILE_FIELDS_RETRY_MS);
+      return null;
+    }
     const gz = await resp.arrayBuffer();
     const ds = new DecompressionStream('deflate'); // Python zlib.compress = zlib format
     const raw = new Uint8Array(await new Response(new Blob([gz]).stream().pipeThrough(ds)).arrayBuffer());
@@ -1137,15 +1221,26 @@ async function fetchTileFields(tileId) {
     const chans = {};
     let off = 8;
     for (let i = 0; i < nf; i++) { chans[FIELD_KEYS[i]] = raw.subarray(off, off + res * res); off += res * res; }
-    return { res, chans };
-  } catch { return null; }
+    const fields = { res, chans };
+    _tileFieldsCache.set(tileId, fields);
+    _tileFieldsRetryAfter.delete(tileId);
+    return fields;
+  })().catch((error) => {
+    _tileFieldsRetryAfter.set(tileId, performance.now() + TILE_FIELDS_RETRY_MS);
+    enqueueClientLog('warn', 'fields.fetch', { tileId, error: String(error) });
+    return null;
+  }).finally(() => {
+    _tileFieldsPending.delete(tileId);
+  });
+  _tileFieldsPending.set(tileId, pending);
+  return pending;
 }
 
 function attachTileScatter(mesh, tile, hm) {
   if (!mesh || !tile?.id) return;
   // Store per-tile height data UNCONDITIONALLY — the GroundRing patch consumes it
   // (collectTiles) to seed its Heightfield. Building scatter *geometry* is gated
-  // separately by SCATTER_ENABLED (updateNearFieldScatter), so this is not the
+  // separately by LEGACY_TILE_SCATTER_ENABLED (updateNearFieldScatter), so this is not the
   // scatter; it's just the terrain heightmap the grass needs to sit on the ground.
   // Store the input only. The actual build/dispose is CAMERA-FOLLOWING (see
   // updateNearFieldScatter) — only tiles near the camera carry plants. Tiles are
@@ -1184,7 +1279,7 @@ async function buildScatterForTile(mesh, inp) {
 // per-instance max-dist cull. Keeps plant/rock geometry to a small
 // camera-following area instead of the whole streamed world.
 function updateNearFieldScatter() {
-  if (!SCATTER_ENABLED) return;
+  if (!LEGACY_TILE_SCATTER_ENABLED) return;
   camera.getWorldPosition(_camCtr);
   for (const mesh of terrainRoot.children) {
     const inp = mesh.userData?.scatterInput;
@@ -1743,7 +1838,7 @@ function vehicleConsoleWarn(message, ...args) {
 
 function applyVehicleTextureSampling(texture) {
   if (!texture || !texture.isTexture) return;
-  const maxAniso = renderer.capabilities.getMaxAnisotropy?.() ?? 1;
+  const maxAniso = renderer.capabilities?.getMaxAnisotropy?.() ?? 1;
   texture.anisotropy = Math.max(1, Math.min(maxAniso, VEHICLE_TEXTURE_ANISOTROPY));
   texture.minFilter = THREE.LinearMipmapLinearFilter;
   texture.magFilter = THREE.LinearFilter;
@@ -3246,8 +3341,27 @@ function createWebGPUAtmospherePostProcessing(renderer) {
     return null;
   }
   renderer.library.addLight(CloudShadowAtmosphereLightNode, AtmosphereLight);
-  const atmosphereLight = new AtmosphereLight(webgpuAtmosphereContext, MAX_VIEW_DIST);
+  const atmosphereLight = new AtmosphereLight(MAX_VIEW_DIST);
   atmosphereLight.name = 'webgpu-atmosphere-light';
+
+  // Sun-space cascaded shadow maps over the terrain. Feeds both surface
+  // shadows and the epipolar god-ray shadow length below.
+  atmosphereLight.castShadow = true;
+  atmosphereLight.shadow.mapSize.width = 2048;
+  atmosphereLight.shadow.mapSize.height = 2048;
+  atmosphereLight.shadow.bias = 1e-4;
+  atmosphereLight.shadow.camera.near = 0;
+  atmosphereLight.shadow.camera.far = 3e5;
+  const csmShadowNode = new CascadedShadowMapsNode(atmosphereLight);
+  // 3 cascades, not 4: texture-heavy materials (vehicle PBR maps + atmosphere
+  // LUTs + cloud shadow) hit WebGPU's 16-sampled-textures-per-stage limit.
+  csmShadowNode.cascades = 3;
+  csmShadowNode.maxFar = MAX_VIEW_DIST;
+  csmShadowNode.fade = false;
+  csmShadowNode.lightMargin = 1e5;
+  atmosphereLight.shadow.shadowNode = csmShadowNode;
+  webgpuCsmShadowNode = csmShadowNode;
+
   webgpuCloudShadows = new WebGPUCloudShadows({
     anchor: anchorPosition,
     east,
@@ -3262,27 +3376,76 @@ function createWebGPUAtmospherePostProcessing(renderer) {
   scene.add(atmosphereLight.target);
   webgpuAtmosphereLight = atmosphereLight;
 
-  const scenePass = pass(scene, camera, { samples: 4 });
+  // TAA supersedes MSAA (samples: 0) and stabilizes the epipolar sampling.
+  const scenePass = pass(scene, camera, { samples: 0 });
   scenePass.setMRT(mrt({
     output,
-    normal: normalView
+    velocity: highpVelocity,
+    viewZUnit
   }));
   const colorNode = scenePass.getTextureNode('output');
   const depthNode = scenePass.getTextureNode('depth');
-  const normalNode = scenePass.getTextureNode('normal');
-  const postProcessing = new PostProcessing(renderer);
-  const atmosphereNode = cloudShadowAerialPerspective(
-    webgpuAtmosphereContext,
-    colorNode,
-    depthNode,
-    normalNode,
-    webgpuCloudShadows
-  );
+  const velocityNode = scenePass.getTextureNode('velocity');
+  const viewZUnitNode = scenePass.getTextureNode('viewZUnit');
+  viewZUnitNode.value.format = THREE.RedFormat;
+
+  // Epipolar volumetric shadow length (Intel Outdoor Light Scattering):
+  // the per-ray occlusion term that carves god rays out of the inscatter.
+  const shadowLengthNode = shadowLength(csmShadowNode, viewZUnitNode);
+  webgpuShadowLengthNode = shadowLengthNode;
+
+  const atmosphereNode = webgpuAerialPerspective(colorNode, depthNode, shadowLengthNode);
   atmosphereNode.skyNode.sunNode.angularRadius.value = webgpuAtmosphereSettings.sunAngularRadius;
   atmosphereNode.skyNode.sunNode.intensity.value = webgpuAtmosphereSettings.sunIntensity;
   webgpuAtmosphereNode = atmosphereNode;
-  postProcessing.outputNode = atmosphereNode;
-  bootLog('renderer.webgpu.atmosphere.ready');
+
+  const lensFlareNode = lensFlare(atmosphereNode);
+  const toneMappingNode = toneMapping(
+    THREE.AgXToneMapping,
+    webgpuToneMappingExposure,
+    lensFlareNode
+  );
+  const taaNode = temporalAntialias(toneMappingNode, depthNode, velocityNode, camera);
+  const postProcessing = new PostProcessing(renderer);
+  let outputNode = taaNode.add(dithering);
+  if (window.location.hash === '#shadow-length-internal') {
+    // Epipolar pipeline internals (coordinate/min-max/slice textures).
+    outputNode = bool(true).select(
+      shadowLengthNode.getDebugInternalTexturesNode(),
+      outputNode
+    );
+  } else if (window.location.hash === '#shadow-length') {
+    // Shareable validation view (like #shadow-mask): grayscale god-ray shadow
+    // length, 1.0 = 10 km of shadowed ray. The node outputs vec2(distance to
+    // shadow start, shadowed extent) in unit space — y is the length term.
+    // The select keeps the main path in the graph so the scene pass (and its
+    // viewZ buffer) still renders.
+    outputNode = bool(true).select(
+      shadowLengthNode.yyy
+        .mul(1 / webgpuAtmosphereParameters.worldToUnit)
+        .mul(0.0001),
+      outputNode
+    );
+  }
+  postProcessing.outputNode = outputNode;
+  // Console-poke handle for shadow/god-ray diagnostics.
+  window.__atlantisWebGPU = {
+    renderer,
+    atmosphereLight,
+    csmShadowNode,
+    shadowLengthNode,
+    atmosphereNode,
+    postProcessing,
+    scene,
+    camera,
+    THREE,
+    MeshLambertNodeMaterial
+  };
+  bootLog('renderer.webgpu.atmosphere.ready', {
+    godRays: true,
+    csmCascades: csmShadowNode.cascades,
+    csmMaxFar: csmShadowNode.maxFar
+  });
   return postProcessing;
 }
 
@@ -3299,7 +3462,7 @@ function applyWebGPUAtmosphereLiveSettings() {
   if (!renderBackend.isWebGPU) {
     return;
   }
-  renderer.toneMappingExposure = webgpuAtmosphereSettings.toneMappingExposure;
+  webgpuToneMappingExposure.value = webgpuAtmosphereSettings.toneMappingExposure;
   if (webgpuSkyBackgroundNode?.sunNode != null) {
     webgpuSkyBackgroundNode.sunNode.angularRadius.value = webgpuAtmosphereSettings.sunAngularRadius;
     webgpuSkyBackgroundNode.sunNode.intensity.value = webgpuAtmosphereSettings.sunIntensity;
@@ -3309,13 +3472,30 @@ function applyWebGPUAtmosphereLiveSettings() {
     postSun.angularRadius.value = webgpuAtmosphereSettings.sunAngularRadius;
     postSun.intensity.value = webgpuAtmosphereSettings.sunIntensity;
   }
+  if (webgpuShadowLengthNode != null) {
+    webgpuShadowLengthNode.epipolarSliceCount.value = webgpuAtmosphereSettings.godRaySlices;
+    webgpuShadowLengthNode.maxSliceSampleCount.value = webgpuAtmosphereSettings.godRaySlices / 2;
+  }
+  const activeShadowLength = webgpuAtmosphereSettings.godRays ? webgpuShadowLengthNode : null;
+  if (
+    webgpuAtmosphereNode != null &&
+    webgpuAtmosphereNode.shadowLengthNode !== activeShadowLength
+  ) {
+    webgpuAtmosphereNode.shadowLengthNode = activeShadowLength;
+    if (webgpuAtmosphereNode.skyNode != null) {
+      webgpuAtmosphereNode.skyNode.shadowLengthNode = activeShadowLength;
+    }
+    if (webgpuAtmospherePostProcessing != null) {
+      webgpuAtmospherePostProcessing.needsUpdate = true;
+    }
+  }
 }
 
 function applyWebGPUCloudShadowLiveSettings() {
   if (webgpuCloudShadows == null) {
     return;
   }
-  webgpuCloudShadows.enabled.value = false;
+  webgpuCloudShadows.enabled.value = webgpuCloudShadowSettings.enabled;
   webgpuCloudShadows.debugSurface.value = webgpuCloudShadowSettings.debugSurface;
   webgpuCloudShadows.coverage.value = webgpuCloudShadowSettings.coverage;
   webgpuCloudShadows.density.value = webgpuCloudShadowSettings.density;
@@ -3329,8 +3509,13 @@ function rebuildWebGPUAtmosphere() {
   if (webgpuAtmosphereLight != null) {
     scene.remove(webgpuAtmosphereLight.target);
     scene.remove(webgpuAtmosphereLight);
+    // Also disposes the CSM shadow node and its render targets.
+    webgpuAtmosphereLight.dispose();
     webgpuAtmosphereLight = null;
   }
+  webgpuCsmShadowNode = null;
+  webgpuShadowLengthNode?.dispose?.();
+  webgpuShadowLengthNode = null;
   webgpuCloudShadows?.dispose();
   webgpuCloudShadows = null;
   webgpuAtmospherePostProcessing?.dispose?.();
@@ -3338,7 +3523,7 @@ function rebuildWebGPUAtmosphere() {
   webgpuAtmosphereContext?.dispose?.();
   webgpuAtmosphereContext = createWebGPUAtmosphereContext();
   if (webgpuAtmosphereContext != null) {
-    webgpuSkyBackgroundNode = skyBackground(webgpuAtmosphereContext);
+    webgpuSkyBackgroundNode = skyBackground();
     scene.backgroundNode = webgpuSkyBackgroundNode;
     updateWebGPUAtmosphereDate(lastRenderedDate);
   } else {
@@ -3357,6 +3542,17 @@ const buildMesh = createTerrainMeshBuilder({
   oceanClassifier: terrainOceanClassifier,
   exaggeration: EXAG,
   attachScatter: attachTileScatter,
+  // Lit terrain: receives the AtmosphereLight (physical sun + sky) and the
+  // cascaded shadow maps that drive the god rays. The WebGL client keeps its
+  // unlit material and applies sun lighting in post instead.
+  // shadowSide FrontSide: the tiles are open heightfield sheets, and three's
+  // default back-side shadow rendering would cull them out of the shadow maps
+  // entirely (leaving CSM/god rays empty).
+  createMaterial: () => new MeshLambertNodeMaterial({
+    color: 0xffffff, side: THREE.FrontSide, vertexColors: true,
+    shadowSide: THREE.FrontSide,
+  }),
+  shadows: true,
 });
 
 // --- Status colors for untextured tiles ---

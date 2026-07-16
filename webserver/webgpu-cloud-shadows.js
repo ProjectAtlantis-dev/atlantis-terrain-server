@@ -15,7 +15,7 @@ import {
   float,
   mix,
   mx_fractal_noise_float,
-  positionWorld,
+  positionView,
   select,
   smoothstep,
   texture,
@@ -25,7 +25,10 @@ import {
   vec3,
   vec4
 } from 'three/tsl';
-import { AtmosphereLightNode } from '@takram/three-atmosphere/webgpu';
+import {
+  AtmosphereLightNode,
+  getAtmosphereContext
+} from '@takram/three-atmosphere/webgpu';
 
 const SHADOW_MAP_SIZE = 512;
 const SHADOW_MAP_SPAN_M = 70_000;
@@ -58,13 +61,14 @@ export class CloudShadowAtmosphereLightNode extends AtmosphereLightNode {
   setupDirect(builder) {
     const directLight = super.setupDirect(builder);
     const cloudShadow = this.light?.cloudShadow;
-    const atmosphereContext = this.light?.atmosphereContext;
-    if (directLight == null || cloudShadow == null || atmosphereContext == null) {
+    if (directLight == null || cloudShadow == null) {
       return directLight;
     }
+    // v0.19: the context is resolved through the builder, not the light.
+    const atmosphereContext = getAtmosphereContext(builder);
 
-    let positionECEF = atmosphereContext.matrixWorldToECEF
-      .mul(vec4(positionWorld, 1))
+    let positionECEF = atmosphereContext.matrixViewToECEF
+      .mul(vec4(positionView, 1))
       .xyz;
     if (atmosphereContext.correctAltitude) {
       positionECEF = positionECEF.add(atmosphereContext.altitudeCorrectionECEF);

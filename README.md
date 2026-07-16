@@ -100,7 +100,7 @@ The frontend depends on a local clone of the [Takram three-geospatial](https://g
 ```bash
 cd webserver
 git clone https://github.com/takram-design-engineering/three-geospatial.git
-cd three-geospatial && git checkout ab3d1cf5 && cd ..
+cd three-geospatial && git checkout b012ad06 && cd ..
 npm install
 ```
 

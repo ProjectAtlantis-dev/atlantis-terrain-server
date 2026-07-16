@@ -30,7 +30,10 @@ function elevationColor(elevation) {
   return stops.at(-1);
 }
 
-export function createTerrainMeshBuilder({ oceanClassifier, exaggeration, attachScatter }) {
+export function createTerrainMeshBuilder({
+  oceanClassifier, exaggeration, attachScatter,
+  createMaterial = null, shadows = false,
+}) {
   const {
     OCEAN_EDGE_SEED_MAX_M, sampleOceanBlueScore,
     classifyOceanMask, adjustedSeabedElevation,
@@ -88,10 +91,16 @@ export function createTerrainMeshBuilder({ oceanClassifier, exaggeration, attach
     geometry.setAttribute('uv', new THREE.BufferAttribute(uvs, 2));
     geometry.setIndex(indices);
     geometry.computeVertexNormals();
-    const material = new THREE.MeshBasicMaterial({
-      color: 0xffffff, side: THREE.FrontSide, vertexColors: true,
-    });
+    const material = createMaterial
+      ? createMaterial()
+      : new THREE.MeshBasicMaterial({
+          color: 0xffffff, side: THREE.FrontSide, vertexColors: true,
+        });
     const mesh = new THREE.Mesh(geometry, material);
+    if (shadows) {
+      mesh.castShadow = true;
+      mesh.receiveShadow = true;
+    }
     Object.assign(mesh.userData, {
       tileId: tile.id, bbox: tile.bbox, isWater: oceanCount > 0,
       oceanCoverage: oceanCount / (resolution * resolution),
