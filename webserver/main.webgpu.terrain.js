@@ -3416,6 +3416,10 @@ function createWebGPUAtmospherePostProcessing(renderer) {
   // Sun-space cascaded shadow maps over the terrain. Feeds both surface
   // shadows and the epipolar god-ray shadow length below.
   atmosphereLight.castShadow = true;
+  // 2048/cascade uniformly: ShadowLengthNode derives maxShadowStep and
+  // shadowMapTexelSize from cascade 0 only, so mixed per-cascade sizes are
+  // unsafe. Resolution is re-evaluated from stationary A/B measurements
+  // after split/refresh fixes, not assumed.
   atmosphereLight.shadow.mapSize.width = 2048;
   atmosphereLight.shadow.mapSize.height = 2048;
   atmosphereLight.shadow.bias = 1e-4;
@@ -3428,6 +3432,26 @@ function createWebGPUAtmospherePostProcessing(renderer) {
   csmShadowNode.maxFar = MAX_VIEW_DIST;
   csmShadowNode.fade = false;
   csmShadowNode.lightMargin = 1e5;
+  // Custom splits: the CSM serves two roles — sharp surface shadows where
+  // the LAAS veg patch lives (768 m span, active below 800 m AGL) and macro
+  // occlusion to MAX_VIEW_DIST for the epipolar god rays. 'practical' puts
+  // the first break at ~8 km (~19 m/texel); pinning it at 500 m gives
+  // ~0.6 m/texel near detail while the far cascade keeps mountain/fjord
+  // occluders for shadowLength. Values are normalized to
+  // min(camera.far, maxFar). Set before first render — CSMShadowNode._init
+  // runs updateFrustums(); changing splits at runtime needs a manual
+  // updateFrustums() call.
+  csmShadowNode.mode = 'custom';
+  csmShadowNode.customSplitsCallback = (cascades, near, far, target) => {
+    const splitsM = [500, 8000];
+    let prev = 0;
+    for (let i = 0; i < cascades - 1; i++) {
+      const frac = Math.min(Math.max((splitsM[i] ?? far) / far, prev + 1e-4), 1);
+      target.push(frac);
+      prev = frac;
+    }
+    target.push(1);
+  };
   atmosphereLight.shadow.shadowNode = csmShadowNode;
   webgpuCsmShadowNode = csmShadowNode;
 
@@ -5152,8 +5176,70 @@ function render() {
     // inside the frame corrupts other passes on r182).
     webgpuCloudShadows.update(renderer);
   }
+  updateTerrainShadowBudget();
   renderBackend.renderScene(scene, camera);
   stopRenderLoopIfIdle();
+}
+
+// --- Terrain shadow budget -------------------------------------------------
+// Per-cascade caster selection needs NO radial cull here: terrain tiles keep
+// frustumCulled=true with valid geometry bounding spheres, so each cascade's
+// shadow render already frustum-culls tiles against its own sun-space ortho
+// box (which CSMShadowNode extrudes sunward by lightMargin). A castShadow
+// radius cap is global across cascades — it would also strip distant
+// mountains out of the far cascade that the epipolar god rays march, so it
+// is a profiling diagnostic only (?shadowRadialCull=1), never production.
+// - Staggered cascades: near cascade refreshes every frame, cascade i every
+//   2^i frames. (Interim policy — to be replaced by texel-drift/sun-angle
+//   invalidation; three freezes each cascade's depth map and sampling matrix
+//   together while needsUpdate is false, so staleness is consistent, not
+//   swimming.)
+// BOOT_QUERY, not location.search: the boot code strips the query string
+// from the URL via history.replaceState right after capturing it.
+const SHADOW_RADIAL_CULL_DIAGNOSTIC = BOOT_QUERY.get('shadowRadialCull') === '1';
+const SHADOW_CASTER_RADIUS_M = 20000;
+const SHADOW_CULL_INTERVAL_FRAMES = 15;
+let shadowBudgetFrame = 0;
+const _shadowCasterScratch = new THREE.Vector3();
+
+function updateTerrainShadowBudget() {
+  if (!renderBackend.isWebGPU) {
+    return;
+  }
+  shadowBudgetFrame++;
+
+  const cascadeLights = webgpuCsmShadowNode?.lights;
+  if (cascadeLights != null && cascadeLights.length > 0) {
+    for (let i = 0; i < cascadeLights.length; i++) {
+      const shadow = cascadeLights[i].shadow;
+      if (shadow == null) continue;
+      shadow.autoUpdate = false;
+      if ((shadowBudgetFrame & ((1 << i) - 1)) === 0) {
+        shadow.needsUpdate = true;
+      }
+    }
+  }
+
+  if (!SHADOW_RADIAL_CULL_DIAGNOSTIC) {
+    return;
+  }
+  if (shadowBudgetFrame % SHADOW_CULL_INTERVAL_FRAMES !== 0) {
+    return;
+  }
+  const radiusSq = SHADOW_CASTER_RADIUS_M * SHADOW_CASTER_RADIUS_M;
+  scene.traverse(obj => {
+    if (!obj.isMesh || obj.userData?.tileId == null) return;
+    // Tile coordinates are baked into the geometry (mesh transform stays at
+    // the terrain-root origin), so measure the bounding-sphere center in
+    // world space — matrixWorld alone reports the same point for every tile.
+    const geometry = obj.geometry;
+    if (geometry.boundingSphere === null) geometry.computeBoundingSphere();
+    const distSq = _shadowCasterScratch
+      .copy(geometry.boundingSphere.center)
+      .applyMatrix4(obj.matrixWorld)
+      .distanceToSquared(camera.position);
+    obj.castShadow = distSq < radiusSq;
+  });
 }
 
 streamingMaintenanceTimer = window.setInterval(runStreamingMaintenance, STREAMING_MAINTENANCE_MS);
