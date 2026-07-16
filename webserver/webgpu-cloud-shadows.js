@@ -53,6 +53,10 @@ function createShadowTarget() {
   return target;
 }
 
+// Live toggle for cloud shadows on surfaces (1 = on). A uniform so flipping
+// it does not rebuild the lighting graph.
+export const cloudShadowsEnabled = uniform(1).setName('cloudShadowsEnabled');
+
 export class CloudShadowAtmosphereLightNode extends AtmosphereLightNode {
   static get type() {
     return 'CloudShadowAtmosphereLightNode';
@@ -73,8 +77,13 @@ export class CloudShadowAtmosphereLightNode extends AtmosphereLightNode {
     if (atmosphereContext.correctAltitude) {
       positionECEF = positionECEF.add(atmosphereContext.altitudeCorrectionECEF);
     }
+    // Takram beer shadow map (CloudBeerShadowMapNode) or the legacy
+    // procedural map (WebGPUCloudShadows) — both expose a transmittance node.
+    const transmittance = cloudShadow.sampleTransmittance != null
+      ? cloudShadow.sampleTransmittance(positionECEF)
+      : cloudShadow.getTransmittanceNode(positionECEF);
     directLight.lightColor = directLight.lightColor.mul(
-      cloudShadow.getTransmittanceNode(positionECEF)
+      mix(float(1), transmittance, cloudShadowsEnabled)
     );
     return directLight;
   }

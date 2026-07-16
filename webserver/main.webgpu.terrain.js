@@ -64,15 +64,19 @@ import {
   Turbulence
 } from '@takram/three-clouds';
 import {
+  CloudBeerShadowMapNode,
+  CloudDensityField,
+  CloudShapeDetailNode,
   CloudShapeNode,
-  LocalWeatherNode
+  LocalWeatherNode,
+  TurbulenceNode
 } from '@takram/three-clouds/webgpu';
 import { DitheringEffect } from './three-geospatial/packages/effects/src/index.ts';
 import { Ellipsoid, Geodetic, radians } from '@takram/three-geospatial';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import {
-  CloudShadowAtmosphereLightNode,
-  WebGPUCloudShadows
+  cloudShadowsEnabled,
+  CloudShadowAtmosphereLightNode
 } from './webgpu-cloud-shadows.js';
 import { buildBackupScatterLibrary } from './laas-scatter-adapter.js';
 import { GreenlandPatch } from './laas-terrain-patch.js';
@@ -275,6 +279,7 @@ let webgpuAtmosphereLight = null;
 let webgpuAtmosphereNode = null;
 let webgpuAtmospherePostProcessing = null;
 let webgpuCloudShadows = null;
+let webgpuCloudDensityField = null;
 let webgpuCsmShadowNode = null;
 let webgpuShadowLengthNode = null;
 let webgpuAtmospherePostProcessingReady = false;
@@ -3426,14 +3431,24 @@ function createWebGPUAtmospherePostProcessing(renderer) {
   atmosphereLight.shadow.shadowNode = csmShadowNode;
   webgpuCsmShadowNode = csmShadowNode;
 
-  webgpuCloudShadows = new WebGPUCloudShadows({
-    anchor: anchorPosition,
-    east,
-    north,
-    up,
-    camera,
-    atmosphereContext: webgpuAtmosphereContext
+  // Takram volumetric cloud density field + beer shadow map (cascaded cloud
+  // optical depth marched from the sun). Replaces the handrolled procedural
+  // cloud-shadow quad. The procedural texture nodes compute once on first
+  // build; the shadow map recomputes every frame from updateBefore.
+  const cloudTextures = {
+    localWeather: new LocalWeatherNode(),
+    shape: new CloudShapeNode(),
+    shapeDetail: new CloudShapeDetailNode(),
+    turbulence: new TurbulenceNode()
+  };
+  webgpuCloudDensityField = new CloudDensityField({
+    localWeatherNode: cloudTextures.localWeather.getTextureNode(),
+    shapeNode: cloudTextures.shape.getTextureNode(),
+    shapeDetailNode: cloudTextures.shapeDetail.getTextureNode(),
+    turbulenceNode: cloudTextures.turbulence.getTextureNode()
   });
+  webgpuCloudShadows = new CloudBeerShadowMapNode(camera, webgpuCloudDensityField);
+  webgpuCloudShadows.maxFar = MAX_VIEW_DIST;
   applyWebGPUCloudShadowLiveSettings();
   atmosphereLight.cloudShadow = webgpuCloudShadows;
   scene.add(atmosphereLight);
@@ -3516,6 +3531,27 @@ function createWebGPUAtmospherePostProcessing(renderer) {
       screenUV.x.lessThan(0.5).select(weatherSample, shapeSample),
       outputNode
     );
+  } else if (window.location.hash === '#cloud-bsm') {
+    // Beer shadow map cascades side by side. R channel = distance to cloud
+    // front (scaled), G = mean extinction — cloud footprints show as
+    // structure in G; empty sky is (maxRayDistance, 0, 0, 0).
+    const bsmX = screenUV.x.mul(3);
+    const bsmSample = webgpuCloudShadows
+      .getTextureNode()
+      .sample(vec3(bsmX.fract(), screenUV.y, bsmX.floor().add(0.5).div(3)));
+    // Keep the main path in the graph so the scene pass still renders (the
+    // CSM and the rest of the pipeline initialize from it).
+    outputNode = bool(true).select(
+      vec4(
+        vec3(
+          bsmSample.g.mul(2000),
+          bsmSample.b.add(bsmSample.a).mul(0.5),
+          bsmSample.r.mul(1e-5)
+        ),
+        1
+      ),
+      outputNode
+    );
   } else if (window.location.hash === '#cloud-shape-only') {
     // Minimal graph: 3D shape slices only, main path excluded entirely.
     // Distinguishes "3D node broken in-client" from "post graph pressure".
@@ -3542,7 +3578,9 @@ function createWebGPUAtmospherePostProcessing(renderer) {
     scene,
     camera,
     THREE,
-    MeshLambertNodeMaterial
+    MeshLambertNodeMaterial,
+    cloudDensityField: webgpuCloudDensityField,
+    beerShadowMap: webgpuCloudShadows
   };
   bootLog('renderer.webgpu.atmosphere.ready', {
     godRays: true,
@@ -3595,14 +3633,21 @@ function applyWebGPUAtmosphereLiveSettings() {
 }
 
 function applyWebGPUCloudShadowLiveSettings() {
-  if (webgpuCloudShadows == null) {
+  cloudShadowsEnabled.value = webgpuCloudShadowSettings.enabled ? 1 : 0;
+  if (webgpuCloudDensityField == null) {
     return;
   }
-  webgpuCloudShadows.enabled.value = webgpuCloudShadowSettings.enabled;
-  webgpuCloudShadows.debugSurface.value = webgpuCloudShadowSettings.debugSurface;
-  webgpuCloudShadows.coverage.value = webgpuCloudShadowSettings.coverage;
-  webgpuCloudShadows.density.value = webgpuCloudShadowSettings.density;
-  webgpuCloudShadows.strength.value = webgpuCloudShadowSettings.strength;
+  webgpuCloudDensityField.coverage.value = webgpuCloudShadowSettings.coverage;
+  // "density" scales all four layers' density uniformly, preserving the
+  // takram per-layer profile ratios.
+  const scale = webgpuCloudShadowSettings.density;
+  const defaults = webgpuCloudDensityField.layers;
+  webgpuCloudDensityField.densityScales.value.set(
+    defaults[0].densityScale * scale,
+    defaults[1].densityScale * scale,
+    defaults[2].densityScale * scale,
+    defaults[3].densityScale * scale
+  );
 }
 
 function rebuildWebGPUAtmosphere() {
@@ -3621,6 +3666,7 @@ function rebuildWebGPUAtmosphere() {
   webgpuShadowLengthNode = null;
   webgpuCloudShadows?.dispose();
   webgpuCloudShadows = null;
+  webgpuCloudDensityField = null;
   webgpuAtmospherePostProcessing?.dispose?.();
   webgpuAtmosphereNode = null;
   webgpuAtmosphereContext?.dispose?.();
@@ -4261,7 +4307,16 @@ window.takramDebug = {
   applyDate,
   bootEvents,
   getBootEvents: () => bootEvents.slice(),
-  getCloudShadowDebugSummary: () => webgpuCloudShadows?.debugSummary() ?? null,
+  getCloudShadowDebugSummary: () =>
+    webgpuCloudDensityField != null
+      ? {
+          enabled: cloudShadowsEnabled.value === 1,
+          coverage: webgpuCloudDensityField.coverage.value,
+          densityScales: webgpuCloudDensityField.densityScales.value.toArray(),
+          shadowTopHeight: webgpuCloudDensityField.shadowTopHeight.value,
+          shadowBottomHeight: webgpuCloudDensityField.shadowBottomHeight.value
+        }
+      : null,
   flushClientLogQueue: () => flushClientLogQueue(),
   fetchTiles,
   loadHouseModel,
@@ -5093,7 +5148,9 @@ function render() {
     greenlandPatch.update(renderer, camera, cameraAGL);
   }
   if (renderBackend.isWebGPU && webgpuCloudShadows != null) {
-    webgpuCloudShadows.update(renderer, clock.elapsedTime);
+    // Throttled internally; must run OUTSIDE the render (a compute submit
+    // inside the frame corrupts other passes on r182).
+    webgpuCloudShadows.update(renderer);
   }
   renderBackend.renderScene(scene, camera);
   stopRenderLoopIfIdle();
