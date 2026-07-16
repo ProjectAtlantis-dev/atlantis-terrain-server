@@ -16,6 +16,7 @@ import {
   mix,
   mx_fractal_noise_float,
   positionView,
+  renderGroup,
   select,
   smoothstep,
   texture,
@@ -54,8 +55,11 @@ function createShadowTarget() {
 }
 
 // Live toggle for cloud shadows on surfaces (1 = on). A uniform so flipping
-// it does not rebuild the lighting graph.
-export const cloudShadowsEnabled = uniform(1).setName('cloudShadowsEnabled');
+// it does not rebuild the lighting graph. MUST be renderGroup-scoped: this
+// node is shared by every lit material, and per-object uniforms shared
+// across materials generate invalid WGSL on r182 ("object.name_1 : f32"
+// struct members -> invalid terrain pipelines).
+export const cloudShadowsEnabled = uniform(1).setGroup(renderGroup);
 
 export class CloudShadowAtmosphereLightNode extends AtmosphereLightNode {
   static get type() {
