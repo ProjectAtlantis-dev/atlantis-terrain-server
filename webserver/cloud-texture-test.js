@@ -38,3 +38,5 @@ renderer.setAnimationLoop(() => {
   renderer.render(scene, camera);
 });
 console.log('CLOUD_TEXTURE_TEST_READY');
+
+window.__test = { renderer, shapeNode };

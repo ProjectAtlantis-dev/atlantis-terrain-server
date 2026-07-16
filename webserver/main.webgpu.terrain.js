@@ -20,6 +20,7 @@ import {
   transformNormalToView,
   uv,
   vec3,
+  vec4,
   uniform
 } from 'three/tsl';
 import { MeshLambertNodeMaterial, PostProcessing, WebGPURenderer } from 'three/webgpu';
@@ -464,11 +465,36 @@ function createRenderBackend() {
     setPostProcessing(postProcessing) {
       this.postProcessing = postProcessing;
     },
+    async clampRequiredLimits() {
+      // A requiredLimits entry above what the adapter supports fails DEVICE
+      // creation entirely, and three silently falls back to the WebGL backend
+      // (headless Chromium adapters cap maxSampledTexturesPerShaderStage at
+      // 16 where headed Chrome offers 48). Clamp each requested limit to the
+      // adapter's maximum so init degrades per-limit instead of per-backend.
+      const requested = renderer.backend?.parameters?.requiredLimits;
+      if (requested == null || navigator.gpu == null) {
+        return;
+      }
+      const adapter = await navigator.gpu.requestAdapter().catch(() => null);
+      if (adapter == null) {
+        return;
+      }
+      for (const [name, value] of Object.entries(requested)) {
+        const supported = adapter.limits[name];
+        if (typeof supported === 'number' && value > supported) {
+          requested[name] = supported;
+          enqueueClientLog('warn', 'renderer.webgpu.limit.clamped', {
+            limit: name, requested: value, supported
+          });
+        }
+      }
+    },
     initialize() {
       if (!isWebGPU) {
         return;
       }
-      renderer.init()
+      this.clampRequiredLimits()
+        .then(() => renderer.init())
         .then(() => {
           // GroundRing's shaded grass uses an EqualDepth pass behind an
           // identical depth-only twin. LAAS installs @invariant on every
@@ -3471,19 +3497,37 @@ function createWebGPUAtmospherePostProcessing(renderer) {
     // first build; visible noise on both halves = the texture stack works.
     const weatherNode = new LocalWeatherNode();
     const shapeNode = new CloudShapeNode();
-    const weatherSample = weatherNode
-      .getTextureNode()
-      .sample(screenUV.mul(vec3(2, 1, 0).xy));
+    window.__cloudDebug = { weatherNode, shapeNode };
+    const weatherSample = vec4(
+      weatherNode.getTextureNode().sample(screenUV.mul(vec3(2, 1, 0).xy)).xyz,
+      1
+    );
     // Right half tiles 8 Z-slices of the 128^3 shape texture so partial
     // compute coverage (some slices written, others not) is visible.
     const shapeX = screenUV.x.mul(2).sub(1).mul(8);
-    const shapeSample = shapeNode
-      .getTextureNode()
-      .sample(vec3(shapeX.fract(), screenUV.y, shapeX.floor().div(8)))
-      .xxxx;
+    const shapeSample = vec4(
+      shapeNode
+        .getTextureNode()
+        .sample(vec3(shapeX.fract(), screenUV.y, shapeX.floor().div(8)))
+        .xxx,
+      1
+    );
     outputNode = bool(true).select(
       screenUV.x.lessThan(0.5).select(weatherSample, shapeSample),
       outputNode
+    );
+  } else if (window.location.hash === '#cloud-shape-only') {
+    // Minimal graph: 3D shape slices only, main path excluded entirely.
+    // Distinguishes "3D node broken in-client" from "post graph pressure".
+    const shapeNode = new CloudShapeNode();
+    window.__cloudDebug = { shapeNode };
+    const shapeX = screenUV.x.mul(8);
+    outputNode = vec4(
+      shapeNode
+        .getTextureNode()
+        .sample(vec3(shapeX.fract(), screenUV.y, shapeX.floor().div(8)))
+        .xxx,
+      1
     );
   }
   postProcessing.outputNode = outputNode;
