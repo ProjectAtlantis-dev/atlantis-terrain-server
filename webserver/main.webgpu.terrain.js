@@ -3782,7 +3782,7 @@ tileLifecycle = createTileLifecycle({
   terrainRoot,
   disposeScatter: disposeTileScatter,
   log: tileLog,
-  onSceneMutated: markSceneMutated,
+  onSceneMutated: () => { markSceneMutated(); markShadowCastersChanged(); },
 });
 
 function clearProcgenTerrainNodes(mesh) {
@@ -3969,7 +3969,7 @@ terrainMeshRuntime = createTerrainMeshRuntime({
   getWaterMask: tileId => waterMaskCache.get(tileId),
   getCurrentTileIds: () => currentTileIds,
   tileDepth: tileDepthFromId,
-  onMeshAdded: markSceneMutated,
+  onMeshAdded: () => { markSceneMutated(); markShadowCastersChanged(); },
   vehicleNearTile: vehicleNearTileBbox,
   getVehicleDepth: () => vehicleLastContactDepth,
   requestVehicleResnap: requestVehicleTerrainResnap,
@@ -4106,6 +4106,15 @@ function markSceneMutated() {
   sceneMutationVersion++;
 }
 
+// Separate from sceneMutationVersion: that counter also bumps on
+// material/texture-only mutations, which depth-only shadow maps don't see.
+// This one tracks caster GEOMETRY changes (tile mesh add/evict/replace) and
+// drives CSM cascade invalidation.
+let shadowCasterVersion = 0;
+function markShadowCastersChanged() {
+  shadowCasterVersion++;
+}
+
 function hasActiveKeyInput() {
   return Object.values(controls.keys).some(Boolean);
 }
@@ -4195,7 +4204,7 @@ const performTileFetch = createTerrainFetchExecutor({
   textureCache: texCache,
   materialize: materializeTile, buildMesh, tileLog, applyMissing: markMissing, updateTextures,
   prepareUntexturedMesh: applyWebGPUUntexturedTerrainMaterial,
-  onMeshAdded: markSceneMutated,
+  onMeshAdded: () => { markSceneMutated(); markShadowCastersChanged(); },
   onResponseApplied: requestRender,
   enqueueLog: enqueueClientLog, bootLog,
 });
@@ -5189,18 +5198,50 @@ function render() {
 // radius cap is global across cascades — it would also strip distant
 // mountains out of the far cascade that the epipolar god rays march, so it
 // is a profiling diagnostic only (?shadowRadialCull=1), never production.
-// - Staggered cascades: near cascade refreshes every frame, cascade i every
-//   2^i frames. (Interim policy — to be replaced by texel-drift/sun-angle
-//   invalidation; three freezes each cascade's depth map and sampling matrix
-//   together while needsUpdate is false, so staleness is consistent, not
-//   swimming.)
+// - Cascade refresh is invalidation-driven, not frame-staggered: three keeps
+//   each cascade's depth map and its sampling matrix frozen TOGETHER while
+//   needsUpdate is false (shadow.updateMatrices only runs inside
+//   renderShadow), so a cached cascade never swims — it only lags coverage.
+//   A cascade re-renders when its texel-snapped fit drifts ≥ N texels, the
+//   sun moves past its angle threshold, tiles stream, the procgen patch
+//   recenters, the vehicle (a scene CSM caster) moves, the projection
+//   changes, or a slow wall-clock fallback expires. Frame counts are
+//   meaningless at low FPS.
 // BOOT_QUERY, not location.search: the boot code strips the query string
 // from the URL via history.replaceState right after capturing it.
 const SHADOW_RADIAL_CULL_DIAGNOSTIC = BOOT_QUERY.get('shadowRadialCull') === '1';
+// A/B diagnostic: ?csmRefreshLegacy=1 selects the old frame-count stagger
+// (near cascade every frame, cascade i every 2^i frames) instead of the
+// invalidation policy. For measurement-protocol comparisons.
+const CSM_LEGACY_STAGGER_DIAGNOSTIC = BOOT_QUERY.get('csmRefreshLegacy') === '1';
 const SHADOW_CASTER_RADIUS_M = 20000;
 const SHADOW_CULL_INTERVAL_FRAMES = 15;
 let shadowBudgetFrame = 0;
 const _shadowCasterScratch = new THREE.Vector3();
+
+// Per-cascade thresholds. Drift is measured on the previous frame's fitted
+// (texel-snapped) cascade light position — one frame stale, absorbed by the
+// threshold. Sun thresholds: real-time sun moves ~0.25°/min, so 0.05° ≈ 12 s
+// between near-cascade refreshes from sun motion alone.
+// streamHoldMs: tile add/evict/replace marks cascades dirty, but the swap
+// preserves the terrain surface (same ground, different tessellation or a
+// textured twin), so depth barely changes — coalesce to one refresh per hold
+// window instead of chasing the materialization trickle frame by frame.
+const CSM_REFRESH_POLICY = [
+  { driftTexels: 2, sunRadians: 0.05 * THREE.MathUtils.DEG2RAD, streamHoldMs: 2000, fallbackMs: 5000 },    // 0–500 m
+  { driftTexels: 2, sunRadians: 0.10 * THREE.MathUtils.DEG2RAD, streamHoldMs: 5000, fallbackMs: 15000 },   // 0.5–8 km
+  { driftTexels: 2, sunRadians: 0.20 * THREE.MathUtils.DEG2RAD, streamHoldMs: 10000, fallbackMs: 30000 }   // 8–50 km
+];
+const _csmRefreshStats = { count: [0, 0, 0], reasons: {} };
+let _csmStateOwner = null;   // csm node the state belongs to (reset on rebuild)
+let _csmCascadeState = [];
+let _csmSeenSceneVersion = -1;
+let _csmSeenPatchCenter = null;
+let _csmSeenFov = -1;
+let _csmSeenAspect = -1;
+const _csmSeenVehiclePos = new THREE.Vector3(Infinity, Infinity, Infinity);
+const _csmSeenVehicleQuat = new THREE.Quaternion();
+const _csmSunScratch = new THREE.Vector3();
 
 function updateTerrainShadowBudget() {
   if (!renderBackend.isWebGPU) {
@@ -5208,18 +5249,131 @@ function updateTerrainShadowBudget() {
   }
   shadowBudgetFrame++;
 
-  const cascadeLights = webgpuCsmShadowNode?.lights;
-  if (cascadeLights != null && cascadeLights.length > 0) {
+  const csm = webgpuCsmShadowNode;
+  const cascadeLights = csm?.lights;
+  if (csm != null && cascadeLights != null && cascadeLights.length > 0) {
+    if (CSM_LEGACY_STAGGER_DIAGNOSTIC) {
+      for (let i = 0; i < cascadeLights.length; i++) {
+        const shadow = cascadeLights[i].shadow;
+        if (shadow == null) continue;
+        shadow.autoUpdate = false;
+        if ((shadowBudgetFrame & ((1 << i) - 1)) === 0) {
+          shadow.needsUpdate = true;
+        }
+      }
+      runShadowRadialCullDiagnostic();
+      return;
+    }
+    if (_csmStateOwner !== csm) {
+      _csmStateOwner = csm;
+      _csmCascadeState = [];
+      _csmRefreshStats.count = [0, 0, 0];
+      _csmRefreshStats.reasons = {};
+      csm._refreshStats = _csmRefreshStats;
+      // Baseline the change detectors NOW so the first policy frame doesn't
+      // fire a spurious 'projection' event — that would call
+      // updateFrustums() on a freshly initialized CSM for no reason.
+      _csmSeenFov = camera.fov;
+      _csmSeenAspect = camera.aspect;
+      _csmSeenPatchCenter = greenlandPatch?.centerId ?? null;
+      _csmSeenSceneVersion = shadowCasterVersion;
+    }
+    const nowMs = performance.now();
+
+    // Global invalidation events. Caster streaming only marks cascades
+    // dirty (consumed below under each cascade's streamHoldMs); recenter and
+    // projection changes refresh immediately.
+    let globalReason = null;
+    let castersChanged = false;
+    if (shadowCasterVersion !== _csmSeenSceneVersion) {
+      _csmSeenSceneVersion = shadowCasterVersion;
+      castersChanged = true;
+    }
+    const patchCenter = greenlandPatch?.centerId ?? null;
+    if (patchCenter !== _csmSeenPatchCenter) {
+      _csmSeenPatchCenter = patchCenter;
+      globalReason = 'recenter';
+    }
+    if (camera.fov !== _csmSeenFov || camera.aspect !== _csmSeenAspect) {
+      _csmSeenFov = camera.fov;
+      _csmSeenAspect = camera.aspect;
+      // Splits and cascade bounds derive from the projection; refit first.
+      if (csm.camera != null) {
+        csm.updateFrustums();
+      }
+      globalReason = 'projection';
+    }
+
+    // The vehicle casts into the scene CSM (its meshes are castShadow=true)
+    // on top of its local shadow light; until that's separated its motion
+    // dirties the near cascade.
+    const vehicleMoved =
+      _csmSeenVehiclePos.distanceToSquared(vehicleGroup.position) > 0.05 * 0.05 ||
+      _csmSeenVehicleQuat.angleTo(vehicleGroup.quaternion) > 0.003;
+    if (vehicleMoved) {
+      _csmSeenVehiclePos.copy(vehicleGroup.position);
+      _csmSeenVehicleQuat.copy(vehicleGroup.quaternion);
+    }
+
+    const sunDir = _csmSunScratch
+      .subVectors(csm.light.target.position, csm.light.position)
+      .normalize();
+
     for (let i = 0; i < cascadeLights.length; i++) {
-      const shadow = cascadeLights[i].shadow;
+      const lwLight = cascadeLights[i];
+      const shadow = lwLight.shadow;
       if (shadow == null) continue;
       shadow.autoUpdate = false;
-      if ((shadowBudgetFrame & ((1 << i) - 1)) === 0) {
+      const policy = CSM_REFRESH_POLICY[Math.min(i, CSM_REFRESH_POLICY.length - 1)];
+      let st = _csmCascadeState[i];
+      if (st == null) {
+        st = _csmCascadeState[i] = {
+          fitPos: new THREE.Vector3(),
+          sunDir: new THREE.Vector3(),
+          lastMs: -Infinity,
+          rendered: false,
+          dirtyStream: false
+        };
+      }
+      if (castersChanged) st.dirtyStream = true;
+      let reason = st.rendered ? globalReason : 'init';
+      const shadowCam = shadow.camera;
+      const texel = Number.isFinite(shadowCam.right) && Number.isFinite(shadowCam.left)
+        ? (shadowCam.right - shadowCam.left) / shadow.mapSize.x
+        : 0;
+      if (reason == null && texel > 0 &&
+          lwLight.position.distanceTo(st.fitPos) > policy.driftTexels * texel) {
+        reason = 'drift';
+      }
+      if (reason == null && sunDir.angleTo(st.sunDir) > policy.sunRadians) {
+        reason = 'sun';
+      }
+      if (reason == null && i === 0 && vehicleMoved) {
+        reason = 'vehicle';
+      }
+      if (reason == null && st.dirtyStream && nowMs - st.lastMs > policy.streamHoldMs) {
+        reason = 'stream';
+      }
+      if (reason == null && nowMs - st.lastMs > policy.fallbackMs) {
+        reason = 'fallback';
+      }
+      if (reason != null) {
         shadow.needsUpdate = true;
+        st.rendered = true;
+        st.dirtyStream = false;
+        st.lastMs = nowMs;
+        st.fitPos.copy(lwLight.position);
+        st.sunDir.copy(sunDir);
+        _csmRefreshStats.count[i] = (_csmRefreshStats.count[i] ?? 0) + 1;
+        _csmRefreshStats.reasons[reason] = (_csmRefreshStats.reasons[reason] ?? 0) + 1;
       }
     }
   }
 
+  runShadowRadialCullDiagnostic();
+}
+
+function runShadowRadialCullDiagnostic() {
   if (!SHADOW_RADIAL_CULL_DIAGNOSTIC) {
     return;
   }
