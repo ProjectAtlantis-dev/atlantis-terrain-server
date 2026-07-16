@@ -709,28 +709,6 @@ export function createTerrainTileSet({
     if (lastTiles) updateTextureDemand(lastTiles);
   }
 
-  function applyEnhancedTexture(tileId, texture) {
-    const mesh = terrainRoot.children.find(
-      child => child.isMesh && child.userData?.tileId === tileId,
-    );
-    if (!mesh) return false;
-    applyMaterial(mesh, texture);
-    onMaterialApplied(mesh);
-    return true;
-  }
-
-  function discardEnhancedTexture(tileId) {
-    textureStreamer.invalidate(tileId);
-    const mesh = terrainRoot.children.find(child => child.userData?.tileId === tileId);
-    if (!mesh) return false;
-    desaturatedTextures.get(tileId)?.texture?.dispose?.();
-    desaturatedTextures.delete(tileId);
-    mesh.userData.terrainBaseTexture?.dispose?.();
-    mesh.userData.terrainBaseTexture = null;
-    applyMaterial(mesh, null);
-    return true;
-  }
-
   function setClassifierMode(enabled) {
     const next = Boolean(enabled);
     if (classifierMode === next) return classifierMode;
@@ -765,8 +743,6 @@ export function createTerrainTileSet({
     reconcile,
     updateTextures,
     refreshTextures,
-    applyEnhancedTexture,
-    discardEnhancedTexture,
     setClassifierMode,
     setClassifierTexture,
     resetTextureApplications: updateTextureDemand.reset,

@@ -2,7 +2,7 @@
 
 TEXTURE UPGRADE CHAIN — DO NOT FUCK WITH THE ORDER:
 
-    ancestor_crop → dataforsyningen → dataforsyningen_enhanced → upscaled
+    ancestor_crop → dataforsyningen
 
 TEXTURE SOURCE STATES:
 - ancestor_crop:            Cropped from parent at subdivision time. Fresh, untried.
@@ -16,11 +16,6 @@ TEXTURE SOURCE STATES:
                             deep-ocean fill (OCEAN_RGB). Terminal.
 - sentinel2_crop:           Legacy Sentinel-2 placeholder. Re-fetchable.
 - dataforsyningen:          Primary source (SPOT 6/7, 1.6m/0.2m via EPSG:3184).
-- dataforsyningen_enhanced: SUPIR upscale of dataforsyningen via ComfyUI.
-- upscaled:                 Final upscaled output.
-
-- The enhance path (SUPIR via ComfyUI) ONLY processes dataforsyningen tiles.
-  It never fetches from the internet. Never enhance sentinel2.
 - write_texture() has an expected_upgrades whitelist. If you add a new source,
   update that whitelist or you'll get TEX CLOBBER warnings.
 
@@ -39,12 +34,9 @@ SEA / OCEAN TILES:
 
 import datetime
 import io
-import json
 import math
 import os
-import time
 import urllib.error
-import urllib.parse
 import urllib.request
 
 import numpy as np
@@ -54,8 +46,6 @@ from rasterio.transform import from_bounds as transform_from_bounds
 from rasterio.warp import Resampling as WarpResampling, reproject, transform_bounds
 
 from colored_log import get_logger
-from seam_queue import init_seam_jobs
-from terrain_config import ENHANCE_DEPTH
 
 log_tex = get_logger("terrain.tex")
 
@@ -96,7 +86,6 @@ def ocean_texture_jpeg(resolution=256):
     img.save(buf, format="JPEG", quality=85)
     return buf.getvalue()
 
-
 def repair_white_ocean(jpeg_bytes, heightmap, max_elev_m=0.5, min_frac=0.005):
     """Fill white WMS no-data pixels over ocean with OCEAN_RGB.
 
@@ -135,9 +124,6 @@ def repair_white_ocean(jpeg_bytes, heightmap, max_elev_m=0.5, min_frac=0.005):
     buf = io.BytesIO()
     Image.fromarray(arr).save(buf, format="JPEG", quality=85)
     return buf.getvalue()
-
-COMFY_URL = "http://100.106.176.121:8188"
-_UPSCALER_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "upscaler")
 
 def _env_bool(name, default=False):
     raw = os.environ.get(name)
@@ -266,7 +252,6 @@ def init_textures(db):
     """Create texture tables if they don't exist."""
     existing = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
     db.executescript(_TEXTURE_SCHEMA)
-    init_seam_jobs(db)
     db.commit()
     if "textures" not in existing:
         log_tex.info("Created table: textures")
@@ -294,9 +279,6 @@ def write_texture(db, tile_id, jpeg_bytes, source):
             ("ancestor_crop_nodata", "ocean_nodata"),
             ("ocean_nodata", "dataforsyningen"),
             ("sentinel2", "dataforsyningen"),
-            ("dataforsyningen", "dataforsyningen_enhanced"),
-            ("dataforsyningen_enhanced", "upscaled"),
-            ("sentinel2_enhanced", "upscaled"),
         }
         msg = (
             f"{tile_id}: replacing {ex_source} "
@@ -467,195 +449,3 @@ def fetch_sentinel2_texture(bbox, resolution=256):
     buf = io.BytesIO()
     img.save(buf, format="JPEG", quality=85)
     return buf.getvalue()
-
-
-# ---------------------------------------------------------------------------
-# ComfyUI SUPIR upscaler integration
-# ---------------------------------------------------------------------------
-
-# Widget names per node type (order matches widgets_values in the workflow)
-_WIDGET_MAP = {
-    "LoadImage": ["image", "upload"],
-    "ImageScale": ["upscale_method", "width", "height", "crop"],
-    "SUPIR_model_loader": ["supir_model", "sdxl_model", "fp8_unet", "diffusion_dtype"],
-    "SUPIR_encode": ["use_tiled_vae", "encoder_tile_size", "encoder_dtype"],
-    "SUPIR_conditioner": ["positive_prompt", "negative_prompt"],
-    "SUPIR_sample": ["seed", "steps", "cfg_scale_start", "cfg_scale_end",
-                     "EDM_s_churn", "s_noise", "DPMPP_eta",
-                     "control_scale_start", "control_scale_end",
-                     "restore_cfg", "keep_model_loaded", "sampler"],
-    "SUPIR_decode": ["use_tiled_vae", "decoder_tile_size"],
-    "SaveImage": ["filename_prefix"],
-}
-
-
-def _assign_widgets(entry, node_type, values):
-    names = _WIDGET_MAP.get(node_type, [])
-    connected = set(entry["inputs"].keys())
-    for i, name in enumerate(names):
-        if i < len(values) and name not in connected:
-            entry["inputs"][name] = values[i]
-
-
-def _convert_workflow_to_api(workflow_json):
-    """Convert UI-format workflow (nodes/links) to API format."""
-    links = {l[0]: l for l in workflow_json["links"]}
-    prompt = {}
-    for node in workflow_json["nodes"]:
-        nid = str(node["id"])
-        entry = {"class_type": node["type"], "inputs": {}}
-        if "inputs" in node:
-            for inp in node["inputs"]:
-                link_id = inp.get("link")
-                if link_id is not None and link_id in links:
-                    link = links[link_id]
-                    entry["inputs"][inp["name"]] = [str(link[1]), link[2]]
-        if "widgets_values" in node:
-            _assign_widgets(entry, node["type"], node["widgets_values"])
-        prompt[nid] = entry
-    return prompt
-
-
-def _upload_to_comfy(filename, png_bytes):
-    """Upload an image to ComfyUI via POST multipart to /upload/image."""
-    boundary = "----ComfyUploadBoundary"
-    body = (
-        f"--{boundary}\r\n"
-        f'Content-Disposition: form-data; name="image"; filename="{filename}"\r\n'
-        f"Content-Type: image/png\r\n\r\n"
-    ).encode("utf-8") + png_bytes + f"\r\n--{boundary}--\r\n".encode("utf-8")
-
-    req = urllib.request.Request(
-        f"{COMFY_URL}/upload/image",
-        data=body,
-        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
-        method="POST",
-    )
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        result = json.loads(resp.read())
-    log_tex.info(f"[COMFY] uploaded {filename}: {result}")
-    return result
-
-
-def _texture_to_png(jpeg_bytes):
-    """Convert JPEG bytes to PNG bytes in memory."""
-    img = Image.open(io.BytesIO(jpeg_bytes)).convert("RGB")
-    buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    return buf.getvalue()
-
-
-def _submit_upscale(tile_id, texture_jpeg, positive_prompt=None, negative_prompt=None):
-    """Submit a SUPIR upscale job to ComfyUI and return the result JPEG bytes."""
-    tex_filename = f"tile_{tile_id}_texture.png"
-    tex_png = _texture_to_png(texture_jpeg)
-    _upload_to_comfy(tex_filename, tex_png)
-
-    workflow_path = os.path.join(_UPSCALER_DIR, "supir_upscaler.json")
-    with open(workflow_path) as f:
-        workflow = json.load(f)
-    prompt = _convert_workflow_to_api(workflow)
-
-    # Patch inputs: node 1 = texture, node 8 = save prefix
-    if "1" in prompt:
-        prompt["1"]["inputs"]["image"] = tex_filename
-    if "8" in prompt:
-        prompt["8"]["inputs"]["filename_prefix"] = f"supir_{tile_id}"
-
-    # Patch SUPIR conditioner prompts (node 5) if custom prompts provided
-    if "5" in prompt:
-        if positive_prompt is not None:
-            prompt["5"]["inputs"]["positive_prompt"] = positive_prompt
-        if negative_prompt is not None:
-            prompt["5"]["inputs"]["negative_prompt"] = negative_prompt
-
-    actual_pos = prompt.get("5", {}).get("inputs", {}).get("positive_prompt", "<MISSING>")
-    actual_neg = prompt.get("5", {}).get("inputs", {}).get("negative_prompt", "<MISSING>")
-    log_tex.info(f"[COMFY] submitting SUPIR upscale for {tile_id} → {COMFY_URL}")
-    log_tex.info(f"[COMFY]   positive_prompt: {actual_pos}")
-    log_tex.info(f"[COMFY]   negative_prompt: {actual_neg}")
-    payload = json.dumps({"prompt": prompt}).encode("utf-8")
-    req = urllib.request.Request(
-        f"{COMFY_URL}/prompt",
-        data=payload,
-        headers={"Content-Type": "application/json"},
-    )
-    resp = urllib.request.urlopen(req, timeout=30)
-    result = json.loads(resp.read())
-    prompt_id = result.get("prompt_id")
-    log_tex.info(f"[COMFY] queued prompt_id={prompt_id} for {tile_id}")
-
-    # Poll for completion
-    start = time.time()
-    while True:
-        elapsed = time.time() - start
-        if elapsed > 300:
-            raise TimeoutError(f"ComfyUI upscale timed out after {elapsed:.0f}s for {tile_id}")
-        time.sleep(2)
-        try:
-            hist_resp = urllib.request.urlopen(f"{COMFY_URL}/history/{prompt_id}", timeout=10)
-            history = json.loads(hist_resp.read())
-        except Exception:
-            continue
-        if prompt_id not in history:
-            continue
-        entry = history[prompt_id]
-        status = entry.get("status", {})
-        status_str = status.get("status_str", "")
-
-        if status_str == "error":
-            raise RuntimeError(f"ComfyUI upscale failed for {tile_id}: {status}")
-
-        if status_str == "success" or status.get("completed"):
-            outputs = entry.get("outputs", {})
-            for nid, out in outputs.items():
-                if "images" in out:
-                    for img_info in out["images"]:
-                        fname = img_info["filename"]
-                        subfolder = img_info.get("subfolder", "")
-                        img_type = img_info.get("type", "output")
-                        view_url = (
-                            f"{COMFY_URL}/view?"
-                            f"filename={urllib.parse.quote(fname)}"
-                            f"&type={img_type}"
-                        )
-                        if subfolder:
-                            view_url += f"&subfolder={urllib.parse.quote(subfolder)}"
-                        log_tex.info(f"[COMFY] downloading result: {fname}")
-                        with urllib.request.urlopen(view_url, timeout=30) as dl_resp:
-                            result_png = dl_resp.read()
-                        # Convert to JPEG
-                        result_img = Image.open(io.BytesIO(result_png)).convert("RGB")
-                        buf = io.BytesIO()
-                        result_img.save(buf, format="JPEG", quality=90)
-                        elapsed = time.time() - start
-                        log_tex.info(f"[COMFY] SUPIR upscale done for {tile_id} in {elapsed:.1f}s")
-                        return buf.getvalue()
-            raise RuntimeError(f"ComfyUI completed but no output images for {tile_id}")
-
-    raise RuntimeError(f"ComfyUI polling loop exited unexpectedly for {tile_id}")
-
-
-def fetch_enhanced_texture(bbox, resolution=256, s2_jpeg=None, tile_id=None,
-                           positive_prompt=None, negative_prompt=None):
-    """Enhance an existing dataforsyningen texture via ComfyUI SUPIR upscaler.
-
-    Only works with textures already in the DB — never fetches from the internet.
-    Returns (jpeg_bytes, source_string) or (None, None).
-    """
-    if s2_jpeg is None:
-        return None, None
-
-    if tile_id is not None:
-        depth = int(tile_id.split("-")[0]) if "-" in tile_id else -1
-        if depth == ENHANCE_DEPTH:
-            try:
-                enhanced = _submit_upscale(tile_id, s2_jpeg,
-                                           positive_prompt=positive_prompt,
-                                           negative_prompt=negative_prompt)
-                return enhanced, "dataforsyningen_enhanced"
-            except Exception as e:
-                log_tex.error(f"[COMFY] upscale failed for {tile_id}: {type(e).__name__}: {e}")
-                return None, None
-
-    return None, None

@@ -43,7 +43,7 @@ Real imagery down to depth 12, invented detail below it.
 4. Dataforsyningen runs out of detail around depth 13 (SPOT is 1.6 m/px). Below that, accuracy vs reality stops mattering: **depth 12 already tells us what goes where**. A coarse class map at d12 scale (water / grey / dark slopes & shadows / green / white — see `flaskserver/classifier/storage.py`) is the entire semantic contract.
 5. **Everything below depth 12 is procedural** (work in progress): per-class texture and asset synthesis, seeded from absolute EPSG:3413 coordinates so every visit renders identical detail, color-anchored to the real d12 imagery so the transition doesn't pop. Judged on looks, not fidelity. Google imagery is a labeling/measurement reference only and never ships.
 
-Retired approaches, kept in git history only: SUPIR/ComfyUI enhance (`dataforsyningen_enhanced`/`upscaled` sources — never worked right), bathymetry flattening, and learned recoloring from external reference imagery.
+Retired approaches, kept in git history only: bathymetry flattening and learned recoloring from external reference imagery.
 
 The eyeball harness is the **tile inspector** (`pipeline.html?tile=<id>`): a tile's progress through heightmap → southness → texture → procgen, with per-stage status and keyboard navigation across tiles and depths.
 

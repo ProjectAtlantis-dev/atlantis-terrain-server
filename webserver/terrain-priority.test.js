@@ -18,10 +18,9 @@ import {
   createTileLifecycle,
   reconcileTerrainTiles,
 } from './terrain-tile-set.js';
-import { createTerrainEnhancementController } from './terrain-enhancement-controller.js';
 import { createTerrainMeshBuilder, decodeTerrainHeightmap } from './terrain-mesh-builder.js';
-import { applyTerrainAvailabilityStatus, createTerrainSeamStatusController } from './terrain-status-controller.js';
-import { collectTerrainDebugMeshes, createTerrainHoverOutlineController, createTerrainMapGridController, createTerrainOutlineController, summarizeTerrainMesh } from './terrain-debug-runtime.js';
+import { applyTerrainAvailabilityStatus } from './terrain-status-controller.js';
+import { collectTerrainDebugMeshes, createTerrainHoverOutlineController, createTerrainMapGridController, summarizeTerrainMesh } from './terrain-debug-runtime.js';
 import { createTerrainFetchRuntime } from './terrain-fetch-runtime.js';
 import { restoreTerrainCameraState, terrainCameraState } from './terrain-camera-state.js';
 import { createTerrainClientLogger } from './terrain-client-logging.js';
@@ -584,11 +583,9 @@ test('terrain tile set owns reconciliation, scene residency, and texture demand'
     remove(mesh) { this.children = this.children.filter(child => child !== mesh); },
   };
   const textureRequests = [];
-  const invalidated = [];
   const textureStreamer = {
     texCache: new Map(),
     texSource: new Map(),
-    invalidate(tileId) { invalidated.push(tileId); },
     pump(scored) { textureRequests.push(...scored.map(item => item.tile.id)); },
   };
   const tileSet = createTerrainTileSet({
@@ -615,6 +612,7 @@ test('terrain tile set owns reconciliation, scene residency, and texture demand'
     },
   });
   const tile = { id: '1-0-0', bbox: [0, 0, 1, 1], heightmap: 'hm' };
+  const baseTexture = { disposed: false, dispose() { this.disposed = true; } };
   const reconciliation = tileSet.reconcile([tile]);
   tileSet.updateTextures([tile]);
   assert.equal(terrainRoot.children.length, 1);
@@ -622,23 +620,19 @@ test('terrain tile set owns reconciliation, scene residency, and texture demand'
   assert.equal(tileSet.currentTileIds, reconciliation.nextTileIds);
   assert.deepEqual(textureRequests, [tile.id]);
 
-  const enhancedTexture = { disposed: false, dispose() { this.disposed = true; } };
-  assert.equal(tileSet.applyEnhancedTexture(tile.id, enhancedTexture), true);
-  assert.equal(terrainRoot.children[0].material.map, enhancedTexture);
+  terrainRoot.children[0].material.map = baseTexture;
+  terrainRoot.children[0].userData.terrainBaseTexture = baseTexture;
+  assert.equal(terrainRoot.children[0].material.map, baseTexture);
   assert.equal(tileSet.setClassifierMode(true), true);
   assert.equal(terrainRoot.children[0].material.map.desaturated, true);
-  assert.equal(terrainRoot.children[0].material.map.source, enhancedTexture);
+  assert.equal(terrainRoot.children[0].material.map.source, baseTexture);
   const classifierTexture = { classifier: true };
   tileSet.setClassifierTexture(tile.id, classifierTexture);
   assert.equal(terrainRoot.children[0].material.map, classifierTexture);
   tileSet.setClassifierTexture(tile.id, null);
   assert.equal(terrainRoot.children[0].material.map.desaturated, true);
   assert.equal(tileSet.setClassifierMode(false), false);
-  assert.equal(terrainRoot.children[0].material.map, enhancedTexture);
-  assert.equal(tileSet.discardEnhancedTexture(tile.id), true);
-  assert.deepEqual(invalidated, [tile.id]);
-  assert.equal(enhancedTexture.disposed, true);
-  assert.equal(terrainRoot.children[0].material.map, null);
+  assert.equal(terrainRoot.children[0].material.map, baseTexture);
 });
 
 test('terrain origin and pipeline decisions preserve two-pass behavior', () => {
@@ -917,23 +911,6 @@ test('ancestor crops materialize deferred child slots and yield to exact texture
   assert.equal(terrainRoot.children[0].userData.terrainPlaceholderTexture, undefined);
 });
 
-test('shared enhancement controller tracks 202 pending and 429 backoff', () => {
-  let timestamp = 1000;
-  const controller = createTerrainEnhancementController({
-    log() {}, applyEnhancedTexture() {},
-    textureCache: new Map(), textureSource: new Map(),
-    hasTextureWork: () => false, getLastCameraMoveTime: () => 0,
-    hasTiles: () => true, now: () => timestamp,
-  });
-  controller.handleResponse('tile', { status: 202 });
-  assert.deepEqual(controller.pending.get('tile'), { submitted: 1000, nextPollAt: 6000 });
-  timestamp = 2000;
-  controller.handleResponse('tile', { status: 429 }, true);
-  assert.equal(controller.backoffUntil, 12000);
-  assert.equal(controller.retryAfter.get('tile'), 12000);
-  assert.deepEqual(controller.pending.get('tile'), { submitted: 1000, nextPollAt: 12000 });
-});
-
 test('shared terrain mesh builder preserves heightmap geometry and metadata', () => {
   const source = new Float32Array([1, 2, 3, 4]);
   const encoded = Buffer.from(source.buffer).toString('base64');
@@ -968,20 +945,7 @@ test('shared availability status skips textured meshes and prioritizes downloadi
   assert.deepEqual(applied, [['downloading', 'downloading'], ['missing', 'missing']]);
 });
 
-test('shared seam status preserves priority and labels', () => {
-  const seams = createTerrainSeamStatusController({ now: () => 3000 });
-  seams.apply({
-    pending: ['pending', 'both'], running: ['running', 'both'],
-    done_recent: ['done'], failed: ['failed'],
-  });
-  assert.equal(seams.status('both'), 'running');
-  assert.match(seams.statusHtml('failed'), /FAILED/);
-  assert.match(seams.statusHtml('pending'), /PENDING/);
-  assert.match(seams.statusHtml('done'), /DONE/);
-  assert.equal(seams.statusHtml('none'), null);
-});
-
-test('shared terrain debug metadata and outline selection remain deterministic', () => {
+test('shared terrain debug metadata remains deterministic', () => {
   const mesh = {
     isMesh: true,
     userData: { tileId: 'tile', bbox: [0, 0, 1, 1] },
@@ -996,21 +960,6 @@ test('shared terrain debug metadata and outline selection remain deterministic',
     tileId: 'tile', hasTexture: true, textureSize: '256x128',
     color: '#abcdef', bbox: [0, 0, 1, 1],
   });
-  const group = () => ({
-    children: [], add(child) { this.children.push(child); },
-    remove(child) { this.children = this.children.filter(item => item !== child); },
-  });
-  const pendingGroup = group(), enhancedGroup = group();
-  const outlines = createTerrainOutlineController({
-    terrainRoot: root, pendingGroup, enhancedGroup,
-    pending: new Map([['tile', {}]]), inflight: new Map(),
-    textureSource: new Map([['tile', 'dataforsyningen_enhanced']]),
-  });
-  assert.equal(outlines.updatePending(), true);
-  assert.equal(outlines.updatePending(), false);
-  assert.equal(pendingGroup.children.length, 1);
-  assert.equal(outlines.updateEnhanced(), true);
-  assert.equal(enhancedGroup.children.length, 1);
 });
 
 test('shared terrain hover outline owns replacement and cleanup', () => {

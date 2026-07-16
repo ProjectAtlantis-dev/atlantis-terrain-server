@@ -10,8 +10,6 @@ import re
 import sqlite3
 import threading
 import time
-import urllib.parse
-import urllib.request
 import zlib
 from concurrent.futures import ThreadPoolExecutor
 from logging import FileHandler
@@ -21,7 +19,7 @@ from typing import Any, cast
 import asyncio
 
 from colored_log import get_logger
-from terrain_config import BOOTSTRAP_SEED_DEPTH, ENHANCE_DEPTH, ENHANCE_ENABLED
+from terrain_config import BOOTSTRAP_SEED_DEPTH, MAX_TILE_DEPTH
 
 log = get_logger("terrain")
 log_db = get_logger("terrain.db")
@@ -164,10 +162,8 @@ _read_texture: Any = None
 _write_texture: Any = None
 _fetch_sentinel2_texture: Any = None
 _fetch_dataforsyningen_texture: Any = None
-_fetch_enhanced_texture: Any = None
 _init_textures: Any = None
 _init_classifier_tiles: Any = None
-_enqueue_seam_jobs: Any = None
 
 _tex_pool = ThreadPoolExecutor(max_workers=4)
 _tex_fetching: dict[str, tuple[str, int]] = {}
@@ -266,174 +262,17 @@ def _tex_retry_worker() -> None:
         db.close()
 
 
-_enhance_pool = ThreadPoolExecutor(max_workers=2)
-_enhancing: set[str] = set()
-_enhancing_lock = threading.Lock()
-ENHANCE_MAX_QUEUED = 4  # max tiles in ComfyUI queue at once
-
 _cog_fetch_lock = threading.Lock()
 _cog_fetching_tiles: set[str] = set()
 _cog_fetched_total = 0      # lifetime count of COG tiles fetched from S3
 _cog_skipped_total = 0      # lifetime count of tiles skipped (already had data)
 _cog_already_fetched: set[str] = set()  # tile IDs we've already fetched this session
 
-_SUPIR_TILE_RE = re.compile(r"\b(?:supir|upscaled)_(\d+-\d+-\d+)\b")
-_INPUT_TILE_RE = re.compile(r"\btile_(\d+-\d+-\d+)_(?:texture|heightmap)\.png\b")
-
-
-def _recover_comfy_jobs():
-  """On startup, check ComfyUI /queue for in-flight tile jobs and resume tracking them."""
-  if not ENHANCE_ENABLED:
-    log_tex.info("[ENHANCE RECOVERY] skipped — SUPIR upscaling disabled (ENHANCE_ENABLED=False)")
-    return
-  from texture import COMFY_URL
-  log_tex.info(f"[ENHANCE RECOVERY] checking ComfyUI at {COMFY_URL}")
-  try:
-    resp = urllib.request.urlopen(f"{COMFY_URL}/queue", timeout=10)
-    queue = json.loads(resp.read())
-  except Exception as e:
-    log_tex.warning(f"[ENHANCE RECOVERY] can't reach ComfyUI: {e}")
-    return
-
-  # Extract (prompt_id, tile_id) pairs from running + pending
-  jobs: list[tuple[str, str]] = []  # (prompt_id, tile_id)
-  ignored_wrong_depth = 0
-  for item in queue.get("queue_running", []) + queue.get("queue_pending", []):
-    # prompt_id is item[1] in the list format comfy uses
-    prompt_id = item[1] if isinstance(item, (list, tuple)) and len(item) > 1 else None
-    if not prompt_id:
-      continue
-    # find tile IDs in the prompt data
-    found: set[str] = set()
-    for text in _iter_all_strings(item):
-      for m in _SUPIR_TILE_RE.findall(text):
-        found.add(m)
-      for m in _INPUT_TILE_RE.findall(text):
-        found.add(m)
-    for tid in found:
-      parsed = _parse_tile_id(tid)
-      if parsed is None or parsed[0] != ENHANCE_DEPTH:
-        ignored_wrong_depth += 1
-        continue
-      jobs.append((prompt_id, tid))
-
-  if not jobs:
-    if ignored_wrong_depth:
-      log_tex.info(f"[ENHANCE RECOVERY] ignored {ignored_wrong_depth} non-depth-{ENHANCE_DEPTH} jobs")
-    return
-
-  # Filter out tiles that are already enhanced in the DB
-  db = sqlite3.connect(str(DB_PATH), check_same_thread=False)
-  try:
-    already = set()
-    for _, tid in jobs:
-      row = db.execute(
-        "SELECT source FROM textures WHERE tile_id = ?", (tid,)
-      ).fetchone()
-      if row and row[0] in ("dataforsyningen_enhanced", "sentinel2_enhanced", "upscaled"):
-        already.add(tid)
-  finally:
-    db.close()
-
-  jobs = [(pid, tid) for pid, tid in jobs if tid not in already]
-  if not jobs:
-    if already:
-      log_tex.info(f"[ENHANCE RECOVERY] {len(already)} comfy jobs already enhanced, nothing to recover")
-    return
-
-  tile_ids = [tid for _, tid in jobs]
-  log_tex.info(f"[ENHANCE RECOVERY] recovering {len(jobs)} in-flight comfy jobs: {tile_ids}")
-  with _enhancing_lock:
-    for _, tid in jobs:
-      _enhancing.add(tid)
-
-  for prompt_id, tid in jobs:
-    _enhance_pool.submit(_recover_worker, prompt_id, tid)
-
-
-def _iter_all_strings(value):
-  """Recursively yield all strings from a nested structure."""
-  if isinstance(value, str):
-    yield value
-  elif isinstance(value, dict):
-    for v in value.values():
-      yield from _iter_all_strings(v)
-  elif isinstance(value, (list, tuple)):
-    for v in value:
-      yield from _iter_all_strings(v)
-
-
-def _recover_worker(prompt_id: str, tile_id: str):
-  """Poll ComfyUI for a pre-existing job and save the result when done."""
-  from texture import COMFY_URL
-  log_tex.info(f"[ENHANCE RECOVERY] waiting for {tile_id} (prompt={prompt_id[:8]}...)")
-  start = time.time()
-  wdb = None
-  try:
-    while time.time() - start < 600:
-      time.sleep(3)
-      try:
-        resp = urllib.request.urlopen(f"{COMFY_URL}/history/{prompt_id}", timeout=10)
-        history = json.loads(resp.read())
-      except Exception:
-        continue
-      if prompt_id not in history:
-        continue
-      entry = history[prompt_id]
-      status = entry.get("status", {})
-      status_str = status.get("status_str", "")
-
-      if status_str == "error":
-        log_tex.error(f"[ENHANCE RECOVERY] {tile_id} failed on comfy")
-        return
-
-      if status_str == "success" or status.get("completed"):
-        # Download result image
-        outputs = entry.get("outputs", {})
-        for nid, out in outputs.items():
-          if "images" not in out:
-            continue
-          for img_info in out["images"]:
-            fname = img_info["filename"]
-            subfolder = img_info.get("subfolder", "")
-            img_type = img_info.get("type", "output")
-            view_url = (
-              f"{COMFY_URL}/view?"
-              f"filename={urllib.parse.quote(fname)}"
-              f"&type={img_type}"
-            )
-            if subfolder:
-              view_url += f"&subfolder={urllib.parse.quote(subfolder)}"
-            with urllib.request.urlopen(view_url, timeout=30) as dl:
-              result_png = dl.read()
-            from PIL import Image as _PILImage
-            result_img = _PILImage.open(io.BytesIO(result_png)).convert("RGB")
-            buf = io.BytesIO()
-            result_img.save(buf, format="JPEG", quality=90)
-            jpeg_bytes = buf.getvalue()
-            wdb = sqlite3.connect(str(DB_PATH), check_same_thread=False)
-            wdb.execute("PRAGMA journal_mode=WAL")
-            if _init_textures is not None:
-              _init_textures(wdb)
-            _write_texture(wdb, tile_id, jpeg_bytes, "dataforsyningen_enhanced")
-            log_tex.info(f"[ENHANCE RECOVERY] {tile_id} saved ({len(jpeg_bytes)} bytes)")
-            return
-        log_tex.warning(f"[ENHANCE RECOVERY] {tile_id} completed but no output images")
-        return
-
-    log_tex.warning(f"[ENHANCE RECOVERY] {tile_id} timed out after 600s")
-  except Exception as e:
-    log_tex.error(f"[ENHANCE RECOVERY] {tile_id} error: {e}")
-  finally:
-    if wdb is not None:
-      wdb.close()
-    with _enhancing_lock:
-      _enhancing.discard(tile_id)
 def _bootstrap_backend() -> None:
   global _backend_ready, _backend_error
   global _np, _Image, _to_stereo, _query_tiles_stereo, _load_no_data_cache
   global _GRID_N, _tile_bbox, _texture_ids_in, _read_texture, _write_texture
-  global _fetch_sentinel2_texture, _fetch_dataforsyningen_texture, _fetch_enhanced_texture, _init_textures, _init_classifier_tiles, _enqueue_seam_jobs
+  global _fetch_sentinel2_texture, _fetch_dataforsyningen_texture, _init_textures, _init_classifier_tiles
 
   if _backend_ready or _backend_error is not None:
     return
@@ -445,11 +284,9 @@ def _bootstrap_backend() -> None:
     from coords import to_stereo
     from classifier.storage import init_classifier_tiles
     from database import GRID_N, _tile_bbox as terrain_tile_bbox, seed_tiles, open_db
-    from seam_queue import enqueue_tile_and_neighbors
     from serve import load_no_data_cache, query_tiles_stereo
     from texture import (
       fetch_dataforsyningen_texture,
-      fetch_enhanced_texture,
       fetch_sentinel2_texture,
       init_textures,
       read_texture,
@@ -461,10 +298,10 @@ def _bootstrap_backend() -> None:
 
     tile_count = db.execute("SELECT COUNT(*) FROM tiles").fetchone()[0]
     if tile_count == 0:
-      seed_depth = max(0, min(BOOTSTRAP_SEED_DEPTH, ENHANCE_DEPTH))
+      seed_depth = max(0, min(BOOTSTRAP_SEED_DEPTH, MAX_TILE_DEPTH))
       log_db.info(
         f"Empty tiles table — fast bootstrap seed to depth {seed_depth} "
-        f"(target ceiling depth {ENHANCE_DEPTH})..."
+        f"(target ceiling depth {MAX_TILE_DEPTH})..."
       )
       seed_tiles(db, max_depth=seed_depth)
       tile_count = db.execute("SELECT COUNT(*) FROM tiles").fetchone()[0]
@@ -476,10 +313,10 @@ def _bootstrap_backend() -> None:
     # Keep traversal ceiling metadata at full target depth, even if bootstrap
     # seeded fewer levels initially.
     cur_max = db.execute("SELECT value FROM metadata WHERE key = 'max_depth'").fetchone()
-    if cur_max is None or int(cur_max[0]) < ENHANCE_DEPTH:
-      db.execute("INSERT OR REPLACE INTO metadata (key, value) VALUES ('max_depth', ?)", (str(ENHANCE_DEPTH),))
+    if cur_max is None or int(cur_max[0]) < MAX_TILE_DEPTH:
+      db.execute("INSERT OR REPLACE INTO metadata (key, value) VALUES ('max_depth', ?)", (str(MAX_TILE_DEPTH),))
       db.commit()
-      log_db.info(f"Updated max_depth metadata to {ENHANCE_DEPTH}")
+      log_db.info(f"Updated max_depth metadata to {MAX_TILE_DEPTH}")
 
     try:
       no_data_count = load_no_data_cache(db)
@@ -500,15 +337,12 @@ def _bootstrap_backend() -> None:
     _write_texture = write_texture
     _fetch_sentinel2_texture = fetch_sentinel2_texture
     _fetch_dataforsyningen_texture = fetch_dataforsyningen_texture
-    _fetch_enhanced_texture = fetch_enhanced_texture
     _init_textures = init_textures
     _init_classifier_tiles = init_classifier_tiles
-    _enqueue_seam_jobs = enqueue_tile_and_neighbors
 
     _backend_ready = True
     log.info(f"Terrain backend ready. DB={DB_PATH}")
     log_db.info(f"No-data cache: {no_data_count} tiles")
-    _recover_comfy_jobs()
 
   except Exception as exc:  # pragma: no cover - runtime setup path
     _backend_error = (
@@ -516,19 +350,6 @@ def _bootstrap_backend() -> None:
       "Install dependencies into ./venv and ensure pipeline modules are present."
     )
     log.error(_backend_error)
-
-
-def _queue_seam_jobs_for_tile(db: sqlite3.Connection, tile_id: str) -> None:
-  if _enqueue_seam_jobs is None:
-    return
-  parsed = _parse_tile_id(tile_id)
-  if parsed is None or parsed[0] != ENHANCE_DEPTH:
-    return
-  try:
-    _enqueue_seam_jobs(db, tile_id, center_priority=120, neighbor_priority=80)
-    log_tex.info(f"[SEAM] queued blend jobs for {tile_id} and neighbors")
-  except Exception as exc:
-    log_tex.warning(f"[SEAM] failed to queue jobs for {tile_id}: {type(exc).__name__}: {exc}")
 
 
 def _terrain_unavailable_response(status: int = 503):
@@ -885,7 +706,7 @@ def api_tiles():
     return unavailable
 
   error = _arg_float("error", 0.0005)
-  max_depth = min(_arg_int("maxDepth", ENHANCE_DEPTH), ENHANCE_DEPTH)
+  max_depth = min(_arg_int("maxDepth", MAX_TILE_DEPTH), MAX_TILE_DEPTH)
   max_range = _arg_float("range", 16000.0)
 
   if "sx" in request.args and "sy" in request.args:
@@ -1420,7 +1241,7 @@ def api_heatmap():
   # quadtree. Never advertise leaves deeper than the renderer can request.
   max_depth = min(
     _arg_int("maxDepth", int(cam["maxDepth"])),
-    ENHANCE_DEPTH,
+    MAX_TILE_DEPTH,
   )
   lod_factor = _arg_float("lod", 2.0)
 
@@ -1562,248 +1383,6 @@ def api_coverage_index():
   ]
   return jsonify({"tiles": tiles})
 
-
-@app.post("/api/texture/<tile_id>/enhance")
-def api_texture_enhance(tile_id: str):
-  unavailable = _terrain_unavailable_response()
-  if unavailable is not None:
-    return unavailable
-
-  # Parse optional prompt overrides from JSON body
-  positive_prompt = None
-  negative_prompt = None
-  if request.is_json:
-    body = request.get_json(silent=True) or {}
-    positive_prompt = body.get("positive_prompt") or None
-    negative_prompt = body.get("negative_prompt") or None
-
-  db = _get_db()
-  row = db.execute(
-    "SELECT texture, source FROM textures WHERE tile_id = ?",
-    (tile_id,),
-  ).fetchone()
-  if row is None:
-    return Response(b"", status=404)
-
-  existing_jpeg, source = row[0], row[1]
-  # Already enhanced — return cached result
-  if source in ("dataforsyningen_enhanced", "sentinel2_enhanced", "upscaled"):
-    return Response(
-      existing_jpeg,
-      mimetype="image/jpeg",
-      headers={
-        "X-Tex-Source": source,
-        "X-Tex-Status": "ready",
-        "X-Tex-Quality": "full",
-        "X-Tex-Temporary": "0",
-      },
-    )
-
-  if not ENHANCE_ENABLED:
-    log_tex.info(f"[ENHANCE] {tile_id}: rejected — SUPIR upscaling disabled (ENHANCE_ENABLED=False)")
-    return Response(b"", status=503, headers={"X-Tex-Status": "enhance_disabled"})
-
-  parsed = _parse_tile_id(tile_id)
-  if parsed is None:
-    return Response(b"", status=400)
-  d, c, r = parsed
-
-  # Only upscale target depth tiles
-  if d != ENHANCE_DEPTH:
-    log_tex.info(f"[ENHANCE] {tile_id}: rejected — depth {d} != target {ENHANCE_DEPTH}")
-    return Response(b"", status=204, headers={"X-Tex-Status": "wrong_depth"})
-
-  # Already in flight or queue full?
-  with _enhancing_lock:
-    if tile_id in _enhancing:
-      return Response(
-        b"",
-        status=202,
-        headers={"X-Tex-Status": "enhancing"},
-      )
-    if len(_enhancing) >= ENHANCE_MAX_QUEUED:
-      return Response(
-        b"",
-        status=429,
-        headers={"X-Tex-Status": "queue_full"},
-      )
-
-  if source != "dataforsyningen":
-    log_tex.info(f"[ENHANCE] {tile_id}: rejected — source is '{source}', need 'dataforsyningen'")
-    return Response(b"", status=204, headers={"X-Tex-Status": f"wrong_source_{source}"})
-
-  bbox = _tile_bbox(d, c, r)
-
-  # Fire off background upscale — return 202 immediately
-  with _enhancing_lock:
-    _enhancing.add(tile_id)
-
-  def _enhance_worker():
-    wdb = None
-    try:
-      wdb = sqlite3.connect(str(DB_PATH), check_same_thread=False)
-      wdb.execute("PRAGMA journal_mode=WAL")
-      if _init_textures is not None:
-        _init_textures(wdb)
-      enhanced, esrc = _fetch_enhanced_texture(
-        list(bbox), resolution=256, s2_jpeg=existing_jpeg,
-        tile_id=tile_id,
-        positive_prompt=positive_prompt,
-        negative_prompt=negative_prompt,
-      )
-      if enhanced is not None:
-        _write_texture(wdb, tile_id, enhanced, esrc)
-        log_tex.info(f"[ENHANCE] {tile_id}: done, wrote {len(enhanced)} bytes as {esrc}")
-      else:
-        log_tex.warning(f"[ENHANCE] {tile_id}: upscaler returned None")
-    except Exception as e:
-      log_tex.error(f"[ENHANCE] {tile_id} failed: {type(e).__name__}: {e}")
-    finally:
-      if wdb is not None:
-        wdb.close()
-      with _enhancing_lock:
-        _enhancing.discard(tile_id)
-
-  _enhance_pool.submit(_enhance_worker)
-  log_tex.info(f"[ENHANCE] {tile_id}: queued for background upscale")
-  return Response(
-    b"",
-    status=202,
-    headers={"X-Tex-Status": "enhancing"},
-  )
-
-
-@app.post("/api/texture/<tile_id>/discard_enhanced")
-def api_texture_discard_enhanced(tile_id: str):
-  """Discard an enhanced texture, its seam job, and re-queue neighbor seams."""
-  unavailable = _terrain_unavailable_response()
-  if unavailable is not None:
-    return unavailable
-
-  db = _get_db()
-  row = db.execute(
-    "SELECT source FROM textures WHERE tile_id = ?", (tile_id,)
-  ).fetchone()
-  if row is None:
-    return jsonify({"error": "no texture found"}), 404
-
-  source = row[0]
-  if source not in ("dataforsyningen_enhanced", "sentinel2_enhanced", "upscaled"):
-    return jsonify({"error": f"not enhanced (source={source})"}), 400
-
-  db.execute("DELETE FROM textures WHERE tile_id = ?", (tile_id,))
-  db.commit()
-
-  log_tex.info(f"[DISCARD] {tile_id}: discarded {source}")
-  return jsonify({"ok": True, "discarded": source})
-
-
-@app.get("/api/enhance/status")
-def api_enhance_status():
-  unavailable = _terrain_unavailable_response()
-  if unavailable is not None:
-    return unavailable
-  db = _get_db()
-  # Check tiles table exists (may not if bootstrap is still running)
-  has_tiles = db.execute(
-    "SELECT name FROM sqlite_master WHERE type='table' AND name='tiles'"
-  ).fetchone()
-  if not has_tiles:
-    return jsonify({"error": "tiles table not ready yet"}), 503
-  # Seeding progress at target depth (tile rows exist by design; this tracks DEM population).
-  seed_total = db.execute(
-    "SELECT COUNT(*) FROM tiles WHERE depth = ?",
-    (ENHANCE_DEPTH,),
-  ).fetchone()[0]
-  seed_populated = db.execute(
-    "SELECT COUNT(*) FROM tiles WHERE depth = ? AND source <> 'empty'",
-    (ENHANCE_DEPTH,),
-  ).fetchone()[0]
-  seed_with_heightmap = db.execute(
-    "SELECT COUNT(*) FROM tiles WHERE depth = ? AND heightmap IS NOT NULL",
-    (ENHANCE_DEPTH,),
-  ).fetchone()[0]
-  seed_progress_pct = (
-    round((float(seed_populated) * 100.0) / float(seed_total), 2)
-    if seed_total > 0
-    else 0.0
-  )
-
-  # Total target-depth tiles with heightmaps (eligible for enhance)
-  total = db.execute(
-    "SELECT COUNT(*) FROM tiles WHERE depth = ? AND heightmap IS NOT NULL",
-    (ENHANCE_DEPTH,),
-  ).fetchone()[0]
-  # How many already have enhanced textures
-  done = db.execute(
-    """SELECT COUNT(*)
-       FROM textures tx
-       JOIN tiles t ON t.tile_id = tx.tile_id
-       WHERE t.depth = ?
-         AND tx.source IN ('dataforsyningen_enhanced', 'sentinel2_enhanced', 'upscaled')""",
-    (ENHANCE_DEPTH,),
-  ).fetchone()[0]
-  # How many have base sentinel2 textures (could be enhanced)
-  eligible = db.execute(
-    """SELECT COUNT(*) FROM textures t
-       JOIN tiles tl ON t.tile_id = tl.tile_id
-       WHERE tl.depth = ? AND tl.heightmap IS NOT NULL
-         AND t.source IN ('dataforsyningen', 'sentinel2')"""
-    ,
-    (ENHANCE_DEPTH,),
-  ).fetchone()[0]
-  with _enhancing_lock:
-    in_progress = list(_enhancing)
-  return jsonify({
-    "total": total,
-    "eligible": eligible,
-    "done": done,
-    "seed_total": seed_total,
-    "seed_populated": seed_populated,
-    "seed_with_heightmap": seed_with_heightmap,
-    "seed_progress_pct": seed_progress_pct,
-    "in_progress": len(in_progress),
-    "in_progress_tiles": in_progress,
-    "max_queued": ENHANCE_MAX_QUEUED,
-  })
-
-
-@app.get("/api/seam_status")
-def api_seam_status():
-  db = _get_db()
-  has_table = db.execute(
-    "SELECT name FROM sqlite_master WHERE type='table' AND name='seam_jobs'"
-  ).fetchone()
-  if not has_table:
-    return jsonify({"pending": [], "running": [], "done_recent": [], "failed": []})
-  pending = [r[0] for r in db.execute(
-    "SELECT tile_id FROM seam_jobs WHERE status = 'pending' ORDER BY priority DESC"
-  ).fetchall()]
-  running = [r[0] for r in db.execute(
-    "SELECT tile_id FROM seam_jobs WHERE status = 'running'"
-  ).fetchall()]
-  # Recently finished (last 30 seconds) so the UI can flash them briefly
-  done_recent = [r[0] for r in db.execute(
-    "SELECT tile_id FROM seam_jobs WHERE status = 'done' AND updated_at > datetime('now', '-30 seconds')"
-  ).fetchall()]
-  failed = [r[0] for r in db.execute(
-    "SELECT tile_id FROM seam_jobs WHERE status = 'failed'"
-  ).fetchall()]
-  return jsonify({
-    "pending": pending,
-    "running": running,
-    "done_recent": done_recent,
-    "failed": failed,
-  })
-
-
-@app.post("/api/seam_retry_failed")
-def api_seam_retry_failed():
-  from seam_queue import retry_failed
-  db = _get_db()
-  count = retry_failed(db)
-  log.info(f"[SEAM] retried {count} failed jobs")
-  return jsonify({"retried": count})
 
 
 @app.post("/api/tile_inspect")

@@ -21,7 +21,7 @@ import numpy as np
 
 from tiles import Tile, GREENLAND_BBOX
 from colored_log import get_logger
-from terrain_config import ENHANCE_DEPTH
+from terrain_config import MAX_TILE_DEPTH
 
 log_db = get_logger("terrain.db")
 
@@ -294,7 +294,7 @@ def compute_geometric_error(heightmap):
 # Seed tiles
 # ---------------------------------------------------------------------------
 
-def seed_tiles(db, max_depth=ENHANCE_DEPTH, root_bbox=None):
+def seed_tiles(db, max_depth=MAX_TILE_DEPTH, root_bbox=None):
     """Populate the tiles table with the full quadtree structure.
 
     Creates tile rows for depths 0 through max_depth with IDs, bboxes,

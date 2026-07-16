@@ -25,9 +25,8 @@ import { createTerrainVehicleRuntime } from './terrain-vehicle-runtime.js';
 import { createTileHistory, terrainFogDistance, tileDepthFromId } from './terrain-tile-runtime.js';
 import { createTextureStreamer, rendererTextureAnisotropy } from './terrain-texture-streamer.js';
 import { evaluateTerrainRefetch, summarizeTerrainCamera, terrainCameraCoordinates, terrainCameraGridPosition, terrainCameraStereoPosition } from './terrain-tile-fetch.js';
-import { createTerrainEnhancementController } from './terrain-enhancement-controller.js';
-import { applyTerrainAvailabilityStatus, createTerrainSeamStatusController } from './terrain-status-controller.js';
-import { collectTerrainDebugMeshes, createTerrainHoverOutlineController, createTerrainMapGridController, createTerrainOutlineController, summarizeTerrainMesh } from './terrain-debug-runtime.js';
+import { applyTerrainAvailabilityStatus } from './terrain-status-controller.js';
+import { collectTerrainDebugMeshes, createTerrainHoverOutlineController, createTerrainMapGridController, summarizeTerrainMesh } from './terrain-debug-runtime.js';
 import { createTerrainFetchRuntime } from './terrain-fetch-runtime.js';
 import { createTerrainTileSet } from './terrain-tile-set.js';
 import { createTerrainClassifierRuntime } from './terrain-classifier-runtime.js';
@@ -651,18 +650,6 @@ const hoverOutlineController = createTerrainHoverOutlineController({
 });
 const mapGridController = createTerrainMapGridController({ terrainRoot });
 
-const enhanceOutlines = new THREE.Group();
-enhanceOutlines.visible = false;
-enhanceOutlines.renderOrder = 998;
-terrainRoot.add(enhanceOutlines);
-
-const enhancedOutlines = new THREE.Group();
-enhancedOutlines.visible = false;
-enhancedOutlines.renderOrder = 997;
-terrainRoot.add(enhancedOutlines);
-
-const seamStatusController = createTerrainSeamStatusController({});
-
 // --- Terrain streaming state ---
 const EXAG = 1.0;
 
@@ -950,32 +937,11 @@ function getFogDistance() {
   return terrainFogDistance(getCameraLatLon().alt);
 }
 
-// --- Deferred enhancement (idle-time upgrade) ---
-
-const enhancementController = createTerrainEnhancementController({
-  log: tileLog,
-  textureCache: texCache,
-  textureSource: texSource,
-  hasTextureWork: () => texInflight.size > 0 || texFetching.size > 0,
-  getLastCameraMoveTime: () => cameraRuntimeState.lastMoveTime,
-  hasTiles: () => Boolean(terrainPipelineState.lastTiles),
-  applyEnhancedTexture: terrainTileSet.applyEnhancedTexture,
-});
 const tileMenuRuntime = createTerrainTileMenuRuntime({
-  controls,
   tileInfoElement: tileInfoEl,
-  terrainTiles: terrainTileSet,
-  enhancementController,
 });
-const showEnhanceDialog = tileMenuRuntime.showEnhance;
 const showTileMenu = tileMenuRuntime.show;
 const hideTileMenu = tileMenuRuntime.hide;
-const terrainOutlineController = createTerrainOutlineController({
-  terrainRoot, pendingGroup: enhanceOutlines, enhancedGroup: enhancedOutlines,
-  pending: enhancementController.pending,
-  inflight: enhancementController.inflight,
-  textureSource: texSource,
-});
 
 // --- Camera position → lat/lon conversion ---
 
@@ -1151,7 +1117,6 @@ function runStreamingMaintenance() {
     terrainTileSet.updateTextures(terrainPipelineState.lastTiles);
     classifierRuntime.update(terrainPipelineState.lastTiles);
   }
-  enhancementController.update();
   if (dateChanged || renderBackend.sceneMutationVersion !== before) {
     requestRender();
   }
@@ -1410,7 +1375,6 @@ function updateMovement(dt) {
       vehicleRuntime.vehicleSnapPending = true;
       vehicleRuntime.throttledVehicleSave();
       cameraRuntimeState.lastMoveTime = performance.now();
-      enhancementController.abortAll();
     }
     return;
   }
@@ -1497,7 +1461,6 @@ function updateMovement(dt) {
   }
   if (move.lengthSq() > 0) {
     cameraRuntimeState.lastMoveTime = performance.now();
-    enhancementController.abortAll();
   }
   camera.position.add(move);
   // NaN guard — if camera position gets corrupted (e.g. bad terrain data
@@ -1548,19 +1511,6 @@ function updateHud() {
     texLine += `  <span style="color:#f8c">srv: ${terrainPipelineState.serverTexturesFetching} fetching</span>`;
     if (terrainPipelineState.serverTexturesRetrying > 0) texLine += `  <span style="color:#f66">${terrainPipelineState.serverTexturesRetrying} retry</span>`;
     if (srvMissing > 0) texLine += `  <span style="color:#999">${srvMissing} missing</span>`;
-  }
-  const es = enhancementController.status;
-  const enhDone = es.done || 0;
-  const enhTotal = es.total || 0;
-  const enhInProg = es.in_progress || 0;
-  const enhEligible = es.eligible || 0;
-  if (enhTotal > 0) {
-    const pct = Math.round(enhDone / enhTotal * 100);
-    let enhParts = [];
-    if (enhInProg > 0) enhParts.push(`<span style="color:#f8c">${enhInProg} upscaling</span>`);
-    enhParts.push(`<span style="color:#8f8">${enhDone}/${enhTotal} enhanced (${pct}%)</span>`);
-    if (enhEligible > 0) enhParts.push(`<span style="color:#fc8">${enhEligible} eligible</span>`);
-    texLine += '  ' + enhParts.join('  ');
   }
   const modeLabel = heatmapRuntime?.active
     ? 'HEATMAP'
@@ -1662,7 +1612,6 @@ function resetView() {
   terrainPipelineState.firstLoad = true;
   textureStreamer.abortAll();
   terrainTileSet.resetTextureApplications();
-  enhancementController.abortAll();
   terrainFetchRuntime.reset(1);
   terrainPipelineState.originX = 0; terrainPipelineState.originY = 0;
   terrainPipelineState.cameraStereoX = 0; terrainPipelineState.cameraStereoY = 0;
@@ -1883,16 +1832,11 @@ renderer.domElement.addEventListener('mousemove', event => {
     });
 
   const src = texSource.get(info.tileId) || 'none';
-  const isEnhanced = src.includes('enhanced');
-  const srcLabel = isEnhanced
-    ? `<span style="color:#0f0;font-weight:bold">ENHANCED</span>`
-    : `<span style="color:#f80">${src || 'no texture'}</span>`;
+  const srcLabel = `<span style="color:#f80">${src || 'no texture'}</span>`;
   const matHex = info.color !== '-' ? info.color : '#ffffff';
-  const seamLabel = seamStatusController.statusHtml(info.tileId);
   tileInfoEl.innerHTML = [
     `<b style="color:${matHex}">${info.tileId}</b>`,
     `tex: ${info.hasTexture ? 'YES' : 'NO'} ${info.textureSize}  source: ${srcLabel}`,
-    seamLabel ? `seam: ${seamLabel}` : null,
     `<b>overlaps: ${overlappingMeshes.length}</b>`,
     overlapLines.length > 0 ? overlapLines.join('<br>') : null
   ].filter(Boolean).join('<br>');
@@ -2020,16 +1964,11 @@ function render() {
   vehicleRuntime.updateVehicleShadowSystem();
   houseRuntime.update(nowMs, controls.mapMode);
   vehicleRuntime.vehicleMarkerLayer.visible = controls.mapMode;
-  enhanceOutlines.visible = controls.mapMode;
-  enhancedOutlines.visible = controls.mapMode;
   mapGridController.setVisible(controls.mapMode && !heatmapRuntime.active);
   if (controls.mapMode) {
     if (!heatmapRuntime.active) {
       mapGridController.update(collectTerrainDebugMeshes(terrainRoot, debugIntersectables));
     }
-    seamStatusController.poll();
-    terrainOutlineController.updatePending();
-    terrainOutlineController.updateEnhanced();
     updateMapCamera();
     markerCameraRel.copy(camera.position).sub(anchorPosition);
     camMarker.position.set(
