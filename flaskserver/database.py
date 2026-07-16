@@ -19,7 +19,7 @@ import zlib
 import datetime
 import numpy as np
 
-from tiles import Tile, GREENLAND_BBOX
+from tiles import GREENLAND_BBOX
 from colored_log import get_logger
 from terrain_config import MAX_TILE_DEPTH
 
@@ -41,6 +41,8 @@ CONFIDENCE = {
 }
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
+SCHEMA_VERSION = 1
+_SCHEMA_VERSION_KEY = "schema_version"
 
 
 class TileClobberError(RuntimeError):
@@ -108,13 +110,14 @@ CREATE TABLE IF NOT EXISTS metadata (
 # see texture.py for the texture table
 
 
-def _retire_legacy_terrain_data(db):
-    """Discard data produced or retained by retired terrain pipelines.
+def _migrate_to_v1(db):
+    """Remove storage and data left by retired terrain pipelines.
 
     Bathymetry rewrote the canonical heightmap and kept a second copy in
     ``bathy_originals``.  Neither copy is trustworthy: reset every tile the
     old pipeline touched so the normal missing-tile path reloads it from the
-    source COG, then remove the obsolete storage.
+    source COG, then remove the obsolete storage. The seam and water-mask
+    tables belonged to the same retired pipeline and have no remaining readers.
     """
     tables = {
         row[0]
@@ -153,11 +156,31 @@ def _retire_legacy_terrain_data(db):
 
     db.execute("DROP TABLE IF EXISTS bathy_originals")
     db.execute("DROP TABLE IF EXISTS google_refs")
+    db.execute("DROP TABLE IF EXISTS seam_jobs")
+    db.execute("DROP TABLE IF EXISTS water_masks")
 
     columns = {row[1] for row in db.execute("PRAGMA table_info(tiles)")}
     for column in ("has_sealevel_water", "has_flattened_water"):
         if column in columns:
             db.execute(f"ALTER TABLE tiles DROP COLUMN {column}")
+
+
+def _migrate_schema(db):
+    row = db.execute(
+        "SELECT value FROM metadata WHERE key = ?", (_SCHEMA_VERSION_KEY,)
+    ).fetchone()
+    version = int(row[0]) if row is not None else 0
+    if version > SCHEMA_VERSION:
+        raise RuntimeError(
+            f"Database schema version {version} is newer than supported "
+            f"version {SCHEMA_VERSION}"
+        )
+    if version < 1:
+        _migrate_to_v1(db)
+        db.execute(
+            "INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)",
+            (_SCHEMA_VERSION_KEY, "1"),
+        )
 
 
 def open_db(path=None):
@@ -178,7 +201,7 @@ def open_db(path=None):
     db.execute("PRAGMA synchronous=NORMAL")
     existing = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
     db.executescript(_SCHEMA)
-    _retire_legacy_terrain_data(db)
+    _migrate_schema(db)
     db.commit()
     for tbl in ("tiles", "metadata"):
         if tbl not in existing:
@@ -569,23 +592,6 @@ def read_tile(db, tile_id):
     }
 
 
-def read_tiles_at_depth(db, depth):
-    """Read all tile IDs at a given depth.
-
-    Args:
-        db: sqlite3 connection
-        depth: integer depth level
-
-    Returns:
-        list of tile_id strings
-    """
-    rows = db.execute(
-        "SELECT tile_id FROM tiles WHERE depth = ? ORDER BY tile_id",
-        (depth,)
-    ).fetchall()
-    return [r[0] for r in rows]
-
-
 def read_tile_metadata(db, tile_id):
     """Read tile metadata without decompressing heightmap blobs.
 
@@ -617,25 +623,3 @@ def get_metadata(db, key):
     """Read a metadata value by key."""
     row = db.execute("SELECT value FROM metadata WHERE key = ?", (key,)).fetchone()
     return row[0] if row else None
-
-
-def tile_count(db, depth=None, source=None):
-    """Count tiles, optionally filtered by depth and/or source.
-
-    Args:
-        db: sqlite3 connection
-        depth: optional depth filter
-        source: optional source filter
-
-    Returns:
-        int count
-    """
-    query = "SELECT COUNT(*) FROM tiles WHERE 1=1"
-    params = []
-    if depth is not None:
-        query += " AND depth = ?"
-        params.append(depth)
-    if source is not None:
-        query += " AND source = ?"
-        params.append(source)
-    return db.execute(query, params).fetchone()[0]

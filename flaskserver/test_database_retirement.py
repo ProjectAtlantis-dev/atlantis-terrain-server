@@ -42,6 +42,8 @@ def _seed_legacy_db(path):
             updated_at TEXT
         );
         CREATE TABLE google_refs (tile_id TEXT PRIMARY KEY, texture BLOB);
+        CREATE TABLE seam_jobs (tile_id TEXT PRIMARY KEY);
+        CREATE TABLE water_masks (tile_id TEXT PRIMARY KEY);
         """
     )
     heightmap = np.ones((GRID_N, GRID_N), dtype=np.float32)
@@ -104,6 +106,14 @@ class RetiredTerrainMigrationTest(unittest.TestCase):
             }
             self.assertNotIn("bathy_originals", tables)
             self.assertNotIn("google_refs", tables)
+            self.assertNotIn("seam_jobs", tables)
+            self.assertNotIn("water_masks", tables)
+            self.assertEqual(
+                db.execute(
+                    "SELECT value FROM metadata WHERE key = 'schema_version'"
+                ).fetchone(),
+                ("1",),
+            )
             columns = {row[1] for row in db.execute("PRAGMA table_info(tiles)")}
             self.assertNotIn("has_sealevel_water", columns)
             self.assertNotIn("has_flattened_water", columns)

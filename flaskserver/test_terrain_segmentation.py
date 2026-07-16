@@ -1,0 +1,71 @@
+import unittest
+
+import numpy as np
+from scipy import ndimage
+
+from classifier.segmentation import (
+    SegmentationConfig,
+    render_boundaries,
+    segment_terrain_tile,
+    terrain_feature_channels,
+)
+
+
+class TerrainSegmentationTest(unittest.TestCase):
+    def test_heightmap_is_flipped_to_image_orientation(self):
+        rgb = np.zeros((8, 8, 3), dtype=np.uint8)
+        # DB row zero is south: elevation increases toward north.
+        heightmap = np.repeat(
+            np.linspace(0, 70, 8, dtype=np.float32)[:, None], 8, axis=1
+        )
+        channels = terrain_feature_channels(rgb, heightmap, 70.0)
+        self.assertGreater(
+            float(channels["elevation"][0].mean()),
+            float(channels["elevation"][-1].mean()),
+        )
+
+    def test_geometry_contributes_boundaries_with_uniform_color(self):
+        rgb = np.full((64, 64, 3), 100, dtype=np.uint8)
+        heightmap = np.zeros((17, 17), dtype=np.float32)
+        heightmap[:, 9:] = 120.0
+        result = segment_terrain_tile(
+            rgb,
+            heightmap,
+            160.0,
+            SegmentationConfig(target_segment_m=40.0, image_blur_pixels=0),
+        )
+        cost = result.channels["boundary_cost"]
+        center_cost = float(cost[:, 30:38].mean())
+        outer_cost = float(np.concatenate((cost[:, :16], cost[:, 48:]), 1).mean())
+        self.assertGreater(center_cost, outer_cost + 20)
+
+    def test_labels_are_dense_and_statistics_cover_every_pixel(self):
+        rgb = np.zeros((48, 64, 3), dtype=np.uint8)
+        rgb[:, 32:] = (220, 230, 240)
+        heightmap = np.repeat(
+            np.linspace(0, 40, 13, dtype=np.float32)[:, None], 17, axis=1
+        )
+        result = segment_terrain_tile(rgb, heightmap, 120.0)
+        self.assertEqual(result.labels.shape, rgb.shape[:2])
+        self.assertEqual(result.labels.min(), 0)
+        self.assertEqual(result.labels.max() + 1, len(result.regions))
+        self.assertEqual(
+            sum(region["pixel_count"] for region in result.regions),
+            rgb.shape[0] * rgb.shape[1],
+        )
+        for region_id in range(len(result.regions)):
+            self.assertEqual(ndimage.label(result.labels == region_id)[1], 1)
+        self.assertEqual(render_boundaries(rgb, result.labels).shape, rgb.shape)
+
+    def test_sparse_dem_holes_are_filled_but_empty_dem_is_rejected(self):
+        rgb = np.zeros((8, 8, 3), dtype=np.uint8)
+        heightmap = np.zeros((5, 5), dtype=np.float32)
+        heightmap[2, 2] = np.nan
+        result = segment_terrain_tile(rgb, heightmap, 40.0)
+        self.assertTrue(np.isfinite(result.channels["elevation"]).all())
+        with self.assertRaisesRegex(ValueError, "no finite samples"):
+            segment_terrain_tile(rgb, np.full((5, 5), np.nan), 40.0)
+
+
+if __name__ == "__main__":
+    unittest.main()
