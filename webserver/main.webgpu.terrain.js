@@ -5,11 +5,21 @@ import {
   color,
   context,
   densityFogFactor,
+  float,
   fog,
+  mix,
   mrt,
+  normalLocal,
   output,
   pass,
+  positionLocal,
+  screenUV,
+  smoothstep,
+  texture,
   toneMapping,
+  transformNormalToView,
+  uv,
+  vec3,
   uniform
 } from 'three/tsl';
 import { MeshLambertNodeMaterial, PostProcessing, WebGPURenderer } from 'three/webgpu';
@@ -52,6 +62,10 @@ import {
   LocalWeather,
   Turbulence
 } from '@takram/three-clouds';
+import {
+  CloudShapeNode,
+  LocalWeatherNode
+} from '@takram/three-clouds/webgpu';
 import { DitheringEffect } from './three-geospatial/packages/effects/src/index.ts';
 import { Ellipsoid, Geodetic, radians } from '@takram/three-geospatial';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
@@ -63,6 +77,8 @@ import { buildBackupScatterLibrary } from './laas-scatter-adapter.js';
 import { GreenlandPatch } from './laas-terrain-patch.js';
 import { installMaterialKeyMemo } from './laas/render/ThreePatches.ts';
 import { installPositionInvariance } from './laas/render/VegPrepass.ts';
+import { vegViewPos } from './laas/render/VegInstance.ts';
+import { buildTerrainShading } from './laas/render/TerrainMaterial.ts';
 import { buildTileScatter, disposeTileScatter, updateScatterVisibility } from './procgen/scatter.ts';
 import { createTileLifecycle } from './terrain-tile-lifecycle.js';
 import { createTerrainOceanClassifier } from './classifier/terrain-ocean.js';
@@ -404,7 +420,12 @@ function createRenderBackend() {
         antialias: true,
         samples: 4,
         depth: true,
-        logarithmicDepthBuffer: false
+        logarithmicDepthBuffer: false,
+        // LAAS TerrainMaterial (satellite + five field/noise maps) combined
+        // with Atlantis CSM/lighting uses 17 fragment sampled textures. The
+        // active adapter exposes 48, but WebGPU only grants the conservative
+        // default 16 unless the device request asks for the higher limit.
+        requiredLimits: { maxSampledTexturesPerShaderStage: 24 }
       })
     : new THREE.WebGLRenderer({
         antialias: true,
@@ -456,6 +477,21 @@ function createRenderBackend() {
           // camera-following black/transparent holes seen in the terrain.
           installPositionInvariance(renderer);
           installMaterialKeyMemo(renderer);
+          const device = renderer.backend?.device;
+          if (device) {
+            device.addEventListener('uncapturederror', event => {
+              const error = event.error;
+              enqueueClientLog('error', 'renderer.webgpu.uncaptured', {
+                message: error?.message ?? String(error),
+              });
+            });
+            device.lost.then(info => {
+              enqueueClientLog('error', 'renderer.webgpu.device.lost', {
+                reason: info.reason,
+                message: info.message,
+              });
+            });
+          }
           this.ready = true;
           bootLog('renderer.webgpu.ready');
         })
@@ -1017,9 +1053,10 @@ Ellipsoid.WGS84
   .decompose(terrainRoot.position, terrainRoot.quaternion, terrainRoot.scale);
 scene.add(terrainRoot);
 
-// Production LAAS near-field vegetation. GreenlandPatch only mounts GroundRing
-// draws over the streamed terrain; the ArcticDEM meshes remain the ground and
-// keep ownership of imagery, picking, collision, and tile lifecycle.
+// Production LAAS near-field system. GreenlandPatch owns the camera-following
+// Heightfield, GroundRing, GPU Forests/rocks and their local scatter buffers;
+// ArcticDEM meshes remain authoritative for geometry/picking/collision while
+// receiving LAAS TerrainMaterial as their near-field visual LOD.
 if (typeof window !== 'undefined') window.__enqueueClientLog = enqueueClientLog;
 const PROCGEN_PATCH_ENABLED = BOOT_QUERY.get('procgenPatch') !== '0';
 const greenlandPatch = PROCGEN_PATCH_ENABLED
@@ -1027,6 +1064,7 @@ const greenlandPatch = PROCGEN_PATCH_ENABLED
       loadFields: fetchTileFields,
       getCSM: () => webgpuCsmShadowNode,
       getSunLight: () => webgpuAtmosphereLight,
+      onWindowChanged: () => refreshProcgenTerrainMaterials(),
     })
   : null;
 
@@ -3426,6 +3464,27 @@ function createWebGPUAtmospherePostProcessing(renderer) {
         .mul(0.0001),
       outputNode
     );
+  } else if (window.location.hash === '#cloud-textures') {
+    // Smoke test for the WebGPU clouds port (upstream webgpu/clouds merge):
+    // left half = LocalWeatherNode RGB (2D compute), right half = a mid slice
+    // of CloudShapeNode (3D compute). Both run their compute dispatch on
+    // first build; visible noise on both halves = the texture stack works.
+    const weatherNode = new LocalWeatherNode();
+    const shapeNode = new CloudShapeNode();
+    const weatherSample = weatherNode
+      .getTextureNode()
+      .sample(screenUV.mul(vec3(2, 1, 0).xy));
+    // Right half tiles 8 Z-slices of the 128^3 shape texture so partial
+    // compute coverage (some slices written, others not) is visible.
+    const shapeX = screenUV.x.mul(2).sub(1).mul(8);
+    const shapeSample = shapeNode
+      .getTextureNode()
+      .sample(vec3(shapeX.fract(), screenUV.y, shapeX.floor().div(8)))
+      .xxxx;
+    outputNode = bool(true).select(
+      screenUV.x.lessThan(0.5).select(weatherSample, shapeSample),
+      outputNode
+    );
   }
   postProcessing.outputNode = outputNode;
   // Console-poke handle for shadow/god-ray diagnostics.
@@ -3612,11 +3671,108 @@ tileLifecycle = createTileLifecycle({
   onSceneMutated: markSceneMutated,
 });
 
+function clearProcgenTerrainNodes(mesh) {
+  const material = mesh?.material;
+  if (!material || !mesh.userData.procgenTerrainMaterial) return false;
+  material.colorNode = null;
+  material.normalNode = null;
+  material.roughnessNode = null;
+  material.metalnessNode = null;
+  mesh.userData.procgenTerrainMaterial = null;
+  material.needsUpdate = true;
+  return true;
+}
+
+function procgenContextIntersectsMesh(contextValue, mesh) {
+  const bbox = mesh?.userData?.bbox ?? mesh?.userData?.scatterInput?.bbox;
+  if (!Array.isArray(bbox) || bbox.length !== 4) return false;
+  return (
+    bbox[2] >= contextValue.xMin && bbox[0] <= contextValue.xMax &&
+    bbox[3] >= contextValue.yMin && bbox[1] <= contextValue.yMax
+  );
+}
+
+function applyProcgenTerrainNodes(mesh, tex, contextValue) {
+  const material = mesh.material;
+  const key = `${contextValue.id}:${tex?.uuid ?? 'fields'}`;
+  if (mesh.userData.procgenTerrainMaterial === key) return false;
+
+  // Streamed tile vertices are terrainRoot-local z-up (x=east, y=north,
+  // z=elevation). LAAS fields/materials are y-up with +z toward south.
+  const laasPosition = vec3(
+    positionLocal.x.sub(contextValue.centerX),
+    positionLocal.z,
+    float(contextValue.centerY).sub(positionLocal.y),
+  );
+  const hf = contextValue.hf;
+  const shading = buildTerrainShading({
+    normalTex: hf.normalTex,
+    biomeTex: hf.biomeTex,
+    fieldsTex: hf.fieldsTex,
+    noiseA: hf.noiseA,
+    noiseB: hf.noiseB,
+    mp: hf.mp,
+    far: false,
+    external: true,
+    worldPosition: laasPosition,
+    cameraWorldPosition: vegViewPos,
+    worldSize: contextValue.worldSize,
+  });
+
+  // Geometry ends at 265 m. Keep the matching ground representation fully
+  // present through that handoff, then dissolve it into satellite imagery
+  // across the clipmap guard band instead of exposing a circular cutoff.
+  const cameraDistance = laasPosition.sub(vegViewPos).length();
+  const procedural = float(1).sub(smoothstep(270, 350, cameraDistance));
+  const satellite = tex ? texture(tex, uv()).rgb : color(COLOR_WEBGPU_UNTEXTURED);
+  material.colorNode = mix(satellite, shading.colorNode, procedural);
+
+  // Blend the derived LAAS normal back to the real DEM normal over the same
+  // handoff. Convert terrain z-up normal -> LAAS y-up, blend, then return to
+  // the mesh's local z-up frame before Three transforms it into ECEF view.
+  const baseLaasNormal = vec3(normalLocal.x, normalLocal.z, normalLocal.y.negate());
+  const blendedLaasNormal = mix(baseLaasNormal, shading.worldNormalNode, procedural).normalize();
+  const terrainNormal = vec3(
+    blendedLaasNormal.x,
+    blendedLaasNormal.z.negate(),
+    blendedLaasNormal.y,
+  );
+  material.normalNode = transformNormalToView(terrainNormal);
+  material.roughnessNode = mix(float(1), shading.roughnessNode, procedural);
+  material.metalnessNode = float(0);
+  material.vertexColors = false;
+  mesh.userData.procgenTerrainMaterial = key;
+  material.needsUpdate = true;
+  return true;
+}
+
+function refreshProcgenTerrainMaterials() {
+  const contextValue = greenlandPatch?.terrainMaterialContext?.();
+  let applied = 0;
+  let cleared = 0;
+  for (const child of terrainRoot.children) {
+    if (!child.isMesh || !child.material) continue;
+    const tex = child.material.map ?? null;
+    if (contextValue && procgenContextIntersectsMesh(contextValue, child)) {
+      if (applyProcgenTerrainNodes(child, tex, contextValue)) applied++;
+    } else {
+      if (clearProcgenTerrainNodes(child)) cleared++;
+    }
+  }
+  enqueueClientLog('info', 'patch.materials', {
+    center: contextValue?.id ?? null,
+    applied,
+    cleared,
+  });
+  markSceneMutated();
+}
+
 function applyTerrainMaterialMode(mesh, tex) {
   if (!mesh || !mesh.material) return;
   let needsUpdate = false;
   const useOceanOverlay = oceanMapDebugEnabled && controls.mapMode;
   if (useOceanOverlay) {
+    needsUpdate = clearProcgenTerrainNodes(mesh) || needsUpdate;
     if (mesh.material.map !== null) {
       mesh.material.map = null;
       needsUpdate = true;
@@ -3635,6 +3791,12 @@ function applyTerrainMaterialMode(mesh, tex) {
   if (tex && mesh.material.map !== tex) {
     mesh.material.map = tex;
     needsUpdate = true;
+  }
+  const contextValue = greenlandPatch?.terrainMaterialContext?.();
+  if (contextValue && procgenContextIntersectsMesh(contextValue, mesh)) {
+    needsUpdate = applyProcgenTerrainNodes(mesh, tex, contextValue) || needsUpdate;
+  } else {
+    needsUpdate = clearProcgenTerrainNodes(mesh) || needsUpdate;
   }
   if (!tex && USE_WEBGPU_RENDER_BACKEND) {
     applyWebGPUUntexturedTerrainMaterial(mesh);
@@ -4880,7 +5042,7 @@ function render() {
     return;
   }
   updateNearFieldScatter();
-  if (renderBackend.isWebGPU && greenlandPatch) {
+  if (renderBackend.isWebGPU && renderer.backend?.isWebGPUBackend === true && greenlandPatch) {
     if (!greenlandPatch.ready && !greenlandPatch.building) {
       void greenlandPatch.build(renderer, camera, cameraAGL);
     }
