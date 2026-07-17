@@ -84,6 +84,7 @@ import { installMaterialKeyMemo } from './laas/render/ThreePatches.ts';
 import { installPositionInvariance } from './laas/render/VegPrepass.ts';
 import { vegViewPos } from './laas/render/VegInstance.ts';
 import { createGroundingNode } from './webgpu-ground-post.js';
+import { createCloudGodRayShadowLength } from './webgpu-cloud-godrays.js';
 import { buildTerrainShading } from './laas/render/TerrainMaterial.ts';
 import { buildTileScatter, disposeTileScatter, updateScatterVisibility } from './procgen/scatter.ts';
 import { createTileLifecycle } from './terrain-tile-lifecycle.js';
@@ -283,6 +284,7 @@ let webgpuCloudShadows = null;
 let webgpuCloudDensityField = null;
 let webgpuCsmShadowNode = null;
 let webgpuShadowLengthNode = null;
+let webgpuActiveShadowLengthNode = null;
 let webgpuAtmospherePostProcessingReady = false;
 let webgpuSunLastLogMs = 0;
 let webgpuSunLastLogDateMs = NaN;
@@ -3475,7 +3477,17 @@ function createWebGPUAtmospherePostProcessing(renderer) {
   webgpuCloudShadows = new CloudBeerShadowMapNode(camera, webgpuCloudDensityField);
   webgpuCloudShadows.maxFar = MAX_VIEW_DIST;
   applyWebGPUCloudShadowLiveSettings();
-  atmosphereLight.cloudShadow = webgpuCloudShadows;
+  // DETACHED — measured 2026-07-17: attaching the BSM to the light craters
+  // the frame rate ~50x (22-30 fps → 0.3), and a bisect proved it is NOT
+  // the compute march (?bsmFreeze=1 identical) and NOT the sampling math
+  // (stubbing sampleOpticalDepth to a constant changes nothing). The mere
+  // graph mutation in CloudShadowAtmosphereLightNode.setupDirect
+  // (lightColor *= mix(1, x, uniform)) triggers it — a three r182
+  // lighting-graph pathology, present since stage 2 (its 0.5-4 fps
+  // "contention" numbers were this). Surface cloud shadows stay off until
+  // that is understood; cloud GOD RAYS don't need this attach — they fold
+  // the BSM into shadowLength in the post pass instead.
+  // atmosphereLight.cloudShadow = webgpuCloudShadows;
   scene.add(atmosphereLight);
   scene.add(atmosphereLight.target);
   webgpuAtmosphereLight = atmosphereLight;
@@ -3498,6 +3510,23 @@ function createWebGPUAtmospherePostProcessing(renderer) {
   const shadowLengthNode = shadowLength(csmShadowNode, viewZUnitNode);
   webgpuShadowLengthNode = shadowLengthNode;
 
+  // Cloud god rays: march the beer shadow map along each view ray in post
+  // and merge the cloud shadow segment into the CSM shadow length. Samples
+  // the BSM only here — never through light.cloudShadow (see the DETACHED
+  // note above). ?cloudGodRays=0 compiles it out.
+  let cloudGodRays = null;
+  if (webgpuCloudShadows != null && BOOT_QUERY.get('cloudGodRays') !== '0') {
+    cloudGodRays = createCloudGodRayShadowLength({
+      csmShadowLengthNode: shadowLengthNode,
+      beerShadowMap: webgpuCloudShadows,
+      depthNode,
+      camera,
+      atmosphereContext: webgpuAtmosphereContext,
+      worldToUnit: webgpuAtmosphereParameters.worldToUnit
+    });
+  }
+  webgpuActiveShadowLengthNode = cloudGodRays?.node ?? shadowLengthNode;
+
   // Screen-space grounding (GTAO + contact shadows) on the scene color
   // before aerial perspective. LAAS excludes understory plants from the CSM
   // caster set on the assumption these two layers ground them instead;
@@ -3514,7 +3543,11 @@ function createWebGPUAtmospherePostProcessing(renderer) {
     }
   });
 
-  const atmosphereNode = webgpuAerialPerspective(grounding.node, depthNode, shadowLengthNode);
+  const atmosphereNode = webgpuAerialPerspective(
+    grounding.node,
+    depthNode,
+    webgpuActiveShadowLengthNode
+  );
   atmosphereNode.skyNode.sunNode.angularRadius.value = webgpuAtmosphereSettings.sunAngularRadius;
   atmosphereNode.skyNode.sunNode.intensity.value = webgpuAtmosphereSettings.sunIntensity;
   webgpuAtmosphereNode = atmosphereNode;
@@ -3622,7 +3655,8 @@ function createWebGPUAtmospherePostProcessing(renderer) {
     MeshLambertNodeMaterial,
     cloudDensityField: webgpuCloudDensityField,
     beerShadowMap: webgpuCloudShadows,
-    grounding: grounding.uniforms
+    grounding: grounding.uniforms,
+    cloudGodRays: cloudGodRays?.uniforms ?? null
   };
   bootLog('renderer.webgpu.atmosphere.ready', {
     godRays: true,
@@ -3659,7 +3693,9 @@ function applyWebGPUAtmosphereLiveSettings() {
     webgpuShadowLengthNode.epipolarSliceCount.value = webgpuAtmosphereSettings.godRaySlices;
     webgpuShadowLengthNode.maxSliceSampleCount.value = webgpuAtmosphereSettings.godRaySlices / 2;
   }
-  const activeShadowLength = webgpuAtmosphereSettings.godRays ? webgpuShadowLengthNode : null;
+  const activeShadowLength = webgpuAtmosphereSettings.godRays
+    ? (webgpuActiveShadowLengthNode ?? webgpuShadowLengthNode)
+    : null;
   if (
     webgpuAtmosphereNode != null &&
     webgpuAtmosphereNode.shadowLengthNode !== activeShadowLength
@@ -3706,6 +3742,7 @@ function rebuildWebGPUAtmosphere() {
   webgpuCsmShadowNode = null;
   webgpuShadowLengthNode?.dispose?.();
   webgpuShadowLengthNode = null;
+  webgpuActiveShadowLengthNode = null;
   webgpuCloudShadows?.dispose();
   webgpuCloudShadows = null;
   webgpuCloudDensityField = null;
@@ -5201,7 +5238,11 @@ function render() {
   if (renderBackend.isWebGPU && webgpuCloudShadows != null) {
     // Throttled internally; must run OUTSIDE the render (a compute submit
     // inside the frame corrupts other passes on r182).
-    webgpuCloudShadows.update(renderer);
+    // ?bsmFreeze=1: cost-attribution diagnostic — materials keep sampling
+    // the beer shadow map but its compute never re-marches.
+    if (BOOT_QUERY.get('bsmFreeze') !== '1') {
+      webgpuCloudShadows.update(renderer);
+    }
   }
   updateTerrainShadowBudget();
   renderBackend.renderScene(scene, camera);
