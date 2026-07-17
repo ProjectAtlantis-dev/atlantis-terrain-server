@@ -1,0 +1,2400 @@
+diff --git a/eslint.config.mjs b/eslint.config.mjs
+index 2dea9ba4..0ccecac2 100644
+--- a/eslint.config.mjs
++++ b/eslint.config.mjs
+@@ -89,6 +89,7 @@ export default defineConfig(
+       'no-negated-condition': 'off',
+       'no-plusplus': 'off',
+       'no-multi-assign': 'off',
++      'max-nested-callbacks': 'off',
+       'prefer-named-capture-group': 'off',
+       'no-await-in-loop': 'off',
+       'require-unicode-regexp': 'off',
+diff --git a/packages/atmosphere/src/webgpu/AtmosphereLUTNode.ts b/packages/atmosphere/src/webgpu/AtmosphereLUTNode.ts
+index 3be034ae..d8a608a8 100644
+--- a/packages/atmosphere/src/webgpu/AtmosphereLUTNode.ts
++++ b/packages/atmosphere/src/webgpu/AtmosphereLUTNode.ts
+@@ -182,10 +182,28 @@ export class AtmosphereLUTNode extends Node {
+     }
+     this.currentVersion = this.version
+ 
+-    // TODO: Race condition
+-    this.updateTextures(renderer).catch((error: unknown) => {
+-      throw error instanceof Error ? error : new Error()
+-    })
++    // Upstream ran this via updateTextures() → timeSlice(requestIdleCallback):
++    // fire-and-forget async that lands each compute submit (plus the
++    // renderer state resets inside run()) at arbitrary points between and
++    // during frames — upstream's own "TODO: Race condition". On three r182
++    // WebGPU those idle-time submits interleave with in-flight frame
++    // encoding and corrupt the scattering LUTs (black sky, no aerial haze,
++    // terrain still sunlit — transmittance/irradiance land first and
++    // survive). Draining the generator synchronously keeps all four
++    // computes inside this updateBefore, before the frame encodes — the
++    // same one-shot pattern the procedural cloud textures use (0de9f604).
++    invariant(this.textures != null)
++    const context = this.textures.createContext()
++    this.updating = true
++    try {
++      for (const step of this.performCompute(renderer, context)) {
++        void step
++      }
++    } finally {
++      this.updating = false
++      context.dispose()
++      this.disposeQueue?.()
++    }
+   }
+ 
+   override setup(builder: NodeBuilder): unknown {
+diff --git a/packages/clouds/package.json b/packages/clouds/package.json
+index e1c1f29b..f07052be 100644
+--- a/packages/clouds/package.json
++++ b/packages/clouds/package.json
+@@ -30,6 +30,11 @@
+       "types": "./types/r3f/index.d.ts",
+       "import": "./build/r3f.js",
+       "require": "./build/r3f.cjs"
++    },
++    "./webgpu": {
++      "types": "./types/webgpu/index.d.ts",
++      "import": "./build/webgpu.js",
++      "require": "./build/webgpu.cjs"
+     }
+   },
+   "main": "./build/index.cjs",
+diff --git a/packages/clouds/src/Procedural3DTexture.ts b/packages/clouds/src/Procedural3DTexture.ts
+index 5e99719b..317f8292 100644
+--- a/packages/clouds/src/Procedural3DTexture.ts
++++ b/packages/clouds/src/Procedural3DTexture.ts
+@@ -79,7 +79,7 @@ export class Procedural3DTextureBase implements Procedural3DTexture {
+     // Unfortunately, rendering into 3D target requires as many draw calls as
+     // the value of "size".
+     for (let layer = 0; layer < this.size; ++layer) {
+-      this.material.uniforms.layer.value = layer / this.size
++      this.material.uniforms.layer.value = (layer + 0.5) / this.size
+       renderer.setRenderTarget(this.renderTarget, layer)
+       renderer.render(this.mesh, this.camera)
+     }
+diff --git a/packages/clouds/src/shaders/tileableNoise.glsl b/packages/clouds/src/shaders/tileableNoise.glsl
+index 25edcb18..87f8a3b0 100644
+--- a/packages/clouds/src/shaders/tileableNoise.glsl
++++ b/packages/clouds/src/shaders/tileableNoise.glsl
+@@ -53,7 +53,7 @@ float getWorleyNoise(const vec3 p, const float cellCount) {
+     for (int y = -1; y <= 1; ++y) {
+       for (int z = -1; z <= 1; ++z) {
+         vec3 tp = floor(cell) + vec3(x, y, z);
+-        tp = cell - tp - noise(mod(tp, cellCount / 1.0));
++        tp = cell - tp - noise(mod(tp, cellCount));
+         d = min(d, dot(tp, tp));
+       }
+     }
+diff --git a/packages/clouds/src/webgpu/CloudBeerShadowMapNode.ts b/packages/clouds/src/webgpu/CloudBeerShadowMapNode.ts
+new file mode 100644
+index 00000000..07282b90
+--- /dev/null
++++ b/packages/clouds/src/webgpu/CloudBeerShadowMapNode.ts
+@@ -0,0 +1,511 @@
++// TSL/WebGPU port of the beer shadow map pass (ShadowPass/ShadowMaterial +
++// shaders/shadow.frag): cloud optical depth marched from the sun through the
++// cloud layers into cascaded shadow maps fitted to the camera frustum.
++//
++// Differences from the WebGL implementation:
++// - Renders via a compute dispatch into one Storage3DTexture layer per
++//   cascade instead of an MRT fragment pass.
++// - No temporal resolve yet: jitter comes from static interleaved gradient
++//   noise instead of STBN, and there is no history reprojection. Structured
++//   volume sampling keeps the result temporally stable regardless.
++
++import {
++  HalfFloatType,
++  LinearFilter,
++  Matrix3,
++  Matrix4,
++  RGBAFormat,
++  Vector2,
++  Vector3,
++  type PerspectiveCamera
++} from 'three'
++import {
++  Break,
++  Continue,
++  Fn,
++  If,
++  Loop,
++  Return,
++  clamp,
++  exp,
++  float,
++  greaterThan,
++  instanceIndex,
++  int,
++  ivec3,
++  length,
++  max,
++  min,
++  normalize,
++  saturate,
++  select,
++  renderGroup,
++  textureStore,
++  uniform,
++  uniformArray,
++  uvec3,
++  vec2,
++  vec3,
++  vec4
++} from 'three/tsl'
++import {
++  NodeUpdateType,
++  Storage3DTexture,
++  TempNode,
++  type NodeBuilder,
++  type NodeFrame,
++  type TextureNode
++} from 'three/webgpu'
++
++import {
++  getAtmosphereContext,
++  type AtmosphereContext
++} from '@takram/three-atmosphere/webgpu'
++import {
++  FnVar,
++  interleavedGradientNoise,
++  outputTexture3D,
++  raySphereIntersection,
++  type Node
++} from '@takram/three-geospatial/webgpu'
++
++import { CascadedShadowMaps } from '../CascadedShadowMaps'
++import type { CloudDensityField } from './CloudDensityField'
++import {
++  getStructureNormal,
++  intersectStructuredPlanes
++} from './structuredSampling'
++
++const MAP_SIZE = 512
++const CASCADE_COUNT = 3
++
++const rotationScratch = /*#__PURE__*/ new Matrix3()
++const vectorScratch = /*#__PURE__*/ new Vector3()
++
++export class CloudBeerShadowMapNode extends TempNode {
++  static override get type(): string {
++    return 'CloudBeerShadowMapNode'
++  }
++
++  camera: PerspectiveCamera
++  readonly densityField: CloudDensityField
++
++  readonly csm = new CascadedShadowMaps({
++    cascadeCount: CASCADE_COUNT,
++    mapSize: new Vector2(MAP_SIZE, MAP_SIZE),
++    margin: 7000,
++    fade: false
++  })
++
++  // Primary raymarch parameters (defaults from qualityPresets.shadow).
++  readonly maxIterationCount = 50 // Baked into the shader
++  readonly minStepSize = uniform(100).setGroup(renderGroup)
++  readonly maxStepSize = uniform(1000).setGroup(renderGroup)
++  readonly minDensity = uniform(1e-5).setGroup(renderGroup)
++  readonly minExtinction = uniform(1e-5).setGroup(renderGroup)
++  readonly minTransmittance = uniform(1e-4).setGroup(renderGroup)
++  readonly opticalDepthTailScale = uniform(2).setGroup(renderGroup)
++
++  private readonly inverseShadowMatrices = uniformArray(
++    Array.from({ length: CASCADE_COUNT }, () => new Matrix4()),
++    'mat4'
++  )
++  private readonly shadowMatrices = uniformArray(
++    Array.from({ length: CASCADE_COUNT }, () => new Matrix4()),
++    'mat4'
++  )
++
++  readonly texture = new Storage3DTexture(MAP_SIZE, MAP_SIZE, CASCADE_COUNT)
++
++  // Recompute cadence: the map refreshes when the sun moves or the camera
++  // leaves the fitted cascades, and at most every `updateInterval` frames
++  // otherwise (there is no temporal accumulation to feed every frame).
++  updateInterval = 30
++  /** Diagnostic: number of compute dispatches actually submitted. */
++  dispatchCount = 0
++
++  private readonly textureNode: TextureNode
++  private atmosphereContext?: AtmosphereContext
++  private computeNode?: unknown
++  private framesSinceDispatch = Infinity
++  private readonly lastSunDirection = new Vector3()
++  private readonly lastCameraPosition = new Vector3()
++
++  constructor(camera: PerspectiveCamera, densityField: CloudDensityField) {
++    super(null)
++    this.camera = camera
++    this.densityField = densityField
++
++    this.texture.type = HalfFloatType
++    this.texture.format = RGBAFormat
++    this.texture.minFilter = LinearFilter
++    this.texture.magFilter = LinearFilter
++    this.texture.generateMipmaps = false
++    this.texture.name = 'CloudBeerShadowMapNode'
++
++    this.textureNode = outputTexture3D(this, this.texture)
++  }
++
++  getTextureNode(): TextureNode {
++    return this.textureNode
++  }
++
++  get maxFar(): number | null {
++    return this.csm.maxFar
++  }
++
++  set maxFar(value: number | null) {
++    this.csm.maxFar = value
++  }
++
++  // Call from the application render loop, BEFORE renderer.render /
++  // postProcessing.render. Submitting the compute from inside the frame
++  // (setup or updateBefore) interleaves a command submission with the
++  // in-flight render graph on three r182 and corrupts unrelated passes
++  // (observed: epipolar god-ray internals — black frames).
++  update(renderer: { compute: (node: never) => unknown }): void {
++    const context = this.atmosphereContext
++    if (context == null || this.computeNode == null) {
++      return // Not built yet.
++    }
++
++    // Sun direction in world space (matrixWorldToECEF is a rigid transform;
++    // same workaround as AtmosphereLightNode: nothing updates
++    // matrixECEFToWorld in the node graph).
++    const sunDirectionWorld = vectorScratch
++      .copy(context.sunDirectionECEF.value)
++      .applyMatrix3(
++        rotationScratch
++          .setFromMatrix4(context.matrixWorldToECEF.value)
++          .transpose()
++      )
++
++    ++this.framesSinceDispatch
++    const sunMoved =
++      this.lastSunDirection.distanceToSquared(sunDirectionWorld) > 1e-8
++    const cameraMoved =
++      this.lastCameraPosition.distanceToSquared(this.camera.position) > 100
++    if (
++      !sunMoved &&
++      !cameraMoved &&
++      this.framesSinceDispatch < this.updateInterval
++    ) {
++      return
++    }
++    this.framesSinceDispatch = 0
++    this.lastSunDirection.copy(sunDirectionWorld)
++    this.lastCameraPosition.copy(this.camera.position)
++    this.dispatchCount += 1
++
++    this.csm.update(this.camera, sunDirectionWorld)
++
++    const cascades = this.csm.cascades
++    const inverseMatrices = this.inverseShadowMatrices.array as Matrix4[]
++    const matrices = this.shadowMatrices.array as Matrix4[]
++    for (let i = 0; i < CASCADE_COUNT; ++i) {
++      inverseMatrices[i].copy(cascades[i].inverseMatrix)
++      matrices[i].copy(cascades[i].matrix)
++    }
++
++    void renderer.compute(this.computeNode as never)
++  }
++
++  override setup(builder: NodeBuilder): unknown {
++    const context = getAtmosphereContext(builder)
++    this.atmosphereContext = context
++
++    const density = this.densityField
++    const bottomRadius = float(context.parameters.bottomRadius)
++    const sunDirectionECEF = context.sunDirectionECEF
++    const { matrixWorldToECEF, altitudeCorrectionECEF } = context
++
++    const computeNode = Fn(() => {
++      const id = instanceIndex
++      const x = id.mod(MAP_SIZE)
++      const y = id.div(MAP_SIZE).mod(MAP_SIZE)
++      const cascade = id.div(MAP_SIZE * MAP_SIZE)
++      If(uvec3(x, y, cascade).greaterThanEqual(uvec3(MAP_SIZE, MAP_SIZE, CASCADE_COUNT)).any(), () => {
++        Return()
++      })
++
++      const uv = vec2(float(x).add(0.5), float(y).add(0.5))
++        .div(MAP_SIZE)
++        .toConst('shadowUv')
++      const clip = uv.mul(2).sub(1).toConst()
++
++      const pointClip = this.inverseShadowMatrices
++        .element(cascade)
++        .mul(vec4(clip.x, clip.y, -1, 1))
++        .toConst()
++      const point = pointClip.xyz.div(pointClip.w).toConst('shadowPoint')
++      const sunPosition = matrixWorldToECEF
++        .mul(vec4(point, 1))
++        .xyz.add(altitudeCorrectionECEF)
++        .toConst('sunPosition')
++
++      const rayDirection = normalize(sunDirectionECEF.negate()).toConst(
++        'shadowRayDirection'
++      )
++
++      // Ray interval between the shadow-top and shadow-bottom spheres.
++      const topIntersection = raySphereIntersection(
++        sunPosition,
++        rayDirection,
++        vec3(0),
++        bottomRadius.add(density.shadowTopHeight)
++      ).toConst()
++      const bottomIntersection = raySphereIntersection(
++        sunPosition,
++        rayDirection,
++        vec3(0),
++        bottomRadius.add(density.shadowBottomHeight)
++      ).toConst()
++      const rayNear = max(0, topIntersection.x).toConst('shadowRayNear')
++      const rayFar = select(
++        bottomIntersection.x.lessThan(0),
++        1e6,
++        bottomIntersection.x
++      ).toConst('shadowRayFar')
++      const maxRayDistance = rayFar.sub(rayNear).toConst('maxRayDistance')
++
++      const rayOrigin = rayDirection
++        .mul(rayNear)
++        .add(sunPosition)
++        .toConst('shadowRayOrigin')
++
++      const jitter = interleavedGradientNoise(vec2(float(x), float(y))).toConst(
++        'shadowJitter'
++      )
++
++      // Structured volume sampling: spatially aliased but temporally stable,
++      // which matters most at shadow map resolutions.
++      const normal = getStructureNormal(rayDirection, jitter)
++      const { stepOffset, stepSize } = intersectStructuredPlanes(
++        normal,
++        rayOrigin,
++        rayDirection,
++        clamp(
++          maxRayDistance.div(this.maxIterationCount),
++          this.minStepSize,
++          this.maxStepSize
++        )
++      )
++
++      const rayDistance = stepOffset.toVar('rayDistance')
++      const extinctionSum = float(0).toVar('extinctionSum')
++      const maxOpticalDepth = float(0).toVar('maxOpticalDepth')
++      const maxOpticalDepthTail = float(0).toVar('maxOpticalDepthTail')
++      const transmittanceIntegral = float(1).toVar('transmittanceIntegral')
++      const weightedDistanceSum = float(0).toVar('weightedDistanceSum')
++      const transmittanceSum = float(0).toVar('transmittanceSum')
++      const sampleCount = int(0).toVar('sampleCount')
++
++      Loop(this.maxIterationCount, () => {
++        If(rayDistance.greaterThan(maxRayDistance), () => {
++          Break()
++        })
++
++        const position = rayDirection
++          .mul(rayDistance)
++          .add(rayOrigin)
++          .toConst('marchPosition')
++        const height = length(position).sub(bottomRadius).toConst('height')
++
++        If(density.insideLayerIntervals(height), () => {
++          rayDistance.addAssign(stepSize)
++          Continue()
++        })
++
++        const globeUv = density.getGlobeUv(position)
++        const weather = density.sampleWeather(globeUv, height, { shadow: true })
++
++        If(greaterThan(weather.density, vec4(this.minDensity)).any(), () => {
++          // Note this assumes an homogeneous medium.
++          const media = density.sampleMedia(weather, position, globeUv)
++          If(media.extinction.greaterThan(this.minExtinction), () => {
++            extinctionSum.addAssign(media.extinction)
++            maxOpticalDepth.addAssign(media.extinction.mul(stepSize))
++            transmittanceIntegral.mulAssign(
++              exp(media.extinction.negate().mul(stepSize))
++            )
++            weightedDistanceSum.addAssign(
++              rayDistance.mul(transmittanceIntegral)
++            )
++            transmittanceSum.addAssign(transmittanceIntegral)
++            sampleCount.addAssign(1)
++          })
++        })
++
++        If(transmittanceIntegral.lessThanEqual(this.minTransmittance), () => {
++          // A large amount of optical depth accumulates in the tail, beyond
++          // the point of minimum transmittance. The expected optical depth
++          // seems to decrease exponentially with the number of samples taken
++          // before reaching the minimum transmittance.
++          // https://x.com/shotamatsuda/status/1886259549931520437
++          maxOpticalDepthTail.assign(
++            min(
++              this.opticalDepthTailScale
++                .mul(stepSize)
++                .mul(exp(float(1).sub(float(sampleCount)))),
++              stepSize.mul(0.5) // Excess optical depth only adds aliasing.
++            )
++          )
++          Break()
++        })
++        rayDistance.addAssign(stepSize)
++      })
++
++      const result = select(
++        sampleCount.equal(0),
++        vec4(maxRayDistance, 0, 0, 0),
++        vec4(
++          min(weightedDistanceSum.div(transmittanceSum), maxRayDistance),
++          extinctionSum.div(float(sampleCount)),
++          maxOpticalDepth,
++          maxOpticalDepthTail
++        )
++      ).toConst('shadowResult')
++
++      textureStore(this.texture, ivec3(int(x), int(y), int(cascade)), result)
++    })().compute(MAP_SIZE * MAP_SIZE * CASCADE_COUNT, [8, 8, 1])
++
++    this.computeNode = computeNode
++
++    return super.setup(builder)
++  }
++
++  // Optical depth of the clouds shadowing `positionECEF`, reconstructed from
++  // the beer shadow map (see clouds.frag readShadowOpticalDepth):
++  //   od = min(maxOD + tail, meanExtinction * max(0, dTop - offset - front))
++  sampleOpticalDepth(
++    positionECEF: Node<'vec3'>,
++    distanceOffset: Node<'float'> | number = 0
++  ): Node<'float'> {
++    const density = this.densityField
++
++    return FnVar(() => (builder: NodeBuilder) => {
++      const context = getAtmosphereContext(builder)
++      const bottomRadius = float(context.parameters.bottomRadius)
++      const { matrixWorldToECEF, altitudeCorrectionECEF, sunDirectionECEF } =
++        context
++
++      const position = positionECEF.toConst('shadowSamplePositionECEF')
++      const topIntersection = raySphereIntersection(
++        position,
++        sunDirectionECEF,
++        vec3(0),
++        bottomRadius.add(density.shadowTopHeight)
++      ).toConst()
++      const distanceToTop = topIntersection.y.toConst('distanceToShadowTop')
++
++      const result = float(0).toVar('shadowOpticalDepth')
++      If(distanceToTop.greaterThan(0), () => {
++        // World position for the cascade projection. matrixWorldToECEF is
++        // rigid, so its transpose rotation + negated translation inverts it;
++        // in this codebase the world already is ECEF (identity), keep the
++        // altitude correction only.
++        const world = position.sub(altitudeCorrectionECEF).toConst()
++
++        // First-fit cascade selection: use the finest cascade whose map
++        // contains the point.
++        const uvs: Array<Node<'vec2'>> = []
++        for (let i = 0; i < CASCADE_COUNT; ++i) {
++          const clip = this.shadowMatrices.element(i).mul(vec4(world, 1))
++          uvs.push(clip.xy.div(clip.w).mul(0.5).add(0.5).toConst())
++        }
++        const inside = uvs.map(uv =>
++          uv.x
++            .greaterThanEqual(0)
++            .and(uv.x.lessThanEqual(1))
++            .and(uv.y.greaterThanEqual(0))
++            .and(uv.y.lessThanEqual(1))
++            .toConst()
++        )
++
++        const cascadeIndex = select(
++          inside[0],
++          0,
++          select(inside[1], 1, select(inside[2], 2, -1))
++        ).toConst('cascadeIndex')
++        const uv = select(
++          inside[0],
++          uvs[0],
++          select(inside[1], uvs[1], uvs[2])
++        ).toConst('cascadeUv')
++
++        If(cascadeIndex.greaterThanEqual(0), () => {
++          const layer = float(cascadeIndex).add(0.5).div(CASCADE_COUNT)
++          const shadow = this.textureNode
++            .sample(vec3(uv, layer))
++            .toConst('beerShadowMapSample')
++          const distanceToFront = max(
++            0,
++            distanceToTop.sub(distanceOffset).sub(shadow.r)
++          )
++          result.assign(
++            min(shadow.b.add(shadow.a), shadow.g.mul(distanceToFront))
++          )
++        })
++      })
++      return result
++    })()
++  }
++
++  // Cloud shadow transmittance at an ECEF position: exp(-opticalDepth).
++  sampleTransmittance(
++    positionECEF: Node<'vec3'>,
++    distanceOffset: Node<'float'> | number = 0
++  ): Node<'float'> {
++    return saturate(
++      exp(this.sampleOpticalDepth(positionECEF, distanceOffset).negate())
++    )
++  }
++
++  // Port of clouds.frag marchShadowLength for cloud god rays: expected
++  // shadowed length along a view ray, where each step contributes
++  // (1 - transmittance) * stepSize from the beer shadow map's optical depth
++  // toward the sun. Additionally accumulates the first moment so the result
++  // can be fitted to the contiguous-segment model the atmosphere runtime's
++  // shadowLength consumes: returns vec2(shadowedLength, segmentStart) in
++  // METERS along the ray (callers convert to unit space).
++  marchShadowLength(
++    rayOriginECEF: Node<'vec3'>,
++    rayDirectionECEF: Node<'vec3'>,
++    maxRayDistance: Node<'float'>,
++    jitter: Node<'float'>,
++    {
++      iterations = 48,
++      minStepSize = 100,
++      stepScale = 1.04
++    }: { iterations?: number; minStepSize?: number; stepScale?: number } = {}
++  ): Node<'vec2'> {
++    return Fn(() => {
++      const shadowed = float(0).toVar('cloudShadowedLength')
++      const moment = float(0).toVar('cloudShadowMoment')
++      const stepSize = float(minStepSize).toVar('cloudShadowStep')
++      const rayDistance = stepSize.mul(jitter).toVar('cloudShadowDistance')
++      Loop(iterations, () => {
++        If(rayDistance.greaterThan(maxRayDistance), () => {
++          Break()
++        })
++        const position = rayOriginECEF.add(rayDirectionECEF.mul(rayDistance))
++        const opticalDepth = this.sampleOpticalDepth(position)
++        const contribution = exp(opticalDepth.negate())
++          .oneMinus()
++          .mul(stepSize)
++        shadowed.addAssign(contribution)
++        moment.addAssign(contribution.mul(rayDistance))
++        stepSize.mulAssign(stepScale)
++        rayDistance.addAssign(stepSize)
++      })
++      const center = moment.div(max(shadowed, 1e-3))
++      const start = max(center.sub(shadowed.mul(0.5)), 0)
++      return vec2(shadowed, start)
++    })()
++  }
++
++  override dispose(): void {
++    this.texture.dispose()
++    super.dispose()
++  }
++}
+diff --git a/packages/clouds/src/webgpu/CloudDensityField.ts b/packages/clouds/src/webgpu/CloudDensityField.ts
+new file mode 100644
+index 00000000..2071c5b2
+--- /dev/null
++++ b/packages/clouds/src/webgpu/CloudDensityField.ts
+@@ -0,0 +1,332 @@
++// TSL port of shaders/clouds.glsl (weather/media sampling) plus the CPU-side
++// parameter/layer uniforms from uniforms.ts, packaged as a reusable object so
++// the shadow pass and the visible cloud raymarch share one density model.
++
++import { Vector2, Vector3, Vector4 } from 'three'
++import {
++  abs,
++  all,
++  asin,
++  atan,
++  clamp,
++  dot,
++  exp,
++  float,
++  greaterThan,
++  length,
++  max,
++  mix,
++  normalize,
++  pow,
++  remapClamp,
++  renderGroup,
++  saturate,
++  select,
++  sqrt,
++  uniform,
++  vec2,
++  vec3,
++  vec4,
++  type ShaderNodeObject
++} from 'three/tsl'
++import type { Node as ThreeNode, TextureNode } from 'three/webgpu'
++
++import type { Node } from '@takram/three-geospatial/webgpu'
++
++import { CloudLayers } from '../CloudLayers'
++
++export interface WeatherSample {
++  heightFraction: Node<'vec4'>
++  density: Node<'vec4'>
++}
++
++export interface MediaSample {
++  weight: Node<'vec4'>
++  scattering: Node<'float'>
++  extinction: Node<'float'>
++}
++
++export interface CloudDensityFieldTextures {
++  localWeatherNode: TextureNode
++  shapeNode: TextureNode
++  shapeDetailNode?: TextureNode | null
++  turbulenceNode?: TextureNode | null
++}
++
++export class CloudDensityField {
++  readonly localWeatherNode: TextureNode
++  readonly shapeNode: TextureNode
++  readonly shapeDetailNode: TextureNode | null
++  readonly turbulenceNode: TextureNode | null
++
++  // Participating medium
++  readonly scatteringCoefficient = uniform(1).setGroup(renderGroup)
++  readonly absorptionCoefficient = uniform(0).setGroup(renderGroup)
++
++  // Weather and shape
++  readonly coverage = uniform(0.3).setGroup(renderGroup)
++  readonly localWeatherRepeat = uniform(new Vector2().setScalar(100)).setGroup(renderGroup)
++  readonly localWeatherOffset = uniform(new Vector2()).setGroup(renderGroup)
++  readonly shapeRepeat = uniform(new Vector3().setScalar(0.0003)).setGroup(renderGroup)
++  readonly shapeOffset = uniform(new Vector3()).setGroup(renderGroup)
++  readonly shapeDetailRepeat = uniform(new Vector3().setScalar(0.006)).setGroup(renderGroup)
++  readonly shapeDetailOffset = uniform(new Vector3()).setGroup(renderGroup)
++  readonly turbulenceRepeat = uniform(new Vector2().setScalar(20)).setGroup(renderGroup)
++  readonly turbulenceDisplacement = uniform(350).setGroup(renderGroup)
++
++  // Cloud layers (packed by updateLayerUniforms)
++  readonly layers = CloudLayers.DEFAULT.clone()
++  readonly minLayerHeights = uniform(new Vector4()).setGroup(renderGroup)
++  readonly maxLayerHeights = uniform(new Vector4()).setGroup(renderGroup)
++  readonly minIntervalHeights = uniform(new Vector3()).setGroup(renderGroup)
++  readonly maxIntervalHeights = uniform(new Vector3()).setGroup(renderGroup)
++  readonly densityScales = uniform(new Vector4()).setGroup(renderGroup)
++  readonly shapeAmounts = uniform(new Vector4()).setGroup(renderGroup)
++  readonly shapeDetailAmounts = uniform(new Vector4()).setGroup(renderGroup)
++  readonly weatherExponents = uniform(new Vector4()).setGroup(renderGroup)
++  readonly shapeAlteringBiases = uniform(new Vector4()).setGroup(renderGroup)
++  readonly coverageFilterWidths = uniform(new Vector4()).setGroup(renderGroup)
++  readonly minHeight = uniform(0).setGroup(renderGroup)
++  readonly maxHeight = uniform(0).setGroup(renderGroup)
++  readonly shadowTopHeight = uniform(0).setGroup(renderGroup)
++  readonly shadowBottomHeight = uniform(0).setGroup(renderGroup)
++  readonly shadowLayerMask = uniform(new Vector4()).setGroup(renderGroup)
++  readonly densityProfileExpTerms = uniform(new Vector4()).setGroup(renderGroup)
++  readonly densityProfileExponents = uniform(new Vector4()).setGroup(renderGroup)
++  readonly densityProfileLinearTerms = uniform(new Vector4()).setGroup(renderGroup)
++  readonly densityProfileConstantTerms = uniform(new Vector4()).setGroup(renderGroup)
++
++  constructor(textures: CloudDensityFieldTextures) {
++    this.localWeatherNode = textures.localWeatherNode
++    this.shapeNode = textures.shapeNode
++    this.shapeDetailNode = textures.shapeDetailNode ?? null
++    this.turbulenceNode = textures.turbulenceNode ?? null
++    this.updateLayerUniforms()
++  }
++
++  // Mirrors updateCloudLayerUniforms() in ../uniforms.ts. Call after
++  // mutating `layers`.
++  updateLayerUniforms(): void {
++    const layers = this.layers
++    layers.packValues('altitude', this.minLayerHeights.value)
++    layers.packSums('altitude', 'height', this.maxLayerHeights.value)
++    layers.packIntervalHeights(
++      this.minIntervalHeights.value,
++      this.maxIntervalHeights.value
++    )
++    layers.packValues('densityScale', this.densityScales.value)
++    layers.packValues('shapeAmount', this.shapeAmounts.value)
++    layers.packValues('shapeDetailAmount', this.shapeDetailAmounts.value)
++    layers.packValues('weatherExponent', this.weatherExponents.value)
++    layers.packValues('shapeAlteringBias', this.shapeAlteringBiases.value)
++    layers.packValues('coverageFilterWidth', this.coverageFilterWidths.value)
++    layers.packDensityProfiles('expTerm', this.densityProfileExpTerms.value)
++    layers.packDensityProfiles('exponent', this.densityProfileExponents.value)
++    layers.packDensityProfiles('linearTerm', this.densityProfileLinearTerms.value)
++    layers.packDensityProfiles(
++      'constantTerm',
++      this.densityProfileConstantTerms.value
++    )
++
++    let totalMinHeight = Infinity
++    let totalMaxHeight = 0
++    let shadowBottomHeight = Infinity
++    let shadowTopHeight = 0
++    const mask = [0, 0, 0, 0]
++    for (let i = 0; i < layers.length; ++i) {
++      const { altitude, height, shadow } = layers[i]
++      const maxHeight = altitude + height
++      if (height > 0) {
++        if (altitude < totalMinHeight) totalMinHeight = altitude
++        if (shadow && altitude < shadowBottomHeight) shadowBottomHeight = altitude
++        if (maxHeight > totalMaxHeight) totalMaxHeight = maxHeight
++        if (shadow && maxHeight > shadowTopHeight) shadowTopHeight = maxHeight
++      }
++      mask[i] = shadow ? 1 : 0
++    }
++    this.minHeight.value = totalMinHeight !== Infinity ? totalMinHeight : 0
++    this.maxHeight.value = totalMaxHeight
++    this.shadowBottomHeight.value =
++      shadowBottomHeight !== Infinity ? shadowBottomHeight : 0
++    this.shadowTopHeight.value = shadowTopHeight
++    this.shadowLayerMask.value.fromArray(mask)
++  }
++
++  // Cube-sphere relaxation by:
++  // http://mathproofs.blogspot.com/2005/07/mapping-cube-to-sphere.html
++  getGlobeUv(position: Node<'vec3'>): Node<'vec2'> {
++    const n = normalize(position).toConst('globeNormal')
++    const f = abs(n).toConst()
++    const c = n.div(max(f.x, max(f.y, f.z))).toConst()
++    const m = select(
++      all(greaterThan(f.yy, vec2(f.x, f.z))),
++      select(c.y.greaterThan(0), vec2(n.x.negate(), n.z), n.xz),
++      select(
++        all(greaterThan(f.xx, vec2(f.y, f.z))),
++        select(c.x.greaterThan(0), n.yz, vec2(n.y.negate(), n.z)),
++        select(c.z.greaterThan(0), n.xy, vec2(n.x, n.y.negate()))
++      )
++    ).toConst('cubeM')
++
++    const m2 = m.mul(m).toConst()
++    const q = dot(m2.xy, vec2(-2, 2)).sub(3).toConst()
++    const q2 = q.mul(q)
++    const uvx = sqrt(
++      float(1.5)
++        .add(m2.x)
++        .sub(m2.y)
++        .sub(sqrt(m2.x.mul(-24).add(q2)).mul(0.5))
++    )
++      .mul(select(m.x.greaterThan(0), 1, -1))
++      .toConst('cubeUvX')
++    const uvy = sqrt(float(6).div(float(3).sub(uvx.mul(uvx)))).mul(m.y)
++    return vec2(uvx, uvy).mul(0.5).add(0.5)
++  }
++
++  insideLayerIntervals(height: Node<'float'>): ShaderNodeObject<ThreeNode> {
++    const gtx = height.greaterThan(this.minIntervalHeights.x)
++    const ltx = height.lessThan(this.maxIntervalHeights.x)
++    const gty = height.greaterThan(this.minIntervalHeights.y)
++    const lty = height.lessThan(this.maxIntervalHeights.y)
++    const gtz = height.greaterThan(this.minIntervalHeights.z)
++    const ltz = height.lessThan(this.maxIntervalHeights.z)
++    return gtx.and(ltx).or(gty.and(lty)).or(gtz.and(ltz))
++  }
++
++  private shapeAlteringFunction(heightFraction: Node<'vec4'>): Node<'vec4'> {
++    // Apply a semi-circle transform to round the clouds towards the top.
++    const biased = pow(heightFraction, this.shapeAlteringBiases)
++    const x = clamp(biased.mul(2).sub(1), -1, 1).toConst()
++    return float(1).sub(x.mul(x))
++  }
++
++  sampleWeather(
++    uv: Node<'vec2'>,
++    height: Node<'float'>,
++    { shadow = false }: { shadow?: boolean } = {}
++  ): WeatherSample {
++    const heightFraction = remapClamp(
++      vec4(height),
++      this.minLayerHeights,
++      this.maxLayerHeights
++    ).toConst('heightFraction')
++
++    // NOTE: The procedural textures have no mips, so the WebGL mipLevel
++    // parameter is dropped here.
++    let localWeather: Node<'vec4'> = pow(
++      this.localWeatherNode
++        .sample(uv.mul(this.localWeatherRepeat).add(this.localWeatherOffset))
++        .rgba,
++      this.weatherExponents
++    )
++    if (shadow) {
++      localWeather = localWeather.mul(this.shadowLayerMask)
++    }
++    localWeather = localWeather.toConst('localWeather')
++
++    const heightScale = this.shapeAlteringFunction(heightFraction).toConst()
++
++    // Modulation to control weather by the coverage parameter.
++    // Reference: https://github.com/Prograda/Skybolt/blob/master/Assets/Core/Shaders/Clouds.h#L63
++    const factor = float(1).sub(this.coverage.mul(heightScale)).toConst()
++    const density = remapClamp(
++      mix(localWeather, vec4(1), this.coverageFilterWidths),
++      factor,
++      factor.add(this.coverageFilterWidths)
++    ).toConst('weatherDensity')
++
++    return { heightFraction, density }
++  }
++
++  private getLayerDensity(heightFraction: Node<'vec4'>): Node<'vec4'> {
++    return this.densityProfileExpTerms
++      .mul(exp(this.densityProfileExponents.mul(heightFraction)))
++      .add(this.densityProfileLinearTerms.mul(heightFraction))
++      .add(this.densityProfileConstantTerms)
++  }
++
++  sampleMedia(
++    weather: WeatherSample,
++    position: Node<'vec3'>,
++    uv: Node<'vec2'>
++  ): MediaSample {
++    let density = weather.density
++
++    // TODO: Define in physical length (upstream TODO as well).
++    const surfaceNormal = normalize(position)
++    const localWeatherSpeed = length(this.localWeatherOffset)
++    const evolution = surfaceNormal
++      .mul(localWeatherSpeed)
++      .mul(-2e4)
++      .toConst('evolution')
++
++    let turbulence: Node<'vec3'> = vec3(0)
++    if (this.turbulenceNode != null) {
++      const turbulenceUv = uv
++        .mul(this.localWeatherRepeat)
++        .mul(this.turbulenceRepeat)
++      turbulence = this.turbulenceNode
++        .sample(turbulenceUv)
++        .rgb.mul(2)
++        .sub(1)
++        .mul(this.turbulenceDisplacement)
++        .mul(
++          dot(density, remapClamp(weather.heightFraction, vec4(0.3), vec4(0)))
++        )
++        .toConst('turbulence')
++    }
++
++    const shapePosition = position
++      .add(evolution)
++      .add(turbulence)
++      .mul(this.shapeRepeat)
++      .add(this.shapeOffset)
++    const shape = this.shapeNode.sample(shapePosition).r.toConst('shape')
++    density = remapClamp(
++      density,
++      vec4(float(1).sub(shape)).mul(this.shapeAmounts),
++      vec4(1)
++    )
++
++    if (this.shapeDetailNode != null) {
++      const detailPosition = position
++        .add(turbulence)
++        .mul(this.shapeDetailRepeat)
++        .add(this.shapeDetailOffset)
++      const detail = this.shapeDetailNode
++        .sample(detailPosition)
++        .r.toConst('shapeDetail')
++      // Fluffy at the top and whippy at the bottom.
++      const modifier = mix(
++        vec4(pow(detail, 6)),
++        vec4(float(1).sub(detail)),
++        remapClamp(weather.heightFraction, vec4(0.2), vec4(0.4))
++      )
++        .mul(this.shapeDetailAmounts)
++        .toConst('detailModifier')
++      density = remapClamp(density.mul(2), modifier.mul(0.5), vec4(1))
++    }
++
++    // Apply the density profiles.
++    density = saturate(
++      density
++        .mul(this.densityScales)
++        .mul(this.getLayerDensity(weather.heightFraction))
++    ).toConst('mediaDensity')
++
++    const densitySum = density.x
++      .add(density.y)
++      .add(density.z)
++      .add(density.w)
++      .toConst('densitySum')
++    const weight = density.div(densitySum).toConst('mediaWeight')
++    const scattering = densitySum
++      .mul(this.scatteringCoefficient)
++      .toConst('mediaScattering')
++    const extinction = densitySum
++      .mul(this.absorptionCoefficient)
++      .add(scattering)
++      .toConst('mediaExtinction')
++    return { weight, scattering, extinction }
++  }
++}
+diff --git a/packages/clouds/src/webgpu/CloudShapeDetailNode.ts b/packages/clouds/src/webgpu/CloudShapeDetailNode.ts
+new file mode 100644
+index 00000000..6b0bf720
+--- /dev/null
++++ b/packages/clouds/src/webgpu/CloudShapeDetailNode.ts
+@@ -0,0 +1,37 @@
++import { vec2, vec3, vec4 } from 'three/tsl'
++import { Vector3, type NodeBuilder } from 'three/webgpu'
++
++import type { Node } from '@takram/three-geospatial/webgpu'
++
++import { CLOUD_SHAPE_DETAIL_TEXTURE_SIZE } from '../constants'
++import { ProceduralTexture3DNode } from './ProceduralTexture3DNode'
++import { stackableWorleyNoise } from './stackableNoise'
++
++export class CloudShapeDetailNode extends ProceduralTexture3DNode {
++  override get type(): string {
++    return 'CloudShapeDetailNode'
++  }
++
++  constructor(size = new Vector3().setScalar(CLOUD_SHAPE_DETAIL_TEXTURE_SIZE)) {
++    super(size)
++  }
++
++  protected override setupOutputNode(
++    uvw: Node<'vec3'>,
++    builder: NodeBuilder
++  ): Node {
++    const cellCount = 2
++    const noise = vec4(
++      stackableWorleyNoise(uvw, cellCount),
++      stackableWorleyNoise(uvw, cellCount * 2),
++      stackableWorleyNoise(uvw, cellCount * 4),
++      stackableWorleyNoise(uvw, cellCount * 8)
++    ).oneMinus()
++    const fbm = vec3(
++      noise.xyz.dot(vec3(0.625, 0.25, 0.125)),
++      noise.yzw.dot(vec3(0.625, 0.25, 0.125)),
++      noise.zw.dot(vec2(0.75, 0.25))
++    )
++    return fbm.dot(vec3(0.625, 0.25, 0.125))
++  }
++}
+diff --git a/packages/clouds/src/webgpu/CloudShapeNode.ts b/packages/clouds/src/webgpu/CloudShapeNode.ts
+new file mode 100644
+index 00000000..9f77cecb
+--- /dev/null
++++ b/packages/clouds/src/webgpu/CloudShapeNode.ts
+@@ -0,0 +1,65 @@
++import { Vector3 } from 'three'
++import { vec2, vec3, vec4 } from 'three/tsl'
++import type { NodeBuilder } from 'three/webgpu'
++
++import { FnLayout, type Node } from '@takram/three-geospatial/webgpu'
++
++import { CLOUD_SHAPE_TEXTURE_SIZE } from '../constants'
++import { ProceduralTexture3DNode } from './ProceduralTexture3DNode'
++import { stackablePerlinNoise, stackableWorleyNoise } from './stackableNoise'
++
++export const perlinWorley = /*#__PURE__*/ FnLayout({
++  name: 'perlinWorley',
++  type: 'float',
++  inputs: [{ name: 'point', type: 'vec3' }]
++})(([point]) => {
++  const octaveCount = 3
++  const frequency = 8
++  const perlin = stackablePerlinNoise(point, frequency, octaveCount).saturate()
++
++  const cellCount = 4
++  const noise = vec3(
++    stackableWorleyNoise(point, cellCount * 2),
++    stackableWorleyNoise(point, cellCount * 8),
++    stackableWorleyNoise(point, cellCount * 14)
++  ).oneMinus()
++  const fbm = noise.dot(vec3(0.625, 0.25, 0.125))
++  return perlin.remap(0, 1, fbm, 1)
++})
++
++export const worleyFbm = /*#__PURE__*/ FnLayout({
++  name: 'worleyFbm',
++  type: 'float',
++  inputs: [{ name: 'point', type: 'vec3' }]
++})(([point]) => {
++  const cellCount = 4
++  const noise = vec4(
++    stackableWorleyNoise(point, cellCount * 2),
++    stackableWorleyNoise(point, cellCount * 4),
++    stackableWorleyNoise(point, cellCount * 8),
++    stackableWorleyNoise(point, cellCount * 16)
++  ).oneMinus()
++  const fbm = vec3(
++    noise.xyz.dot(vec3(0.625, 0.25, 0.125)),
++    noise.yzw.dot(vec3(0.625, 0.25, 0.125)),
++    noise.zw.dot(vec2(0.75, 0.25))
++  )
++  return fbm.dot(vec3(0.625, 0.25, 0.125))
++})
++
++export class CloudShapeNode extends ProceduralTexture3DNode {
++  override get type(): string {
++    return 'CloudShapeNode'
++  }
++
++  constructor(size = new Vector3().setScalar(CLOUD_SHAPE_TEXTURE_SIZE)) {
++    super(size)
++  }
++
++  protected override setupOutputNode(
++    uvw: Node<'vec3'>,
++    builder: NodeBuilder
++  ): Node {
++    return perlinWorley(uvw).remap(worleyFbm(uvw).sub(1), 1)
++  }
++}
+diff --git a/packages/clouds/src/webgpu/LocalWeatherNode.ts b/packages/clouds/src/webgpu/LocalWeatherNode.ts
+new file mode 100644
+index 00000000..3a0c805e
+--- /dev/null
++++ b/packages/clouds/src/webgpu/LocalWeatherNode.ts
+@@ -0,0 +1,102 @@
++import { Vector2 } from 'three'
++import { float, Loop, smoothstep, vec3, vec4 } from 'three/tsl'
++import type { NodeBuilder } from 'three/webgpu'
++
++import { FnLayout, type Node } from '@takram/three-geospatial/webgpu'
++
++import { ProceduralTextureNode } from './ProceduralTextureNode'
++import { stackablePerlinNoise, stackableWorleyNoise } from './stackableNoise'
++
++const worleyFbm = /*#__PURE__*/ FnLayout({
++  name: 'worleyFbm',
++  type: 'float',
++  inputs: [
++    { name: 'point', type: 'vec3' },
++    { name: 'frequency', type: 'float' },
++    { name: 'amplitude', type: 'float' },
++    { name: 'lacunarity', type: 'float' },
++    { name: 'gain', type: 'float' },
++    { name: 'octaveCount', type: 'int' }
++  ]
++})(([point, frequency, amplitude, lacunarity, gain, octaveCount]) => {
++  const amplitudeVar = amplitude.toVar()
++  const frequencyVar = frequency.toVar()
++  const noise = float(0).toVar()
++  Loop({ start: 0, end: octaveCount }, () => {
++    noise.addAssign(
++      amplitudeVar.mul(stackableWorleyNoise(point, frequencyVar).oneMinus())
++    )
++    frequencyVar.mulAssign(lacunarity)
++    amplitudeVar.mulAssign(gain)
++  })
++  return noise
++})
++
++export class LocalWeatherNode extends ProceduralTextureNode {
++  override get type(): string {
++    return 'LocalWeatherNode'
++  }
++
++  constructor(size = new Vector2().setScalar(512)) {
++    super(size)
++  }
++
++  protected override setupOutputNode(
++    uv: Node<'vec2'>,
++    builder: NodeBuilder
++  ): Node {
++    const output = vec4().toVar()
++
++    // Mid clouds
++    {
++      let worley = worleyFbm(
++        uv.add(vec3(0.5)),
++        8.0, // frequency
++        0.4, // amplitude
++        2.0, // lacunarity
++        0.95, // gain
++        4 // octaveCount
++      )
++      worley = smoothstep(1.0, 1.4, worley)
++      output.g.assign(worley)
++    }
++
++    // Low clouds
++    {
++      let worley = worleyFbm(
++        uv,
++        16.0, // frequency
++        0.4, // amplitude
++        2.0, // lacunarity
++        0.95, // gain
++        4 // octaveCount
++      )
++      worley = smoothstep(0.8, 1.4, worley)
++      output.r.assign(worley.sub(output.g).saturate())
++    }
++
++    // High clouds
++    {
++      let perlin = stackablePerlinNoise(
++        uv,
++        vec3(6.0, 12.0, 1.0), // frequency
++        8 // octaveCount
++      )
++      perlin = smoothstep(-0.5, 0.5, perlin)
++      output.b.assign(perlin)
++    }
++
++    // Extra
++    {
++      let perlin = stackablePerlinNoise(
++        uv.add(vec3(-19.1, 33.4, 47.2)),
++        32.0, // frequency
++        4 // octaveCount
++      )
++      perlin = smoothstep(-0.5, 0.5, perlin)
++      output.a.assign(perlin)
++    }
++
++    return output
++  }
++}
+diff --git a/packages/clouds/src/webgpu/ProceduralTexture3DNode.ts b/packages/clouds/src/webgpu/ProceduralTexture3DNode.ts
+new file mode 100644
+index 00000000..cc7c4bad
+--- /dev/null
++++ b/packages/clouds/src/webgpu/ProceduralTexture3DNode.ts
+@@ -0,0 +1,121 @@
++import {
++  LinearFilter,
++  NoColorSpace,
++  RepeatWrapping,
++  UnsignedByteType,
++  Vector3
++} from 'three'
++import {
++  Fn,
++  If,
++  instanceIndex,
++  Return,
++  textureStore,
++  uvec3,
++  vec3
++} from 'three/tsl'
++import {
++  NodeUpdateType,
++  Storage3DTexture,
++  TempNode,
++  type NodeBuilder,
++  type NodeFrame,
++  type TextureNode
++} from 'three/webgpu'
++
++import { outputTexture3D, type Node } from '@takram/three-geospatial/webgpu'
++
++export abstract class ProceduralTexture3DNode extends TempNode {
++  static override get type(): string {
++    return 'ProceduralTexture3DNode'
++  }
++
++  readonly texture = this.createStorage3DTexture()
++
++  private readonly textureNode: TextureNode
++
++  private computeNode?: unknown
++  private computeDispatched = false
++
++  constructor(size = new Vector3(1)) {
++    super(null)
++    // Dispatching compute during setup() corrupts pipelines that are being
++    // built in the same frame on three r182 (invalid bind group layouts on
++    // unrelated materials). Defer the dispatch to the frame update phase.
++    this.updateBeforeType = NodeUpdateType.FRAME
++    this.textureNode = outputTexture3D(this, this.texture)
++    this.setSize(size.x, size.y, size.z)
++  }
++
++  protected createStorage3DTexture(name?: string): Storage3DTexture {
++    const texture = new Storage3DTexture(1, 1, 1)
++    texture.type = UnsignedByteType
++    texture.minFilter = LinearFilter
++    texture.magFilter = LinearFilter
++    texture.wrapS = RepeatWrapping
++    texture.wrapT = RepeatWrapping
++    texture.wrapR = RepeatWrapping
++    texture.colorSpace = NoColorSpace
++    texture.generateMipmaps = false
++
++    const typeName = (this.constructor as typeof Node).type
++    texture.name = name != null ? `${typeName}.${name}` : typeName
++
++    return texture
++  }
++
++  getTextureNode(): TextureNode {
++    return this.textureNode
++  }
++
++  setSize(width: number, height: number, depth: number): this {
++    this.texture.setSize(width, height, depth)
++    return this
++  }
++
++  protected abstract setupOutputNode(
++    uvw: Node<'vec3'>,
++    builder: NodeBuilder
++  ): Node
++
++  override setup(builder: NodeBuilder): unknown {
++    const { width, height, depth } = this.texture
++
++    const computeNode = Fn(() => {
++      const id = instanceIndex
++      const x = id.mod(width)
++      const y = id.div(width).mod(height)
++      const z = id.div(width * height)
++      const size = uvec3(width, height, depth)
++      If(uvec3(x, y, z).greaterThanEqual(size).any(), () => {
++        Return()
++      })
++      const textureCoordinate = vec3(x, y, z)
++      const uvw = textureCoordinate.add(0.5).div(vec3(width, height, depth))
++
++      textureStore(
++        this.texture,
++        textureCoordinate,
++        this.setupOutputNode(uvw, builder)
++      )
++    })().compute(width * height * depth, [4, 4, 4])
++
++    this.computeNode = computeNode
++    this.computeDispatched = false
++
++    return super.setup(builder)
++  }
++
++  override updateBefore(frame: NodeFrame): void {
++    if (this.computeDispatched || this.computeNode == null) {
++      return
++    }
++    this.computeDispatched = true
++    void frame.renderer!.compute(this.computeNode as never)
++  }
++
++  override dispose(): void {
++    this.texture.dispose()
++    super.dispose()
++  }
++}
+diff --git a/packages/clouds/src/webgpu/ProceduralTextureNode.ts b/packages/clouds/src/webgpu/ProceduralTextureNode.ts
+new file mode 100644
+index 00000000..2b767945
+--- /dev/null
++++ b/packages/clouds/src/webgpu/ProceduralTextureNode.ts
+@@ -0,0 +1,119 @@
++import {
++  LinearFilter,
++  NoColorSpace,
++  RepeatWrapping,
++  UnsignedByteType,
++  Vector2
++} from 'three'
++import {
++  Fn,
++  If,
++  instanceIndex,
++  Return,
++  textureStore,
++  uvec2,
++  vec2
++} from 'three/tsl'
++import {
++  NodeUpdateType,
++  StorageTexture,
++  TempNode,
++  type NodeBuilder,
++  type NodeFrame,
++  type TextureNode
++} from 'three/webgpu'
++
++import { outputTexture, type Node } from '@takram/three-geospatial/webgpu'
++
++export abstract class ProceduralTextureNode extends TempNode {
++  static override get type(): string {
++    return 'ProceduralTextureNode'
++  }
++
++  readonly texture = this.createStorageTexture()
++
++  private readonly textureNode: TextureNode
++
++  private computeNode?: unknown
++  private computeDispatched = false
++
++  constructor(size = new Vector2(1)) {
++    super(null)
++    // Dispatching compute during setup() corrupts pipelines that are being
++    // built in the same frame on three r182 (invalid bind group layouts on
++    // unrelated materials). Defer the dispatch to the frame update phase.
++    this.updateBeforeType = NodeUpdateType.FRAME
++    this.textureNode = outputTexture(this, this.texture)
++    this.setSize(size.x, size.y)
++  }
++
++  protected createStorageTexture(name?: string): StorageTexture {
++    const texture = new StorageTexture(1, 1)
++    texture.type = UnsignedByteType
++    texture.minFilter = LinearFilter
++    texture.magFilter = LinearFilter
++    texture.wrapS = RepeatWrapping
++    texture.wrapT = RepeatWrapping
++    texture.colorSpace = NoColorSpace
++    texture.generateMipmaps = false
++
++    const typeName = (this.constructor as typeof Node).type
++    texture.name = name != null ? `${typeName}.${name}` : typeName
++
++    return texture
++  }
++
++  getTextureNode(): TextureNode {
++    return this.textureNode
++  }
++
++  setSize(width: number, height: number): this {
++    this.texture.setSize(width, height, this.texture.depth)
++    return this
++  }
++
++  protected abstract setupOutputNode(
++    uv: Node<'vec2'>,
++    builder: NodeBuilder
++  ): Node
++
++  override setup(builder: NodeBuilder): unknown {
++    const { width, height } = this.texture
++
++    const computeNode = Fn(() => {
++      const id = instanceIndex
++      const x = id.mod(width)
++      const y = id.div(width)
++      const size = uvec2(width, height)
++      If(uvec2(x, y).greaterThanEqual(size).any(), () => {
++        Return()
++      })
++      const textureCoordinate = vec2(x, y)
++      const uv = textureCoordinate.add(0.5).div(vec2(width, height))
++
++      textureStore(
++        this.texture,
++        textureCoordinate,
++        this.setupOutputNode(uv, builder)
++      )
++    })().compute(width * height, [8, 8, 1])
++
++    this.computeNode = computeNode
++    this.computeDispatched = false
++
++    return super.setup(builder)
++  }
++
++  override updateBefore(frame: NodeFrame): void {
++    if (this.computeDispatched || this.computeNode == null) {
++      return
++    }
++    this.computeDispatched = true
++    void frame.renderer!.compute(this.computeNode as never)
++  }
++
++  override dispose(): void {
++    this.texture.dispose()
++    super.dispose()
++  }
++}
+diff --git a/packages/clouds/src/webgpu/TurbulenceNode.ts b/packages/clouds/src/webgpu/TurbulenceNode.ts
+new file mode 100644
+index 00000000..1d991845
+--- /dev/null
++++ b/packages/clouds/src/webgpu/TurbulenceNode.ts
+@@ -0,0 +1,66 @@
++import { Vector2 } from 'three'
++import { int, vec3 } from 'three/tsl'
++import type { NodeBuilder } from 'three/webgpu'
++
++import { FnLayout, type Node } from '@takram/three-geospatial/webgpu'
++
++import { ProceduralTextureNode } from './ProceduralTextureNode'
++import { stackablePerlinNoise } from './stackableNoise'
++
++const perlin = (point: Node<'vec3'>): Node<'float'> => {
++  return stackablePerlinNoise(point, vec3(12), int(3))
++}
++
++const perlin3D = /*#__PURE__*/ FnLayout({
++  name: 'perlin3D',
++  type: 'vec3',
++  inputs: [{ name: 'point', type: 'vec3' }]
++})(([point]) => {
++  const perlin1 = perlin(point)
++  const perlin2 = perlin(point.yzx.add(vec3(-19.1, 33.4, 47.2)))
++  const perlin3 = perlin(point.zxy.add(vec3(74.2, -124.5, 99.4)))
++  return vec3(perlin1, perlin2, perlin3)
++})
++
++const curl = /*#__PURE__*/ FnLayout({
++  name: 'curl',
++  type: 'vec3',
++  inputs: [{ name: 'point', type: 'vec3' }]
++})(([point]) => {
++  const delta = 0.1
++  const dx = vec3(delta, 0, 0)
++  const dy = vec3(0, delta, 0)
++  const dz = vec3(0, 0, delta)
++
++  const px0 = perlin3D(point.sub(dx))
++  const px1 = perlin3D(point.add(dx))
++  const py0 = perlin3D(point.sub(dy))
++  const py1 = perlin3D(point.add(dy))
++  const pz0 = perlin3D(point.sub(dz))
++  const pz1 = perlin3D(point.add(dz))
++
++  const x = py1.z.sub(py0.z).sub(pz1.y).add(pz0.y)
++  const y = pz1.x.sub(pz0.x).sub(px1.z).add(px0.z)
++  const z = px1.y.sub(px0.y).sub(py1.x).add(py0.x)
++
++  return vec3(x, y, z)
++    .mul(1 / (delta * 2))
++    .normalize()
++})
++
++export class TurbulenceNode extends ProceduralTextureNode {
++  override get type(): string {
++    return 'TurbulenceNode'
++  }
++
++  constructor(size = new Vector2().setScalar(128)) {
++    super(size)
++  }
++
++  protected override setupOutputNode(
++    uv: Node<'vec2'>,
++    builder: NodeBuilder
++  ): Node {
++    return curl(vec3(uv, 0)).mul(0.5).add(0.5)
++  }
++}
+diff --git a/packages/clouds/src/webgpu/index.ts b/packages/clouds/src/webgpu/index.ts
+new file mode 100644
+index 00000000..c12231dc
+--- /dev/null
++++ b/packages/clouds/src/webgpu/index.ts
+@@ -0,0 +1,9 @@
++export * from './CloudBeerShadowMapNode'
++export * from './CloudDensityField'
++export * from './CloudShapeDetailNode'
++export * from './CloudShapeNode'
++export * from './LocalWeatherNode'
++export * from './ProceduralTexture3DNode'
++export * from './ProceduralTextureNode'
++export * from './structuredSampling'
++export * from './TurbulenceNode'
+diff --git a/packages/clouds/src/webgpu/perlinNoise.ts b/packages/clouds/src/webgpu/perlinNoise.ts
+new file mode 100644
+index 00000000..fa691e0c
+--- /dev/null
++++ b/packages/clouds/src/webgpu/perlinNoise.ts
+@@ -0,0 +1,245 @@
++// Ported from GLM: https://github.com/g-truc/glm/blob/master/glm/gtc/noise.inl
++
++/**
++ * OpenGL Mathematics (GLM)
++ *
++ * GLM is licensed under The Happy Bunny License or MIT License
++ *
++ * The Happy Bunny License (Modified MIT License)
++ *
++ * Copyright (c) 2005 - G-Truc Creation
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * Restrictions: By making use of the Software for military purposes, you choose
++ * to make a Bunny unhappy.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ *
++ * The MIT License
++ *
++ * Copyright (c) 2005 - G-Truc Creation
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++import { floor, mix, mul, step, sub, vec4 } from 'three/tsl'
++
++import { FnLayout } from '@takram/three-geospatial/webgpu'
++
++const mod289 = /*#__PURE__*/ FnLayout({
++  name: 'mod289',
++  type: 'vec4',
++  inputs: [{ name: 'x', type: 'vec4' }]
++})(([x]) => {
++  return x.sub(floor(x.mul(1 / 289)).mul(289))
++})
++
++const permute = /*#__PURE__*/ FnLayout({
++  name: 'permute',
++  type: 'vec4',
++  inputs: [{ name: 'v', type: 'vec4' }]
++})(([v]) => {
++  return mod289(v.mul(34).add(1).mul(v))
++})
++
++const taylorInvSqrt = /*#__PURE__*/ FnLayout({
++  name: 'taylorInvSqrt',
++  type: 'vec4',
++  inputs: [{ name: 'r', type: 'vec4' }]
++})(([r]) => {
++  return sub(1.79284291400159, r.mul(0.85373472095314))
++})
++
++const fade = /*#__PURE__*/ FnLayout({
++  name: 'fade',
++  type: 'vec4',
++  inputs: [{ name: 'v', type: 'vec4' }]
++})(([v]) => {
++  return v.pow3().mul(v.mul(v.mul(6).sub(15)).add(10))
++})
++
++// Classic Perlin noise, periodic version
++export const periodicPerlinNoise = /*#__PURE__*/ FnLayout({
++  name: 'periodicPerlinNoise',
++  type: 'float',
++  inputs: [
++    { name: 'position', type: 'vec4' },
++    { name: 'repeat', type: 'vec4' }
++  ]
++})(([position, repeat]) => {
++  const Pi0 = position.floor().mod(repeat) // Integer part modulo repeat
++  const Pi1 = Pi0.add(1).mod(repeat) // Integer part + 1 mod repeat
++  const Pf0 = position.fract() // Fractional part for interpolation
++  const Pf1 = Pf0.sub(1) // Fractional part - 1
++  const ix = vec4(Pi0.x, Pi1.x, Pi0.x, Pi1.x)
++  const iy = vec4(Pi0.y, Pi0.y, Pi1.y, Pi1.y)
++  const iz0 = vec4(Pi0.z)
++  const iz1 = vec4(Pi1.z)
++  const iw0 = vec4(Pi0.w)
++  const iw1 = vec4(Pi1.w)
++
++  const ixy = permute(permute(ix).add(iy))
++  const ixy0 = permute(ixy.add(iz0))
++  const ixy1 = permute(ixy.add(iz1))
++  const ixy00 = permute(ixy0.add(iw0))
++  const ixy01 = permute(ixy0.add(iw1))
++  const ixy10 = permute(ixy1.add(iw0))
++  const ixy11 = permute(ixy1.add(iw1))
++
++  const gx00 = ixy00.div(7)
++  const gy00 = gx00.floor().div(7)
++  const gz00 = gy00.floor().div(6)
++  gx00.assign(gx00.fract().sub(0.5))
++  gy00.assign(gy00.fract().sub(0.5))
++  gz00.assign(gz00.fract().sub(0.5))
++  const gw00 = vec4(0.75).sub(gx00.abs()).sub(gy00.abs()).sub(gz00.abs())
++  const sw00 = step(gw00, 0)
++  gx00.subAssign(sw00.mul(step(0, gx00).sub(0.5)))
++  gy00.subAssign(sw00.mul(step(0, gy00).sub(0.5)))
++
++  const gx01 = ixy01.div(7)
++  const gy01 = gx01.floor().div(7)
++  const gz01 = gy01.floor().div(6)
++  gx01.assign(gx01.fract().sub(0.5))
++  gy01.assign(gy01.fract().sub(0.5))
++  gz01.assign(gz01.fract().sub(0.5))
++  const gw01 = vec4(0.75).sub(gx01.abs()).sub(gy01.abs()).sub(gz01.abs())
++  const sw01 = step(gw01, 0)
++  gx01.subAssign(sw01.mul(step(0, gx01).sub(0.5)))
++  gy01.subAssign(sw01.mul(step(0, gy01).sub(0.5)))
++
++  const gx10 = ixy10.div(7)
++  const gy10 = gx10.floor().div(7)
++  const gz10 = gy10.floor().div(6)
++  gx10.assign(gx10.fract().sub(0.5))
++  gy10.assign(gy10.fract().sub(0.5))
++  gz10.assign(gz10.fract().sub(0.5))
++  const gw10 = vec4(0.75).sub(gx10.abs()).sub(gy10.abs()).sub(gz10.abs())
++  const sw10 = step(gw10, 0)
++  gx10.subAssign(sw10.mul(step(0, gx10).sub(0.5)))
++  gy10.subAssign(sw10.mul(step(0, gy10).sub(0.5)))
++
++  const gx11 = ixy11.div(7)
++  const gy11 = gx11.floor().div(7)
++  const gz11 = gy11.floor().div(6)
++  gx11.assign(gx11.fract().sub(0.5))
++  gy11.assign(gy11.fract().sub(0.5))
++  gz11.assign(gz11.fract().sub(0.5))
++  const gw11 = vec4(0.75).sub(gx11.abs()).sub(gy11.abs()).sub(gz11.abs())
++  const sw11 = step(gw11, 0)
++  gx11.subAssign(sw11.mul(step(0, gx11).sub(0.5)))
++  gy11.subAssign(sw11.mul(step(0, gy11).sub(0.5)))
++
++  const g0000 = vec4(gx00.x, gy00.x, gz00.x, gw00.x)
++  const g1000 = vec4(gx00.y, gy00.y, gz00.y, gw00.y)
++  const g0100 = vec4(gx00.z, gy00.z, gz00.z, gw00.z)
++  const g1100 = vec4(gx00.w, gy00.w, gz00.w, gw00.w)
++  const g0010 = vec4(gx10.x, gy10.x, gz10.x, gw10.x)
++  const g1010 = vec4(gx10.y, gy10.y, gz10.y, gw10.y)
++  const g0110 = vec4(gx10.z, gy10.z, gz10.z, gw10.z)
++  const g1110 = vec4(gx10.w, gy10.w, gz10.w, gw10.w)
++  const g0001 = vec4(gx01.x, gy01.x, gz01.x, gw01.x)
++  const g1001 = vec4(gx01.y, gy01.y, gz01.y, gw01.y)
++  const g0101 = vec4(gx01.z, gy01.z, gz01.z, gw01.z)
++  const g1101 = vec4(gx01.w, gy01.w, gz01.w, gw01.w)
++  const g0011 = vec4(gx11.x, gy11.x, gz11.x, gw11.x)
++  const g1011 = vec4(gx11.y, gy11.y, gz11.y, gw11.y)
++  const g0111 = vec4(gx11.z, gy11.z, gz11.z, gw11.z)
++  const g1111 = vec4(gx11.w, gy11.w, gz11.w, gw11.w)
++
++  const norm00 = taylorInvSqrt(
++    vec4(g0000.dot(g0000), g0100.dot(g0100), g1000.dot(g1000), g1100.dot(g1100))
++  )
++  g0000.mulAssign(norm00.x)
++  g0100.mulAssign(norm00.y)
++  g1000.mulAssign(norm00.z)
++  g1100.mulAssign(norm00.w)
++
++  const norm01 = taylorInvSqrt(
++    vec4(g0001.dot(g0001), g0101.dot(g0101), g1001.dot(g1001), g1101.dot(g1101))
++  )
++  g0001.mulAssign(norm01.x)
++  g0101.mulAssign(norm01.y)
++  g1001.mulAssign(norm01.z)
++  g1101.mulAssign(norm01.w)
++
++  const norm10 = taylorInvSqrt(
++    vec4(g0010.dot(g0010), g0110.dot(g0110), g1010.dot(g1010), g1110.dot(g1110))
++  )
++  g0010.mulAssign(norm10.x)
++  g0110.mulAssign(norm10.y)
++  g1010.mulAssign(norm10.z)
++  g1110.mulAssign(norm10.w)
++
++  const norm11 = taylorInvSqrt(
++    vec4(g0011.dot(g0011), g0111.dot(g0111), g1011.dot(g1011), g1111.dot(g1111))
++  )
++  g0011.mulAssign(norm11.x)
++  g0111.mulAssign(norm11.y)
++  g1011.mulAssign(norm11.z)
++  g1111.mulAssign(norm11.w)
++
++  const n0000 = g0000.dot(Pf0)
++  const n1000 = g1000.dot(vec4(Pf1.x, Pf0.y, Pf0.z, Pf0.w))
++  const n0100 = g0100.dot(vec4(Pf0.x, Pf1.y, Pf0.z, Pf0.w))
++  const n1100 = g1100.dot(vec4(Pf1.x, Pf1.y, Pf0.z, Pf0.w))
++  const n0010 = g0010.dot(vec4(Pf0.x, Pf0.y, Pf1.z, Pf0.w))
++  const n1010 = g1010.dot(vec4(Pf1.x, Pf0.y, Pf1.z, Pf0.w))
++  const n0110 = g0110.dot(vec4(Pf0.x, Pf1.y, Pf1.z, Pf0.w))
++  const n1110 = g1110.dot(vec4(Pf1.x, Pf1.y, Pf1.z, Pf0.w))
++  const n0001 = g0001.dot(vec4(Pf0.x, Pf0.y, Pf0.z, Pf1.w))
++  const n1001 = g1001.dot(vec4(Pf1.x, Pf0.y, Pf0.z, Pf1.w))
++  const n0101 = g0101.dot(vec4(Pf0.x, Pf1.y, Pf0.z, Pf1.w))
++  const n1101 = g1101.dot(vec4(Pf1.x, Pf1.y, Pf0.z, Pf1.w))
++  const n0011 = g0011.dot(vec4(Pf0.x, Pf0.y, Pf1.z, Pf1.w))
++  const n1011 = g1011.dot(vec4(Pf1.x, Pf0.y, Pf1.z, Pf1.w))
++  const n0111 = g0111.dot(vec4(Pf0.x, Pf1.y, Pf1.z, Pf1.w))
++  const n1111 = g1111.dot(Pf1)
++
++  const fadeXYZW = fade(Pf0)
++  const n0W = mix(
++    vec4(n0000, n1000, n0100, n1100),
++    vec4(n0001, n1001, n0101, n1101),
++    fadeXYZW.w
++  )
++  const n1W = mix(
++    vec4(n0010, n1010, n0110, n1110),
++    vec4(n0011, n1011, n0111, n1111),
++    fadeXYZW.w
++  )
++  const nZW = mix(n0W, n1W, fadeXYZW.z)
++  const nYZW = mix(nZW.xy, nZW.zw, fadeXYZW.y)
++  const nXYZW = mix(nYZW.x, nYZW.y, fadeXYZW.x)
++  return mul(2.2, nXYZW)
++})
+diff --git a/packages/clouds/src/webgpu/stackableNoise.ts b/packages/clouds/src/webgpu/stackableNoise.ts
+new file mode 100644
+index 00000000..242fc5fd
+--- /dev/null
++++ b/packages/clouds/src/webgpu/stackableNoise.ts
+@@ -0,0 +1,123 @@
++// Based on the following work with slight modifications.
++// https://github.com/sebh/TileableVolumeNoise
++
++/**
++ * The MIT License (MIT)
++ *
++ * Copyright(c) 2017 Sébastien Hillaire
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++import { float, Loop, min, mix, sin, sub, vec3, vec4 } from 'three/tsl'
++
++import { FnLayout } from '@takram/three-geospatial/webgpu'
++
++import { periodicPerlinNoise } from './perlinNoise'
++
++const hash = /*#__PURE__*/ FnLayout({
++  name: 'hash',
++  type: 'float',
++  inputs: [{ name: 'n', type: 'float' }]
++})(([n]) => {
++  return sin(n.add(1.951)).mul(43758.5453).fract()
++})
++
++const noise = /*#__PURE__*/ FnLayout({
++  name: 'noise',
++  type: 'float',
++  inputs: [{ name: 'x', type: 'vec3' }]
++})(([x]) => {
++  const p = x.floor().toVar()
++  const f = x.fract().toVar()
++
++  f.assign(f.pow2().mul(sub(3, f.mul(2))))
++  const n = p.x.add(p.y.mul(57)).add(p.z.mul(113)).toVar()
++  return mix(
++    mix(
++      mix(hash(n), hash(n.add(1)), f.x),
++      mix(hash(n.add(57)), hash(n.add(58)), f.x),
++      f.y
++    ),
++    mix(
++      mix(hash(n.add(113)), hash(n.add(114)), f.x),
++      mix(hash(n.add(170)), hash(n.add(171)), f.x),
++      f.y
++    ),
++    f.z
++  )
++})
++
++export const stackableWorleyNoise = /*#__PURE__*/ FnLayout({
++  name: 'stackableWorleyNoise',
++  type: 'float',
++  inputs: [
++    { name: 'p', type: 'vec3' },
++    { name: 'cellCount', type: 'float' }
++  ]
++})(([p, cellCount]) => {
++  const cell = p.mul(cellCount).toVar()
++  const d = float(1.0e10).toVar()
++  // @ts-expect-error Missing type
++  Loop({ start: -1, end: 1, condition: '<=', name: 'x' }, ({ x }) => {
++    // @ts-expect-error Missing type
++    Loop({ start: -1, end: 1, condition: '<=', name: 'y' }, ({ y }) => {
++      // @ts-expect-error Missing type
++      Loop({ start: -1, end: 1, condition: '<=', name: 'z' }, ({ z }) => {
++        const tp = cell
++          .floor()
++          .add(vec3(x, y, z))
++          .toVar()
++        tp.assign(cell.sub(tp).sub(noise(tp.mod(cellCount))))
++        d.assign(min(d, tp.dot(tp)))
++      })
++    })
++  })
++  return d.saturate()
++})
++
++export const stackablePerlinNoise = /*#__PURE__*/ FnLayout({
++  name: 'stackablePerlinNoise',
++  type: 'float',
++  inputs: [
++    { name: 'point', type: 'vec3' },
++    { name: 'frequency', type: 'vec3' },
++    { name: 'octaveCount', type: 'int' }
++  ]
++})(([point, frequency, octaveCount]) => {
++  // Noise frequency factor between octave, forced to 2.
++  const octaveFrequencyFactor = 2
++
++  // Compute the sum for each octave.
++  const sum = float(0).toVar()
++  const roughness = float(0.5).toVar()
++  const weightSum = float(0).toVar()
++  const weight = float(1).toVar()
++  const nextFrequency = frequency.toVar()
++  Loop({ start: 0, end: octaveCount }, () => {
++    const p = vec4(point.x, point.y, point.z, 0).mul(vec4(nextFrequency, 1))
++    const value = periodicPerlinNoise(p, vec4(nextFrequency, 1)).toVar()
++    sum.addAssign(value.mul(weight))
++    weightSum.addAssign(weight)
++    weight.mulAssign(roughness)
++    nextFrequency.mulAssign(octaveFrequencyFactor)
++  })
++
++  return sum.div(weightSum)
++})
+diff --git a/packages/clouds/src/webgpu/structuredSampling.ts b/packages/clouds/src/webgpu/structuredSampling.ts
+new file mode 100644
+index 00000000..4d2d1cc0
+--- /dev/null
++++ b/packages/clouds/src/webgpu/structuredSampling.ts
+@@ -0,0 +1,107 @@
++// TSL port of shaders/structuredSampling.glsl
++// Implements Structured Volume Sampling:
++// https://github.com/huwb/volsample
++// Implementation reference: https://www.shadertoy.com/view/ttVfDc
++//
++// These helpers compose nodes inline (plain functions, not Fn) because they
++// produce multiple outputs; TSL inlines the resulting graph.
++
++import { abs, dot, exp, mod, select, sign, vec3, vec4 } from 'three/tsl'
++
++import type { Node } from '@takram/three-geospatial/webgpu'
++
++function getIcosahedralVertices(direction: Node<'vec3'>): {
++  v1: Node<'vec3'>
++  v2: Node<'vec3'>
++  v3: Node<'vec3'>
++} {
++  // Normalization scalers to fit dodecahedron to unit sphere.
++  const a = 0.85065080835204 // phi / sqrt(2 + phi)
++  const b = 0.5257311121191336 // 1 / sqrt(2 + phi)
++
++  // Derive the vertices of icosahedron where triangle intersects the
++  // direction. See: https://www.ppsloan.org/publications/AmbientDice.pdf
++  const kT = 0.6180339887498948 // 1 / phi
++  const kT2 = 0.38196601125010515 // 1 / phi^2
++  const absD = abs(direction).toConst()
++  const selector1 = dot(absD, vec3(1, kT2, -kT))
++  const selector2 = dot(absD, vec3(-kT, 1, kT2))
++  const selector3 = dot(absD, vec3(kT2, -kT, 1))
++  const octantSign = sign(direction).toConst()
++  return {
++    v1: selector1
++      .greaterThan(0)
++      .select(vec3(a, b, 0), vec3(-b, 0, a))
++      .mul(octantSign)
++      .toConst('icoV1'),
++    v2: selector2
++      .greaterThan(0)
++      .select(vec3(0, a, b), vec3(a, -b, 0))
++      .mul(octantSign)
++      .toConst('icoV2'),
++    v3: selector3
++      .greaterThan(0)
++      .select(vec3(b, 0, a), vec3(0, a, -b))
++      .mul(octantSign)
++      .toConst('icoV3')
++  }
++}
++
++const sortKey = (v: Node<'vec3'>): Node<'float'> => dot(v, vec3(0.5, 0.5, 1))
++
++export function getStructureNormal(
++  direction: Node<'vec3'>,
++  jitter: Node<'float'>
++): Node<'vec3'> {
++  const { v1, v2, v3 } = getIcosahedralVertices(direction)
++
++  // Three-element sorting network on dot(v, base), mirroring sortVertices().
++  const aw0 = vec4(v1, sortKey(v1)).toConst()
++  const bw0 = vec4(v2, sortKey(v2)).toConst()
++  const cw0 = vec4(v3, sortKey(v3)).toConst()
++  const s1 = aw0.w.greaterThan(bw0.w).toConst()
++  const aw1 = select(s1, bw0, aw0).toConst()
++  const bw1 = select(s1, aw0, bw0).toConst()
++  const s2 = bw1.w.greaterThan(cw0.w).toConst()
++  const bw2 = select(s2, cw0, bw1).toConst()
++  const cw2 = select(s2, bw1, cw0).toConst()
++  const s3 = aw1.w.greaterThan(bw2.w).toConst()
++  const a = select(s3, bw2, aw1).xyz.toConst('sortedA')
++  const b = select(s3, aw1, bw2).xyz.toConst('sortedB')
++  const c = cw2.xyz.toConst('sortedC')
++
++  // Pentagonal weights
++  const w = exp(
++    vec3(dot(a, direction), dot(b, direction), dot(c, direction)).mul(40)
++  ).toConst()
++  const weights = w.div(w.x.add(w.y).add(w.z)).toConst('pentagonalWeights')
++
++  return select(
++    jitter.lessThan(weights.x),
++    a,
++    select(jitter.lessThan(weights.x.add(weights.y)), b, c)
++  ).toConst('structureNormal')
++}
++
++// Reference: https://github.com/huwb/volsample/blob/master/src/unity/Assets/Shaders/RayMarchCore.cginc
++export function intersectStructuredPlanes(
++  normal: Node<'vec3'>,
++  rayOrigin: Node<'vec3'>,
++  rayDirection: Node<'vec3'>,
++  samplePeriod: Node<'float'>
++): { stepOffset: Node<'float'>; stepSize: Node<'float'> } {
++  const NoD = dot(rayDirection, normal).toConst('NoD')
++  const stepSize = samplePeriod.div(abs(NoD)).toConst('structuredStepSize')
++
++  // Skips leftover bit to get from rayOrigin to first strata plane. mod()
++  // gives different results depending on the sign of the argument; ensure
++  // the first sample is in front of the viewer.
++  const offset = mod(dot(rayOrigin, normal), samplePeriod)
++    .div(NoD)
++    .negate()
++    .toConst()
++  const stepOffset = select(offset.lessThan(0), offset.add(stepSize), offset)
++    .toConst('structuredStepOffset')
++
++  return { stepOffset, stepSize }
++}
+diff --git a/packages/clouds/vite.config.ts b/packages/clouds/vite.config.ts
+index 9f4f7107..2d4b672f 100644
+--- a/packages/clouds/vite.config.ts
++++ b/packages/clouds/vite.config.ts
+@@ -46,7 +46,8 @@ export default defineConfig({
+       // Could also be a dictionary or array of multiple entry points.
+       entry: {
+         'build/index': 'src/index.ts',
+-        'build/r3f': 'src/r3f/index.ts'
++        'build/r3f': 'src/r3f/index.ts',
++        'build/webgpu': 'src/webgpu/index.ts'
+       },
+       name: 'clouds'
+     },
+diff --git a/packages/core/src/webgpu/FilterNode.ts b/packages/core/src/webgpu/FilterNode.ts
+index 097a51e4..3232007f 100644
+--- a/packages/core/src/webgpu/FilterNode.ts
++++ b/packages/core/src/webgpu/FilterNode.ts
+@@ -7,6 +7,7 @@ import {
+ import {
+   NodeUpdateType,
+   TempNode,
++  type Node,
+   type NodeBuilder,
+   type TextureNode
+ } from 'three/webgpu'
+diff --git a/storybook-webgpu/src/atmosphere/AtmosphereLUT-3D.tsx b/storybook-webgpu/src/atmosphere/AtmosphereLUT-3D.tsx
+index 1a3bc7cb..b8713bf4 100644
+--- a/storybook-webgpu/src/atmosphere/AtmosphereLUT-3D.tsx
++++ b/storybook-webgpu/src/atmosphere/AtmosphereLUT-3D.tsx
+@@ -52,7 +52,7 @@ const textureUVW = FnVar((textureSize: Node<'vec3'>, zoom: Node<'float'>) => {
+   If(index.greaterThanEqual(textureSize.z), () => {
+     Discard()
+   })
+-  return vec3(uv.fract(), index.toFloat().add(0.5).div(textureSize.z))
++  return vec3(uv.fract(), index.toFloat().div(textureSize.z))
+ })
+ 
+ const Content: FC<StoryProps> = ({
+diff --git a/storybook-webgpu/src/clouds/ProceduralTexture-2D.tsx b/storybook-webgpu/src/clouds/ProceduralTexture-2D.tsx
+new file mode 100644
+index 00000000..3d30200b
+--- /dev/null
++++ b/storybook-webgpu/src/clouds/ProceduralTexture-2D.tsx
+@@ -0,0 +1,122 @@
++import { ScreenQuad } from '@react-three/drei'
++import { useThree } from '@react-three/fiber'
++import { useEffect, type FC } from 'react'
++import { LinearSRGBColorSpace, NoToneMapping } from 'three'
++import {
++  Discard,
++  float,
++  Fn,
++  If,
++  positionGeometry,
++  screenSize,
++  screenUV,
++  uniform,
++  vec2,
++  vec4
++} from 'three/tsl'
++import { NodeMaterial, type Renderer } from 'three/webgpu'
++
++import type { ProceduralTextureNode } from '@takram/three-clouds/webgpu'
++import { FnVar, type Node } from '@takram/three-geospatial/webgpu'
++
++import type { StoryFC } from '../components/createStory'
++import { Description } from '../components/Description'
++import { WebGPUCanvas } from '../components/WebGPUCanvas'
++import { rendererArgs, rendererArgTypes } from '../controls/rendererControls'
++import { useResource } from '../hooks/useResource'
++import { useTransientControl } from '../hooks/useTransientControl'
++
++export const textureUV = FnVar(
++  (textureSize: Node<'vec2'>, zoom: Node<'float'>) => {
++    const scale = screenSize.div(textureSize).div(zoom).toVar()
++    const uv = screenUV.mul(scale).add(scale.oneMinus().mul(0.5)).toVar()
++    If(uv.lessThan(0).any().or(uv.greaterThan(1).any()), () => {
++      Discard()
++    })
++    return uv.flipY()
++  }
++)
++
++const Content: FC<StoryProps> = ({ node }) => {
++  const renderer = useThree<Renderer>(({ gl }) => gl as any)
++  renderer.toneMapping = NoToneMapping
++  renderer.outputColorSpace = LinearSRGBColorSpace
++
++  const zoom = uniform(0)
++
++  const material = useResource(() => new NodeMaterial(), [])
++  material.vertexNode = vec4(positionGeometry.xy, 0, 1)
++
++  const textureNode = node.getTextureNode()
++  const textureSize = vec2(textureNode.value.width, textureNode.value.height)
++  const uv = textureUV(textureSize, zoom)
++
++  material.colorNode = Fn(() => {
++    const coord = vec4(uv, uv.sub(0.5)).mul(2)
++    const color = float().toVar()
++    If(uv.y.greaterThan(0.5), () => {
++      If(uv.x.lessThan(0.5), () => {
++        color.assign(textureNode.sample(coord.xw).r)
++      }).Else(() => {
++        color.assign(textureNode.sample(coord.zw).g)
++      })
++    }).Else(() => {
++      If(uv.x.lessThan(0.5), () => {
++        color.assign(textureNode.sample(coord.xy).b)
++      }).Else(() => {
++        color.assign(textureNode.sample(coord.zy).a)
++      })
++    })
++    return color
++  })()
++
++  // Display controls:
++  useTransientControl(
++    ({ zoom }: StoryArgs) => ({ zoom }),
++    value => {
++      zoom.value = value.zoom
++    }
++  )
++
++  useEffect(() => {
++    return () => {
++      node.dispose()
++    }
++  }, [node])
++
++  return <ScreenQuad material={material} />
++}
++
++interface StoryProps {
++  node: ProceduralTextureNode
++}
++
++interface StoryArgs {
++  zoom: number
++}
++
++export const Story: StoryFC<StoryProps, StoryArgs> = props => (
++  <WebGPUCanvas>
++    <Content {...props} />
++    <Description />
++  </WebGPUCanvas>
++)
++
++Story.args = {
++  zoom: 1,
++  ...rendererArgs()
++}
++
++Story.argTypes = {
++  zoom: {
++    control: {
++      type: 'range',
++      min: 1,
++      max: 32,
++      step: 0.1
++    }
++  },
++  ...rendererArgTypes()
++}
++
++export default Story
+diff --git a/storybook-webgpu/src/clouds/ProceduralTexture-3D.tsx b/storybook-webgpu/src/clouds/ProceduralTexture-3D.tsx
+new file mode 100644
+index 00000000..f535677b
+--- /dev/null
++++ b/storybook-webgpu/src/clouds/ProceduralTexture-3D.tsx
+@@ -0,0 +1,116 @@
++import { ScreenQuad } from '@react-three/drei'
++import { useThree } from '@react-three/fiber'
++import { useEffect, type FC } from 'react'
++import { LinearSRGBColorSpace, NoToneMapping } from 'three'
++import {
++  Discard,
++  floor,
++  If,
++  ivec2,
++  max,
++  positionGeometry,
++  screenSize,
++  screenUV,
++  uniform,
++  vec2,
++  vec3,
++  vec4
++} from 'three/tsl'
++import { NodeMaterial, type Renderer } from 'three/webgpu'
++
++import type { ProceduralTexture3DNode } from '@takram/three-clouds/webgpu'
++import { FnVar, type Node } from '@takram/three-geospatial/webgpu'
++
++import type { StoryFC } from '../components/createStory'
++import { Description } from '../components/Description'
++import { WebGPUCanvas } from '../components/WebGPUCanvas'
++import { rendererArgs, rendererArgTypes } from '../controls/rendererControls'
++import { useResource } from '../hooks/useResource'
++import { useTransientControl } from '../hooks/useTransientControl'
++
++const textureUVW = FnVar((textureSize: Node<'vec3'>, zoom: Node<'float'>) => {
++  const uv = vec2(screenUV.x, screenUV.y)
++    .mul(screenSize)
++    .div(textureSize.xy)
++    .div(zoom)
++  const xy = ivec2(uv)
++  const columns = max(floor(screenSize.x.div(textureSize.x.mul(zoom))), 1)
++  If(xy.x.greaterThanEqual(columns), () => {
++    Discard()
++  })
++  const index = xy.y.mul(columns).add(xy.x.mod(columns))
++  If(index.greaterThanEqual(textureSize.z), () => {
++    Discard()
++  })
++  return vec3(uv.fract(), index.toFloat().div(textureSize.z))
++})
++
++const Content: FC<StoryProps> = ({ node }) => {
++  const renderer = useThree<Renderer>(({ gl }) => gl as any)
++  renderer.toneMapping = NoToneMapping
++  renderer.outputColorSpace = LinearSRGBColorSpace
++
++  const zoom = uniform(0)
++
++  const material = useResource(() => new NodeMaterial(), [])
++  material.vertexNode = vec4(positionGeometry.xy, 0, 1)
++
++  const textureNode = node.getTextureNode()
++  const textureSize = vec3(
++    textureNode.value.width,
++    textureNode.value.height,
++    textureNode.value.depth
++  )
++  const uvw = textureUVW(textureSize, zoom)
++  material.colorNode = textureNode.sample(uvw).rgb
++
++  // Display controls:
++  useTransientControl(
++    ({ zoom }: StoryArgs) => ({ zoom }),
++    value => {
++      zoom.value = value.zoom
++    }
++  )
++
++  useEffect(() => {
++    return () => {
++      node.dispose()
++    }
++  }, [node])
++
++  return <ScreenQuad material={material} />
++}
++
++interface StoryProps {
++  node: ProceduralTexture3DNode
++}
++
++interface StoryArgs {
++  zoom: number
++}
++
++export const Story: StoryFC<StoryProps, StoryArgs> = props => (
++  <WebGPUCanvas>
++    <Content {...props} />
++    <Description />
++  </WebGPUCanvas>
++)
++
++Story.args = {
++  zoom: 1,
++  ...rendererArgs()
++}
++
++Story.argTypes = {
++  zoom: {
++    control: {
++      type: 'range',
++      min: 1,
++      max: 32,
++      step: 0.1
++    }
++  },
++  ...rendererArgTypes()
++}
++
++export default Story
+diff --git a/storybook-webgpu/src/clouds/ProceduralTexture.stories.tsx b/storybook-webgpu/src/clouds/ProceduralTexture.stories.tsx
+new file mode 100644
+index 00000000..8d9e845d
+--- /dev/null
++++ b/storybook-webgpu/src/clouds/ProceduralTexture.stories.tsx
+@@ -0,0 +1,91 @@
++import type { Meta } from '@storybook/react-vite'
++
++import {
++  CloudShapeDetailNode,
++  CloudShapeNode,
++  LocalWeatherNode,
++  TurbulenceNode
++} from '@takram/three-clouds/webgpu'
++
++import { createStory } from '../components/createStory'
++import { Story as Story2D } from './ProceduralTexture-2D'
++import { Story as Story3D } from './ProceduralTexture-3D'
++
++import Code2D from './ProceduralTexture-2D?raw'
++import Code3D from './ProceduralTexture-3D?raw'
++
++export default {
++  title: 'clouds/Procedural Texture',
++  parameters: {
++    docs: {
++      codePanel: true,
++      source: {
++        language: 'tsx'
++      }
++    }
++  }
++} satisfies Meta
++
++export const LocalWeather = createStory(Story2D, {
++  props: {
++    node: new LocalWeatherNode()
++  },
++  args: {
++    zoom: 4
++  },
++  parameters: {
++    docs: {
++      source: {
++        code: Code2D
++      }
++    }
++  }
++})
++
++export const Shape = createStory(Story3D, {
++  props: {
++    node: new CloudShapeNode()
++  },
++  args: {
++    zoom: 1
++  },
++  parameters: {
++    docs: {
++      source: {
++        code: Code3D
++      }
++    }
++  }
++})
++
++export const ShapeDetail = createStory(Story3D, {
++  props: {
++    node: new CloudShapeDetailNode()
++  },
++  args: {
++    zoom: 4
++  },
++  parameters: {
++    docs: {
++      source: {
++        code: Code3D
++      }
++    }
++  }
++})
++
++export const Turbulence = createStory(Story2D, {
++  props: {
++    node: new TurbulenceNode()
++  },
++  args: {
++    zoom: 4
++  },
++  parameters: {
++    docs: {
++      source: {
++        code: Code2D
++      }
++    }
++  }
++})
+diff --git a/tsconfig.base.json b/tsconfig.base.json
+index 3404a2ff..1cc8a352 100644
+--- a/tsconfig.base.json
++++ b/tsconfig.base.json
+@@ -40,6 +40,9 @@
+       "@takram/three-clouds/r3f": [
+         "./packages/clouds/src/r3f/index.ts"
+       ],
++      "@takram/three-clouds/webgpu": [
++        "./packages/clouds/src/webgpu/index.ts"
++      ],
+       "@takram/three-geospatial": [
+         "./packages/core/src/index.ts"
+       ],

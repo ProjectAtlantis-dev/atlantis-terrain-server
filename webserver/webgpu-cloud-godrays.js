@@ -36,9 +36,16 @@ import {
 import { hash12 } from './laas/gpu/noise/NoiseTSL.ts';
 import { runiform } from './laas/gpu/RenderUniform.ts';
 
-// Clouds live in the 900-3300 m band here; beyond ~30 km the march adds
-// nothing god rays could resolve against aerial perspective.
-const CLOUD_GODRAY_MAX_DISTANCE_M = 30000;
+// Clouds live in the 900-3300 m band here; beyond ~25 km the march adds
+// nothing god rays could resolve against aerial perspective. The cap is the
+// actual march coverage: 48 geometric steps from 100 m at 1.06 growth reach
+// 100·(1.06^48−1)/0.06 ≈ 25.6 km. Raising the cap requires raising the
+// iteration count or step growth to match — the march stops at whichever is
+// shorter.
+const CLOUD_GODRAY_MAX_DISTANCE_M = 25000;
+const CLOUD_GODRAY_ITERATIONS = 48;
+const CLOUD_GODRAY_MIN_STEP_M = 100;
+const CLOUD_GODRAY_STEP_SCALE = 1.06;
 
 /**
  * @param {object} args
@@ -97,18 +104,35 @@ export function createCloudGodRayShadowLength({
 
     // vec2(shadowedLength, segmentStart) in meters along the ray.
     const cloud = beerShadowMap
-      .marchShadowLength(rayOrigin, rayDirection, maxDistance, jitter)
+      .marchShadowLength(rayOrigin, rayDirection, maxDistance, jitter, {
+        iterations: CLOUD_GODRAY_ITERATIONS,
+        minStepSize: CLOUD_GODRAY_MIN_STEP_M,
+        stepScale: CLOUD_GODRAY_STEP_SCALE,
+      })
       .toVar('cloudShadowSegment');
     const cloudLength = cloud.x.mul(worldToUnit).mul(uStrength);
     const cloudStart = cloud.y.mul(worldToUnit);
 
-    // Merge segments: total shadowed length is additive; the single-segment
-    // model gets the length-weighted mean start.
+    // Merge segments, moment-preserving: the runtime models ONE contiguous
+    // segment, so fit (start, length) to the union's total length and first
+    // moment. Total length is additive (an upper bound where terrain and
+    // cloud intervals overlap — acceptable: it errs toward slightly longer
+    // rays, and uStrength tunes it down). The merged start places the
+    // segment so its CENTER is the length-weighted mean of the two segment
+    // centers: start = Σ Li·(Si + Li/2) / ΣL − ΣL/2. A plain weighted mean
+    // of starts sits L1·L2/ΣL too far down the ray. Known model limit
+    // (WEBGPU_CLOUD_SHADOWS.md): distributed partial cloud cover squeezed
+    // into one fully-shadowed segment over-dims broad overcast — that is a
+    // property of takram's single-segment shadowLength, not of this fit.
     const totalLength = csm.x.add(cloudLength);
-    const mergedStart = csm.y
+    const mergedCenterMoment = csm.y
+      .add(csm.x.mul(0.5))
       .mul(csm.x)
-      .add(cloudStart.mul(cloudLength))
-      .div(totalLength.max(1e-6));
+      .add(cloudStart.add(cloudLength.mul(0.5)).mul(cloudLength));
+    const mergedStart = mergedCenterMoment
+      .div(totalLength.max(1e-6))
+      .sub(totalLength.mul(0.5))
+      .max(0);
     return vec2(totalLength, totalLength.greaterThan(0).select(mergedStart, 0));
   })();
 

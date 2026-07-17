@@ -3478,15 +3478,19 @@ function createWebGPUAtmospherePostProcessing(renderer) {
   webgpuCloudShadows.maxFar = MAX_VIEW_DIST;
   applyWebGPUCloudShadowLiveSettings();
   // DETACHED — measured 2026-07-17: attaching the BSM to the light craters
-  // the frame rate ~50x (22-30 fps → 0.3), and a bisect proved it is NOT
-  // the compute march (?bsmFreeze=1 identical) and NOT the sampling math
-  // (stubbing sampleOpticalDepth to a constant changes nothing). The mere
-  // graph mutation in CloudShadowAtmosphereLightNode.setupDirect
-  // (lightColor *= mix(1, x, uniform)) triggers it — a three r182
-  // lighting-graph pathology, present since stage 2 (its 0.5-4 fps
-  // "contention" numbers were this). Surface cloud shadows stay off until
-  // that is understood; cloud GOD RAYS don't need this attach — they fold
-  // the BSM into shadowLength in the post pass instead.
+  // the frame rate ~50x (22-30 fps → 0.3, GPU-bound: 92% of CPU time blocks
+  // in GPUQueue.submit). Bisected: NOT the compute march (?bsmFreeze=1
+  // identical, 1 dispatch) and NOT the sampling math (sampleOpticalDepth
+  // stubbed to a constant → still 0.3 fps). The collapse follows the
+  // lighting-graph attach itself; WHICH element is unproven — still in the
+  // frame with the stub: the custom light subclass, the mix() into
+  // lightColor, the renderGroup uniform, changed cache keys/bind groups.
+  // Isolation ladder if pursued on r182 (may be mooted by the r185
+  // experiment): (1) subclass returning directLight unchanged, (2) *= const,
+  // (3) *= uniform(1), (4) *= mix(1, const, uniform), (5) + BSM sample.
+  // Present since stage 2 (its 0.5-4 fps "contention" numbers were this).
+  // Cloud GOD RAYS don't need this attach — they fold the BSM into
+  // shadowLength in the post pass instead.
   // atmosphereLight.cloudShadow = webgpuCloudShadows;
   scene.add(atmosphereLight);
   scene.add(atmosphereLight.target);
@@ -3569,12 +3573,15 @@ function createWebGPUAtmospherePostProcessing(renderer) {
     );
   } else if (window.location.hash === '#shadow-length') {
     // Shareable validation view (like #shadow-mask): grayscale god-ray shadow
-    // length, 1.0 = 10 km of shadowed ray. The node outputs vec2(distance to
-    // shadow start, shadowed extent) in unit space — y is the length term.
+    // length, 1.0 = 10 km of shadowed ray. Convention (per the atmosphere
+    // runtime.ts branch diagrams, the authority): x = shadowed LENGTH along
+    // the ray, y = distance to the shadow segment start, unit space. This
+    // view previously displayed .yyy labeled as the length — that showed the
+    // START distance; conclusions drawn from it need rechecking.
     // The select keeps the main path in the graph so the scene pass (and its
     // viewZ buffer) still renders.
     outputNode = bool(true).select(
-      shadowLengthNode.yyy
+      shadowLengthNode.xxx
         .mul(1 / webgpuAtmosphereParameters.worldToUnit)
         .mul(0.0001),
       outputNode

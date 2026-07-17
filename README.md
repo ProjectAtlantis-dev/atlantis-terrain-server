@@ -95,14 +95,15 @@ npm install
 
 ### Frontend (Vite)
 
-The frontend depends on a local clone of the [Takram three-geospatial](https://github.com/takram-design-engineering/three-geospatial) monorepo for atmosphere and cloud effects. Vite aliases `@takram/*` imports to this local source.
+The frontend depends on a local clone of the [Takram three-geospatial](https://github.com/takram-design-engineering/three-geospatial) monorepo for atmosphere and cloud effects, pinned at upstream `b012ad06` **plus this project's WebGPU cloud/atmosphere port** (beer shadow map, cloud god rays, the atmosphere LUT race fix). The port is vendored as `webserver/three-geospatial-port.patch` and applied by the setup script — a plain upstream checkout will NOT build. Vite aliases `@takram/*` imports to this local source.
 
 ```bash
 cd webserver
-git clone https://github.com/takram-design-engineering/three-geospatial.git
-cd three-geospatial && git checkout b012ad06 && cd ..
+./setup-three-geospatial.sh   # clone upstream, pin b012ad06, apply the vendored port patch
 npm install
 ```
+
+After committing new work inside `webserver/three-geospatial`, regenerate the patch (see the header of `setup-three-geospatial.sh`) so clean checkouts stay reproducible.
 
 ### Running
 ```bash
