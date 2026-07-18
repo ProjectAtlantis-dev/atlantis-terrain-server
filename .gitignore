@@ -59,3 +59,4 @@ _metadata.json
 *.OLD
 kitty
 new_upscaler.md
+webserver/public/segmentation-results

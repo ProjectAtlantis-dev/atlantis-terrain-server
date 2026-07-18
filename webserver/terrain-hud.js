@@ -44,9 +44,16 @@ export function createTerrainHud({ onToggleMapMode, onToggleHeatmap, onClockActi
       window.open(url, '_blank');
     }
   });
-  window.addEventListener('mouseup', () => {
+  // The selecting flag pauses HUD rewrites mid-drag. Clear it on every event
+  // that can end a drag: a plain mouseup, but also contextmenu (right-click
+  // swallows the mouseup, which used to freeze the HUD permanently) and the
+  // window losing focus mid-drag.
+  const clearSelecting = () => {
     hud.dataset.selecting = 'false';
-  });
+  };
+  window.addEventListener('mouseup', clearSelecting);
+  window.addEventListener('contextmenu', clearSelecting);
+  window.addEventListener('blur', clearSelecting);
   hud.addEventListener('click', event => {
     if (
       event.target.id === 'mapModeLink' || event.target.id === 'heatmapModeLink' ||
@@ -92,6 +99,11 @@ export function renderGameClock(element, date, isPlaying) {
     timeZone: 'America/Nuuk', hour: '2-digit', minute: '2-digit', hour12: false,
   });
   const [hours, minutes] = nuukTime.split(':');
+  // Rewriting per frame destroys the buttons mid-click and forces relayout;
+  // only touch the DOM when the rendered minute or play state changes.
+  const renderKey = `${hours}:${minutes}|${isPlaying}`;
+  if (element.dataset?.gcRendered === renderKey) return;
+  if (element.dataset) element.dataset.gcRendered = renderKey;
   const style = 'cursor:pointer;padding:0 4px;border:none;background:none;font-size:12px;line-height:1;vertical-align:middle;';
   const color = '#5af';
   element.innerHTML = `<button data-gc="rw" style="${style}color:${color}" title="−15 min"><i class="fa-solid fa-backward"></i></button>`

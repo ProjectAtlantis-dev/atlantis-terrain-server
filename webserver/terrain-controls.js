@@ -82,6 +82,7 @@ export function installTerrainKeyboardControls({
   onOpenGoogleMaps = () => {},
   onToggleHeatmap = () => {},
   onToggleClassifier = () => {},
+  onFlyToTile = () => {},
   onReset,
   onHouseAction,
   onToggleHeadlights,
@@ -113,6 +114,12 @@ export function installTerrainKeyboardControls({
     if (event.code === 'KeyM') return onToggleMap();
     if (event.code === 'KeyG') return onOpenGoogleMaps();
     if (event.code === 'KeyC') return onToggleClassifier();
+    if (event.code === 'KeyT') {
+      // Clear the key first — the prompt dialog swallows the keyup event,
+      // which would leave KeyT stuck and force continuous rendering.
+      controls.keys[event.code] = false;
+      return onFlyToTile();
+    }
     if (event.code === 'KeyR') return onReset();
     if (event.code === 'KeyH') {
       if (event.shiftKey) return onHouseAction(true);

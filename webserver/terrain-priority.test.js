@@ -27,6 +27,7 @@ import { createTerrainClientLogger } from './terrain-client-logging.js';
 import { createTerrainFpsCounter } from './terrain-fps-counter.js';
 import { loadTerrainStartupAssets, normalizeTerrainStartupAssets } from './terrain-startup-assets.js';
 import { createTerrainAtmosphereTextureRuntime } from './terrain-atmosphere-textures.js';
+import { paintClassifierGridBorder } from './terrain-classifier-texture.js';
 import { createTerrainTuningControls } from './terrain-tuning-controls.js';
 import { bindTerrainCloudComposition, configureTerrainClouds, registerTerrainCloudTuning } from './terrain-cloud-runtime.js';
 import { createTerrainHouseConfiguration, createTerrainHouseMarkerRuntime, createTerrainHouseModelController, disposeTerrainHouseTree, markTerrainHousesNeedSnap, terrainHouseLocalPosition, terrainHouseShadowCoverage, terrainHouseZSummary } from './terrain-house-runtime.js';
@@ -45,6 +46,22 @@ import {
   terrainCameraStereoPosition,
   terrainPipelineStatus,
 } from './terrain-tile-fetch.js';
+
+test('classifier grid border is baked into all four texture edges', () => {
+  const fills = [];
+  const context = {
+    fillStyle: null,
+    fillRect(...args) { fills.push(args); },
+  };
+  assert.equal(paintClassifierGridBorder(context, 512, 256), 2);
+  assert.deepEqual(fills, [
+    [0, 0, 512, 2],
+    [0, 254, 512, 2],
+    [0, 2, 2, 252],
+    [510, 2, 2, 252],
+  ]);
+  assert.equal(context.fillStyle, 'rgba(20, 230, 255, 0.9)');
+});
 
 test('terrain camera persistence round-trips pose and frame state', () => {
   const saved = terrainCameraState({

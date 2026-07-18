@@ -41,6 +41,7 @@ import { createTerrainHouseSceneRuntime } from './terrain-house-scene-runtime.js
 import { createTerrainTileMenuRuntime } from './terrain-tile-menu-runtime.js';
 import { createTerrainHeatmapRuntime } from './terrain-heatmap-runtime.js';
 import { googleMaps3dUrl } from './terrain-google-maps.js';
+import { createTerrainFlyToTileRuntime } from './terrain-fly-to-tile.js';
 import { epsg3413DirectionBearing, epsg3413ToWgs84 } from './terrain-polar-stereo.js';
 
 export async function startTerrainApplication({ backend = 'webgl' } = {}) {
@@ -1162,6 +1163,38 @@ const terrainFetchRuntime = createTerrainFetchRuntime({
   events: terrainFetchEvents,
 });
 
+// --- Fly to tile (T key, ?tile= URL param) ---
+
+function raycastGroundAltitude(eastM, northM, startAltM) {
+  const terrainMeshes = houseRuntime.houseTerrainMeshes();
+  if (terrainMeshes.length === 0) return null;
+  const rayOrigin = anchorPosition.clone()
+    .addScaledVector(east, eastM)
+    .addScaledVector(north, northM)
+    .addScaledVector(up, startAltM);
+  aglRaycaster.set(rayOrigin, up.clone().negate());
+  const hits = aglRaycaster.intersectObjects(terrainMeshes);
+  if (hits.length === 0) return null;
+  return startAltM - hits[0].distance;
+}
+
+const flyToTileRuntime = createTerrainFlyToTileRuntime({
+  camera, anchorPosition, east, north, up, controls, cameraRuntimeState,
+  pipelineState: terrainPipelineState, anchorLat, anchorLon,
+  exitVehicle: () => vehicleRuntime.setVehicleControlActive(false, 'fly-to-tile'),
+  applyCameraOrientation,
+  requestFetch: () => terrainFetchRuntime.request(),
+  requestRender,
+  updateMapCamera,
+  raycastGroundAltitude,
+  enqueueLog: enqueueClientLog,
+});
+
+function promptFlyToTile() {
+  const tileId = window.prompt('Fly to tile (depth-col-row):', '');
+  if (tileId) flyToTileRuntime.flyToTile(tileId);
+}
+
 // --- Save/restore camera position ---
 
 function savePosition() {
@@ -1239,7 +1272,13 @@ bootLog('tiles.initial-fetch.start', {
   anchorLon
 });
 terrainPipelineState.ready = true;
-terrainFetchRuntime.request();
+// ?tile=12-1461-786 starts the session centered over that tile (overrides the
+// restored camera). flyToTile triggers the initial fetch itself, so the tile
+// becomes the adopted origin; fall back to a normal fetch on a bad id.
+const bootFlyToTileId = new URLSearchParams(window.location.search).get('tile');
+if (!bootFlyToTileId || !flyToTileRuntime.flyToTile(bootFlyToTileId).ok) {
+  terrainFetchRuntime.request();
+}
 houseRuntime.start();
 vehicleRuntime.loadVehicleState();
 vehicleRuntime.loadVehicleModel();
@@ -1253,6 +1292,7 @@ window.takramDebug = {
   anchorLon,
   controls,
   applyDate,
+  flyToTile: tileId => flyToTileRuntime.flyToTile(tileId),
   bootEvents,
   getBootEvents: () => bootEvents.slice(),
   getCloudShadowDebugSummary: () => webgpuAtmosphere?.debugSummary() ?? null,
@@ -1476,6 +1516,9 @@ function updateMovement(dt) {
   clampAltitude();
 }
 
+let lastHudHtml = '';
+let lastAltText = '';
+
 function updateHud() {
   const rel = camera.position.clone().sub(anchorPosition);
   const eastM = rel.dot(east);
@@ -1558,21 +1601,32 @@ function updateHud() {
       ' · Google 3D (G)' +
       ' · R reset · <span id="debugLogLink" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">debug log</span>'
   ].join('<br>');
-  const selection = window.getSelection();
-  const selectionInsideHud = Boolean(
-    selection && !selection.isCollapsed && (
-      hud.contains(selection.anchorNode) || hud.contains(selection.focusNode)
-    )
-  );
-  if (hud.dataset.selecting !== 'true' && !selectionInsideHud) {
-    hud.innerHTML = hudHtml;
+  // Rewriting innerHTML every rendered frame forces a DOM parse + relayout
+  // even when nothing changed — only write when the content differs. The
+  // selection guards pause writes while the user is selecting HUD text to
+  // copy; the cache comparison retries the write once the guard lifts.
+  if (hudHtml !== lastHudHtml) {
+    const selection = window.getSelection();
+    const selectionInsideHud = Boolean(
+      selection && !selection.isCollapsed && (
+        hud.contains(selection.anchorNode) || hud.contains(selection.focusNode)
+      )
+    );
+    if (hud.dataset.selecting !== 'true' && !selectionInsideHud) {
+      hud.innerHTML = hudHtml;
+      lastHudHtml = hudHtml;
+    }
   }
-  alt.textContent =
+  const altText =
     `${altM.toFixed(0)}m / ${(altM * 3.28084).toFixed(0)}ft  ${deg.toFixed(0)}° ${compass}` +
     `  FOV ${camera.fov.toFixed(0)}°` +
     (heatmapRuntime?.active
       ? '  [HEATMAP]'
       : (controls.mapMode ? '  [MAP]' : (vehicleRuntime.vehicleControlActive ? '  [VEHICLE]' : '')));
+  if (altText !== lastAltText) {
+    alt.textContent = altText;
+    lastAltText = altText;
+  }
 }
 
 function resetView() {
@@ -1698,6 +1752,7 @@ installTerrainKeyboardControls({
   onOpenGoogleMaps: openGoogleMapsView,
   onToggleHeatmap: toggleHeatmap,
   onToggleClassifier: toggleClassifierMode,
+  onFlyToTile: promptFlyToTile,
   onReset: resetView,
   onHouseAction: load => load
     ? houseRuntime.loadHouseModel('keyboard')

@@ -11,6 +11,7 @@ import {
   tileDepthFromId,
   terrainVisibilityDistance,
 } from './terrain-tile-runtime.js';
+import { paintClassifierGridBorder } from './terrain-classifier-texture.js';
 
 function parseTileId(tileId) {
   const match = /^(\d+)-(\d+)-(\d+)$/.exec(tileId || '');
@@ -49,6 +50,7 @@ export function createDesaturatedTerrainTexture(texture, documentImpl = globalTh
     pixels.data[index + 2] = gray;
   }
   context.putImageData(pixels, 0, 0);
+  paintClassifierGridBorder(context, width, height);
   const desaturated = new THREE.CanvasTexture(canvas);
   desaturated.flipY = texture.flipY;
   desaturated.colorSpace = texture.colorSpace;

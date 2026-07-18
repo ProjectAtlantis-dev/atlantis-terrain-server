@@ -47,7 +47,7 @@ Retired approaches, kept in git history only: bathymetry flattening and learned 
 
 The eyeball harness is the **tile inspector** (`pipeline.html?tile=<id>`): a tile's progress through heightmap → southness → texture → procgen, with per-stage status and keyboard navigation across tiles and depths.
 
-Classifier output lives in `terrain.db`'s `classifier_tiles` table as a zlib-compressed, image-oriented `uint8` label raster plus a class-schema name, dimensions, optional confidence raster, source/model identifier, and timestamp. A fresh database contains no classifier rows. In the 3D view, press **C** to toggle classifier presentation: missing tiles keep their satellite imagery but desaturate it, while available `coarse_v1` tiles are painted as grey / green / dark / white / water classes. Grayscale elevation is used only while a satellite texture is still loading. Deeper terrain tiles inherit a nearest-neighbor crop from the closest classified ancestor.
+Classifier output lives in `terrain.db`'s `classifier_tiles` table as a zlib-compressed, image-oriented `uint8` label raster plus a class-schema name, dimensions, optional confidence raster, source/model identifier, and timestamp. A fresh database contains no classifier rows. In the 3D view, press **C** to toggle classifier presentation: missing tiles keep their satellite imagery but desaturate it, while available `coarse_v1` tiles are painted as grey / green / dark / white / water classes. Both presentations paint cyan tile borders directly into their terrain textures, producing a terrain-conforming grid with normal hidden-surface removal. Grayscale elevation is used only while a satellite texture is still loading. Deeper terrain tiles inherit a nearest-neighbor crop from the closest classified ancestor.
 
 ## Troubleshooting
 
@@ -56,6 +56,10 @@ Classifier output lives in `terrain.db`'s `classifier_tiles` table as a zlib-com
 ## Default Camera
 
 The camera starts facing north at Nuuk (64.18°N, 51.72°W). You can override this via URL params, e.g. `?lat=66.5&lon=-53.2`. Press **R** to reset the view if shit gets crazy (e.g. the world suddenly turns into a blue ball).
+
+## Fly to Tile
+
+Press **T** and enter a tile id (`depth-col-row`, e.g. `12-1461-786`) to teleport the camera to a north-up, near-top-down view centered over that tile, at an altitude where the tile roughly fills the screen. Once the tile's heightmap streams in, the camera auto-lifts to keep the same height above the actual ground (useful over the ice sheet). Starting the app with `?tile=12-1461-786` flies there on boot, overriding the saved camera. Also available from the console as `takramDebug.flyToTile('12-1461-786')`.
 
 ## Map Mode
 
