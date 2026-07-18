@@ -115,6 +115,17 @@ export class Heightfield {
   noiseA: StorageTexture | null = null;
   noiseB: StorageTexture | null = null;
 
+  // External streaming keeps upload attributes and compute graphs stable.
+  // Mutating BufferAttribute arrays avoids creating new TSL graphs (and their
+  // multi-second lazy shader compilation) on every camera-window recenter.
+  private externalHeightUpload: StorageBufferAttribute | null = null;
+  private externalHeightKernel: ComputeNode | null = null;
+  private externalFieldsUpload: StorageBufferAttribute | null = null;
+  private externalBiomeUpload: StorageBufferAttribute | null = null;
+  private externalWaterUpload: StorageBufferAttribute | null = null;
+  private externalFieldsKernel: ComputeNode | null = null;
+  private derivedMapsKernel: ComputeNode | null = null;
+
   private constructor(
     cfg: QualityConfig,
     mp: MacroParams,
@@ -263,7 +274,8 @@ export class Heightfield {
         arr[y * res + x] = opts.sampleDEM(wx, wz);
       }
     }
-    const src = storage(new StorageBufferAttribute(arr, 1), 'float', N);
+    const heightUpload = new StorageBufferAttribute(arr, 1);
+    const src = storage(heightUpload, 'float', N);
     const height = instancedArray(N, 'float') as SynthesisResult['height'];
     const hardness = instancedArray(N, 'float') as SynthesisResult['hardness'];
     const seedK = Fn(() => {
@@ -290,6 +302,8 @@ export class Heightfield {
     const synth = { res, height, hardness } as SynthesisResult;
     const hf = new Heightfield(cfg, mp, synth, heightTex, normalTex, worldSize, true);
     hf.simRes = res;
+    hf.externalHeightUpload = heightUpload;
+    hf.externalHeightKernel = seedK;
 
     progress(0.38, 'terrain: baking material noise textures');
     const noise = await bakeNoiseTextures(renderer);
@@ -335,9 +349,14 @@ export class Heightfield {
     }
     if (!this.waterY) this.waterY = instancedArray(N, 'float') as SynthesisResult['height'];
 
-    const fieldValues = new Float32Array(N * 4);
-    const biomeValues = new Float32Array(N * 4);
-    const waterValues = new Float32Array(N);
+    if (!this.externalFieldsUpload) {
+      this.externalFieldsUpload = new StorageBufferAttribute(new Float32Array(N * 4), 4);
+      this.externalBiomeUpload = new StorageBufferAttribute(new Float32Array(N * 4), 4);
+      this.externalWaterUpload = new StorageBufferAttribute(new Float32Array(N), 1);
+    }
+    const fieldValues = this.externalFieldsUpload.array as Float32Array;
+    const biomeValues = this.externalBiomeUpload!.array as Float32Array;
+    const waterValues = this.externalWaterUpload!.array as Float32Array;
     for (let y = 0; y < res; y++) {
       const wz = ((y + 0.5) / res - 0.5) * this.worldSize;
       for (let x = 0; x < res; x++) {
@@ -360,25 +379,31 @@ export class Heightfield {
         waterValues[i] = waterSurface;
       }
     }
-    const fieldsSrc = storage(new StorageBufferAttribute(fieldValues, 4), 'vec4', N);
-    const biomeSrc = storage(new StorageBufferAttribute(biomeValues, 4), 'vec4', N);
-    const waterSrc = storage(new StorageBufferAttribute(waterValues, 1), 'float', N);
-    const fieldsTex = this.fieldsTex;
-    const biomeTex = this.biomeTex;
-    const waterY = this.waterY;
-    const fillK = Fn(() => {
-      const i = instanceIndex;
-      If(i.greaterThanEqual(N), () => {
-        Return();
-      });
-      const x = i.mod(res);
-      const y = i.div(res);
-      textureStore(fieldsTex, uvec2(x.toUint(), y.toUint()), fieldsSrc.element(i)).toWriteOnly();
-      textureStore(biomeTex, uvec2(x.toUint(), y.toUint()), biomeSrc.element(i)).toWriteOnly();
-      waterY.element(i).assign(waterSrc.element(i));
-    })().compute(N);
-    fillK.setName('externalClassifierFields');
-    await renderer.computeAsync(fillK);
+    this.externalFieldsUpload.needsUpdate = true;
+    this.externalBiomeUpload!.needsUpdate = true;
+    this.externalWaterUpload!.needsUpdate = true;
+    if (!this.externalFieldsKernel) {
+      const fieldsSrc = storage(this.externalFieldsUpload, 'vec4', N);
+      const biomeSrc = storage(this.externalBiomeUpload!, 'vec4', N);
+      const waterSrc = storage(this.externalWaterUpload!, 'float', N);
+      const fieldsTex = this.fieldsTex;
+      const biomeTex = this.biomeTex;
+      const waterY = this.waterY;
+      const fillK = Fn(() => {
+        const i = instanceIndex;
+        If(i.greaterThanEqual(N), () => {
+          Return();
+        });
+        const x = i.mod(res);
+        const y = i.div(res);
+        textureStore(fieldsTex, uvec2(x.toUint(), y.toUint()), fieldsSrc.element(i)).toWriteOnly();
+        textureStore(biomeTex, uvec2(x.toUint(), y.toUint()), biomeSrc.element(i)).toWriteOnly();
+        waterY.element(i).assign(waterSrc.element(i));
+      })().compute(N);
+      fillK.setName('externalClassifierFields');
+      this.externalFieldsKernel = fillK;
+    }
+    await renderer.computeAsync(this.externalFieldsKernel);
   }
 
   /**
@@ -397,7 +422,12 @@ export class Heightfield {
   ): Promise<void> {
     const res = this.res;
     const N = res * res;
-    const arr = new Float32Array(N);
+    const upload = this.externalHeightUpload;
+    const kernel = this.externalHeightKernel;
+    if (!upload || !kernel) {
+      throw new Error('Heightfield.reseed requires persistent external upload resources');
+    }
+    const arr = upload.array as Float32Array;
     for (let y = 0; y < res; y++) {
       const wz = ((y + 0.5) / res - 0.5) * this.worldSize;
       for (let x = 0; x < res; x++) {
@@ -405,16 +435,8 @@ export class Heightfield {
         arr[y * res + x] = sampleDEM(wx, wz);
       }
     }
-    const src = storage(new StorageBufferAttribute(arr, 1), 'float', N);
-    const k = Fn(() => {
-      const i = instanceIndex;
-      If(i.greaterThanEqual(N), () => {
-        Return();
-      });
-      this.height.element(i).assign(src.element(i));
-    })().compute(N);
-    k.setName('demReseed');
-    await renderer.computeAsync(k);
+    upload.needsUpdate = true;
+    await renderer.computeAsync(kernel);
     await this.rebuildDerivedMaps(renderer);
     if (sampleFields) await this.writeExternalFields(renderer, sampleFields, arr);
     if (cpuReadback) {
@@ -716,35 +738,38 @@ export class Heightfield {
   /** height buffer → height texture + central-difference normals/slope */
   async rebuildDerivedMaps(renderer: Renderer): Promise<void> {
     const res = this.res;
-    const height = this.height;
-    const texel = this.worldSize / res;
-    const kernel = Fn(() => {
-      const i = instanceIndex;
-      If(i.greaterThanEqual(res * res), () => {
-        Return();
-      });
-      const x = i.mod(res).toInt();
-      const y = i.div(res).toInt();
-      const xm = clamp(float(x).sub(1), 0, res - 1).toInt();
-      const xp = clamp(float(x).add(1), 0, res - 1).toInt();
-      const ym = clamp(float(y).sub(1), 0, res - 1).toInt();
-      const yp = clamp(float(y).add(1), 0, res - 1).toInt();
-      const h = height.element(i).toVar();
-      const hl = height.element(y.mul(res).add(xm)).toVar();
-      const hr = height.element(y.mul(res).add(xp)).toVar();
-      const hd = height.element(ym.mul(res).add(x)).toVar();
-      const hu = height.element(yp.mul(res).add(x)).toVar();
-      const n = vec3(hl.sub(hr), float(texel * 2), hd.sub(hu)).normalize();
-      const slope = vec2(hl.sub(hr), hd.sub(hu)).length().div(texel * 2);
-      textureStore(this.heightTex, uvec2(x.toUint(), y.toUint()), vec4(h, 0, 0, 1)).toWriteOnly();
-      textureStore(
-        this.normalTex,
-        uvec2(x.toUint(), y.toUint()),
-        vec4(n, slope),
-      ).toWriteOnly();
-    })().compute(res * res);
-    kernel.setName('terrainDerivedMaps');
-    await renderer.computeAsync(kernel);
+    if (!this.derivedMapsKernel) {
+      const height = this.height;
+      const texel = this.worldSize / res;
+      const kernel = Fn(() => {
+        const i = instanceIndex;
+        If(i.greaterThanEqual(res * res), () => {
+          Return();
+        });
+        const x = i.mod(res).toInt();
+        const y = i.div(res).toInt();
+        const xm = clamp(float(x).sub(1), 0, res - 1).toInt();
+        const xp = clamp(float(x).add(1), 0, res - 1).toInt();
+        const ym = clamp(float(y).sub(1), 0, res - 1).toInt();
+        const yp = clamp(float(y).add(1), 0, res - 1).toInt();
+        const h = height.element(i).toVar();
+        const hl = height.element(y.mul(res).add(xm)).toVar();
+        const hr = height.element(y.mul(res).add(xp)).toVar();
+        const hd = height.element(ym.mul(res).add(x)).toVar();
+        const hu = height.element(yp.mul(res).add(x)).toVar();
+        const n = vec3(hl.sub(hr), float(texel * 2), hd.sub(hu)).normalize();
+        const slope = vec2(hl.sub(hr), hd.sub(hu)).length().div(texel * 2);
+        textureStore(this.heightTex, uvec2(x.toUint(), y.toUint()), vec4(h, 0, 0, 1)).toWriteOnly();
+        textureStore(
+          this.normalTex,
+          uvec2(x.toUint(), y.toUint()),
+          vec4(n, slope),
+        ).toWriteOnly();
+      })().compute(res * res);
+      kernel.setName('terrainDerivedMaps');
+      this.derivedMapsKernel = kernel;
+    }
+    await renderer.computeAsync(this.derivedMapsKernel);
   }
 
   /** world xz (m) → uv in [0,1]² over the height grid */

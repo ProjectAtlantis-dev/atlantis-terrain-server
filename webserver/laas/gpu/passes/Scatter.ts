@@ -28,6 +28,7 @@ import {
   Return,
   atomicAdd,
   atomicLoad,
+  atomicStore,
   float,
   instanceIndex,
   instancedArray,
@@ -92,12 +93,16 @@ export const enum VegClass {
 /** structural variants baked per tree species (geometry reuse, D5) */
 export const TREE_VARIANTS = 4;
 
+type AtomicCounter = ReturnType<StorageBufferNode<'uint'>['toAtomic']>;
+
 export interface ScatterLayer {
   bufA: StorageBufferNode<'vec4'>;
   bufB: StorageBufferNode<'vec4'>;
   cap: number;
-  /** accepted instances (clamped to cap) — read back once at boot */
+  /** Accepted instances (clamped to cap), refreshed after every reseed. */
   count: number;
+  /** Stable dispatch ceiling; cull exits at the live count. */
+  scanCapacity: number;
 }
 
 export interface ScatterResult {
@@ -106,6 +111,8 @@ export interface ScatterResult {
   extras: ScatterLayer;
   /** stones (3 size classes) + fallen branches — ground-solid coverage */
   stones: ScatterLayer;
+  /** Re-run placement into the same buffers after Heightfield.reseed(). */
+  reseed(renderer: Renderer): Promise<void>;
 }
 
 // child-grid cell sizes (m) — jitter spans the full cell, so no grid reads
@@ -316,8 +323,6 @@ function speciesWeight(
     .mul(slopeMod)
     .mul(colonyField(wpos, sp.colonyM, salt, floor));
 }
-
-type AtomicCounter = ReturnType<StorageBufferNode<'uint'>['toAtomic']>;
 
 /** append helper: idx = old counter value; write when under cap */
 function append(
@@ -574,7 +579,6 @@ export async function runScatter(
     );
   })().compute(treeG * treeG);
   treeK.setName('scatterTrees');
-  await renderer.computeAsync(treeK);
 
   // ----------------------------------------------------------- understory --
   const underG = Math.round(worldSize / UNDER_CELL);
@@ -710,7 +714,6 @@ export async function runScatter(
     );
   })().compute(underG * underG);
   underK.setName('scatterUnderstory');
-  await renderer.computeAsync(underK);
 
   // --------------------------------------------------------------- extras --
   const extraG = Math.round(worldSize / EXTRA_CELL);
@@ -829,7 +832,6 @@ export async function runScatter(
     );
   })().compute(extraG * extraG);
   extraK.setName('scatterExtras');
-  await renderer.computeAsync(extraK);
 
   // ------------------------------------------------- stones + branches --
   // size-stratified ground solids: stones everywhere geology says so
@@ -984,20 +986,53 @@ export async function runScatter(
     );
   })().compute(stoneG * stoneG);
   stoneK.setName('scatterStones');
-  await renderer.computeAsync(stoneK);
 
-  // ---- counts (single boot-time readback; instance data stays on GPU) ----
-  const [tc, uc, ec, sc] = await Promise.all([
-    readCount(renderer, treeCount, TREE_CAP),
-    readCount(renderer, underCount, UNDER_CAP),
-    readCount(renderer, extraCount, EXTRA_CAP),
-    readCount(renderer, stoneCount, STONE_CAP),
-  ]);
+  // Keep placement buffers and kernels alive across streamed-window recenters.
+  // Rebuilding Forests used to recreate hundreds of draw nodes/materials and
+  // force shader compilation every 96 m; only the field textures and instance
+  // contents need to change.
+  const counters = [treeCount, underCount, extraCount, stoneCount];
+  const clearK = Fn(() => {
+    If(instanceIndex.greaterThan(0), () => { Return(); });
+    for (const counter of counters) atomicStore(counter.element(0), uint(0));
+  })().compute(1);
+  clearK.setName('scatterClear');
 
-  return {
-    trees: { bufA: treeA, bufB: treeB, cap: TREE_CAP, count: tc },
-    understory: { bufA: underA, bufB: underB, cap: UNDER_CAP, count: uc },
-    extras: { bufA: extraA, bufB: extraB, cap: EXTRA_CAP, count: ec },
-    stones: { bufA: stoneA, bufB: stoneB, cap: STONE_CAP, count: sc },
+  const result: ScatterResult = {
+    trees: {
+      bufA: treeA, bufB: treeB, cap: TREE_CAP, count: 0,
+      scanCapacity: Math.min(TREE_CAP, treeG * treeG),
+    },
+    understory: {
+      bufA: underA, bufB: underB, cap: UNDER_CAP, count: 0,
+      scanCapacity: Math.min(UNDER_CAP, underG * underG),
+    },
+    extras: {
+      bufA: extraA, bufB: extraB, cap: EXTRA_CAP, count: 0,
+      scanCapacity: Math.min(EXTRA_CAP, extraG * extraG),
+    },
+    stones: {
+      bufA: stoneA, bufB: stoneB, cap: STONE_CAP, count: 0,
+      scanCapacity: Math.min(STONE_CAP, stoneG * stoneG),
+    },
+    async reseed(activeRenderer: Renderer): Promise<void> {
+      await activeRenderer.computeAsync(clearK);
+      await activeRenderer.computeAsync(treeK);
+      await activeRenderer.computeAsync(underK);
+      await activeRenderer.computeAsync(extraK);
+      await activeRenderer.computeAsync(stoneK);
+      const [tc, uc, ec, sc] = await Promise.all([
+        readCount(activeRenderer, treeCount, TREE_CAP),
+        readCount(activeRenderer, underCount, UNDER_CAP),
+        readCount(activeRenderer, extraCount, EXTRA_CAP),
+        readCount(activeRenderer, stoneCount, STONE_CAP),
+      ]);
+      result.trees.count = tc;
+      result.understory.count = uc;
+      result.extras.count = ec;
+      result.stones.count = sc;
+    },
   };
+  await result.reseed(renderer);
+  return result;
 }

@@ -360,3 +360,46 @@ at runtime forces a full material recompile — never do it mid-measurement.
   graft. Detailed additive findings, source changes, tests and pending flight
   verification are tracked in `ATLANTIS_LAAS_RECOVERY.md`; this performance log
   remains the source of pass-level stationary and motion measurements.
+- **2026-07-18 (terrain transport rejection)** — Measured the live 20 km
+  `/api/tiles` snapshot at 43,164,335 JSON bytes / 1,884 embedded heightmaps
+  (1,428 at depth 12), taking about two minutes locally. This is now a primary
+  movement blocker independent of render-pass tuning: unchanged heightmaps are
+  retransmitted and reparsed on every refetch. The additive recovery log owns
+  the replacement world-partition requirements; pass-level GPU work remains
+  relevant only after transport/residency is bounded.
+- **2026-07-19 (bounded streaming + visual correctness)** — WebGPU now requests
+  a 384-leaf balanced manifest and versioned binary pages; the same 20 km query
+  measured ~191-193 KB in 117-133 ms instead of 43.16 MB, with unchanged pages
+  retained client-side. Production motion recovered from ~0.45 fps/repeating
+  3.3 s frames to 50.07 fps average (16.7 ms median, 200.1 ms worst); the worst
+  hitch is still above acceptance. Screenshot forensics then found four visual
+  bugs independent of the frame-rate win: stale unversioned classifier blobs,
+  dark-flat land classified as 84.7% water, screen-space rock LOD dithering,
+  and legacy near-opaque ShadowMaterial terrain receivers running beside the
+  scene CSM. All are corrected and documented with fresh-page counts/raycast
+  evidence in `ATLANTIS_LAAS_RECOVERY.md`. Exact coastal proof: 6,377 plants,
+  10,172 grass drawn, 12,143 rocks generated; no duplicate ShadowMaterial hit.
+- **2026-07-19 (WebGPU varying-limit correction)** — Instrumented runtime
+  validation exposed eight local-detail render pipelines at 17 vertex-output
+  locations against WebGPU's limit of 16. The stable rock LOD threshold and
+  two tint hashes now share one `vec3` varying instead of consuming two
+  locations, and unused full-physical material variants were removed from the
+  local-detail path. Final fresh-scene verification produced no shader/pipeline
+  validation errors. An earlier 51.83 fps sample was rejected because it ran
+  with the invalid pipelines. Validation-clean same-site 834.8 m movement:
+  37.79 fps average, 17.1 ms p50, 34.2 ms p95, 200.1 ms p99, 250 ms worst.
+  Startup at a separate 700 m test coordinate still timed out at 120 s and
+  remains explicitly open.
+- **2026-07-19 (rock grounding/camera stability)** — Screenshot forensics and
+  a same-coordinate GPU readback separated rock placement from streaming.
+  Atlantis sampled a bilinear DEM saddle while the visible terrain renders two
+  planar triangles; prop grounding now uses the exact terrain index split and
+  has direct unit coverage. Rigid LOD rings use stable object-surface dithering
+  instead of either screen noise or a whole-object slot threshold, and the
+  existing 12-tap contact ray now spans the scaled boulder range. Fresh probe:
+  3,340 large extras + 16,694 stones generated; two settled camera headings
+  both produced 3,128 visible rock/extra draws and no WebGPU validation error.
+  This does not close flight streaming continuity: the current 45 m/s detail
+  gate and in-place 192 m reseed still hide the whole procedural root. The
+  proper follow-up is resident old/new patch handoff or a macro-rock tier, not
+  another threshold tweak.

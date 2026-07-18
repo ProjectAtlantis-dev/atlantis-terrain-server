@@ -19,11 +19,20 @@ import { updateSunUniforms } from './laas/render/VegMaterials.ts';
 import { mountSeasonUI } from './laas/render/Season.ts';
 import { setWindContext } from './laas/render/Wind.ts';
 import { parseTileId } from './procgen/chunk-window.js';
+import { sampleTriangulatedHeight } from './terrain-height-sampling.js';
 
 const PATCH_WORLD_SIZE = 768; // 384 m half-width: 265 m lush ring + guard band
 const PATCH_RES = 256;        // 3 m field/normal samples
-const RECENTER_STEP = 96;     // stable deterministic cells; rebuild after 96 m
-const AGL_MAX = 800;        // satellite terrain still renders above and below this
+// A 192 m snap leaves at least 23 m of valid heightfield beyond GroundRing's
+// 265 m far radius at the worst camera offset. The former 96 m snap rebuilt
+// the complete scatter/forest allocation twice as often without adding view.
+const RECENTER_STEP = 192;
+// Above this altitude the individual grass/plants are at or below useful
+// screen size, while their ~3.2 M candidate cull and moving-window rebuilds
+// remain fully priced. The streamed terrain/material LOD remains visible.
+const DETAIL_AGL_MAX = 500;
+const DETAIL_SPEED_DISABLE_MPS = 45;
+const DETAIL_SPEED_ENABLE_MPS = 30;
 const RETRY_MS = 500;
 
 function log(level, ev, details) {
@@ -77,19 +86,11 @@ function finestFieldSourceAt(tiles, x, y) {
 function sampleSource(tile, x, y) {
   const fc = ((x - tile.xMin) / (tile.xMax - tile.xMin)) * (tile.res - 1);
   const fr = ((y - tile.yMin) / (tile.yMax - tile.yMin)) * (tile.res - 1);
-  const c0 = Math.max(0, Math.min(tile.res - 2, Math.floor(fc)));
-  const r0 = Math.max(0, Math.min(tile.res - 2, Math.floor(fr)));
-  const tc = Math.max(0, Math.min(1, fc - c0));
-  const tr = Math.max(0, Math.min(1, fr - r0));
-  const i00 = r0 * tile.res + c0;
-  const h00 = tile.hm[i00];
-  const h10 = tile.hm[i00 + 1];
-  const h01 = tile.hm[i00 + tile.res];
-  const h11 = tile.hm[i00 + tile.res + 1];
-  return h00 * (1 - tc) * (1 - tr)
-    + h10 * tc * (1 - tr)
-    + h01 * (1 - tc) * tr
-    + h11 * tc * tr;
+  // Match terrain-mesh-builder's actual triangle split exactly. Bilinear
+  // interpolation follows a curved saddle between four heights while the
+  // rendered terrain is two planes (a,b,d) / (b,f,d); on coarse, rugged DEM
+  // cells that discrepancy can visually perch props above the triangle.
+  return sampleTriangulatedHeight(tile.hm, tile.res, fc, fr);
 }
 
 // Classifier rasters are north-up (row 0 = bbox yMax), unlike the DEM's
@@ -310,6 +311,7 @@ export class GreenlandPatch {
     this.building = false;
     this.reseeding = false;
     this.nextBuildAttempt = 0;
+    this.motionDetailActive = true;
     this._diag = 0;
   }
 
@@ -398,7 +400,7 @@ export class GreenlandPatch {
   }
 
   async build(renderer, camera, cameraAGL) {
-    if (this.building || this.ready || !camera || cameraAGL > AGL_MAX) return;
+    if (this.building || this.ready || !camera || cameraAGL > DETAIL_AGL_MAX) return;
     const now = performance.now();
     if (now < this.nextBuildAttempt) return;
     this.building = true;
@@ -481,8 +483,12 @@ export class GreenlandPatch {
 
   async _recenter(renderer, descriptor, sourceTiles) {
     this.reseeding = true;
+    const startedAt = performance.now();
+    let fieldsReadyAt = startedAt;
+    let heightfieldReadyAt = startedAt;
     try {
       if (!await this._loadClassifier(sourceTiles, descriptor)) return;
+      fieldsReadyAt = performance.now();
       const window = buildWindow(descriptor, sourceTiles);
       if (!window) return;
       await this.hf.reseed(
@@ -491,22 +497,32 @@ export class GreenlandPatch {
         false,
         makeWindowFieldSampler(window),
       );
-      this._disposeForests(renderer);
-      const forests = await this._buildForests(renderer, new WorldSeed(this.seedN));
+      heightfieldReadyAt = performance.now();
+      // Heightfield.reseed keeps the texture objects stable. Refill the
+      // existing scatter buffers so Forests retains its compiled cull kernels,
+      // indirect buffers, draw geometry and materials across window moves.
+      await this.scatter.reseed(renderer);
+      const scatterReadyAt = performance.now();
       this.vegRoot.position.set(
         descriptor.centerX,
         descriptor.centerY,
         0,
       );
-      this.vegRoot.add(forests.group);
       this.window = window;
       this.centerId = descriptor.id;
+      this.lastRecenterTiming = {
+        fieldsMs: Number((fieldsReadyAt - startedAt).toFixed(1)),
+        heightfieldMs: Number((heightfieldReadyAt - fieldsReadyAt).toFixed(1)),
+        scatterMs: Number((scatterReadyAt - heightfieldReadyAt).toFixed(1)),
+        totalMs: Number((scatterReadyAt - startedAt).toFixed(1)),
+      };
       this.onWindowChanged?.(this);
       log('info', 'patch.recenter', {
         center: descriptor.id,
         spanMetres: PATCH_WORLD_SIZE,
         sourceTiles: sourceTiles.filter(tile => tile.fields).length,
         fields: window.stats,
+        timing: this.lastRecenterTiming,
       });
     } catch (err) {
       log('error', 'patch.recenter', { error: String(err), stack: String(err?.stack ?? '') });
@@ -515,10 +531,20 @@ export class GreenlandPatch {
     }
   }
 
-  update(renderer, camera, cameraAGL) {
+  update(renderer, camera, cameraAGL, traversalSpeedMps = 0) {
     if (!this.ready) return;
 
-    const active = Number.isFinite(cameraAGL) && cameraAGL <= AGL_MAX;
+    const speed = Number.isFinite(traversalSpeedMps) ? Math.abs(traversalSpeedMps) : 0;
+    if (this.motionDetailActive && speed > DETAIL_SPEED_DISABLE_MPS) {
+      this.motionDetailActive = false;
+      log('info', 'patch.detail-lod', { active: false, reason: 'speed', speedMps: Math.round(speed) });
+    } else if (!this.motionDetailActive && speed < DETAIL_SPEED_ENABLE_MPS) {
+      this.motionDetailActive = true;
+      log('info', 'patch.detail-lod', { active: true, reason: 'speed', speedMps: Math.round(speed) });
+    }
+    const active = Number.isFinite(cameraAGL)
+      && cameraAGL <= DETAIL_AGL_MAX
+      && this.motionDetailActive;
     this.vegRoot.visible = active;
     if (!active) return;
 
@@ -536,6 +562,13 @@ export class GreenlandPatch {
       if (descriptor.id !== this.centerId || sourceRefined) {
         void this._recenter(renderer, descriptor, sourceTiles);
       }
+    }
+    if (this.reseeding) {
+      // Do not enqueue culls/renders against buffers while the GPU is
+      // rewriting them for the next window. The settled patch returns on the
+      // next frame without reallocating its rendering graph.
+      this.vegRoot.visible = false;
+      return;
     }
 
     this.vegRoot.updateWorldMatrix(true, false);

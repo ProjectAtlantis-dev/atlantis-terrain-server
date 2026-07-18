@@ -130,7 +130,11 @@ export function createGroundingNode({
           )
             .mul(0.8)
             .add(0.4);
-          const range = float(1.7);
+          // The original 1.7 m ray was tuned for grass/feet and did not span
+          // Greenland's 2-5 m scaled boulders. A 3 m march costs the same 12
+          // taps but restores the contact penumbra that tells the eye a large
+          // rock is bedded into the terrain rather than hovering above it.
+          const range = float(3.0);
           // First-hit-wins early exit: the contribution 1−f·0.5 strictly
           // decreases with step index, so once any step hits, later steps
           // can never raise the max. hitF sentinel 2 = no hit yet.
@@ -149,7 +153,7 @@ export function createGroundingNode({
               const dS = texture(depthNode.value, uvS).x;
               const bufV = getViewPosition(uvS, dS, uProjInv);
               const dz = bufV.z.sub(sampleV.z); // >0: buffer closer to camera
-              const hit = dz.greaterThan(0.05).and(dz.lessThan(1.4)).and(inFrame);
+              const hit = dz.greaterThan(0.05).and(dz.lessThan(2.6)).and(inFrame);
               If(hit, () => {
                 hitF.assign(f);
               });

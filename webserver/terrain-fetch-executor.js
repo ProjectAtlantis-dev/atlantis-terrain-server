@@ -1,6 +1,6 @@
 import {
   adoptTerrainOrigin, buildTerrainTilesRequest, offsetTerrainPayload,
-  selectTerrainFrameOffset, summarizeTerrainResponse,
+  hydrateTerrainHeightmaps, selectTerrainFrameOffset, summarizeTerrainResponse,
   terrainCameraStereoPosition, terrainPipelineStatus,
 } from './terrain-tile-fetch.js';
 import { reconcileTerrainTiles } from './terrain-tile-reconciler.js';
@@ -8,6 +8,8 @@ import { reconcileTerrainTiles } from './terrain-tile-reconciler.js';
 export function createTerrainFetchExecutor({
   state,
   previewMaxDepth,
+  useManifest = false,
+  tileBudget = 384,
   getHeading,
   getRange,
   getCameraLatLon,
@@ -33,6 +35,7 @@ export function createTerrainFetchExecutor({
   fetchImpl = (...args) => fetch(...args),
   now = () => performance.now(),
 }) {
+  const heightmapCache = new Map();
   return async function executeTerrainFetch({ lat, lon, pass, signal }) {
     state.pass = pass;
     const started = now();
@@ -44,11 +47,20 @@ export function createTerrainFetchExecutor({
       previewMaxDepth, isFirstLoad: state.isFirstLoad,
       frameOffsetReady: state.frameOffsetReady,
       originX: state.originX, originY: state.originY,
+      useManifest, tileBudget,
       cameraSnapshot,
     });
     enqueueLog('info', `fetchTiles.request[pass${pass}]`, request.logDetails);
     const response = await fetchImpl(request.url, { signal });
     const data = await response.json();
+    if (data?.manifest) {
+      const hydration = await hydrateTerrainHeightmaps(data.tiles, {
+        cache: heightmapCache,
+        fetchImpl,
+        signal,
+      });
+      enqueueLog('info', `fetchTiles.heightPages[pass${pass}]`, hydration);
+    }
     const local = getCameraLocalPosition();
     const frameOffset = selectTerrainFrameOffset({
       isFirstLoad: state.isFirstLoad, frameOffsetReady: state.frameOffsetReady,

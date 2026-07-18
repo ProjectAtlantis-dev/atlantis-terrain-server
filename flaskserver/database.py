@@ -581,12 +581,14 @@ def read_tile_metadata(db, tile_id):
     """Read tile metadata without decompressing heightmap blobs.
 
     Returns:
-        dict with tile_id, depth, col, row, bbox, geometric_error, source.
+        dict with tile_id, depth, col, row, bbox, geometric_error, source,
+        updated_at and has_heightmap.
         None if tile doesn't exist.
     """
     row = db.execute(
         "SELECT tile_id, depth, col, row, x_min, y_min, x_max, y_max, "
-        "geometric_error, source FROM tiles WHERE tile_id = ?",
+        "geometric_error, source, updated_at, heightmap IS NOT NULL "
+        "FROM tiles WHERE tile_id = ?",
         (tile_id,)
     ).fetchone()
 
@@ -601,6 +603,8 @@ def read_tile_metadata(db, tile_id):
         'bbox': (row[4], row[5], row[6], row[7]),
         'geometric_error': row[8],
         'source': row[9],
+        'updated_at': row[10],
+        'has_heightmap': bool(row[11]),
     }
 
 

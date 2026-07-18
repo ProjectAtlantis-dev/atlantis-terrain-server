@@ -278,6 +278,7 @@ export class Forests {
   private compact!: StorageBufferNode<'uint'>;
   private counters!: ReturnType<StorageBufferNode<'uint'>['toAtomic']>;
   private kernels: object[] = [];
+  private cullKernels: { kernel: object; layer: ScatterLayer }[] = [];
   private camU = uniform(new Vector3());
   private planesU = uniformArray(
     Array.from({ length: 6 }, () => new Vector4()),
@@ -532,8 +533,12 @@ export class Forests {
       )
         .split(',')
         .includes('casters');
-      const ringCasts =
-        !ablateCasters && (pool.cls < 6 ? true : isUnderClass(pool.cls) ? false : true);
+      // Atlantis production policy: procedural ground objects are grounded by
+      // terrain shading, GTAO and the contact pass, never CSM. Even near-only
+      // large-rock caster draws produced multi-second movement frames. Tree
+      // crowns may retain their aggregate/proxy CSM path in forested worlds;
+      // the current Greenland library is explicitly treeless.
+      const ringCasts = !ablateCasters && pool.cls < 6;
       const crownDensity = pool.cls < 6 ? CROWN_SHADOW_DENSITY[pool.cls] ?? 0 : 0;
       // fit the shadow proxy to THIS pool's real extents (R1 union bbox)
       let poolDims: CrownDims | null = null;
@@ -588,6 +593,7 @@ export class Forests {
             compact: this.compact,
             groupBase: offsets[g] ?? 0,
             fade: fadeFor(pool.cls, ring),
+            surfaceDither: pool.cls >= 18,
             wind: windBind,
             // flower classes (12–15) + morphology tundra plants (24–31) carry a
             // part-id vdata.x, so their flower heads collapse out of bloom.
@@ -625,8 +631,9 @@ export class Forests {
           // buys nothing there; the crown proxies (added below for rings
           // 1+2 in EVERY cascade) own the far shadow. Ring-1 real casters
           // only feed the two near cascades (~15 ms → ~7 ms caster raster).
-          const cascadeMax =
-            pool.cls < 6 && ring === 1 && crownDensity > 0 ? 2 : CASCADES;
+          const cascadeMax = pool.cls < 6 && ring === 1 && crownDensity > 0
+            ? 2
+            : CASCADES;
           if (part.castShadow && ringCasts && !proxyOwnsRing) {
             for (let c = 0; c < cascadeMax; c++) {
               const cg = casterGroupOf(c, pool.cls, pool.variant, ring);
@@ -774,7 +781,10 @@ export class Forests {
       layer: ScatterLayer,
       kind: 'trees' | 'under' | 'extras',
     ): object => {
-      const N = layer.count;
+      // Compile once for the stable candidate ceiling. A recenter rewrites the
+      // same scatter buffers; update() sizes the runtime dispatch from the
+      // refreshed CPU count without adding another shader storage binding.
+      const N = layer.scanCapacity;
       const k = Fn(() => {
         const i = instanceIndex;
         If(i.greaterThanEqual(uint(Math.max(N, 1))), () => {
@@ -907,30 +917,6 @@ export class Forests {
               appendTo(pe.mul(2).add(EXTRAS_BASE).toInt() as unknown as NI, i as unknown as NU);
             });
           });
-          for (let c = 0; c < CASCADES; c++) {
-            const base = MAIN_GROUPS + c * CASC_LOCALS + 72;
-            If(inCascade(c, center, rad).greaterThan(0.5), () => {
-              If(hasR2, () => {
-                If(dist.lessThan(EX_R1_FAR + EX_BAND), () => {
-                  appendTo(
-                    pe.mul(2).add(base).toInt() as unknown as NI,
-                    i as unknown as NU,
-                  );
-                });
-                If(dist.greaterThanEqual(EX_R1_FAR - EX_BAND), () => {
-                  appendTo(
-                    pe.mul(2).add(base + 1).toInt() as unknown as NI,
-                    i as unknown as NU,
-                  );
-                });
-              }).Else(() => {
-                appendTo(
-                  pe.mul(2).add(base).toInt() as unknown as NI,
-                  i as unknown as NU,
-                );
-              });
-            });
-          }
         }
       })().compute(Math.max(N, 1));
       k.setName(`vegCull_${kind}`);
@@ -950,13 +936,12 @@ export class Forests {
     })().compute(D);
     indirectK.setName('vegIndirect');
 
-    this.kernels = [
-      clearK,
-      makeCull(this.scatter.trees, 'trees'),
-      makeCull(this.scatter.understory, 'under'),
-      makeCull(this.scatter.extras, 'extras'),
-      makeCull(this.scatter.stones, 'extras'),
-      indirectK,
+    this.kernels = [clearK, indirectK];
+    this.cullKernels = [
+      { kernel: makeCull(this.scatter.trees, 'trees'), layer: this.scatter.trees },
+      { kernel: makeCull(this.scatter.understory, 'under'), layer: this.scatter.understory },
+      { kernel: makeCull(this.scatter.extras, 'extras'), layer: this.scatter.extras },
+      { kernel: makeCull(this.scatter.stones, 'extras'), layer: this.scatter.stones },
     ];
   }
 
@@ -1010,9 +995,17 @@ export class Forests {
         }
       }
     }
-    for (const k of this.kernels) {
-      renderer.compute(k as Parameters<Renderer['compute']>[0]);
+    renderer.compute(this.kernels[0] as Parameters<Renderer['compute']>[0]);
+    for (const { kernel, layer } of this.cullKernels) {
+      // Renderer accepts a runtime count override, so the compiled kernel and
+      // buffers persist while sparse Greenland windows dispatch only their
+      // accepted instances—not the theoretical candidate ceiling.
+      renderer.compute(
+        kernel as Parameters<Renderer['compute']>[0],
+        Math.max(layer.count, 1),
+      );
     }
+    renderer.compute(this.kernels[1] as Parameters<Renderer['compute']>[0]);
     this.frame++;
     if (this.frame % 90 === 0 && !this.reading) {
       this.reading = true;

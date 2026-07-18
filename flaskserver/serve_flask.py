@@ -995,6 +995,9 @@ def api_tiles():
   error = _arg_float("error", 0.0005)
   max_depth = _arg_int("maxDepth", 13)
   max_range = _arg_float("range", 16000.0)
+  manifest_only = request.args.get("manifest", "0").lower() in {"1", "true", "yes"}
+  default_budget = 384 if manifest_only else 2500
+  tile_budget = max(64, min(2500, _arg_int("budget", default_budget)))
 
   if "sx" in request.args and "sy" in request.args:
     qx = _arg_float("sx", 0.0)
@@ -1024,6 +1027,8 @@ def api_tiles():
       max_depth=max_depth,
       max_range=max_range,
       altitude=alt,
+      max_tiles=tile_budget,
+      include_heightmaps=not manifest_only,
       log=lambda msg: log.debug(f"[/api/tiles] {msg}"),
     )
   except Exception as exc:
@@ -1037,7 +1042,10 @@ def api_tiles():
   else:
     log.debug(f"[/api/tiles] result: {len(tiles)} tiles, {len(missing)} missing")
 
-  all_tile_ids = [t["id"] for t in tiles if t["heightmap"] is not None]
+  all_tile_ids = [
+    t["id"] for t in tiles
+    if t.get("heightmap") is not None or bool(t.get("has_heightmap"))
+  ]
   check_ids = set(all_tile_ids)
   for tid in all_tile_ids:
     d, c, r = _parse_tile_id(tid) or (0, 0, 0)
@@ -1066,8 +1074,8 @@ def api_tiles():
     "missing": 0,
   }
   for tile in tiles:
-    hm = tile["heightmap"]
-    if hm is None:
+    hm = tile.get("heightmap")
+    if hm is None and not manifest_only:
       continue
 
     bbox = tile["bbox"]
@@ -1078,13 +1086,11 @@ def api_tiles():
     if tex_status in tex_status_counts:
       tex_status_counts[tex_status] += 1
 
-    tile_data.append(
-      {
+    item = {
         "id": tid,
         "bbox": [bbox[0] - ox, bbox[1] - oy, bbox[2] - ox, bbox[3] - oy],
         "depth": tile["depth"],
         "resolution": _GRID_N,
-        "heightmap": base64.b64encode(hm.astype(_np.float32).tobytes()).decode("ascii"),
         "hasTexture": bool(tex_flags["has_texture"]),
         "texAvailable": bool(tex_flags["available"]),
         "texStatus": tex_status,
@@ -1095,7 +1101,15 @@ def api_tiles():
         "waterMaskUrl": f"/api/watermask/{tid}.png",
         "texPriority": math.log(max(priority, 1.0)),
       }
-    )
+    if manifest_only:
+      height_version = tile.get("updated_at") or "0"
+      item["heightmapUrl"] = (
+        f"/api/height/{tid}.bin?v={urllib.parse.quote(str(height_version))}"
+      )
+      item["heightVersion"] = height_version
+    else:
+      item["heightmap"] = base64.b64encode(hm.astype(_np.float32).tobytes()).decode("ascii")
+    tile_data.append(item)
 
   missing_data = []
   for tid, bbox in missing:
@@ -1220,8 +1234,29 @@ def api_tiles():
       "texQueued": len(tex_fetching),
       "texRetryQueue": len(_tex_retry_queue),
       "texStatusCounts": tex_status_counts,
+      "manifest": manifest_only,
+      "tileBudget": tile_budget,
     }
   )
+
+
+@app.get("/api/height/<tile_id>.bin")
+def api_tile_height(tile_id: str):
+  """Raw little-endian float32 height page for the additive manifest client."""
+  if _parse_tile_id(tile_id) is None:
+    return Response(b"", status=400)
+  row = _get_db().execute(
+    "SELECT heightmap, updated_at FROM tiles WHERE tile_id = ?", (tile_id,)
+  ).fetchone()
+  if row is None or row[0] is None:
+    return Response(b"", status=404)
+  raw = zlib.decompress(row[0])
+  response = Response(raw, mimetype="application/octet-stream")
+  response.headers["Cache-Control"] = "private, max-age=31536000, immutable"
+  response.headers["X-Height-Resolution"] = str(_GRID_N)
+  if row[1] is not None:
+    response.headers["ETag"] = f'"{tile_id}:{row[1]}"'
+  return response
 
 
 def _colorized_jpeg(tile_id: str, resolution: int = 256):
@@ -1602,7 +1637,19 @@ def api_tile_fields(tile_id: str):
   db = _get_db()
   init_fields_cache(db)
   hdrs = {"Cache-Control": "no-store", "X-Field-Keys": ",".join(FIELD_KEYS)}
-  cached = read_fields_cache(db, tile_id, res)
+  texture_version = db.execute(
+    "SELECT updated_at FROM textures WHERE tile_id = ?", (tile_id,)
+  ).fetchone()
+  terrain_version = db.execute(
+    "SELECT updated_at FROM tiles WHERE tile_id = ?", (tile_id,)
+  ).fetchone()
+  mask_version = db.execute(
+    "SELECT updated_at FROM water_masks WHERE tile_id = ?", (tile_id,)
+  ).fetchone()
+  source_version = "|".join(str(row[0]) if row else "" for row in (
+    texture_version, terrain_version, mask_version,
+  ))
+  cached = read_fields_cache(db, tile_id, res, source_version)
   if cached is not None:
     return Response(cached, mimetype="application/octet-stream",
                     headers={**hdrs, "X-Fields": "cache"})
@@ -1622,9 +1669,17 @@ def api_tile_fields(tile_id: str):
 
   rgb = np.asarray(_Image.open(_io.BytesIO(tex)).convert("RGB"), np.uint8)
   bbox = _tile_bbox(d, c, r)
-  fields = compute_fields(rgb, hm, bbox[2] - bbox[0])
+  water_mask = None
+  cached_water = _read_water_mask(db, tile_id) if _read_water_mask else None
+  if cached_water is not None:
+    water_mask = np.asarray(
+      _Image.open(_io.BytesIO(cached_water[0])).convert("L"), np.float32
+    ) / 255.0
+  fields = compute_fields(
+    rgb, hm, bbox[2] - bbox[0], water_mask=water_mask,
+  )
   blob = pack_fields(fields, res)
-  write_fields_cache(db, tile_id, res, blob)
+  write_fields_cache(db, tile_id, res, blob, source_version)
   return Response(blob, mimetype="application/octet-stream",
                   headers={**hdrs, "X-Fields": "computed", "X-DEM-Source": str(hm_source)})
 

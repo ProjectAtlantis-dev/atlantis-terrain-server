@@ -12,7 +12,7 @@
  */
 
 import { BufferAttribute, BufferGeometry, Mesh } from 'three';
-import { MeshPhysicalNodeMaterial, type StorageTexture } from 'three/webgpu';
+import { MeshStandardNodeMaterial, type StorageTexture } from 'three/webgpu';
 import {
   Discard,
   Fn,
@@ -71,10 +71,9 @@ export function buildCanopyShell(
   geo.setAttribute('position', new BufferAttribute(pos, 3));
   geo.setIndex(new BufferAttribute(idx, 1));
 
-  // physical for specularIntensity — the far-forest aggregate silvered at
-  // glancing sun exactly like the cards (user feedback batch 2 item 11)
-  const mat = new MeshPhysicalNodeMaterial();
-  mat.specularIntensity = 0.2;
+  // The far aggregate uses the lean standard PBR pipeline. Full physical PBR
+  // exceeds the WebGPU varying budget after atmosphere/shadow composition.
+  const mat = new MeshStandardNodeMaterial();
 
   /** canopy-top height field: terrain + coverage lift + crown bumps */
   const shellY = (p: NV2): NF => {

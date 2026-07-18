@@ -1,6 +1,8 @@
 import * as THREE from 'three';
 
 export function decodeTerrainHeightmap(base64, decodeBase64 = value => atob(value)) {
+  if (base64 instanceof Float32Array) return base64;
+  if (base64 instanceof ArrayBuffer) return new Float32Array(base64);
   const raw = decodeBase64(base64);
   const bytes = new Uint8Array(raw.length);
   for (let index = 0; index < raw.length; index++) bytes[index] = raw.charCodeAt(index);

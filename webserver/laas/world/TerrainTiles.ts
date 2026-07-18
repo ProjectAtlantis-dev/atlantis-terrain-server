@@ -13,7 +13,7 @@
 import { InstancedMesh, PlaneGeometry, RingGeometry, Mesh, type PerspectiveCamera } from 'three';
 import {
   IrradianceNode,
-  MeshPhysicalNodeMaterial,
+  MeshStandardNodeMaterial,
   type StorageBufferNode,
   type StorageTexture,
 } from 'three/webgpu';
@@ -106,11 +106,9 @@ export class TerrainTiles {
     patch.rotateX(-Math.PI / 2); // local xz in [-0.5-s, 0.5+s], +y up
 
     // --- material ---------------------------------------------------------------
-    // physical for specularIntensity: the dielectric F0 0.04 sheen at
-    // glancing sun desaturates whole hillsides to silver (user feedback —
-    // 'terrain gets too silvery'); rock keeps a modest glint
-    const mat = new MeshPhysicalNodeMaterial();
-    mat.specularIntensity = 0.35;
+    // Standard PBR preserves terrain roughness/metalness while staying within
+    // WebGPU's varying budget after atmosphere and shadow composition.
+    const mat = new MeshStandardNodeMaterial();
     const tile = this.tileBuf.element(instanceIndex);
     const tileOrigin = tile.xy; // world xz of tile center
     const tileSize = tile.z;
@@ -331,8 +329,7 @@ export class TerrainTiles {
     // --- far shell -----------------------------------------------------------------
     const ring = new RingGeometry(WORLD_HALF * 0.952, FAR_RADIUS, 160, 42);
     ring.rotateX(-Math.PI / 2);
-    const farMat = new MeshPhysicalNodeMaterial();
-    farMat.specularIntensity = 0.35;
+    const farMat = new MeshStandardNodeMaterial();
     const fxz = positionLocal.xz;
     const farMacro = macroTerrain(fxz, hf.mp, 'far');
     const baked = hf.sampleHeight(fxz);

@@ -11,7 +11,7 @@
  */
 
 import { PlaneGeometry } from 'three';
-import { MeshStandardNodeMaterial, MeshPhysicalNodeMaterial } from 'three/webgpu';
+import { MeshStandardNodeMaterial } from 'three/webgpu';
 import {
   cameraPosition,
   clamp,
@@ -31,6 +31,7 @@ import {
   applyDitherFade,
   applyInstanceTint,
   fetchInstance,
+  slotHash,
   type InstanceBinding,
 } from './VegInstance';
 
@@ -43,10 +44,10 @@ export function impostorRuntimeMaterial(
   atlas: ImpostorAtlas,
   bind: InstanceBinding,
 ): MeshStandardNodeMaterial {
-  // physical for specularIntensity — distant crowns went silver at
-  // glancing sun just like the near cards (same flat-normal sheen)
-  const mat = new MeshPhysicalNodeMaterial();
-  mat.specularIntensity = 0.25;
+  // Impostors stay on the lean standard PBR pipeline: atmosphere + shadows
+  // leave no varying budget for the full physical material, and a flat card
+  // should not carry the physical pipeline's coherent silver sheen.
+  const mat = new MeshStandardNodeMaterial();
   const { A, B, slot } = fetchInstance(bind);
   const s = A.w;
   const r = s.mul(atlas.radius);
@@ -120,8 +121,11 @@ export function impostorRuntimeMaterial(
   mat.normalNode = transformNormalToView(nW as never);
 
   const dist = A.xyz.sub(cameraPosition).length();
-  if (bind.fade) applyDitherFade(mat, dist, bind.fade);
-  applyInstanceTint(mat, slot, bind.tint ?? 0.14);
+  const instanceHashes = varying(
+    vec3(slotHash(slot, 17), slotHash(slot, 91), slotHash(slot, 333)),
+  );
+  if (bind.fade) applyDitherFade(mat, dist, bind.fade, instanceHashes.z);
+  applyInstanceTint(mat, slot, bind.tint ?? 0.14, instanceHashes as never);
   return mat;
 }
 

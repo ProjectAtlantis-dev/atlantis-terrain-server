@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import datetime
 import struct
+import threading
 import zlib
 
 import numpy as np
@@ -27,13 +28,21 @@ FIELD_KEYS = ["veg", "rock", "snow", "water", "slope", "southness", "sun", "alti
 
 FIELD_RES = 64          # served field raster edge (smooth fields — small is plenty)
 _PACK_MAGIC = b"FLD1"   # header magic for the packed blob
+FIELD_ALGORITHM_VERSION = 2
+_CACHE_SCHEMA_LOCK = threading.Lock()
 
 
 def _up(a: np.ndarray, res: int) -> np.ndarray:
     return np.asarray(Image.fromarray(a.astype(np.float32), "F").resize((res, res), Image.BILINEAR), np.float32)
 
 
-def compute_fields(rgb: np.ndarray, heightmap: np.ndarray, tile_size_m: float, res: int | None = None) -> dict:
+def compute_fields(
+    rgb: np.ndarray,
+    heightmap: np.ndarray,
+    tile_size_m: float,
+    res: int | None = None,
+    water_mask: np.ndarray | None = None,
+) -> dict:
     """rgb (H,W,3) uint8 summer texture + heightmap (G,G) float32 + tile span (m)
     -> dict of (res,res) float32 fields (0..1, southness -1..1). res defaults to the
     texture edge."""
@@ -59,12 +68,27 @@ def compute_fields(rgb: np.ndarray, heightmap: np.ndarray, tile_size_m: float, r
     sat = a.max(-1) - a.min(-1)
     snow = np.clip((bright - 0.75) / 0.20, 0, 1) * np.clip(1.0 - sat * 5.0, 0, 1)
     blue = np.clip((b - np.maximum(r, g)) * 3.0, 0, 1)
-    # water: dark-grey OR bluish, but only on FLAT ground — steep+dark is shadowed
-    # rock/veg, not water (the fjord/glacier-shadow bug). SAM water_masks are the
-    # accurate source (build_water_mask); this heuristic is the no-torch fallback.
+    # Water fallback: blue flat surfaces can occur at any elevation, but the
+    # dark-grey signal is only credible close to sea level. The former
+    # `dark OR blue` rule labelled flat, dark coastal tundra as 85% water and
+    # suppressed every plant in the player clipmap. Cached SAM masks, when
+    # available, replace this heuristic below.
     dark = np.clip((0.36 - bright) / 0.30, 0, 1)
     flat = np.clip(1.0 - slope / 0.15, 0, 1)
-    water = np.clip(np.maximum(dark * 0.85, blue * 1.3) * flat * (1.0 - veg) * (1.0 - snow), 0, 1)
+    coast = np.clip((8.0 - elev) / 8.0, 0, 1)
+    water = np.clip(
+        np.maximum(dark * 0.85 * coast, blue * 1.3)
+        * flat * (1.0 - veg) * (1.0 - snow),
+        0,
+        1,
+    )
+    if water_mask is not None:
+        wm = np.asarray(water_mask, np.float32)
+        if wm.shape != (res, res):
+            wm = _up(wm, res)
+        if float(wm.max(initial=0.0)) > 1.0:
+            wm = wm / 255.0
+        water = np.clip(wm, 0, 1)
     # rock = bare ground (the complement of veg/snow/water), damped in dark shadow
     # so shaded slopes don't all read as bright rock. No baseline inflation.
     greyish = 0.45 + 0.55 * np.clip((bright - 0.28) / 0.35, 0, 1)
@@ -156,21 +180,40 @@ def unpack_fields(blob: bytes) -> dict:
 
 
 def init_fields_cache(db) -> None:
-    db.execute(
-        "CREATE TABLE IF NOT EXISTS fields ("
-        "tile_id TEXT NOT NULL, res INTEGER NOT NULL, blob BLOB NOT NULL, "
-        "updated_at TEXT NOT NULL, PRIMARY KEY (tile_id, res))"
-    )
-    db.commit()
+    # Flask serves field pages concurrently. Serialize the one-time migration
+    # so first-load requests cannot both observe the old schema and race the
+    # same ALTER TABLE (which otherwise returns a 500 to one requester).
+    with _CACHE_SCHEMA_LOCK:
+        db.execute(
+            "CREATE TABLE IF NOT EXISTS fields ("
+            "tile_id TEXT NOT NULL, res INTEGER NOT NULL, blob BLOB NOT NULL, "
+            "updated_at TEXT NOT NULL, PRIMARY KEY (tile_id, res))"
+        )
+        columns = {row[1] for row in db.execute("PRAGMA table_info(fields)")}
+        if "algorithm_version" not in columns:
+            db.execute("ALTER TABLE fields ADD COLUMN algorithm_version INTEGER NOT NULL DEFAULT 1")
+        if "source_version" not in columns:
+            db.execute("ALTER TABLE fields ADD COLUMN source_version TEXT NOT NULL DEFAULT ''")
+        db.commit()
 
 
-def read_fields_cache(db, tile_id: str, res: int) -> bytes | None:
-    row = db.execute("SELECT blob FROM fields WHERE tile_id=? AND res=?", (tile_id, res)).fetchone()
+def read_fields_cache(db, tile_id: str, res: int, source_version: str = "") -> bytes | None:
+    row = db.execute(
+        "SELECT blob FROM fields WHERE tile_id=? AND res=? "
+        "AND algorithm_version=? AND source_version=?",
+        (tile_id, res, FIELD_ALGORITHM_VERSION, source_version),
+    ).fetchone()
     return row[0] if row else None
 
 
-def write_fields_cache(db, tile_id: str, res: int, blob: bytes) -> None:
+def write_fields_cache(
+    db, tile_id: str, res: int, blob: bytes, source_version: str = ""
+) -> None:
     now = datetime.datetime.now(datetime.timezone.utc).isoformat()
-    db.execute("INSERT OR REPLACE INTO fields (tile_id, res, blob, updated_at) VALUES (?,?,?,?)",
-               (tile_id, res, blob, now))
+    db.execute(
+        "INSERT OR REPLACE INTO fields "
+        "(tile_id, res, blob, updated_at, algorithm_version, source_version) "
+        "VALUES (?,?,?,?,?,?)",
+        (tile_id, res, blob, now, FIELD_ALGORITHM_VERSION, source_version),
+    )
     db.commit()

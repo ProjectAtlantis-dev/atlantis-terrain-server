@@ -2,7 +2,7 @@
  * VegInstance — turns a Phase-4 vegetation material into a GPU-driven
  * instanced draw: per-instance transform (pos/scale/yaw/lean-shear) is read
  * from the scatter buffers through a cull-compacted index list, LOD ring
- * transitions are dithered (IGN screen noise vs distance fade), and a small
+ * transitions use stable per-instance stochastic thresholds, and a small
  * per-instance tint breaks population uniformity beyond the per-vertex vdata
  * jitter (per-instance variation law).
  *
@@ -23,11 +23,9 @@ import {
   float,
   frontFacing,
   instanceIndex,
-  interleavedGradientNoise,
   mix,
   normalLocal,
   positionLocal,
-  screenCoordinate,
   smoothstep,
   uint,
   varying,
@@ -76,6 +74,9 @@ export interface InstanceBinding {
   fade?: RingFade | null;
   /** per-instance tint strength (0 disables) */
   tint?: number;
+  /** Use a stable object-surface pattern for rigid LOD crossfades. Whole-rock
+   * thresholds make an opaque boulder switch in one frame as distance moves. */
+  surfaceDither?: boolean;
   /**
    * flower/tundra plants only (vdata.x = part id): collapse the flower-head
    * verts (vdata.x high) to the plant base OUT OF BLOOM, so petals physically
@@ -148,8 +149,14 @@ export function applyDitherFade(
   mat: MeshStandardNodeMaterial,
   dist: NF,
   fade: RingFade,
+  stableNoise?: NF,
 ): void {
-  const ign = interleavedGradientNoise(screenCoordinate.xy);
+  // Screen-coordinate IGN made rigid rocks change their visible pixels when
+  // the camera merely rotated (sparkle/VCR shimmer and apparent movement).
+  // Instance draws provide a camera-stable threshold shared by both LODs;
+  // rigid rocks use object-surface noise so an opaque boulder does not switch
+  // wholesale. Impostors retain a deterministic vertex-domain fallback.
+  const ign = stableNoise ?? varying(positionLocal.x.mul(12.9898).sin().mul(43758.5453).fract());
   let draw: NB | null = null;
   if (fade.fadeInAt !== undefined) {
     const b = fade.inBand ?? fade.band;
@@ -175,13 +182,16 @@ export function applyInstanceTint(
   mat: MeshStandardNodeMaterial,
   slot: NU,
   tintK: number,
+  packedHashes?: NV3,
 ): void {
   if (tintK <= 0) return;
-  // Pack both per-instance hashes into one interpolator. Several full tundra
-  // materials already sit at the WebGPU 16-location vertex-output limit;
-  // separate scalar varyings pushed them to location 16 and invalidated the
-  // pipeline on Apple/Chrome even though both values are instance-constant.
-  const hashes = varying(vec2(slotHash(slot, 17), slotHash(slot, 91)));
+  // Tint and LOD stability share one vec3 interpolator. These materials sit
+  // at WebGPU's 16-location vertex-output limit after atmosphere/shadows;
+  // a separate scalar varying for the stable LOD threshold invalidates every
+  // affected pipeline even though all three values are instance-constant.
+  const hashes = packedHashes ?? varying(
+    vec3(slotHash(slot, 17), slotHash(slot, 91), slotHash(slot, 333)),
+  );
   const h1 = hashes.x;
   const h2 = hashes.y;
   const warmCool = mix(
@@ -279,10 +289,24 @@ export function instanceVeg(
   (mat as unknown as { castShadowPositionNode: unknown }).castShadowPositionNode = wpos;
 
   const f = bind.fade;
+  const instanceHashes = varying(
+    vec3(slotHash(slot, 17), slotHash(slot, 91), slotHash(slot, 333)),
+  ) as unknown as NV3;
   if (f && (f.fadeInAt !== undefined || f.fadeOutAt !== undefined)) {
-    applyDitherFade(mat, dist, f);
+    // Rigid opaque rocks need a spatial crossfade: one threshold per instance
+    // makes the entire object blink between rings. positionLocal is stable
+    // across camera motion/rotation and is already consumed by rock shading,
+    // so this adds no screen-space crawl and no extra varying location.
+    const surfaceNoise = positionLocal
+      .mul(11.37)
+      .dot(vec3(12.9898, 78.233, 37.719))
+      .add(instanceHashes.z.mul(19.193))
+      .sin()
+      .mul(43758.5453)
+      .fract() as unknown as NF;
+    applyDitherFade(mat, dist, f, bind.surfaceDither ? surfaceNoise : instanceHashes.z);
   }
-  applyInstanceTint(mat, slot, bind.tint ?? 0.12);
+  applyInstanceTint(mat, slot, bind.tint ?? 0.12, instanceHashes);
 
   // ?facedbg=1 — winding diagnosis: front faces green, back faces red
   if (bootQuery().get('facedbg') === '1') {

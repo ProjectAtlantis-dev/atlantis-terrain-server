@@ -9,6 +9,7 @@ import {
   fog,
   mix,
   mrt,
+  normalMap,
   normalLocal,
   output,
   pass,
@@ -19,11 +20,16 @@ import {
   toneMapping,
   transformNormalToView,
   uv,
+  vec2,
   vec3,
   vec4,
   uniform
 } from 'three/tsl';
-import { MeshLambertNodeMaterial, PostProcessing, WebGPURenderer } from 'three/webgpu';
+import {
+  MeshLambertNodeMaterial,
+  PostProcessing,
+  WebGPURenderer,
+} from 'three/webgpu';
 import {
   EffectComposer,
   EffectPass,
@@ -100,6 +106,8 @@ import {
   createAircraftState,
   setupAircraftModelParts,
   stepAircraftFlight,
+  toggleAircraftConversionMode,
+  toggleAircraftEngine,
   updateAircraftVisuals,
 } from './terrain-aircraft-runtime.js';
 import {
@@ -257,6 +265,13 @@ const VEHICLE_HEADLIGHTS = (
 const VEHICLE_PART_CONFIG = normalizeVehiclePartDefinition(VEHICLE_DEFINITION);
 
 const scene = new THREE.Scene();
+// CSM supplies direct sun but cannot be the only terrain light: shadowed
+// ground then falls toward black, especially at Greenland's low sun angles.
+// A restrained sky/ground hemisphere is the real-time ambient floor; it does
+// not cast or add another shadow pass.
+const terrainAmbientLight = new THREE.HemisphereLight(0xb8cee2, 0x263125, 0.35);
+terrainAmbientLight.name = 'terrain-ambient-floor';
+scene.add(terrainAmbientLight);
 // Black fog — aerial perspective inscatter fills in the natural sky color at distance.
 scene.fog = new THREE.FogExp2(0x000000, 0.00009);
 const _sceneFog = scene.fog;
@@ -1145,6 +1160,27 @@ const WATER_EXTENT = 200000; // 200km each direction — covers all visible ocea
 const waterNormalTex = new THREE.TextureLoader().load('/waternormals.jpg', tex => {
   tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
 });
+const waterTimeNode = uniform(0).setName('atlantisWaterTime');
+// Water does not need a full physical pipeline until the scene has a proper
+// environment probe. Lambert keeps atmosphere/shadow composition under the
+// WebGPU varying limit and still accepts the animated normal node.
+const webgpuWaterMat = new MeshLambertNodeMaterial();
+webgpuWaterMat.colorNode = color(0x287f9d);
+// Until the geospatial scene has an environment reflection probe, preserve a
+// blue sky-reflection floor. Without it the physically lit ocean resolves
+// almost black because this scene does not yet provide an environment map.
+webgpuWaterMat.emissiveNode = color(0x1b607e);
+const waterUv = uv().mul(18);
+const waterN0 = texture(
+  waterNormalTex,
+  waterUv.add(vec2(waterTimeNode.mul(0.012), waterTimeNode.mul(0.007))),
+).xyz.mul(2).sub(1);
+const waterN1 = texture(
+  waterNormalTex,
+  waterUv.mul(0.63).add(vec2(waterTimeNode.mul(-0.008), waterTimeNode.mul(0.011))),
+).xyz.mul(2).sub(1);
+webgpuWaterMat.normalNode = normalMap(waterN0.add(waterN1).normalize());
+webgpuWaterMat.side = THREE.FrontSide;
 const waterMat = new THREE.ShaderMaterial({
   uniforms: {
     time: { value: 0 },
@@ -1212,10 +1248,16 @@ const waterMat = new THREE.ShaderMaterial({
   depthWrite: false,
 });
 const waterGeo = new THREE.PlaneGeometry(WATER_EXTENT * 2, WATER_EXTENT * 2, 1, 1);
-const waterMesh = new THREE.Mesh(waterGeo, waterMat);
+const waterMesh = new THREE.Mesh(
+  waterGeo,
+  USE_WEBGPU_RENDER_BACKEND ? webgpuWaterMat : waterMat,
+);
+waterMesh.name = 'atlantis-ocean-surface';
 waterMesh.position.set(0, 0, 0.5); // just above terrain ocean at z=0
 waterMesh.frustumCulled = false;
-waterMesh.visible = false; // disabled for now
+waterMesh.castShadow = false;
+waterMesh.receiveShadow = false;
+waterMesh.visible = false;
 terrainRoot.add(waterMesh);
 
 const camMarkerGeo = new THREE.ConeGeometry(200, 600, 4);
@@ -1809,6 +1851,12 @@ const VEHICLE_SHADOW_GROUND_ANCHOR = THREE.MathUtils.clamp(
 );
 // Aggressive default so the vehicle shadow is clearly legible on bright ortho textures.
 const VEHICLE_SHADOW_OPACITY = THREE.MathUtils.clamp(paramNumber('vehicleShadowOpacity', 0.95), 0, 1);
+// WebGPU already has the scene-wide CSM. The older per-vehicle/per-house
+// systems duplicate every terrain tile with a nearly opaque ShadowMaterial
+// receiver and add another shadow-casting directional light. Those receivers
+// produced the camera-facing black bands seen ~423 m away. Keep the legacy
+// receiver path only for WebGL, which does not use the WebGPU CSM.
+const DEDICATED_TERRAIN_SHADOW_RECEIVERS = !USE_WEBGPU_RENDER_BACKEND;
 const vehicleShadowReceiverMaterial = new THREE.ShadowMaterial({
   color: 0x000000,
   transparent: true,
@@ -2706,6 +2754,11 @@ function clearVehicleShadowReceivers() {
 }
 
 function syncVehicleShadowReceivers() {
+  if (!DEDICATED_TERRAIN_SHADOW_RECEIVERS) {
+    clearVehicleShadowReceivers();
+    vehicleShadowReceiverLayer.visible = false;
+    return;
+  }
   if (!groundVehicleEntries.some(entry => entry.loaded)) {
     clearVehicleShadowReceivers();
     return;
@@ -2740,6 +2793,11 @@ function syncVehicleShadowReceivers() {
 }
 
 function updateVehicleShadowSystem() {
+  if (!DEDICATED_TERRAIN_SHADOW_RECEIVERS) {
+    vehicleShadowCasterLight.visible = false;
+    vehicleShadowReceiverLayer.visible = false;
+    return;
+  }
   const selected = selectedVehicleEntry();
   const entry = selected?.vehicleType === 'ground' && selected.loaded
     ? selected
@@ -3182,6 +3240,26 @@ function tryEnterVehicleControlFromPointer(event) {
   return trySelectVehicleFromPointer(event, { activate: true });
 }
 
+function toggleSelectedAircraftEngine(reason = 'manual') {
+  const entry = selectedVehicleEntry();
+  if (entry?.vehicleType !== 'aircraft' || !vehicleControlActive) return false;
+  const running = toggleAircraftEngine(entry);
+  bootLog('vehicle.aircraft.engine', { id: entry.id, running, reason });
+  requestRender();
+  return running;
+}
+
+function toggleSelectedAircraftConversion(reason = 'manual') {
+  const entry = selectedVehicleEntry();
+  if (entry?.vehicleType !== 'aircraft' || !vehicleControlActive || !entry.engineRunning) {
+    return false;
+  }
+  const mode = toggleAircraftConversionMode(entry);
+  bootLog('vehicle.aircraft.conversion', { id: entry.id, mode, reason });
+  requestRender();
+  return true;
+}
+
 const vehicleControlUI = createVehicleControlUI({
   onDrive: () => setVehicleControlActive(true, 'control-ui'),
   onExit: () => setVehicleControlActive(false, 'control-ui'),
@@ -3191,12 +3269,8 @@ const vehicleControlUI = createVehicleControlUI({
     !selectedGroundVehicleEntry()?.turretControlActive,
     'control-ui'
   ),
-  onToggleEngine: () => {
-    const entry = selectedVehicleEntry();
-    if (entry?.vehicleType !== 'aircraft' || !vehicleControlActive) return;
-    entry.engineRunning = !entry.engineRunning;
-    bootLog('vehicle.aircraft.engine', { id: entry.id, running: entry.engineRunning });
-  },
+  onToggleEngine: () => toggleSelectedAircraftEngine('control-ui'),
+  onToggleConversion: () => toggleSelectedAircraftConversion('control-ui'),
 });
 const vehicleFireRuntime = createVehicleFireRuntime({
   terrainRoot,
@@ -3472,6 +3546,11 @@ function clearHouseShadowReceivers() {
 }
 
 function syncHouseShadowReceivers() {
+  if (!DEDICATED_TERRAIN_SHADOW_RECEIVERS) {
+    clearHouseShadowReceivers();
+    houseShadowReceiverLayer.visible = false;
+    return;
+  }
   if (!HOUSE_MODEL.enabled) {
     clearHouseShadowReceivers();
     return;
@@ -3515,6 +3594,12 @@ function updateHouseShadowSystem() {
     }
   };
 
+  if (!DEDICATED_TERRAIN_SHADOW_RECEIVERS) {
+    setGate('scene-csm');
+    houseShadowCasterLight.visible = false;
+    houseShadowReceiverLayer.visible = false;
+    return;
+  }
   if (!HOUSE_USE_SHADOW_MAP) {
     setGate('shadowmap-disabled');
     houseShadowCasterLight.visible = false;
@@ -4495,17 +4580,23 @@ function procgenContextIntersectsMesh(contextValue, mesh) {
   );
 }
 
+// Shared runtime values: a recenter changes coordinates, not shader structure.
+// Embedding centerX/centerY as JS literals made every 192 m move compile a new
+// terrain shader for each intersecting tile (multi-second WebGPU hitch).
+const procgenCenterX = uniform(0);
+const procgenCenterY = uniform(0);
+
 function applyProcgenTerrainNodes(mesh, tex, contextValue) {
   const material = mesh.material;
-  const key = `${contextValue.id}:${tex?.uuid ?? 'fields'}`;
+  const key = `procgen:${tex?.uuid ?? 'fields'}`;
   if (mesh.userData.procgenTerrainMaterial === key) return false;
 
   // Streamed tile vertices are terrainRoot-local z-up (x=east, y=north,
   // z=elevation). LAAS fields/materials are y-up with +z toward south.
   const laasPosition = vec3(
-    positionLocal.x.sub(contextValue.centerX),
+    positionLocal.x.sub(procgenCenterX),
     positionLocal.z,
-    float(contextValue.centerY).sub(positionLocal.y),
+    procgenCenterY.sub(positionLocal.y),
   );
   const hf = contextValue.hf;
   const shading = buildTerrainShading({
@@ -4551,6 +4642,10 @@ function applyProcgenTerrainNodes(mesh, tex, contextValue) {
 
 function refreshProcgenTerrainMaterials() {
   const contextValue = greenlandPatch?.terrainMaterialContext?.();
+  if (contextValue) {
+    procgenCenterX.value = contextValue.centerX;
+    procgenCenterY.value = contextValue.centerY;
+  }
   let applied = 0;
   let cleared = 0;
   for (const child of terrainRoot.children) {
@@ -4883,6 +4978,7 @@ const terrainFetchState = {
 
 const performTileFetch = createTerrainFetchExecutor({
   state: terrainFetchState, previewMaxDepth: PREVIEW_MAX_DEPTH,
+  useManifest: true, tileBudget: 384,
   getHeading: () => priorityHeading(vehicleControlActive, selectedVehicleEntry()?.headingRad ?? controls.yaw, controls.yaw),
   getRange: () => _terrainRange, getCameraLatLon, getCameraSnapshot: getCameraLogSnapshot,
   getCameraLocalPosition: () => {
@@ -5062,15 +5158,31 @@ window.takramDebug = {
     vehicleType: entry.vehicleType,
     loaded: entry.loaded,
     displayName: entry.definition?.displayName ?? null,
+    configuredParts: entry.vehicleType === 'aircraft' ? entry.definition?.parts ?? null : null,
     position: entry.group.position.toArray(),
     headingDeg: Number(THREE.MathUtils.radToDeg(entry.headingRad).toFixed(3)),
     speedMps: entry.vehicleType === 'aircraft' ? entry.forwardSpeedMs : entry.speed,
     engineRunning: entry.vehicleType === 'aircraft' ? entry.engineRunning : null,
+    collective: entry.vehicleType === 'aircraft' ? Number(entry.collective.toFixed(4)) : null,
+    rotorSpool: entry.vehicleType === 'aircraft' ? Number(entry.rotorSpool.toFixed(4)) : null,
+    nacelleTiltDeg: entry.vehicleType === 'aircraft' ? Number(entry.nacelleTiltDeg.toFixed(2)) : null,
+    conversionMode: entry.vehicleType === 'aircraft' ? entry.conversionMode : null,
+    flightRegime: entry.vehicleType === 'aircraft' ? entry.flightRegime : null,
+    altitudeAGL: entry.vehicleType === 'aircraft' ? Number(entry.altitudeAGL.toFixed(2)) : null,
+    verticalSpeedMs: entry.vehicleType === 'aircraft' ? Number(entry.verticalSpeedMs.toFixed(3)) : null,
     rotors: entry.vehicleType === 'aircraft' ? {
       left: entry.leftRotorMesh?.name ?? null,
       right: entry.rightRotorMesh?.name ?? null,
       angleRad: Number(entry.rotorSpinAngle.toFixed(5)),
       angularVelocityRadS: Number(entry.rotorAngularVelocity.toFixed(5)),
+    } : null,
+    nacelles: entry.vehicleType === 'aircraft' ? {
+      left: entry.leftNacellePivot?.name ?? null,
+      right: entry.rightNacellePivot?.name ?? null,
+      leftRotation: entry.leftNacellePivot?.rotation.toArray().slice(0, 3)
+        .map(value => Number(value.toFixed(5))) ?? null,
+      rightRotation: entry.rightNacellePivot?.rotation.toArray().slice(0, 3)
+        .map(value => Number(value.toFixed(5))) ?? null,
     } : null,
   })),
   cycleVehicleCameraMode: () => cycleVehicleCameraMode('debug-api'),
@@ -5512,12 +5624,15 @@ function updateHud() {
     `lat: ${(anchorLat + northM / 111320).toFixed(5)}°  lon: ${(anchorLon + eastM / (111320 * Math.cos(anchorLat * Math.PI / 180))).toFixed(5)}°  alt: ${altM.toFixed(0)}m`,
     `enu: E ${eastM.toFixed(0)}m  N ${northM.toFixed(0)}m  U ${altM.toFixed(0)}m`,
     `speed: ${speedKmh.toFixed(0)} km/h  heading: ${deg.toFixed(0)}° ${compass}`,
+    vehicleControlActive && hudVehicle?.vehicleType === 'aircraft'
+      ? `${hudVehicle.flightRegime} · collective ${Math.round(hudVehicle.collective * 100)}% · rotor ${Math.round(hudVehicle.rotorSpool * 100)}% · nacelles ${hudVehicle.nacelleTiltDeg.toFixed(0)}° · V/S ${hudVehicle.verticalSpeedMs.toFixed(1)} m/s · AGL ${hudVehicle.altitudeAGL.toFixed(0)} m`
+      : '',
     hmLine,
     texLine,
     hudVehicle?.turretControlActive
       ? 'Mouse aims turret, W/S drive, A/D steer, T or Esc exits turret · firing pending WebGPU validation'
       : vehicleControlActive && hudVehicle?.vehicleType === 'aircraft'
-      ? `E engine (${hudVehicle.engineRunning ? 'ON' : 'OFF'}), W/S move, A/D yaw, Space climb, Q descend, V camera (${currentVehicleCameraModeName()}), Esc exit`
+      ? `E engine (${hudVehicle.engineRunning ? 'ON' : 'OFF'}), Space/Q collective, W/S move, A/D turn, F ${hudVehicle.conversionMode === 'cruise' ? 'convert to hover' : 'convert to cruise'}, V camera (${currentVehicleCameraModeName()}), Esc exit`
       : vehicleControlActive
       ? `W/S drive, A/D steer, mouse orbit, V camera (${currentVehicleCameraModeName()}), L lights, Esc exit`
       : (hudVehicle != null
@@ -5554,6 +5669,12 @@ function updateHud() {
     turretActive: Boolean(hudVehicle?.turretControlActive),
     isAircraft,
     engineRunning: Boolean(hudVehicle?.engineRunning),
+    conversionMode: hudVehicle?.conversionMode ?? 'hover',
+    collective: hudVehicle?.collective ?? 0,
+    rotorSpool: hudVehicle?.rotorSpool ?? 0,
+    altitudeAGL: hudVehicle?.altitudeAGL ?? 0,
+    verticalSpeedMs: hudVehicle?.verticalSpeedMs ?? 0,
+    flightRegime: hudVehicle?.flightRegime ?? 'GROUND',
   });
 }
 
@@ -5664,12 +5785,8 @@ installTerrainKeyboardControls({
     !selectedGroundVehicleEntry()?.turretControlActive,
     'keyboard'
   ),
-  onToggleAircraftEngine: () => {
-    const entry = selectedVehicleEntry();
-    if (entry?.vehicleType !== 'aircraft') return;
-    entry.engineRunning = !entry.engineRunning;
-    bootLog('vehicle.aircraft.engine', { id: entry.id, running: entry.engineRunning });
-  },
+  onToggleAircraftEngine: () => toggleSelectedAircraftEngine('keyboard'),
+  onToggleAircraftConversion: () => toggleSelectedAircraftConversion('keyboard'),
   onChanged: requestRender,
 });
 
@@ -5925,8 +6042,8 @@ function render() {
   // Animate water
   waterMat.uniforms.time.value = clock.elapsedTime * 0.4;
   waterMat.uniforms.sunDirection.value.copy(sunDirection);
-  // The GLSL water material is not supported by WebGPURenderer.
-  waterMesh.visible = !renderBackend.isWebGPU && !controls.mapMode;
+  waterTimeNode.value = clock.elapsedTime;
+  waterMesh.visible = !controls.mapMode;
 
   // Terrain streaming: check if camera moved far enough to re-fetch
   if (!isFirstLoad) {
@@ -5967,7 +6084,7 @@ function render() {
     houseLayer.visible = true;
     updateHouseHotReload(nowMs);
     snapPendingHouses();
-    if (HOUSE_USE_SHADOW_MAP) {
+    if (DEDICATED_TERRAIN_SHADOW_RECEIVERS && HOUSE_USE_SHADOW_MAP) {
       syncHouseShadowReceivers();
       updateHouseShadowSystem();
       renderer.shadowMap.autoUpdate = true;
@@ -5983,8 +6100,11 @@ function render() {
           receiverCount: houseShadowReceivers.size
         });
       }
-    } else {
+    } else if (!USE_WEBGPU_RENDER_BACKEND) {
       updateHouseLocalShadows();
+      houseShadowReceiverLayer.visible = false;
+      houseShadowCasterLight.visible = false;
+    } else {
       houseShadowReceiverLayer.visible = false;
       houseShadowCasterLight.visible = false;
     }
@@ -6050,7 +6170,13 @@ function render() {
     if (procgenTerrainReady && !greenlandPatch.ready && !greenlandPatch.building) {
       void greenlandPatch.build(renderer, camera, cameraAGL);
     }
-    greenlandPatch.update(renderer, camera, cameraAGL);
+    const controlledVehicle = vehicleControlActive ? selectedVehicleEntry() : null;
+    const traversalSpeedMps = controlledVehicle?.vehicleType === 'aircraft'
+      ? Math.abs(controlledVehicle.forwardSpeedMs ?? 0)
+      : controlledVehicle?.vehicleType === 'ground'
+        ? Math.abs(controlledVehicle.speed ?? 0)
+        : Math.hypot(controls.speed, controls.strafeSpeed);
+    greenlandPatch.update(renderer, camera, cameraAGL, traversalSpeedMps);
   }
   if (renderBackend.isWebGPU && webgpuCloudShadows != null) {
     // Throttled internally; must run OUTSIDE the render (a compute submit

@@ -8,7 +8,7 @@
  */
 
 import { Color, DoubleSide, type DirectionalLight, type Texture, Vector3 } from 'three';
-import { MeshPhysicalNodeMaterial, MeshStandardNodeMaterial } from 'three/webgpu';
+import { MeshStandardNodeMaterial } from 'three/webgpu';
 import {
   attribute,
   cameraPosition,
@@ -17,6 +17,7 @@ import {
   mix,
   normalMap,
   normalWorld,
+  positionLocal,
   positionWorld,
   smoothstep,
   texture,
@@ -90,8 +91,7 @@ export interface BarkMatParams {
 }
 
 export function barkMaterial(p: BarkMatParams): MeshStandardNodeMaterial {
-  const mat = new MeshPhysicalNodeMaterial();
-  mat.specularIntensity = 0.45;
+  const mat = new MeshStandardNodeMaterial();
   const d = vdata();
   const base = vec3(p.color.r, p.color.g, p.color.b);
   mat.colorNode = hueShift(base, d.x, 0.18).mul(d.w.mul(0.75).add(0.25));
@@ -108,8 +108,7 @@ export function barkTexturedMaterial(tex: {
   texA: Texture;
   texB: Texture;
 }): MeshStandardNodeMaterial {
-  const mat = new MeshPhysicalNodeMaterial();
-  mat.specularIntensity = 0.45;
+  const mat = new MeshStandardNodeMaterial();
   const d = vdata();
   const a = texture(tex.texA, uv() as never) as unknown as NV4;
   const b = texture(tex.texB, uv() as never) as unknown as NV4;
@@ -139,10 +138,14 @@ export function rockMaterial(opts?: {
    *  DETAIL layer, so the per-type tone + lichen/moss stay intact. */
   tex?: RockTextures;
 }): MeshStandardNodeMaterial {
-  const mat = new MeshPhysicalNodeMaterial();
-  mat.specularIntensity = 0.4;
+  const mat = new MeshStandardNodeMaterial();
   const d = vdata();
-  const wp = positionWorld;
+  // Atlantis renders in ECEF, where positionWorld is about 6.4 million
+  // metres. High-frequency procedural coordinates lose float precision there
+  // and crawl across the rock under TAA/camera motion. positionLocal contains
+  // the instance-transformed clipmap coordinate (hundreds of metres), so the
+  // triplanar texture and noise remain spatially stable.
+  const wp = positionLocal;
   const strataT = d.y;
   const upness = normalWorld.y.max(0);
   // band tint: alternating warm/cool sediment layers + grain
@@ -280,8 +283,7 @@ export function deadwoodMaterial(
    *  at noon without a dry-wood darkening */
   dim?: { r: number; g: number; b: number },
 ): MeshStandardNodeMaterial {
-  const mat = new MeshPhysicalNodeMaterial();
-  mat.specularIntensity = 0.45;
+  const mat = new MeshStandardNodeMaterial();
   const d = vdata();
   const a = texture(tex.texA, uv() as never) as unknown as NV4;
   const b = texture(tex.texB, uv() as never) as unknown as NV4;
@@ -381,11 +383,10 @@ export interface FoliageMatParams {
 }
 
 export function foliageMaterial(p: FoliageMatParams): MeshStandardNodeMaterial {
-  // Physical variant for specularIntensity: white dielectric F0 0.04 at
-  // glancing sun desaturates sunlit leaves to SILVER (user) — real leaves
-  // read color-first; translucency + diffuse carry the lit look
-  const mat = new MeshPhysicalNodeMaterial();
-  mat.specularIntensity = 0.3;
+  // Keep local foliage on the lean standard PBR pipeline. Full physical
+  // materials exceed WebGPU's varying budget once atmosphere and shadows are
+  // composed, and their extra dielectric sheen made leaves read silver.
+  const mat = new MeshStandardNodeMaterial();
   const d = vdata();
   const base = vec3(p.color.r, p.color.g, p.color.b);
   const tinted = hueShift(base, d.x, p.color.hueVar).mul(d.w.mul(0.8).add(0.2));
@@ -407,10 +408,8 @@ export function foliageCardMaterial(
   atlas: Texture,
   p: FoliageMatParams,
 ): MeshStandardNodeMaterial {
-  // see foliageMaterial: cards are worse — ONE flat normal per card means
-  // the sheen paints whole cards silver coherently. Near-diffuse.
-  const mat = new MeshPhysicalNodeMaterial();
-  mat.specularIntensity = 0.18;
+  // See foliageMaterial: cards use the same lean standard PBR pipeline.
+  const mat = new MeshStandardNodeMaterial();
   const d = vdata();
   const t = texture(atlas, uv() as never) as unknown as NV4;
   const albedo = t.rgb.mul(t.rgb); // sqrt-encoded at capture
