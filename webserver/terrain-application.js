@@ -38,6 +38,8 @@ import { createTerrainAtmosphereTextureRuntime } from './terrain-atmosphere-text
 import { createTerrainTuningControls } from './terrain-tuning-controls.js';
 import { bindTerrainCloudComposition, configureTerrainClouds, registerTerrainCloudTuning } from './terrain-cloud-runtime.js';
 import { createTerrainHouseSceneRuntime } from './terrain-house-scene-runtime.js';
+import { createTerrainBuildingsRuntime } from './terrain-buildings-runtime.js';
+import { createTerrainRoadsRuntime } from './terrain-roads-runtime.js';
 import { createTerrainTileMenuRuntime } from './terrain-tile-menu-runtime.js';
 import { createTerrainHeatmapRuntime } from './terrain-heatmap-runtime.js';
 import { googleMaps3dUrl } from './terrain-google-maps.js';
@@ -933,6 +935,22 @@ const classifierRuntime = createTerrainClassifierRuntime({
     requestRender();
   },
 });
+const buildingsRuntime = createTerrainBuildingsRuntime({
+  terrainRoot,
+  pipelineState: terrainPipelineState,
+  exaggeration: EXAG,
+  bootLog,
+  onMutated: markSceneMutated,
+  requestRender,
+});
+const roadsRuntime = createTerrainRoadsRuntime({
+  terrainRoot,
+  pipelineState: terrainPipelineState,
+  exaggeration: EXAG,
+  bootLog,
+  onMutated: markSceneMutated,
+  requestRender,
+});
 
 function getFogDistance() {
   return terrainFogDistance(getCameraLatLon().alt);
@@ -1280,6 +1298,8 @@ if (!bootFlyToTileId || !flyToTileRuntime.flyToTile(bootFlyToTileId).ok) {
   terrainFetchRuntime.request();
 }
 houseRuntime.start();
+buildingsRuntime.start();
+roadsRuntime.start();
 vehicleRuntime.loadVehicleState();
 vehicleRuntime.loadVehicleModel();
 
@@ -1301,6 +1321,10 @@ window.takramDebug = {
   loadHouseModel: houseRuntime.loadHouseModel,
   setHousesVisible: visible => houseRuntime.setHousesRuntimeVisible(Boolean(visible), 'debug-api'),
   getHousesVisible: () => houseRuntime.housesRuntimeVisible,
+  setBuildingsVisible: visible => buildingsRuntime.setVisible(visible),
+  getBuildingsMesh: () => buildingsRuntime.getMesh(),
+  setRoadsVisible: visible => roadsRuntime.setVisible(visible),
+  getRoadsMesh: () => roadsRuntime.getMesh(),
   saveVehicleState: reason => vehicleRuntime.saveVehicleState(reason ?? 'debug-api'),
   loadVehicleState: vehicleRuntime.loadVehicleState,
   setVehicleControlActive: active => vehicleRuntime.setVehicleControlActive(Boolean(active), 'debug-api'),

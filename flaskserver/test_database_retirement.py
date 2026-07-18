@@ -112,7 +112,7 @@ class RetiredTerrainMigrationTest(unittest.TestCase):
                 db.execute(
                     "SELECT value FROM metadata WHERE key = 'schema_version'"
                 ).fetchone(),
-                ("1",),
+                ("2",),
             )
             columns = {row[1] for row in db.execute("PRAGMA table_info(tiles)")}
             self.assertNotIn("has_sealevel_water", columns)
@@ -127,7 +127,9 @@ class RetiredTerrainMigrationTest(unittest.TestCase):
             }
             self.assertEqual(rows["11-1-1"], ("empty", 0.0, None, None))
             self.assertEqual(rows["11-1-2"], ("empty", 0.0, None, None))
-            self.assertEqual(rows["11-1-3"][0:2], ("arcticdem_10m", 12.0))
+            self.assertEqual(
+                rows["11-1-3"][0:2], ("unmasked_arcticdem_10m", 12.0)
+            )
             self.assertIsNotNone(rows["11-1-3"][2])
             self.assertIsNotNone(rows["11-1-3"][3])
             db.close()

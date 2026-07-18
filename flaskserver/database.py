@@ -38,10 +38,11 @@ CONFIDENCE = {
     'external':   4,
     'arcticdem':  5,
     'arcticdem_10m': 6,
+    'official_coastline': 6,
 }
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 _SCHEMA_VERSION_KEY = "schema_version"
 
 
@@ -165,6 +166,60 @@ def _migrate_to_v1(db):
             db.execute(f"ALTER TABLE tiles DROP COLUMN {column}")
 
 
+def _migrate_to_v2(db):
+    """Queue cached terrain for a non-destructive coastline-aware refresh."""
+    source_map = {
+        "arcticdem": "unmasked_arcticdem",
+        "arcticdem_10m": "unmasked_arcticdem_10m",
+        "copernicus": "unmasked_copernicus",
+        "parent_resampled": "unmasked_parent_resampled",
+    }
+    upgrade_ids = [
+        row[0]
+        for row in db.execute(
+            f"SELECT tile_id FROM tiles WHERE source IN "
+            f"({','.join('?' for _ in source_map)})",
+            tuple(source_map),
+        )
+    ]
+    for old_source, queued_source in source_map.items():
+        db.execute(
+            "UPDATE tiles SET source = ? WHERE source = ?",
+            (queued_source, old_source),
+        )
+
+    # Old no-data rows have no payload worth preserving. Reopen them so the
+    # official mask can resolve all-ocean tiles even when both DEMs are empty.
+    no_data_ids = [
+        row[0]
+        for row in db.execute("SELECT tile_id FROM tiles WHERE source = 'no_data'")
+    ]
+    if no_data_ids:
+        now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        db.executemany(
+            "UPDATE tiles SET heightmap = NULL, confidence_map = NULL, "
+            "geometric_error = 0.0, source = 'empty', updated_at = ? "
+            "WHERE tile_id = ?",
+            ((now, tile_id) for tile_id in no_data_ids),
+        )
+
+    if upgrade_ids:
+        tables = {
+            row[0]
+            for row in db.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        if "classifier_tiles" in tables:
+            db.executemany(
+                "DELETE FROM classifier_tiles WHERE tile_id = ?",
+                ((tile_id,) for tile_id in upgrade_ids),
+            )
+        log_db.info(
+            f"Queued {len(upgrade_ids)} terrain tiles for official coastline refresh"
+        )
+
+
 def _migrate_schema(db):
     row = db.execute(
         "SELECT value FROM metadata WHERE key = ?", (_SCHEMA_VERSION_KEY,)
@@ -180,6 +235,13 @@ def _migrate_schema(db):
         db.execute(
             "INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)",
             (_SCHEMA_VERSION_KEY, "1"),
+        )
+        version = 1
+    if version < 2:
+        _migrate_to_v2(db)
+        db.execute(
+            "INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)",
+            (_SCHEMA_VERSION_KEY, "2"),
         )
 
 

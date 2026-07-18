@@ -838,11 +838,19 @@ def api_tiles():
           from concurrent.futures import ThreadPoolExecutor, as_completed
           from ingest import _read_cog_heightmap, _resample_from_parent
           from database import CONFIDENCE, write_tile
-          from serve import mark_no_data
+          from serve import mark_no_data, _UPGRADEABLE_SOURCES
 
           db = sqlite3.connect(str(DB_PATH), check_same_thread=False)
           db.execute("PRAGMA journal_mode=WAL")
           log_cog.info(f"Starting {len(missing_list)} tiles from S3... (session: {_cog_fetched_total} fetched, {_cog_skipped_total} skipped)")
+
+          upgrade_ids = set()
+          for tid, _ in missing_list:
+            row = db.execute(
+              "SELECT source FROM tiles WHERE tile_id = ?", (tid,)
+            ).fetchone()
+            if row and row[0] in _UPGRADEABLE_SOURCES:
+              upgrade_ids.add(tid)
 
           def _worker(tile_id, bbox):
             log_cog.debug(f"[cog-worker] {tile_id}: reading bbox=[{bbox[0]:.0f},{bbox[1]:.0f},{bbox[2]:.0f},{bbox[3]:.0f}]")
@@ -863,7 +871,10 @@ def api_tiles():
                 conf = CONFIDENCE.get(src_name, CONFIDENCE['arcticdem'])
                 cm = _np.where(_np.isnan(data), _np.uint8(0), _np.uint8(conf))
                 hm = _np.where(_np.isnan(data), 0.0, data).astype(_np.float32)
-                write_tile(db, tile_id, hm, cm, src_name, reconcile=False)
+                write_tile(
+                  db, tile_id, hm, cm, src_name, reconcile=False,
+                  allow_overwrite=tile_id in upgrade_ids,
+                )
                 fetched += 1
                 _cog_fetched_total += 1
               except Exception:
@@ -886,7 +897,10 @@ def api_tiles():
                 hm = _np.where(_np.isnan(data), 0.0, data).astype(_np.float32)
                 from database import TileClobberError
                 try:
-                  write_tile(db, tile_id, hm, cm, source_name, reconcile=False)
+                  write_tile(
+                    db, tile_id, hm, cm, source_name, reconcile=False,
+                    allow_overwrite=tile_id in upgrade_ids,
+                  )
                   parent_resampled_count += 1
                   _cog_fetched_total += 1
                   log_cog.info(f"  [PARENT RESAMPLE] {tile_id}: filled from parent")
@@ -931,6 +945,103 @@ def api_tiles():
       "texStatusCounts": tex_status_counts,
     }
   )
+
+
+@app.get("/api/buildings")
+def api_buildings():
+  """Asiaq Teknisk Grundkort building footprints near a point.
+
+  Same origin convention as /api/tiles: coordinates are EPSG:3413 minus
+  (ox, oy). Rings are [[x, y, roofZ], ...] with per-vertex surveyed roof
+  elevations; groundZ is sampled from our heightmaps at ingest time.
+  Empty result until ingest_buildings.py has populated the table.
+  """
+  unavailable = _terrain_unavailable_response()
+  if unavailable is not None:
+    return unavailable
+  if "sx" in request.args and "sy" in request.args:
+    qx = _arg_float("sx", 0.0)
+    qy = _arg_float("sy", 0.0)
+  else:
+    lat = _arg_float("lat", 64.175)
+    lon = _arg_float("lon", -51.7388)
+    qx, qy = _to_stereo(lat, lon)
+  max_range = _arg_float("range", 20000.0)
+  ox = _arg_float("ox", qx)
+  oy = _arg_float("oy", qy)
+
+  db = _get_db()
+  has_table = db.execute(
+    "SELECT name FROM sqlite_master WHERE type='table' AND name='buildings'"
+  ).fetchone()
+  if not has_table:
+    return jsonify({"buildings": [], "count": 0, "qx": qx, "qy": qy})
+
+  rows = db.execute(
+    "SELECT building_id, b_number, use_type, ground_z, ring FROM buildings "
+    "WHERE cx BETWEEN ? AND ? AND cy BETWEEN ? AND ? LIMIT 20000",
+    (qx - max_range, qx + max_range, qy - max_range, qy + max_range),
+  ).fetchall()
+
+  buildings = []
+  for building_id, b_number, use_type, ground_z, ring_json in rows:
+    ring = json.loads(ring_json)
+    buildings.append({
+      "id": building_id,
+      "b": b_number,
+      "use": use_type,
+      "groundZ": ground_z,
+      "ring": [[x - ox, y - oy, z] for x, y, z in ring],
+    })
+  log.debug(f"[/api/buildings] {len(buildings)} buildings near qx={qx:.0f} qy={qy:.0f} range={max_range:.0f}")
+  return jsonify({"buildings": buildings, "count": len(buildings), "qx": qx, "qy": qy})
+
+
+@app.get("/api/roads")
+def api_roads():
+  """Asiaq road/path centerlines near a point (see /api/buildings for the
+  origin convention). Paths are [[x, y, surveyedZ], ...]; width_m is assigned
+  per category at ingest. Empty until ingest_roads.py has run."""
+  unavailable = _terrain_unavailable_response()
+  if unavailable is not None:
+    return unavailable
+  if "sx" in request.args and "sy" in request.args:
+    qx = _arg_float("sx", 0.0)
+    qy = _arg_float("sy", 0.0)
+  else:
+    lat = _arg_float("lat", 64.175)
+    lon = _arg_float("lon", -51.7388)
+    qx, qy = _to_stereo(lat, lon)
+  max_range = _arg_float("range", 20000.0)
+  ox = _arg_float("ox", qx)
+  oy = _arg_float("oy", qy)
+
+  db = _get_db()
+  has_table = db.execute(
+    "SELECT name FROM sqlite_master WHERE type='table' AND name='roads'"
+  ).fetchone()
+  if not has_table:
+    return jsonify({"roads": [], "count": 0, "qx": qx, "qy": qy})
+
+  rows = db.execute(
+    "SELECT road_id, kind, category, name, width_m, path FROM roads "
+    "WHERE cx BETWEEN ? AND ? AND cy BETWEEN ? AND ? LIMIT 20000",
+    (qx - max_range, qx + max_range, qy - max_range, qy + max_range),
+  ).fetchall()
+
+  roads = []
+  for road_id, kind, category, name, width_m, path_json in rows:
+    path = json.loads(path_json)
+    roads.append({
+      "id": road_id,
+      "kind": kind,
+      "category": category,
+      "name": name,
+      "widthM": width_m,
+      "path": [[x - ox, y - oy, z] for x, y, z in path],
+    })
+  log.debug(f"[/api/roads] {len(roads)} polylines near qx={qx:.0f} qy={qy:.0f} range={max_range:.0f}")
+  return jsonify({"roads": roads, "count": len(roads), "qx": qx, "qy": qy})
 
 
 @app.get("/api/texture/<tile_id>.jpg")

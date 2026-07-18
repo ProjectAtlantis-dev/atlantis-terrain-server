@@ -74,8 +74,13 @@ def write_classifier_tile(
     class_schema=COARSE_SCHEMA,
     confidence=None,
     source="classifier",
+    enforce_official_water=True,
 ):
-    """Insert or replace a semantic tile. Primarily used by classifier jobs."""
+    """Insert or replace a semantic tile. Primarily used by classifier jobs.
+
+    For ``coarse_v1``, mapped sea pixels are always forced to the schema's
+    ``water`` label. The model cannot override the official coastline.
+    """
     if class_schema not in CLASS_SCHEMAS:
         raise ValueError(f"unknown classifier schema: {class_schema}")
     array = np.asarray(classes, dtype=np.uint8)
@@ -83,11 +88,25 @@ def write_classifier_tile(
         raise ValueError("classifier class map must be a 2D array")
     if array.size and int(array.max()) >= len(CLASS_SCHEMAS[class_schema]["names"]):
         raise ValueError(f"class map contains labels outside {class_schema}")
+    array = array.copy()
+    if enforce_official_water and class_schema == COARSE_SCHEMA:
+        from classifier.official_water import classifier_water_mask_for_tile
+
+        official_water = classifier_water_mask_for_tile(
+            db, tile_id, int(array.shape[1]), int(array.shape[0])
+        )
+        if official_water is not None:
+            water_label = CLASS_SCHEMAS[class_schema]["names"].index("water")
+            array[official_water] = np.uint8(water_label)
     confidence_blob = None
     if confidence is not None:
         confidence_array = np.asarray(confidence, dtype=np.uint8)
         if confidence_array.shape != array.shape:
             raise ValueError("classifier confidence map must match the class map")
+        if enforce_official_water and class_schema == COARSE_SCHEMA:
+            if official_water is not None:
+                confidence_array = confidence_array.copy()
+                confidence_array[official_water] = np.uint8(255)
         confidence_blob = zlib.compress(confidence_array.tobytes(), level=6)
     now = datetime.datetime.now(datetime.timezone.utc).isoformat()
     db.execute(

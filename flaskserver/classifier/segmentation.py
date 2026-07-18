@@ -111,8 +111,14 @@ def _rgb_to_lab(rgb):
     ).astype(np.float32)
 
 
-def terrain_feature_channels(rgb, heightmap, tile_size_m, config=None):
-    """Build image-aligned appearance and DEM channels used by segmentation."""
+def terrain_feature_channels(
+    rgb, heightmap, tile_size_m, config=None, *, water_mask=None
+):
+    """Build image-aligned appearance and DEM channels used by segmentation.
+
+    ``water_mask`` is the official north-first image mask. Elevation is used
+    only as a backwards-compatible fallback when no authoritative mask exists.
+    """
     config = config or SegmentationConfig()
     rgb, heightmap = _validate_inputs(rgb, heightmap, tile_size_m, config)
     heightmap = _fill_heightmap(heightmap)
@@ -136,7 +142,16 @@ def terrain_feature_channels(rgb, heightmap, tile_size_m, config=None):
     elevation = _resize_float(heightmap[::-1], out_w, out_h)
     slope = _resize_float(slope_degrees[::-1], out_w, out_h)
     relief = _resize_float(local_relief[::-1], out_w, out_h)
-    water = (elevation <= config.sea_level_m).astype(np.float32)
+    if water_mask is None:
+        water = (elevation <= config.sea_level_m).astype(np.float32)
+    else:
+        water = np.asarray(water_mask, dtype=bool)
+        if water.shape != (out_h, out_w):
+            raise ValueError(
+                f"water_mask shape {water.shape} must match RGB shape "
+                f"{(out_h, out_w)}"
+            )
+        water = water.astype(np.float32)
     valid_rgb = (rgb.max(axis=2) > 3).astype(np.float32)
     lab = _rgb_to_lab(rgb)
 
@@ -311,11 +326,15 @@ def _region_statistics(labels, rgb, channels):
     return tuple(regions)
 
 
-def segment_terrain_tile(rgb, heightmap, tile_size_m, config=None):
+def segment_terrain_tile(
+    rgb, heightmap, tile_size_m, config=None, *, water_mask=None
+):
     """Return geometry-aware contiguous superpixels and region statistics."""
     config = config or SegmentationConfig()
     rgb, heightmap = _validate_inputs(rgb, heightmap, tile_size_m, config)
-    channels = terrain_feature_channels(rgb, heightmap, tile_size_m, config)
+    channels = terrain_feature_channels(
+        rgb, heightmap, tile_size_m, config, water_mask=water_mask
+    )
     cost = _boundary_cost(channels, config)
     if config.image_blur_pixels > 0:
         cost = ndimage.gaussian_filter(

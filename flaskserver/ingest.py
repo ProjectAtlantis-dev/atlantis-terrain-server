@@ -274,6 +274,9 @@ def _read_cog_heightmap(bbox, resolution=GRID_N):
     else:
         log_cog.info(f"  Copernicus: no valid data")
 
+    selected = None
+    selected_source = None
+
     if arctic_ok and cop_ok:
         assert arctic is not None and cop is not None
         # Compare: difference between the two
@@ -290,18 +293,31 @@ def _read_cog_heightmap(bbox, resolution=GRID_N):
         cop_valid = np.sum(~np.isnan(cop))
         if arctic_valid >= cop_valid:
             log_cog.info(f"  WINNER: ArcticDEM ({arctic_valid} vs {cop_valid} valid pixels)")
-            return arctic, 'arcticdem_10m'
+            selected, selected_source = arctic, 'arcticdem_10m'
         else:
             log_cog.info(f"  WINNER: Copernicus ({cop_valid} vs {arctic_valid} valid pixels)")
-            return cop, 'copernicus'
+            selected, selected_source = cop, 'copernicus'
 
-    if arctic_ok:
+    elif arctic_ok:
         log_cog.info(f"  Using ArcticDEM (only source with data)")
-        return arctic, 'arcticdem_10m'
+        selected, selected_source = arctic, 'arcticdem_10m'
 
-    if cop_ok:
+    elif cop_ok:
         log_cog.info(f"  Using Copernicus (only source with data)")
-        return cop, 'copernicus'
+        selected, selected_source = cop, 'copernicus'
+
+    from coastline import apply_official_coastline
+    selected, coast_applied = apply_official_coastline(
+        selected, bbox, resolution
+    )
+    if coast_applied:
+        water_count = int(np.sum(selected <= 0.0)) if selected is not None else 0
+        log_cog.info(
+            f"  Official coastline applied: {water_count}/{resolution * resolution} "
+            "samples at/below sea level"
+        )
+    if selected is not None:
+        return selected, selected_source or 'official_coastline'
 
     log_cog.info(f"  No data from any source for bbox=[{bbox[0]:.0f},{bbox[1]:.0f},{bbox[2]:.0f},{bbox[3]:.0f}]")
     return None, None

@@ -39,6 +39,25 @@ class TerrainSegmentationTest(unittest.TestCase):
         outer_cost = float(np.concatenate((cost[:, :16], cost[:, 48:]), 1).mean())
         self.assertGreater(center_cost, outer_cost + 20)
 
+    def test_official_water_mask_overrides_elevation_fallback(self):
+        rgb = np.full((8, 8, 3), 100, dtype=np.uint8)
+        heightmap = np.full((5, 5), 150.0, dtype=np.float32)
+        official = np.zeros((8, 8), dtype=bool)
+        official[:, :3] = True
+        channels = terrain_feature_channels(
+            rgb, heightmap, 40.0, water_mask=official
+        )
+        np.testing.assert_array_equal(channels["water"], official.astype(np.float32))
+
+    def test_official_water_mask_must_match_classifier_pixels(self):
+        with self.assertRaisesRegex(ValueError, "water_mask shape"):
+            terrain_feature_channels(
+                np.zeros((8, 8, 3), dtype=np.uint8),
+                np.zeros((5, 5), dtype=np.float32),
+                40.0,
+                water_mask=np.zeros((5, 5), dtype=bool),
+            )
+
     def test_labels_are_dense_and_statistics_cover_every_pixel(self):
         rgb = np.zeros((48, 64, 3), dtype=np.uint8)
         rgb[:, 32:] = (220, 230, 240)

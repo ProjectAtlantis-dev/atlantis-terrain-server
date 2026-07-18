@@ -30,10 +30,21 @@ from terrain_config import MAX_TILE_DEPTH
 from terrain_seams import SqliteSeamCache, repair_lod_seams as _stitch_lod_edges
 
 
-REAL_SOURCES = ('arcticdem', 'arcticdem_10m', 'copernicus', 'parent_resampled')
+REAL_SOURCES = (
+    'arcticdem', 'arcticdem_10m', 'copernicus', 'parent_resampled',
+    'official_coastline',
+    'unmasked_arcticdem', 'unmasked_arcticdem_10m',
+    'unmasked_copernicus', 'unmasked_parent_resampled',
+)
 
 # Sources that should be refetched at higher DEM resolution
-_UPGRADEABLE_SOURCES = {'arcticdem'}  # old 32m data
+_UPGRADEABLE_SOURCES = {
+    'arcticdem',  # old 32m data
+    'unmasked_arcticdem',
+    'unmasked_arcticdem_10m',
+    'unmasked_copernicus',
+    'unmasked_parent_resampled',
+}
 
 # Tiles we've already tried to fetch and found no COG data (ocean, etc).
 # Seeded from DB on startup, updated as new tiles are discovered.
@@ -148,7 +159,9 @@ def _traverse(db, depth, col, row, qx, qy, max_depth, error_threshold,
         return
 
     has_real_data = meta['source'] in REAL_SOURCES
-    is_placeholder = meta['source'] == 'parent_resampled'
+    is_placeholder = meta['source'] in (
+        'parent_resampled', 'unmasked_parent_resampled'
+    )
 
     # Unfetched tiles have geometric_error=0 from seeding — assume high
     # error so the traversal subdivides through them to find smaller tiles

@@ -10,7 +10,8 @@ Each region follows a weighted combination of:
 - elevation
 - slope
 - local relief
-- the sea-level boundary
+- the official Greenland `Åbent Land` coastline mask (with sea-level elevation
+  used only as a fallback if the authority is unavailable)
 - valid imagery versus black provider no-data
 
 The default target diameter is 40 metres. Output statistics include RGB mean
@@ -27,3 +28,7 @@ venv/bin/python segment_tile.py 12-1372-784 --output /tmp/segments
 This writes a lossless `labels.npy` raster, a boundary-overlay PNG, and JSON
 region features. DEM rows are flipped internally from the database's
 south-first convention into the texture's north-first image convention.
+
+The same official mask is enforced when a `coarse_v1` semantic class map is
+written: every mapped sea pixel is assigned the `water` label with maximum
+confidence, regardless of the model's prediction.

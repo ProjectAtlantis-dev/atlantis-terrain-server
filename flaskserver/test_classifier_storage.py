@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 
@@ -28,9 +29,14 @@ class ClassifierStorageTest(unittest.TestCase):
                 "VALUES ('12-1-2', 12, 1, 2, 0, 0, 1, 1, NULL, 0, 'test', 'now')"
             )
             labels = np.asarray([[0, 1, 2], [3, 4, 0]], dtype=np.uint8)
-            write_classifier_tile(
-                db, "12-1-2", labels, class_schema=COARSE_SCHEMA, source="test-model-v1"
-            )
+            with patch(
+                "classifier.official_water.classifier_water_mask_for_tile",
+                return_value=np.zeros(labels.shape, dtype=bool),
+            ):
+                write_classifier_tile(
+                    db, "12-1-2", labels, class_schema=COARSE_SCHEMA,
+                    source="test-model-v1"
+                )
             schema, width, height, blob, source = db.execute(
                 "SELECT class_schema, width, height, class_map, source "
                 "FROM classifier_tiles WHERE tile_id = '12-1-2'"
@@ -39,6 +45,37 @@ class ClassifierStorageTest(unittest.TestCase):
                              (COARSE_SCHEMA, 3, 2, "test-model-v1"))
             np.testing.assert_array_equal(decode_class_map(blob, width, height), labels)
             self.assertEqual(colorize_class_map(labels, schema).shape, (2, 3, 3))
+            db.close()
+
+    def test_official_water_overrides_model_class_and_confidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db = open_db(str(Path(directory) / "terrain.db"))
+            db.execute(
+                "INSERT INTO tiles "
+                "(tile_id, depth, col, row, x_min, y_min, x_max, y_max, "
+                "parent_id, geometric_error, source, updated_at) "
+                "VALUES ('12-1-2', 12, 1, 2, 0, 0, 1, 1, NULL, 0, 'test', 'now')"
+            )
+            labels = np.zeros((2, 3), dtype=np.uint8)
+            confidence = np.full(labels.shape, 80, dtype=np.uint8)
+            water = np.array([[False, True, False], [True, True, False]])
+            with patch(
+                "classifier.official_water.classifier_water_mask_for_tile",
+                return_value=water,
+            ):
+                write_classifier_tile(
+                    db, "12-1-2", labels, confidence=confidence
+                )
+            width, height, class_blob, confidence_blob = db.execute(
+                "SELECT width, height, class_map, confidence_map "
+                "FROM classifier_tiles WHERE tile_id = '12-1-2'"
+            ).fetchone()
+            stored = decode_class_map(class_blob, width, height)
+            stored_confidence = np.frombuffer(
+                __import__("zlib").decompress(confidence_blob), dtype=np.uint8
+            ).reshape(labels.shape)
+            np.testing.assert_array_equal(stored == 4, water)
+            np.testing.assert_array_equal(stored_confidence[water], 255)
             db.close()
 
     def test_rejects_labels_outside_the_declared_schema(self):
