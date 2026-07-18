@@ -216,6 +216,11 @@ def open_db(path=None):
     from classifier.storage import init_classifier_tiles
     init_classifier_tiles(db)
 
+    from terrain_seams import init_seam_cache
+    init_seam_cache(db)
+    if "terrain_seam_cache" not in existing:
+        log_db.info("Created table: terrain_seam_cache")
+
     return db
 
 
@@ -446,6 +451,12 @@ def _reconcile_edges(db, tile_id, heightmap, confidence_map):
                 (_compress_array(nbr_hm), _compress_array(nbr_cm),
                  nbr_error, now, nbr_id)
             )
+            from terrain_seams import invalidate_tile_seams
+            invalidated = invalidate_tile_seams(db, nbr_id)
+            if invalidated:
+                log_db.info(
+                    f"[seam-cache] {nbr_id}: invalidated {invalidated} seams"
+                )
 
 
 # ---------------------------------------------------------------------------
@@ -512,6 +523,10 @@ def write_tile(
         )
         if cursor.rowcount == 0:
             raise KeyError(f"Unknown tile_id: {tile_id}")
+        from terrain_seams import invalidate_tile_seams
+        invalidated = invalidate_tile_seams(db, tile_id)
+        if invalidated:
+            log_db.info(f"[seam-cache] {tile_id}: invalidated {invalidated} seams")
         db.commit()
         return True
 
@@ -523,6 +538,10 @@ def write_tile(
         (hm_blob, cm_blob, error, source, now, tile_id)
     )
     if cursor.rowcount == 1:
+        from terrain_seams import invalidate_tile_seams
+        invalidated = invalidate_tile_seams(db, tile_id)
+        if invalidated:
+            log_db.info(f"[seam-cache] {tile_id}: invalidated {invalidated} seams")
         db.commit()
         return True
 

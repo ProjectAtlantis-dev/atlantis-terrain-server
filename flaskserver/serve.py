@@ -27,7 +27,7 @@ from database import (
     GRID_N, CONFIDENCE, _tile_id, _tile_bbox, compute_geometric_error,
 )
 from terrain_config import MAX_TILE_DEPTH
-from terrain_seams import repair_lod_seams as _stitch_lod_edges
+from terrain_seams import SqliteSeamCache, repair_lod_seams as _stitch_lod_edges
 
 
 REAL_SOURCES = ('arcticdem', 'arcticdem_10m', 'copernicus', 'parent_resampled')
@@ -79,11 +79,12 @@ def _fetch_tile(db, tile_id, bbox, allow_overwrite=False):
         mark_no_data(db, tile_id)
         return False
 
-    conf = CONFIDENCE.get(src_name, CONFIDENCE['arcticdem'])
+    source_name = src_name if isinstance(src_name, str) else 'arcticdem'
+    conf = CONFIDENCE.get(source_name, CONFIDENCE['arcticdem'])
     cm = np.where(np.isnan(data), np.uint8(0), np.uint8(conf))
     hm = np.where(np.isnan(data), 0.0, data).astype(np.float32)
     try:
-        write_tile(db, tile_id, hm, cm, src_name, reconcile=False,
+        write_tile(db, tile_id, hm, cm, source_name, reconcile=False,
                    allow_overwrite=allow_overwrite)
     except TileClobberError:
         return False
@@ -385,7 +386,17 @@ def _query_tiles_impl(db, qx, qy, error_threshold, max_depth, max_range, log, al
         log(f"  [DEM UPGRADE] {upgrade_count} tiles queued for 10m refetch")
 
     results = sorted(results, key=lambda t: -t['depth'])
-    _stitch_lod_edges(results)
+    seam_cache = SqliteSeamCache(db)
+    seam_repairs = _stitch_lod_edges(results, cache=seam_cache)
+    if seam_repairs["cache_writes"]:
+        db.commit()
+    if seam_repairs["same_depth"] or seam_repairs["cross_lod"]:
+        log(
+            "[SEAM CACHE] "
+            f"same={seam_repairs['same_depth']} cross={seam_repairs['cross_lod']} "
+            f"hits={seam_repairs['cache_hits']} misses={seam_repairs['cache_misses']} "
+            f"writes={seam_repairs['cache_writes']}"
+        )
 
     # --- Clear logging: what came from where ---
     db_depths = Counter(t['depth'] for t in results)
@@ -470,15 +481,16 @@ def fetch_missing_tiles(db, missing, max_workers=6, log=print):
                     no_data += 1
                     continue
 
-                conf = CONFIDENCE.get(src_name, CONFIDENCE['arcticdem'])
+                source_name = src_name if isinstance(src_name, str) else 'arcticdem'
+                conf = CONFIDENCE.get(source_name, CONFIDENCE['arcticdem'])
                 cm = np.where(np.isnan(data), np.uint8(0), np.uint8(conf))
                 hm = np.where(np.isnan(data), 0.0, data).astype(np.float32)
                 overwrite = tid in upgrade_tids
-                write_tile(db, tile_id, hm, cm, src_name, reconcile=False,
+                write_tile(db, tile_id, hm, cm, source_name, reconcile=False,
                            allow_overwrite=overwrite)
                 fetched += 1
                 if overwrite:
-                    log(f"  [DEM UPGRADE] {tid}: {src_name} replaced old 32m data")
+                    log(f"  [DEM UPGRADE] {tid}: {source_name} replaced old 32m data")
             except TileClobberError as exc:
                 clobbered += 1
                 log(

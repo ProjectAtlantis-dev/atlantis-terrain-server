@@ -7,6 +7,8 @@ The front end in /webserver folder is running vite. The entry point is `main.js`
 
 The backend in /flaskserver manages terrain heightmaps and textures in a SQLite db (terrain.db). It always assumes the user starts from scratch and will rebuild all missing data as needed. FIRST VISIT TO ANY LOCATION WILL BE SLOW — heightmaps and textures are fetched on demand and cached in the DB. Subsequent visits are fast. All tile demand is driven from the frontend heatmap.
 
+Rendered tile seams are cached in `terrain_seam_cache` by the exact normalized physical-edge key `(tile_a, direction, tile_b)`. Same-depth and cross-LOD repairs use the same lookup. Writing new heightmap data deletes every cached seam that names the changed tile on either side, so repaired edges are rebuilt on the next terrain query.
+
 ## Data Sources
 
 | Data | Source | Resolution | Notes |
