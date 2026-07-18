@@ -25,6 +25,9 @@ export interface VehicleParts {
   rightNacelle?: string[];
   leftRotor?: string | null;
   rightRotor?: string | null;
+  turretPivot?: [number, number, number];
+  gunPivot?: [number, number, number];
+  muzzle?: [number, number, number];
 }
 
 export type VehicleType = "ground" | "aircraft";
@@ -47,6 +50,9 @@ export interface NacelleConfig {
   rotorRadiusM: number;
   leftCenter: [number, number, number];
   rightCenter: [number, number, number];
+  rotorAxis?: "x" | "y" | "z";
+  rotorSpeedRpm?: number;
+  rotorResponseSeconds?: number;
 }
 
 export interface VehicleDefinition {

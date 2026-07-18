@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import * as THREE from 'three';
 
 import {
   headingForward2D,
@@ -9,7 +10,13 @@ import {
 import { compassHeading } from './terrain-hud.js';
 import { applyMapDrag } from './terrain-controls.js';
 import { createVehiclePersistenceRuntime, normalizeSavedVehicleState, stepSuspension, stepVehicleDrive, vehicleLocalToLatLon, vehicleStateSnapshot } from './terrain-vehicle.js';
-import { createAircraftState, stepAircraftFlight } from './terrain-aircraft-runtime.js';
+import {
+  createAircraftState,
+  setupAircraftModelParts,
+  stepAircraftFlight,
+  updateAircraftVisuals,
+} from './terrain-aircraft-runtime.js';
+import { createVehicleFireRuntime } from './terrain-vehicle-fire.js';
 import { meshUsesTextureClassification, scoreTextureTiles, textureRetryDelay, tileDepthFromId } from './terrain-tile-runtime.js';
 import { createTextureStreamer, rendererTextureAnisotropy } from './terrain-texture-streamer.js';
 import { createTileLifecycle } from './terrain-tile-lifecycle.js';
@@ -972,6 +979,85 @@ test('aircraft hover state is isolated and respects engine, controls, and ground
   assert.equal(aircraft.verticalSpeedMs, 0);
 });
 
+test('aircraft rotor setup assigns distinct pivots and counter-rotates with spool response', () => {
+  const group = new THREE.Group();
+  const model = new THREE.Group();
+  const leftRotor = new THREE.Mesh(new THREE.BoxGeometry(8, 0.2, 8));
+  const rightRotor = new THREE.Mesh(new THREE.BoxGeometry(8, 0.2, 8));
+  leftRotor.name = 'V22_Rotor_Left';
+  rightRotor.name = 'V22_Rotor_Right';
+  leftRotor.position.z = 7;
+  rightRotor.position.z = -7;
+  model.add(leftRotor, rightRotor);
+  const aircraft = createAircraftState({
+    id: 'osprey-01',
+    definition: {
+      vehicleType: 'aircraft',
+      flight: {},
+      parts: {
+        leftRotor: leftRotor.name,
+        rightRotor: rightRotor.name,
+      },
+      nacelles: {
+        tiltSpeedDegS: 12.2,
+        rotorAxis: 'y',
+        rotorSpeedRpm: 397,
+        rotorResponseSeconds: 3.5,
+      },
+    },
+    instance: { headingDeg: 0 },
+    group,
+    marker: null,
+  });
+  const summary = setupAircraftModelParts(aircraft, model);
+  assert.equal(summary.rotorAnimationAvailable, true);
+  assert.equal(aircraft.leftRotorMesh, leftRotor);
+  assert.equal(aircraft.rightRotorMesh, rightRotor);
+  aircraft.engineRunning = true;
+  updateAircraftVisuals(aircraft, 1);
+  assert.ok(aircraft.rotorAngularVelocity > 0);
+  assert.notEqual(leftRotor.rotation.y, 0);
+  assert.equal(rightRotor.rotation.y, -leftRotor.rotation.y);
+  assert.equal(leftRotor.rotation.z, 0);
+  const runningVelocity = aircraft.rotorAngularVelocity;
+  aircraft.engineRunning = false;
+  updateAircraftVisuals(aircraft, 1);
+  assert.ok(aircraft.rotorAngularVelocity < runningVelocity);
+});
+
+test('WebGPU vehicle fire runtime reuses node-material pools and expires effects', () => {
+  const terrainRoot = new THREE.Group();
+  const camera = new THREE.PerspectiveCamera(60, 1, 0.1, 5000);
+  camera.position.set(0, -5, 2);
+  camera.lookAt(0, 100, 0);
+  camera.updateMatrixWorld(true);
+  const target = new THREE.Mesh(new THREE.PlaneGeometry(500, 500));
+  target.position.y = 100;
+  terrainRoot.add(target);
+  terrainRoot.updateMatrixWorld(true);
+  const runtime = createVehicleFireRuntime({
+    terrainRoot,
+    camera,
+    getTerrainTargets: () => [target],
+    tracerCount: 2,
+    impactCount: 2,
+  });
+  const vehicleEntry = { id: 'amv-01', lastFireAt: -Infinity };
+  assert.equal(runtime.fire(vehicleEntry, new THREE.Vector3(0, 0, 2), 1), true);
+  assert.equal(runtime.fire(vehicleEntry, new THREE.Vector3(0, 0, 2), 1.05), false);
+  assert.deepEqual(runtime.summary(), {
+    shotsFired: 1,
+    activeTracers: 1,
+    activeImpacts: 1,
+    muzzleVisible: true,
+    nodeMaterials: true,
+  });
+  runtime.update(4);
+  assert.equal(runtime.summary().activeTracers, 0);
+  assert.equal(runtime.summary().activeImpacts, 0);
+  assert.equal(runtime.summary().muzzleVisible, false);
+});
+
 test('shared vehicle persistence helpers preserve coordinates and normalize saved state', () => {
   const anchorLat = 64;
   const anchorLon = -51;
@@ -991,11 +1077,11 @@ test('shared vehicle persistence helpers preserve coordinates and normalize save
   }), { lat: 64, lon: -51, headingDeg: 270, z: 12.346 });
 
   assert.deepEqual(normalizeSavedVehicleState({
-    lat: '64.1', lon: '-51.2', headingDeg: '361.5', z: '8.25', terrainDepth: '7.9',
-  }), { lat: 64.1, lon: -51.2, headingDeg: 361.5, z: 8.25, terrainDepth: 7 });
+    lat: '64.1', lon: '-51.2', headingDeg: '361.5', z: '8.25', terrainDepth: '7.9', terrainTileId: ' 12-1-2 ',
+  }), { lat: 64.1, lon: -51.2, headingDeg: 361.5, z: 8.25, terrainDepth: 7, terrainTileId: '12-1-2' });
   assert.deepEqual(normalizeSavedVehicleState({
     lat: 64, lon: -51, headingDeg: 0, z: 'bad', terrainDepth: -2,
-  }), { lat: 64, lon: -51, headingDeg: 0, z: null, terrainDepth: 0 });
+  }), { lat: 64, lon: -51, headingDeg: 0, z: null, terrainDepth: 0, terrainTileId: null });
   assert.equal(normalizeSavedVehicleState({ lat: 64, lon: 'bad', headingDeg: 0 }), null);
 });
 

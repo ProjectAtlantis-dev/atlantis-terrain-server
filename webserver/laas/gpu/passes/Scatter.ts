@@ -468,9 +468,14 @@ export async function runScatter(
     const s = sampleSite(hf, wpos);
 
     // hard exclusions: open/standing water, river channels, lake shelf
-    If(s.h.lessThan(LAKE_LEVEL + 0.4), () => {
-      Return();
-    });
+    // LAKE_LEVEL is the synthetic standalone world's absolute water plane.
+    // ArcticDEM heights use a real geographic datum, so external worlds must
+    // rely on the classifier-backed standing-water field below instead.
+    if (!hf.external) {
+      If(s.h.lessThan(LAKE_LEVEL + 0.4), () => {
+        Return();
+      });
+    }
     If(s.riverDepth.greaterThan(0.22).or(s.standing.greaterThan(0.3)), () => {
       Return();
     });
@@ -587,9 +592,11 @@ export async function runScatter(
     const wpos = cell.add(jit).div(underG).sub(0.5).mul(worldSize);
     const s = sampleSite(hf, wpos);
 
-    If(s.h.lessThan(LAKE_LEVEL + 0.35), () => {
-      Return();
-    });
+    if (!hf.external) {
+      If(s.h.lessThan(LAKE_LEVEL + 0.35), () => {
+        Return();
+      });
+    }
     If(s.riverDepth.greaterThan(0.2).or(s.standing.greaterThan(0.3)), () => {
       Return();
     });
@@ -724,9 +731,11 @@ export async function runScatter(
     const wpos = cell.add(jit).div(extraG).sub(0.5).mul(worldSize);
     const s = sampleSite(hf, wpos);
 
-    If(s.h.lessThan(LAKE_LEVEL + 0.3), () => {
-      Return();
-    });
+    if (!hf.external) {
+      If(s.h.lessThan(LAKE_LEVEL + 0.3), () => {
+        Return();
+      });
+    }
     If(s.riverDepth.greaterThan(0.3).or(s.standing.greaterThan(0.35)), () => {
       Return();
     });
@@ -843,9 +852,11 @@ export async function runScatter(
     const jit = cellHash2(cell, sS);
     const wpos = cell.add(jit).div(stoneG).sub(0.5).mul(worldSize);
     const s = sampleSite(hf, wpos);
-    If(s.h.lessThan(LAKE_LEVEL + 0.25), () => {
-      Return();
-    });
+    if (!hf.external) {
+      If(s.h.lessThan(LAKE_LEVEL + 0.25), () => {
+        Return();
+      });
+    }
     // GREENLAND: exclude DEEP standing water (lakes), but keep stones IN stream
     // channels — the bed packs with a visible cobble field even under shallow
     // flow (ref photo: stones IN the stream, not just around it). riverDepth

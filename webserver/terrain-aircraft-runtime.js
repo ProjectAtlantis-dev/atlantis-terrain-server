@@ -52,7 +52,9 @@ export function createAircraftState({ id, definition, instance, group, marker })
     leftRotorMesh: null,
     rightRotorMesh: null,
     rotorSpinAngle: 0,
+    rotorAngularVelocity: 0,
     cameraModeIndex: 1,
+    cameraZoom: 1,
     cameraOrbitYaw: 0,
     cameraOrbitPitch: Math.atan2(
       AIRCRAFT_CAMERA_MODES[1].height,
@@ -60,6 +62,8 @@ export function createAircraftState({ id, definition, instance, group, marker })
     ),
     lastKnownGroundZ: null,
     lastSaveAt: -Infinity,
+    saveFailureUntil: 0,
+    saveFailureReported: false,
   };
 }
 
@@ -136,9 +140,28 @@ export function updateAircraftVisuals(state, dt) {
   const tiltRad = THREE.MathUtils.degToRad(state.nacelleTiltDeg);
   if (state.leftNacellePivot) state.leftNacellePivot.rotation.y = tiltRad;
   if (state.rightNacellePivot) state.rightNacellePivot.rotation.y = tiltRad;
-  if (state.engineRunning) state.rotorSpinAngle += Math.PI * 24 * dt;
-  if (state.leftRotorMesh) state.leftRotorMesh.rotation.z = state.rotorSpinAngle;
-  if (state.rightRotorMesh) state.rightRotorMesh.rotation.z = -state.rotorSpinAngle;
+  const rotorAxis = ['x', 'y', 'z'].includes(state.definition.nacelles?.rotorAxis)
+    ? state.definition.nacelles.rotorAxis
+    : 'y';
+  const rotorSpeedRpm = Number.isFinite(state.definition.nacelles?.rotorSpeedRpm)
+    ? state.definition.nacelles.rotorSpeedRpm
+    : 397;
+  const rotorResponseSeconds = Number.isFinite(state.definition.nacelles?.rotorResponseSeconds)
+    ? Math.max(0.05, state.definition.nacelles.rotorResponseSeconds)
+    : 3.5;
+  const targetRotorVelocity = state.engineRunning ? rotorSpeedRpm * Math.PI * 2 / 60 : 0;
+  const rotorResponse = 1 - Math.exp(-Math.max(0, dt) / rotorResponseSeconds);
+  state.rotorAngularVelocity += (
+    targetRotorVelocity - state.rotorAngularVelocity
+  ) * rotorResponse;
+  if (!state.engineRunning && Math.abs(state.rotorAngularVelocity) < 1e-4) {
+    state.rotorAngularVelocity = 0;
+  }
+  state.rotorSpinAngle = (
+    state.rotorSpinAngle + state.rotorAngularVelocity * Math.max(0, dt)
+  ) % (Math.PI * 2);
+  if (state.leftRotorMesh) state.leftRotorMesh.rotation[rotorAxis] = state.rotorSpinAngle;
+  if (state.rightRotorMesh) state.rightRotorMesh.rotation[rotorAxis] = -state.rotorSpinAngle;
 
   const headingOffset = THREE.MathUtils.degToRad(Number(state.definition.headingOffsetDeg) || 0);
   const quaternion = VISUAL_QUATERNION.setFromAxisAngle(
@@ -160,18 +183,21 @@ export function setupAircraftModelParts(state, model, log = () => {}) {
   const parts = state.definition.parts ?? {};
   const leftNames = new Set(Array.isArray(parts.leftNacelle) ? parts.leftNacelle : []);
   const rightNames = new Set(Array.isArray(parts.rightNacelle) ? parts.rightNacelle : []);
-  const rotorNames = new Set([parts.leftRotor, parts.rightRotor].filter(Boolean));
+  const leftRotorName = typeof parts.leftRotor === 'string' ? parts.leftRotor : null;
+  const rightRotorName = typeof parts.rightRotor === 'string' ? parts.rightRotor : null;
   const modelSize = new THREE.Vector3();
   new THREE.Box3().setFromObject(model).getSize(modelSize);
   const modelMax = Math.max(modelSize.x, modelSize.y, modelSize.z);
   const left = [];
   const right = [];
-  const rotors = [];
+  let leftRotor = null;
+  let rightRotor = null;
   model.traverse(object => {
     if (!object.isMesh) return;
     if (leftNames.has(object.name)) left.push(object);
     if (rightNames.has(object.name)) right.push(object);
-    if (rotorNames.has(object.name)) rotors.push(object);
+    if (object.name === leftRotorName) leftRotor = object;
+    if (object.name === rightRotorName) rightRotor = object;
   });
   const isSeparate = mesh => {
     const size = new THREE.Vector3();
@@ -180,16 +206,31 @@ export function setupAircraftModelParts(state, model, log = () => {}) {
   };
   const validLeft = left.filter(isSeparate);
   const validRight = right.filter(isSeparate);
-  const validRotors = rotors.filter(isSeparate);
-  if ((left.length || right.length || rotors.length) && !(validLeft.length || validRight.length || validRotors.length)) {
-    log('aircraft.parts.material-merged', { id: state.id, left: left.length, right: right.length, rotors: rotors.length }, 'warn');
+  if ((left.length || right.length) && !(validLeft.length || validRight.length)) {
+    log('aircraft.parts.nacelles-material-merged', {
+      id: state.id,
+      left: left.length,
+      right: right.length,
+    }, 'warn');
   }
-  // The current GLB is material-grouped. Do not destructively reparent oversized meshes.
-  // Once a physically split asset arrives, this function is the guarded setup boundary.
+  const distinctRotors = leftRotor != null && rightRotor != null && leftRotor !== rightRotor;
+  state.leftRotorMesh = distinctRotors ? leftRotor : null;
+  state.rightRotorMesh = distinctRotors ? rightRotor : null;
+  if (!distinctRotors) {
+    log('aircraft.parts.rotors-unavailable', {
+      id: state.id,
+      leftRotor: leftRotor?.name ?? null,
+      rightRotor: rightRotor?.name ?? null,
+      aliased: leftRotor != null && leftRotor === rightRotor,
+    }, 'warn');
+  }
   return {
     leftCandidates: left.length,
     rightCandidates: right.length,
-    rotorCandidates: rotors.length,
-    animationAvailable: validLeft.length > 0 && validRight.length > 0 && validRotors.length >= 2,
+    leftRotor: state.leftRotorMesh?.name ?? null,
+    rightRotor: state.rightRotorMesh?.name ?? null,
+    rotorAxis: state.definition.nacelles?.rotorAxis ?? 'y',
+    nacelleAnimationAvailable: validLeft.length > 0 && validRight.length > 0,
+    rotorAnimationAvailable: distinctRotors,
   };
 }

@@ -33,15 +33,23 @@ export function installTerrainPointerControls({
   isTurretActive = () => false,
   onVehicleOrbit,
   onTurretAim = () => {},
+  onFireStart = () => {},
+  onFireStop = () => {},
   onMapCameraChanged,
   onChanged = () => {},
 }) {
   const onMouseDown = event => {
+    if (isTurretActive() && event.button === 0) {
+      onFireStart();
+      onChanged();
+      return;
+    }
     controls.dragging = true;
     controls.dragButton = event.button;
     onChanged();
   };
-  const onMouseUp = () => {
+  const onMouseUp = event => {
+    if (event.button === 0) onFireStop();
     controls.dragging = false;
     controls.dragButton = 0;
     onChanged();

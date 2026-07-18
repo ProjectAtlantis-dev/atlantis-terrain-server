@@ -22,6 +22,12 @@ function cleanNames(value, fallback) {
   return [...new Set(names)];
 }
 
+function cleanVector3(value) {
+  if (!Array.isArray(value) || value.length !== 3) return null;
+  const numbers = value.map(Number);
+  return numbers.every(Number.isFinite) ? numbers : null;
+}
+
 export function normalizeVehiclePartDefinition(definition = {}) {
   const source = definition?.parts;
   const parts = source != null && typeof source === 'object' ? source : {};
@@ -36,6 +42,9 @@ export function normalizeVehiclePartDefinition(definition = {}) {
     gun: optionalPart(parts.gun, DEFAULT_PARTS.gun),
     body: cleanNames(parts.body, DEFAULT_PARTS.body),
     shield: cleanNames(parts.shield, DEFAULT_PARTS.shield),
+    turretPivot: cleanVector3(parts.turretPivot),
+    gunPivot: cleanVector3(parts.gunPivot),
+    muzzle: cleanVector3(parts.muzzle),
     wheelClusterSplitThreshold: Number.isFinite(splitThreshold) && splitThreshold > 0
       ? splitThreshold
       : null,
@@ -422,7 +431,11 @@ export function createVehicleTurretRig(THREE, parts) {
     return result;
   }
 
-  const turretCenter = meanPosition(turretPosition, THREE);
+  const authoredTurretPivot = parts.config?.turretPivot;
+  const turretCenter = authoredTurretPivot != null
+    ? new THREE.Vector3().fromArray(authoredTurretPivot)
+    : meanPosition(turretPosition, THREE);
+  if (authoredTurretPivot == null) result.warnings.push('turret-pivot-derived');
   const turretParent = result.turretMesh.parent;
   const turretSiblingIndex = turretParent.children.indexOf(result.turretMesh);
   const turretPivot = new THREE.Group();
@@ -457,21 +470,30 @@ export function createVehicleTurretRig(THREE, parts) {
     return result;
   }
 
-  const gunCenter = meanPosition(gunPosition, THREE);
+  const authoredGunPivot = parts.config?.gunPivot;
+  const gunCenter = authoredGunPivot != null
+    ? new THREE.Vector3().fromArray(authoredGunPivot)
+    : meanPosition(gunPosition, THREE);
+  if (authoredGunPivot == null) result.warnings.push('gun-pivot-derived');
   let muzzleIndex = 0;
   for (let index = 1; index < gunPosition.count; index++) {
     if (gunPosition.getY(index) > gunPosition.getY(muzzleIndex)) muzzleIndex = index;
   }
-  result.barrelTipLocal.set(
-    gunPosition.getX(muzzleIndex) - turretCenter.x,
-    gunPosition.getY(muzzleIndex) - turretCenter.y,
-    gunPosition.getZ(muzzleIndex) - gunCenter.z
-  );
+  const authoredMuzzle = parts.config?.muzzle;
+  const muzzle = authoredMuzzle != null
+    ? new THREE.Vector3().fromArray(authoredMuzzle)
+    : new THREE.Vector3(
+      gunPosition.getX(muzzleIndex),
+      gunPosition.getY(muzzleIndex),
+      gunPosition.getZ(muzzleIndex),
+    );
+  if (authoredMuzzle == null) result.warnings.push('muzzle-derived');
+  result.barrelTipLocal.copy(muzzle).sub(gunCenter);
   const gunPivot = new THREE.Group();
   gunPivot.name = `${result.gunMesh.name}-pitch-pivot`;
-  gunPivot.position.set(0, 0, gunCenter.z - turretCenter.z);
+  gunPivot.position.copy(gunCenter).sub(turretCenter);
   result.gunMesh.parent.remove(result.gunMesh);
-  result.gunMesh.position.set(-turretCenter.x, -turretCenter.y, -gunCenter.z);
+  result.gunMesh.position.copy(gunCenter).multiplyScalar(-1);
   turretPivot.add(gunPivot);
   gunPivot.add(result.gunMesh);
   result.gunPivot = gunPivot;

@@ -16,6 +16,9 @@
       "wheels": ["Object_8", "Object_9", "Object_10"],
       "turret": "Object_3",
       "gun": "Object_2",
+      "turretPivot": [-0.0212537228, -0.0314384869, 2.5640559026],
+      "gunPivot": [-0.090423459, -0.2248844177, 2.8694027054],
+      "muzzle": [-0.0183600001, 0.8793110251, 2.8641149998],
       "body": ["Object_4", "Object_5", "Object_6"],
       "shield": ["Object_7"]
     },
@@ -47,6 +50,9 @@
         "wheels": ["Object_8", "Object_9", "Object_10"],
         "turret": "Object_3",
         "gun": "Object_2",
+        "turretPivot": [-0.0212537228, -0.0314384869, 2.5640559026],
+        "gunPivot": [-0.090423459, -0.2248844177, 2.8694027054],
+        "muzzle": [-0.0183600001, 0.8793110251, 2.8641149998],
         "body": ["Object_4", "Object_5", "Object_6"],
         "shield": ["Object_7"]
       },
@@ -67,7 +73,7 @@
       }
     },
     "v22-osprey": {
-      "url": "/models/v22_osprey.glb",
+      "url": "/models/v22_osprey_rotors.glb",
       "displayName": "V-22 Osprey",
       "vehicleType": "aircraft",
       "realLengthM": 17.47,
@@ -77,8 +83,8 @@
         "body": ["Object_2"],
         "leftNacelle": ["Object_5", "Object_6"],
         "rightNacelle": ["Object_7", "Object_8"],
-        "leftRotor": "Object_9",
-        "rightRotor": "Object_9"
+        "leftRotor": "V22_Rotor_Left",
+        "rightRotor": "V22_Rotor_Right"
       },
       "flight": {
         "maxSpeedMs": 141,
@@ -95,6 +101,9 @@
       "nacelles": {
         "tiltSpeedDegS": 12.2,
         "rotorRadiusM": 5.8,
+        "rotorAxis": "y",
+        "rotorSpeedRpm": 397,
+        "rotorResponseSeconds": 3.5,
         "leftCenter": [-1.6, -7.2, 2.5],
         "rightCenter": [-1.6, 7.2, 2.5]
       }

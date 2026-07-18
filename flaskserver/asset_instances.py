@@ -216,6 +216,9 @@ class VehiclePartsModel(BaseModel):
   rightNacelle: list[str] = Field(default_factory=list)
   leftRotor: str | None = None
   rightRotor: str | None = None
+  turretPivot: tuple[float, float, float] | None = None
+  gunPivot: tuple[float, float, float] | None = None
+  muzzle: tuple[float, float, float] | None = None
 
   @field_validator("wheels", "body", "shield", "leftNacelle", "rightNacelle", mode="before")
   @classmethod
@@ -259,6 +262,9 @@ class NacelleConfigModel(BaseModel):
   rotorRadiusM: float = Field(gt=0)
   leftCenter: tuple[float, float, float]
   rightCenter: tuple[float, float, float]
+  rotorAxis: Literal["x", "y", "z"] = "y"
+  rotorSpeedRpm: float = Field(default=397, gt=0)
+  rotorResponseSeconds: float = Field(default=3.5, gt=0)
 
 
 class VehicleDefinitionModel(BaseModel):

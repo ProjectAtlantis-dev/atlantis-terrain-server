@@ -133,6 +133,8 @@ function cameraWindowAt(x, y) {
 // tiles. Missing coverage delays the clipmap instead of inventing terrain.
 function buildWindow(descriptor, sourceTiles) {
   const heights = new Float32Array(PATCH_RES * PATCH_RES);
+  const heightSourceIds = new Set();
+  const fieldSourceIds = new Set();
   const classifier = {
     veg: new Float32Array(PATCH_RES * PATCH_RES),
     rock: new Float32Array(PATCH_RES * PATCH_RES),
@@ -147,6 +149,8 @@ function buildWindow(descriptor, sourceTiles) {
       const source = finestSourceAt(sourceTiles, x, y);
       const fieldSource = finestFieldSourceAt(sourceTiles, x, y);
       if (!source || !fieldSource) return null;
+      heightSourceIds.add(source.id);
+      fieldSourceIds.add(fieldSource.id);
       const index = row * PATCH_RES + col;
       heights[index] = sampleSource(source, x, y);
       for (const channel of Object.keys(classifier)) {
@@ -154,7 +158,57 @@ function buildWindow(descriptor, sourceTiles) {
       }
     }
   }
-  return { descriptor, heights, classifier };
+  return {
+    descriptor,
+    heights,
+    classifier,
+    centerSourceDepth: finestSourceAt(
+      sourceTiles,
+      descriptor.centerX,
+      descriptor.centerY,
+    )?.depth ?? -1,
+    stats: {
+      ...summarizeWindowFields(heights, classifier),
+      heightSourceIds: [...heightSourceIds].sort(),
+      fieldSourceIds: [...fieldSourceIds].sort(),
+    },
+  };
+}
+
+function summarizeWindowFields(heights, classifier) {
+  const summarize = (values) => {
+    let min = Infinity;
+    let max = -Infinity;
+    let sum = 0;
+    for (let index = 0; index < values.length; index++) {
+      const value = values[index];
+      min = Math.min(min, value);
+      max = Math.max(max, value);
+      sum += value;
+    }
+    return {
+      min: Number(min.toFixed(3)),
+      mean: Number((sum / Math.max(1, values.length)).toFixed(3)),
+      max: Number(max.toFixed(3)),
+    };
+  };
+  let dry = 0;
+  let vegetated = 0;
+  for (let index = 0; index < classifier.water.length; index++) {
+    if (classifier.water[index] <= 0.45) dry += 1;
+    if (classifier.veg[index] > 0.1) vegetated += 1;
+  }
+  const count = Math.max(1, classifier.water.length);
+  return {
+    height: summarize(heights),
+    veg: summarize(classifier.veg),
+    rock: summarize(classifier.rock),
+    snow: summarize(classifier.snow),
+    water: summarize(classifier.water),
+    moisture: summarize(classifier.moisture),
+    dryFraction: Number((dry / count).toFixed(3)),
+    vegetatedFraction: Number((vegetated / count).toFixed(3)),
+  };
 }
 
 function sampleWindow(window, x, y) {
@@ -414,6 +468,7 @@ export class GreenlandPatch {
         libraryPools: this.vegLibrary.pools.length,
         plants: this.scatter.understory.count,
         rocks: this.scatter.extras.count + this.scatter.stones.count,
+        fields: window.stats,
       });
     } catch (err) {
       this.nextBuildAttempt = now + RETRY_MS;
@@ -451,6 +506,7 @@ export class GreenlandPatch {
         center: descriptor.id,
         spanMetres: PATCH_WORLD_SIZE,
         sourceTiles: sourceTiles.filter(tile => tile.fields).length,
+        fields: window.stats,
       });
     } catch (err) {
       log('error', 'patch.recenter', { error: String(err), stack: String(err?.stack ?? '') });
@@ -470,7 +526,14 @@ export class GreenlandPatch {
     if (!this.reseeding) {
       const sourceTiles = collectTiles(this.terrainRoot);
       const descriptor = cameraWindowAt(camTR.x, camTR.y);
-      if (descriptor.id !== this.centerId) {
+      const centerDepth = finestSourceAt(
+        sourceTiles,
+        descriptor.centerX,
+        descriptor.centerY,
+      )?.depth ?? -1;
+      const sourceRefined = descriptor.id === this.centerId
+        && centerDepth > (this.window?.centerSourceDepth ?? -1);
+      if (descriptor.id !== this.centerId || sourceRefined) {
         void this._recenter(renderer, descriptor, sourceTiles);
       }
     }

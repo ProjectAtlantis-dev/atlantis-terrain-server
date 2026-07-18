@@ -2763,4 +2763,9 @@ if __name__ == "__main__":
   ws_port = int(os.environ.get("WS_PORT", "5181"))
   ws_thread = threading.Thread(target=_start_ws_server, args=(host, ws_port), daemon=True)
   ws_thread.start()
-  app.run(host=host, port=port, debug=False)
+  # threaded=True: the default single-threaded dev server serializes EVERY
+  # request behind slow external fetches (dataforsyningen 30 s timeouts /
+  # 429 retries) — one stalled satellite fetch froze tiles, textures, and
+  # /api/fields together during fast flythroughs (2026-07-18). All sqlite
+  # connects already pass check_same_thread=False.
+  app.run(host=host, port=port, debug=False, threaded=True)

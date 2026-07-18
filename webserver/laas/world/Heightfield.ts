@@ -68,6 +68,11 @@ export class Heightfield {
   readonly cfg: QualityConfig;
   readonly mp: MacroParams;
   readonly res: number;
+  /** True when elevation/classification comes from a streamed geographic
+   * dataset rather than LAAS's synthetic world. Consumers must not apply
+   * synthetic absolute-height constants (for example LAKE_LEVEL) in this
+   * mode; water and biome exclusions come from the external field maps. */
+  readonly external: boolean;
   /** Width of this heightfield in metres. Generated worlds use WORLD_SIZE;
    * external streaming mosaics may provide a smaller, tile-aligned span. */
   readonly worldSize: number;
@@ -117,6 +122,7 @@ export class Heightfield {
     heightTex: StorageTexture,
     normalTex: StorageTexture,
     worldSize = WORLD_SIZE,
+    external = false,
   ) {
     this.cfg = cfg;
     this.mp = mp;
@@ -126,6 +132,7 @@ export class Heightfield {
     this.heightTex = heightTex;
     this.normalTex = normalTex;
     this.worldSize = worldSize;
+    this.external = external;
   }
 
   static async generate(
@@ -281,7 +288,7 @@ export class Heightfield {
     normalTex.generateMipmaps = false;
 
     const synth = { res, height, hardness } as SynthesisResult;
-    const hf = new Heightfield(cfg, mp, synth, heightTex, normalTex, worldSize);
+    const hf = new Heightfield(cfg, mp, synth, heightTex, normalTex, worldSize, true);
     hf.simRes = res;
 
     progress(0.38, 'terrain: baking material noise textures');

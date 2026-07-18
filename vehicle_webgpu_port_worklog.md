@@ -249,3 +249,73 @@ Append build, typecheck, runtime, visual, and performance results here as each s
   position/speed change. Switching selection to `amv-01` also left the AMV selected and
   control-active; the longer timed interaction callback was delayed by the very slow
   headless full-scene render, so this does not replace an eventual normal-window visual pass.
+
+### 2026-07-18 — genuine per-entry ground registry and WebGPU firing
+
+- Replaced the Patria's persistent module-level movement/snap/save/camera/turret/wheel state
+  with `createGroundVehicleState` entries stored directly in the shared vehicle registry.
+  Every returned ground instance now receives its own scene group, model, mesh collection,
+  terrain contact state, suspension, orientation target, wheel and turret rigs, headlights,
+  camera orbit, firing cadence, and persistence throttle/failure state.
+- Made ground model loading definition-driven and applied it to every ground registry entry.
+  Terrain resnap, suspension, wheel spin, turret transforms, marker updates, caster movement
+  invalidation, selection, control routing, HUD status, and debug inspection now iterate or
+  resolve registry entries instead of assuming one AMV.
+- Removed the WebGPU main view's dependency on the legacy primary-vehicle
+  `/api/vehicle_state` save route. Ground and aircraft entries now persist through their own
+  `PATCH /api/asset/:id` endpoint. Ground saves retain terrain depth/tile affinity.
+- Added authored Patria turret yaw pivot, gun pitch pivot, and muzzle coordinates to both
+  server metadata catalogs and preserved them through TypeScript, Flask, and browser
+  sanitizers. Runtime derivation remains a compatibility fallback and is explicitly warned.
+- Added a WebGPU-native firing runtime. Muzzle flash, tracers, and impacts use preallocated
+  `MeshBasicNodeMaterial` pools; no old WebGL normal-pass visibility workaround or per-shot
+  mesh/material allocation is present. Fire cadence is per registry entry, tracers stop at
+  the actual aim hit/range, and the reusable Web Audio graph is primed from the trusted input
+  event.
+- Added firing callbacks to the shared pointer controls and routed them only while the
+  selected ground entry has active turret control. Pointer-lock loss, blur, turret exit, and
+  vehicle exit all release held fire.
+- Aircraft follow-camera zoom is now independent state (`cameraZoom`) rather than the
+  ineffective same-ratio distance/height pitch rewrite.
+- Deterministic verification: all 55 shared tests pass, including a native node-material
+  pool/cooldown/lifetime firing test. The WebGPU production build (365 modules), asset-server
+  TypeScript check, Flask compile, and `git diff --check` pass.
+- Live verification used an isolated database containing `amv-01`, `amv-02`, and
+  `osprey-01`. All three models loaded. Both Patria entries reported complete, warning-free
+  authored turret rigs. Driving each ground entry separately changed its own transform while
+  the other entries remained independently addressable; the V-22 stayed unchanged. A live
+  turret shot produced one muzzle flash, tracer, and terrain impact from node-material pools.
+- The live headless scene remains too slow for trustworthy visual-quality acceptance and
+  caused its own 1.5-second persistence requests to time out while frames blocked the page.
+  Those timeouts are recorded as a harness/performance limitation, not hidden as a pass.
+  Normal-window visual acceptance of muzzle/tracer/impact appearance is still required.
+
+### 2026-07-18 — V-22 propeller geometry repaired and animated
+
+- Headless Blender inspection proved the old `leftRotor`/`rightRotor` metadata was wrong:
+  both pointed at `Object_9`, a material bucket containing scattered trim, cockpit, and
+  exterior pieces rather than either propeller. The actual blades and spinners were
+  separable connected components distributed across `Object_5` and `Object_7`.
+- Added the reproducible, source-hash-guarded generator
+  `webserver/tools/rig_v22_rotors.py`. It preserves the original GLB, extracts only geometry
+  inside the measured rotor discs, joins each side across its original materials, places
+  origins at the measured hubs, exports a replacement GLB, re-imports it, and rejects any
+  polygon-count, name, pivot, per-rotor geometry, or embedded-texture hash mismatch. All 17
+  embedded PNG payloads remain byte-for-byte identical to the source asset.
+- Generated `webserver/public/models/v22_osprey_rotors.glb` while preserving the original
+  `v22_osprey.glb`. Total source geometry remains 102,326 polygons; each new rotor contains
+  2,622 polygons. The generated asset SHA-256 is
+  `97dc6bce041eb7cfc5b030813ba77478aa22f8d0fb3462b1311ff6b5dac82f28`.
+- Updated both metadata catalogs to load the repaired asset and resolve the distinct
+  `V22_Rotor_Left` and `V22_Rotor_Right` objects. Added sanitized rotor-axis, RPM, and
+  response-time configuration to both server contracts.
+- Completed the runtime setup boundary so it assigns the two resolved rotor meshes. Rotor
+  animation uses the asset's correct local Y axis, counter-rotation, configured 397 RPM,
+  and exponential engine spool-up/coast-down rather than the old instantaneous Z rotation.
+- Verification: all 56 shared tests pass, including distinct rotor assignment, axis,
+  counter-rotation, spool-up, and coast-down. WebGPU production build, asset-server
+  typecheck, Flask compile, metadata parsing, and diff checks pass.
+- Live Brave WebGPU verification loaded both named meshes. Starting the engine through the
+  real `E` control path advanced the rotor angle and raised angular velocity from 0 to
+  15.25 rad/s; engine shutdown decayed it to 1.46 rad/s. The remaining material-merged
+  warning now concerns nacelle tilt only, not propeller animation.

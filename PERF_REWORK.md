@@ -277,6 +277,52 @@ at runtime forces a full material recompile — never do it mid-measurement.
 - [ ] Do NOT start with the r185 upgrade; upgrading cannot correct hundreds of
       millions of intentional per-pixel operations.
 
+## New fronts opened 2026-07-18 PM (user live-test feedback)
+
+- [x] **God rays degraded at ground level** — caused by Tier 0's
+      firstCascade=1 (zero measured fps benefit, real visual cost: terrain
+      within 500 m stopped carving shafts). REVERTED to 0; `?godRayFirstCascade=1`
+      kept for A/B.
+- [x] **Giant stale shadow band beyond the LAAS patch during flight** — my
+      CSM budget starved far cascades (near cascade re-drifts every frame and
+      won every grant). Fixed: stalest-first ordering among equal urgency
+      (natural round-robin). Verified: grants [3,3,2] over a 20 s flight leg,
+      no band in screenshots.
+- [x] **Freeze during fast movement (partial)** — BSM re-dispatched its full
+      density march every frame above ~36 km/h (10 m move trigger).
+      Added `minDispatchInterval = 10` frames floor in CloudBeerShadowMapNode.
+      The other half is the wholesale 96 m LAAS recenter (Tier 2, user's WIP).
+- [x] **Flask served everything single-threaded** — `app.run` without
+      `threaded=True` serialized every tile/texture/fields request behind
+      30 s external satellite fetches; one slow dataforsyningen call froze
+      streaming, textures AND fields together during flythroughs. Fixed
+      (+ sqlite already used check_same_thread=False throughout).
+- [x] **Texture enhancement silently dead** — SUPIR/ComfyUI tailscale IP was
+      hardcoded in texture.py and went stale when the GPU box re-enrolled
+      (old 100.106.176.121 no longer in the tailnet) → 0/6429 enhanced all
+      day. Fixed: COMFY_URL now env-only (flaskserver/.env, gitignored);
+      unset = enhancement cleanly disabled. NOTE: nothing answers on :8188 on
+      any current tailnet node — ComfyUI must be started on the 4090 box.
+- [x] **"No plants" forensics — veg pipeline itself WORKS.** Cold boot over a
+      high-veg tile (64.0309, -51.81835) places 21k grass, visually
+      confirmed. The bare areas the user saw (Nuuk spawn/coast) have
+      classifier veg ≈ 0.00-0.21 max (fresh recompute matches cache — not
+      poisoned; those fjord-shore tiles genuinely classify barren). Open
+      questions that remain:
+      - [ ] plants/rocks/understory scatter is 0 EVERYWHERE and always has
+            been (192/192 log entries since 07-17) — unfinished wiring in the
+            clipmap/worldSize WIP (Scatter.ts/Forests). Also 4× console
+            warnings `Vertex attribute "vdata" not found on geometry`.
+      - [ ] classifier veg looks under-reported for Greenland moss/tundra
+            (terrain paint shows moss where grass threshold says barren) —
+            threshold/classifier tuning vs GroundRing gate mismatch.
+      - [ ] fields are only served at depth 12 (64² per ~660 m tile ≈ 10 m/px)
+            — coarse for a 768 m patch; consider deeper fields or higher res.
+- [x] **No visible clouds on WebGPU** — not a regression: CloudsEffect (the
+      visual clouds) only exists in the WebGL path; the WebGPU port stage 1
+      brought only density field + BSM (shadows/god rays). Stage 2 (visible
+      clouds) is an open roadmap item, now explicitly tracked here.
+
 ## Work log (append-only, newest last)
 
 - **2026-07-17** — Verified external AI's regression analysis against source:
@@ -309,3 +355,8 @@ at runtime forces a full material recompile — never do it mid-measurement.
   pipeline now ≈33 fps at 1440p headless vs 27.6 before today. Next: motion
   runs for the CSM budget + BSM behavior, then veg (≈10 ms) and grounding
   (≈7 ms) buckets, then temporal reconstruction to push the march to ¼ res.
+- **2026-07-18 (LAAS recovery continues)** — The working standalone LAAS
+  flight runtime on port 5174 is now the executable reference for the Atlantis
+  graft. Detailed additive findings, source changes, tests and pending flight
+  verification are tracked in `ATLANTIS_LAAS_RECOVERY.md`; this performance log
+  remains the source of pass-level stationary and motion measurements.

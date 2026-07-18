@@ -293,6 +293,9 @@ function sanitizeVehicleParts(raw: unknown): VehicleParts | undefined {
   const rightNacelle = stringList(source.rightNacelle);
   const leftRotor = optionalName(source.leftRotor);
   const rightRotor = optionalName(source.rightRotor);
+  const turretPivot = sanitizeNumberTuple3(source.turretPivot);
+  const gunPivot = sanitizeNumberTuple3(source.gunPivot);
+  const muzzle = sanitizeNumberTuple3(source.muzzle);
   const parts: VehicleParts = {};
   if (wheels.length > 0) parts.wheels = wheels;
   if (turret !== undefined) parts.turret = turret;
@@ -303,6 +306,9 @@ function sanitizeVehicleParts(raw: unknown): VehicleParts | undefined {
   if (rightNacelle.length > 0) parts.rightNacelle = rightNacelle;
   if (leftRotor !== undefined) parts.leftRotor = leftRotor;
   if (rightRotor !== undefined) parts.rightRotor = rightRotor;
+  if (turretPivot !== undefined) parts.turretPivot = turretPivot;
+  if (gunPivot !== undefined) parts.gunPivot = gunPivot;
+  if (muzzle !== undefined) parts.muzzle = muzzle;
   return parts;
 }
 
@@ -341,11 +347,26 @@ function sanitizeNacelleConfig(raw: unknown): NacelleConfig | undefined {
   const rotorRadiusM = coerceFiniteNumber(source.rotorRadiusM);
   const leftCenter = sanitizeNumberTuple3(source.leftCenter);
   const rightCenter = sanitizeNumberTuple3(source.rightCenter);
+  const rotorAxis = source.rotorAxis === "x" || source.rotorAxis === "y" || source.rotorAxis === "z"
+    ? source.rotorAxis
+    : undefined;
+  const rotorSpeedRpm = coerceFiniteNumber(source.rotorSpeedRpm);
+  const rotorResponseSeconds = coerceFiniteNumber(source.rotorResponseSeconds);
   if (tiltSpeedDegS == null || tiltSpeedDegS < 0 || rotorRadiusM == null || rotorRadiusM <= 0
-    || leftCenter == null || rightCenter == null) {
+    || leftCenter == null || rightCenter == null
+    || (rotorSpeedRpm != null && rotorSpeedRpm <= 0)
+    || (rotorResponseSeconds != null && rotorResponseSeconds <= 0)) {
     return undefined;
   }
-  return { tiltSpeedDegS, rotorRadiusM, leftCenter, rightCenter };
+  return {
+    tiltSpeedDegS,
+    rotorRadiusM,
+    leftCenter,
+    rightCenter,
+    ...(rotorAxis ? { rotorAxis } : {}),
+    ...(rotorSpeedRpm != null ? { rotorSpeedRpm } : {}),
+    ...(rotorResponseSeconds != null ? { rotorResponseSeconds } : {}),
+  };
 }
 
 function sanitizeVehicleDefinition(raw: unknown): VehicleDefinition {
