@@ -104,6 +104,7 @@ export function installTerrainKeyboardControls({
   onCycleVehicleCamera = () => {},
   onToggleTurret = () => {},
   onToggleAircraftEngine = () => {},
+  onToggleAircraftConversion = () => {},
   onChanged = () => {},
   doubleTapMs = 300,
 }) {
@@ -145,6 +146,7 @@ export function installTerrainKeyboardControls({
     if (event.code === 'KeyV' && isVehicleActive() && !isTurretActive()) onCycleVehicleCamera();
     if (event.code === 'KeyT' && isVehicleActive()) onToggleTurret();
     if (event.code === 'KeyE' && isVehicleActive()) onToggleAircraftEngine();
+    if (event.code === 'KeyF' && isVehicleActive()) onToggleAircraftConversion();
   };
   const onKeyUp = event => {
     controls.keys[event.code] = false;

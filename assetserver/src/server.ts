@@ -347,6 +347,12 @@ function sanitizeNacelleConfig(raw: unknown): NacelleConfig | undefined {
   const rotorRadiusM = coerceFiniteNumber(source.rotorRadiusM);
   const leftCenter = sanitizeNumberTuple3(source.leftCenter);
   const rightCenter = sanitizeNumberTuple3(source.rightCenter);
+  const tiltAxis = source.tiltAxis === "x" || source.tiltAxis === "y" || source.tiltAxis === "z"
+    ? source.tiltAxis
+    : undefined;
+  const tiltDirection = source.tiltDirection === -1 || source.tiltDirection === 1
+    ? source.tiltDirection
+    : undefined;
   const rotorAxis = source.rotorAxis === "x" || source.rotorAxis === "y" || source.rotorAxis === "z"
     ? source.rotorAxis
     : undefined;
@@ -363,6 +369,8 @@ function sanitizeNacelleConfig(raw: unknown): NacelleConfig | undefined {
     rotorRadiusM,
     leftCenter,
     rightCenter,
+    ...(tiltAxis ? { tiltAxis } : {}),
+    ...(tiltDirection != null ? { tiltDirection } : {}),
     ...(rotorAxis ? { rotorAxis } : {}),
     ...(rotorSpeedRpm != null ? { rotorSpeedRpm } : {}),
     ...(rotorResponseSeconds != null ? { rotorResponseSeconds } : {}),

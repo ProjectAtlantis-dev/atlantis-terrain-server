@@ -13,6 +13,7 @@ export function createVehicleControlUI({
   onToggleLights = () => {},
   onToggleTurret = () => {},
   onToggleEngine = () => {},
+  onToggleConversion = () => {},
 } = {}) {
   const panel = documentRef.createElement('section');
   panel.id = 'vehicle-control-panel';
@@ -68,6 +69,7 @@ export function createVehicleControlUI({
   addButton('lights', 'Lights');
   addButton('turret', 'Turret');
   addButton('engine', 'Engine');
+  addButton('conversion', 'Convert');
   panel.append(title, identity, telemetry, actions, help);
   documentRef.body.appendChild(panel);
 
@@ -96,6 +98,7 @@ export function createVehicleControlUI({
     lights: onToggleLights,
     turret: onToggleTurret,
     engine: onToggleEngine,
+    conversion: onToggleConversion,
   };
   const onClick = event => {
     const button = event.target.closest?.('[data-vehicle-action]');
@@ -121,6 +124,12 @@ export function createVehicleControlUI({
     turretActive = false,
     isAircraft = false,
     engineRunning = false,
+    conversionMode = 'hover',
+    collective = 0,
+    rotorSpool = 0,
+    altitudeAGL = 0,
+    verticalSpeedMs = 0,
+    flightRegime = 'GROUND',
   } = {}) => {
     panel.hidden = !selected;
     if (!selected) {
@@ -131,7 +140,11 @@ export function createVehicleControlUI({
     title.style.color = active ? '#ff6b61' : '#8fd0ff';
     identity.textContent = id ? `id: ${id}` : '';
     const status = !loaded ? 'LOADING' : mapMode ? 'MAP MODE' : active ? 'CONTROL ACTIVE' : 'READY';
-    telemetry.textContent = `${status} · ${(Math.abs(speedMps) * 3.6).toFixed(0)} km/h · camera ${cameraMode}`;
+    telemetry.textContent = isAircraft
+      ? `${status} · ${flightRegime} · ${(Math.abs(speedMps) * 3.6).toFixed(0)} km/h · ${altitudeAGL.toFixed(0)} m AGL`
+        + `\nCOL ${Math.round(collective * 100)}% · RPM ${Math.round(rotorSpool * 100)}% · V/S ${verticalSpeedMs.toFixed(1)} m/s`
+      : `${status} · ${(Math.abs(speedMps) * 3.6).toFixed(0)} km/h · camera ${cameraMode}`;
+    telemetry.style.whiteSpace = isAircraft ? 'pre-line' : '';
     setButtonState(buttons.get('drive'), {
       hidden: active,
       disabled: !loaded || mapMode,
@@ -141,14 +154,16 @@ export function createVehicleControlUI({
     setButtonState(buttons.get('lights'), { disabled: !active || !hasLights });
     setButtonState(buttons.get('turret'), { disabled: !active || !hasTurret });
     setButtonState(buttons.get('engine'), { hidden: !isAircraft, disabled: !active });
+    setButtonState(buttons.get('conversion'), { hidden: !isAircraft, disabled: !active || !engineRunning });
     buttons.get('lights').textContent = lightsOn ? 'Lights off' : 'Lights on';
     buttons.get('turret').textContent = turretActive ? 'Exit turret' : 'Turret';
     buttons.get('engine').textContent = engineRunning ? 'Engine off' : 'Engine on';
+    buttons.get('conversion').textContent = conversionMode === 'cruise' ? 'Convert to hover' : 'Convert to cruise';
     crosshair.style.display = turretActive ? '' : 'none';
     help.textContent = turretActive
       ? 'Mouse aims · WASD still drives · T or Esc exits turret · firing effects pending WebGPU validation'
       : active && isAircraft
-      ? 'E engine · W/S hover movement · A/D yaw · Space climb · Q descend · drag orbit · V camera · Esc exit'
+      ? 'E engine · Space/Q collective · W/S move · A/D turn · F hover/cruise conversion · drag orbit · V camera · Esc exit'
       : active
       ? 'W/S drive · A/D steer · drag orbit · V camera · L lights · T turret · Esc exit'
       : mapMode

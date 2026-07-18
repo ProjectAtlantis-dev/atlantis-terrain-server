@@ -17,7 +17,13 @@ const FLIGHT_DEFAULTS = Object.freeze({
   yawRateRad: 1.05,
   pitchRateRad: 0.52,
   rollRateRad: 0.78,
+  hoverCollective: 0.56,
+  collectiveRatePerS: 0.42,
 });
+const GRAVITY_MS2 = 9.8;
+const HOVER_NACELLE_DEG = 97.5;
+const TRANSITION_ENTRY_NACELLE_DEG = 68;
+const MAX_PHYSICS_STEP_S = 0.05;
 const LOCAL_UP = new THREE.Vector3(0, 0, 1);
 const VISUAL_QUATERNION = new THREE.Quaternion();
 const VISUAL_AXIS = new THREE.Vector3();
@@ -25,6 +31,46 @@ const VISUAL_ROTATION = new THREE.Quaternion();
 
 function configValue(config, key, defaults) {
   return Number.isFinite(config?.[key]) ? config[key] : defaults[key];
+}
+
+function clamp01(value) {
+  return Math.max(0, Math.min(1, value));
+}
+
+function smoothstep01(value) {
+  const t = clamp01(value);
+  return t * t * (3 - 2 * t);
+}
+
+function nominalRotorVelocity(state) {
+  const rotorSpeedRpm = Number.isFinite(state.definition.nacelles?.rotorSpeedRpm)
+    ? state.definition.nacelles.rotorSpeedRpm
+    : 397;
+  return rotorSpeedRpm * Math.PI * 2 / 60;
+}
+
+export function aircraftRotorSpool(state) {
+  return clamp01(state.rotorAngularVelocity / Math.max(0.001, nominalRotorVelocity(state)));
+}
+
+export function setAircraftEngineRunning(state, running) {
+  state.engineRunning = Boolean(running);
+  if (!state.engineRunning) {
+    state.collective = 0;
+    state.conversionMode = 'hover';
+    state.nacelleTiltTarget = HOVER_NACELLE_DEG;
+  }
+  return state.engineRunning;
+}
+
+export function toggleAircraftEngine(state) {
+  return setAircraftEngineRunning(state, !state.engineRunning);
+}
+
+export function toggleAircraftConversionMode(state) {
+  if (!state.engineRunning) return state.conversionMode;
+  state.conversionMode = state.conversionMode === 'cruise' ? 'hover' : 'cruise';
+  return state.conversionMode;
 }
 
 export function createAircraftState({ id, definition, instance, group, marker }) {
@@ -43,10 +89,14 @@ export function createAircraftState({ id, definition, instance, group, marker })
     forwardSpeedMs: 0,
     verticalSpeedMs: 0,
     altitudeAGL: 0,
+    collective: 0,
+    rotorSpool: 0,
+    conversionMode: 'hover',
+    flightRegime: 'GROUND',
     pitchRad: 0,
     rollRad: 0,
-    nacelleTiltDeg: 97.5,
-    nacelleTiltTarget: 97.5,
+    nacelleTiltDeg: HOVER_NACELLE_DEG,
+    nacelleTiltTarget: HOVER_NACELLE_DEG,
     leftNacellePivot: null,
     rightNacellePivot: null,
     leftRotorMesh: null,
@@ -69,64 +119,137 @@ export function createAircraftState({ id, definition, instance, group, marker })
 
 export function stepAircraftFlight(state, input, dt, groundZ = null) {
   const flight = state.definition.flight;
+  const stepDuration = Math.max(0, Number(dt) || 0);
   const hoverMax = configValue(flight, 'hoverMaxSpeedMs', FLIGHT_DEFAULTS);
   const climbRate = configValue(flight, 'climbRateMs', FLIGHT_DEFAULTS);
   const descendRate = configValue(flight, 'descendRateMs', FLIGHT_DEFAULTS);
   const accel = configValue(flight, 'accelMs2', FLIGHT_DEFAULTS);
   const yawRate = configValue(flight, 'yawRateRad', FLIGHT_DEFAULTS);
+  const maxSpeed = Math.max(hoverMax, configValue(flight, 'maxSpeedMs', FLIGHT_DEFAULTS));
+  const hoverCollective = Math.max(
+    0.2,
+    Math.min(0.9, configValue(flight, 'hoverCollective', FLIGHT_DEFAULTS)),
+  );
+  const collectiveRate = Math.max(
+    0.05,
+    configValue(flight, 'collectiveRatePerS', FLIGHT_DEFAULTS),
+  );
+  const transitionLow = configValue(flight, 'transitionLowMs', FLIGHT_DEFAULTS);
+  const transitionHigh = Math.max(
+    transitionLow + 0.001,
+    configValue(flight, 'transitionHighMs', FLIGHT_DEFAULTS),
+  );
   const yawInput = (input.left ? 1 : 0) + (input.right ? -1 : 0);
-
-  if (!state.engineRunning) {
-    state.forwardSpeedMs *= Math.max(0, 1 - 0.5 * dt);
-    if (state.altitudeAGL > 1) state.verticalSpeedMs -= 9.8 * dt;
-    else state.verticalSpeedMs = Math.min(state.verticalSpeedMs, 0);
-    state.pitchRad *= Math.max(0, 1 - 2 * dt);
-    state.rollRad *= Math.max(0, 1 - 2 * dt);
-  } else {
-    state.headingRad += yawInput * yawRate * dt;
-    if (input.climb) {
-      state.verticalSpeedMs = Math.min(climbRate, state.verticalSpeedMs + climbRate * 2 * dt);
-    } else if (input.descend) {
-      state.verticalSpeedMs = Math.max(-descendRate, state.verticalSpeedMs - descendRate * 2 * dt);
-    } else {
-      state.verticalSpeedMs *= Math.max(0, 1 - 3 * dt);
-    }
-    if (input.forward) {
-      state.forwardSpeedMs = Math.min(hoverMax, state.forwardSpeedMs + accel * dt);
-    } else if (input.back) {
-      state.forwardSpeedMs = Math.max(-hoverMax * 0.3, state.forwardSpeedMs - accel * 1.5 * dt);
-    } else {
-      state.forwardSpeedMs *= Math.max(0, 1 - 0.8 * dt);
-    }
-
-    const speedRatio = state.forwardSpeedMs / Math.max(1, hoverMax);
-    const climbRatio = state.verticalSpeedMs / Math.max(1, climbRate);
-    const targetPitch = -speedRatio * 0.35 + climbRatio * 0.15;
-    state.pitchRad += (targetPitch - state.pitchRad) * Math.min(1, 3 * dt);
-    const speedFactor = Math.min(1, Math.abs(state.forwardSpeedMs) / Math.max(1, hoverMax * 0.5));
-    const targetRoll = -yawInput * 0.5 * (0.3 + 0.7 * speedFactor);
-    state.rollRad += (targetRoll - state.rollRad) * Math.min(1, 3 * dt);
-
-    const speed = Math.abs(state.forwardSpeedMs);
-    const low = configValue(flight, 'transitionLowMs', FLIGHT_DEFAULTS);
-    const high = Math.max(low + 0.001, configValue(flight, 'transitionHighMs', FLIGHT_DEFAULTS));
-    state.nacelleTiltTarget = speed <= low ? 97.5 : speed >= high
-      ? 0
-      : 97.5 * (1 - (speed - low) / (high - low));
-  }
-
-  state.group.position.x += -Math.sin(state.headingRad) * state.forwardSpeedMs * dt;
-  state.group.position.y += Math.cos(state.headingRad) * state.forwardSpeedMs * dt;
-  state.group.position.z += state.verticalSpeedMs * dt;
-
   if (Number.isFinite(groundZ)) state.lastKnownGroundZ = groundZ;
   const floorZ = (state.lastKnownGroundZ ?? 0) + Math.max(0.5, Number(state.definition.altOffsetM) || 0);
-  state.altitudeAGL = state.group.position.z - (state.lastKnownGroundZ ?? 0);
-  if (state.group.position.z < floorZ) {
-    state.group.position.z = floorZ;
-    state.altitudeAGL = floorZ - (state.lastKnownGroundZ ?? 0);
-    if (state.verticalSpeedMs < 0) state.verticalSpeedMs = 0;
+
+  let remaining = stepDuration;
+  while (remaining > 1e-6) {
+    const step = Math.min(MAX_PHYSICS_STEP_S, remaining);
+    remaining -= step;
+
+    state.rotorSpool = aircraftRotorSpool(state);
+    if (state.engineRunning) {
+      const collectiveInput = (input.climb ? 1 : 0) + (input.descend ? -1 : 0);
+      state.collective = clamp01(state.collective + collectiveInput * collectiveRate * step);
+    }
+
+    const speedAbs = Math.abs(state.forwardSpeedMs);
+    if (state.conversionMode === 'cruise') {
+      // The pilot requests conversion; a game assist initially holds enough nacelle angle
+      // to retain lift, then schedules the rest forward as airspeed builds.
+      const schedule = smoothstep01(
+        (speedAbs - transitionLow) / Math.max(1, transitionHigh - transitionLow),
+      );
+      state.nacelleTiltTarget = THREE.MathUtils.lerp(
+        TRANSITION_ENTRY_NACELLE_DEG,
+        0,
+        schedule,
+      );
+    } else {
+      state.nacelleTiltTarget = HOVER_NACELLE_DEG;
+    }
+
+    const nacelleVertical = Math.sin(THREE.MathUtils.degToRad(
+      Math.max(0, Math.min(90, state.nacelleTiltDeg)),
+    ));
+    const conversion = 1 - nacelleVertical;
+    const wingSupport = smoothstep01(
+      (speedAbs - transitionLow * 0.55) / Math.max(1, transitionHigh - transitionLow * 0.55),
+    ) * conversion;
+    const rotorSupport = state.rotorSpool * state.rotorSpool
+      * (state.collective / hoverCollective)
+      * nacelleVertical;
+    let verticalAcceleration = (rotorSupport + wingSupport - 1) * GRAVITY_MS2;
+
+    const collectiveNeutral = Math.abs(state.collective - hoverCollective) <= 0.07;
+    if (state.engineRunning && state.rotorSpool > 0.82 && nacelleVertical > 0.7
+      && collectiveNeutral && !input.climb && !input.descend) {
+      // A broad neutral band makes hover pleasant without turning Space/Q back into
+      // scripted vertical velocities. Rotor spool and collective still pay for the lift.
+      verticalAcceleration = -state.verticalSpeedMs * 2.4;
+    } else {
+      verticalAcceleration -= state.verticalSpeedMs * (0.18 + nacelleVertical * 0.12);
+    }
+    state.verticalSpeedMs = THREE.MathUtils.clamp(
+      state.verticalSpeedMs + verticalAcceleration * step,
+      -descendRate,
+      climbRate,
+    );
+
+    const driveInput = (input.forward ? 1 : 0) + (input.back ? -1 : 0);
+    const poweredAuthority = state.engineRunning
+      ? state.rotorSpool * state.collective
+      : 0;
+    if (driveInput !== 0 && poweredAuthority > 0) {
+      const thrustScale = 0.75 + conversion * 1.25;
+      state.forwardSpeedMs += driveInput * accel * poweredAuthority * thrustScale * step;
+    } else {
+      const coastDrag = state.engineRunning
+        ? THREE.MathUtils.lerp(0.8, 0.08, conversion)
+        : 0.22;
+      state.forwardSpeedMs *= Math.max(0, 1 - coastDrag * step);
+    }
+    const speedEnvelopeBlend = state.conversionMode === 'cruise' ? 1 : conversion;
+    const forwardLimit = THREE.MathUtils.lerp(hoverMax, maxSpeed, speedEnvelopeBlend);
+    const reverseLimit = THREE.MathUtils.lerp(hoverMax * 0.3, 0, conversion);
+    state.forwardSpeedMs = THREE.MathUtils.clamp(
+      state.forwardSpeedMs,
+      -reverseLimit,
+      forwardLimit,
+    );
+
+    state.headingRad += yawInput * yawRate * THREE.MathUtils.lerp(1, 0.55, conversion) * step;
+    const speedRatio = state.forwardSpeedMs / Math.max(1, forwardLimit);
+    const climbRatio = state.verticalSpeedMs / Math.max(1, climbRate);
+    const targetPitch = -speedRatio * THREE.MathUtils.lerp(0.35, 0.18, conversion)
+      + climbRatio * 0.12;
+    state.pitchRad += (targetPitch - state.pitchRad) * Math.min(1, 3 * step);
+    const targetRoll = -yawInput * THREE.MathUtils.lerp(0.28, 0.62, conversion);
+    state.rollRad += (targetRoll - state.rollRad) * Math.min(1, 3.5 * step);
+
+    state.group.position.x += -Math.sin(state.headingRad) * state.forwardSpeedMs * step;
+    state.group.position.y += Math.cos(state.headingRad) * state.forwardSpeedMs * step;
+    state.group.position.z += state.verticalSpeedMs * step;
+
+    if (state.group.position.z < floorZ) {
+      state.group.position.z = floorZ;
+      if (state.verticalSpeedMs < 0) state.verticalSpeedMs = 0;
+    }
   }
+
+  state.altitudeAGL = state.group.position.z - (state.lastKnownGroundZ ?? 0);
+  const grounded = state.group.position.z <= floorZ + 0.05;
+  const conversion = 1 - Math.sin(THREE.MathUtils.degToRad(
+    Math.max(0, Math.min(90, state.nacelleTiltDeg)),
+  ));
+  state.flightRegime = grounded
+    ? 'GROUND'
+    : conversion < 0.12 && Math.abs(state.forwardSpeedMs) < transitionLow
+      ? 'HOVER'
+      : conversion > 0.78 && Math.abs(state.forwardSpeedMs) >= transitionLow
+        ? 'AIRPLANE'
+        : 'TRANSITION';
   state.marker?.position.set(state.group.position.x, state.group.position.y, 5);
   return state;
 }
@@ -137,9 +260,15 @@ export function updateAircraftVisuals(state, dt) {
     : 12.2;
   const tiltDiff = state.nacelleTiltTarget - state.nacelleTiltDeg;
   state.nacelleTiltDeg += Math.sign(tiltDiff) * Math.min(Math.abs(tiltDiff), tiltSpeed * dt);
-  const tiltRad = THREE.MathUtils.degToRad(state.nacelleTiltDeg);
-  if (state.leftNacellePivot) state.leftNacellePivot.rotation.y = tiltRad;
-  if (state.rightNacellePivot) state.rightNacellePivot.rotation.y = tiltRad;
+  const tiltAxis = ['x', 'y', 'z'].includes(state.definition.nacelles?.tiltAxis)
+    ? state.definition.nacelles.tiltAxis
+    : 'z';
+  const tiltDirection = state.definition.nacelles?.tiltDirection === -1 ? -1 : 1;
+  const tiltRad = THREE.MathUtils.degToRad(
+    (HOVER_NACELLE_DEG - state.nacelleTiltDeg) * tiltDirection,
+  );
+  if (state.leftNacellePivot) state.leftNacellePivot.rotation[tiltAxis] = tiltRad;
+  if (state.rightNacellePivot) state.rightNacellePivot.rotation[tiltAxis] = tiltRad;
   const rotorAxis = ['x', 'y', 'z'].includes(state.definition.nacelles?.rotorAxis)
     ? state.definition.nacelles.rotorAxis
     : 'y';
@@ -157,6 +286,7 @@ export function updateAircraftVisuals(state, dt) {
   if (!state.engineRunning && Math.abs(state.rotorAngularVelocity) < 1e-4) {
     state.rotorAngularVelocity = 0;
   }
+  state.rotorSpool = aircraftRotorSpool(state);
   state.rotorSpinAngle = (
     state.rotorSpinAngle + state.rotorAngularVelocity * Math.max(0, dt)
   ) % (Math.PI * 2);
@@ -193,15 +323,25 @@ export function setupAircraftModelParts(state, model, log = () => {}) {
   let leftRotor = null;
   let rightRotor = null;
   model.traverse(object => {
-    if (!object.isMesh) return;
     if (leftNames.has(object.name)) left.push(object);
     if (rightNames.has(object.name)) right.push(object);
+    if (!object.isMesh) return;
     if (object.name === leftRotorName) leftRotor = object;
     if (object.name === rightRotorName) rightRotor = object;
   });
-  const isSeparate = mesh => {
+  model.updateWorldMatrix(true, true);
+  const isSeparate = candidate => {
+    const bounds = new THREE.Box3();
+    const geometryBounds = new THREE.Box3();
+    candidate.traverse(object => {
+      if (!object.isMesh || object === leftRotor || object === rightRotor) return;
+      if (object.geometry.boundingBox == null) object.geometry.computeBoundingBox();
+      geometryBounds.copy(object.geometry.boundingBox).applyMatrix4(object.matrixWorld);
+      bounds.union(geometryBounds);
+    });
+    if (bounds.isEmpty()) return false;
     const size = new THREE.Vector3();
-    new THREE.Box3().setFromObject(mesh).getSize(size);
+    bounds.getSize(size);
     return Math.max(size.x, size.y, size.z) / Math.max(modelMax, 0.001) <= 0.5;
   };
   const validLeft = left.filter(isSeparate);
@@ -214,6 +354,10 @@ export function setupAircraftModelParts(state, model, log = () => {}) {
     }, 'warn');
   }
   const distinctRotors = leftRotor != null && rightRotor != null && leftRotor !== rightRotor;
+  const distinctNacelles = validLeft.length === 1 && validRight.length === 1
+    && validLeft[0] !== validRight[0];
+  state.leftNacellePivot = distinctNacelles ? validLeft[0] : null;
+  state.rightNacellePivot = distinctNacelles ? validRight[0] : null;
   state.leftRotorMesh = distinctRotors ? leftRotor : null;
   state.rightRotorMesh = distinctRotors ? rightRotor : null;
   if (!distinctRotors) {
@@ -230,7 +374,7 @@ export function setupAircraftModelParts(state, model, log = () => {}) {
     leftRotor: state.leftRotorMesh?.name ?? null,
     rightRotor: state.rightRotorMesh?.name ?? null,
     rotorAxis: state.definition.nacelles?.rotorAxis ?? 'y',
-    nacelleAnimationAvailable: validLeft.length > 0 && validRight.length > 0,
+    nacelleAnimationAvailable: distinctNacelles,
     rotorAnimationAvailable: distinctRotors,
   };
 }

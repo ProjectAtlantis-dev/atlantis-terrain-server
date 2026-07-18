@@ -50,6 +50,8 @@ export interface NacelleConfig {
   rotorRadiusM: number;
   leftCenter: [number, number, number];
   rightCenter: [number, number, number];
+  tiltAxis?: "x" | "y" | "z";
+  tiltDirection?: -1 | 1;
   rotorAxis?: "x" | "y" | "z";
   rotorSpeedRpm?: number;
   rotorResponseSeconds?: number;

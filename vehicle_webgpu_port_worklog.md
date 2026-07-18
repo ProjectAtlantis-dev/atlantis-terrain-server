@@ -319,3 +319,223 @@ Append build, typecheck, runtime, visual, and performance results here as each s
   real `E` control path advanced the rotor angle and raised angular velocity from 0 to
   15.25 rad/s; engine shutdown decayed it to 1.46 rad/s. The remaining material-merged
   warning now concerns nacelle tilt only, not propeller animation.
+
+### 2026-07-18 — game-focused VTOL flight model (implemented)
+
+Checkpoint before this slice: `bd1c155` (`Checkpoint WebGPU terrain and vehicle port`).
+
+- [x] Preserve `E` as engine start/stop; engine start only spools the rotors and never
+  launches the aircraft by itself.
+- [x] Replace Space/Q scripted climb/descent and automatic hover with a persistent
+  collective control. Lift must depend on collective and actual rotor spool.
+- [x] Replace speed-triggered nacelle automation with explicit, approachable transition
+  control while keeping safe rate limits and useful game assists.
+- [x] Blend hover and airplane behavior: rotor-vector thrust at low speed, wing lift at
+  forward speed, gravity/drag throughout, and responsive pitch/yaw/roll presentation.
+- [x] Keep W/S, A/D, Space/Q, E, V, Escape, selection, entry/exit, camera, and persistence
+  behavior compatible with the vehicle port wherever their meanings remain appropriate.
+- [x] Add HUD/debug feedback for collective, rotor spool, nacelle angle, vertical speed,
+  airspeed, and the current GROUND/HOVER/TRANSITION/AIRPLANE regime.
+- [x] Add deterministic tests for grounded spool-up, collective takeoff, hover stability,
+  collective descent, transition thrust/lift blending, engine-out gravity, and control
+  isolation.
+- [x] Run the complete shared test suite, WebGPU production build, server typecheck, Flask
+  compile, metadata parse, and final diff checks before calling the slice complete.
+
+Implementation notes:
+
+- `E` now controls only engine state and governed rotor spool. Space/Q raise and lower a
+  persistent collective; takeoff requires both sufficient collective and actual rotor RPM.
+- `F` toggles the pilot's hover/cruise request. A conversion schedule holds 68 degrees of
+  nacelle angle until useful airspeed exists, then blends toward airplane mode instead of
+  letting a single keypress dump all vertical thrust at zero speed.
+- Vertical force now combines rotor support (`RPM² × collective × nacelle direction`),
+  forward-speed wing support, gravity, drag, climb/descent limits, and a deliberately broad
+  neutral-collective hover assist. Physics is integrated in bounded substeps so the flight
+  model remains stable even while the main renderer is running at a low frame rate.
+- W/S retains the port's approachable forward/back intent, A/D retains turn intent, and
+  their acceleration/yaw/bank response blends between hover and cruise. This is deliberately
+  game-realistic rather than a cockpit-level V-22 simulator.
+- Extended the reproducible Blender rig to extract two 8,267-polygon nacelle assemblies,
+  pivot them at the measured rotor hubs, and parent the repaired rotors to them. The export
+  retains all 102,326 source polygons and every embedded texture. Current generated GLB:
+  `d5d03fe64d769718b3d6fedf5a636d170d21656f554b50a93dbd5d3d413e1870`.
+- A full-scene live load caught that glTF represents each multi-material nacelle as a named
+  pivot node containing mesh primitives. The resolver now accepts those nodes, excludes the
+  rotor children from its old oversized-material safety check, and has a matching hierarchy
+  regression test. The same live page confirmed the aircraft position remained unchanged at
+  its pre-test coordinates because collective was never raised.
+- Final verification passed: 64 shared tests, the 365-module WebGPU production build,
+  asset-server TypeScript checking, Flask compilation, both metadata parses, and
+  `git diff --check`.
+
+## 2026-07-19 — vehicle recovery board (authoritative correction)
+
+This section supersedes the completion claims above where they conflict with live visual
+feedback. The earlier tests proved that code executed and matched its own expectations; they
+did not prove that Patria handling, V-22 controls, camera behavior, rotor motion, materials,
+or firing retained the accepted gameplay. Do not mark an item below complete from unit tests
+or headless state alone.
+
+### What "performance" means in this recovery
+
+There are two separate problems. They must not be conflated:
+
+1. **Full-scene rendering cost.** `PERF_REWORK.md` owns this track. Its current measured
+   stationary 2560x1440 frame is about 36 ms: cloud march about 10.7 ms, LAAS vegetation
+   about 9.8 ms (about 5.8 ms in casters), and GTAO/contact about 6.7 ms. Movement can stack
+   CSM refreshes, beer-shadow compute, tile streaming, and wholesale LAAS recenter work in
+   the same frame. The vehicle recovery will not reduce vegetation quality, shadow quality,
+   resolution, materials, or view distance to disguise this cost.
+2. **Gameplay time under a slow renderer.** Both the old working WebGL application and the
+   current WebGPU application use `Math.min(0.05, clock.getDelta())`. This clamp dates to the
+   initial February 2026 code; it was not introduced by the vehicle port. It prevents a huge
+   movement jump after a tab pause or loading stall, but below 20 fps it causes slow motion.
+   Do not alter it during behavioral restoration. First restore WebGL parity and address the
+   rendering regression. Only then evaluate a shared fixed-step game clock at forced 60,
+   15, and 5 fps. A fixed step may fix time dilation; it cannot fix visible rendering lag.
+
+The isolated vehicle scene is permitted for diagnosis of models, axes, materials, and input.
+It is not final acceptance. Final acceptance must also pass in the complete WebGPU scene with
+all production graphics enabled.
+
+### Verified architecture and source of truth
+
+- The local `integration/webgpu-restoration` branch demonstrates the intended architecture:
+  `main.js` and `main.webgpu.js` both start `terrain-application.js`; only the backend value
+  changes. Vehicle gameplay did not require a WebGPU rewrite.
+- The current `godray-rework` branch descends from the older grafted WebGPU tree and again
+  contains separate `main.terrain.js` and `main.webgpu.terrain.js` applications. This allowed
+  gameplay and UI to diverge.
+- The local, uncommitted
+  `/Users/projectatlantis/work/atlantis-terrain-server` `vehicle_splitting` working tree is
+  the behavioral source for Patria movement, suspension/grounding, wheel motion, turret,
+  firing, camera, selection, and the original V-22 control contract.
+- Renderer-independent gameplay must be shared. WebGPU-specific code is allowed only at a
+  demonstrated material/render-pass incompatibility, after the original path is tried.
+
+### Confirmed implementation errors
+
+- [x] The V-22 rotor geometry lies in local XY, so the shaft/spin axis is local **Z**. The
+      current metadata/test expectation of `rotorAxis: "y"` is wrong and makes the blades
+      tumble.
+- [x] The V-22 nacelles extend along local Z and must convert about the wing axis **Y**. The
+      current `tiltAxis: "z"` is wrong. The conversion sign must be verified at static hover,
+      transition, and cruise poses before flight testing.
+- [x] The rigged GLB preserves 17 embedded cockpit/instrument images, but the five exterior
+      `DefaultWhite` body meshes still have no body PBR maps. The missing 4K albedo, normal,
+      roughness, metallic, glass diffuse, and glass roughness masters remain under the local
+      Atlantis server's `webserver/public/models/v22_textures/` directory.
+- [x] The Patria port replaced the accepted vertex-cluster wheel animation with a new
+      load-time geometry split/pivot rig, then collected the replacement animated meshes for
+      collision raycasts. This is not behavioral parity and is an unnecessary variable in
+      grounding.
+- [x] The old firing path was not first tested unchanged under `WebGPURenderer`; it was
+      replaced preemptively with a new node-material pool because of an assumed NormalPass
+      incompatibility. That assumption is not visual acceptance evidence.
+- [x] Bare `R` invokes the global destructive reset. Required behavior is no bare reset key;
+      provide a small out-of-the-way Reset View UI action with confirmation.
+
+### Rollback safety
+
+- Existing local commit: `bd1c155` (`Checkpoint WebGPU terrain and vehicle port`). It already
+  includes the first WebGPU firing rewrite, registry changes, Patria changes, and first rotor
+  rig. It is not a clean pre-port baseline.
+- The game-focused VTOL, persistent collective, manual `F` conversion, expanded nacelle rig,
+  and later UI/server changes remain uncommitted after `bd1c155`.
+- [ ] Before implementation, create a new local checkpoint containing only the current
+      vehicle/server/model/worklog files and vehicle-related hunks from the mixed WebGPU main
+      file. Do not stage parallel LAAS, terrain, cloud, shadow, or post-processing changes.
+- [ ] Tag or branch that checkpoint clearly so the exact current state can be restored
+      without resetting the shared working tree.
+
+### Recovery milestones
+
+#### 1. Record the accepted behavior before porting
+
+- [ ] Record the local WebGL Patria constants, key routing, movement integration, terrain
+      probes, suspension, camera, wheels, turret, firing cadence/effects, and entry/exit flow.
+- [ ] Record the original V-22 contract: `E` engine, `W/S` forward/back, `A/D` turn,
+      `Space/Q` climb/descend, automatic speed-based nacelle conversion, `V` camera, `Esc`
+      exit. Do not retain the unapproved `F` conversion toggle.
+- [ ] Capture an accepted WebGL reference run and telemetry for a repeatable Patria route:
+      position, heading, speed, ground target, suspension Z, and camera pose.
+
+#### 2. Restore Patria parity before optimizing it
+
+- [ ] Make WebGPU call the same renderer-independent Patria gameplay functions used by the
+      WebGL path. Do not maintain a second WebGPU movement model.
+- [ ] Restore the accepted wheel animation and keep visual wheel transforms out of the
+      grounding collider.
+- [ ] Restore the accepted terrain-contact, suspension, slope, camera, turret, and entry/exit
+      behavior without tuning constants.
+- [ ] Replay the reference route in both backends. Positions, speed, heading, grounding, and
+      camera must match within documented tolerances before any cleanup or optimization.
+
+#### 3. Restore firing and animations by evidence
+
+- [ ] Run the original firing implementation unchanged under WebGPU first: muzzle flash,
+      tracer, impact, audio, pointer-lock aiming, cadence, and exit cleanup.
+- [ ] If a specific material or render pass actually fails, adapt only that boundary and
+      document the failing screenshot/error and the smallest fix. Do not replace the entire
+      firing system speculatively.
+- [ ] Visually compare the Patria wheel, turret, gun, muzzle, tracer, and impact animation
+      against WebGL. Headless object counts are insufficient.
+
+#### 4. Repair the V-22 without another Blender round-trip
+
+- [ ] Use the existing separated GLB geometry and patch the authoritative metadata/runtime
+      to nacelle tilt axis Y and rotor spin axis Z.
+- [ ] Validate model-space static poses with axis helpers: hover, mid-transition, and cruise.
+      Confirm the conversion sign, both hub pivots, rotor parenting, and counter-rotation.
+- [ ] Restore the original game-friendly controls and automatic transition before adding
+      any new lift model. Engine spool may remain visual, but must not redefine the controls.
+- [ ] Add the existing 4K body/glass PBR masters without Blender: preserve cockpit maps,
+      bind sRGB albedo, normal, correctly packed metallic/roughness, and transparent glass to
+      the rigged model's existing UVs.
+- [ ] Accept only after takeoff, hover, forward travel, automatic transition, landing,
+      camera, textures, nacelles, and rotors are visually correct in the full WebGPU scene.
+
+#### 5. Replace the vehicle control panel with an informational HUD
+
+- [ ] Remove Drive/Exit/Camera/Lights/Turret/Engine/Convert action buttons.
+- [ ] Show actual speed and the keys to press. Ground HUD target:
+      `PATRIA AMV | 42 km/h | W/S drive | A/D steer | V camera | L lights | T turret | Esc exit`.
+- [ ] Aircraft HUD target includes km/h and knots, vertical speed, and the accepted keys.
+- [ ] Before control is active, show selection/entry hints only: left-click select,
+      right-click enter.
+- [ ] Remove bare `R`. Add a small Reset View action outside the vehicle HUD, require
+      confirmation, and list exactly which saved camera/tuning/time state it clears.
+
+#### 6. Restore discoverability and navigation
+
+- [ ] Make Patria and V-22 markers visible and selectable in the existing `M` map without
+      changing their persisted positions.
+- [ ] Restore the corrected local WebGPU Google navigator from `bfc54ba`, `dc9be26`, and
+      `e212b5a`, including explicit Navigate and exact WGS84-to-EPSG:3413 placement.
+- [ ] `G` toggles the navigator. Map selection must not move the camera until Navigate is
+      explicitly activated.
+
+#### 7. Performance and final acceptance gates
+
+- [ ] Record stationary warmed full-scene FPS/frame time with vehicles hidden and visible;
+      the delta identifies vehicle-specific render cost without blaming the vehicle for the
+      known cloud/LAAS/post costs.
+- [ ] Record the same Patria route at normal WebGL and WebGPU performance. Do not change the
+      historical `0.05` clamp during this comparison.
+- [ ] After rendering performance is healthy, force 60/15/5 fps and decide whether a shared
+      fixed-step gameplay clock is needed. If implemented, tab resume must not teleport,
+      gameplay must not enter slow motion, and both renderers must use the same clock.
+- [ ] Final visual sign-off must cover Patria handling/grounding/camera/firing, V-22
+      controls/camera/materials/nacelles/rotors, both map systems, HUD hints/speed, and reset
+      safety. Tests/builds support this sign-off but cannot replace it.
+
+### Explicit non-goals during vehicle recovery
+
+- No shadow-resolution changes, vegetation-density cuts, LOD removals, material removals,
+  view-distance reductions, or other graphics shortcuts.
+- No new VTOL control scheme, firing rewrite, wheel-rig rewrite, or camera redesign before
+  accepted WebGL behavior is restored.
+- No wholesale shared-application merge while parallel terrain/graphics work is active.
+  Share the vehicle gameplay boundary first; schedule broader application consolidation as
+  a coordinated follow-up so it cannot overwrite active renderer work.

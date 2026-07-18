@@ -81,8 +81,8 @@
       "headingOffsetDeg": -90,
       "parts": {
         "body": ["Object_2"],
-        "leftNacelle": ["Object_5", "Object_6"],
-        "rightNacelle": ["Object_7", "Object_8"],
+        "leftNacelle": ["V22_Nacelle_Left"],
+        "rightNacelle": ["V22_Nacelle_Right"],
         "leftRotor": "V22_Rotor_Left",
         "rightRotor": "V22_Rotor_Right"
       },
@@ -101,6 +101,8 @@
       "nacelles": {
         "tiltSpeedDegS": 12.2,
         "rotorRadiusM": 5.8,
+        "tiltAxis": "z",
+        "tiltDirection": 1,
         "rotorAxis": "y",
         "rotorSpeedRpm": 397,
         "rotorResponseSeconds": 3.5,

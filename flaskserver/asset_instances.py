@@ -262,6 +262,8 @@ class NacelleConfigModel(BaseModel):
   rotorRadiusM: float = Field(gt=0)
   leftCenter: tuple[float, float, float]
   rightCenter: tuple[float, float, float]
+  tiltAxis: Literal["x", "y", "z"] = "z"
+  tiltDirection: Literal[-1, 1] = 1
   rotorAxis: Literal["x", "y", "z"] = "y"
   rotorSpeedRpm: float = Field(default=397, gt=0)
   rotorResponseSeconds: float = Field(default=3.5, gt=0)

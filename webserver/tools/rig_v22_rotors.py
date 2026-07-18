@@ -1,11 +1,11 @@
-"""Split the material-merged V-22 propellers into two pivoted GLB objects.
+"""Rig the material-merged V-22 propellers and conversion nacelles.
 
 Run with Blender, not CPython:
   blender --background --factory-startup --python tools/rig_v22_rotors.py
 
 The source asset is preserved. The generated asset is validated by re-importing it and
-checking polygon counts, rotor names, hub pivots, and byte-identical embedded textures
-before the script exits successfully.
+checking polygon counts, part names, pivots, hierarchy, and byte-identical embedded
+textures before the script exits successfully.
 """
 
 import argparse
@@ -33,6 +33,9 @@ HUBS = {
 }
 AXIAL_TOLERANCE = 0.8
 ROTOR_RADIUS = 6.25
+NACELLE_X_BOUNDS = (-3.3, 0.3)
+NACELLE_Y_BOUNDS = (-3.2, 2.1)
+NACELLE_HALF_SPAN = 1.3
 
 
 def parse_args():
@@ -116,6 +119,15 @@ def component_is_rotor(mesh, indices, hub):
     return axial_max <= AXIAL_TOLERANCE and radial_max <= ROTOR_RADIUS
 
 
+def component_is_nacelle(mesh, indices, hub):
+    return all(
+        NACELLE_X_BOUNDS[0] <= mesh.vertices[index].co.x <= NACELLE_X_BOUNDS[1]
+        and NACELLE_Y_BOUNDS[0] <= mesh.vertices[index].co.y <= NACELLE_Y_BOUNDS[1]
+        and abs(mesh.vertices[index].co.z - hub.z) <= NACELLE_HALF_SPAN
+        for index in indices
+    )
+
+
 def separate_rotor_part(source, side, hub):
     mesh = source.data
     selected = {
@@ -149,18 +161,51 @@ def separate_rotor_part(source, side, hub):
     return part
 
 
-def join_parts(parts, side, hub):
+def separate_nacelle_part(source, side, hub):
+    mesh = source.data
+    selected = {
+        index
+        for component in connected_components(mesh)
+        if component_is_nacelle(mesh, component, hub)
+        for index in component
+    }
+    if not selected:
+        return None
+    before = set(bpy.data.objects)
+    bpy.ops.object.select_all(action="DESELECT")
+    source.select_set(True)
+    bpy.context.view_layer.objects.active = source
+    bpy.ops.object.mode_set(mode="EDIT")
+    bpy.ops.mesh.select_all(action="DESELECT")
+    bpy.ops.object.mode_set(mode="OBJECT")
+    for vertex in mesh.vertices:
+        vertex.select = vertex.index in selected
+    bpy.ops.object.mode_set(mode="EDIT")
+    bpy.ops.mesh.separate(type="SELECTED")
+    bpy.ops.object.mode_set(mode="OBJECT")
+    created = list(set(bpy.data.objects) - before)
+    if len(created) != 1:
+        raise RuntimeError(
+            f"Expected one separated {side} nacelle object from {source.name}, got {len(created)}"
+        )
+    part = created[0]
+    part.name = f"V22_Nacelle_{side}_{source.name}"
+    print("V22_NACELLE_PART", side, source.name, len(part.data.vertices), len(part.data.polygons))
+    return part
+
+
+def join_parts(parts, name, hub):
     bpy.ops.object.select_all(action="DESELECT")
     for part in parts:
         part.select_set(True)
     active = parts[0]
     bpy.context.view_layer.objects.active = active
     bpy.ops.object.join()
-    active.name = f"V22_Rotor_{side}"
+    active.name = name
     parent = active.parent
     bpy.context.scene.cursor.location = parent.matrix_world @ hub if parent else hub
     bpy.ops.object.origin_set(type="ORIGIN_CURSOR", center="MEDIAN")
-    print("V22_ROTOR_JOINED", side, len(active.data.vertices), len(active.data.polygons))
+    print("V22_PART_JOINED", name, len(active.data.vertices), len(active.data.polygons))
     return active
 
 
@@ -172,7 +217,7 @@ def mesh_totals():
     )
 
 
-def validate_export(output, expected_polygons, expected_image_hashes):
+def validate_export(output, expected_polygons, expected_image_hashes, expected_part_polygons):
     if embedded_image_hashes(output) != expected_image_hashes:
         raise RuntimeError("Exported GLB changed or dropped embedded texture images")
     bpy.ops.wm.read_factory_settings(use_empty=True)
@@ -183,18 +228,31 @@ def validate_export(output, expected_polygons, expected_image_hashes):
     ]
     if any(rotor is None or rotor.type != "MESH" for rotor in exported_rotors):
         raise RuntimeError("Exported GLB is missing V22_Rotor_Left or V22_Rotor_Right")
+    exported_nacelles = [
+        bpy.data.objects.get("V22_Nacelle_Left"),
+        bpy.data.objects.get("V22_Nacelle_Right"),
+    ]
+    if any(nacelle is None or nacelle.type != "MESH" for nacelle in exported_nacelles):
+        raise RuntimeError("Exported GLB is missing V22_Nacelle_Left or V22_Nacelle_Right")
     if mesh_totals()[1] != expected_polygons:
         raise RuntimeError(
             f"Exported polygon count changed: {expected_polygons} -> {mesh_totals()[1]}"
         )
-    for rotor, hub in zip(exported_rotors, HUBS.values()):
-        if (rotor.location - hub).length > 1e-4:
-            raise RuntimeError(f"Exported pivot moved for {rotor.name}: {list(rotor.location)}")
-        if len(rotor.data.polygons) != 2622:
-            raise RuntimeError(
-                f"Unexpected geometry in {rotor.name}: {len(rotor.data.polygons)} polygons"
-            )
-    print("V22_EXPORT_VALIDATED", [(rotor.name, list(rotor.location)) for rotor in exported_rotors])
+    for rotor, nacelle, hub in zip(exported_rotors, exported_nacelles, HUBS.values()):
+        if (nacelle.location - hub).length > 1e-4:
+            raise RuntimeError(f"Exported pivot moved for {nacelle.name}: {list(nacelle.location)}")
+        if rotor.parent is not nacelle:
+            raise RuntimeError(f"{rotor.name} is not parented to {nacelle.name}")
+        for part in (rotor, nacelle):
+            expected = expected_part_polygons[part.name]
+            if len(part.data.polygons) != expected:
+                raise RuntimeError(
+                    f"Unexpected geometry in {part.name}: {len(part.data.polygons)} != {expected}"
+                )
+    print(
+        "V22_EXPORT_VALIDATED",
+        [(part.name, list(part.location), len(part.data.polygons)) for part in exported_nacelles + exported_rotors],
+    )
 
 
 def main():
@@ -220,7 +278,28 @@ def main():
             raise RuntimeError(f"Missing expected mesh {source_name}")
         for side, hub in HUBS.items():
             parts[side].append(separate_rotor_part(source_object, side, hub))
-    rotors = [join_parts(parts[side], side, hub) for side, hub in HUBS.items()]
+    rotors = [
+        join_parts(parts[side], f"V22_Rotor_{side}", hub)
+        for side, hub in HUBS.items()
+    ]
+    nacelle_parts = {side: [] for side in HUBS}
+    for source_object in list(bpy.context.scene.objects):
+        if source_object.type != "MESH" or source_object.name.startswith("V22_Rotor_"):
+            continue
+        for side, hub in HUBS.items():
+            part = separate_nacelle_part(source_object, side, hub)
+            if part is not None:
+                nacelle_parts[side].append(part)
+    if any(not values for values in nacelle_parts.values()):
+        raise RuntimeError("Failed to extract both nacelle assemblies")
+    nacelles = [
+        join_parts(nacelle_parts[side], f"V22_Nacelle_{side}", hub)
+        for side, hub in HUBS.items()
+    ]
+    for rotor, nacelle in zip(rotors, nacelles):
+        world = rotor.matrix_world.copy()
+        rotor.parent = nacelle
+        rotor.matrix_world = world
     after_vertices, after_polygons = mesh_totals()
     if (before_vertices, before_polygons) != (after_vertices, after_polygons):
         raise RuntimeError(
@@ -236,7 +315,11 @@ def main():
         export_apply=False,
         export_animations=False,
     )
-    validate_export(output, before_polygons, source_image_hashes)
+    expected_part_polygons = {
+        part.name: len(part.data.polygons)
+        for part in rotors + nacelles
+    }
+    validate_export(output, before_polygons, source_image_hashes, expected_part_polygons)
     print("V22_RIG_COMPLETE", output, sha256(output))
 
 
