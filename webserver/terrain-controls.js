@@ -30,7 +30,9 @@ export function installTerrainPointerControls({
   mouseSensitivity,
   mapPanFactor,
   isVehicleActive,
+  isTurretActive = () => false,
   onVehicleOrbit,
+  onTurretAim = () => {},
   onMapCameraChanged,
   onChanged = () => {},
 }) {
@@ -45,6 +47,11 @@ export function installTerrainPointerControls({
     onChanged();
   };
   const onMouseMove = event => {
+    if (isTurretActive()) {
+      onTurretAim(event.movementX, event.movementY);
+      onChanged();
+      return;
+    }
     if (!controls.dragging) return;
     if (controls.mapMode) {
       const action = applyMapDrag(controls, event, mouseSensitivity, mapPanFactor);
@@ -76,14 +83,19 @@ export function installTerrainPointerControls({
 export function installTerrainKeyboardControls({
   controls,
   isVehicleActive,
+  isTurretActive = () => false,
   onForwardDoubleTap,
   onEscapeVehicle,
+  onEscapeTurret = () => {},
   onToggleMap,
   onOpenPipeline,
   onOpenHeatmap,
   onReset,
   onHouseAction,
   onToggleHeadlights,
+  onCycleVehicleCamera = () => {},
+  onToggleTurret = () => {},
+  onToggleAircraftEngine = () => {},
   onChanged = () => {},
   doubleTapMs = 300,
 }) {
@@ -104,6 +116,11 @@ export function installTerrainKeyboardControls({
       }
     }
     if (event.repeat) return;
+    if (event.code === 'Escape' && isTurretActive()) {
+      onEscapeTurret();
+      controls.keys[event.code] = false;
+      return;
+    }
     if (event.code === 'Escape' && isVehicleActive()) {
       onEscapeVehicle();
       controls.keys[event.code] = false;
@@ -117,6 +134,9 @@ export function installTerrainKeyboardControls({
       return onOpenHeatmap();
     }
     if (event.code === 'KeyL' && isVehicleActive()) onToggleHeadlights();
+    if (event.code === 'KeyV' && isVehicleActive() && !isTurretActive()) onCycleVehicleCamera();
+    if (event.code === 'KeyT' && isVehicleActive()) onToggleTurret();
+    if (event.code === 'KeyE' && isVehicleActive()) onToggleAircraftEngine();
   };
   const onKeyUp = event => {
     controls.keys[event.code] = false;

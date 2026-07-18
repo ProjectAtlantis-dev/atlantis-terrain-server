@@ -20,6 +20,7 @@ import {
   vogelDiskSample,
 } from 'three/tsl';
 import type { NF, NV2, NV4 } from '../gpu/TSLTypes';
+import { bootQuery } from '../core/BootQuery';
 
 const BLOCKER_TAPS = 6;
 const PCF_TAPS = 9;
@@ -112,7 +113,7 @@ export function setupSunShadows(
 ): ShadowRig {
   // perf attribution: ?ablate=shadows (no casting) | pcss (default filter)
   const ablate = new Set(
-    (new URLSearchParams(window.location.search).get('ablate') ?? '').split(','),
+    (bootQuery().get('ablate') ?? '').split(','),
   );
   if (ablate.has('shadows')) {
     sun.castShadow = false;
@@ -150,7 +151,7 @@ export function setupSunShadows(
 
   // shadow-debug bisects: ?csmcasc=1 single cascade, ?csmfade=0 hard splits,
   // ?shadowcache=0 re-renders every cascade every frame (perf A/B)
-  const q = new URLSearchParams(window.location.search);
+  const q = bootQuery();
   const csmOpts = {
     cascades: Math.max(1, Math.min(4, Number(q.get('csmcasc') ?? 4))),
     maxFar,

@@ -11,7 +11,7 @@
  * GI, and dither fades on top.
  */
 
-import type { BufferGeometry, DataTexture } from 'three';
+import { BufferAttribute, BufferGeometry, type DataTexture } from 'three';
 import type { MeshStandardNodeMaterial, Renderer } from 'three/webgpu';
 import type { Rng, WorldSeed } from '../core/Seed';
 import { bakeBarkTextures, type BarkTextures } from '../gpu/passes/BarkSynth';
@@ -78,6 +78,50 @@ export interface VegPool {
   /** cull-sphere data (from geometry bounds, conservative over parts) */
   height: number;
   radius: number;
+}
+
+/**
+ * Deterministic aggregate LOD for small Greenland plants. These meshes are
+ * mostly repeated leaves/cards/stems, so retaining an evenly distributed
+ * triangle subset preserves the silhouette better than collapsing topology
+ * (and, critically, preserves custom `vdata` used by flowers and wind).
+ */
+function subsetGeometry(source: BufferGeometry, ratio: number): BufferGeometry {
+  const flat = source.index ? source.toNonIndexed() : source.clone();
+  const position = flat.getAttribute('position');
+  const triangleCount = Math.floor((position?.count ?? 0) / 3);
+  if (triangleCount <= 1) return flat;
+  const keep = Math.max(1, Math.min(triangleCount, Math.round(triangleCount * ratio)));
+  const selected = Array.from({ length: keep }, (_, i) =>
+    Math.min(triangleCount - 1, Math.floor(((i + 0.5) * triangleCount) / keep)),
+  );
+  const result = new BufferGeometry();
+  for (const [name, attribute] of Object.entries(flat.attributes)) {
+    const src = attribute as BufferAttribute;
+    const ArrayType = src.array.constructor as new (length: number) => typeof src.array;
+    const dst = new ArrayType(keep * 3 * src.itemSize);
+    let out = 0;
+    for (const triangle of selected) {
+      const begin = triangle * 3 * src.itemSize;
+      const end = begin + 3 * src.itemSize;
+      for (let at = begin; at < end; at++) dst[out++] = src.array[at] ?? 0;
+    }
+    result.setAttribute(name, new BufferAttribute(dst, src.itemSize, src.normalized));
+  }
+  result.computeBoundingBox();
+  result.computeBoundingSphere();
+  return result;
+}
+
+function lodParts(parts: PoolPart[], ratio: number): PoolPart[] {
+  return parts.map(part => {
+    const geo = subsetGeometry(part.geo, ratio);
+    return {
+      ...part,
+      geo,
+      tris: geo.getAttribute('position').count / 3,
+    };
+  });
 }
 
 /**
@@ -184,12 +228,14 @@ export async function buildVegLibrary(
   renderer: Renderer,
   seed: WorldSeed,
   progress: (p: number, msg: string) => void = () => {},
+  options: { treeless?: boolean } = {},
 ): Promise<VegLib> {
+  const treeless = options.treeless === true;
   // ---- shared captures -------------------------------------------------------
   progress(0, 'veg: capturing foliage atlases');
   const atlases = new Map<string, DataTexture>();
   for (const sp of [
-    ...TREE_SPECIES,
+    ...(treeless ? [] : TREE_SPECIES),
     ...UNDERSTORY_SPECIES,
     BUSH_BILBERRY,
     BUSH_BEARBERRY,
@@ -200,7 +246,11 @@ export async function buildVegLibrary(
   }
   progress(0.2, 'veg: baking bark textures');
   const barks = new Map<number, BarkTextures>();
-  const layers = new Set<number>([...TREE_SPECIES.map((s) => s.barkLayer), 2, 5]);
+  const layers = new Set<number>([
+    ...(treeless ? [] : TREE_SPECIES.map((s) => s.barkLayer)),
+    2,
+    5,
+  ]);
   for (const layer of layers) {
     barks.set(layer, await bakeBarkTextures(renderer, layer, seed.sub(`bark/${layer}`) % 977));
   }
@@ -248,7 +298,7 @@ export async function buildVegLibrary(
     return parts;
   };
 
-  for (let ci = 0; ci < TREE_SPECIES.length; ci++) {
+  for (let ci = 0; ci < (treeless ? 0 : TREE_SPECIES.length); ci++) {
     const sp = TREE_SPECIES[ci] as SpeciesParams;
     for (let v = 0; v < TREE_VARIANTS; v++) {
       const label = `veg/${sp.id}/${v}`;
@@ -298,7 +348,7 @@ export async function buildVegLibrary(
   // ---- tree impostors (variant 0 R1 geometry, relightable octahedral) -------
   progress(0.56, 'veg: capturing octahedral impostors');
   const impostors = new Map<number, ImpostorAtlas>();
-  for (let ci = 0; ci < TREE_SPECIES.length; ci++) {
+  for (let ci = 0; ci < (treeless ? 0 : TREE_SPECIES.length); ci++) {
     const sp = TREE_SPECIES[ci] as SpeciesParams;
     const t = buildTree(sp, seed.rng(`veg/${sp.id}/0`), {
       lod: 1,
@@ -806,6 +856,23 @@ export async function buildVegLibrary(
     });
   }
   clsMaxDist[VegClass.Branch] = 230;
+
+  // Greenland is treeless, but it still needs the renderer architecture that
+  // made LAAS affordable. Every understory species gets three real geometry
+  // rings: full silhouette near, distributed 45% aggregate mid, 15% far.
+  // TerrainMaterial owns the final ground-scale representation after r2.
+  for (const pool of pools) {
+    const understory =
+      (pool.cls >= VegClass.BushHazel && pool.cls <= VegClass.FlowerCotton) ||
+      (pool.cls >= VegClass.CushionCampion && pool.cls <= VegClass.Cloudberry);
+    if (!understory || !pool.r1?.length) continue;
+    const full = pool.r1;
+    pool.r0 = full;
+    pool.r1 = lodParts(full, 0.45);
+    pool.r2 = lodParts(full, 0.15);
+    pool.trisR1 = pool.r1.reduce((sum, part) => sum + part.tris, 0);
+    pool.trisR2 = pool.r2.reduce((sum, part) => sum + part.tris, 0);
+  }
 
   progress(1, 'veg: pools ready');
   return { pools, impostors, clsHeight, clsRadius, clsMaxDist, atlases, barks };

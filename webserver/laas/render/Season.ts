@@ -13,6 +13,7 @@ import { float, mix, vec3 } from 'three/tsl';
 import { runiform } from '../gpu/RenderUniform';
 import type { NF, NV3 } from '../gpu/TSLTypes';
 import { AUTUMN, SPRING, WINTER } from '../world/WorldConst';
+import { bootQuery } from '../core/BootQuery';
 
 export const seasonU = {
   spring: runiform(SPRING),
@@ -85,7 +86,7 @@ export function seasonFlower(petal: NV3, dormant: NV3): NV3 {
  * ?freeze=1 (the screenshot tool) so captures stay clean.
  */
 export function mountSeasonUI(): void {
-  if (new URLSearchParams(window.location.search).get('freeze') === '1') return;
+  if (bootQuery().get('freeze') === '1') return;
   const bar = document.createElement('div');
   bar.id = 'season-ui';
   bar.style.cssText = [

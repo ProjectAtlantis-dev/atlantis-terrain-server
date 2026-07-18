@@ -48,6 +48,12 @@ export default defineConfig({
     ]
   },
   server: {
+    // Listen on all interfaces (IPv4 + IPv6): needed for tailnet access —
+    // both `tailscale serve` (which dials 127.0.0.1) and direct
+    // http://<tailscale-ip>:5173. Default binding was IPv6 loopback only.
+    host: true,
+    // Allow the tailscale-serve HTTPS hostname through vite's Host check.
+    allowedHosts: ['.ts.net'],
     proxy: {
       '/api': 'http://localhost:5180'
     }

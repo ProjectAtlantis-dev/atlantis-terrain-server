@@ -7,7 +7,7 @@
  * ((x+0.5)/res − 0.5)·WORLD_SIZE on both axes (x→world x, y→world z).
  */
 
-import { FloatType, HalfFloatType, NearestFilter, RedFormat } from 'three';
+import { FloatType, HalfFloatType, LinearFilter, NearestFilter, RedFormat } from 'three';
 import type { ComputeNode, Renderer } from 'three/webgpu';
 import { StorageBufferAttribute, StorageTexture } from 'three/webgpu';
 import {
@@ -46,6 +46,23 @@ import { makeMacroParams, type MacroParams } from './MacroMap';
 import { WORLD_SIZE, qualityConfig, type QualityConfig } from './WorldConst';
 
 export type ProgressFn = (p: number, msg: string) => void;
+
+export interface ExternalFieldSample {
+  veg: number;
+  rock: number;
+  snow: number;
+  water: number;
+  moisture: number;
+}
+
+function externalBiomeId(f: ExternalFieldSample): number {
+  if (f.snow > 0.55) return 0; // nival
+  if (f.rock > 0.72 && f.veg < 0.3) return 1; // fell field
+  if (f.moisture > 0.68 && f.veg > 0.2) return 5; // mire
+  if (f.veg > 0.7 && f.moisture > 0.25) return 4; // grass-sedge meadow
+  if (f.veg < 0.22) return 2; // sparse tundra
+  return 3; // dwarf-shrub heath
+}
 
 export class Heightfield {
   readonly cfg: QualityConfig;
@@ -204,11 +221,10 @@ export class Heightfield {
    * GREENLAND GRAFT KEYSTONE — build a Heightfield from EXTERNAL elevation
    * (real ArcticDEM) instead of GPU synthesis. Seeds the height buffer from a
    * CPU sampler over the WORLD_SIZE patch (centred, +x east / +z north),
-   * derives normals + heightTex, and (first milestone) fills MINIMAL
-   * fields/biome/water so GroundRing lays a grass carpet everywhere non-water.
-   * Real erosion/hydrology (runErosion/runFlowRivers) and the /api/fields
-   * classifier layer on top of this next, reusing the same downstream passes
-   * as generate().
+   * derives normals + heightTex, and fuses the real /api/fields classifier into
+   * the LAAS fields/biome/water resources consumed by GroundRing and Forests.
+   * Erosion/hydrology can layer on later without changing this external-data
+   * contract.
    */
   static async fromExternal(
     renderer: Renderer,
@@ -216,8 +232,7 @@ export class Heightfield {
     opts: {
       res: number;
       sampleDEM: (wx: number, wz: number) => number;
-      biomeId?: number; // 3 = dwarf-shrub heath (Greenland default)
-      vegDensity?: number;
+      sampleFields: (wx: number, wz: number) => ExternalFieldSample;
       worldSize?: number;
       cpuReadback?: boolean;
       progress?: ProgressFn;
@@ -269,11 +284,16 @@ export class Heightfield {
     const hf = new Heightfield(cfg, mp, synth, heightTex, normalTex, worldSize);
     hf.simRes = res;
 
+    progress(0.38, 'terrain: baking material noise textures');
+    const noise = await bakeNoiseTextures(renderer);
+    hf.noiseA = noise.texA;
+    hf.noiseB = noise.texB;
+
     progress(0.5, 'terrain: deriving normals');
     await hf.rebuildDerivedMaps(renderer);
 
-    // MINIMAL classifier fields (the real /api/fields fuse layers on next)
-    await hf.buildMinimalFields(renderer, res, opts.biomeId ?? 3, opts.vegDensity ?? 0.9);
+    progress(0.72, 'terrain: fusing satellite classifier fields');
+    await hf.writeExternalFields(renderer, opts.sampleFields, arr);
 
     if (opts.cpuReadback !== false) {
       progress(0.9, 'terrain: height readback');
@@ -283,47 +303,75 @@ export class Heightfield {
     return hf;
   }
 
-  /** zero-hydrology fieldsTex + uniform biome + dry waterY → grass everywhere
-   *  non-water. Placeholder until the real classifier/hydrology fuse lands. */
-  private async buildMinimalFields(
+  /** Upload classifier-backed maps into stable GPU resources. The same method
+   * mutates them during recentering so GroundRing's compiled node graph keeps
+   * valid texture/buffer references. */
+  private async writeExternalFields(
     renderer: Renderer,
-    res: number,
-    biomeId: number,
-    veg: number,
+    sampleFields: (wx: number, wz: number) => ExternalFieldSample,
+    heights: Float32Array,
   ): Promise<void> {
-    const fields = new StorageTexture(res, res); // rgba16f: moisture, flow, riverDepth, waterSurf
-    fields.type = HalfFloatType;
-    fields.generateMipmaps = false;
-    const biome = new StorageTexture(res, res); // rgba8: biomeId/8, snow, vegDensity, rockExposure
-    biome.generateMipmaps = false;
-    const bx = biomeId / 8;
+    const res = this.res;
+    const N = res * res;
+    if (!this.fieldsTex) {
+      this.fieldsTex = new StorageTexture(res, res);
+      this.fieldsTex.type = HalfFloatType;
+      this.fieldsTex.minFilter = LinearFilter;
+      this.fieldsTex.magFilter = LinearFilter;
+      this.fieldsTex.generateMipmaps = false;
+    }
+    if (!this.biomeTex) {
+      this.biomeTex = new StorageTexture(res, res);
+      this.biomeTex.minFilter = LinearFilter;
+      this.biomeTex.magFilter = LinearFilter;
+      this.biomeTex.generateMipmaps = false;
+    }
+    if (!this.waterY) this.waterY = instancedArray(N, 'float') as SynthesisResult['height'];
+
+    const fieldValues = new Float32Array(N * 4);
+    const biomeValues = new Float32Array(N * 4);
+    const waterValues = new Float32Array(N);
+    for (let y = 0; y < res; y++) {
+      const wz = ((y + 0.5) / res - 0.5) * this.worldSize;
+      for (let x = 0; x < res; x++) {
+        const wx = ((x + 0.5) / res - 0.5) * this.worldSize;
+        const i = y * res + x;
+        const f = sampleFields(wx, wz);
+        const water = Math.max(0, Math.min(1, f.water));
+        const dry = water <= 0.45;
+        const veg = dry ? Math.max(0, Math.min(1, f.veg)) : 0;
+        const rock = dry ? Math.max(0, Math.min(1, f.rock)) : 0;
+        const snow = Math.max(0, Math.min(1, f.snow));
+        const moisture = Math.max(water, Math.max(0, Math.min(1, f.moisture)));
+        const waterSurface = dry ? -1e4 : heights[i] + 0.02;
+        // Scatter's standing-water exclusion expects a positive depth, while
+        // GroundRing samples waterY directly against the bed. Keep those two
+        // representations explicit instead of letting lakes accept plants.
+        const classifierSurface = dry ? -1e4 : heights[i] + 1;
+        fieldValues.set([moisture, 0, 0, classifierSurface], i * 4);
+        biomeValues.set([externalBiomeId({ veg, rock, snow, water, moisture }) / 8, snow, veg, rock], i * 4);
+        waterValues[i] = waterSurface;
+      }
+    }
+    const fieldsSrc = storage(new StorageBufferAttribute(fieldValues, 4), 'vec4', N);
+    const biomeSrc = storage(new StorageBufferAttribute(biomeValues, 4), 'vec4', N);
+    const waterSrc = storage(new StorageBufferAttribute(waterValues, 1), 'float', N);
+    const fieldsTex = this.fieldsTex;
+    const biomeTex = this.biomeTex;
+    const waterY = this.waterY;
     const fillK = Fn(() => {
       const i = instanceIndex;
-      If(i.greaterThanEqual(res * res), () => {
+      If(i.greaterThanEqual(N), () => {
         Return();
       });
       const x = i.mod(res);
       const y = i.div(res);
-      textureStore(fields, uvec2(x.toUint(), y.toUint()), vec4(0.5, 0, 0, 0)).toWriteOnly();
-      textureStore(biome, uvec2(x.toUint(), y.toUint()), vec4(bx, 0, veg, 0)).toWriteOnly();
-    })().compute(res * res);
-    fillK.setName('minimalFields');
+      textureStore(fieldsTex, uvec2(x.toUint(), y.toUint()), fieldsSrc.element(i)).toWriteOnly();
+      textureStore(biomeTex, uvec2(x.toUint(), y.toUint()), biomeSrc.element(i)).toWriteOnly();
+      waterY.element(i).assign(waterSrc.element(i));
+    })().compute(N);
+    fillK.setName('externalClassifierFields');
     await renderer.computeAsync(fillK);
-    this.fieldsTex = fields;
-    this.biomeTex = biome;
-
-    // dry waterY (sim res = height res here): −1e4 everywhere → nothing gated as water
-    const wy = instancedArray(res * res, 'float') as SynthesisResult['height'];
-    const wK = Fn(() => {
-      const i = instanceIndex;
-      If(i.greaterThanEqual(res * res), () => {
-        Return();
-      });
-      wy.element(i).assign(float(-1e4));
-    })().compute(res * res);
-    wK.setName('minimalWaterY');
-    await renderer.computeAsync(wK);
-    this.waterY = wy;
   }
 
   /**
@@ -331,12 +379,14 @@ export class Heightfield {
    * sampler + re-derive normals, MUTATING the existing buffers so GroundRing's
    * references stay valid. Called ONLY when the player crosses into a new tile
    * (not per frame) — this is what lets the detail window follow the camera
-   * without a rebuild. DEM-independent fields (biome/water) are left as-is.
+   * without a rebuild. The classifier textures and water buffer are mutated in
+   * the same pass so the moved window never keeps stale vegetation placement.
    */
   async reseed(
     renderer: Renderer,
     sampleDEM: (wx: number, wz: number) => number,
     cpuReadback = true,
+    sampleFields?: (wx: number, wz: number) => ExternalFieldSample,
   ): Promise<void> {
     const res = this.res;
     const N = res * res;
@@ -359,6 +409,7 @@ export class Heightfield {
     k.setName('demReseed');
     await renderer.computeAsync(k);
     await this.rebuildDerivedMaps(renderer);
+    if (sampleFields) await this.writeExternalFields(renderer, sampleFields, arr);
     if (cpuReadback) {
       const ab = await renderer.getArrayBufferAsync(this.height.value);
       this.cpuHeights = new Float32Array(ab);

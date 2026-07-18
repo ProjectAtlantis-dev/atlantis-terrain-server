@@ -54,6 +54,7 @@ import { GradeUniforms, gradeParamsAt } from './ColorScript';
 import { runiform } from '../gpu/RenderUniform';
 import { gtaoLayer } from './Gtao';
 import { HalfResMrtNode, type HalfResEntry } from './HalfResMrt';
+import { bootQuery } from '../core/BootQuery';
 
 export class PostStack {
   readonly post: RenderPipeline;
@@ -69,7 +70,7 @@ export class PostStack {
     froxels: Froxels | null = null,
   ) {
     const { renderer, scene, camera } = engine;
-    const q = new URLSearchParams(window.location.search);
+    const q = bootQuery();
     const cloudview = q.get('cloudview');
     // perf attribution: ?ablate=clouds,ao,taa,bloom disables stages
     const ablate = new Set((q.get('ablate') ?? '').split(','));
@@ -633,7 +634,7 @@ export class PostStack {
   // ?lockexp=1 — freeze auto-exposure at its boot value: motion probes diff
   // frames across runs and the meter's adaptation transient otherwise
   // dominates the signal (probe-cloudlag pitch runs)
-  private lockExposure = new URLSearchParams(window.location.search).get('lockexp') === '1';
+  private lockExposure = bootQuery().get('lockexp') === '1';
 
   setTimeOfDay(tod: number): void {
     this.grade.apply(gradeParamsAt(tod));

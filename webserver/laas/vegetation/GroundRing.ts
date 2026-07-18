@@ -44,7 +44,6 @@ import {
   atomicAdd,
   atomicLoad,
   atomicStore,
-  cameraPosition,
   float,
   instanceIndex,
   instancedArray,
@@ -78,6 +77,7 @@ import type { NB, NF, NI, NU, NV2, NV3, NV4 } from '../gpu/TSLTypes';
 import type { Heightfield } from '../world/Heightfield';
 import type { ProbeGI } from '../gpu/passes/ProbeGI';
 import { seasonU } from '../render/Season';
+import { vegViewPos } from '../render/VegInstance';
 import {
   barkChipGeometry,
   debrisMaterial,
@@ -88,9 +88,11 @@ import {
 import { buildRock } from './RockBuilder';
 import type { WorldSeed } from '../core/Seed';
 import { runiform } from '../gpu/RenderUniform';
+import { bootQuery } from '../core/BootQuery';
 
-const GRASS_GRID = 3072;
-const GRASS_CELL = 0.105; // m → ±161 m ring, ~90 slots/m²
+const GRASS_GRID = 1536;
+const GRASS_CELL = 0.21; // m → ±161 m ring, ~23 five-blade clumps/m²
+const GRASS_BASE_WIDEN = GRASS_CELL / 0.105;
 const GRASS_R = 155;
 const G_NEAR = 30;
 const G_MID = 70;
@@ -790,7 +792,7 @@ export class GroundRing {
       // grass layers shade 2-8x per pixel without a prepass (random draw
       // order defeats early-Z); twin shares geometry = same indirect slot
       const noPrepass =
-        new URLSearchParams(window.location.search).get('prepass') === '0';
+        bootQuery().get('prepass') === '0';
       if (this.useDepthPrepass && !noPrepass && (spec.g <= 2 || spec.g === 8)) {
         const matS = spec.mat as unknown as { positionNode: unknown; maskNode: unknown };
         this.prepassGroup.add(
@@ -837,12 +839,17 @@ export class GroundRing {
     // taller than short sedge/moss-grass drifts).
     const drift = cellHash2(wc.mul(0.05).floor(), bind.salt ^ 0x7777);
     const tilt = cellHash2(wc, bind.salt ^ 0x4545).sub(0.5).mul(0.5);
-    const dist = wpos.sub(vec2(cameraPosition.x, cameraPosition.z)).length();
+    // GroundRing can live under a rotation/translation island in the Greenland
+    // client. `cameraPosition` is then ECEF while `wpos` is LAAS-local, which
+    // pushes every near/mid fade past its cutoff and leaves only the unfaded
+    // outer tuft ring visible. Forests already publishes the main proxy-camera
+    // position through vegViewPos; keep every vegetation LOD in that one frame.
+    const dist = wpos.sub(vec2(vegViewPos.x, vegViewPos.z)).length();
     // width compensation for the continuous thinning — coverage conserved.
     // far mode: coarse-grid super-tufts have their own fixed footprint
     const widen = far
       ? h2.y.mul(0.8).add(1.6)
-      : float(1).div(grassThin(dist).sqrt()).clamp(1, 4);
+      : float(GRASS_BASE_WIDEN).div(grassThin(dist).sqrt()).clamp(GRASS_BASE_WIDEN, 5);
     // GREENLAND: heath/tundra/fell are dwarf-shrub + MOSS ground — a low dense
     // MAT, not tall grass. Sample the zone and shorten the sward hard there so
     // it reads as tundra ground-cover; meadow & mire keep tall grass/sedge.
@@ -1065,7 +1072,7 @@ export class GroundRing {
       normalLocal.assign(n);
       return vec3(rx.add(wpos.x), ls.y.add(y).sub(sink), rz.add(wpos.y));
     })();
-    const dist = wpos.sub(vec2(cameraPosition.x, cameraPosition.z)).length();
+    const dist = wpos.sub(vec2(vegViewPos.x, vegViewPos.z)).length();
     bandFade(mat, dist, null, DEB_R - 6, 5);
   }
 

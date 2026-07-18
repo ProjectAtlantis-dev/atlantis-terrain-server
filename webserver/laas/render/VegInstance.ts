@@ -40,6 +40,7 @@ import { vegWindOffset, windContext, type WindBind } from './Wind';
 import { trampleOffset } from './Trample';
 import { seasonBloom, seasonU } from './Season';
 import { runiform } from '../gpu/RenderUniform';
+import { bootQuery } from '../core/BootQuery';
 
 /**
  * Main-camera position for LOD-ring fades. NEVER use TSL `cameraPosition`
@@ -176,8 +177,13 @@ export function applyInstanceTint(
   tintK: number,
 ): void {
   if (tintK <= 0) return;
-  const h1 = varying(slotHash(slot, 17));
-  const h2 = varying(slotHash(slot, 91));
+  // Pack both per-instance hashes into one interpolator. Several full tundra
+  // materials already sit at the WebGPU 16-location vertex-output limit;
+  // separate scalar varyings pushed them to location 16 and invalidated the
+  // pipeline on Apple/Chrome even though both values are instance-constant.
+  const hashes = varying(vec2(slotHash(slot, 17), slotHash(slot, 91)));
+  const h1 = hashes.x;
+  const h2 = hashes.y;
   const warmCool = mix(
     vec3(1 + tintK, 1, 1 - tintK * 0.8),
     vec3(1 - tintK * 0.8, 1, 1 + tintK),
@@ -279,7 +285,7 @@ export function instanceVeg(
   applyInstanceTint(mat, slot, bind.tint ?? 0.12);
 
   // ?facedbg=1 — winding diagnosis: front faces green, back faces red
-  if (new URLSearchParams(window.location.search).get('facedbg') === '1') {
+  if (bootQuery().get('facedbg') === '1') {
     mat.colorNode = frontFacing.select(vec4(0, 1, 0, 1), vec4(1, 0, 0, 1));
     mat.side = DoubleSide;
   }
@@ -302,7 +308,7 @@ export function instanceVeg(
   const op = mat.opacityNode as unknown as NF | null;
   if (op) {
     const cut = Number(
-      new URLSearchParams(window.location.search).get('shadcut') ?? 0.35,
+      bootQuery().get('shadcut') ?? 0.35,
     );
     (mat as unknown as { maskShadowNode: unknown }).maskShadowNode = op.greaterThan(
       Math.max(mat.alphaTest, Number.isFinite(cut) ? cut : 0.35),

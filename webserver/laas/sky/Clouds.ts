@@ -41,6 +41,7 @@ import { windU } from '../render/Wind';
 import { WORLD_SIZE } from '../world/WorldConst';
 import type { Atmosphere } from './Atmosphere';
 import { SUN_E } from './Atmosphere';
+import { bootQuery } from '../core/BootQuery';
 
 const BASE_RES = 96;
 const DETAIL_RES = 32;
@@ -82,7 +83,7 @@ export class Clouds {
   constructor(atmosphere: Atmosphere) {
     this.atmosphere = atmosphere;
     // tuning overrides: ?cov=0.6&cdens=1.2
-    const q = new URLSearchParams(window.location.search);
+    const q = bootQuery();
     const covQ = Number(q.get('cov') ?? NaN);
     const densQ = Number(q.get('cdens') ?? NaN);
     if (Number.isFinite(covQ)) this.coverage.value = covQ;

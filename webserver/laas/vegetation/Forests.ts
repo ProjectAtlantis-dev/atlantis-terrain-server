@@ -87,6 +87,7 @@ import { instanceVeg, updateVegViewPos, type RingFade } from '../render/VegInsta
 import { depthPrepassTwin } from '../render/VegPrepass';
 import type { NF, NI, NU, NV3, NV4 } from '../gpu/TSLTypes';
 import type { VegLib } from './VegLibrary';
+import { bootQuery } from '../core/BootQuery';
 
 // ring distances (m) + dither bands (user feedback: transitions read too
 // close — full-card trees hold to 150 m, impostors start at 460 m).
@@ -126,7 +127,9 @@ const MAIN_GROUPS = HERO_BASE + 6 * 4;
  * they fade out by IMP_CAST_FAR instead.
  */
 const CASC_LOCALS = 142;
-const CASCADES = 4;
+// Atlantis configures three CSM cascades. Building/culling a fourth set of
+// caster groups wastes compute and draw traversal without a camera consuming it.
+const CASCADES = 3;
 const GROUPS = MAIN_GROUPS + CASCADES * CASC_LOCALS;
 /** crown-proxy shadows fade out across this band (m from camera) */
 const IMP_CAST_FADE0 = 620;
@@ -366,7 +369,7 @@ export class Forests {
     const draws: DrawSpec[] = [];
     const meshes: Mesh[] = [];
 
-    const prepassQ = new URLSearchParams(window.location.search).get('prepass');
+    const prepassQ = bootQuery().get('prepass');
     const noPrepass = prepassQ === '0' || prepassQ === 'grass';
     const addDraw = (
       geo: import('three').BufferGeometry,
@@ -485,7 +488,28 @@ export class Forests {
         return { fadeInAt: R2_FAR, band: BAND2 };
       }
       const maxD = this.lib.clsMaxDist[cls] ?? 150;
-      if (isUnderClass(cls)) return { fadeOutAt: maxD - 15, band: 15 };
+      if (isUnderClass(cls)) {
+        const nearD = Math.min(34, maxD * 0.34);
+        const midD = Math.min(82, maxD * 0.7);
+        const nearBand = Math.min(8, nearD * 0.24);
+        const midBand = Math.min(12, Math.max(7, (midD - nearD) * 0.25));
+        const edgeBand = Math.min(14, Math.max(8, (maxD - midD) * 0.45));
+        if (ring === 0) return { fadeOutAt: nearD, band: nearBand };
+        if (ring === 1) {
+          return {
+            fadeInAt: nearD,
+            inBand: nearBand,
+            fadeOutAt: midD,
+            band: midBand,
+          };
+        }
+        return {
+          fadeInAt: midD,
+          inBand: midBand,
+          fadeOutAt: maxD - edgeBand,
+          band: edgeBand,
+        };
+      }
       const hasR2 = cls === 18 || cls === 19 || cls === 20 || cls === 21 || cls === 23;
       if (ring === 1)
         return hasR2
@@ -504,7 +528,7 @@ export class Forests {
       // understory is grounded by contact shadows + AO instead.
       // ?ablate=casters drops ALL veg caster draws (perf attribution).
       const ablateCasters = (
-        new URLSearchParams(window.location.search).get('ablate') ?? ''
+        bootQuery().get('ablate') ?? ''
       )
         .split(',')
         .includes('casters');
@@ -585,7 +609,7 @@ export class Forests {
           this.patchGI(mat);
           // ?clsdbg=1 — flat-color every draw by VegClass (artifact triage:
           // "which pool is that?"); keeps alpha cutouts so silhouettes read
-          if (new URLSearchParams(window.location.search).get('clsdbg') === '1') {
+          if (bootQuery().get('clsdbg') === '1') {
             const hue = (pool.cls * 47) % 360;
             const cdbg = new Color().setHSL(hue / 360, 0.95, 0.55);
             const op = mat.opacityNode as unknown as NF | null;

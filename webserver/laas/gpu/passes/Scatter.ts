@@ -211,7 +211,7 @@ interface SiteSamples {
 }
 
 function sampleSite(hf: Heightfield, wpos: NV2): SiteSamples {
-  const uv = wpos.div(WORLD_SIZE).add(0.5);
+  const uv = wpos.div(hf.worldSize).add(0.5);
   const h = hf.sampleHeight(wpos);
   const ns = texture(hf.normalTex, uv, 0) as unknown as NV4;
   // ecotone warp: read the biome classification through a ±26 m wobble
@@ -219,7 +219,7 @@ function sampleSite(hf: Heightfield, wpos: NV2): SiteSamples {
     fbm3(vec3(wpos.x.mul(0.011), 3.7, wpos.y.mul(0.011)), 2),
     fbm3(vec3(wpos.x.mul(0.011), 91.2, wpos.y.mul(0.011)), 2),
   ).mul(26);
-  const uvW = wpos.add(warp).div(WORLD_SIZE).add(0.5);
+  const uvW = wpos.add(warp).div(hf.worldSize).add(0.5);
   const bio = texture(
     hf.biomeTex as NonNullable<typeof hf.biomeTex>,
     uvW,
@@ -446,12 +446,13 @@ export async function runScatter(
   hf: Heightfield,
   seed: WorldSeed,
 ): Promise<ScatterResult> {
+  const worldSize = hf.worldSize;
   const sT = seed.sub('scatter/trees') & 0x7fffffff;
   const sU = seed.sub('scatter/understory') & 0x7fffffff;
   const sE = seed.sub('scatter/extras') & 0x7fffffff;
 
   // ---------------------------------------------------------------- trees --
-  const treeG = Math.round(WORLD_SIZE / TREE_CELL);
+  const treeG = Math.round(worldSize / TREE_CELL);
   const treeA = instancedArray(TREE_CAP, 'vec4');
   const treeB = instancedArray(TREE_CAP, 'vec4');
   const treeCount = instancedArray(1, 'uint').toAtomic();
@@ -463,7 +464,7 @@ export async function runScatter(
     });
     const cell = vec2(float(i.mod(treeG)), float(i.div(treeG)));
     const jit = cellHash2(cell, sT);
-    const wpos = cell.add(jit).div(treeG).sub(0.5).mul(WORLD_SIZE);
+    const wpos = cell.add(jit).div(treeG).sub(0.5).mul(worldSize);
     const s = sampleSite(hf, wpos);
 
     // hard exclusions: open/standing water, river channels, lake shelf
@@ -571,7 +572,7 @@ export async function runScatter(
   await renderer.computeAsync(treeK);
 
   // ----------------------------------------------------------- understory --
-  const underG = Math.round(WORLD_SIZE / UNDER_CELL);
+  const underG = Math.round(worldSize / UNDER_CELL);
   const underA = instancedArray(UNDER_CAP, 'vec4');
   const underB = instancedArray(UNDER_CAP, 'vec4');
   const underCount = instancedArray(1, 'uint').toAtomic();
@@ -583,7 +584,7 @@ export async function runScatter(
     });
     const cell = vec2(float(i.mod(underG)), float(i.div(underG)));
     const jit = cellHash2(cell, sU);
-    const wpos = cell.add(jit).div(underG).sub(0.5).mul(WORLD_SIZE);
+    const wpos = cell.add(jit).div(underG).sub(0.5).mul(worldSize);
     const s = sampleSite(hf, wpos);
 
     If(s.h.lessThan(LAKE_LEVEL + 0.35), () => {
@@ -705,7 +706,7 @@ export async function runScatter(
   await renderer.computeAsync(underK);
 
   // --------------------------------------------------------------- extras --
-  const extraG = Math.round(WORLD_SIZE / EXTRA_CELL);
+  const extraG = Math.round(worldSize / EXTRA_CELL);
   const extraA = instancedArray(EXTRA_CAP, 'vec4');
   const extraB = instancedArray(EXTRA_CAP, 'vec4');
   const extraCount = instancedArray(1, 'uint').toAtomic();
@@ -720,7 +721,7 @@ export async function runScatter(
     });
     const cell = vec2(float(i.mod(extraG)), float(i.div(extraG)));
     const jit = cellHash2(cell, sE);
-    const wpos = cell.add(jit).div(extraG).sub(0.5).mul(WORLD_SIZE);
+    const wpos = cell.add(jit).div(extraG).sub(0.5).mul(worldSize);
     const s = sampleSite(hf, wpos);
 
     If(s.h.lessThan(LAKE_LEVEL + 0.3), () => {
@@ -827,7 +828,7 @@ export async function runScatter(
   // light scatter on all soil; fallen branches on forest floors. This is
   // the "no bare ground" layer — references show ground GEOMETRY at every
   // distance, never naked splat.
-  const stoneG = Math.round(WORLD_SIZE / STONE_CELL);
+  const stoneG = Math.round(worldSize / STONE_CELL);
   const stoneA = instancedArray(STONE_CAP, 'vec4');
   const stoneB = instancedArray(STONE_CAP, 'vec4');
   const stoneCount = instancedArray(1, 'uint').toAtomic();
@@ -840,7 +841,7 @@ export async function runScatter(
     });
     const cell = vec2(float(i.mod(stoneG)), float(i.div(stoneG)));
     const jit = cellHash2(cell, sS);
-    const wpos = cell.add(jit).div(stoneG).sub(0.5).mul(WORLD_SIZE);
+    const wpos = cell.add(jit).div(stoneG).sub(0.5).mul(worldSize);
     const s = sampleSite(hf, wpos);
     If(s.h.lessThan(LAKE_LEVEL + 0.25), () => {
       Return();

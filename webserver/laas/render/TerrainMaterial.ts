@@ -40,7 +40,7 @@ import {
 import { sunU } from './VegMaterials';
 import { seasonU } from './Season';
 import { zoneMasks, type MacroParams } from '../world/MacroMap';
-import { LAKE_LEVEL, WORLD_HALF, WORLD_SIZE } from '../world/WorldConst';
+import { LAKE_LEVEL, WORLD_SIZE } from '../world/WorldConst';
 
 export interface TerrainShadingInputs {
   /** rgba16f: xyz world normal, w slope */
@@ -61,6 +61,14 @@ export interface TerrainShadingInputs {
    * beyond the world edge.
    */
   baseNormalSlope?: NV4;
+  /** LAAS-local y-up shading position override (streamed Greenland terrain). */
+  worldPosition?: NV3;
+  /** Camera in the same LAAS-local frame as worldPosition. */
+  cameraWorldPosition?: NV3;
+  /** Width represented by the field textures. */
+  worldSize?: number;
+  /** Disable synthetic-world macro zones/lake level for real Greenland data. */
+  external?: boolean;
 }
 
 export interface TerrainShading {
@@ -71,7 +79,7 @@ export interface TerrainShading {
   worldNormalNode: NV3;
 }
 
-const uvFromWorld = (p: NV2): NV2 => p.div(WORLD_SIZE).add(0.5);
+const uvFromWorld = (p: NV2, worldSize = WORLD_SIZE): NV2 => p.div(worldSize).add(0.5);
 
 /**
  * Micro-displacement constants — SHARED by the TerrainTiles vertex stage
@@ -98,9 +106,12 @@ export const DISP = {
 } as const;
 
 export function buildTerrainShading(inp: TerrainShadingInputs): TerrainShading {
-  const wp = positionWorld;
+  const wp = inp.worldPosition ?? positionWorld;
+  const cameraP = inp.cameraWorldPosition ?? cameraPosition;
+  const worldSize = inp.worldSize ?? WORLD_SIZE;
+  const worldHalf = worldSize * 0.5;
   const wxz = wp.xz;
-  const uv = uvFromWorld(wxz);
+  const uv = uvFromWorld(wxz, worldSize);
   const h = wp.y;
 
   // --- baked-noise helpers (uv = world / (scale · channel period)) -----------
@@ -117,7 +128,13 @@ export function buildTerrainShading(inp: TerrainShadingInputs): TerrainShading {
     texture(inp.noiseA, wxz.div(s * PERIOD_FBM).add(vec2(ox, oz))).zw.div(s);
   /** ridged-3 gradient (world units at feature scale s) */
   const ridG = (s: number): NV2 =>
-    texture(inp.noiseB, wxz.div(s * PERIOD_RID)).xy.div(s);
+    inp.external
+      // Atlantis lighting/CSM + satellite + five LAAS maps reaches the
+      // hardware's 16-sampler ceiling. Reuse noiseA's independent gradient
+      // channel at a decorrelated scale for real Greenland, retaining the
+      // crag/bump response without binding a seventeenth sampler.
+      ? fbmG(s * 0.73, 0.19, 0.67).mul(0.85)
+      : texture(inp.noiseB, wxz.div(s * PERIOD_RID)).xy.div(s);
   /** 1D band noise [0,1] along an arbitrary phase axis */
   const band = (phase: NF, lane: NF): NF =>
     texture(inp.noiseA, vec2(phase, lane).div(PERIOD_VAL)).x;
@@ -130,10 +147,10 @@ export function buildTerrainShading(inp: TerrainShadingInputs): TerrainShading {
   // Beyond the world edge the baked maps clamp to their last texel row and
   // SMEAR it radially across the vista shell (pale streaks). Cross-fade to
   // procedural estimates outside the domain (far shell only).
-  const outsideK = inp.far
+  const outsideK = inp.far && !inp.external
     ? smoothstep(
-        WORLD_HALF * 0.96,
-        WORLD_HALF * 1.0,
+        worldHalf * 0.96,
+        worldHalf * 1.0,
         wxz.abs().x.max(wxz.abs().y),
       )
     : float(0);
@@ -146,7 +163,9 @@ export function buildTerrainShading(inp: TerrainShadingInputs): TerrainShading {
   const moisture = mix(fields.x, float(0.35), outsideK);
   const flowStrength = mix(fields.y, float(0), outsideK);
   const riverDepth = mix(fields.z, float(0), outsideK);
-  const zm = zoneMasks(wxz, inp.mp);
+  const zm = inp.external
+    ? { tAlp: float(0), tKarst: float(0), tLake: float(0) }
+    : zoneMasks(wxz, inp.mp);
 
   // ---------- macro variation (2–50 m breakup — tiling killer) ----------------
   const macroA = val(43.7);
@@ -332,7 +351,7 @@ export function buildTerrainShading(inp: TerrainShadingInputs): TerrainShading {
   // (g0–g3); this gives the 200 m+ sward the same directional life so the
   // far layers dissolve into a live field, not flat paint.
   {
-    const vDir = positionWorld.sub(cameraPosition).normalize();
+    const vDir = wp.sub(cameraP).normalize();
     const sunD = vec3(sunU.dir as unknown as NV3).normalize();
     const toSun = vDir.dot(sunD).max(0);
     const grazing = float(1).sub(baseNormal.dot(vDir.negate()).abs()).pow2();
@@ -341,7 +360,7 @@ export function buildTerrainShading(inp: TerrainShadingInputs): TerrainShading {
       .mul(toSun.pow(3))
       .mul(grazing)
       .mul(smoothstep(0.05, 0.22, sunD.y))
-      .mul(smoothstep(60, 220, positionWorld.sub(cameraPosition).length()))
+      .mul(smoothstep(60, 220, wp.sub(cameraP).length()))
       .mul(0.55);
     col = col.add(vec3(0.085, 0.1, 0.032).mul(sheenK)) as NV3;
   }
@@ -364,7 +383,9 @@ export function buildTerrainShading(inp: TerrainShadingInputs): TerrainShading {
   col = mix(col, wallGreen, wallVeg);
 
   // wet darkening: river margins, lake shores, marshes
-  const shoreWet = smoothstep(LAKE_LEVEL + 2.5, LAKE_LEVEL + 0.3, h);
+  const shoreWet = inp.external
+    ? float(0)
+    : smoothstep(LAKE_LEVEL + 2.5, LAKE_LEVEL + 0.3, h);
   const wet = clamp(
     smoothstep(0.55, 0.95, moisture).mul(0.5).add(riverDepth.mul(2)).add(shoreWet.mul(0.6)),
     0,
@@ -376,7 +397,7 @@ export function buildTerrainShading(inp: TerrainShadingInputs): TerrainShading {
   // far-detail synthesis (Pillar D): serrated normal-domain detail keeps
   // mid/far ridges craggy where geometric density has LOD'd out. Applied by
   // DISTANCE on both near tiles and the far shell.
-  const camDist = wp.sub(cameraPosition).length();
+  const camDist = wp.sub(cameraP).length();
   const farK = inp.far ? float(1) : smoothstep(900, 2600, camDist);
   // pre-baked ridged gradient at 310 m features; ×44 ≈ the old ±22 m
   // finite-difference amplitude (×2: baked noise is [0,1], mx was [-1,1])

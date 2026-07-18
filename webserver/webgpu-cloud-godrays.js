@@ -24,6 +24,7 @@
  */
 
 import * as THREE from 'three/webgpu';
+import { RTTNode } from 'three/webgpu';
 import {
   Fn,
   float,
@@ -46,6 +47,34 @@ const CLOUD_GODRAY_MAX_DISTANCE_M = 25000;
 const CLOUD_GODRAY_ITERATIONS = 48;
 const CLOUD_GODRAY_MIN_STEP_M = 100;
 const CLOUD_GODRAY_STEP_SCALE = 1.06;
+// The march runs in a scaled offscreen target, not per output pixel: the BSM
+// segment is a soft 25 km signal, so quarter the invocations survives a
+// bilinear upsample (bucket-sweep 2026-07-18 measured the full-res march at
+// ~10.7 ms of a 36 ms frame at 1440p — the largest single bucket). Known
+// limit: plain bilinear can halo at depth silhouettes (sky/ground
+// maxDistance mismatch); revisit with a depth-aware upsample + temporal
+// reconstruction if visible (PERF_REWORK.md Tier 3).
+const CLOUD_GODRAY_RESOLUTION_SCALE = 0.5;
+
+// RTTNode auto-resize tracks the FULL drawing buffer; this keeps the target
+// at a fixed fraction of it across window resizes instead.
+const _rttSizeScratch = new THREE.Vector2();
+class ScaledRTTNode extends RTTNode {
+  constructor(node, resolutionScale) {
+    super(node, 1, 1);
+    this.resolutionScale = resolutionScale;
+  }
+
+  updateBefore(frame) {
+    const size = frame.renderer.getDrawingBufferSize(_rttSizeScratch);
+    const w = Math.max(1, Math.floor(size.width * this.resolutionScale));
+    const h = Math.max(1, Math.floor(size.height * this.resolutionScale));
+    if (w !== this.renderTarget.width || h !== this.renderTarget.height) {
+      this.setSize(w, h);
+    }
+    super.updateBefore(frame);
+  }
+}
 
 /**
  * @param {object} args
@@ -56,6 +85,8 @@ const CLOUD_GODRAY_STEP_SCALE = 1.06;
  * @param {object} args.atmosphereContext takram AtmosphereContext (matrixViewToECEF,
  *   altitudeCorrectionECEF, correctAltitude are TSL-compatible)
  * @param {number} args.worldToUnit meters → atmosphere unit scale
+ * @param {boolean} [args.fullRes=false] march per output pixel instead of in
+ *   the scaled offscreen target (A/B escape hatch, ?cloudGodRaysFull=1)
  * @returns {{ node: object, uniforms: { uStrength: object } }}
  */
 export function createCloudGodRayShadowLength({
@@ -65,6 +96,7 @@ export function createCloudGodRayShadowLength({
   camera,
   atmosphereContext,
   worldToUnit,
+  fullRes = false,
 }) {
   const uProjInv = runiform(camera.projectionMatrixInverse);
   const _camPos = new THREE.Vector3();
@@ -74,9 +106,10 @@ export function createCloudGodRayShadowLength({
   const uFrame = runiform(0).onRenderUpdate(frame => (frame.frameId ?? 0) % 4096);
   const uStrength = runiform(1);
 
-  const node = Fn(() => {
-    const csm = vec2(csmShadowLengthNode).toVar('csmShadowLength');
-
+  // vec2(shadowedLength, segmentStart) in meters along the view ray. Kept in
+  // meters (not unit space) so uStrength/worldToUnit stay in the full-res
+  // merge and tune live without re-rendering the offscreen target.
+  const cloudSegment = Fn(() => {
     // Per-pixel view ray in ECEF. Direction from a fixed finite depth (the
     // far-plane value degenerates through the inverse projection).
     const viewDir = getViewPosition(screenUV, float(0.5), uProjInv).normalize();
@@ -102,14 +135,26 @@ export function createCloudGodRayShadowLength({
       screenUV.mul(vec2(311.7, 761.3)).add(float(uFrame).mul(0.6180339887)),
     );
 
-    // vec2(shadowedLength, segmentStart) in meters along the ray.
-    const cloud = beerShadowMap
+    const segment = beerShadowMap
       .marchShadowLength(rayOrigin, rayDirection, maxDistance, jitter, {
         iterations: CLOUD_GODRAY_ITERATIONS,
         minStepSize: CLOUD_GODRAY_MIN_STEP_M,
         stepScale: CLOUD_GODRAY_STEP_SCALE,
       })
       .toVar('cloudShadowSegment');
+    return vec4(segment, 0, 1);
+  });
+
+  // Default path: march into a half-res target (linear-filtered HalfFloat),
+  // sampled here at full res = bilinear upsample.
+  const cloudSource = fullRes
+    ? cloudSegment()
+    : new ScaledRTTNode(cloudSegment(), CLOUD_GODRAY_RESOLUTION_SCALE);
+
+  const node = Fn(() => {
+    const csm = vec2(csmShadowLengthNode).toVar('csmShadowLength');
+
+    const cloud = vec2(cloudSource.xy).toVar('cloudShadowSegmentM');
     const cloudLength = cloud.x.mul(worldToUnit).mul(uStrength);
     const cloudStart = cloud.y.mul(worldToUnit);
 

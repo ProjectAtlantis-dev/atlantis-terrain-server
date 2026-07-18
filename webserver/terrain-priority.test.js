@@ -9,6 +9,7 @@ import {
 import { compassHeading } from './terrain-hud.js';
 import { applyMapDrag } from './terrain-controls.js';
 import { createVehiclePersistenceRuntime, normalizeSavedVehicleState, stepSuspension, stepVehicleDrive, vehicleLocalToLatLon, vehicleStateSnapshot } from './terrain-vehicle.js';
+import { createAircraftState, stepAircraftFlight } from './terrain-aircraft-runtime.js';
 import { meshUsesTextureClassification, scoreTextureTiles, textureRetryDelay, tileDepthFromId } from './terrain-tile-runtime.js';
 import { createTextureStreamer, rendererTextureAnisotropy } from './terrain-texture-streamer.js';
 import { createTileLifecycle } from './terrain-tile-lifecycle.js';
@@ -138,12 +139,14 @@ test('startup asset normalization clones valid records and rejects junk', () => 
   const vehicle = { id: 'v1' };
   const normalized = normalizeTerrainStartupAssets({
     vehicle_definition: { model: 'truck' },
+    vehicle_definitions: { truck: { model: 'truck' }, bad: null },
     structure_definition: null,
     vehicle_instances: [vehicle, null, 'bad'],
     structure_instances: [{ id: 's1' }, 4],
   });
   assert.deepEqual(normalized, {
     vehicle_definition: { model: 'truck' },
+    vehicle_definitions: { truck: { model: 'truck' } },
     structure_definition: {},
     vehicle_instances: [{ id: 'v1' }],
     structure_instances: [{ id: 's1' }],
@@ -187,8 +190,8 @@ test('shared startup asset loader returns complete defaults on failure', async (
       fetchImpl: async () => ({ ok: false, status: 503 }),
     });
     assert.deepEqual(result, {
-      source: 'defaults', schemaVersion: 4, seeded: null,
-      vehicle_definition: {}, structure_definition: {},
+      source: 'defaults', schemaVersion: 5, seeded: null,
+      vehicle_definition: {}, vehicle_definitions: {}, structure_definition: {},
       vehicle_instances: [], structure_instances: [],
     });
   } finally {
@@ -938,6 +941,35 @@ test('vehicle drive follows heading and respects speed limit', () => {
   assert.equal(step.speed, 12);
   assert.ok(Math.abs(step.deltaX) < 1e-12);
   assert.equal(step.deltaY, 12);
+});
+
+test('aircraft hover state is isolated and respects engine, controls, and ground floor', () => {
+  const group = { position: { x: 0, y: 0, z: 20 } };
+  const marker = { position: { set() {} } };
+  const aircraft = createAircraftState({
+    id: 'osprey-01',
+    definition: {
+      vehicleType: 'aircraft', altOffsetM: 2,
+      flight: { hoverMaxSpeedMs: 30, climbRateMs: 15, descendRateMs: 10, accelMs2: 15, yawRateRad: 1.05 },
+    },
+    instance: { headingDeg: 0 },
+    group,
+    marker,
+  });
+  aircraft.altitudeAGL = 20;
+  aircraft.engineRunning = true;
+  stepAircraftFlight(aircraft, { forward: true, climb: true, left: true }, 1, 0);
+  assert.equal(aircraft.forwardSpeedMs, 15);
+  assert.equal(aircraft.verticalSpeedMs, 15);
+  assert.equal(aircraft.headingRad, 1.05);
+  assert.ok(group.position.z > 20);
+
+  aircraft.engineRunning = false;
+  group.position.z = -5;
+  aircraft.verticalSpeedMs = -20;
+  stepAircraftFlight(aircraft, {}, 0.5, 4);
+  assert.equal(group.position.z, 6);
+  assert.equal(aircraft.verticalSpeedMs, 0);
 });
 
 test('shared vehicle persistence helpers preserve coordinates and normalize saved state', () => {

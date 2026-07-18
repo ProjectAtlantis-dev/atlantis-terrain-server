@@ -1,4 +1,5 @@
 /** URL parameter parsing — every run is fully described by its URL. */
+import { bootQuery } from './BootQuery';
 
 export type QualityPreset = 'low' | 'high' | 'ultra';
 
@@ -29,8 +30,8 @@ function num(v: string | null, fallback: number): number {
   return Number.isFinite(n) ? n : fallback;
 }
 
-export function parseParams(search: string = window.location.search): LaasParams {
-  const q = new URLSearchParams(search);
+export function parseParams(search?: string): LaasParams {
+  const q = search != null ? new URLSearchParams(search) : bootQuery();
   const presetRaw = q.get('preset') ?? 'high';
   const preset: QualityPreset =
     presetRaw === 'low' || presetRaw === 'ultra' ? presetRaw : 'high';

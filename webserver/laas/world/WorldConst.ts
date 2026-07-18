@@ -1,3 +1,4 @@
+import { bootQuery } from '../core/BootQuery';
 /**
  * World constants — the single place defining world dimensions, grid sizes,
  * vertical scale, and biome identifiers. The macro layout (where the massif,
@@ -81,7 +82,7 @@ export const enum Season {
 // SPRING / AUTUMN / WINTER palette comparisons below stay live.
 function readSeason(): Season {
   if (typeof window !== 'undefined' && window.location) {
-    const s = new URLSearchParams(window.location.search).get('season');
+    const s = bootQuery().get('season');
     if (s === 'spring') return Season.Spring;
     if (s === 'autumn') return Season.Autumn;
     if (s === 'winter') return Season.Winter;

@@ -93,6 +93,25 @@ import { priorityHeading, terrainTilePriority } from './terrain-priority.js';
 import { compassHeading, createTerrainHud, renderGameClock, TERRAIN_HUD_LINKS } from './terrain-hud.js';
 import { installTerrainKeyboardControls, installTerrainPointerControls } from './terrain-controls.js';
 import { createVehiclePersistenceRuntime, normalizeSavedVehicleState, stepSuspension, stepVehicleDrive, vehicleLocalToLatLon as terrainVehicleLocalToLatLon, vehicleStateSnapshot } from './terrain-vehicle.js';
+import { createVehicleControlUI } from './terrain-vehicle-controls-ui.js';
+import {
+  AIRCRAFT_CAMERA_MODES,
+  createAircraftState,
+  setupAircraftModelParts,
+  stepAircraftFlight,
+  updateAircraftVisuals,
+} from './terrain-aircraft-runtime.js';
+import {
+  createVehicleWheelRig,
+  createVehicleTurretRig,
+  discoverVehicleParts,
+  getVehicleWheelContactSnapshot,
+  normalizeVehiclePartDefinition,
+  spinVehicleWheelRig,
+  summarizeVehicleParts,
+  summarizeVehicleTurretRig,
+  summarizeVehicleWheelRig,
+} from './terrain-vehicle-parts.js';
 import { createTileHistory, terrainFogDistance, terrainVisibilityDistance, tileDepthFromId } from './terrain-tile-runtime.js';
 import { createTextureStreamer, rendererTextureAnisotropy } from './terrain-texture-streamer.js';
 import { createTerrainMeshRuntime } from './terrain-mesh-runtime.js';
@@ -155,6 +174,9 @@ const webgpuCloudShadowSettings = {
 // URL. Runtime tuning remains UI-owned; these values exist solely for
 // reproducible camera/procgen verification runs.
 const BOOT_QUERY = new URLSearchParams(window.location.search);
+// laas/ modules read boot flags lazily, long after the query string is
+// stripped below — laas/core/BootQuery.ts falls back to this handle.
+window.__BOOT_QUERY = BOOT_QUERY;
 function bootQueryNumber(name, fallback) {
   const raw = BOOT_QUERY.get(name);
   if (raw == null || raw.trim() === '') return fallback;
@@ -218,6 +240,13 @@ const startupAssetsResponse = await loadTerrainStartupAssets({
   bootLog,
 });
 const VEHICLE_DEFINITION = startupAssetsResponse.vehicle_definition;
+const VEHICLE_DEFINITIONS = (
+  startupAssetsResponse.vehicle_definitions != null
+  && typeof startupAssetsResponse.vehicle_definitions === 'object'
+  && Object.keys(startupAssetsResponse.vehicle_definitions).length > 0
+)
+  ? startupAssetsResponse.vehicle_definitions
+  : { default: VEHICLE_DEFINITION };
 const STRUCTURE_DEFINITION = startupAssetsResponse.structure_definition;
 const VEHICLE_HEADLIGHTS = (
   VEHICLE_DEFINITION.headlights != null &&
@@ -225,6 +254,7 @@ const VEHICLE_HEADLIGHTS = (
 )
   ? VEHICLE_DEFINITION.headlights
   : null;
+const VEHICLE_PART_CONFIG = normalizeVehiclePartDefinition(VEHICLE_DEFINITION);
 
 const scene = new THREE.Scene();
 // Black fog — aerial perspective inscatter fills in the natural sky color at distance.
@@ -282,6 +312,7 @@ let webgpuAtmosphereNode = null;
 let webgpuAtmospherePostProcessing = null;
 let webgpuCloudShadows = null;
 let webgpuCloudDensityField = null;
+let webgpuCloudTextureNodes = [];
 let webgpuCsmShadowNode = null;
 let webgpuShadowLengthNode = null;
 let webgpuActiveShadowLengthNode = null;
@@ -442,7 +473,10 @@ function createRenderBackend() {
         logarithmicDepthBuffer: true
       });
   renderer.setSize(window.innerWidth, window.innerHeight);
-  renderer.setPixelRatio(window.devicePixelRatio);
+  // Cap DPR at 2: every post pass scales with output pixels, and 3x retina
+  // fill is 2.25x the pixels of 2x for no visible gain (PERF_REWORK.md).
+  const pixelRatio = Math.min(window.devicePixelRatio, 2);
+  renderer.setPixelRatio(pixelRatio);
   renderer.shadowMap.enabled = true;
   if (!isWebGPU) {
     renderer.shadowMap.type = THREE.PCFSoftShadowMap;
@@ -457,7 +491,8 @@ function createRenderBackend() {
     backend: isWebGPU ? 'webgpu' : 'webgl',
     width: window.innerWidth,
     height: window.innerHeight,
-    pixelRatio: window.devicePixelRatio,
+    pixelRatio,
+    devicePixelRatio: window.devicePixelRatio,
     shadowMap: renderer.shadowMap.type
   });
 
@@ -1660,7 +1695,10 @@ let housesRuntimeVisible = HOUSE_MODEL.enabled;
 houseLayer.visible = housesRuntimeVisible;
 
 // ── Patria AMV vehicle ──────────────────────────────────────────────────
-const _vehicleSeedInstance = ASSET_VEHICLE_INSTANCES.length > 0 ? ASSET_VEHICLE_INSTANCES[0] : {};
+const _vehicleSeedInstance = ASSET_VEHICLE_INSTANCES.find(instance => {
+  const definition = VEHICLE_DEFINITIONS[instance?.definitionId];
+  return definition?.vehicleType !== 'aircraft';
+}) ?? ASSET_VEHICLE_INSTANCES[0] ?? {};
 const VEHICLE_MODEL = {
   url: (typeof VEHICLE_DEFINITION.url === 'string' && VEHICLE_DEFINITION.url.trim() !== '')
     ? VEHICLE_DEFINITION.url
@@ -1686,6 +1724,8 @@ bootLog('assets.loaded', {
   headlightsParams: VEHICLE_HEADLIGHTS != null,
   structureCount: houseSites.length,
   vehicleCount: ASSET_VEHICLE_INSTANCES.length,
+  vehicleDisplayName: VEHICLE_DEFINITION.displayName || null,
+  vehicleParts: VEHICLE_PART_CONFIG,
 });
 const VEHICLE_TIRE_RADIUS_M = Math.max(
   0,
@@ -1706,9 +1746,9 @@ const VEHICLE_MARKER_MAP_SCALE = THREE.MathUtils.clamp(
   2
 );
 const vehicleMarkerColor = 0xff2d55;
-const vehicleMarker = (function createVehicleMarker() {
+function createVehicleMarker(labelText, markerId) {
   const marker = new THREE.Group();
-  marker.name = 'vehicle-marker-amv';
+  marker.name = `vehicle-marker-${markerId}`;
   const line = new THREE.Line(
     new THREE.BufferGeometry().setFromPoints([
       new THREE.Vector3(0, 0, 0),
@@ -1746,12 +1786,13 @@ const vehicleMarker = (function createVehicleMarker() {
   );
   dot.position.z = HOUSE_MARKER_HEIGHT;
   dot.renderOrder = 1004;
-  const label = createHouseLabelSprite('AMV', vehicleMarkerColor);
+  const label = createHouseLabelSprite(labelText, vehicleMarkerColor);
   label.position.set(0, 0, HOUSE_MARKER_HEIGHT + 900);
   label.renderOrder = 1005;
   marker.add(line, halo, dot, label);
   return marker;
-})();
+}
+const vehicleMarker = createVehicleMarker('AMV', 'amv');
 vehicleMarkerLayer.add(vehicleMarker);
 // Vehicle lighting — directional + ambient, synced to Takram sunDirection
 const vehicleSunLight = new THREE.DirectionalLight(0xffffff, 3.0);
@@ -1814,32 +1855,25 @@ const vehicleDownRaycaster = new THREE.Raycaster();
 const vehicleDownDirection = up.clone().negate().normalize();
 const vehicleTargetWorld = new THREE.Vector3();
 const vehicleTargetLocal = new THREE.Vector3();
-let vehicleSnapPending = true;
-let vehicleLoaded = false;
 let vehicleControlActive = false;
-let vehicleSavedStatePending = null;
-let lastVehicleSnapAttemptAt = 0;
-let vehicleAwaitingInitialSnap = false;
-let vehicleRestoreRequiresDepth = false;
-let vehicleRestoreDepthTarget = -1;
-let vehicleGroundZTarget = null;
-let vehicleVerticalVelocity = 0;
-let vehicleHeadingRad = THREE.MathUtils.degToRad(VEHICLE_MODEL.headingDeg);
-let vehicleBodyLengthM = VEHICLE_MODEL.realLengthM;
-let vehicleBodyWidthM = Math.max(2, VEHICLE_MODEL.realLengthM * 0.35);
-let vehicleLastContactDepth = -1;
-let vehicleLastContactTileId = null;
 const vehicleUpRaycaster = new THREE.Raycaster();
 const vehicleUpDirection = up.clone().normalize();
-let vehicleMeshes = [];
-let vehicleHeadlightSpots = [];
 const VEHICLE_DRIVE_SPEED = paramNumber('vehicleDriveSpeed', 24);
 const VEHICLE_ACCEL = paramNumber('vehicleAccel', 24);      // m/s² throttle
 const VEHICLE_BRAKE = paramNumber('vehicleBrake', 3);       // m/s² engine brake (coast-down)
 const VEHICLE_STEER_SPEED = paramNumber('vehicleSteerSpeed', 1.5);
-let vehicleSpeed = 0; // current vehicle speed in m/s
-let VEHICLE_CAMERA_FOLLOW_DISTANCE = paramNumber('vehicleCamDistance', 38);
-let VEHICLE_CAMERA_FOLLOW_HEIGHT = paramNumber('vehicleCamHeight', 12);
+const VEHICLE_CAMERA_MODES = Object.freeze([
+  Object.freeze({ name: 'CLOSE', dist: 15, height: 5 }),
+  Object.freeze({ name: 'MEDIUM', dist: 25, height: 8 }),
+  Object.freeze({ name: 'FAR', dist: 38, height: 12 }),
+]);
+const TURRET_PITCH_MIN = THREE.MathUtils.degToRad(-10);
+const TURRET_PITCH_MAX = THREE.MathUtils.degToRad(45);
+const TURRET_MOUSE_SENSITIVITY = 0.003;
+const TURRET_CAMERA_BEHIND_M = 8;
+const TURRET_CAMERA_ABOVE_M = 3;
+const VEHICLE_CAMERA_FOLLOW_DISTANCE_DEFAULT = paramNumber('vehicleCamDistance', 38);
+const VEHICLE_CAMERA_FOLLOW_HEIGHT_DEFAULT = paramNumber('vehicleCamHeight', 12);
 const VEHICLE_CAMERA_LOOK_HEIGHT = paramNumber('vehicleCamLookHeight', 2.2);
 const VEHICLE_CAMERA_ORBIT_SENS = paramNumber('vehicleCamOrbitSens', MOUSE_SENS);
 const VEHICLE_CAMERA_ORBIT_PITCH_MIN = THREE.MathUtils.degToRad(
@@ -1874,7 +1908,6 @@ const VEHICLE_SLOPE_PROBE_WIDTH_SCALE = THREE.MathUtils.clamp(
 const vehicleFollowLocal = new THREE.Vector3();
 const vehicleFollowWorld = new THREE.Vector3();
 const VEHICLE_LOG_STYLE = 'color:#ffbf00;font-weight:600;';
-const vehicleGroundNormal = new THREE.Vector3(0, 0, 1);
 const vehicleDesiredForward = new THREE.Vector3();
 const vehicleDesiredRight = new THREE.Vector3();
 const vehicleOrientationMatrix = new THREE.Matrix4();
@@ -1894,11 +1927,106 @@ const VEHICLE_TEXTURE_ANISOTROPY = Math.max(
   1,
   Math.floor(paramNumber('vehicleTextureAnisotropy', 8))
 );
-let vehicleCameraOrbitYaw = 0;
-let vehicleCameraOrbitPitch = Math.atan2(
-  VEHICLE_CAMERA_FOLLOW_HEIGHT,
-  VEHICLE_CAMERA_FOLLOW_DISTANCE
-);
+const VEHICLE_ENTRY_ID = (
+  typeof _vehicleSeedInstance.id === 'string' && _vehicleSeedInstance.id.trim() !== ''
+)
+  ? _vehicleSeedInstance.id.trim()
+  : 'amv-01';
+let selectedVehicleId = null;
+const vehicleRegistry = new Map();
+const groundVehicleState = {
+  id: VEHICLE_ENTRY_ID,
+  vehicleType: 'ground',
+  definition: VEHICLE_DEFINITIONS[_vehicleSeedInstance.definitionId] ?? VEHICLE_DEFINITION,
+  instance: _vehicleSeedInstance,
+  group: vehicleGroup,
+  marker: vehicleMarker,
+  meshes: [],
+  loaded: false,
+  savedStatePending: null,
+  snapPending: true,
+  lastSnapAttemptAt: 0,
+  awaitingInitialSnap: false,
+  restoreRequiresDepth: false,
+  restoreDepthTarget: -1,
+  groundZTarget: null,
+  verticalVelocity: 0,
+  headingRad: THREE.MathUtils.degToRad(VEHICLE_MODEL.headingDeg),
+  bodyLengthM: VEHICLE_MODEL.realLengthM,
+  bodyWidthM: Math.max(2, VEHICLE_MODEL.realLengthM * 0.35),
+  lastContactDepth: -1,
+  lastContactTileId: null,
+  parts: null,
+  wheelRig: null,
+  turretRig: null,
+  headlightSpots: [],
+  speed: 0,
+  cameraFollowDistance: VEHICLE_CAMERA_FOLLOW_DISTANCE_DEFAULT,
+  cameraFollowHeight: VEHICLE_CAMERA_FOLLOW_HEIGHT_DEFAULT,
+  cameraModeIndex: VEHICLE_CAMERA_MODES.findIndex(mode => (
+    mode.dist === VEHICLE_CAMERA_FOLLOW_DISTANCE_DEFAULT
+    && mode.height === VEHICLE_CAMERA_FOLLOW_HEIGHT_DEFAULT
+  )),
+  cameraOrbitYaw: 0,
+  cameraOrbitPitch: Math.atan2(
+    VEHICLE_CAMERA_FOLLOW_HEIGHT_DEFAULT,
+    VEHICLE_CAMERA_FOLLOW_DISTANCE_DEFAULT
+  ),
+  groundNormal: new THREE.Vector3(0, 0, 1),
+  turretControlActive: false,
+  turretYawRad: 0,
+  turretPitchRad: 0,
+  fireHeld: false,
+  lastFireAt: 0,
+};
+vehicleRegistry.set(VEHICLE_ENTRY_ID, groundVehicleState);
+const aircraftEntries = [];
+for (const instance of ASSET_VEHICLE_INSTANCES) {
+  const definition = VEHICLE_DEFINITIONS[instance?.definitionId];
+  if (definition?.vehicleType !== 'aircraft') continue;
+  const id = typeof instance.id === 'string' && instance.id.trim() ? instance.id.trim() : `aircraft-${aircraftEntries.length + 1}`;
+  const group = new THREE.Group();
+  group.name = id;
+  terrainRoot.add(group);
+  const marker = createVehicleMarker(definition.displayName || 'VTOL', id);
+  vehicleMarkerLayer.add(marker);
+  const state = createAircraftState({ id, definition, instance, group, marker });
+  const sunLight = new THREE.DirectionalLight(0xffffff, 3);
+  sunLight.castShadow = false;
+  group.add(sunLight, sunLight.target, new THREE.AmbientLight(0x8090b0, 1));
+  state.sunLight = sunLight;
+  aircraftEntries.push(state);
+  vehicleRegistry.set(id, state);
+}
+const vehicleBarrelTipLocal = new THREE.Vector3();
+const vehicleTurretDirectionLocal = new THREE.Vector3();
+const vehicleTurretCameraLocal = new THREE.Vector3();
+const vehicleTurretLookLocal = new THREE.Vector3();
+const vehicleTurretCameraWorld = new THREE.Vector3();
+const vehicleTurretLookWorld = new THREE.Vector3();
+const vehicleTurretUpLocal = new THREE.Vector3();
+const vehicleTurretOriginLocal = new THREE.Vector3();
+
+function isVehicleSelected() {
+  return selectedVehicleId === VEHICLE_ENTRY_ID;
+}
+
+function selectedVehicleEntry() {
+  return selectedVehicleId ? vehicleRegistry.get(selectedVehicleId) ?? null : null;
+}
+
+function isAircraftSelected() {
+  return selectedVehicleEntry()?.vehicleType === 'aircraft';
+}
+
+function currentVehicleCameraModeName() {
+  if (groundVehicleState.turretControlActive) return 'TURRET';
+  const aircraft = selectedVehicleEntry();
+  if (aircraft?.vehicleType === 'aircraft') {
+    return AIRCRAFT_CAMERA_MODES[aircraft.cameraModeIndex]?.name ?? 'CUSTOM';
+  }
+  return VEHICLE_CAMERA_MODES[groundVehicleState.cameraModeIndex]?.name ?? 'CUSTOM';
+}
 
 function vehicleConsoleLog(message, ...args) {
   console.log(`%c[VEHICLE] ${message}`, VEHICLE_LOG_STYLE, ...args);
@@ -1935,16 +2063,16 @@ function vehicleLocalToLatLon(x, y) {
 
 function getVehicleStateSnapshot() {
   return vehicleStateSnapshot({
-    loaded: vehicleLoaded,
+    loaded: groundVehicleState.loaded,
     position: vehicleGroup.position,
-    headingRad: vehicleHeadingRad,
+    headingRad: groundVehicleState.headingRad,
     anchorLat,
     anchorLon,
   });
 }
 
 function sampleBestVehicleTerrainHit(localX = vehicleGroup.position.x, localY = vehicleGroup.position.y, terrainMeshes = null) {
-  if (!vehicleLoaded) {
+  if (!groundVehicleState.loaded) {
     return { hit: null, depth: -1, tileId: null };
   }
   const targets = terrainMeshes ?? houseTerrainMeshes();
@@ -1981,17 +2109,17 @@ function terrainDirectionFromWorld(worldDir, out) {
 }
 
 function updateVehicleOrientationTargetFromGround() {
-  vehicleDesiredForward.set(-Math.sin(vehicleHeadingRad), Math.cos(vehicleHeadingRad), 0);
+  vehicleDesiredForward.set(-Math.sin(groundVehicleState.headingRad), Math.cos(groundVehicleState.headingRad), 0);
   vehicleDesiredForward.addScaledVector(
-    vehicleGroundNormal,
-    -vehicleDesiredForward.dot(vehicleGroundNormal)
+    groundVehicleState.groundNormal,
+    -vehicleDesiredForward.dot(groundVehicleState.groundNormal)
   );
   if (vehicleDesiredForward.lengthSq() < 1e-8) {
     vehicleDesiredForward.set(0, 1, 0);
   } else {
     vehicleDesiredForward.normalize();
   }
-  vehicleDesiredRight.crossVectors(vehicleDesiredForward, vehicleGroundNormal);
+  vehicleDesiredRight.crossVectors(vehicleDesiredForward, groundVehicleState.groundNormal);
   if (vehicleDesiredRight.lengthSq() < 1e-8) {
     vehicleDesiredRight.set(1, 0, 0);
   } else {
@@ -2000,17 +2128,17 @@ function updateVehicleOrientationTargetFromGround() {
   vehicleOrientationMatrix.makeBasis(
     vehicleDesiredRight,
     vehicleDesiredForward,
-    vehicleGroundNormal
+    groundVehicleState.groundNormal
   );
   vehicleOrientationTargetQuat.setFromRotationMatrix(vehicleOrientationMatrix);
 }
 
 function updateVehicleGroundNormalFromTerrain(centerHit, terrainMeshes) {
   let normalReady = false;
-  const headingForward = vehicleDesiredForward.set(-Math.sin(vehicleHeadingRad), Math.cos(vehicleHeadingRad), 0).normalize();
-  const headingRight = vehicleDesiredRight.set(Math.cos(vehicleHeadingRad), Math.sin(vehicleHeadingRad), 0).normalize();
-  const probeForwardM = Math.max(1.0, vehicleBodyLengthM * VEHICLE_SLOPE_PROBE_LENGTH_SCALE);
-  const probeRightM = Math.max(0.8, vehicleBodyWidthM * VEHICLE_SLOPE_PROBE_WIDTH_SCALE);
+  const headingForward = vehicleDesiredForward.set(-Math.sin(groundVehicleState.headingRad), Math.cos(groundVehicleState.headingRad), 0).normalize();
+  const headingRight = vehicleDesiredRight.set(Math.cos(groundVehicleState.headingRad), Math.sin(groundVehicleState.headingRad), 0).normalize();
+  const probeForwardM = Math.max(1.0, groundVehicleState.bodyLengthM * VEHICLE_SLOPE_PROBE_LENGTH_SCALE);
+  const probeRightM = Math.max(0.8, groundVehicleState.bodyWidthM * VEHICLE_SLOPE_PROBE_WIDTH_SCALE);
   const centerX = vehicleGroup.position.x;
   const centerY = vehicleGroup.position.y;
   const front = sampleBestVehicleTerrainHit(
@@ -2047,7 +2175,7 @@ function updateVehicleGroundNormalFromTerrain(centerHit, terrainMeshes) {
           vehicleProbeNormalWorld.multiplyScalar(-1);
         }
         terrainDirectionFromWorld(vehicleProbeNormalWorld, vehicleProbeNormalLocal);
-        vehicleGroundNormal.copy(vehicleProbeNormalLocal);
+        groundVehicleState.groundNormal.copy(vehicleProbeNormalLocal);
         normalReady = true;
       }
     }
@@ -2062,17 +2190,17 @@ function updateVehicleGroundNormalFromTerrain(centerHit, terrainMeshes) {
       vehicleProbeNormalWorld.multiplyScalar(-1);
     }
     terrainDirectionFromWorld(vehicleProbeNormalWorld, vehicleProbeNormalLocal);
-    vehicleGroundNormal.copy(vehicleProbeNormalLocal);
+    groundVehicleState.groundNormal.copy(vehicleProbeNormalLocal);
     normalReady = true;
   }
   if (!normalReady) {
-    vehicleGroundNormal.copy(up);
+    groundVehicleState.groundNormal.copy(up);
   }
-  vehicleGroundNormal.normalize();
+  groundVehicleState.groundNormal.normalize();
 }
 
 function vehicleNearTileBbox(bbox) {
-  if (!vehicleLoaded || !Array.isArray(bbox) || bbox.length !== 4) return false;
+  if (!groundVehicleState.loaded || !Array.isArray(bbox) || bbox.length !== 4) return false;
   const x = vehicleGroup.position.x;
   const y = vehicleGroup.position.y;
   return (
@@ -2084,9 +2212,9 @@ function vehicleNearTileBbox(bbox) {
 }
 
 function requestVehicleTerrainResnap(reason = 'terrain-update') {
-  if (!vehicleLoaded) return;
-  if (vehicleSnapPending) return;
-  vehicleSnapPending = true;
+  if (!groundVehicleState.loaded) return;
+  if (groundVehicleState.snapPending) return;
+  groundVehicleState.snapPending = true;
   // bootLog('vehicle.resnap.requested', { reason });
 }
 
@@ -2096,9 +2224,9 @@ function setVehicleGroundTarget(nextZ, options = {}) {
     resetVelocity = false,
   } = options;
   if (!Number.isFinite(nextZ)) return;
-  vehicleGroundZTarget = nextZ;
+  groundVehicleState.groundZTarget = nextZ;
   if (resetVelocity) {
-    vehicleVerticalVelocity = 0;
+    groundVehicleState.verticalVelocity = 0;
   }
   if (immediate) {
     vehicleGroup.position.z = nextZ;
@@ -2107,31 +2235,36 @@ function setVehicleGroundTarget(nextZ, options = {}) {
 }
 
 function updateVehicleSuspension(dt) {
-  if (!vehicleLoaded || !Number.isFinite(vehicleGroundZTarget)) return;
+  if (!groundVehicleState.loaded || !Number.isFinite(groundVehicleState.groundZTarget)) return;
   const suspension = stepSuspension({
-    dt, position: vehicleGroup.position.z, target: vehicleGroundZTarget,
-    velocity: vehicleVerticalVelocity, frequency: VEHICLE_SUSPENSION_HZ,
+    dt, position: vehicleGroup.position.z, target: groundVehicleState.groundZTarget,
+    velocity: groundVehicleState.verticalVelocity, frequency: VEHICLE_SUSPENSION_HZ,
     dampingRatio: VEHICLE_SUSPENSION_DAMPING_RATIO,
     maxVelocity: VEHICLE_SUSPENSION_MAX_VEL,
   });
   vehicleGroup.position.z = suspension.position;
-  vehicleVerticalVelocity = suspension.velocity;
+  groundVehicleState.verticalVelocity = suspension.velocity;
   updateVehicleOrientationTargetFromGround();
   const orientationAlpha = 1 - Math.exp(-VEHICLE_ORIENTATION_RESPONSE * suspension.stepDt);
   vehicleGroup.quaternion.slerp(vehicleOrientationTargetQuat, orientationAlpha);
   vehicleMarker.position.z = vehicleGroup.position.z + HOUSE_MARKER_BASE_LIFT;
 }
 
+function updateVehicleWheelSpin(dt) {
+  if (!groundVehicleState.loaded || groundVehicleState.wheelRig == null) return;
+  spinVehicleWheelRig(groundVehicleState.wheelRig, groundVehicleState.speed * dt, VEHICLE_TIRE_RADIUS_M);
+}
+
 function createVehicleSaveSnapshot(options = {}) {
   const { snapToGround = false, bypassSnapThrottle = false } = options;
-  if (snapToGround && vehicleLoaded) {
-    vehicleSnapPending = true;
+  if (snapToGround && groundVehicleState.loaded) {
+    groundVehicleState.snapPending = true;
     snapVehicleToTerrain({ forceImmediate: true, bypassThrottle: bypassSnapThrottle });
   }
   const state = getVehicleStateSnapshot();
   if (state == null) return null;
-  if (Number.isFinite(vehicleGroundZTarget)) {
-    state.z = Number(vehicleGroundZTarget.toFixed(3));
+  if (Number.isFinite(groundVehicleState.groundZTarget)) {
+    state.z = Number(groundVehicleState.groundZTarget.toFixed(3));
   }
   const terrainSample = sampleBestVehicleTerrainHit();
   if (terrainSample.depth >= 0) state.terrainDepth = terrainSample.depth;
@@ -2149,8 +2282,48 @@ const vehiclePersistence = createVehiclePersistenceRuntime({
 const saveVehicleState = vehiclePersistence.save;
 const throttledVehicleSave = vehiclePersistence.throttledSave;
 
+async function saveAircraftState(entry, reason = 'manual') {
+  if (!entry?.loaded) return false;
+  const latLon = vehicleLocalToLatLon(entry.group.position.x, entry.group.position.y);
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort(), VEHICLE_SAVE_FETCH_TIMEOUT_MS);
+  try {
+    const response = await fetch(`${ASSET_SERVER_BASE}/api/asset/${encodeURIComponent(entry.id)}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        lat: Number(latLon.lat.toFixed(8)),
+        lon: Number(latLon.lon.toFixed(8)),
+        headingDeg: Number(THREE.MathUtils.radToDeg(entry.headingRad).toFixed(3)),
+        z: Number(entry.group.position.z.toFixed(3)),
+      }),
+      signal: controller.signal,
+    });
+    if (!response.ok) throw new Error(`asset patch status ${response.status}`);
+    bootLog('vehicle.state.save.ok', { id: entry.id, reason });
+    return true;
+  } catch (error) {
+    bootLog('vehicle.state.save.error', {
+      id: entry.id,
+      reason,
+      timedOut: error?.name === 'AbortError',
+      message: error?.message ?? String(error),
+    }, 'error');
+    return false;
+  } finally {
+    window.clearTimeout(timeout);
+  }
+}
+
+function throttledAircraftSave(entry) {
+  const now = performance.now();
+  if (now - entry.lastSaveAt < 5000) return;
+  entry.lastSaveAt = now;
+  void saveAircraftState(entry, 'flight-throttle');
+}
+
 function loadVehicleState() {
-  const state = ASSET_VEHICLE_INSTANCES.length > 0 ? ASSET_VEHICLE_INSTANCES[0] : null;
+  const state = _vehicleSeedInstance.id ? _vehicleSeedInstance : null;
   if (state == null) {
     bootLog('vehicle.state.load.empty');
     return null;
@@ -2160,8 +2333,8 @@ function loadVehicleState() {
     bootLog('vehicle.state.load.invalid', { state }, 'error');
     return null;
   }
-  vehicleSavedStatePending = normalized;
-  return vehicleSavedStatePending;
+  groundVehicleState.savedStatePending = normalized;
+  return groundVehicleState.savedStatePending;
 }
 
 function loadVehicleModel() {
@@ -2198,8 +2371,8 @@ function loadVehicleModel() {
         modelSize.y * vehicleScale,
         modelSize.z * vehicleScale,
       ].sort((a, b) => b - a);
-      vehicleBodyLengthM = scaledDims[0];
-      vehicleBodyWidthM = scaledDims[1];
+      groundVehicleState.bodyLengthM = scaledDims[0];
+      groundVehicleState.bodyWidthM = scaledDims[1];
       const scaledSpan = modelLength * vehicleScale;
       vehicleShadowRadius = THREE.MathUtils.clamp(
         scaledSpan * 12,
@@ -2219,12 +2392,12 @@ function loadVehicleModel() {
         const hlPenumbra = VEHICLE_HEADLIGHTS.penumbra;
         const hlDistance = VEHICLE_HEADLIGHTS.distanceM;
         const hlDecay = VEHICLE_HEADLIGHTS.decay;
-        const hlFrontY = (vehicleBodyLengthM * VEHICLE_HEADLIGHTS.mountFrontRatio) / localScale;
+        const hlFrontY = (groundVehicleState.bodyLengthM * VEHICLE_HEADLIGHTS.mountFrontRatio) / localScale;
         const hlHeight = VEHICLE_HEADLIGHTS.mountHeightM / localScale;
         const hlSpacing = VEHICLE_HEADLIGHTS.mountSpacingM / localScale;
         const hlTargetY = hlFrontY + (VEHICLE_HEADLIGHTS.targetForwardM / localScale);
         const hlTargetZ = VEHICLE_HEADLIGHTS.targetHeightM / localScale;
-        vehicleHeadlightSpots = [];
+        groundVehicleState.headlightSpots = [];
         for (const side of [-1, 1]) {
           const hl = new THREE.SpotLight(hlColor, hlIntensity, hlDistance, hlAngle, hlPenumbra, hlDecay);
           hl.position.set(side * hlSpacing, hlFrontY, hlHeight);
@@ -2234,13 +2407,26 @@ function loadVehicleModel() {
           vehicleGroup.add(target);
           hl.target = target;
           vehicleGroup.add(hl);
-          vehicleHeadlightSpots.push(hl);
+          groundVehicleState.headlightSpots.push(hl);
         }
       }
-      // Collect vehicle meshes for upward raycast collision
-      vehicleMeshes = [];
-      model.traverse(obj => { if (obj.isMesh) vehicleMeshes.push(obj); });
-      const savedState = vehicleSavedStatePending;
+      groundVehicleState.parts = discoverVehicleParts(model, VEHICLE_DEFINITION);
+      const vehiclePartsSummary = summarizeVehicleParts(groundVehicleState.parts);
+      bootLog('vehicle.parts.discovered', vehiclePartsSummary,
+        groundVehicleState.parts.missing.length > 0 ? 'warn' : 'info');
+      groundVehicleState.wheelRig = createVehicleWheelRig(THREE, groundVehicleState.parts);
+      const vehicleWheelRigSummary = summarizeVehicleWheelRig(groundVehicleState.wheelRig);
+      bootLog('vehicle.wheels.rigged', vehicleWheelRigSummary,
+        vehicleWheelRigSummary.skipped.length > 0 ||
+        vehicleWheelRigSummary.crossingTriangleCount > 0 ? 'warn' : 'info');
+      groundVehicleState.turretRig = createVehicleTurretRig(THREE, groundVehicleState.parts);
+      const vehicleTurretRigSummary = summarizeVehicleTurretRig(groundVehicleState.turretRig);
+      bootLog('vehicle.turret.rigged', vehicleTurretRigSummary,
+        vehicleTurretRigSummary.warnings.length > 0 ? 'warn' : 'info');
+      // Collect after wheel rigging so collision uses the replacement wheel meshes.
+      groundVehicleState.meshes = [];
+      model.traverse(obj => { if (obj.isMesh) groundVehicleState.meshes.push(obj); });
+      const savedState = groundVehicleState.savedStatePending;
       const startLat = Number.isFinite(savedState?.lat) ? savedState.lat : VEHICLE_MODEL.lat;
       const startLon = Number.isFinite(savedState?.lon) ? savedState.lon : VEHICLE_MODEL.lon;
       const startHeadingDeg = Number.isFinite(savedState?.headingDeg)
@@ -2248,23 +2434,23 @@ function loadVehicleModel() {
         : VEHICLE_MODEL.headingDeg;
       const startZ = Number.isFinite(savedState?.z) ? savedState.z : (VEHICLE_MODEL.z ?? 0);
       const local = houseLocalFromLatLon(startLat, startLon);
-      vehicleHeadingRad = THREE.MathUtils.degToRad(startHeadingDeg);
-      vehicleGroundNormal.copy(up);
+      groundVehicleState.headingRad = THREE.MathUtils.degToRad(startHeadingDeg);
+      groundVehicleState.groundNormal.copy(up);
       updateVehicleOrientationTargetFromGround();
       vehicleGroup.position.set(local.x, local.y, startZ);
       vehicleGroup.quaternion.copy(vehicleOrientationTargetQuat);
       vehicleGroup.scale.setScalar(vehicleScale);
-      vehicleLoaded = true;
-      vehicleSnapPending = true;
-      vehicleAwaitingInitialSnap = true;
-      vehicleRestoreRequiresDepth = Boolean(savedState);
-      vehicleRestoreDepthTarget = Number.isFinite(savedState?.terrainDepth)
+      groundVehicleState.loaded = true;
+      groundVehicleState.snapPending = true;
+      groundVehicleState.awaitingInitialSnap = true;
+      groundVehicleState.restoreRequiresDepth = Boolean(savedState);
+      groundVehicleState.restoreDepthTarget = Number.isFinite(savedState?.terrainDepth)
         ? savedState.terrainDepth
         : VEHICLE_RESTORE_MIN_DEPTH;
-      vehicleGroundZTarget = Number.isFinite(startZ) ? startZ : null;
-      vehicleVerticalVelocity = 0;
-      vehicleLastContactDepth = -1;
-      vehicleLastContactTileId = null;
+      groundVehicleState.groundZTarget = Number.isFinite(startZ) ? startZ : null;
+      groundVehicleState.verticalVelocity = 0;
+      groundVehicleState.lastContactDepth = -1;
+      groundVehicleState.lastContactTileId = null;
       vehicleGroup.visible = false;
       vehicleMarker.position.set(local.x, local.y, HOUSE_MARKER_BASE_LIFT);
       bootLog('vehicle.load.success', {
@@ -2277,7 +2463,7 @@ function loadVehicleModel() {
         startLon: Number(startLon.toFixed(8)),
         startHeadingDeg: Number(startHeadingDeg.toFixed(3)),
         startZ: Number(startZ.toFixed(3)),
-        restoreDepthTarget: vehicleRestoreDepthTarget,
+        restoreDepthTarget: groundVehicleState.restoreDepthTarget,
       });
     },
     undefined,
@@ -2288,9 +2474,124 @@ function loadVehicleModel() {
   );
 }
 
+const aircraftGroundRaycaster = new THREE.Raycaster();
+const aircraftGroundOrigin = new THREE.Vector3();
+const aircraftGroundHitLocal = new THREE.Vector3();
+const aircraftCameraLocal = new THREE.Vector3();
+const aircraftLookLocal = new THREE.Vector3();
+const aircraftCameraWorld = new THREE.Vector3();
+const aircraftLookWorld = new THREE.Vector3();
+const aircraftHeadingQuat = new THREE.Quaternion();
+const aircraftLocalUp = new THREE.Vector3(0, 0, 1);
+
+function sampleAircraftGroundZ(entry) {
+  const terrainMeshes = houseTerrainMeshes();
+  if (terrainMeshes.length === 0) return entry.lastKnownGroundZ;
+  aircraftGroundOrigin.set(entry.group.position.x, entry.group.position.y, 20000);
+  terrainRoot.localToWorld(aircraftGroundOrigin);
+  aircraftGroundRaycaster.set(aircraftGroundOrigin, vehicleDownDirection);
+  const hit = aircraftGroundRaycaster.intersectObjects(terrainMeshes, false)[0];
+  if (!hit) return entry.lastKnownGroundZ;
+  aircraftGroundHitLocal.copy(hit.point);
+  terrainRoot.worldToLocal(aircraftGroundHitLocal);
+  return aircraftGroundHitLocal.z;
+}
+
+function loadAircraftModels() {
+  for (const entry of aircraftEntries) {
+    vehicleLoader.load(
+      entry.definition.url,
+      gltf => {
+        const model = gltf.scene;
+        const rotation = entry.definition.modelRotationDeg;
+        if (Array.isArray(rotation) && rotation.length === 3) {
+          model.rotation.set(...rotation.map(THREE.MathUtils.degToRad));
+        } else {
+          model.rotation.x = Math.PI * 0.5;
+        }
+        model.traverse(object => {
+          if (!object.isMesh) return;
+          object.castShadow = true;
+          object.receiveShadow = true;
+          const materials = Array.isArray(object.material) ? object.material : [object.material];
+          for (const material of materials) applyVehicleMaterialSampling(material);
+        });
+        const bounds = new THREE.Box3().setFromObject(model);
+        const size = new THREE.Vector3();
+        bounds.getSize(size);
+        const modelLength = Math.max(size.x, size.y, size.z);
+        const scale = modelLength > 0 ? entry.definition.realLengthM / modelLength : 1;
+        model.position.z -= bounds.min.z;
+        entry.group.add(model);
+        entry.group.scale.setScalar(scale);
+        entry.meshes = [];
+        model.traverse(object => { if (object.isMesh) entry.meshes.push(object); });
+        const local = houseLocalFromLatLon(entry.instance.lat, entry.instance.lon);
+        entry.group.position.set(local.x, local.y, Number(entry.instance.z) || 0);
+        entry.marker.position.set(local.x, local.y, HOUSE_MARKER_BASE_LIFT);
+        entry.loaded = true;
+        entry.group.visible = true;
+        entry.altitudeAGL = Math.max(0, entry.group.position.z - (sampleAircraftGroundZ(entry) ?? 0));
+        const parts = setupAircraftModelParts(entry, model, bootLog);
+        updateAircraftVisuals(entry, 0);
+        bootLog('vehicle.load.success', {
+          id: entry.id,
+          vehicleType: 'aircraft',
+          url: entry.definition.url,
+          scale: Number(scale.toFixed(5)),
+          parts,
+        });
+        markSceneMutated();
+        requestRender();
+      },
+      undefined,
+      error => bootLog('vehicle.load.error', {
+        id: entry.id,
+        vehicleType: 'aircraft',
+        message: error?.message ?? String(error),
+      }, 'error'),
+    );
+  }
+}
+
+function updateAircraftFollowCamera(entry) {
+  if (!entry?.loaded) return;
+  const mode = AIRCRAFT_CAMERA_MODES[entry.cameraModeIndex] ?? AIRCRAFT_CAMERA_MODES[1];
+  const radius = Math.hypot(mode.dist, mode.height);
+  const horizontalRadius = radius * Math.cos(entry.cameraOrbitPitch);
+  aircraftCameraLocal.set(
+    Math.sin(entry.cameraOrbitYaw) * horizontalRadius,
+    -Math.cos(entry.cameraOrbitYaw) * horizontalRadius,
+    radius * Math.sin(entry.cameraOrbitPitch),
+  );
+  aircraftHeadingQuat.setFromAxisAngle(aircraftLocalUp, entry.headingRad);
+  aircraftCameraLocal.applyQuaternion(aircraftHeadingQuat).add(entry.group.position);
+  aircraftLookLocal.copy(entry.group.position).addScaledVector(aircraftLocalUp, 2);
+  aircraftCameraWorld.copy(aircraftCameraLocal);
+  terrainRoot.localToWorld(aircraftCameraWorld);
+  aircraftLookWorld.copy(aircraftLookLocal);
+  terrainRoot.localToWorld(aircraftLookWorld);
+  camera.position.copy(aircraftCameraWorld);
+  camera.up.copy(up);
+  camera.lookAt(aircraftLookWorld);
+}
+
+function syncAircraftSunLights() {
+  _vehicleSunLocal.set(
+    sunDirection.dot(east),
+    sunDirection.dot(north),
+    sunDirection.dot(up),
+  ).normalize();
+  for (const entry of aircraftEntries) {
+    if (!entry.loaded) continue;
+    entry.sunLight.target.position.set(0, 0, 0);
+    entry.sunLight.position.copy(_vehicleSunLocal).multiplyScalar(40);
+  }
+}
+
 const _vehicleSunLocal = new THREE.Vector3();
 function syncVehicleSunLight() {
-  if (!vehicleLoaded) return;
+  if (!groundVehicleState.loaded) return;
   // sunDirection is in ECEF; convert to terrainRoot local (ENU-ish)
   _vehicleSunLocal.set(
     sunDirection.dot(east),
@@ -2331,7 +2632,7 @@ function clearVehicleShadowReceivers() {
 }
 
 function syncVehicleShadowReceivers() {
-  if (!vehicleLoaded) {
+  if (!groundVehicleState.loaded) {
     clearVehicleShadowReceivers();
     return;
   }
@@ -2365,7 +2666,7 @@ function syncVehicleShadowReceivers() {
 }
 
 function updateVehicleShadowSystem() {
-  if (!vehicleLoaded || controls.mapMode) {
+  if (!groundVehicleState.loaded || controls.mapMode) {
     vehicleShadowCasterLight.visible = false;
     vehicleShadowReceiverLayer.visible = false;
     return;
@@ -2389,10 +2690,10 @@ function updateVehicleShadowSystem() {
   ).normalize();
 
   vehicleShadowCenterLocal.copy(vehicleGroup.position);
-  if (Number.isFinite(vehicleGroundZTarget)) {
+  if (Number.isFinite(groundVehicleState.groundZTarget)) {
     vehicleShadowCenterLocal.z = THREE.MathUtils.lerp(
       vehicleShadowCenterLocal.z,
-      vehicleGroundZTarget,
+      groundVehicleState.groundZTarget,
       VEHICLE_SHADOW_GROUND_ANCHOR
     );
   }
@@ -2446,13 +2747,13 @@ function updateVehicleShadowSystem() {
 
 function snapVehicleToTerrain(options = {}) {
   const { forceImmediate = false, bypassThrottle = false } = options;
-  if (!vehicleLoaded) return;
+  if (!groundVehicleState.loaded) return;
   const now = performance.now();
-  const minInterval = vehicleSnapPending ? VEHICLE_SNAP_PENDING_MS : VEHICLE_SNAP_IDLE_MS;
-  if (!bypassThrottle && now - lastVehicleSnapAttemptAt < minInterval) return;
-  lastVehicleSnapAttemptAt = now;
+  const minInterval = groundVehicleState.snapPending ? VEHICLE_SNAP_PENDING_MS : VEHICLE_SNAP_IDLE_MS;
+  if (!bypassThrottle && now - groundVehicleState.lastSnapAttemptAt < minInterval) return;
+  groundVehicleState.lastSnapAttemptAt = now;
   const terrainMeshes = houseTerrainMeshes();
-  if (terrainMeshes.length === 0 || vehicleMeshes.length === 0) return;
+  if (terrainMeshes.length === 0 || groundVehicleState.meshes.length === 0) return;
   const terrainSample = sampleBestVehicleTerrainHit(
     vehicleGroup.position.x,
     vehicleGroup.position.y,
@@ -2462,8 +2763,8 @@ function snapVehicleToTerrain(options = {}) {
   const fallbackHit = terrainSample.hit;
   const depth = tileDepthFromId(terrainSample.hit.object?.userData?.tileId);
   const selectedTileId = terrainSample.hit.object?.userData?.tileId ?? null;
-  const bestMinDepthHit = depth >= vehicleRestoreDepthTarget ? terrainSample.hit : null;
-  const selectedHit = vehicleRestoreRequiresDepth
+  const bestMinDepthHit = depth >= groundVehicleState.restoreDepthTarget ? terrainSample.hit : null;
+  const selectedHit = groundVehicleState.restoreRequiresDepth
     ? bestMinDepthHit
     : fallbackHit;
   if (!selectedHit) {
@@ -2476,7 +2777,7 @@ function snapVehicleToTerrain(options = {}) {
   // Step 2: temporarily position vehicle high above terrain
   vehicleTargetLocal.copy(terrainPoint);
   terrainRoot.worldToLocal(vehicleTargetLocal);
-  const alignImmediately = forceImmediate || vehicleAwaitingInitialSnap;
+  const alignImmediately = forceImmediate || groundVehicleState.awaitingInitialSnap;
   const preSnapZ = vehicleGroup.position.z;
   vehicleSnapPrevQuat.copy(vehicleGroup.quaternion);
   vehicleGroup.quaternion.copy(vehicleOrientationTargetQuat);
@@ -2484,7 +2785,7 @@ function snapVehicleToTerrain(options = {}) {
   vehicleGroup.updateMatrixWorld(true);
   // Step 3: raycast UP from terrain surface to find vehicle bottom
   vehicleUpRaycaster.set(terrainPoint, vehicleUpDirection);
-  const vehicleHits = vehicleUpRaycaster.intersectObjects(vehicleMeshes);
+  const vehicleHits = vehicleUpRaycaster.intersectObjects(groundVehicleState.meshes);
   let groundedZ = vehicleTargetLocal.z + VEHICLE_TERRAIN_LIFT_M;
   if (vehicleHits.length === 0) {
     // Fallback: just use terrain height + small offset
@@ -2500,8 +2801,8 @@ function snapVehicleToTerrain(options = {}) {
   } else {
     vehicleGroup.quaternion.copy(vehicleOrientationTargetQuat);
   }
-  const prevDepth = vehicleLastContactDepth;
-  const prevTargetZ = vehicleGroundZTarget;
+  const prevDepth = groundVehicleState.lastContactDepth;
+  const prevTargetZ = groundVehicleState.groundZTarget;
   setVehicleGroundTarget(
     groundedZ,
     { immediate: alignImmediately, resetVelocity: forceImmediate }
@@ -2510,40 +2811,40 @@ function snapVehicleToTerrain(options = {}) {
   if (depthRefined && Number.isFinite(prevTargetZ)) {
     const dz = groundedZ - prevTargetZ;
     if (Math.abs(dz) > 0.005) {
-      vehicleVerticalVelocity += dz * VEHICLE_REFINEMENT_BOUNCE;
-      vehicleVerticalVelocity = THREE.MathUtils.clamp(
-        vehicleVerticalVelocity,
+      groundVehicleState.verticalVelocity += dz * VEHICLE_REFINEMENT_BOUNCE;
+      groundVehicleState.verticalVelocity = THREE.MathUtils.clamp(
+        groundVehicleState.verticalVelocity,
         -VEHICLE_SUSPENSION_MAX_VEL,
         VEHICLE_SUSPENSION_MAX_VEL
       );
     }
   }
-  vehicleSnapPending = false;
-  vehicleRestoreRequiresDepth = false;
-  vehicleRestoreDepthTarget = -1;
-  vehicleLastContactDepth = Number.isFinite(depth) ? depth : vehicleLastContactDepth;
-  vehicleLastContactTileId = selectedTileId;
-  if (vehicleAwaitingInitialSnap) {
-    vehicleAwaitingInitialSnap = false;
+  groundVehicleState.snapPending = false;
+  groundVehicleState.restoreRequiresDepth = false;
+  groundVehicleState.restoreDepthTarget = -1;
+  groundVehicleState.lastContactDepth = Number.isFinite(depth) ? depth : groundVehicleState.lastContactDepth;
+  groundVehicleState.lastContactTileId = selectedTileId;
+  if (groundVehicleState.awaitingInitialSnap) {
+    groundVehicleState.awaitingInitialSnap = false;
     vehicleGroup.visible = true;
   }
 }
 
 function updateVehicleFollowCamera() {
-  if (!vehicleLoaded) return;
-  const heading = vehicleHeadingRad;
+  if (!groundVehicleState.loaded) return;
+  const heading = groundVehicleState.headingRad;
   const forwardX = -Math.sin(heading);
   const forwardY = Math.cos(heading);
   const rightX = Math.cos(heading);
   const rightY = Math.sin(heading);
   const radius = Math.sqrt(
-    VEHICLE_CAMERA_FOLLOW_DISTANCE * VEHICLE_CAMERA_FOLLOW_DISTANCE +
-    VEHICLE_CAMERA_FOLLOW_HEIGHT * VEHICLE_CAMERA_FOLLOW_HEIGHT
+    groundVehicleState.cameraFollowDistance * groundVehicleState.cameraFollowDistance +
+    groundVehicleState.cameraFollowHeight * groundVehicleState.cameraFollowHeight
   );
-  const horizontalRadius = radius * Math.cos(vehicleCameraOrbitPitch);
-  const verticalOffset = radius * Math.sin(vehicleCameraOrbitPitch);
-  const backScale = Math.cos(vehicleCameraOrbitYaw);
-  const sideScale = Math.sin(vehicleCameraOrbitYaw);
+  const horizontalRadius = radius * Math.cos(groundVehicleState.cameraOrbitPitch);
+  const verticalOffset = radius * Math.sin(groundVehicleState.cameraOrbitPitch);
+  const backScale = Math.cos(groundVehicleState.cameraOrbitYaw);
+  const sideScale = Math.sin(groundVehicleState.cameraOrbitYaw);
   // Compute offset in vehicle-local frame (forward=+Y, right=+X, up=+Z)
   const localOffX = sideScale * horizontalRadius;
   const localOffY = -backScale * horizontalRadius;
@@ -2572,11 +2873,147 @@ function updateVehicleFollowCamera() {
   controls.pitch = Math.asin(THREE.MathUtils.clamp(vehicleLookDirLocal.z, -1, 1));
 }
 
+function updateVehicleTurretRig() {
+  if (!groundVehicleState.loaded || groundVehicleState.turretRig == null) return;
+  if (groundVehicleState.turretRig.turretPivot) {
+    groundVehicleState.turretRig.turretPivot.rotation.z = groundVehicleState.turretYawRad;
+  }
+  if (groundVehicleState.turretRig.gunPivot) {
+    groundVehicleState.turretRig.gunPivot.rotation.x = groundVehicleState.turretPitchRad;
+  }
+  vehicleGroup.updateWorldMatrix(true, true);
+}
+
+function getVehicleBarrelTipTerrainLocal(target) {
+  if (groundVehicleState.turretRig?.gunPivot == null) return target.copy(vehicleGroup.position);
+  target.copy(groundVehicleState.turretRig.barrelTipLocal);
+  groundVehicleState.turretRig.gunPivot.localToWorld(target);
+  terrainRoot.worldToLocal(target);
+  return target;
+}
+
+function getVehicleTurretDirectionLocal(target) {
+  if (groundVehicleState.turretRig?.gunPivot == null) {
+    return target.set(0, 1, 0).applyQuaternion(vehicleGroup.quaternion).normalize();
+  }
+  const origin = vehicleTurretOriginLocal.set(0, 0, 0);
+  target.set(0, 1, 0);
+  groundVehicleState.turretRig.gunPivot.localToWorld(origin);
+  groundVehicleState.turretRig.gunPivot.localToWorld(target);
+  terrainRoot.worldToLocal(origin);
+  terrainRoot.worldToLocal(target);
+  return target.sub(origin).normalize();
+}
+
+function updateVehicleTurretCamera() {
+  if (!groundVehicleState.loaded || !groundVehicleState.turretControlActive) return;
+  getVehicleBarrelTipTerrainLocal(vehicleBarrelTipLocal);
+  getVehicleTurretDirectionLocal(vehicleTurretDirectionLocal);
+  vehicleTurretCameraLocal.copy(vehicleBarrelTipLocal)
+    .addScaledVector(vehicleTurretDirectionLocal, -TURRET_CAMERA_BEHIND_M);
+  vehicleTurretUpLocal.set(0, 0, 1).applyQuaternion(vehicleGroup.quaternion).normalize();
+  vehicleTurretCameraLocal.addScaledVector(vehicleTurretUpLocal, TURRET_CAMERA_ABOVE_M);
+  vehicleTurretLookLocal.copy(vehicleBarrelTipLocal)
+    .addScaledVector(vehicleTurretDirectionLocal, 500);
+  vehicleTurretCameraWorld.copy(vehicleTurretCameraLocal);
+  terrainRoot.localToWorld(vehicleTurretCameraWorld);
+  vehicleTurretLookWorld.copy(vehicleTurretLookLocal);
+  terrainRoot.localToWorld(vehicleTurretLookWorld);
+  camera.position.copy(vehicleTurretCameraWorld);
+  camera.up.copy(up);
+  camera.lookAt(vehicleTurretLookWorld);
+}
+
+function setVehicleTurretControlActive(nextActive, reason = 'manual') {
+  const requested = Boolean(nextActive);
+  const available = groundVehicleState.turretRig?.turretPivot != null && groundVehicleState.turretRig?.gunPivot != null;
+  const next = requested && available && vehicleControlActive && isVehicleSelected() && !isAircraftSelected();
+  if (groundVehicleState.turretControlActive === next) return groundVehicleState.turretControlActive;
+  groundVehicleState.turretControlActive = next;
+  if (next) {
+    renderer.domElement.requestPointerLock?.();
+  } else if (document.pointerLockElement === renderer.domElement) {
+    document.exitPointerLock?.();
+  }
+  bootLog('vehicle.turret.control', {
+    id: VEHICLE_ENTRY_ID,
+    active: groundVehicleState.turretControlActive,
+    available,
+    reason,
+  });
+  requestRender();
+  return groundVehicleState.turretControlActive;
+}
+
+function aimVehicleTurret(movementX, movementY) {
+  if (!groundVehicleState.turretControlActive) return;
+  groundVehicleState.turretYawRad -= movementX * TURRET_MOUSE_SENSITIVITY;
+  groundVehicleState.turretPitchRad = THREE.MathUtils.clamp(
+    groundVehicleState.turretPitchRad - movementY * TURRET_MOUSE_SENSITIVITY,
+    TURRET_PITCH_MIN,
+    TURRET_PITCH_MAX
+  );
+}
+
+function selectVehicle(reason = 'manual', vehicleId = VEHICLE_ENTRY_ID) {
+  if (!vehicleRegistry.has(vehicleId)) return false;
+  const changed = selectedVehicleId !== vehicleId;
+  if (changed && vehicleControlActive) {
+    setVehicleControlActive(false, 'selection-changed');
+  }
+  selectedVehicleId = vehicleId;
+  if (changed) {
+    bootLog('vehicle.selection', { id: selectedVehicleId, reason });
+  }
+  requestRender();
+  return true;
+}
+
+function cycleVehicleCameraMode(reason = 'manual') {
+  if (!vehicleControlActive || groundVehicleState.turretControlActive) return false;
+  const entry = selectedVehicleEntry();
+  if (entry?.vehicleType === 'aircraft') {
+    entry.cameraModeIndex = (entry.cameraModeIndex + 1) % AIRCRAFT_CAMERA_MODES.length;
+    bootLog('vehicle.camera.mode', {
+      id: entry.id,
+      mode: AIRCRAFT_CAMERA_MODES[entry.cameraModeIndex].name,
+      reason,
+    });
+    requestRender();
+    return true;
+  }
+  if (!isVehicleSelected()) return false;
+  groundVehicleState.cameraModeIndex = (groundVehicleState.cameraModeIndex + 1) % VEHICLE_CAMERA_MODES.length;
+  const mode = VEHICLE_CAMERA_MODES[groundVehicleState.cameraModeIndex];
+  groundVehicleState.cameraFollowDistance = mode.dist;
+  groundVehicleState.cameraFollowHeight = mode.height;
+  groundVehicleState.cameraOrbitPitch = THREE.MathUtils.clamp(
+    Math.atan2(mode.height, mode.dist),
+    VEHICLE_CAMERA_ORBIT_PITCH_MIN,
+    VEHICLE_CAMERA_ORBIT_PITCH_MAX
+  );
+  bootLog('vehicle.camera.mode', { id: VEHICLE_ENTRY_ID, mode: mode.name, reason });
+  requestRender();
+  return true;
+}
+
+function toggleVehicleHeadlights(reason = 'manual') {
+  if (!vehicleControlActive || !isVehicleSelected() || groundVehicleState.headlightSpots.length === 0) {
+    return false;
+  }
+  const nextVisible = !groundVehicleState.headlightSpots.some(light => light.visible);
+  for (const light of groundVehicleState.headlightSpots) light.visible = nextVisible;
+  bootLog('vehicle.headlights', { id: VEHICLE_ENTRY_ID, visible: nextVisible, reason });
+  requestRender();
+  return true;
+}
+
 function setVehicleControlActive(nextActive, reason = 'manual', options = {}) {
   const { skipExitSave = false } = options;
   driftMode = false;
   const requested = Boolean(nextActive);
-  if (requested && (!vehicleLoaded || controls.mapMode)) {
+  const entry = selectedVehicleEntry();
+  if (requested && (entry == null || !entry.loaded || controls.mapMode)) {
     return false;
   }
   const wasActive = vehicleControlActive;
@@ -2588,46 +3025,87 @@ function setVehicleControlActive(nextActive, reason = 'manual', options = {}) {
   if (vehicleControlActive) {
     controls.speed = 0;
     controls.strafeSpeed = 0;
-    vehicleCameraOrbitYaw = 0;
-    vehicleCameraOrbitPitch = THREE.MathUtils.clamp(
-      Math.atan2(VEHICLE_CAMERA_FOLLOW_HEIGHT, VEHICLE_CAMERA_FOLLOW_DISTANCE),
+    entry.cameraOrbitYaw = 0;
+    const cameraMode = entry.vehicleType === 'aircraft'
+      ? AIRCRAFT_CAMERA_MODES[entry.cameraModeIndex]
+      : { dist: groundVehicleState.cameraFollowDistance, height: groundVehicleState.cameraFollowHeight };
+    entry.cameraOrbitPitch = THREE.MathUtils.clamp(
+      Math.atan2(cameraMode.height, cameraMode.dist),
       VEHICLE_CAMERA_ORBIT_PITCH_MIN,
       VEHICLE_CAMERA_ORBIT_PITCH_MAX
     );
-    controls.yaw = vehicleHeadingRad;
-    updateVehicleFollowCamera();
+    controls.yaw = entry.vehicleType === 'aircraft' ? entry.headingRad : groundVehicleState.headingRad;
+    if (entry.vehicleType === 'aircraft') updateAircraftFollowCamera(entry);
+    else updateVehicleFollowCamera();
   }
   if (wasActive && !vehicleControlActive) {
+    setVehicleTurretControlActive(false, `vehicle-exit-${reason}`);
+    groundVehicleState.turretYawRad = 0;
+    groundVehicleState.turretPitchRad = 0;
+    updateVehicleTurretRig();
     controls.speed = 0; // stop camera drift when exiting vehicle mode
     controls.strafeSpeed = 0;
   }
-  if (wasActive && !vehicleControlActive && vehicleLoaded && !skipExitSave) {
+  if (wasActive && !vehicleControlActive && entry?.vehicleType !== 'aircraft' && groundVehicleState.loaded && !skipExitSave) {
     saveVehicleState(`exit-${reason}`, {
       snapToGround: true,
       requireGroundedZ: false,
       bypassSnapThrottle: true,
     });
   }
+  if (wasActive && !vehicleControlActive && entry?.vehicleType === 'aircraft' && !skipExitSave) {
+    void saveAircraftState(entry, `exit-${reason}`);
+  }
   bootLog('vehicle.control', {
+    id: entry?.id ?? null,
     active: vehicleControlActive,
     reason,
   });
   return vehicleControlActive;
 }
 
-function tryEnterVehicleControlFromPointer(event) {
-  if (controls.mapMode || !vehicleLoaded || vehicleMeshes.length === 0) {
-    return false;
-  }
+function pointerVehicleEntry(event) {
+  if (controls.mapMode) return null;
   mouseNDC.x = (event.clientX / window.innerWidth) * 2 - 1;
   mouseNDC.y = -(event.clientY / window.innerHeight) * 2 + 1;
   raycaster.setFromCamera(mouseNDC, camera);
-  const hits = raycaster.intersectObjects(vehicleMeshes, false);
-  if (hits.length === 0) {
-    return false;
+  let nearest = null;
+  for (const entry of vehicleRegistry.values()) {
+    if (!entry.loaded || entry.meshes.length === 0) continue;
+    const hit = raycaster.intersectObjects(entry.meshes, false)[0];
+    if (hit && (nearest == null || hit.distance < nearest.distance)) nearest = { entry, distance: hit.distance };
   }
-  return setVehicleControlActive(true, 'right-click-vehicle');
+  return nearest?.entry ?? null;
 }
+
+function trySelectVehicleFromPointer(event, { activate = false } = {}) {
+  const entry = pointerVehicleEntry(event);
+  if (entry == null) return false;
+  selectVehicle(activate ? 'right-click-pointer' : 'left-click-pointer', entry.id);
+  if (activate) return setVehicleControlActive(true, 'right-click-vehicle');
+  return true;
+}
+
+function tryEnterVehicleControlFromPointer(event) {
+  return trySelectVehicleFromPointer(event, { activate: true });
+}
+
+const vehicleControlUI = createVehicleControlUI({
+  onDrive: () => setVehicleControlActive(true, 'control-ui'),
+  onExit: () => setVehicleControlActive(false, 'control-ui'),
+  onCycleCamera: () => cycleVehicleCameraMode('control-ui'),
+  onToggleLights: () => toggleVehicleHeadlights('control-ui'),
+  onToggleTurret: () => setVehicleTurretControlActive(
+    !groundVehicleState.turretControlActive,
+    'control-ui'
+  ),
+  onToggleEngine: () => {
+    const entry = selectedVehicleEntry();
+    if (entry?.vehicleType !== 'aircraft' || !vehicleControlActive) return;
+    entry.engineRunning = !entry.engineRunning;
+    bootLog('vehicle.aircraft.engine', { id: entry.id, running: entry.engineRunning });
+  },
+});
 // ── Patria AMV diesel audio ─────────────────────────────────────────────
 // Non-positional audio with manual distance-based volume (avoids ECEF panner issues)
 const audioListener = new THREE.AudioListener();
@@ -3468,6 +3946,13 @@ function createWebGPUAtmospherePostProcessing(renderer) {
     shapeDetail: new CloudShapeDetailNode(),
     turbulence: new TurbulenceNode()
   };
+  // App-loop managed dispatch: their in-frame one-shot computes race the
+  // first-frame pipeline builds (atmosphere LUTs) and nondeterministically
+  // black out the sky on r182.
+  webgpuCloudTextureNodes = Object.values(cloudTextures);
+  for (const node of webgpuCloudTextureNodes) {
+    node.autoDispatch = false;
+  }
   webgpuCloudDensityField = new CloudDensityField({
     localWeatherNode: cloudTextures.localWeather.getTextureNode(),
     shapeNode: cloudTextures.shape.getTextureNode(),
@@ -3512,6 +3997,18 @@ function createWebGPUAtmospherePostProcessing(renderer) {
   // Epipolar volumetric shadow length (Intel Outdoor Light Scattering):
   // the per-ray occlusion term that carves god rays out of the inscatter.
   const shadowLengthNode = shadowLength(csmShadowNode, viewZUnitNode);
+  // Own the god-ray quality budget: takram's autoSampleResolution rewrites
+  // epipolarSliceCount/maxSliceSampleCount from viewport size every frame,
+  // silently quadrupling the configured grid on a 1080p+ window
+  // (PERF_REWORK.md). Disabled so godRaySlices is actually honored.
+  shadowLengthNode.autoSampleResolution = false;
+  shadowLengthNode.epipolarSliceCount.value = webgpuAtmosphereSettings.godRaySlices;
+  shadowLengthNode.maxSliceSampleCount.value = webgpuAtmosphereSettings.godRaySlices / 2;
+  // firstCascade stays 0: skipping the near cascade measured ZERO fps gain
+  // (epipolar cost is not the bottleneck, PERF_REWORK.md 2026-07-18) and at
+  // ground level it visibly kills shafts from terrain within 500 m. Set via
+  // ?godRayFirstCascade=1 only for A/B.
+  shadowLengthNode.firstCascade.value = bootQueryNumber('godRayFirstCascade', 0);
   webgpuShadowLengthNode = shadowLengthNode;
 
   // Cloud god rays: march the beer shadow map along each view ray in post
@@ -3526,7 +4023,9 @@ function createWebGPUAtmospherePostProcessing(renderer) {
       depthNode,
       camera,
       atmosphereContext: webgpuAtmosphereContext,
-      worldToUnit: webgpuAtmosphereParameters.worldToUnit
+      worldToUnit: webgpuAtmosphereParameters.worldToUnit,
+      // half-res march by default; ?cloudGodRaysFull=1 = per-pixel A/B path
+      fullRes: BOOT_QUERY.get('cloudGodRaysFull') === '1'
     });
   }
   webgpuActiveShadowLengthNode = cloudGodRays?.node ?? shadowLengthNode;
@@ -3753,6 +4252,7 @@ function rebuildWebGPUAtmosphere() {
   webgpuCloudShadows?.dispose();
   webgpuCloudShadows = null;
   webgpuCloudDensityField = null;
+  webgpuCloudTextureNodes = [];
   webgpuAtmospherePostProcessing?.dispose?.();
   webgpuAtmosphereNode = null;
   webgpuAtmosphereContext?.dispose?.();
@@ -4033,7 +4533,7 @@ terrainMeshRuntime = createTerrainMeshRuntime({
   tileDepth: tileDepthFromId,
   onMeshAdded: () => { markSceneMutated(); markShadowCastersChanged(); },
   vehicleNearTile: vehicleNearTileBbox,
-  getVehicleDepth: () => vehicleLastContactDepth,
+  getVehicleDepth: () => groundVehicleState.lastContactDepth,
   requestVehicleResnap: requestVehicleTerrainResnap,
 });
 const updateTerrainTextures = createTerrainTextureController({
@@ -4069,7 +4569,7 @@ function tilePriority(tile) {
   return terrainTilePriority(tile, {
     cameraX: camLocalX,
     cameraY: camLocalY,
-    heading: priorityHeading(vehicleControlActive, vehicleHeadingRad, controls.yaw),
+    heading: priorityHeading(vehicleControlActive, groundVehicleState.headingRad, controls.yaw),
     pitch: controls.pitch,
     usePitch: !vehicleControlActive,
     fovDeg: camera.fov,
@@ -4255,7 +4755,7 @@ const terrainFetchState = {
 
 const performTileFetch = createTerrainFetchExecutor({
   state: terrainFetchState, previewMaxDepth: PREVIEW_MAX_DEPTH,
-  getHeading: () => priorityHeading(vehicleControlActive, vehicleHeadingRad, controls.yaw),
+  getHeading: () => priorityHeading(vehicleControlActive, groundVehicleState.headingRad, controls.yaw),
   getRange: () => _terrainRange, getCameraLatLon, getCameraSnapshot: getCameraLogSnapshot,
   getCameraLocalPosition: () => {
     const relative = camera.position.clone().sub(anchorPosition);
@@ -4390,6 +4890,7 @@ if (HOUSE_MODEL.enabled && housesRuntimeVisible) {
 }
 loadVehicleState();
 loadVehicleModel();
+loadAircraftModels();
 
 window.takramDebug = {
   sceneMode: 'clouds-terrain-managed-flask-ux-wip',
@@ -4421,6 +4922,38 @@ window.takramDebug = {
   loadVehicleState,
   setVehicleControlActive: active => setVehicleControlActive(Boolean(active), 'debug-api'),
   getVehicleControlActive: () => vehicleControlActive,
+  getSelectedVehicleId: () => selectedVehicleId,
+  selectVehicle: id => selectVehicle('debug-api', id ?? VEHICLE_ENTRY_ID),
+  getVehicleRegistry: () => Array.from(vehicleRegistry.values(), entry => ({
+    id: entry.id,
+    vehicleType: entry.vehicleType,
+    loaded: entry.loaded,
+    displayName: entry.definition?.displayName ?? null,
+    position: entry.group.position.toArray(),
+    headingDeg: Number(THREE.MathUtils.radToDeg(
+      entry.vehicleType === 'aircraft' ? entry.headingRad : groundVehicleState.headingRad
+    ).toFixed(3)),
+    speedMps: entry.vehicleType === 'aircraft' ? entry.forwardSpeedMs : groundVehicleState.speed,
+    engineRunning: entry.vehicleType === 'aircraft' ? entry.engineRunning : null,
+  })),
+  cycleVehicleCameraMode: () => cycleVehicleCameraMode('debug-api'),
+  getVehicleCameraMode: () => currentVehicleCameraModeName(),
+  getVehicleTurretRigSummary: () => summarizeVehicleTurretRig(groundVehicleState.turretRig),
+  getVehicleTurretControlActive: () => groundVehicleState.turretControlActive,
+  setVehicleTurretControlActive: active => setVehicleTurretControlActive(
+    Boolean(active),
+    'debug-api'
+  ),
+  getVehicleParts: () => groundVehicleState.parts,
+  getVehiclePartsSummary: () => summarizeVehicleParts(groundVehicleState.parts),
+  getVehicleWheelRigSummary: () => summarizeVehicleWheelRig(groundVehicleState.wheelRig),
+  getVehicleWheelContacts: () => getVehicleWheelContactSnapshot(
+    THREE,
+    groundVehicleState.wheelRig,
+    terrainRoot,
+    vehicleGroup,
+    VEHICLE_TIRE_RADIUS_M
+  ),
   houseInstances,
   houseZSummary,
   houseShadowDebugSummary,
@@ -4599,29 +5132,51 @@ function updateMovement(dt) {
   const leftPressed = isPressed('KeyA', 'ArrowLeft');
   const rightPressed = isPressed('KeyD', 'ArrowRight');
 
-  if (vehicleControlActive && !controls.mapMode) {
+  if (vehicleControlActive && selectedVehicleEntry() == null) {
+    setVehicleControlActive(false, 'selection-changed');
+  }
+
+  const selectedEntry = selectedVehicleEntry();
+  if (vehicleControlActive && selectedEntry?.vehicleType === 'aircraft' && !controls.mapMode) {
     controls.speed = 0;
     controls.strafeSpeed = 0;
-    if (!vehicleLoaded) {
+    stepAircraftFlight(selectedEntry, {
+      forward: forwardPressed,
+      back: backPressed,
+      left: leftPressed,
+      right: rightPressed,
+      climb: Boolean(controls.keys.Space),
+      descend: Boolean(controls.keys.KeyQ),
+    }, dt, sampleAircraftGroundZ(selectedEntry));
+    throttledAircraftSave(selectedEntry);
+    _lastCamMoveTime = performance.now();
+    abortAllEnhancements();
+    return;
+  }
+
+  if (vehicleControlActive && isVehicleSelected() && !controls.mapMode) {
+    controls.speed = 0;
+    controls.strafeSpeed = 0;
+    if (!groundVehicleState.loaded) {
       setVehicleControlActive(false, 'vehicle-unloaded');
       return;
     }
     const steer = (leftPressed ? 1 : 0) + (rightPressed ? -1 : 0);
     const drive = (forwardPressed ? 1 : 0) + (backPressed ? -1 : 0);
     const driveStep = stepVehicleDrive({
-      dt, heading: vehicleHeadingRad, speed: vehicleSpeed, steer, drive,
-      groundNormalX: vehicleGroundNormal.x, groundNormalY: vehicleGroundNormal.y,
+      dt, heading: groundVehicleState.headingRad, speed: groundVehicleState.speed, steer, drive,
+      groundNormalX: groundVehicleState.groundNormal.x, groundNormalY: groundVehicleState.groundNormal.y,
       acceleration: VEHICLE_ACCEL, brake: VEHICLE_BRAKE,
       steerSpeed: VEHICLE_STEER_SPEED, maxSpeed: VEHICLE_DRIVE_SPEED,
     });
-    vehicleHeadingRad = driveStep.heading;
-    vehicleSpeed = driveStep.speed;
-    if (vehicleSpeed !== 0 || steer !== 0) {
+    groundVehicleState.headingRad = driveStep.heading;
+    groundVehicleState.speed = driveStep.speed;
+    if (groundVehicleState.speed !== 0 || steer !== 0) {
       vehicleGroup.position.x += driveStep.deltaX;
       vehicleGroup.position.y += driveStep.deltaY;
       vehicleMarker.position.x = vehicleGroup.position.x;
       vehicleMarker.position.y = vehicleGroup.position.y;
-      vehicleSnapPending = true;
+      groundVehicleState.snapPending = true;
       throttledVehicleSave();
       _lastCamMoveTime = performance.now();
       abortAllEnhancements();
@@ -4728,12 +5283,18 @@ function updateMovement(dt) {
 }
 
 function updateHud() {
+  const hudVehicle = selectedVehicleEntry();
   const rel = camera.position.clone().sub(anchorPosition);
   const eastM = rel.dot(east);
   const northM = rel.dot(north);
   const altM = rel.dot(up);
-  const speedKmh = Math.hypot(controls.speed, controls.strafeSpeed) * 3.6;
-  const headingForHud = vehicleControlActive ? vehicleHeadingRad : controls.yaw;
+  const displayedSpeedMps = vehicleControlActive
+    ? Math.abs(hudVehicle?.vehicleType === 'aircraft' ? hudVehicle.forwardSpeedMs : groundVehicleState.speed)
+    : Math.hypot(controls.speed, controls.strafeSpeed);
+  const speedKmh = displayedSpeedMps * 3.6;
+  const headingForHud = vehicleControlActive
+    ? (hudVehicle?.vehicleType === 'aircraft' ? hudVehicle.headingRad : groundVehicleState.headingRad)
+    : controls.yaw;
   const { degrees: deg, compass } = compassHeading(headingForHud);
   // Heightmap line — always present, stable width
   const hmPending = _hmMissing + _hmDownloading;
@@ -4777,8 +5338,12 @@ function updateHud() {
   }
   const modeLabel = controls.mapMode
     ? 'MAP'
-    : (vehicleControlActive ? 'VEHICLE' : 'FLIGHT');
-  const modeHtml = vehicleControlActive
+    : (groundVehicleState.turretControlActive ? 'TURRET' : (vehicleControlActive
+      ? (hudVehicle?.vehicleType === 'aircraft' ? 'VTOL' : 'VEHICLE')
+      : 'FLIGHT'));
+  const modeHtml = groundVehicleState.turretControlActive
+    ? '<span style="color:#ff8c00">TURRET</span>'
+    : vehicleControlActive
     ? '<span style="color:#ff3b30">VEHICLE</span>'
     : modeLabel;
 
@@ -4801,9 +5366,15 @@ function updateHud() {
     `speed: ${speedKmh.toFixed(0)} km/h  heading: ${deg.toFixed(0)}° ${compass}`,
     hmLine,
     texLine,
-    vehicleControlActive
-      ? 'W/S drive, A/D steer, mouse orbit camera, Esc exits vehicle control'
-      : 'WASD or Arrows move, Q/Z altitude, drag look',
+    groundVehicleState.turretControlActive
+      ? 'Mouse aims turret, W/S drive, A/D steer, T or Esc exits turret · firing pending WebGPU validation'
+      : vehicleControlActive && hudVehicle?.vehicleType === 'aircraft'
+      ? `E engine (${hudVehicle.engineRunning ? 'ON' : 'OFF'}), W/S move, A/D yaw, Space climb, Q descend, V camera (${currentVehicleCameraModeName()}), Esc exit`
+      : vehicleControlActive
+      ? `W/S drive, A/D steer, mouse orbit, V camera (${currentVehicleCameraModeName()}), L lights, Esc exit`
+      : (hudVehicle != null
+        ? `${hudVehicle.definition?.displayName || 'Vehicle'} selected · right-click it or use Drive`
+        : 'WASD or Arrows move, Q/Z altitude, drag look · click vehicle to select, right-click to drive'),
     'map: left-drag rotate, right-drag pan, wheel zoom',
     controls.mapMode
       ? `ocean overlay: ${oceanMapDebugEnabled ? 'ON' : 'OFF'}  (right-click menu; cyan=ocean, magenta=seed, orange=passable)`
@@ -4815,7 +5386,27 @@ function updateHud() {
   alt.textContent =
     `${altM.toFixed(0)}m / ${(altM * 3.28084).toFixed(0)}ft  ${deg.toFixed(0)}° ${compass}` +
     `  FOV ${camera.fov.toFixed(0)}°` +
-    (controls.mapMode ? '  [MAP]' : (vehicleControlActive ? '  [VEHICLE]' : ''));
+    (controls.mapMode ? '  [MAP]' : (groundVehicleState.turretControlActive ? '  [TURRET]' : (vehicleControlActive ? '  [VEHICLE]' : '')));
+  const isAircraft = hudVehicle?.vehicleType === 'aircraft';
+  const headlightsOn = !isAircraft && groundVehicleState.headlightSpots.some(light => light.visible);
+  vehicleControlUI.update({
+    selected: hudVehicle != null,
+    loaded: Boolean(hudVehicle?.loaded),
+    active: vehicleControlActive,
+    mapMode: controls.mapMode,
+    displayName: hudVehicle?.definition?.displayName || 'Vehicle',
+    id: hudVehicle?.id || '',
+    cameraMode: currentVehicleCameraModeName(),
+    speedMps: vehicleControlActive
+      ? (isAircraft ? hudVehicle.forwardSpeedMs : groundVehicleState.speed)
+      : 0,
+    hasLights: !isAircraft && groundVehicleState.headlightSpots.length > 0,
+    lightsOn: headlightsOn,
+    hasTurret: !isAircraft && groundVehicleState.turretRig?.gunPivot != null,
+    turretActive: groundVehicleState.turretControlActive,
+    isAircraft,
+    engineRunning: Boolean(hudVehicle?.engineRunning),
+  });
 }
 
 function resetView() {
@@ -4892,14 +5483,20 @@ function toggleMapMode() {
 installTerrainKeyboardControls({
   controls,
   isVehicleActive: () => vehicleControlActive,
+  isTurretActive: () => groundVehicleState.turretControlActive,
   onForwardDoubleTap: () => {
     driftMode = !driftMode;
     console.log(`[drift] ${driftMode ? 'ON' : 'OFF'}`);
   },
   onEscapeVehicle: () => {
-    saveVehicleState('escape', { snapToGround: true, requireGroundedZ: false, bypassSnapThrottle: true });
-    setVehicleControlActive(false, 'escape', { skipExitSave: true });
+    if (isAircraftSelected()) {
+      setVehicleControlActive(false, 'escape');
+    } else {
+      saveVehicleState('escape', { snapToGround: true, requireGroundedZ: false, bypassSnapThrottle: true });
+      setVehicleControlActive(false, 'escape', { skipExitSave: true });
+    }
   },
+  onEscapeTurret: () => setVehicleTurretControlActive(false, 'escape'),
   onToggleMap: toggleMapMode,
   onOpenPipeline: () => window.open(HUD_LINKS.pipelineMapLink, '_blank'),
   onOpenHeatmap: () => window.open(HUD_LINKS.radarHeatmapLink, '_blank'),
@@ -4908,7 +5505,18 @@ installTerrainKeyboardControls({
     ? loadHouseModel('keyboard')
     : setHousesRuntimeVisible(!housesRuntimeVisible, 'keyboard'),
   onToggleHeadlights: () => {
-    for (const light of vehicleHeadlightSpots) light.visible = !light.visible;
+    toggleVehicleHeadlights('keyboard');
+  },
+  onCycleVehicleCamera: () => cycleVehicleCameraMode('keyboard'),
+  onToggleTurret: () => setVehicleTurretControlActive(
+    !groundVehicleState.turretControlActive,
+    'keyboard'
+  ),
+  onToggleAircraftEngine: () => {
+    const entry = selectedVehicleEntry();
+    if (entry?.vehicleType !== 'aircraft') return;
+    entry.engineRunning = !entry.engineRunning;
+    bootLog('vehicle.aircraft.engine', { id: entry.id, running: entry.engineRunning });
   },
   onChanged: requestRender,
 });
@@ -4919,19 +5527,35 @@ installTerrainPointerControls({
   mouseSensitivity: MOUSE_SENS,
   mapPanFactor: MAP_PAN_FACTOR,
   isVehicleActive: () => vehicleControlActive,
+  isTurretActive: () => groundVehicleState.turretControlActive,
   onVehicleOrbit: (movementX, movementY) => {
-    vehicleCameraOrbitYaw -= movementX * VEHICLE_CAMERA_ORBIT_SENS;
-    vehicleCameraOrbitPitch = THREE.MathUtils.clamp(
-      vehicleCameraOrbitPitch + movementY * VEHICLE_CAMERA_ORBIT_SENS,
+    const entry = selectedVehicleEntry();
+    if (entry == null) return;
+    entry.cameraOrbitYaw -= movementX * VEHICLE_CAMERA_ORBIT_SENS;
+    entry.cameraOrbitPitch = THREE.MathUtils.clamp(
+      entry.cameraOrbitPitch + movementY * VEHICLE_CAMERA_ORBIT_SENS,
       VEHICLE_CAMERA_ORBIT_PITCH_MIN,
       VEHICLE_CAMERA_ORBIT_PITCH_MAX,
     );
   },
+  onTurretAim: aimVehicleTurret,
   onMapCameraChanged: updateMapCamera,
   onChanged: requestRender,
 });
 
+document.addEventListener('pointerlockchange', () => {
+  if (groundVehicleState.turretControlActive && document.pointerLockElement !== renderer.domElement) {
+    setVehicleTurretControlActive(false, 'pointer-lock-lost');
+  }
+});
+
+let vehicleSelectionPointerDown = null;
 renderer.domElement.addEventListener('pointerdown', event => {
+  vehicleSelectionPointerDown = {
+    button: event.button,
+    x: event.clientX,
+    y: event.clientY,
+  };
   console.warn('[CLICK TEST] pointerdown', {
     x: event.clientX,
     y: event.clientY,
@@ -4964,8 +5588,14 @@ renderer.domElement.addEventListener('click', event => {
     }, 'error');
   }
   if (!controls.mapMode) {
+    const down = vehicleSelectionPointerDown;
+    vehicleSelectionPointerDown = null;
+    const isSelectionClick = down != null && down.button === 0 && event.button === 0 &&
+      Math.hypot(event.clientX - down.x, event.clientY - down.y) <= 4;
+    if (isSelectionClick) trySelectVehicleFromPointer(event);
     return;
   }
+  vehicleSelectionPointerDown = null;
   const targets = collectDebugMeshes(terrainRoot);
   if (targets.length === 0) {
     return;
@@ -5084,8 +5714,19 @@ renderer.domElement.addEventListener(
       requestRender();
     } else if (vehicleControlActive) {
       const scale = zoomIn ? 0.9 : 1.1;
-      VEHICLE_CAMERA_FOLLOW_DISTANCE = Math.max(8, Math.min(200, VEHICLE_CAMERA_FOLLOW_DISTANCE * scale));
-      VEHICLE_CAMERA_FOLLOW_HEIGHT = Math.max(2, Math.min(80, VEHICLE_CAMERA_FOLLOW_HEIGHT * scale));
+      const entry = selectedVehicleEntry();
+      if (entry?.vehicleType === 'aircraft') {
+        const mode = AIRCRAFT_CAMERA_MODES[entry.cameraModeIndex] ?? AIRCRAFT_CAMERA_MODES[1];
+        entry.cameraOrbitPitch = THREE.MathUtils.clamp(
+          Math.atan2(mode.height * scale, mode.dist * scale),
+          VEHICLE_CAMERA_ORBIT_PITCH_MIN,
+          VEHICLE_CAMERA_ORBIT_PITCH_MAX,
+        );
+      } else {
+        groundVehicleState.cameraFollowDistance = Math.max(8, Math.min(200, groundVehicleState.cameraFollowDistance * scale));
+        groundVehicleState.cameraFollowHeight = Math.max(2, Math.min(80, groundVehicleState.cameraFollowHeight * scale));
+        groundVehicleState.cameraModeIndex = -1;
+      }
       requestRender();
     } else {
       camera.fov *= zoomIn ? 0.95 : 1.05;
@@ -5156,10 +5797,16 @@ function render() {
   snapVehicleToTerrain();
   updateDieselVolume();
   updateVehicleSuspension(dt);
+  updateVehicleWheelSpin(dt);
+  updateVehicleTurretRig();
+  for (const entry of aircraftEntries) updateAircraftVisuals(entry, dt);
   if (vehicleControlActive && !controls.mapMode) {
-    updateVehicleFollowCamera();
+    if (groundVehicleState.turretControlActive) updateVehicleTurretCamera();
+    else if (isAircraftSelected()) updateAircraftFollowCamera(selectedVehicleEntry());
+    else updateVehicleFollowCamera();
   }
   syncVehicleSunLight();
+  syncAircraftSunLights();
   syncVehicleShadowReceivers();
   updateVehicleShadowSystem();
   if (housesRuntimeVisible) {
@@ -5227,6 +5874,9 @@ function render() {
       house.marker.scale.setScalar(markerScale);
     }
     vehicleMarker.scale.setScalar(markerScale * VEHICLE_MARKER_MAP_SCALE);
+    for (const entry of aircraftEntries) {
+      entry.marker.scale.setScalar(markerScale * VEHICLE_MARKER_MAP_SCALE);
+    }
     scene.fog = null;
     scene.background = _mapBg;
     renderBackend.renderMap(scene, mapCam);
@@ -5245,6 +5895,9 @@ function render() {
   if (renderBackend.isWebGPU && webgpuCloudShadows != null) {
     // Throttled internally; must run OUTSIDE the render (a compute submit
     // inside the frame corrupts other passes on r182).
+    for (const node of webgpuCloudTextureNodes) {
+      node.dispatch(renderer);
+    }
     // ?bsmFreeze=1: cost-attribution diagnostic — materials keep sampling
     // the beer shadow map but its compute never re-marches.
     if (BOOT_QUERY.get('bsmFreeze') !== '1') {
@@ -5298,15 +5951,29 @@ const CSM_REFRESH_POLICY = [
   { driftTexels: 2, sunRadians: 0.10 * THREE.MathUtils.DEG2RAD, streamHoldMs: 5000, fallbackMs: 15000 },   // 0.5–8 km
   { driftTexels: 2, sunRadians: 0.20 * THREE.MathUtils.DEG2RAD, streamHoldMs: 10000, fallbackMs: 30000 }   // 8–50 km
 ];
-const _csmRefreshStats = { count: [0, 0, 0], reasons: {} };
+// Refresh budget: at most N cascade rasters per frame (init exempt — a
+// never-rendered map is garbage, not merely stale). During flythrough all
+// three cascades drift past threshold in the same frames; without a budget
+// that's up to 12.6 M shadow texels in one frame. Frozen cascades never
+// "swim" on r182 (depth map + sampling matrix freeze together), they only
+// lag coverage, so deferring by a frame or two is visually safe. Deferred
+// triggers stay sticky per cascade and re-compete next frame; priority is
+// recenter/projection > drift > sun > vehicle > stream > fallback, near
+// cascade first among equals. ?csmBudget=0 disables the cap (grant all) for
+// A/B; ?csmBudget=N raises it.
+const CSM_REFRESH_BUDGET = bootQueryNumber('csmBudget', 1);
+const CSM_REASON_RANK = {
+  init: 0, recenter: 1, projection: 1, drift: 2, sun: 3, vehicle: 4,
+  stream: 5, fallback: 6
+};
+const _csmRefreshStats = { count: [0, 0, 0], reasons: {}, deferred: 0 };
 let _csmStateOwner = null;   // csm node the state belongs to (reset on rebuild)
 let _csmCascadeState = [];
 let _csmSeenSceneVersion = -1;
 let _csmSeenPatchCenter = null;
 let _csmSeenFov = -1;
 let _csmSeenAspect = -1;
-const _csmSeenVehiclePos = new THREE.Vector3(Infinity, Infinity, Infinity);
-const _csmSeenVehicleQuat = new THREE.Quaternion();
+const _csmSeenVehicleTransforms = new Map();
 const _csmSunScratch = new THREE.Vector3();
 
 function updateTerrainShadowBudget() {
@@ -5335,6 +6002,7 @@ function updateTerrainShadowBudget() {
       _csmCascadeState = [];
       _csmRefreshStats.count = [0, 0, 0];
       _csmRefreshStats.reasons = {};
+      _csmRefreshStats.deferred = 0;
       csm._refreshStats = _csmRefreshStats;
       // Baseline the change detectors NOW so the first policy frame doesn't
       // fire a spurious 'projection' event — that would call
@@ -5373,18 +6041,32 @@ function updateTerrainShadowBudget() {
     // The vehicle casts into the scene CSM (its meshes are castShadow=true)
     // on top of its local shadow light; until that's separated its motion
     // dirties the near cascade.
-    const vehicleMoved =
-      _csmSeenVehiclePos.distanceToSquared(vehicleGroup.position) > 0.05 * 0.05 ||
-      _csmSeenVehicleQuat.angleTo(vehicleGroup.quaternion) > 0.003;
-    if (vehicleMoved) {
-      _csmSeenVehiclePos.copy(vehicleGroup.position);
-      _csmSeenVehicleQuat.copy(vehicleGroup.quaternion);
+    let vehicleMoved = false;
+    for (const entry of vehicleRegistry.values()) {
+      if (!entry.loaded) continue;
+      let seen = _csmSeenVehicleTransforms.get(entry.id);
+      if (seen == null) {
+        seen = { position: new THREE.Vector3(Infinity, Infinity, Infinity), quaternion: new THREE.Quaternion() };
+        _csmSeenVehicleTransforms.set(entry.id, seen);
+      }
+      if (seen.position.distanceToSquared(entry.group.position) > 0.05 * 0.05
+        || seen.quaternion.angleTo(entry.group.quaternion) > 0.003) {
+        seen.position.copy(entry.group.position);
+        seen.quaternion.copy(entry.group.quaternion);
+        vehicleMoved = true;
+      }
     }
 
     const sunDir = _csmSunScratch
       .subVectors(csm.light.target.position, csm.light.position)
       .normalize();
 
+    // Pass 1: collect refresh candidates. Triggers that are consumed by the
+    // change detectors above (recenter/projection/vehicle) are latched into
+    // sticky per-cascade flags so a deferred cascade re-competes next frame;
+    // threshold triggers (drift/sun/stream/fallback) re-detect naturally
+    // because state is only stamped on grant.
+    const candidates = [];
     for (let i = 0; i < cascadeLights.length; i++) {
       const lwLight = cascadeLights[i];
       const shadow = lwLight.shadow;
@@ -5398,11 +6080,15 @@ function updateTerrainShadowBudget() {
           sunDir: new THREE.Vector3(),
           lastMs: -Infinity,
           rendered: false,
-          dirtyStream: false
+          dirtyStream: false,
+          dirtyGlobal: null,
+          dirtyVehicle: false
         };
       }
       if (castersChanged) st.dirtyStream = true;
-      let reason = st.rendered ? globalReason : 'init';
+      if (globalReason != null && st.rendered) st.dirtyGlobal = globalReason;
+      if (vehicleMoved && i === 0) st.dirtyVehicle = true;
+      let reason = st.rendered ? st.dirtyGlobal : 'init';
       const shadowCam = shadow.camera;
       const texel = Number.isFinite(shadowCam.right) && Number.isFinite(shadowCam.left)
         ? (shadowCam.right - shadowCam.left) / shadow.mapSize.x
@@ -5414,7 +6100,7 @@ function updateTerrainShadowBudget() {
       if (reason == null && sunDir.angleTo(st.sunDir) > policy.sunRadians) {
         reason = 'sun';
       }
-      if (reason == null && i === 0 && vehicleMoved) {
+      if (reason == null && st.dirtyVehicle) {
         reason = 'vehicle';
       }
       if (reason == null && st.dirtyStream && nowMs - st.lastMs > policy.streamHoldMs) {
@@ -5424,15 +6110,39 @@ function updateTerrainShadowBudget() {
         reason = 'fallback';
       }
       if (reason != null) {
-        shadow.needsUpdate = true;
-        st.rendered = true;
-        st.dirtyStream = false;
-        st.lastMs = nowMs;
-        st.fitPos.copy(lwLight.position);
-        st.sunDir.copy(sunDir);
-        _csmRefreshStats.count[i] = (_csmRefreshStats.count[i] ?? 0) + 1;
-        _csmRefreshStats.reasons[reason] = (_csmRefreshStats.reasons[reason] ?? 0) + 1;
+        candidates.push({ i, st, shadow, light: lwLight, reason });
       }
+    }
+
+    // Pass 2: budgeted grants, most urgent first; among equals the STALEST
+    // cascade wins (oldest lastMs), which round-robins naturally. Sorting by
+    // cascade index here starved the far cascades during sustained flight —
+    // the near cascade re-drifts every frame and won every grant, so the far
+    // maps froze kilometers behind and projected stale shadow over everything
+    // beyond the near range (seen live 2026-07-18 as a giant wrong shadow
+    // band outside the LAAS patch).
+    candidates.sort((a, b) =>
+      (CSM_REASON_RANK[a.reason] ?? 9) - (CSM_REASON_RANK[b.reason] ?? 9) ||
+      a.st.lastMs - b.st.lastMs
+    );
+    let granted = 0;
+    for (const c of candidates) {
+      const exempt = c.reason === 'init';
+      if (!exempt && CSM_REFRESH_BUDGET > 0 && granted >= CSM_REFRESH_BUDGET) {
+        _csmRefreshStats.deferred = (_csmRefreshStats.deferred ?? 0) + 1;
+        continue;
+      }
+      if (!exempt) granted++;
+      c.shadow.needsUpdate = true;
+      c.st.rendered = true;
+      c.st.dirtyStream = false;
+      c.st.dirtyGlobal = null;
+      c.st.dirtyVehicle = false;
+      c.st.lastMs = nowMs;
+      c.st.fitPos.copy(c.light.position);
+      c.st.sunDir.copy(sunDir);
+      _csmRefreshStats.count[c.i] = (_csmRefreshStats.count[c.i] ?? 0) + 1;
+      _csmRefreshStats.reasons[c.reason] = (_csmRefreshStats.reasons[c.reason] ?? 0) + 1;
     }
   }
 

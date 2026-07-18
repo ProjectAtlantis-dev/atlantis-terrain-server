@@ -49,6 +49,7 @@ import { WORLD_SIZE } from '../../world/WorldConst';
 import { canopyAt } from './Scatter';
 import type { ProbeGI } from './ProbeGI';
 import { gustAt, windContext, windU } from '../../render/Wind';
+import { bootQuery } from '../../core/BootQuery';
 
 export const PARTICLE_COUNT = 131072;
 const BOX_R = 36; // m, horizontal half-extent around the camera
@@ -219,7 +220,7 @@ export class Particles {
     );
     // ?partdbg=1 — oversized red emissive quads (pipeline-vs-tuning bisect);
     // ?partdbg=2 — analytic camera ring, sim buffers bypassed (data-vs-draw)
-    const pdbg = new URLSearchParams(window.location.search).get('partdbg');
+    const pdbg = bootQuery().get('partdbg');
     if (pdbg === '1' || pdbg === '2') {
       const center =
         pdbg === '2'

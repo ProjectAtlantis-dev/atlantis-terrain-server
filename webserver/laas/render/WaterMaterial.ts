@@ -70,6 +70,7 @@ import type { Atmosphere } from '../sky/Atmosphere';
 import type { Heightfield } from '../world/Heightfield';
 import { WORLD_HALF } from '../world/WorldConst';
 import { seasonU } from './Season';
+import { bootQuery } from '../core/BootQuery';
 
 /** clear alpine water: absorption per meter (r dies first → teal depths) */
 const SIGMA = { r: 0.42, g: 0.135, b: 0.095 };
@@ -358,7 +359,7 @@ export function waterMaterial(
 
   // ?waterdbg=N — component probe ladder (1 foam, 2 fresnel, 3 refraction,
   // 4 reflection, 5 column thickness, 6 SSR hit/horizon mix)
-  const dbg = Number(new URLSearchParams(window.location.search).get('waterdbg') ?? '0');
+  const dbg = Number(bootQuery().get('waterdbg') ?? '0');
   if (dbg > 0) {
     const paint =
       dbg === 1

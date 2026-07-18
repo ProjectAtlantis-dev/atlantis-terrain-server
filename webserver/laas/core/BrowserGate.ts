@@ -25,6 +25,7 @@
  */
 
 import { failLoud } from './Diagnostics';
+import { bootQuery } from './BootQuery';
 
 interface UAClientHints {
   mobile?: boolean;
@@ -60,7 +61,7 @@ export function isChromiumBrowser(): boolean {
 
 /** @returns true when boot may proceed; false after rendering a notice */
 export function browserGate(): boolean {
-  if (new URLSearchParams(window.location.search).get('nogate') === '1') return true;
+  if (bootQuery().get('nogate') === '1') return true;
 
   if (isMobileDevice()) {
     failLoud('A computer is required', [

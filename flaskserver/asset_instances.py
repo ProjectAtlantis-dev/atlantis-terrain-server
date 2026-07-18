@@ -5,11 +5,11 @@ import math
 import sqlite3
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
-ASSETS_RESPONSE_SCHEMA_VERSION = 4
+ASSETS_RESPONSE_SCHEMA_VERSION = 5
 STRUCTURE_SITES_TABLE = "structure_sites"
 VEHICLE_INSTANCES_TABLE = "vehicle_instances"
 DEFAULT_VEHICLE_INSTANCE_ID = "amv-01"
@@ -21,9 +21,18 @@ ASSETS_METADATA_PATH = Path(__file__).with_name("assets_metadata.json")
 
 _FALLBACK_VEHICLE_DEFINITION = {
   "url": "/models/patria_amv.glb",
+  "displayName": "Patria AMV",
   "realLengthM": 7.7,
   "tireDiameterM": 1.27,
   "altOffsetM": 0.05,
+  "parts": {
+    "wheels": ["Object_8", "Object_9", "Object_10"],
+    "turret": "Object_3",
+    "gun": "Object_2",
+    "body": ["Object_4", "Object_5", "Object_6"],
+    "shield": ["Object_7"],
+  },
+  "wheelClusterSplitThreshold": 3500,
 }
 
 _FALLBACK_STRUCTURE_DEFINITION = {
@@ -34,7 +43,8 @@ _FALLBACK_STRUCTURE_DEFINITION = {
 }
 
 _FALLBACK_SEED_VEHICLE_INSTANCES = [
-  {"id": "amv-01", "lat": 64.18423381, "lon": -51.70139232, "headingDeg": 234.341, "z": 16.279, "headlightsOn": True},
+  {"id": "amv-01", "definitionId": "patria-amv", "lat": 64.18423381, "lon": -51.70139232, "headingDeg": 234.341, "z": 16.279, "headlightsOn": True},
+  {"id": "osprey-01", "definitionId": "v22-osprey", "lat": 64.19094, "lon": -51.67814, "headingDeg": 46, "z": 85, "headlightsOn": False},
 ]
 
 _FALLBACK_SEED_STRUCTURE_INSTANCES = [
@@ -194,13 +204,85 @@ class VehicleHeadlightsModel(BaseModel):
     return value
 
 
+class VehiclePartsModel(BaseModel):
+  model_config = ConfigDict(extra="ignore")
+
+  wheels: list[str] = Field(default_factory=list)
+  turret: str | None = None
+  gun: str | None = None
+  body: list[str] = Field(default_factory=list)
+  shield: list[str] = Field(default_factory=list)
+  leftNacelle: list[str] = Field(default_factory=list)
+  rightNacelle: list[str] = Field(default_factory=list)
+  leftRotor: str | None = None
+  rightRotor: str | None = None
+
+  @field_validator("wheels", "body", "shield", "leftNacelle", "rightNacelle", mode="before")
+  @classmethod
+  def normalize_names(cls, value: Any) -> list[str]:
+    if value is None:
+      return []
+    if not isinstance(value, list):
+      raise ValueError("must be a list of node names")
+    return [item.strip() for item in value if isinstance(item, str) and item.strip()]
+
+  @field_validator("turret", "gun", "leftRotor", "rightRotor", mode="before")
+  @classmethod
+  def normalize_optional_name(cls, value: Any) -> str | None:
+    if value is None:
+      return None
+    if not isinstance(value, str):
+      raise ValueError("must be a node name or null")
+    text = value.strip()
+    return text or None
+
+
+class AircraftFlightConfigModel(BaseModel):
+  model_config = ConfigDict(extra="ignore")
+
+  maxSpeedMs: float = Field(ge=0)
+  hoverMaxSpeedMs: float = Field(ge=0)
+  transitionLowMs: float = Field(ge=0)
+  transitionHighMs: float = Field(ge=0)
+  climbRateMs: float = Field(ge=0)
+  descendRateMs: float = Field(ge=0)
+  accelMs2: float = Field(ge=0)
+  yawRateRad: float = Field(ge=0)
+  pitchRateRad: float = Field(ge=0)
+  rollRateRad: float = Field(ge=0)
+
+
+class NacelleConfigModel(BaseModel):
+  model_config = ConfigDict(extra="ignore")
+
+  tiltSpeedDegS: float = Field(ge=0)
+  rotorRadiusM: float = Field(gt=0)
+  leftCenter: tuple[float, float, float]
+  rightCenter: tuple[float, float, float]
+
+
 class VehicleDefinitionModel(BaseModel):
   model_config = ConfigDict(extra="ignore")
 
   url: str = str(_FALLBACK_VEHICLE_DEFINITION["url"])
+  displayName: str | None = str(_FALLBACK_VEHICLE_DEFINITION["displayName"])
+  vehicleType: Literal["ground", "aircraft"] = "ground"
   realLengthM: float = Field(default=float(_FALLBACK_VEHICLE_DEFINITION["realLengthM"]), gt=0)
   tireDiameterM: float = Field(default=float(_FALLBACK_VEHICLE_DEFINITION["tireDiameterM"]), gt=0)
   altOffsetM: float = float(_FALLBACK_VEHICLE_DEFINITION["altOffsetM"])
+  parts: VehiclePartsModel | None = Field(
+    default_factory=lambda: VehiclePartsModel.model_validate(
+      _FALLBACK_VEHICLE_DEFINITION["parts"]
+    )
+  )
+  wheelClusterSplitThreshold: float | None = Field(
+    default=float(_FALLBACK_VEHICLE_DEFINITION["wheelClusterSplitThreshold"]),
+    gt=0,
+  )
+  headingOffsetDeg: float = 0
+  modelRotationDeg: tuple[float, float, float] | None = None
+  flight: AircraftFlightConfigModel | None = None
+  nacelles: NacelleConfigModel | None = None
 
   @field_validator("url", mode="before")
   @classmethod
@@ -212,9 +294,26 @@ class VehicleDefinitionModel(BaseModel):
       raise ValueError("must be a non-empty string")
     return text
 
-  @field_validator("realLengthM", "tireDiameterM", "altOffsetM")
+  @field_validator("displayName", mode="before")
   @classmethod
-  def validate_finite_number(cls, value: float) -> float:
+  def normalize_display_name(cls, value: Any) -> str | None:
+    if value is None:
+      return None
+    if not isinstance(value, str):
+      raise ValueError("must be a string or null")
+    text = value.strip()
+    return text or None
+
+  @field_validator(
+    "realLengthM",
+    "tireDiameterM",
+    "altOffsetM",
+    "wheelClusterSplitThreshold",
+  )
+  @classmethod
+  def validate_finite_number(cls, value: float | None) -> float | None:
+    if value is None:
+      return None
     if not math.isfinite(value):
       raise ValueError("must be finite")
     return value
@@ -479,6 +578,7 @@ def _sanitize_seed_vehicle_instance(
 
   return {
     "vehicleId": vehicle_id,
+    **({"definitionId": raw["definitionId"].strip()} if isinstance(raw.get("definitionId"), str) and raw["definitionId"].strip() else {}),
     "headlightsOn": headlights_on,
     "state": state,
   }
@@ -488,8 +588,8 @@ def _sanitize_seed_vehicle_instance(
 
 def _load_assets_metadata(
   logger: Any,
-) -> tuple[str, dict[str, Any], dict[str, Any], dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
-  """Returns (source, vehicle_definition, vehicle_headlights, structure_definition,
+) -> tuple[str, dict[str, Any], dict[str, dict[str, Any]], dict[str, Any], dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
+  """Returns (source, vehicle_definition, vehicle_definitions, vehicle_headlights, structure_definition,
               seed_vehicle_instances, seed_structure_instances)."""
   source = "metadata_file"
   raw_payload: Any = None
@@ -544,6 +644,19 @@ def _load_assets_metadata(
 
   structure_definition = _sanitize_structure_definition(raw_structure_def)
   vehicle_definition = _sanitize_vehicle_definition(raw_vehicle_def, logger)
+  vehicle_definitions: dict[str, dict[str, Any]] = {}
+  raw_vehicle_definitions = raw_payload.get("vehicle_definitions")
+  if isinstance(raw_vehicle_definitions, dict):
+    for raw_id, raw_definition in raw_vehicle_definitions.items():
+      definition_id = raw_id.strip() if isinstance(raw_id, str) else ""
+      if not definition_id or not isinstance(raw_definition, dict):
+        continue
+      definition = _sanitize_vehicle_definition(raw_definition, logger)
+      if "headlights" in raw_definition:
+        definition["headlights"] = _sanitize_vehicle_headlights(raw_definition.get("headlights"), logger)
+      vehicle_definitions[definition_id] = definition
+  if not vehicle_definitions:
+    vehicle_definitions["default"] = {**vehicle_definition, "headlights": vehicle_headlights}
 
   # Seed structure instances
   seed_structure_instances = _sanitize_structure_sites(raw_seed_structures)
@@ -562,11 +675,12 @@ def _load_assets_metadata(
     default_state = VehicleStateCommonModel.model_validate(fallback_seed)
     seed_vehicle_instances.append({
       "vehicleId": DEFAULT_VEHICLE_INSTANCE_ID,
+      **({"definitionId": fallback_seed["definitionId"]} if fallback_seed.get("definitionId") else {}),
       "headlightsOn": bool(fallback_seed.get("headlightsOn", True)),
       "state": default_state,
     })
 
-  return source, vehicle_definition, vehicle_headlights, structure_definition, seed_vehicle_instances, seed_structure_instances
+  return source, vehicle_definition, vehicle_definitions, vehicle_headlights, structure_definition, seed_vehicle_instances, seed_structure_instances
 
 
 # ── DB: structure instances ──────────────────────────────────────────────
@@ -660,6 +774,7 @@ def _ensure_vehicle_instances_table(db: sqlite3.Connection) -> None:
     f"""
     CREATE TABLE IF NOT EXISTS {VEHICLE_INSTANCES_TABLE} (
       vehicle_id TEXT PRIMARY KEY,
+      definition_id TEXT,
       enabled INTEGER NOT NULL DEFAULT 1,
       lat REAL NOT NULL,
       lon REAL NOT NULL,
@@ -738,6 +853,18 @@ def _migrate_headlights_column_if_needed(db: sqlite3.Connection, logger: Any) ->
   db.execute(f"ALTER TABLE {VEHICLE_INSTANCES_TABLE}_new RENAME TO {VEHICLE_INSTANCES_TABLE}")
   db.commit()
   logger.info("[VEHICLE] migrated headlights_json → headlights_on")
+
+
+def _migrate_definition_id_column_if_needed(db: sqlite3.Connection, logger: Any) -> None:
+  columns = {
+    row[1]
+    for row in db.execute(f"PRAGMA table_info({VEHICLE_INSTANCES_TABLE})").fetchall()
+  }
+  if "definition_id" in columns:
+    return
+  db.execute(f"ALTER TABLE {VEHICLE_INSTANCES_TABLE} ADD COLUMN definition_id TEXT")
+  db.commit()
+  logger.info("[VEHICLE] added vehicle_instances.definition_id")
 
 
 def _read_primary_vehicle_row(db: sqlite3.Connection) -> tuple | None:
@@ -840,25 +967,21 @@ def _migrate_legacy_vehicle_metadata_if_needed(db: sqlite3.Connection, logger: A
 def _ensure_vehicle_instances_seeded(db: sqlite3.Connection, logger: Any, seed_instances: list[dict[str, Any]]) -> bool:
   _ensure_vehicle_instances_table(db)
   _migrate_headlights_column_if_needed(db, logger)
+  _migrate_definition_id_column_if_needed(db, logger)
   migrated = _migrate_legacy_vehicle_metadata_if_needed(db, logger)
 
-  row = db.execute(
-    f"SELECT COUNT(*) FROM {VEHICLE_INSTANCES_TABLE}"
-  ).fetchone()
-  count = int(row[0]) if row is not None else 0
-  if count > 0:
-    return migrated
-
+  inserted = False
   for instance in seed_instances:
     state = instance["state"]
     db.execute(
       f"""
-      INSERT OR REPLACE INTO {VEHICLE_INSTANCES_TABLE}
-      (vehicle_id, enabled, lat, lon, heading_deg, z, terrain_depth, terrain_tile_id, headlights_on, saved_at, updated_at)
-      VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+      INSERT OR IGNORE INTO {VEHICLE_INSTANCES_TABLE}
+      (vehicle_id, definition_id, enabled, lat, lon, heading_deg, z, terrain_depth, terrain_tile_id, headlights_on, saved_at, updated_at)
+      VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
       """,
       (
         str(instance["vehicleId"]),
+        instance.get("definitionId"),
         state.lat,
         state.lon,
         state.headingDeg,
@@ -869,15 +992,16 @@ def _ensure_vehicle_instances_seeded(db: sqlite3.Connection, logger: Any, seed_i
         time.time(),
       ),
     )
+    inserted = inserted or db.execute("SELECT changes()").fetchone()[0] > 0
   db.commit()
   logger.info(f"[VEHICLE] seeded {len(seed_instances)} default vehicle instances")
-  return True
+  return migrated or inserted
 
 
 def _load_vehicle_instances_from_db(db: sqlite3.Connection) -> list[dict[str, Any]]:
   rows = db.execute(
     f"""
-    SELECT vehicle_id, lat, lon, heading_deg, z, terrain_depth, terrain_tile_id, headlights_on, saved_at
+    SELECT vehicle_id, definition_id, lat, lon, heading_deg, z, terrain_depth, terrain_tile_id, headlights_on, saved_at
     FROM {VEHICLE_INSTANCES_TABLE}
     WHERE enabled = 1
     ORDER BY updated_at DESC, vehicle_id
@@ -886,13 +1010,13 @@ def _load_vehicle_instances_from_db(db: sqlite3.Connection) -> list[dict[str, An
   out: list[dict[str, Any]] = []
   for row in rows:
     payload = {
-      "lat": row[1],
-      "lon": row[2],
-      "headingDeg": row[3],
-      "z": row[4],
-      "terrainDepth": row[5],
-      "terrainTileId": row[6],
-      "savedAt": row[8],
+      "lat": row[2],
+      "lon": row[3],
+      "headingDeg": row[4],
+      "z": row[5],
+      "terrainDepth": row[6],
+      "terrainTileId": row[7],
+      "savedAt": row[9],
     }
     try:
       state_model = VehicleStateRecordModel.model_validate(payload)
@@ -900,7 +1024,8 @@ def _load_vehicle_instances_from_db(db: sqlite3.Connection) -> list[dict[str, An
       continue
     out.append({
       "id": str(row[0]),
-      "headlightsOn": bool(row[7]),
+      **({"definitionId": str(row[1])} if row[1] else {}),
+      "headlightsOn": bool(row[8]),
       **state_model.model_dump(exclude_none=True),
     })
   return out
@@ -912,6 +1037,7 @@ def get_assets_response(db: sqlite3.Connection, logger: Any) -> dict[str, Any]:
   (
     metadata_source,
     vehicle_definition,
+    vehicle_definitions,
     vehicle_headlights,
     structure_definition,
     seed_vehicle_instances,
@@ -941,6 +1067,7 @@ def get_assets_response(db: sqlite3.Connection, logger: Any) -> dict[str, Any]:
       **vehicle_definition,
       "headlights": vehicle_headlights,
     },
+    "vehicle_definitions": vehicle_definitions,
     "structure_definition": structure_definition,
     "vehicle_instances": vehicle_instances,
     "structure_instances": structure_instances,
