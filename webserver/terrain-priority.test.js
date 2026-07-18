@@ -491,7 +491,7 @@ test('terrain preview request preserves boot frame semantics', () => {
     frameOffsetReady: false, originX: 1, originY: 2,
     cameraSnapshot: { camEastM: 3 },
   });
-  assert.equal(request.url, '/api/tiles?lat=64.1&lon=-51.2&alt=120&heading=0.5&range=30000&maxDepth=10');
+  assert.equal(request.url, '/api/tiles?lat=64.1&lon=-51.2&alt=120&heading=0.5&range=30000&maxDepth=10&preview=1');
   assert.deepEqual(request.logDetails, {
     pass: 1, passLabel: 'preview', isFirstLoad: true,
     requestLat: 64.1, requestLon: -51.2, requestAltM: 120,

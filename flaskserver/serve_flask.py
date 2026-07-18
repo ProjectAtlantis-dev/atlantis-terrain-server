@@ -729,6 +729,9 @@ def api_tiles():
   oy = _arg_float("oy", qy)
   alt = _arg_float("alt", 0.0)
   heading = _arg_float("heading", 0.0)
+  # Preview passes flood closest-first; full passes fetch by view priority.
+  preview = _arg_int("preview", 0) == 1
+  has_heading = request.args.get("heading") is not None
 
   global _last_camera
   _last_camera = {"qx": qx, "qy": qy, "alt": alt, "heading": heading,
@@ -743,6 +746,8 @@ def api_tiles():
       max_depth=max_depth,
       max_range=max_range,
       altitude=alt,
+      heading=heading if has_heading else None,
+      preview=preview,
       log=lambda msg: log.debug(f"[/api/tiles] {msg}"),
     )
   except Exception as exc:
@@ -894,7 +899,11 @@ def api_tiles():
                 _cache_coastline(db, tile_id, bbox_by_id[tile_id])
                 fetched += 1
                 _cog_fetched_total += 1
-              except Exception:
+              except Exception as exc:
+                log_cog.warning(
+                  f"  [COG FETCH] {tid}: failed after source read: "
+                  f"{type(exc).__name__}: {exc}"
+                )
                 cog_failed.append(tid)
               finally:
                 _cog_fetching_tiles.discard(tid)

@@ -320,14 +320,20 @@ def _traverse(db, depth, col, row, qx, qy, max_depth, error_threshold,
 
 
 def query_tiles_stereo(db, qx, qy, error_threshold=0.001, max_depth=None,
-                       max_range=0.0, log=print, altitude=0.0):
+                       max_range=0.0, log=print, altitude=0.0,
+                       heading=None, preview=False):
     """Query tiles using error-based LOD with stereo coords directly.
 
     Same as query_tiles() but takes EPSG:3413 coords instead of lat/lon.
     max_range: if > 0, skip tiles beyond this distance in meters.
     altitude: camera altitude in meters — increases effective distance to tiles below.
+    heading: camera heading in radians (JS convention: 0 = north, positive
+    turns west). When given, the missing-tile fetch batch is ordered by view
+    priority instead of plain distance.
+    preview: initial quick-paint pass — keeps the closest-first flood.
     """
-    return _query_tiles_impl(db, qx, qy, error_threshold, max_depth, max_range, log, altitude)
+    return _query_tiles_impl(db, qx, qy, error_threshold, max_depth, max_range,
+                             log, altitude, heading=heading, preview=preview)
 
 
 def query_tiles(db, lat, lon, error_threshold=0.001, max_depth=None,
@@ -356,7 +362,21 @@ def query_tiles(db, lat, lon, error_threshold=0.001, max_depth=None,
     return _query_tiles_impl(db, qx, qy, error_threshold, max_depth, max_range, log, altitude)
 
 
-def _query_tiles_impl(db, qx, qy, error_threshold, max_depth, max_range, log, altitude=0.0):
+def bbox_view_priority(qx, qy, fwd_x, fwd_y, bbox):
+    """Heading-weighted fetch priority (lower = sooner), matching the texture
+    priority in serve_flask: distance divided by how far ahead the tile is."""
+    cx = (bbox[0] + bbox[2]) / 2
+    cy = (bbox[1] + bbox[3]) / 2
+    dx, dy = cx - qx, cy - qy
+    dist = math.hypot(dx, dy)
+    if dist <= 0:
+        return 0.0
+    dot = (dx * fwd_x + dy * fwd_y) / dist
+    return dist / max(dot, 0.01)
+
+
+def _query_tiles_impl(db, qx, qy, error_threshold, max_depth, max_range, log,
+                      altitude=0.0, heading=None, preview=False):
     from database import get_metadata
     from collections import Counter
 
@@ -390,12 +410,6 @@ def _query_tiles_impl(db, qx, qy, error_threshold, max_depth, max_range, log, al
         leaf_ids = leaf_ids[:MAX_TILES]
         log(f"  [BUDGET] dropped {dropped} deepest/farthest tiles, capped at {MAX_TILES}")
 
-    # Cap missing tiles: sort by distance to camera, closest first.
-    # Progressive loading — fetch nearest tiles first, re-query for more.
-    MAX_FETCH_BATCH = 500
-    missing_raw.sort(key=lambda tb: _distance_to_bbox(qx, qy, tb[1]))
-    missing = missing_raw[:MAX_FETCH_BATCH]
-
     # Read full tile data for leaves
     results = []
     for tid in leaf_ids:
@@ -420,17 +434,42 @@ def _query_tiles_impl(db, qx, qy, error_threshold, max_depth, max_range, log, al
             'geometric_error': tile['geometric_error'],
         })
 
-    # Queue background refetch for tiles with outdated DEM resolution.
-    # They keep serving the old heightmap until the new one arrives.
-    upgrade_count = 0
+    # Treat raw restoration and ordinary misses as one priority queue.  The
+    # previous implementation appended upgrades after capping ordinary misses,
+    # so thousands of stale rows bypassed the cap and nearby visible tiles sat
+    # behind coarse restoration work.
+    upgrade_candidates = []
     for t in results:
         if t['source'] in _UPGRADEABLE_SOURCES:
-            tid = t['id']
-            if (tid, t['bbox']) not in missing:
-                missing.append((tid, t['bbox']))
-                upgrade_count += 1
-    if upgrade_count:
-        log(f"  [DEM UPGRADE] {upgrade_count} tiles queued for 10m refetch")
+            upgrade_candidates.append((t['id'], t['bbox']))
+
+    candidates_by_id = {
+        tid: (tid, bbox) for tid, bbox in (*missing_raw, *upgrade_candidates)
+    }
+    missing_candidates = list(candidates_by_id.values())
+    if preview or heading is None:
+        missing_candidates.sort(
+            key=lambda tb: _distance_to_bbox(qx, qy, tb[1])
+        )
+    else:
+        fwd_x = -math.sin(heading)
+        fwd_y = math.cos(heading)
+        missing_candidates.sort(
+            key=lambda tb: bbox_view_priority(qx, qy, fwd_x, fwd_y, tb[1])
+        )
+    # Small batches on purpose: the background fetcher holds its lock for a
+    # whole batch, then the next request reprioritizes from the live camera.
+    MAX_FETCH_BATCH = 100
+    missing = missing_candidates[:MAX_FETCH_BATCH]
+    if upgrade_candidates:
+        upgrade_ids = {candidate[0] for candidate in upgrade_candidates}
+        selected_upgrades = sum(
+            tid in upgrade_ids for tid, _ in missing
+        )
+        log(
+            f"  [DEM RESTORE] {selected_upgrades}/{len(upgrade_candidates)} "
+            "visible stale tiles selected in this batch"
+        )
 
     results = sorted(results, key=lambda t: -t['depth'])
     seam_cache = SqliteSeamCache(db)

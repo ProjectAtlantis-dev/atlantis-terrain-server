@@ -20,7 +20,9 @@ export function buildTerrainTilesRequest({
     ? `sx=${queryX}&sy=${queryY}`
     : `lat=${lat}&lon=${lon}`;
   let url = `/api/tiles?${positionQuery}&alt=${altitude}&heading=${heading}&range=${range}`;
-  if (preview) url += `&maxDepth=${previewMaxDepth}`;
+  // preview=1 keeps the server's closest-first flood for the quick paint;
+  // full passes let it order heightmap fetches by view priority instead.
+  if (preview) url += `&maxDepth=${previewMaxDepth}&preview=1`;
   if (!isFirstLoad || frameOffsetReady) url += `&ox=${originX}&oy=${originY}`;
   return {
     url,
