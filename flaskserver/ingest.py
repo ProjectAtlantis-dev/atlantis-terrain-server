@@ -306,16 +306,6 @@ def _read_cog_heightmap(bbox, resolution=GRID_N):
         log_cog.info(f"  Using Copernicus (only source with data)")
         selected, selected_source = cop, 'copernicus'
 
-    from coastline import apply_official_coastline
-    selected, coast_applied = apply_official_coastline(
-        selected, bbox, resolution
-    )
-    if coast_applied:
-        water_count = int(np.sum(selected <= 0.0)) if selected is not None else 0
-        log_cog.info(
-            f"  Official coastline applied: {water_count}/{resolution * resolution} "
-            "samples at/below sea level"
-        )
     if selected is not None:
         return selected, selected_source or 'official_coastline'
 

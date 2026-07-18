@@ -2,6 +2,7 @@ import os
 import sqlite3
 import tempfile
 import unittest
+import zlib
 from pathlib import Path
 
 import numpy as np
@@ -112,7 +113,7 @@ class RetiredTerrainMigrationTest(unittest.TestCase):
                 db.execute(
                     "SELECT value FROM metadata WHERE key = 'schema_version'"
                 ).fetchone(),
-                ("2",),
+                ("3",),
             )
             columns = {row[1] for row in db.execute("PRAGMA table_info(tiles)")}
             self.assertNotIn("has_sealevel_water", columns)
@@ -144,6 +145,39 @@ class RetiredTerrainMigrationTest(unittest.TestCase):
             )
             db.close()
 
+    def test_v3_preserves_but_queues_coastline_modified_payload(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "terrain.db"
+            db = open_db(str(path))
+            heightmap = np.full((GRID_N, GRID_N), 42.0, dtype=np.float32)
+            confidence = np.full((GRID_N, GRID_N), 6, dtype=np.uint8)
+            db.execute(
+                "INSERT INTO tiles "
+                "(tile_id, depth, col, row, x_min, y_min, x_max, y_max, "
+                "parent_id, geometric_error, source, updated_at, heightmap, "
+                "confidence_map) VALUES "
+                "('12-1-2', 12, 1, 2, 0, 0, 1, 1, NULL, 1, "
+                "'arcticdem_10m', 'now', ?, ?)",
+                (_compress_array(heightmap), _compress_array(confidence)),
+            )
+            db.execute(
+                "UPDATE metadata SET value = '2' WHERE key = 'schema_version'"
+            )
+            db.commit()
+            db.close()
+
+            db = open_db(str(path))
+            source, blob = db.execute(
+                "SELECT source, heightmap FROM tiles WHERE tile_id = '12-1-2'"
+            ).fetchone()
+            self.assertEqual(source, "clobbered_arcticdem_10m")
+            np.testing.assert_array_equal(
+                np.frombuffer(zlib.decompress(blob), dtype=np.float32).reshape(
+                    GRID_N, GRID_N
+                ),
+                heightmap,
+            )
+            db.close()
 
 if __name__ == "__main__":
     unittest.main()

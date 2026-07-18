@@ -419,6 +419,10 @@ def _is_ocean_tile(db, tile_id: str) -> bool:
   if row is None:
     return False
   source, hm_blob = row
+  from coastline import read_water_mask
+  official_water = read_water_mask(db, tile_id)
+  if official_water is not None:
+    return bool(_np.all(official_water))
   if source == 'no_data':
     return True
   if hm_blob is None:
@@ -442,6 +446,8 @@ def _repair_white_ocean_jpeg(db, tile_id: str, jpeg: bytes) -> bytes:
   if not row or row[0] is None:
     return jpeg
   hm = _np.frombuffer(zlib.decompress(row[0]), dtype=_np.float32).reshape(_GRID_N, _GRID_N)
+  from coastline import effective_heightmap
+  hm = effective_heightmap(db, tile_id, hm)
   repaired = repair_white_ocean(jpeg, hm)
   if repaired is not None:
     log_tex.info(f"[tex-repair] {tile_id}: filled white ocean pixels with OCEAN_RGB")
@@ -838,13 +844,17 @@ def api_tiles():
           from concurrent.futures import ThreadPoolExecutor, as_completed
           from ingest import _read_cog_heightmap, _resample_from_parent
           from database import CONFIDENCE, write_tile
-          from serve import mark_no_data, _UPGRADEABLE_SOURCES
+          from serve import (
+            mark_no_data, _UPGRADEABLE_SOURCES, _cache_coastline,
+            _mark_official_ocean,
+          )
 
           db = sqlite3.connect(str(DB_PATH), check_same_thread=False)
           db.execute("PRAGMA journal_mode=WAL")
           log_cog.info(f"Starting {len(missing_list)} tiles from S3... (session: {_cog_fetched_total} fetched, {_cog_skipped_total} skipped)")
 
           upgrade_ids = set()
+          bbox_by_id = {tid: bbox for tid, bbox in missing_list}
           for tid, _ in missing_list:
             row = db.execute(
               "SELECT source FROM tiles WHERE tile_id = ?", (tid,)
@@ -866,6 +876,12 @@ def api_tiles():
               try:
                 tile_id, (data, src_name) = fut.result()
                 if data is None:
+                  water = _cache_coastline(db, tile_id, bbox_by_id[tile_id])
+                  if water is not None and _np.all(water):
+                    _mark_official_ocean(db, tile_id)
+                    fetched += 1
+                    _cog_fetched_total += 1
+                    continue
                   cog_failed.append(tile_id)
                   continue
                 conf = CONFIDENCE.get(src_name, CONFIDENCE['arcticdem'])
@@ -875,6 +891,7 @@ def api_tiles():
                   db, tile_id, hm, cm, src_name, reconcile=False,
                   allow_overwrite=tile_id in upgrade_ids,
                 )
+                _cache_coastline(db, tile_id, bbox_by_id[tile_id])
                 fetched += 1
                 _cog_fetched_total += 1
               except Exception:
@@ -901,6 +918,7 @@ def api_tiles():
                     db, tile_id, hm, cm, source_name, reconcile=False,
                     allow_overwrite=tile_id in upgrade_ids,
                   )
+                  _cache_coastline(db, tile_id, bbox_by_id[tile_id])
                   parent_resampled_count += 1
                   _cog_fetched_total += 1
                   log_cog.info(f"  [PARENT RESAMPLE] {tile_id}: filled from parent")

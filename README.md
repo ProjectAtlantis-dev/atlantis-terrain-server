@@ -46,11 +46,18 @@ Real imagery down to depth 12, invented detail below it.
 4. Dataforsyningen runs out of detail around depth 13 (SPOT is 1.6 m/px). Below that, accuracy vs reality stops mattering: **depth 12 already tells us what goes where**. A coarse class map at d12 scale (water / grey / dark slopes & shadows / green / white — see `flaskserver/classifier/storage.py`) is the entire semantic contract.
 
 Coastal terrain uses the public Greenland `Åbent Land` GTK50 map as its
-authoritative land/sea boundary. Height samples mapped as sea are clamped to
-sea level during ingestion, preventing ArcticDEM/Copernicus artifacts from
-closing fjords or producing islands in open water. The source is served by the
+authoritative land/sea boundary. The raw DEM remains unchanged in the canonical
+`tiles.heightmap` payload. An independent mask in `coastline_masks` is applied
+to a copy when terrain is read or rendered, and the classifier uses the same
+mask to force mapped sea into its water class. This prevents
+ArcticDEM/Copernicus artifacts from closing fjords or producing islands in open
+water without destroying source elevation samples. The source is served by the
 Government of Greenland at `gis.govmin.gl`; ASIAQ's higher-detail technical
 coastline remains locality-only and cannot cover the surrounding fjords.
+
+Schema v3 preserves payloads written by the earlier destructive coastline
+pipeline, queues those rows for on-demand restoration, and replaces them with
+fresh raw ArcticDEM/Copernicus samples as the affected tiles are requested.
 5. **Everything below depth 12 is procedural** (work in progress): per-class texture and asset synthesis, seeded from absolute EPSG:3413 coordinates so every visit renders identical detail, color-anchored to the real d12 imagery so the transition doesn't pop. Judged on looks, not fidelity. Google imagery is a labeling/measurement reference only and never ships.
 
 Retired approaches, kept in git history only: bathymetry flattening and learned recoloring from external reference imagery.

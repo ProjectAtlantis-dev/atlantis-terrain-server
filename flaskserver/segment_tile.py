@@ -17,7 +17,7 @@ from classifier.segmentation import (
     render_boundaries,
     segment_terrain_tile,
 )
-from classifier.official_water import classifier_water_mask
+from classifier.official_water import classifier_water_mask_for_tile
 from database import GRID_N
 
 
@@ -34,7 +34,9 @@ def _load_cached_tile(db, tile_id):
     ).reshape((GRID_N, GRID_N)).copy()
     rgb = np.asarray(Image.open(io.BytesIO(row[5])).convert("RGB"))
     bbox = tuple(float(value) for value in row[:4])
-    water_mask = classifier_water_mask(bbox, rgb.shape[1], rgb.shape[0])
+    water_mask = classifier_water_mask_for_tile(
+        db, tile_id, rgb.shape[1], rgb.shape[0]
+    )
     return rgb, heightmap, float(row[2] - row[0]), water_mask
 
 

@@ -15,6 +15,7 @@ LOD edge stitching eliminates cross-depth seams at query time.
 
 import math
 import os
+import datetime
 import numpy as np
 
 from colored_log import get_logger
@@ -35,6 +36,8 @@ REAL_SOURCES = (
     'official_coastline',
     'unmasked_arcticdem', 'unmasked_arcticdem_10m',
     'unmasked_copernicus', 'unmasked_parent_resampled',
+    'clobbered_arcticdem_10m', 'clobbered_copernicus',
+    'clobbered_parent_resampled', 'clobbered_official_coastline',
 )
 
 # Sources that should be refetched at higher DEM resolution
@@ -44,6 +47,10 @@ _UPGRADEABLE_SOURCES = {
     'unmasked_arcticdem_10m',
     'unmasked_copernicus',
     'unmasked_parent_resampled',
+    'clobbered_arcticdem_10m',
+    'clobbered_copernicus',
+    'clobbered_parent_resampled',
+    'clobbered_official_coastline',
 }
 
 # Tiles we've already tried to fetch and found no COG data (ocean, etc).
@@ -66,6 +73,27 @@ def mark_no_data(db, tile_id):
     db.commit()
 
 
+def _cache_coastline(db, tile_id, bbox=None):
+    """Cache the independent official mask; never modify the stored DEM."""
+    from coastline import cache_official_water_mask
+
+    return cache_official_water_mask(db, tile_id, bbox, GRID_N)
+
+
+def _mark_official_ocean(db, tile_id):
+    now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    db.execute(
+        "UPDATE tiles SET source = 'official_coastline', heightmap = NULL, "
+        "confidence_map = NULL, geometric_error = 0.0, updated_at = ? "
+        "WHERE tile_id = ?",
+        (now, tile_id),
+    )
+    from terrain_seams import invalidate_tile_seams
+
+    invalidate_tile_seams(db, tile_id)
+    db.commit()
+
+
 def _distance_to_bbox(x, y, bbox):
     """Distance from point (x, y) to nearest edge of bbox. 0 if inside."""
     dx = max(bbox[0] - x, 0, x - bbox[2])
@@ -84,6 +112,10 @@ def _fetch_tile(db, tile_id, bbox, allow_overwrite=False):
 
     # Fallback: resample from parent tile if COG returned nothing
     if data is None:
+        water = _cache_coastline(db, tile_id, bbox)
+        if water is not None and np.all(water):
+            _mark_official_ocean(db, tile_id)
+            return True
         data, src_name = _resample_from_parent(db, tile_id, bbox, GRID_N)
 
     if data is None:
@@ -97,6 +129,7 @@ def _fetch_tile(db, tile_id, bbox, allow_overwrite=False):
     try:
         write_tile(db, tile_id, hm, cm, source_name, reconcile=False,
                    allow_overwrite=allow_overwrite)
+        _cache_coastline(db, tile_id, bbox)
     except TileClobberError:
         return False
     return True
@@ -160,7 +193,8 @@ def _traverse(db, depth, col, row, qx, qy, max_depth, error_threshold,
 
     has_real_data = meta['source'] in REAL_SOURCES
     is_placeholder = meta['source'] in (
-        'parent_resampled', 'unmasked_parent_resampled'
+        'parent_resampled', 'unmasked_parent_resampled',
+        'clobbered_parent_resampled',
     )
 
     # Unfetched tiles have geometric_error=0 from seeding — assume high
@@ -465,6 +499,7 @@ def fetch_missing_tiles(db, missing, max_workers=6, log=print):
 
     # Check which tiles already exist with upgradeable sources
     upgrade_tids = set()
+    bbox_by_id = {tid: bbox for tid, bbox in missing}
     for tid, bbox in missing:
         meta = read_tile_metadata(db, tid)
         if meta and meta['source'] in _UPGRADEABLE_SOURCES:
@@ -485,6 +520,11 @@ def fetch_missing_tiles(db, missing, max_workers=6, log=print):
 
                 # Fallback: resample from parent if COG returned nothing
                 if data is None:
+                    water = _cache_coastline(db, tile_id, bbox_by_id[tile_id])
+                    if water is not None and np.all(water):
+                        _mark_official_ocean(db, tile_id)
+                        fetched += 1
+                        continue
                     data, src_name = _resample_from_parent(db, tile_id, bbox=None, resolution=GRID_N)
                     # bbox not needed — _resample_from_parent uses tile_id to find parent
 
@@ -501,6 +541,7 @@ def fetch_missing_tiles(db, missing, max_workers=6, log=print):
                 overwrite = tid in upgrade_tids
                 write_tile(db, tile_id, hm, cm, source_name, reconcile=False,
                            allow_overwrite=overwrite)
+                _cache_coastline(db, tile_id, bbox_by_id[tile_id])
                 fetched += 1
                 if overwrite:
                     log(f"  [DEM UPGRADE] {tid}: {source_name} replaced old 32m data")

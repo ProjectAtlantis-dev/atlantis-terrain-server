@@ -42,7 +42,7 @@ CONFIDENCE = {
 }
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 _SCHEMA_VERSION_KEY = "schema_version"
 
 
@@ -105,6 +105,17 @@ CREATE TABLE IF NOT EXISTS tiles (
 CREATE TABLE IF NOT EXISTS metadata (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS coastline_masks (
+    tile_id    TEXT PRIMARY KEY,
+    width      INTEGER NOT NULL CHECK (width > 0),
+    height     INTEGER NOT NULL CHECK (height > 0),
+    mask       BLOB NOT NULL,
+    source     TEXT NOT NULL,
+    version    INTEGER NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY (tile_id) REFERENCES tiles(tile_id) ON DELETE CASCADE
 );
 """
 
@@ -220,6 +231,27 @@ def _migrate_to_v2(db):
         )
 
 
+def _migrate_to_v3(db):
+    """Queue heightmaps modified by schema v2 for raw cloud restoration."""
+    source_map = {
+        "arcticdem_10m": "clobbered_arcticdem_10m",
+        "copernicus": "clobbered_copernicus",
+        "parent_resampled": "clobbered_parent_resampled",
+        "official_coastline": "clobbered_official_coastline",
+    }
+    restored_count = 0
+    for old_source, queued_source in source_map.items():
+        cursor = db.execute(
+            "UPDATE tiles SET source = ? WHERE source = ?",
+            (queued_source, old_source),
+        )
+        restored_count += cursor.rowcount
+    if restored_count:
+        log_db.info(
+            f"Queued {restored_count} coastline-modified heightmaps for raw restoration"
+        )
+
+
 def _migrate_schema(db):
     row = db.execute(
         "SELECT value FROM metadata WHERE key = ?", (_SCHEMA_VERSION_KEY,)
@@ -242,6 +274,13 @@ def _migrate_schema(db):
         db.execute(
             "INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)",
             (_SCHEMA_VERSION_KEY, "2"),
+        )
+        version = 2
+    if version < 3:
+        _migrate_to_v3(db)
+        db.execute(
+            "INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)",
+            (_SCHEMA_VERSION_KEY, "3"),
         )
 
 
@@ -658,6 +697,9 @@ def read_tile(db, tile_id):
     n = GRID_N
     hm_blob, cm_blob = row[12], row[13]
 
+    raw_heightmap = _decompress_float32(hm_blob, (n, n)) if hm_blob else None
+    from coastline import effective_heightmap
+
     return {
         'tile_id': row[0],
         'depth': row[1],
@@ -668,7 +710,7 @@ def read_tile(db, tile_id):
         'geometric_error': row[9],
         'source': row[10],
         'updated_at': row[11],
-        'heightmap': _decompress_float32(hm_blob, (n, n)) if hm_blob else None,
+        'heightmap': effective_heightmap(db, tile_id, raw_heightmap),
         'confidence_map': _decompress_uint8(cm_blob, (n, n)) if cm_blob else None,
     }
 

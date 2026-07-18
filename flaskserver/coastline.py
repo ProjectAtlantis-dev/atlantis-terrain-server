@@ -12,9 +12,11 @@ and contours minority pixels instead of holes in the water mask.
 """
 from __future__ import annotations
 
+import datetime
 import io
 import urllib.parse
 import urllib.request
+import zlib
 
 import numpy as np
 from PIL import Image
@@ -25,6 +27,7 @@ from colored_log import get_logger
 log_coast = get_logger("terrain.coastline")
 
 OFFICIAL_COASTLINE_VERSION = 1
+OFFICIAL_COASTLINE_SOURCE = "govmin_gl_aabent_land"
 _WMS_URL = "https://gis.govmin.gl/geoserver/wms"
 _WMS_LAYER = "Greenland:gl_aabent_land"
 _OVERSAMPLE = 8
@@ -96,24 +99,90 @@ def fetch_official_water_mask(bbox, resolution: int) -> np.ndarray | None:
         return None
 
 
-def apply_official_coastline(heightmap, bbox, resolution: int):
-    """Clamp authoritative sea samples to sea level; never alter mapped land.
-
-    If both DEMs have no data, a mask that is entirely sea still yields a valid
-    flat ocean tile.  A partial sea mask cannot safely invent missing land and
-    therefore remains unresolved for the normal parent fallback.
-    """
-    water = fetch_official_water_mask(bbox, resolution)
-    if water is None:
-        return heightmap, False
-
+def apply_water_mask(heightmap, water):
+    """Return derived render geometry without mutating the raw DEM."""
     if heightmap is None:
-        if np.all(water):
-            return np.zeros((resolution, resolution), dtype=np.float32), True
-        return None, False
-
+        return None
     result = np.asarray(heightmap, dtype=np.float32).copy()
+    water = np.asarray(water, dtype=bool)
+    if water.shape != result.shape:
+        raise ValueError(
+            f"water mask shape {water.shape} does not match DEM {result.shape}"
+        )
     finite_water = water & np.isfinite(result)
     result[finite_water] = np.minimum(result[finite_water], np.float32(0.0))
     result[water & ~np.isfinite(result)] = np.float32(0.0)
-    return result, bool(np.any(water))
+    return result
+
+
+def write_water_mask(db, tile_id: str, water) -> None:
+    mask = np.asarray(water, dtype=np.uint8)
+    if mask.ndim != 2:
+        raise ValueError("water mask must be a 2D array")
+    db.execute(
+        "INSERT INTO coastline_masks "
+        "(tile_id, width, height, mask, source, version, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT(tile_id) DO UPDATE SET width=excluded.width, "
+        "height=excluded.height, mask=excluded.mask, source=excluded.source, "
+        "version=excluded.version, updated_at=excluded.updated_at",
+        (
+            tile_id,
+            int(mask.shape[1]),
+            int(mask.shape[0]),
+            zlib.compress(mask.tobytes(), level=6),
+            OFFICIAL_COASTLINE_SOURCE,
+            OFFICIAL_COASTLINE_VERSION,
+            datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        ),
+    )
+    # The canonical DEM did not change, but its derived render edge may have.
+    # Cached seams must therefore be rebuilt against the new mask.
+    from terrain_seams import invalidate_tile_seams
+
+    invalidate_tile_seams(db, tile_id)
+    db.commit()
+
+
+def read_water_mask(db, tile_id: str) -> np.ndarray | None:
+    row = db.execute(
+        "SELECT width, height, mask FROM coastline_masks WHERE tile_id = ?",
+        (tile_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    width, height, blob = int(row[0]), int(row[1]), row[2]
+    values = np.frombuffer(zlib.decompress(blob), dtype=np.uint8)
+    if values.size != width * height:
+        raise ValueError(
+            f"coastline mask for {tile_id} has {values.size} values; "
+            f"expected {width * height}"
+        )
+    return values.reshape((height, width)).astype(bool)
+
+
+def cache_official_water_mask(db, tile_id: str, bbox=None, resolution=65):
+    if bbox is None:
+        row = db.execute(
+            "SELECT x_min, y_min, x_max, y_max FROM tiles WHERE tile_id = ?",
+            (tile_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        bbox = tuple(float(value) for value in row)
+    water = fetch_official_water_mask(bbox, resolution)
+    if water is not None:
+        write_water_mask(db, tile_id, water)
+    return water
+
+
+def effective_heightmap(db, tile_id: str, raw_heightmap):
+    """Apply a cached mask at read time while preserving stored raw samples."""
+    water = read_water_mask(db, tile_id)
+    if raw_heightmap is None:
+        if water is not None and np.all(water):
+            return np.zeros(water.shape, dtype=np.float32)
+        return None
+    if water is None:
+        return raw_heightmap
+    return apply_water_mask(raw_heightmap, water)
