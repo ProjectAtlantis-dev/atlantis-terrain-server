@@ -85,6 +85,13 @@ class ClassifierStorageTest(unittest.TestCase):
                 write_classifier_tile(db, "12-1-2", np.asarray([[5]], dtype=np.uint8))
             db.close()
 
+    def test_water_class_is_hot_pink_in_debug_view(self):
+        labels = np.asarray([[4]], dtype=np.uint8)
+        np.testing.assert_array_equal(
+            colorize_class_map(labels, COARSE_SCHEMA)[0, 0],
+            np.asarray([255, 42, 161], dtype=np.uint8),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

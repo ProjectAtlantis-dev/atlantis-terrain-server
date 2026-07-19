@@ -1996,7 +1996,8 @@ function render() {
   renderBackend.setFogDensity(fogStrength / getFogDistance());
   renderBackend.setMapMode(controls.mapMode);
 
-  water.update(clock.elapsedTime, sunDirection, !controls.mapMode);
+  // Keep classifier colors—including the effective-water pink—unobstructed.
+  water.update(clock.elapsedTime, sunDirection, !controls.mapMode && !classifierRuntime.active);
 
   // Terrain streaming: check if camera moved far enough to re-fetch
   if (!terrainPipelineState.firstLoad) {

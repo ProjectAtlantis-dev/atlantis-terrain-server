@@ -166,6 +166,7 @@ _write_texture: Any = None
 _fetch_sentinel2_texture: Any = None
 _fetch_dataforsyningen_texture: Any = None
 _split_texture_metatile: Any = None
+_harmonize_texture_metatile: Any = None
 _init_textures: Any = None
 _init_classifier_tiles: Any = None
 
@@ -284,6 +285,7 @@ def _bootstrap_backend() -> None:
   global _np, _Image, _to_stereo, _query_tiles_stereo, _load_no_data_cache
   global _GRID_N, _tile_bbox, _texture_ids_in, _read_texture, _write_texture
   global _fetch_sentinel2_texture, _fetch_dataforsyningen_texture, _split_texture_metatile
+  global _harmonize_texture_metatile
   global _init_textures, _init_classifier_tiles
 
   if _backend_ready or _backend_error is not None:
@@ -300,6 +302,7 @@ def _bootstrap_backend() -> None:
     from texture import (
       fetch_dataforsyningen_texture,
       fetch_sentinel2_texture,
+      harmonize_texture_metatile,
       init_textures,
       read_texture,
       split_texture_metatile,
@@ -351,6 +354,7 @@ def _bootstrap_backend() -> None:
     _fetch_sentinel2_texture = fetch_sentinel2_texture
     _fetch_dataforsyningen_texture = fetch_dataforsyningen_texture
     _split_texture_metatile = split_texture_metatile
+    _harmonize_texture_metatile = harmonize_texture_metatile
     _init_textures = init_textures
     _init_classifier_tiles = init_classifier_tiles
 
@@ -648,17 +652,19 @@ def _tile_priority(bbox: list[float], qx: float, qy: float, fwd_x: float, fwd_y:
   return dist / max(dot, 0.01)
 
 
-_METATILE_FINAL_SOURCE = "dataforsyningen_metatile"
+_METATILE_FINAL_SOURCE = "dataforsyningen_metatile4h"
 _METATILE_UPGRADEABLE_SOURCES = {
   "sentinel2_crop",
   "ancestor_crop",
   "ancestor_crop_ratelimit",
   "dataforsyningen",
+  "dataforsyningen_metatile",
+  "dataforsyningen_metatile4",
 }
 
 
 def _texture_metatile_spec(tile_id: str) -> tuple[str, tuple, int, dict[str, tuple[int, int]]]:
-  """Return aligned fetch information for the 2x2 group containing tile_id."""
+  """Return aligned fetch information for the 4x4 group containing tile_id."""
   parsed = _parse_tile_id(tile_id)
   if parsed is None:
     raise ValueError(f"invalid tile id: {tile_id}")
@@ -666,20 +672,22 @@ def _texture_metatile_spec(tile_id: str) -> tuple[str, tuple, int, dict[str, tup
   if depth == 0:
     return tile_id, tuple(_tile_bbox(depth, column, row)), 256, {tile_id: (0, 0)}
 
-  parent_depth = depth - 1
-  parent_column = column // 2
-  parent_row = row // 2
+  depth_step = min(2, depth)
+  grid_size = 1 << depth_step
+  parent_depth = depth - depth_step
+  parent_column = column // grid_size
+  parent_row = row // grid_size
   metatile_id = f"{parent_depth}-{parent_column}-{parent_row}"
   children = {
-    f"{depth}-{parent_column * 2 + column_bit}-{parent_row * 2 + row_bit}":
+    f"{depth}-{parent_column * grid_size + column_bit}-{parent_row * grid_size + row_bit}":
       (column_bit, row_bit)
-    for column_bit in range(2)
-    for row_bit in range(2)
+    for column_bit in range(grid_size)
+    for row_bit in range(grid_size)
   }
   return (
     metatile_id,
     tuple(_tile_bbox(parent_depth, parent_column, parent_row)),
-    512,
+    256 * grid_size,
     children,
   )
 
@@ -699,7 +707,16 @@ def _fetch_texture_metatile(tile_id: str) -> tuple[dict[str, bytes] | None, str 
     return None, fail_reason
   if resolution == 256:
     return {tile_id: jpeg}, None
-  quadrants = _split_texture_metatile(jpeg, child_resolution=256)
+  jpeg = _harmonize_texture_metatile(
+    jpeg,
+    child_resolution=256,
+    grid_size=resolution // 256,
+  )
+  quadrants = _split_texture_metatile(
+    jpeg,
+    child_resolution=256,
+    grid_size=resolution // 256,
+  )
   return {
     child_id: quadrants[offset]
     for child_id, offset in child_offsets.items()
@@ -775,7 +792,7 @@ def _queue_texture_fetch(
           parent_id = f"{d - 1}-{c // 2}-{r // 2}"
           _seed_children_from_parent(db, parent_id)
 
-      # Step 2: fetch the aligned parent extent once and split all four exact
+      # Step 2: fetch the aligned grandparent extent once and split all exact
       # children from the same reprojection. Concurrent sibling workers share
       # this lock and observe the first worker's writes instead of refetching.
       metatile_id, metatile_bbox, _, _ = _texture_metatile_spec(tile_id)
@@ -1225,6 +1242,8 @@ def api_texture(tile_id: str):
     "ancestor_crop",
     "ancestor_crop_ratelimit",
     "dataforsyningen",  # legacy independent fetch; upgrade to aligned metatile
+    "dataforsyningen_metatile",  # legacy 2x2 group; upgrade to aligned 4x4
+    "dataforsyningen_metatile4",  # legacy 4x4 group without harmonization
   }
   if row is not None:
     cached, source = row[0], row[1]
@@ -1431,11 +1450,16 @@ def api_classifier_tile(tile_id: str):
 
   from PIL import Image as _Image
   from classifier.storage import colorize_class_map, decode_class_map
+  from coastline import read_water_mask
 
   child_depth, child_col, child_row = parsed
   depth, col, row = parsed
   found = None
   db = _get_db()
+  effective_water = read_water_mask(db, tile_id)
+  water_source_row = db.execute(
+    "SELECT source FROM coastline_masks WHERE tile_id = ?", (tile_id,)
+  ).fetchone() if effective_water is not None else None
   while found is None:
     candidate_id = f"{depth}-{col}-{row}"
     found = db.execute(
@@ -1445,6 +1469,8 @@ def api_classifier_tile(tile_id: str):
     ).fetchone()
     if found is None:
       if depth == 0:
+        if effective_water is not None:
+          break
         return Response(
           b"", status=404,
           headers={"Cache-Control": "no-store", "X-Classifier-Status": "missing"},
@@ -1453,25 +1479,38 @@ def api_classifier_tile(tile_id: str):
       col //= 2
       row //= 2
 
-  class_schema, width, height, class_blob, source = found
   try:
-    labels = decode_class_map(class_blob, width, height)
-    label_image = _Image.fromarray(labels, mode="L")
-    if depth != child_depth:
-      levels = child_depth - depth
-      divisions = 1 << levels
-      sub_col = child_col % divisions
-      sub_row = child_row % divisions
-      x0 = sub_col * width // divisions
-      x1 = (sub_col + 1) * width // divisions
-      # Class maps are image-oriented: row zero is north.
-      y0 = (divisions - 1 - sub_row) * height // divisions
-      y1 = (divisions - sub_row) * height // divisions
-      label_image = label_image.crop((x0, y0, x1, y1))
-    label_image = label_image.resize(
-      (resolution, resolution), _Image.Resampling.NEAREST,
-    )
-    rgb = colorize_class_map(_np.asarray(label_image), class_schema)
+    if found is None:
+      class_schema, source = "effective_water_only", "coastline_masks"
+      rgb = _np.full((resolution, resolution, 3), 42, dtype=_np.uint8)
+    else:
+      class_schema, width, height, class_blob, source = found
+      labels = decode_class_map(class_blob, width, height)
+      label_image = _Image.fromarray(labels, mode="L")
+      if depth != child_depth:
+        levels = child_depth - depth
+        divisions = 1 << levels
+        sub_col = child_col % divisions
+        sub_row = child_row % divisions
+        x0 = sub_col * width // divisions
+        x1 = (sub_col + 1) * width // divisions
+        # Class maps are image-oriented: row zero is north.
+        y0 = (divisions - 1 - sub_row) * height // divisions
+        y1 = (divisions - sub_row) * height // divisions
+        label_image = label_image.crop((x0, y0, x1, y1))
+      label_image = label_image.resize(
+        (resolution, resolution), _Image.Resampling.NEAREST,
+      )
+      rgb = colorize_class_map(_np.asarray(label_image), class_schema)
+    if effective_water is not None:
+      # The render mask is stored south-first; paint its exact effective area
+      # over the classifier in hot pink so the derived fjord geometry and the
+      # debug presentation cannot disagree.
+      water_image = _Image.fromarray(
+        _np.ascontiguousarray(_np.asarray(effective_water, dtype=_np.uint8)[::-1]),
+        mode="L",
+      ).resize((resolution, resolution), _Image.Resampling.NEAREST)
+      rgb[_np.asarray(water_image, dtype=_np.uint8) != 0] = (255, 42, 161)
   except (TypeError, ValueError, zlib.error):
     return Response(
       b"", status=500,
@@ -1480,12 +1519,14 @@ def api_classifier_tile(tile_id: str):
   buf = _io.BytesIO()
   _Image.fromarray(rgb, mode="RGB").save(buf, format="PNG")
   headers = {
-    "Cache-Control": "public, max-age=86400",
+    "Cache-Control": "no-store",
     "X-Classifier-Status": "ready",
     "X-Classifier-Schema": str(class_schema),
     "X-Classifier-Source": str(source),
   }
-  if depth != child_depth:
+  if effective_water is not None:
+    headers["X-Water-Mask-Source"] = str(water_source_row[0])
+  if found is not None and depth != child_depth:
     headers["X-Classifier-Ancestor"] = f"{depth}-{col}-{row}"
   return Response(buf.getvalue(), mimetype="image/png", headers=headers)
 

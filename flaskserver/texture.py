@@ -2,7 +2,7 @@
 
 TEXTURE UPGRADE CHAIN — DO NOT FUCK WITH THE ORDER:
 
-    ancestor_crop → dataforsyningen_metatile
+    ancestor_crop → dataforsyningen_metatile4h
 
 TEXTURE SOURCE STATES:
 - ancestor_crop:            Cropped from parent at subdivision time. Fresh, untried.
@@ -16,8 +16,11 @@ TEXTURE SOURCE STATES:
                             deep-ocean fill (OCEAN_RGB). Terminal.
 - sentinel2_crop:           Legacy Sentinel-2 placeholder. Re-fetchable.
 - dataforsyningen:          Legacy independently-fetched tile. Re-fetchable.
-- dataforsyningen_metatile: Primary source (SPOT 6/7, 1.6m/0.2m via EPSG:3184),
-                            fetched/reprojected as an aligned 2x2 child group.
+- dataforsyningen_metatile: Legacy aligned 2x2 metatile. Re-fetchable.
+- dataforsyningen_metatile4: Legacy unharmonized 4x4 metatile. Re-fetchable.
+- dataforsyningen_metatile4h: Primary source (SPOT 6/7, 1.6m/0.2m via
+                              EPSG:3184), fetched/reprojected as an aligned
+                              4x4 group with feathered color harmonization.
 - write_texture() has an expected_upgrades whitelist. If you add a new source,
   update that whitelist or you'll get TEX CLOBBER warnings.
 
@@ -220,7 +223,7 @@ def fetch_dataforsyningen_texture(bbox, resolution=256, lossless=False):
 
     # Reject if mostly black/empty
     zero_pct = np.mean(dst_arr.max(axis=2) == 0) * 100
-    # A 2x2 metatile may legitimately contain one or more empty children.
+    # A metatile may legitimately contain one or more empty children.
     # Validate those children after splitting instead of rejecting useful
     # siblings along with them.
     zero_fill_limit = 50 if resolution <= 256 else 99
@@ -243,16 +246,16 @@ def fetch_dataforsyningen_texture(bbox, resolution=256, lossless=False):
     return buf.getvalue(), None
 
 
-def split_texture_metatile(image_bytes, child_resolution=256, quality=85):
-    """Split a north-up 2x2 metatile into quadtree child JPEGs.
+def split_texture_metatile(image_bytes, child_resolution=256, grid_size=2, quality=85):
+    """Split a north-up square metatile into quadtree child JPEGs.
 
     Child row coordinates increase northward, while image rows increase
-    southward. Keys are therefore ``(column_bit, row_bit)`` with north children
-    at row bit 1. Keeping this operation downstream of the single metatile
+    southward. Keys are therefore ``(column_offset, row_offset)``. Keeping this
+    operation downstream of the single metatile
     reprojection makes every sibling use the same source image and pixel grid.
     """
     image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-    expected_size = child_resolution * 2
+    expected_size = child_resolution * grid_size
     if image.size != (expected_size, expected_size):
         raise ValueError(
             f"expected {expected_size}x{expected_size} metatile, got "
@@ -260,10 +263,10 @@ def split_texture_metatile(image_bytes, child_resolution=256, quality=85):
         )
 
     children = {}
-    for column_bit in range(2):
-        for row_bit in range(2):
+    for column_bit in range(grid_size):
+        for row_bit in range(grid_size):
             left = column_bit * child_resolution
-            top = (1 - row_bit) * child_resolution
+            top = (grid_size - 1 - row_bit) * child_resolution
             child = image.crop(
                 (left, top, left + child_resolution, top + child_resolution)
             )
@@ -271,6 +274,69 @@ def split_texture_metatile(image_bytes, child_resolution=256, quality=85):
             child.save(buf, format="JPEG", quality=quality)
             children[(column_bit, row_bit)] = buf.getvalue()
     return children
+
+
+def harmonize_texture_metatile(
+    image_bytes,
+    child_resolution=256,
+    grid_size=4,
+    strip_width=4,
+    feather_width=48,
+    smooth_radius=12,
+    max_shift=24.0,
+):
+    """Feather low-frequency provider-mosaic jumps across child boundaries.
+
+    Dataforsyningen can contain acquisition boundaries even inside one WMS
+    render. For each internal cut, estimate the slowly varying RGB difference
+    between narrow strips on both sides and split the correction symmetrically
+    across a feather. Fine texture is preserved and each side moves by at most
+    half ``max_shift`` at the boundary.
+    """
+    image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    expected_size = child_resolution * grid_size
+    if image.size != (expected_size, expected_size):
+        raise ValueError(
+            f"expected {expected_size}x{expected_size} metatile, got "
+            f"{image.width}x{image.height}"
+        )
+    arr = np.asarray(image, dtype=np.float32).copy()
+
+    def smooth(values):
+        if smooth_radius <= 0:
+            return values
+        kernel_size = smooth_radius * 2 + 1
+        kernel = np.ones(kernel_size, dtype=np.float32) / kernel_size
+        padded = np.pad(values, ((smooth_radius, smooth_radius), (0, 0)), mode="reflect")
+        return np.stack([
+            np.convolve(padded[:, band], kernel, mode="valid")
+            for band in range(3)
+        ], axis=1)
+
+    feather = min(feather_width, child_resolution // 2)
+    weights = 0.5 * (
+        1.0 + np.cos(np.pi * np.arange(feather, dtype=np.float32) / feather)
+    )
+
+    for cut in range(child_resolution, expected_size, child_resolution):
+        left = arr[:, cut - strip_width:cut, :].mean(axis=1)
+        right = arr[:, cut:cut + strip_width, :].mean(axis=1)
+        delta = np.clip(smooth(right - left), -max_shift, max_shift)
+        for offset, weight in enumerate(weights):
+            arr[:, cut - 1 - offset, :] += delta * (0.5 * weight)
+            arr[:, cut + offset, :] -= delta * (0.5 * weight)
+
+    for cut in range(child_resolution, expected_size, child_resolution):
+        south = arr[cut - strip_width:cut, :, :].mean(axis=0)
+        north = arr[cut:cut + strip_width, :, :].mean(axis=0)
+        delta = np.clip(smooth(north - south), -max_shift, max_shift)
+        for offset, weight in enumerate(weights):
+            arr[cut - 1 - offset, :, :] += delta * (0.5 * weight)
+            arr[cut + offset, :, :] -= delta * (0.5 * weight)
+
+    buf = io.BytesIO()
+    Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8)).save(buf, format="PNG")
+    return buf.getvalue()
 
 
 # Sentinel-2 Cloudless 2024 (EPSG:3857 / Web Mercator)
@@ -334,6 +400,21 @@ def write_texture(db, tile_id, jpeg_bytes, source):
             ("sentinel2", "dataforsyningen"),
             ("sentinel2", "dataforsyningen_metatile"),
             ("dataforsyningen", "dataforsyningen_metatile"),
+            ("sentinel2_crop", "dataforsyningen_metatile4"),
+            ("ancestor_crop", "dataforsyningen_metatile4"),
+            ("ancestor_crop_ratelimit", "dataforsyningen_metatile4"),
+            ("ocean_nodata", "dataforsyningen_metatile4"),
+            ("sentinel2", "dataforsyningen_metatile4"),
+            ("dataforsyningen", "dataforsyningen_metatile4"),
+            ("dataforsyningen_metatile", "dataforsyningen_metatile4"),
+            ("sentinel2_crop", "dataforsyningen_metatile4h"),
+            ("ancestor_crop", "dataforsyningen_metatile4h"),
+            ("ancestor_crop_ratelimit", "dataforsyningen_metatile4h"),
+            ("ocean_nodata", "dataforsyningen_metatile4h"),
+            ("sentinel2", "dataforsyningen_metatile4h"),
+            ("dataforsyningen", "dataforsyningen_metatile4h"),
+            ("dataforsyningen_metatile", "dataforsyningen_metatile4h"),
+            ("dataforsyningen_metatile4", "dataforsyningen_metatile4h"),
         }
         msg = (
             f"{tile_id}: replacing {ex_source} "
