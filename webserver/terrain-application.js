@@ -843,6 +843,15 @@ const textureStreamer = createTextureStreamer({
 const {
   texCache, texSource, texInflight, texFetching,
 } = textureStreamer;
+let buildingsRuntime = null;
+let buildingTextureRefreshTimer = null;
+function requestBuildingTextureRefresh() {
+  if (buildingTextureRefreshTimer != null) return;
+  buildingTextureRefreshTimer = setTimeout(() => {
+    buildingTextureRefreshTimer = null;
+    buildingsRuntime?.refresh();
+  }, 500);
+}
 const terrainTileSet = createTerrainTileSet({
   terrainRoot,
   textureStreamer,
@@ -856,7 +865,10 @@ const terrainTileSet = createTerrainTileSet({
   vehicle: vehicleRuntime,
   events: {
     onMutated: markSceneMutated,
-    onMaterialApplied: requestRender,
+    onMaterialApplied: () => {
+      requestRender();
+      requestBuildingTextureRefresh();
+    },
   },
 });
 const classifierRuntime = createTerrainClassifierRuntime({
@@ -866,7 +878,7 @@ const classifierRuntime = createTerrainClassifierRuntime({
     requestRender();
   },
 });
-const buildingsRuntime = createTerrainBuildingsRuntime({
+buildingsRuntime = createTerrainBuildingsRuntime({
   terrainRoot,
   pipelineState: terrainPipelineState,
   exaggeration: EXAG,

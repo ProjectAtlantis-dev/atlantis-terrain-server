@@ -98,9 +98,14 @@ test('runtime fetches once frame is ready and skips small moves', async () => {
   runtime.stop();
   assert.equal(calls.length, 1);
 
+  // A newly applied terrain texture explicitly refreshes sampled colors even
+  // when the camera has not crossed the movement threshold.
+  await runtime.refresh();
+  assert.equal(calls.length, 2);
+
   // Camera moved beyond the refetch distance: refetch.
   pipelineState.lastFetchX = 30000;
   await runtime.start();
   runtime.stop();
-  assert.equal(calls.length, 2);
+  assert.equal(calls.length, 3);
 });

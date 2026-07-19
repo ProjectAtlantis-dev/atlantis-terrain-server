@@ -319,29 +319,61 @@ def _sample_underlying_color(
     image: Image.Image,
     points: list[tuple[float, float]],
     coordinate_scale: int,
+    sample_half_width: float = 0,
 ) -> tuple[int, int, int] | None:
-    """Median RGB under a road, sampled evenly along all visible segments."""
+    """Median RGB over the exact centerline/corridor that will be painted."""
     width, height = image.size
     samples: list[tuple[int, int, int]] = []
     for first, second in zip(points, points[1:]):
         x0, y0 = first[0] / coordinate_scale, first[1] / coordinate_scale
         x1, y1 = second[0] / coordinate_scale, second[1] / coordinate_scale
         length = math.hypot(x1 - x0, y1 - y0)
-        steps = max(1, min(32, int(math.ceil(length / 8))))
+        steps = max(1, min(64, int(math.ceil(length / 2))))
+        dx, dy = x1 - x0, y1 - y0
+        if length > 1e-9:
+            normal_x, normal_y = -dy / length, dx / length
+        else:
+            normal_x, normal_y = 0.0, 0.0
+        half_width = sample_half_width / coordinate_scale
+        if half_width >= 2:
+            offsets = (-half_width, -half_width / 2, 0, half_width / 2, half_width)
+        elif half_width > 0:
+            offsets = (-half_width, 0, half_width)
+        else:
+            offsets = (0,)
         for step in range(steps + 1):
             amount = step / steps
-            x = int(round(x0 + (x1 - x0) * amount))
-            y = int(round(y0 + (y1 - y0) * amount))
-            if not (0 <= x < width and 0 <= y < height):
-                continue
-            # A tiny cross-section is more robust than trusting one JPEG pixel.
-            for dx, dy in ((0, 0), (-1, 0), (1, 0), (0, -1), (0, 1)):
-                sx, sy = x + dx, y + dy
-                if 0 <= sx < width and 0 <= sy < height:
-                    samples.append(image.getpixel((sx, sy))[:3])
+            center_x = x0 + dx * amount
+            center_y = y0 + dy * amount
+            for offset in offsets:
+                x = int(round(center_x + normal_x * offset))
+                y = int(round(center_y + normal_y * offset))
+                if 0 <= x < width and 0 <= y < height:
+                    samples.append(image.getpixel((x, y))[:3])
     if not samples:
         return None
     return tuple(int(statistics.median(pixel[channel] for pixel in samples)) for channel in range(3))
+
+
+def _local_segments(
+    points: list[tuple[float, float]],
+    coordinate_scale: int,
+    max_screen_length: float = 3.0,
+):
+    """Yield short continuous pieces so color follows the imagery locally."""
+    max_length = max_screen_length * coordinate_scale
+    for first, second in zip(points, points[1:]):
+        length = math.hypot(second[0] - first[0], second[1] - first[1])
+        pieces = max(1, int(math.ceil(length / max_length)))
+        previous = first
+        for index in range(1, pieces + 1):
+            amount = index / pieces
+            current = (
+                first[0] + (second[0] - first[0]) * amount,
+                first[1] + (second[1] - first[1]) * amount,
+            )
+            yield previous, current
+            previous = current
 
 
 def _pavement_color(sampled: tuple[int, int, int]) -> tuple[int, int, int]:
@@ -357,12 +389,14 @@ def _pavement_color(sampled: tuple[int, int, int]) -> tuple[int, int, int]:
 def _trail_color(
     sampled: tuple[int, int, int], natural: bool
 ) -> tuple[int, int, int]:
-    """A terrain-derived, warm trail tone that remains readable over earth."""
-    target = (112, 91, 62) if natural else (105, 98, 82)
-    darkness = 0.65 if natural else 0.72
+    """Preserve the sampled terrain hue; only lower brightness for contrast."""
+    red, green, blue = (channel / 255 for channel in sampled)
+    hue, saturation, value = colorsys.rgb_to_hsv(red, green, blue)
+    value *= 0.72 if natural else 0.80
+    saturation = min(1.0, saturation * 1.05)
     return tuple(
-        max(0, min(255, int(round((source * 0.62 + warm * 0.38) * darkness))))
-        for source, warm in zip(sampled, target)
+        int(round(channel * 255))
+        for channel in colorsys.hsv_to_rgb(hue, saturation, value)
     )
 
 
@@ -409,12 +443,6 @@ def paint_roads(
         points = _smooth_points(points)
         width_m = float(road.get("widthM", 4.0))
         key = f"{road.get('kind', 'road')}:{road.get('category', '')}"
-        color = (255, 20, 20) if debug else ROAD_COLORS.get(key, DEFAULT_ROAD_COLOR)
-        sampled = None if debug else _sample_underlying_color(image, points, scale)
-        if sampled is not None and road.get("kind") == "road":
-            color = _pavement_color(sampled)
-        elif sampled is not None and road.get("kind") == "path":
-            color = _trail_color(sampled, road.get("category") == "Natursti")
         profile_scale = ROAD_WIDTH_SCALE.get(key, 1.25 if road.get("kind") == "road" else 1.1)
         width_px = width_m * profile_scale / span_x * width * scale
         if road.get("kind") == "road":
@@ -428,9 +456,26 @@ def paint_roads(
         # One continuous two-lane surface. Supersampling supplies the edge
         # transition; extra casing/crown strokes incorrectly imply separate
         # carriageways and a median.
-        alpha = 230 if debug else (215 if road.get("kind") == "path" else 145)
-        _draw_round_line(draw, points, (*color, alpha), fill_width)
-        painted += 1
+        alpha = 230 if debug else (180 if road.get("kind") == "path" else 145)
+        if debug:
+            _draw_round_line(draw, points, (255, 20, 20, alpha), fill_width)
+            painted += 1
+            continue
+        segment_painted = False
+        for first, second in _local_segments(points, scale):
+            sampled = _sample_underlying_color(
+                image, [first, second], scale, sample_half_width=fill_width / 2
+            )
+            if sampled is None:
+                continue
+            if road.get("kind") == "path":
+                color = _trail_color(sampled, road.get("category") == "Natursti")
+            else:
+                color = _pavement_color(sampled)
+            _draw_round_line(draw, [first, second], (*color, alpha), fill_width)
+            segment_painted = True
+        if segment_painted:
+            painted += 1
 
     if not painted:
         return jpeg, 0

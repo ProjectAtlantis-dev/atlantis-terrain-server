@@ -2,7 +2,7 @@
 
 TEXTURE UPGRADE CHAIN — DO NOT FUCK WITH THE ORDER:
 
-    ancestor_crop → dataforsyningen
+    ancestor_crop → dataforsyningen_metatile
 
 TEXTURE SOURCE STATES:
 - ancestor_crop:            Cropped from parent at subdivision time. Fresh, untried.
@@ -15,7 +15,9 @@ TEXTURE SOURCE STATES:
                             heightmap is entirely at/below sea level. Flat
                             deep-ocean fill (OCEAN_RGB). Terminal.
 - sentinel2_crop:           Legacy Sentinel-2 placeholder. Re-fetchable.
-- dataforsyningen:          Primary source (SPOT 6/7, 1.6m/0.2m via EPSG:3184).
+- dataforsyningen:          Legacy independently-fetched tile. Re-fetchable.
+- dataforsyningen_metatile: Primary source (SPOT 6/7, 1.6m/0.2m via EPSG:3184),
+                            fetched/reprojected as an aligned 2x2 child group.
 - write_texture() has an expected_upgrades whitelist. If you add a new source,
   update that whitelist or you'll get TEX CLOBBER warnings.
 
@@ -72,6 +74,15 @@ def is_white_fill_jpeg(jpeg_bytes):
     except Exception:
         return False
     return is_white_fill(arr)
+
+
+def is_no_coverage_fill_jpeg(jpeg_bytes):
+    """True when a cropped child is provider white-fill or mostly warp void."""
+    try:
+        arr = np.array(Image.open(io.BytesIO(jpeg_bytes)).convert("RGB"))
+    except Exception:
+        return False
+    return is_white_fill(arr) or float((arr.max(axis=2) == 0).mean() * 100.0) > 50.0
 
 
 # Median SPOT 6/7 color over fully-ocean tiles in terrain.db (sampled 2026-07:
@@ -143,13 +154,13 @@ _DATAFORSYNINGEN_WMS = "https://api.dataforsyningen.dk/wms/gl_satellitfoto"
 _DATAFORSYNINGEN_LAYERS = "ortofoto_0_2m_regional,ortofoto_1_6m_regional"
 
 
-def fetch_dataforsyningen_texture(bbox, resolution=256):
+def fetch_dataforsyningen_texture(bbox, resolution=256, lossless=False):
     """Fetch Greenland orthophoto from Dataforsyningen WMS.
 
     The WMS only supports EPSG:3184, so we transform the bbox from 3413→3184,
     fetch the image, then reproject the result back to 3413.
 
-    Returns (jpeg_bytes, None) on success,
+    Returns (image_bytes, None) on success (JPEG normally, PNG when lossless),
             (None, 'transient') on rate limit / timeout / HTTP error,
             (None, 'no_coverage') when the tile has no imagery.
     """
@@ -209,19 +220,57 @@ def fetch_dataforsyningen_texture(bbox, resolution=256):
 
     # Reject if mostly black/empty
     zero_pct = np.mean(dst_arr.max(axis=2) == 0) * 100
-    if zero_pct > 50:
+    # A 2x2 metatile may legitimately contain one or more empty children.
+    # Validate those children after splitting instead of rejecting useful
+    # siblings along with them.
+    zero_fill_limit = 50 if resolution <= 256 else 99
+    if zero_pct > zero_fill_limit:
         log_tex.warning(f"[DFORSYNINGEN] rejecting {zero_pct:.0f}% zero-fill result (no coverage)")
         return None, 'no_coverage'
     # Reject nearly uniform white frames (provider no-data response at coarse scales).
     if is_white_fill(dst_arr):
         log_tex.warning(f"[DFORSYNINGEN] rejecting white-fill result std={dst_arr.std():.2f} (no coverage)")
         return None, 'no_coverage'
-    # Re-encode as JPEG
+    # Metatiles stay lossless until their children are cropped so each final
+    # tile is JPEG-encoded only once.
     img = Image.fromarray(dst_arr)
     buf = io.BytesIO()
-    img.save(buf, format="JPEG", quality=85)
+    if lossless:
+        img.save(buf, format="PNG")
+    else:
+        img.save(buf, format="JPEG", quality=85)
     log_tex.info(f"[DFORSYNINGEN] OK: {len(buf.getvalue())} bytes, {zero_pct:.0f}% zero")
     return buf.getvalue(), None
+
+
+def split_texture_metatile(image_bytes, child_resolution=256, quality=85):
+    """Split a north-up 2x2 metatile into quadtree child JPEGs.
+
+    Child row coordinates increase northward, while image rows increase
+    southward. Keys are therefore ``(column_bit, row_bit)`` with north children
+    at row bit 1. Keeping this operation downstream of the single metatile
+    reprojection makes every sibling use the same source image and pixel grid.
+    """
+    image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    expected_size = child_resolution * 2
+    if image.size != (expected_size, expected_size):
+        raise ValueError(
+            f"expected {expected_size}x{expected_size} metatile, got "
+            f"{image.width}x{image.height}"
+        )
+
+    children = {}
+    for column_bit in range(2):
+        for row_bit in range(2):
+            left = column_bit * child_resolution
+            top = (1 - row_bit) * child_resolution
+            child = image.crop(
+                (left, top, left + child_resolution, top + child_resolution)
+            )
+            buf = io.BytesIO()
+            child.save(buf, format="JPEG", quality=quality)
+            children[(column_bit, row_bit)] = buf.getvalue()
+    return children
 
 
 # Sentinel-2 Cloudless 2024 (EPSG:3857 / Web Mercator)
@@ -268,17 +317,23 @@ def write_texture(db, tile_id, jpeg_bytes, source):
         expected_upgrades = {
             ("sentinel2_crop", "sentinel2"),
             ("sentinel2_crop", "dataforsyningen"),
+            ("sentinel2_crop", "dataforsyningen_metatile"),
             ("ancestor_crop", "dataforsyningen"),
+            ("ancestor_crop", "dataforsyningen_metatile"),
             ("ancestor_crop", "ancestor_crop_ratelimit"),
             ("ancestor_crop", "ancestor_crop_nodata"),
             ("ancestor_crop", "ocean_nodata"),
             ("ancestor_crop_ratelimit", "dataforsyningen"),
+            ("ancestor_crop_ratelimit", "dataforsyningen_metatile"),
             ("ancestor_crop_ratelimit", "ancestor_crop_nodata"),
             ("ancestor_crop_ratelimit", "ocean_nodata"),
             ("ancestor_crop_nodata", "ancestor_crop"),
             ("ancestor_crop_nodata", "ocean_nodata"),
             ("ocean_nodata", "dataforsyningen"),
+            ("ocean_nodata", "dataforsyningen_metatile"),
             ("sentinel2", "dataforsyningen"),
+            ("sentinel2", "dataforsyningen_metatile"),
+            ("dataforsyningen", "dataforsyningen_metatile"),
         }
         msg = (
             f"{tile_id}: replacing {ex_source} "

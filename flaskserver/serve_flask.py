@@ -165,6 +165,7 @@ _read_texture: Any = None
 _write_texture: Any = None
 _fetch_sentinel2_texture: Any = None
 _fetch_dataforsyningen_texture: Any = None
+_split_texture_metatile: Any = None
 _init_textures: Any = None
 _init_classifier_tiles: Any = None
 
@@ -172,6 +173,8 @@ _tex_pool = ThreadPoolExecutor(max_workers=4)
 _tex_fetching: dict[str, tuple[str, int]] = {}
 _tex_fetching_lock = threading.Lock()
 _tex_demand_generations: dict[str, int] = {}
+_tex_metatile_locks: dict[str, threading.Lock] = {}
+_tex_metatile_locks_guard = threading.Lock()
 
 
 def _texture_demand_is_stale(client_id: str, generation: int) -> bool:
@@ -239,25 +242,29 @@ def _tex_retry_worker() -> None:
       cur_row = db.execute(
         "SELECT source, texture FROM textures WHERE tile_id = ?", (tile_id,)
       ).fetchone()
-      if cur_row and cur_row[0] not in ("ancestor_crop", "ancestor_crop_ratelimit"):
+      if cur_row and cur_row[0] not in _METATILE_UPGRADEABLE_SOURCES:
         log_tex.debug(f"[tex-retry] {tile_id}: already upgraded to {cur_row[0]}, skipping")
         continue
 
-      jpeg, fail_reason = _fetch_dataforsyningen_texture(list(bbox), resolution=256)
-      if jpeg is not None:
-        jpeg = _repair_white_ocean_jpeg(db, tile_id, jpeg)
-        _write_texture(db, tile_id, jpeg, "dataforsyningen")
-        log_tex.info(f"[tex-retry] {tile_id}: SUCCESS on attempt {attempt + 1}")
-      elif fail_reason == 'no_coverage':
-        _resolve_no_coverage(db, tile_id, cur_row[1] if cur_row else None, "[tex-retry]")
-      else:
-        # Still transient
-        if attempt + 1 < _TEX_RETRY_MAX:
-          _tex_retry_enqueue(tile_id, bbox, attempt + 1)
-          log_tex.debug(f"[tex-retry] {tile_id}: still transient, re-queued attempt {attempt + 2}")
-        else:
-          log_tex.warning(f"[tex-retry] {tile_id}: max retries exhausted")
+      metatile_id, _, _, _ = _texture_metatile_spec(tile_id)
+      with _texture_metatile_lock(metatile_id):
+        children, fail_reason = _fetch_texture_metatile(tile_id)
+        if children is not None:
+          written, no_coverage = _store_texture_metatile(db, children)
+          if tile_id in written:
+            log_tex.info(f"[tex-retry] {tile_id}: SUCCESS on attempt {attempt + 1}")
+          elif tile_id in no_coverage:
+            _resolve_no_coverage(db, tile_id, cur_row[1] if cur_row else None, "[tex-retry]")
+        elif fail_reason == 'no_coverage':
           _resolve_no_coverage(db, tile_id, cur_row[1] if cur_row else None, "[tex-retry]")
+        else:
+          # Still transient
+          if attempt + 1 < _TEX_RETRY_MAX:
+            _tex_retry_enqueue(tile_id, bbox, attempt + 1)
+            log_tex.debug(f"[tex-retry] {tile_id}: still transient, re-queued attempt {attempt + 2}")
+          else:
+            log_tex.warning(f"[tex-retry] {tile_id}: max retries exhausted")
+            _resolve_no_coverage(db, tile_id, cur_row[1] if cur_row else None, "[tex-retry]")
     except Exception as exc:
       log_tex.error(f"[tex-retry] {tile_id}: FAILED: {type(exc).__name__}: {exc}")
     finally:
@@ -276,7 +283,8 @@ def _bootstrap_backend() -> None:
   global _backend_ready, _backend_error
   global _np, _Image, _to_stereo, _query_tiles_stereo, _load_no_data_cache
   global _GRID_N, _tile_bbox, _texture_ids_in, _read_texture, _write_texture
-  global _fetch_sentinel2_texture, _fetch_dataforsyningen_texture, _init_textures, _init_classifier_tiles
+  global _fetch_sentinel2_texture, _fetch_dataforsyningen_texture, _split_texture_metatile
+  global _init_textures, _init_classifier_tiles
 
   if _backend_ready or _backend_error is not None:
     return
@@ -294,6 +302,7 @@ def _bootstrap_backend() -> None:
       fetch_sentinel2_texture,
       init_textures,
       read_texture,
+      split_texture_metatile,
       texture_ids_in,
       write_texture,
     )
@@ -341,6 +350,7 @@ def _bootstrap_backend() -> None:
     _write_texture = write_texture
     _fetch_sentinel2_texture = fetch_sentinel2_texture
     _fetch_dataforsyningen_texture = fetch_dataforsyningen_texture
+    _split_texture_metatile = split_texture_metatile
     _init_textures = init_textures
     _init_classifier_tiles = init_classifier_tiles
 
@@ -638,6 +648,85 @@ def _tile_priority(bbox: list[float], qx: float, qy: float, fwd_x: float, fwd_y:
   return dist / max(dot, 0.01)
 
 
+_METATILE_FINAL_SOURCE = "dataforsyningen_metatile"
+_METATILE_UPGRADEABLE_SOURCES = {
+  "sentinel2_crop",
+  "ancestor_crop",
+  "ancestor_crop_ratelimit",
+  "dataforsyningen",
+}
+
+
+def _texture_metatile_spec(tile_id: str) -> tuple[str, tuple, int, dict[str, tuple[int, int]]]:
+  """Return aligned fetch information for the 2x2 group containing tile_id."""
+  parsed = _parse_tile_id(tile_id)
+  if parsed is None:
+    raise ValueError(f"invalid tile id: {tile_id}")
+  depth, column, row = parsed
+  if depth == 0:
+    return tile_id, tuple(_tile_bbox(depth, column, row)), 256, {tile_id: (0, 0)}
+
+  parent_depth = depth - 1
+  parent_column = column // 2
+  parent_row = row // 2
+  metatile_id = f"{parent_depth}-{parent_column}-{parent_row}"
+  children = {
+    f"{depth}-{parent_column * 2 + column_bit}-{parent_row * 2 + row_bit}":
+      (column_bit, row_bit)
+    for column_bit in range(2)
+    for row_bit in range(2)
+  }
+  return (
+    metatile_id,
+    tuple(_tile_bbox(parent_depth, parent_column, parent_row)),
+    512,
+    children,
+  )
+
+
+def _texture_metatile_lock(metatile_id: str) -> threading.Lock:
+  with _tex_metatile_locks_guard:
+    return _tex_metatile_locks.setdefault(metatile_id, threading.Lock())
+
+
+def _fetch_texture_metatile(tile_id: str) -> tuple[dict[str, bytes] | None, str | None]:
+  """Fetch and split one aligned metatile, without touching the database."""
+  _, bbox, resolution, child_offsets = _texture_metatile_spec(tile_id)
+  jpeg, fail_reason = _fetch_dataforsyningen_texture(
+    list(bbox), resolution=resolution, lossless=resolution > 256
+  )
+  if jpeg is None:
+    return None, fail_reason
+  if resolution == 256:
+    return {tile_id: jpeg}, None
+  quadrants = _split_texture_metatile(jpeg, child_resolution=256)
+  return {
+    child_id: quadrants[offset]
+    for child_id, offset in child_offsets.items()
+  }, None
+
+
+def _store_texture_metatile(db, children: dict[str, bytes]) -> tuple[set[str], set[str]]:
+  """Store valid metatile children without clobbering terminal/final states."""
+  from texture import is_no_coverage_fill_jpeg
+
+  written = set()
+  no_coverage = set()
+  for child_id, jpeg in children.items():
+    if is_no_coverage_fill_jpeg(jpeg):
+      no_coverage.add(child_id)
+      continue
+    existing = db.execute(
+      "SELECT source FROM textures WHERE tile_id = ?", (child_id,)
+    ).fetchone()
+    if existing and existing[0] not in _METATILE_UPGRADEABLE_SOURCES:
+      continue
+    jpeg = _repair_white_ocean_jpeg(db, child_id, jpeg)
+    _write_texture(db, child_id, jpeg, _METATILE_FINAL_SOURCE)
+    written.add(child_id)
+  return written, no_coverage
+
+
 
 def _queue_texture_fetch(
   tile_id: str,
@@ -656,7 +745,7 @@ def _queue_texture_fetch(
         return
     _tex_fetching[tile_id] = (demand_client, demand_generation)
 
-  _RE_FETCHABLE = {"sentinel2_crop", "ancestor_crop"}
+  _RE_FETCHABLE = _METATILE_UPGRADEABLE_SOURCES - {"ancestor_crop_ratelimit"}
 
   def _worker() -> None:
     db = None
@@ -686,31 +775,55 @@ def _queue_texture_fetch(
           parent_id = f"{d - 1}-{c // 2}-{r // 2}"
           _seed_children_from_parent(db, parent_id)
 
-      # Step 2: try Dataforsyningen. If it succeeds, overwrite ancestor_crop.
-      log_tex.debug(f"[tex-worker] {tile_id}: fetching texture bbox={bbox}")
-      jpeg, fail_reason = _fetch_dataforsyningen_texture(list(bbox), resolution=256)
-      if _texture_demand_is_stale(demand_client, demand_generation):
-        log_tex.debug(f"[tex-worker] {tile_id}: demand changed during fetch, discarding")
-        return
-      if jpeg is not None:
-        log_tex.debug(f"[tex-worker] {tile_id}: got {len(jpeg)} bytes from dataforsyningen")
-        jpeg = _repair_white_ocean_jpeg(db, tile_id, jpeg)
-        _write_texture(db, tile_id, jpeg, "dataforsyningen")
-      elif fail_reason == 'no_coverage':
-        # Permanent — mark so we never retry automatically.
+      # Step 2: fetch the aligned parent extent once and split all four exact
+      # children from the same reprojection. Concurrent sibling workers share
+      # this lock and observe the first worker's writes instead of refetching.
+      metatile_id, metatile_bbox, _, _ = _texture_metatile_spec(tile_id)
+      with _texture_metatile_lock(metatile_id):
         existing = db.execute(
-          "SELECT texture FROM textures WHERE tile_id = ?", (tile_id,)
+          "SELECT source FROM textures WHERE tile_id = ?", (tile_id,)
         ).fetchone()
-        _resolve_no_coverage(db, tile_id, existing[0] if existing else None, "[tex-worker]")
-      else:
-        # Transient (rate limit / timeout). Mark and enqueue for retry.
-        existing = db.execute(
-          "SELECT texture FROM textures WHERE tile_id = ?", (tile_id,)
-        ).fetchone()
-        if existing and existing[0]:
-          _write_texture(db, tile_id, existing[0], "ancestor_crop_ratelimit")
-        _tex_retry_enqueue(tile_id, bbox, attempt=0)
-        log_tex.debug(f"[tex-worker] {tile_id}: transient → ancestor_crop_ratelimit, queued for retry")
+        if existing and existing[0] == _METATILE_FINAL_SOURCE:
+          log_tex.debug(f"[tex-worker] {tile_id}: metatile sibling already filled it")
+          return
+
+        log_tex.debug(
+          f"[tex-worker] {tile_id}: fetching metatile {metatile_id} bbox={metatile_bbox}"
+        )
+        children, fail_reason = _fetch_texture_metatile(tile_id)
+        if _texture_demand_is_stale(demand_client, demand_generation):
+          log_tex.debug(f"[tex-worker] {tile_id}: demand changed during fetch, discarding")
+          return
+        if children is not None:
+          written, no_coverage = _store_texture_metatile(db, children)
+          log_tex.debug(
+            f"[tex-worker] {tile_id}: metatile wrote {len(written)} children"
+          )
+          if tile_id in no_coverage:
+            existing = db.execute(
+              "SELECT texture FROM textures WHERE tile_id = ?", (tile_id,)
+            ).fetchone()
+            _resolve_no_coverage(
+              db, tile_id, existing[0] if existing else None, "[tex-worker]"
+            )
+        elif fail_reason == 'no_coverage':
+          # Permanent for the requested child. Sibling requests can still try
+          # their group if provider coverage behavior changes at the boundary.
+          existing = db.execute(
+            "SELECT texture FROM textures WHERE tile_id = ?", (tile_id,)
+          ).fetchone()
+          _resolve_no_coverage(db, tile_id, existing[0] if existing else None, "[tex-worker]")
+        else:
+          # Transient (rate limit / timeout). Mark and enqueue for retry.
+          existing = db.execute(
+            "SELECT texture FROM textures WHERE tile_id = ?", (tile_id,)
+          ).fetchone()
+          if existing and existing[0]:
+            _write_texture(db, tile_id, existing[0], "ancestor_crop_ratelimit")
+          _tex_retry_enqueue(tile_id, bbox, attempt=0)
+          log_tex.debug(
+            f"[tex-worker] {tile_id}: transient → ancestor_crop_ratelimit, queued for retry"
+          )
     except Exception as exc:  # pragma: no cover - runtime fetch path
       log_tex.error(f"[tex-worker] {tile_id} FAILED: {type(exc).__name__}: {exc}")
     finally:
@@ -1107,7 +1220,12 @@ def api_texture(tile_id: str):
 
   cached_crop = None
   # Sources that are temporary placeholders — serve them but let client re-fetch
-  _TEX_TEMPORARY = {"sentinel2_crop", "ancestor_crop", "ancestor_crop_ratelimit"}
+  _TEX_TEMPORARY = {
+    "sentinel2_crop",
+    "ancestor_crop",
+    "ancestor_crop_ratelimit",
+    "dataforsyningen",  # legacy independent fetch; upgrade to aligned metatile
+  }
   if row is not None:
     cached, source = row[0], row[1]
     log_tex.debug(f"[/api/texture] {tile_id}: cache HIT source={source} size={len(cached)} bytes")
@@ -1147,6 +1265,7 @@ def api_texture(tile_id: str):
         "X-Tex-Status": "ancestor_fallback",
         "X-Tex-Quality": "ancestor_crop",
         "X-Tex-Temporary": "1",
+        "X-Tex-Source": source or "",
       },
     )
 

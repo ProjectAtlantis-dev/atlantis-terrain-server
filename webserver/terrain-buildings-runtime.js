@@ -118,7 +118,6 @@ export function createTerrainBuildingsRuntime({
     terrainRoot, pipelineState,
     endpoint, itemsKey: 'buildings', logLabel: 'Buildings',
     buildKeyForItem: item => `${item.id}:${item.colorVersion ?? ''}:${item.color?.join(',') ?? ''}`,
-    refreshIntervalMs: 10000,
     buildGeometry: (items, { offsetX, offsetY }) =>
       buildBuildingsGeometry(items, { offsetX, offsetY, exaggeration }),
     bootLog, onMutated, requestRender, fetchImpl,

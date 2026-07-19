@@ -14,17 +14,14 @@ export function createTerrainVectorLayerRuntime({
   endpoint, itemsKey, logLabel,
   buildGeometry,
   buildKeyForItem = item => item.id,
-  refreshIntervalMs = Infinity,
   bootLog = () => {}, onMutated = () => {}, requestRender = () => {},
   fetchImpl = (...args) => fetch(...args),
-  now = () => Date.now(),
 }) {
   let mesh = null;
   let visible = true;
   let fetching = false;
   let lastFetchX = null;
   let lastFetchY = null;
-  let lastFetchAt = -Infinity;
   let lastBuildKey = null;
   let timer = null;
 
@@ -57,15 +54,13 @@ export function createTerrainVectorLayerRuntime({
     requestRender();
   }
 
-  async function maybeFetch() {
+  async function maybeFetch({ force = false } = {}) {
     if (fetching || !pipelineState.ready || !pipelineState.frameOffsetReady) return;
     const queryX = pipelineState.lastFetchX;
     const queryY = pipelineState.lastFetchY;
     if (!Number.isFinite(queryX) || !Number.isFinite(queryY)) return;
-    const currentTime = now();
-    if (lastFetchX !== null
-      && Math.hypot(queryX - lastFetchX, queryY - lastFetchY) < REFETCH_DISTANCE_M
-      && currentTime - lastFetchAt < refreshIntervalMs) return;
+    if (!force && lastFetchX !== null
+      && Math.hypot(queryX - lastFetchX, queryY - lastFetchY) < REFETCH_DISTANCE_M) return;
     fetching = true;
     try {
       const url = `${endpoint}?sx=${queryX}&sy=${queryY}&range=${FETCH_RANGE_M}`
@@ -75,7 +70,6 @@ export function createTerrainVectorLayerRuntime({
       const data = await response.json();
       lastFetchX = queryX;
       lastFetchY = queryY;
-      lastFetchAt = currentTime;
       applyItems(Array.isArray(data[itemsKey]) ? data[itemsKey] : []);
       bootLog(`${logLabel.toLowerCase()}.fetch`, { count: data.count ?? 0, queryX, queryY });
     } catch (error) {
@@ -104,5 +98,6 @@ export function createTerrainVectorLayerRuntime({
     },
     getVisible: () => visible,
     getMesh: () => mesh,
+    refresh: () => maybeFetch({ force: true }),
   };
 }
