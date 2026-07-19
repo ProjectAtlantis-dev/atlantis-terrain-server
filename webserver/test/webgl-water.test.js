@@ -5,6 +5,7 @@ import * as THREE from 'three';
 import {
   prepareBathymetryTerrainTiles,
 } from '../render-backends/webgl-water.js';
+import { createWaterRuntime } from '../water/water-runtime.js';
 import {
   NORTH_CLIFF_REFLECTION_MAX_PADDING_M,
   northCliffReflectionKeepForDistance,
@@ -65,4 +66,58 @@ test('bathymetry capture composites terrain coarse-to-fine and restores scene st
   assert.equal(child.layers.mask, 2 ** 5);
   assert.equal(parent.renderOrder, 40);
   assert.equal(child.renderOrder, 2);
+});
+
+test('bathymetry recaptures on movement, settled texture changes, and the lazy backstop', () => {
+  const originalNow = performance.now;
+  let nowMs = 0;
+  performance.now = () => nowMs;
+  try {
+    const captures = [];
+    let textureVersion = 0;
+    const water = {
+      mesh: new THREE.Mesh(),
+      setWind() {},
+      update() {},
+      captureBathymetry({ centerXY }) { captures.push(centerXY.clone()); },
+      bathyExtent: 30000,
+      dispose() {},
+    };
+    const runtime = createWaterRuntime({
+      backend: { createWater: () => water },
+      scene: new THREE.Scene(),
+      terrainRoot: new THREE.Group(),
+      anchorPosition: new THREE.Vector3(),
+      east: new THREE.Vector3(1, 0, 0),
+      north: new THREE.Vector3(0, 1, 0),
+      up: new THREE.Vector3(0, 0, 1),
+      getSunDirection: () => new THREE.Vector3(0, 0, 1),
+      getTextureVersion: () => textureVersion,
+    });
+    const camera = { position: new THREE.Vector3(0, 0, 100) };
+    const step = dt => { nowMs += dt; runtime.update({ dt, camera, visible: true }); };
+
+    step(16);
+    assert.equal(captures.length, 1); // initial capture
+
+    textureVersion += 1;
+    step(16);
+    assert.equal(captures.length, 1); // texture change is debounced
+
+    step(2100);
+    assert.equal(captures.length, 2); // settled texture change recaptures
+
+    step(2100);
+    assert.equal(captures.length, 2); // no new version, no early recapture
+
+    step(15100);
+    assert.equal(captures.length, 3); // lazy periodic backstop
+
+    camera.position.set(30000 * 0.13, 0, 100);
+    step(16);
+    assert.equal(captures.length, 4); // recentre on movement
+    assert.equal(captures.at(-1).x, 30000 * 0.13);
+  } finally {
+    performance.now = originalNow;
+  }
 });

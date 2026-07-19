@@ -630,10 +630,18 @@ scene.add(terrainRoot);
 // dropped to -10 m server-side, so the surface has volume above the seabed
 // and land occludes it naturally. Inert on backends without createWater.
 const waterParams = { ...DEFAULT_WATER_PARAMS };
+// Bumped whenever a tile's displayed texture actually changes; the water
+// runtime re-captures its bathymetry (which bakes tile-texture brightness
+// into the reflection gate) once the streaming burst settles instead of
+// serving a stale capture.
+let terrainTextureVersion = 0;
+const appliedTileTextures = new WeakMap();
 const waterRuntime = createWaterRuntime({
   backend: renderBackend, scene, terrainRoot,
   anchorPosition, east, north, up,
   getSunDirection: () => sunDirection,
+  getTextureVersion: () => terrainTextureVersion,
+  log: (event, details) => enqueueClientLog('info', event, details),
   params: waterParams,
 });
 
@@ -684,10 +692,7 @@ const hoverOutlineController = createTerrainHoverOutlineController({
   terrainRoot,
   onChanged: () => { markSceneMutated(); requestRender(); },
 });
-const mapGridController = createTerrainMapGridController({
-  terrainRoot,
-  color: 0x14e6ff,
-});
+const mapGridController = createTerrainMapGridController({ terrainRoot });
 
 // --- Terrain streaming state ---
 const EXAG = 1.0;
@@ -866,7 +871,10 @@ function applyDate(date, { force = true } = {}) {
   gameClockState.renderedDate = new Date(date);
   const previousSunDirection = sunDirection.clone();
   getSunDirectionECEF(date, sunDirection);
-  if (!previousSunDirection.equals(sunDirection)) {
+  if (
+    !USE_WEBGPU_RENDER_BACKEND &&
+    !previousSunDirection.equals(sunDirection)
+  ) {
     restoreCloudTemporalHistory = invalidateTerrainCloudHistory(cloudsEffect);
   }
   aerialPerspective.sunDirection.copy(sunDirection);
@@ -971,7 +979,17 @@ const terrainTileSet = createTerrainTileSet({
   vehicle: vehicleRuntime,
   events: {
     onMutated: markSceneMutated,
-    onMaterialApplied: () => {
+    // onMaterialApplied fires for every tile on every application pass, not
+    // just real changes — the reconciler reapplies constantly. Only actual
+    // map swaps may bump the texture version, or the water runtime's
+    // "textures settled" recapture never settles and rebakes the bathymetry
+    // (a full ortho scene render) every debounce interval forever.
+    onMaterialApplied: mesh => {
+      const map = mesh?.material?.map ?? null;
+      if (appliedTileTextures.get(mesh) !== map) {
+        appliedTileTextures.set(mesh, map);
+        terrainTextureVersion += 1;
+      }
       requestRender();
     },
   },

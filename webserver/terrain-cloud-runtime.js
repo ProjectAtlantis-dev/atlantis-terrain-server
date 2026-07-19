@@ -5,6 +5,12 @@ export function configureTerrainClouds({
   CloudShapeDetail,
   Turbulence,
 } = {}) {
+  if (!installTerrainCloudHistoryReset(effect)) {
+    console.warn(
+      'terrain clouds: history-reset shader patch did not install; sun changes '
+      + 'will leave Bayer-grid ghosts (did takram cloudsResolve.frag change?)',
+    );
+  }
   effect.qualityPreset = 'high';
   effect.coverage = 0.28;
   const altitudes = [1550, 1800, 8300, 9100];
@@ -40,6 +46,44 @@ export function configureTerrainClouds({
   };
 }
 
+const cloudHistoryResetUniforms = new WeakMap();
+
+export function installTerrainCloudHistoryReset(effect) {
+  if (cloudHistoryResetUniforms.has(effect)) return true;
+  const material = effect?.cloudsPass?.resolveMaterial;
+  if (!material?.fragmentShader) return false;
+
+  // Anchors match takram's cloudsResolve.frag at the pinned revision; the
+  // comment line pins the reset to temporalUpscale(), the only currentFrame
+  // branch. A takram bump that rewrites either anchor fails the install (and
+  // the caller's warning) instead of silently reverting to ghosting.
+  const declaration = 'uniform float temporalAlpha;';
+  const resetPoint = '  if (currentFrame) {\n'
+    + '    // Use the texel just rendered without any accumulation.';
+  if (!material.fragmentShader.includes(declaration) || !material.fragmentShader.includes(resetPoint)) {
+    return false;
+  }
+
+  const uniform = { value: 0 };
+  material.uniforms.terrainHistoryReset = uniform;
+  material.fragmentShader = material.fragmentShader
+    .replace(declaration, `${declaration}\nuniform float terrainHistoryReset;`)
+    .replace(resetPoint, `  // Project-owned sun-change reset: spatially upscale the complete current
+  // low-resolution frame into every history pixel instead of mixing 16 Bayer
+  // phases rendered under different sun directions.
+  if (terrainHistoryReset > 0.5) {
+    outputColor = texture(colorBuffer, vUv);
+    #ifdef SHADOW_LENGTH
+    outputShadowLength = texture(shadowLengthBuffer, vUv).r;
+    #endif // SHADOW_LENGTH
+    return;
+  }
+${resetPoint}`);
+  material.needsUpdate = true;
+  cloudHistoryResetUniforms.set(effect, uniform);
+  return true;
+}
+
 export function bindTerrainCloudComposition(cloudsEffect, aerialPerspective) {
   const sync = () => {
     aerialPerspective.overlay = cloudsEffect.atmosphereOverlay;
@@ -69,22 +113,25 @@ export function invalidateTerrainCloudHistory(effect) {
   let restore = pendingHistoryRestores.get(effect);
   if (restore != null) return restore;
 
-  const uniforms = [
-    effect?.shadowPass?.resolveMaterial?.uniforms?.temporalAlpha,
-    effect?.cloudsPass?.resolveMaterial?.uniforms?.temporalAlpha,
-  ].filter(Boolean);
-  const previousValues = uniforms.map(uniform => uniform.value);
+  const shadowAlpha = effect?.shadowPass?.resolveMaterial?.uniforms?.temporalAlpha;
+  const cloudsAlpha = effect?.cloudsPass?.resolveMaterial?.uniforms?.temporalAlpha;
+  const previousShadowAlpha = shadowAlpha?.value;
+  const previousCloudsAlpha = cloudsAlpha?.value;
+  const cloudsReset = cloudHistoryResetUniforms.get(effect);
+  const previousCloudsReset = cloudsReset?.value;
 
-  // Reprojection only follows camera and cascade transforms. A changed sun
-  // direction changes the ray-marched lighting field itself, so retaining the
-  // old samples creates contour-like ghost bands on smooth receivers (water is
-  // especially revealing). Give the next resolve full current-frame weight.
-  for (const uniform of uniforms) uniform.value = 1;
+  // Takram's temporal upscaler ignores temporalAlpha for 15 of its 16 Bayer
+  // phases. terrainHistoryReset makes its next resolve spatially upscale the
+  // complete current low-resolution frame into all history pixels instead.
+  // The shadow resolve is full-resolution, so alpha=1 is sufficient there.
+  if (cloudsReset) cloudsReset.value = 1;
+  if (shadowAlpha) shadowAlpha.value = 1;
+  if (cloudsAlpha) cloudsAlpha.value = 1;
 
   restore = () => {
-    for (let index = 0; index < uniforms.length; index += 1) {
-      uniforms[index].value = previousValues[index];
-    }
+    if (shadowAlpha) shadowAlpha.value = previousShadowAlpha;
+    if (cloudsAlpha) cloudsAlpha.value = previousCloudsAlpha;
+    if (cloudsReset) cloudsReset.value = previousCloudsReset;
     pendingHistoryRestores.delete(effect);
   };
   pendingHistoryRestores.set(effect, restore);

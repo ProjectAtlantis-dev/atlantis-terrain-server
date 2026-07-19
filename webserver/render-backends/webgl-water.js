@@ -245,6 +245,32 @@ const WATER_FRAGMENT = /* glsl */ `
     return bathyAt(p).r;
   }
 
+  // Imagery-darkness reflection gate. The capture's g channel is only
+  // meaningful where its b channel says a real satellite texture was mapped;
+  // everywhere else (placeholder-less tiles, no coverage, beyond the window)
+  // the gate stays FULL OPEN — matching lit water, so texture-state churn
+  // during LOD reshuffles cannot flip a tile's reflection.
+  //
+  // Thresholds are measured, not aesthetic (2026-07, Nuuk archipelago vs the
+  // eastern fjords): lit open-water imagery never goes below ~0.0035 linear
+  // anywhere sampled, while baked cliff-shadow bands fall under ~0.002. The
+  // gate therefore restores fully by 0.0035 and only near-black shadow bands
+  // suppress reflection. The previous 0.0005..0.025 band put ALL of the
+  // archipelago's dark water (median 0.0048) at gate 0.1 — reflection
+  // suppressed fjord-wide, exactly the "scatter trashed" presentation.
+  float reflectionGateAt(vec2 p) {
+    vec2 uv = (p - uBathyCenter) / uBathyExtent + 0.5;
+    vec4 b = texture2D(uBathy, uv);
+    float inB = step(abs(uv.x - 0.5), 0.5) * step(abs(uv.y - 0.5), 0.5);
+    // Relax to full-open across the outer ~2.5 km of the capture window so
+    // the boundary never draws a straight seam through dark shadow water.
+    float edge = max(abs(uv.x - 0.5), abs(uv.y - 0.5));
+    float windowFade = 1.0 - smoothstep(0.42, 0.5, edge);
+    float validity = clamp(b.b, 0.0, 1.0) * b.a * inB * windowFade;
+    float gate = smoothstep(0.0008, 0.0035, b.g);
+    return mix(1.0, gate, validity);
+  }
+
   // Replace analytic sky reflections near north-facing coastal cliffs. Local +y is
   // north, so a north-facing slope rises toward -y (south). Search only on
   // that axis: east/west/south-facing shores are deliberately unaffected.
@@ -330,10 +356,9 @@ const WATER_FRAGMENT = /* glsl */ `
     float colDepth = clamp(-seabed, 0.0, 60.0);
     float northCliffReflection = northCliffReflectionKeep(pxy, bathySample);
     // Luminance is a poor darkness proxy for blue fjord water because it
-    // heavily discounts the blue channel. Only call a pixel black when all
-    // three channels are nearly absent. In linear space this begins restoring
-    // reflection above ~2% sRGB and reaches full strength around ~17% sRGB.
-    float bottomReflection = smoothstep(0.0005, 0.025, bathySample.g) * bathySample.a;
+    // heavily discounts the blue channel; the gate uses the max channel and
+    // only calls a pixel black when all three are nearly absent.
+    float bottomReflection = reflectionGateAt(pxy);
 
     // Wall detection: the open fjord floor is a flat synthetic -10 m plane —
     // the only steep thing under the surface is the artificial mask-drop wall
@@ -654,7 +679,11 @@ export function createWebGLWater({
         if (uUseMap > 0.5) imageColor *= texture2D(uMap, vUv).rgb;
         if (uUseVertexColor > 0.5) imageColor *= vColor;
         float brightness = max(max(imageColor.r, imageColor.g), imageColor.b);
-        gl_FragColor = vec4(uCamH + vZ, brightness, 0.0, 1.0);
+        // b flags imagery-backed brightness. Tiles still waiting for their
+        // satellite texture render grayscale elevation (or plain white), and
+        // a capture taken from those reported full brightness fjord-wide —
+        // the reflection gate must know g is meaningless there.
+        gl_FragColor = vec4(uCamH + vZ, brightness, uUseMap, 1.0);
       }
     `,
     vertexColors: true,
@@ -723,8 +752,12 @@ export function createWebGLWater({
       const prevVisible = mesh.visible;
       const restoreTerrainTiles = prepareBathymetryTerrainTiles(terrainRoot);
       const renderCallbacks = [];
+      const stats = { tiles: 0, textured: 0, untexturedIds: [] };
       for (const tile of terrainRoot.children) {
         if (!tile.isMesh || !/^\d+-\d+-\d+$/.test(tile.userData?.tileId ?? '')) continue;
+        stats.tiles += 1;
+        if (tile.material?.map) stats.textured += 1;
+        else if (stats.untexturedIds.length < 16) stats.untexturedIds.push(tile.userData.tileId);
         const previous = tile.onBeforeRender;
         renderCallbacks.push([tile, previous]);
         tile.onBeforeRender = (...args) => {
@@ -757,6 +790,7 @@ export function createWebGLWater({
       }
       uniforms.uBathyCenter.value.set(centerXY.x, centerXY.y);
       uniforms.uBathyExtent.value = bathyExtent;
+      return stats;
     },
 
     get bathyExtent() { return bathyExtent; },

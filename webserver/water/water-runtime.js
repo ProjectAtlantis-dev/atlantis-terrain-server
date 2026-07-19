@@ -45,6 +45,7 @@ export const DEFAULT_WATER_PARAMS = {
 };
 
 const BATHY_REFRESH_MS = 15000;
+const BATHY_TEXTURE_SETTLE_MS = 2000;
 
 export function createWaterRuntime({
   backend,
@@ -55,6 +56,8 @@ export function createWaterRuntime({
   north,
   up,
   getSunDirection,
+  getTextureVersion = null,
+  log = null,
   params = { ...DEFAULT_WATER_PARAMS },
 }) {
   const water = backend.createWater?.({ geometry: buildRadialGridGeometry() }) ?? null;
@@ -75,6 +78,7 @@ export function createWaterRuntime({
   const simParams = {};
   let simTime = 0;
   let lastCaptureMs = -Infinity;
+  let lastCaptureTextureVersion = null;
 
   function applyWind() {
     water.setWind({
@@ -115,16 +119,39 @@ export function createWaterRuntime({
 
     // The seabed is a static -10 m floor — water terrain effectively never
     // changes; at most the shoreline sharpens as higher-LOD tiles stream in.
-    // So: re-capture when movement re-centres the window, plus a lazy
-    // periodic refresh to pick up shoreline upscales. No event plumbing.
+    // Re-capture when movement re-centres the window, when tile textures have
+    // changed since the last capture (debounced — streaming arrives in
+    // bursts), plus a lazy periodic refresh as a backstop. The texture
+    // trigger matters: the capture bakes tile-texture brightness into the
+    // reflection gate, and with an on-demand render loop the lazy refresh
+    // alone deferred that update to whatever next dirtied the scene — a sun
+    // tick, minutes later — which read as lighting suddenly breaking.
     if (water.captureBathymetry) {
       const nowMs = performance.now();
+      const textureVersion = getTextureVersion?.() ?? 0;
       const moved = lastCaptureCenter.distanceTo(meshOffset)
         > water.bathyExtent * 0.12;
-      if (moved || nowMs - lastCaptureMs >= BATHY_REFRESH_MS) {
-        water.captureBathymetry({ scene, terrainRoot, centerXY: meshOffset });
+      const texturesSettled = textureVersion !== lastCaptureTextureVersion
+        && nowMs - lastCaptureMs >= BATHY_TEXTURE_SETTLE_MS;
+      if (moved || texturesSettled || nowMs - lastCaptureMs >= BATHY_REFRESH_MS) {
+        const reason = lastCaptureTextureVersion == null ? 'initial'
+          : moved ? 'moved'
+          : texturesSettled ? 'textures-settled'
+          : 'periodic';
+        const sincePreviousMs = Number.isFinite(lastCaptureMs)
+          ? Math.round(nowMs - lastCaptureMs) : null;
+        const stats = water.captureBathymetry({ scene, terrainRoot, centerXY: meshOffset });
         lastCaptureCenter.copy(meshOffset);
         lastCaptureMs = nowMs;
+        lastCaptureTextureVersion = textureVersion;
+        log?.('water.bathymetry.capture', {
+          reason,
+          sincePreviousMs,
+          textureVersion,
+          centerX: Math.round(meshOffset.x),
+          centerY: Math.round(meshOffset.y),
+          ...stats,
+        });
       }
     }
   }

@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import test from 'node:test';
+import { Color } from 'three';
 
 import {
   headingAlignedPriorityDistance,
@@ -23,7 +25,7 @@ import {
 } from '../terrain-tile-set.js';
 import { createTerrainMeshBuilder, decodeTerrainHeightmap } from '../terrain-mesh-builder.js';
 import { applyTerrainAvailabilityStatus } from '../terrain-status-controller.js';
-import { collectTerrainDebugMeshes, createTerrainHoverOutlineController, createTerrainMapGridController, summarizeTerrainMesh } from '../terrain-debug-runtime.js';
+import { collectTerrainDebugMeshes, createTerrainHoverOutlineController, createTerrainMapGridController, summarizeTerrainMesh, terrainSeamColorForTile } from '../terrain-debug-runtime.js';
 import { createTerrainFetchRuntime } from '../terrain-fetch-runtime.js';
 import { restoreTerrainCameraState, terrainCameraState } from '../terrain-camera-state.js';
 import { createTerrainClientLogger } from '../terrain-client-logging.js';
@@ -36,6 +38,7 @@ import {
   bindTerrainCloudComposition,
   configureTerrainClouds,
   invalidateTerrainCloudHistory,
+  installTerrainCloudHistoryReset,
   registerTerrainCloudTuning,
 } from '../terrain-cloud-runtime.js';
 import { createTerrainHouseConfiguration, createTerrainHouseMarkerRuntime, createTerrainHouseModelController, disposeTerrainHouseTree, markTerrainHousesNeedSnap, terrainHouseLocalPosition, terrainHouseShadowCoverage, terrainHouseZSummary } from '../terrain-house-runtime.js';
@@ -361,20 +364,53 @@ test('shared cloud runtime configures layers and synchronizes atmosphere composi
   assert.equal(listeners.has('change'), false);
 });
 
-test('cloud history invalidation uses one current-only resolve frame', () => {
+test('cloud history invalidation seeds every temporal-upscale phase from the current frame', () => {
+  // The install anchors on takram's real cloudsResolve.frag; a mocked shader
+  // would only validate our own assumptions about it. resolveMaterial receives
+  // the source verbatim modulo include resolution, which touches neither anchor.
+  const takramResolveShader = readFileSync(
+    new URL(
+      '../three-geospatial/packages/clouds/src/shaders/cloudsResolve.frag',
+      import.meta.url,
+    ),
+    'utf8',
+  );
   const shadowAlpha = { value: 0.01 };
   const cloudsAlpha = { value: 0.1 };
+  const resolveMaterial = {
+    uniforms: { temporalAlpha: cloudsAlpha },
+    fragmentShader: takramResolveShader,
+  };
   const effect = {
+    temporalUpscale: true,
     shadowPass: { resolveMaterial: { uniforms: { temporalAlpha: shadowAlpha } } },
-    cloudsPass: { resolveMaterial: { uniforms: { temporalAlpha: cloudsAlpha } } },
+    cloudsPass: { resolveMaterial },
   };
 
+  assert.equal(installTerrainCloudHistoryReset(effect), true);
+  assert.match(resolveMaterial.fragmentShader, /uniform float terrainHistoryReset;/);
+  // The reset must land inside temporalUpscale(), ahead of the current-phase
+  // branch, so it overrides all 16 Bayer phases — not temporalAntialiasing().
+  const resetIndex = resolveMaterial.fragmentShader.indexOf('terrainHistoryReset > 0.5');
+  const currentFrameIndex = resolveMaterial.fragmentShader.indexOf('if (currentFrame) {');
+  const antialiasingIndex = resolveMaterial.fragmentShader.indexOf('void temporalAntialiasing');
+  assert.ok(resetIndex >= 0);
+  assert.ok(resetIndex < currentFrameIndex);
+  assert.ok(resetIndex < antialiasingIndex);
+  assert.equal(installTerrainCloudHistoryReset(effect), true);
+  assert.equal(
+    resolveMaterial.fragmentShader.match(/terrainHistoryReset > 0\.5/g).length,
+    1,
+  );
+
   const restore = invalidateTerrainCloudHistory(effect);
+  assert.equal(resolveMaterial.uniforms.terrainHistoryReset.value, 1);
   assert.equal(shadowAlpha.value, 1);
   assert.equal(cloudsAlpha.value, 1);
   assert.equal(invalidateTerrainCloudHistory(effect), restore);
 
   restore();
+  assert.equal(resolveMaterial.uniforms.terrainHistoryReset.value, 0);
   assert.equal(shadowAlpha.value, 0.01);
   assert.equal(cloudsAlpha.value, 0.1);
 });
@@ -390,24 +426,28 @@ test('shared cloud tuning registers controls and applies altitude, cirrus, and d
     localWeatherVelocity: { values: [], set(...values) { this.values = values; } },
   };
   const controls = {};
-  registerTerrainCloudTuning({
+  const tuning = registerTerrainCloudTuning({
     effect, controls,
     section: label => sections.push(label),
     slider: (label, options) => { definitions.set(label, options); return { label }; },
     toggle: (label, options) => { definitions.set(label, options); return { label }; },
+    getWindDirection: () => 0,
   });
   assert.deepEqual(sections, ['Clouds']);
-  assert.equal(definitions.size, 8);
+  assert.equal(definitions.size, 7);
   assert.equal(controls._cirrusCheckbox.label, 'cirrus');
 
   definitions.get('cloud altitude').onChange(-2000);
   assert.deepEqual(effect.cloudLayers.map(layer => layer.altitude), [0, 0, 6300, 7100]);
   definitions.get('cirrus').onChange(true);
   assert.equal(effect.cloudLayers[3].densityScale, 0.004);
+  // Drift heading is slaved to the water wind (compass "blows toward" 0 =
+  // north), so speed changes re-resolve the heading instead of a dedicated
+  // direction slider. Compass north maps to +y in the weather-uv frame.
   definitions.get('drift speed').onChange(0.001);
-  definitions.get('drift direction').onChange(90);
   assert.ok(Math.abs(effect.localWeatherVelocity.values[0]) < 1e-12);
   assert.ok(Math.abs(effect.localWeatherVelocity.values[1] - 0.001) < 1e-12);
+  assert.equal(typeof tuning.syncDrift, 'function');
 });
 
 test('shared house configuration and placement preserve terrain conventions', () => {
@@ -1241,12 +1281,24 @@ test('map grid uses the exact rendered mesh bounds', () => {
   };
   const grid = createTerrainMapGridController({ terrainRoot: root });
   const meshes = [
-    { userData: { tileId: 'parent', bbox: [0, 0, 8, 8] } },
-    { userData: { tileId: 'child', bbox: [8, 0, 12, 4] } },
+    { userData: { tileId: '11-1-1', bbox: [0, 0, 8, 8] } },
+    { userData: { tileId: '12-2-2', bbox: [8, 0, 12, 4] } },
   ];
   grid.setVisible(true);
   assert.equal(grid.update(meshes), true);
   assert.equal(grid.lines.geometry.attributes.position.count, 16);
+  assert.equal(grid.lines.geometry.attributes.color.count, 16);
+  assert.equal(grid.lines.material.vertexColors, true);
+  assert.equal(grid.lines.material.toneMapped, false);
+  assert.equal(grid.lines.material.depthWrite, false);
+  const colors = grid.lines.geometry.attributes.color;
+  const depth11 = new Color(terrainSeamColorForTile('11-1-1'));
+  const depth12 = new Color(terrainSeamColorForTile('12-2-2'));
+  assert.ok(Math.abs(colors.getX(0) - depth11.r) < 1e-6);
+  assert.ok(Math.abs(colors.getY(0) - depth11.g) < 1e-6);
+  assert.ok(Math.abs(colors.getZ(0) - depth11.b) < 1e-6);
+  assert.ok(Math.abs(colors.getX(8) - depth12.r) < 1e-6);
+  assert.notEqual(terrainSeamColorForTile('11-1-1'), terrainSeamColorForTile('12-2-2'));
   assert.equal(grid.lines.visible, true);
   assert.equal(grid.update(meshes), false);
   grid.setVisible(false);
