@@ -497,6 +497,19 @@ function buildTuningControls(ap, ce) {
     value: ap.inscatter,
     onChange: v => { ap.inscatter = v; }
   });
+  if (renderBackend.lensFlare) {
+    tuningSectionLabel('Lens Flare');
+    tuningSlider('flare intensity', {
+      min: 0, max: 0.05, step: 0.001, value: renderBackend.lensFlare.intensity,
+      decimals: 3,
+      onChange: v => { renderBackend.lensFlare.intensity = v; }
+    });
+    tuningSlider('flare threshold', {
+      min: 0, max: 30, step: 0.5, value: renderBackend.lensFlare.thresholdLevel,
+      decimals: 1,
+      onChange: v => { renderBackend.lensFlare.thresholdLevel = v; }
+    });
+  }
   cloudTuning = registerTerrainCloudTuning({
     effect: ce, controls,
     section: tuningSectionLabel,
@@ -532,6 +545,12 @@ function buildTuningControls(ap, ce) {
     decimals: 0,
     format: v => `${v.toFixed(0)}km`,
     onChange: v => { waterParams.fetchKm = v; waterRuntime.applyWind(); }
+  });
+  tuningSlider('shore fetch ramp', {
+    min: 0, max: 8000, step: 100, value: waterParams.shoreFetchRamp,
+    decimals: 0,
+    format: v => `${v.toFixed(0)}m`,
+    onChange: v => { waterParams.shoreFetchRamp = v; }
   });
   tuningSlider('swell scale', {
     min: 0.3, max: 2, step: 0.01, value: waterParams.amplitude,

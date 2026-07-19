@@ -42,9 +42,14 @@ const EVOLVE_SHADER = /* glsl */ `
 
     vec4 h0 = texture2D(uH0, (coord + 0.5) / uN);
     float w = sqrt(${GRAVITY.toFixed(3)} * kl);
-    vec2 e = vec2(cos(w * uTime), sin(w * uTime));
+    // e^{-iwt}: with the inverse FFT's e^{+ik.x} convention this makes each
+    // component e^{i(k.x - wt)}, i.e. crests travel toward +k — the +wind
+    // direction the spectrum aligns energy with. The +iwt sign propagated
+    // the swell AGAINST uWindDir, contradicting the micro-ripple advection,
+    // the lee-shore fetch march, and the wind-direction slider semantics.
+    vec2 e = vec2(cos(w * uTime), -sin(w * uTime));
 
-    // h(k,t) = h0(k) e^{iwt} + h0*(-k) e^{-iwt}
+    // h(k,t) = h0(k) e^{-iwt} + h0*(-k) e^{+iwt}
     vec2 h = cmul(h0.xy, e) + cmul(vec2(h0.z, -h0.w), vec2(e.x, -e.y));
 
     vec2 cA, cB;

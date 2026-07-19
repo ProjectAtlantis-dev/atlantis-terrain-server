@@ -439,7 +439,42 @@ export function reconcileTerrainTiles({
   completeCoverage = false,
   onReleaseTile = () => {},
 }) {
-  const { nextTileIds, added, removed } = diffTerrainTileIds(tiles, currentTileIds);
+  const tileById = new Map(tiles.map(tile => [tile.id, tile]));
+  const refreshedIds = new Set();
+
+  // A tile ID alone does not identify its rendered geometry. The server
+  // repairs edges against the neighbors in each response, so an unchanged ID
+  // may carry a new heightmap after a nearby LOD transition. Treat those
+  // payload changes like additions so the stale mesh is rebuilt in place.
+  for (const mesh of [...terrainRoot.children]) {
+    const tileId = mesh.userData?.tileId;
+    const nextTile = tileById.get(tileId);
+    const previousPayload = mesh.userData?.heightmapPayload;
+    if (
+      !mesh.isMesh
+      || !nextTile?.heightmap
+      || typeof previousPayload !== 'string'
+      || previousPayload === nextTile.heightmap
+    ) continue;
+    log(tileId, 'evicted — repaired heightmap changed');
+    lifecycle.evict(mesh);
+    refreshedIds.add(tileId);
+  }
+
+  // Deferred tiles have no resident mesh to inspect, but must still use the
+  // newest repaired payload when their texture eventually arrives.
+  for (const [tileId, deferredTile] of deferredTiles) {
+    const nextTile = tileById.get(tileId);
+    if (!nextTile) continue;
+    if (deferredTile.heightmap !== nextTile.heightmap) {
+      deferredTiles.set(tileId, nextTile);
+    }
+  }
+
+  const diffBaseIds = refreshedIds.size === 0
+    ? currentTileIds
+    : new Set([...currentTileIds].filter(id => !refreshedIds.has(id)));
+  const { nextTileIds, added, removed } = diffTerrainTileIds(tiles, diffBaseIds);
   let purged = 0;
   for (const id of deferredTiles.keys()) {
     if (!nextTileIds.has(id)) {

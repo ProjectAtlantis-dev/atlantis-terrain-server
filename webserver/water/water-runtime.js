@@ -24,6 +24,11 @@ export const DEFAULT_WATER_PARAMS = {
   fetchKm: 100,           // wave-growth fetch: sets the JONSWAP peak so a
                           // windy fjord sea stays short (~60-70 m waves at
                           // 13 m/s) instead of open-Atlantic 150 m swell
+  shoreFetchRamp: 3000,   // metres of open water downwind of a lee shore for
+                          // the sea state to build back to full; the spatial
+                          // counterpart of fetchKm (which stays global). This
+                          // calms only wind-FROM-land shorelines, not the
+                          // fjord as a whole — see the note above.
   alignment: 1.0,         // directional spreading of the spectrum
   choppiness: 1.38,       // horizontal displacement scale
   amplitude: 1.0,

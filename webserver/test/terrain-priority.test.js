@@ -694,6 +694,58 @@ test('preview reconciliation completes heatmap coverage beyond the build budget'
   assert.equal(terrainRoot.children.length, 2);
 });
 
+test('reconciliation rebuilds a resident tile when repaired seam geometry changes', () => {
+  const oldMesh = {
+    isMesh: true,
+    userData: {
+      tileId: '12-20-40', bbox: [0, 0, 4, 4], heightmapPayload: 'old-repair',
+    },
+    material: { map: null },
+  };
+  const terrainRoot = {
+    children: [oldMesh],
+    add(mesh) { this.children.push(mesh); },
+    remove(mesh) { this.children = this.children.filter(item => item !== mesh); },
+  };
+  const evicted = [];
+  const built = [];
+  const nextTile = {
+    id: '12-20-40', bbox: [0, 0, 4, 4], heightmap: 'new-repair', priority: 1,
+  };
+
+  const result = reconcileTerrainTiles({
+    tiles: [nextTile],
+    currentTileIds: new Set([nextTile.id]),
+    deferredTiles: new Map(),
+    terrainRoot,
+    lifecycle: {
+      evict(mesh) { evicted.push(mesh.userData.tileId); terrainRoot.remove(mesh); },
+      sweepStaleParents: () => 0,
+    },
+    priorityForTile: () => 0,
+    textureCache: new Map(),
+    materialize() {},
+    buildMesh(tile) {
+      built.push(tile.id);
+      return {
+        isMesh: true,
+        userData: {
+          tileId: tile.id, bbox: tile.bbox, heightmapPayload: tile.heightmap,
+        },
+        material: { map: null },
+      };
+    },
+    log() {},
+  });
+
+  assert.deepEqual(evicted, [nextTile.id]);
+  assert.deepEqual(built, [nextTile.id]);
+  assert.equal(terrainRoot.children.length, 1);
+  assert.equal(terrainRoot.children[0].userData.heightmapPayload, 'new-repair');
+  assert.deepEqual(result.added, [nextTile.id]);
+  assert.deepEqual(result.removed, []);
+});
+
 test('reconciliation releases old heatmap tiles but retains a complete fallback parent', () => {
   const evicted = [];
   const releasedTextures = [];

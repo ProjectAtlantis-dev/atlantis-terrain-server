@@ -103,6 +103,61 @@ const DETILE_GLSL = /* glsl */ `
   }
 `;
 
+// Bathymetry capture access + lee-shore fetch, shared by vertex (geometry
+// amplitude) and fragment (slope/variance shading) so both see the same
+// spatially-varying sea state.
+const BATHY_GLSL = /* glsl */ `
+  uniform sampler2D uBathy;    // top-down capture: R = local z, G = image brightness
+  uniform vec2 uBathyCenter;
+  uniform float uBathyExtent;
+  uniform vec2 uWindDir;       // local xy, direction the wind blows toward
+  uniform float uFetchRamp;    // metres of open water upwind for a full sea
+                               // state; 0 disables the lee-shore calm zone
+
+  // local terrain height under the water plane; -10 m (the synthetic fjord
+  // floor) wherever the capture has no coverage
+  vec4 bathyAt(vec2 p) {
+    vec2 uv = (p - uBathyCenter) / uBathyExtent + 0.5;
+    float inB = step(abs(uv.x - 0.5), 0.5) * step(abs(uv.y - 0.5), 0.5);
+    vec4 b = texture2D(uBathy, uv);
+    return mix(vec4(-10.0, 0.0, 0.0, 0.0), b, b.a * inB);
+  }
+
+  // Lee-shore fetch: waves need open water upwind to build, so a shore the
+  // wind blows FROM is flanked by calm water that roughens over uFetchRamp
+  // metres downwind. March upwind and take the nearest land hit. Like the
+  // north-cliff reflection setback this is coarse and low-frequency on
+  // purpose; missing a narrow islet between samples is fine. Outside the
+  // capture window there is no land data and the sea stays at full state.
+  float fetchMarch(vec2 p, vec2 upwind) {
+    float nearestLand = uFetchRamp;
+    for (int i = 1; i <= 8; i++) {
+      // squared spacing: dense samples near p, sparse far away. Uniform
+      // steps bottomed out at t1/ramp = 0.125 — waves could never drop
+      // below ~a third of full amplitude even touching the shoreline.
+      float s = float(i) / 8.0;
+      float t = uFetchRamp * s * s;
+      vec4 b = bathyAt(p + upwind * t);
+      // covered capture + terrain at/above the waterline = land
+      float land = step(0.5, b.a) * smoothstep(-1.0, 1.0, b.r);
+      nearestLand = min(nearestLand, mix(uFetchRamp, t, land));
+    }
+    return nearestLand;
+  }
+  float fetchFractionAt(vec2 p) {
+    if (uFetchRamp <= 0.0) return 1.0;
+    vec2 u0 = -normalize(uWindDir + vec2(1e-5, 0.0));
+    // Waves spread in a directional cone, so the calm zone behind a headland
+    // has a penumbra: average three upwind rays (+-14 degrees) instead of
+    // marching one, or every islet casts a hard-edged wedge downwind that
+    // reads as a cast shadow on the water.
+    vec2 u1 = vec2(u0.x * 0.970 - u0.y * 0.242, u0.x * 0.242 + u0.y * 0.970);
+    vec2 u2 = vec2(u0.x * 0.970 + u0.y * 0.242, -u0.x * 0.242 + u0.y * 0.970);
+    float f = fetchMarch(p, u0) + fetchMarch(p, u1) + fetchMarch(p, u2);
+    return clamp(f / (3.0 * uFetchRamp), 0.0, 1.0);
+  }
+`;
+
 const WATER_VERTEX = /* glsl */ `
   #include <common>
   #include <logdepthbuf_pars_vertex>
@@ -117,8 +172,10 @@ const WATER_VERTEX = /* glsl */ `
   varying vec3 vPlanePos;     // terrainRoot-local, z up
   varying float vHeight;
   varying float vDist;
+  varying float vFetch;       // 0 at an upwind shoreline -> 1 at full fetch
 
   ${DETILE_GLSL}
+  ${BATHY_GLSL}
 
   vec3 detiledDisp(sampler2D tex, vec2 uv) {
     vec2 o1, o2, o3; vec3 w;
@@ -140,6 +197,13 @@ const WATER_VERTEX = /* glsl */ `
     vec3 disp = detiledDisp(uDisp0, gridXY / uL.x);
     disp += detiledDisp(uDisp1, gridXY / uL.y) * f1;
     disp += detiledDisp(uDisp2, gridXY / uL.z) * f2;
+
+    // lee-shore fetch scales the whole displacement field. LINEAR in the
+    // open-water fraction: the physical sqrt growth curve kept ~70% wave
+    // amplitude across most of the band and the calm zone never read as
+    // calm — flat presentation beats fidelity here.
+    vFetch = fetchFractionAt(gridXY);
+    disp *= vFetch;
 
     vec3 localPos = vec3(position.xy + disp.xz, disp.y);
     vPlanePos = vec3(gridXY + disp.xz, disp.y);
@@ -171,7 +235,6 @@ const WATER_FRAGMENT = /* glsl */ `
   uniform vec3 uHorizonCool;
   uniform vec3 uDeepColor;
   uniform vec3 uScatterColor;
-  uniform vec2 uWindDir;       // local xy, direction the wind blows toward
   uniform float uWindFactor;
   uniform float uHs;
   uniform float uCloud;
@@ -180,9 +243,6 @@ const WATER_FRAGMENT = /* glsl */ `
   uniform float uOpacity;      // base veil opacity of the surface body
   uniform float uReflect;      // sky-reflection gain (fjord walls occlude sky)
   uniform float uGlintStrength; // direct-sun glitter gain
-  uniform sampler2D uBathy;    // top-down capture: R = local z, G = image brightness
-  uniform vec2 uBathyCenter;
-  uniform float uBathyExtent;
   uniform float uBathyTexel;   // world metres per bathy texel
   uniform float uAbsorb;       // Beer-Lambert absorption, 1/m of water column
   uniform float uNorthCliffReflectionPadding; // max reflection setback, metres
@@ -190,9 +250,11 @@ const WATER_FRAGMENT = /* glsl */ `
   varying vec3 vPlanePos;
   varying float vHeight;
   varying float vDist;
+  varying float vFetch;       // 0 at an upwind shoreline -> 1 at full fetch
 
   ${SKY_GLSL}
   ${DETILE_GLSL}
+  ${BATHY_GLSL}
 
   // derivatives cascade: slopes are Gaussian -> straight L2-weighted sum;
   // J deviates about 1, so blend the deviation; .w is a variance, so its
@@ -234,14 +296,6 @@ const WATER_FRAGMENT = /* glsl */ `
     return v;
   }
 
-  // local terrain height under the water plane; -10 m (the synthetic fjord
-  // floor) wherever the capture has no coverage
-  vec4 bathyAt(vec2 p) {
-    vec2 uv = (p - uBathyCenter) / uBathyExtent + 0.5;
-    float inB = step(abs(uv.x - 0.5), 0.5) * step(abs(uv.y - 0.5), 0.5);
-    vec4 b = texture2D(uBathy, uv);
-    return mix(vec4(-10.0, 0.0, 0.0, 0.0), b, b.a * inB);
-  }
   float seabedAt(vec2 p) {
     return bathyAt(p).r;
   }
@@ -392,17 +446,37 @@ const WATER_FRAGMENT = /* glsl */ `
                    + max(D1.w - dot(D1.xy, D1.xy), 0.0) * f1 * f1
                    + max(D2.w - dot(D2.xy, D2.xy), 0.0) * f2 * f2;
 
-    // micro-ripple detail for near-field sparkle; its slope energy migrates
-    // into roughness as it fades with distance
-    float microFade = 1.0 / (1.0 + d * 0.02);
-    float microAmp = 0.35 * uWindFactor * microFade;
+    // lee-shore fetch: slopes scale like amplitude (the vertex stage scaled
+    // the geometry by the same linear factor), variance like amplitude
+    // squared. The micro-ripples get their own faster ramp: wind re-textures
+    // a lee shore within the first stretch of open water, long before swell.
+    // slopeVarFull keeps the FULL-fetch variance (including the micro energy
+    // that migrates to roughness at distance): the glint energy rolloff must
+    // key off the sea state the sun sees at full fetch, or calming the
+    // variance RELEASES the rolloff and the mid-band renders as a hot white
+    // stripe brighter than the open sea.
+    // micro fade reaches a few hundred metres: the ripples are the only
+    // pixel-scale temporal glitter, and killing them by ~150 m left nothing
+    // but smooth sheen from altitude.
+    float microFade = 1.0 / (1.0 + d * 0.004);
+    float fetchAmp = vFetch;
+    float microGate = smoothstep(0.02, 0.25, vFetch);
+    float slopeVarFull = slopeVar
+      + 0.5 * (0.35 * uWindFactor) * (0.35 * uWindFactor) * (1.0 - microFade);
+    slope *= fetchAmp;
+    slopeVar *= vFetch * vFetch;
+
+    // micro-ripple detail for near/mid-field sparkle; its slope energy
+    // migrates into roughness as it fades with distance
+    float microAmp = 0.35 * uWindFactor * microFade * microGate;
     if (microAmp > 0.003) {
       vec2 mp = pxy * 2.3 - uWindDir * uTime * 1.5;
       float e = 0.25;
       float m0 = fbm(mp);
       slope += vec2(fbm(mp + vec2(e, 0.0)) - m0, fbm(mp + vec2(0.0, e)) - m0) / e * microAmp;
     }
-    slopeVar += 0.5 * (0.35 * uWindFactor) * (0.35 * uWindFactor) * (1.0 - microFade);
+    float microVarAmp = 0.35 * uWindFactor * microGate;
+    slopeVar += 0.5 * microVarAmp * microVarAmp * (1.0 - microFade);
 
     vec3 N = normalize(vec3(-slope.x, -slope.y, 1.0));
     // shading normal: relax toward up with distance. The full-detail N feeds
@@ -474,18 +548,32 @@ const WATER_FRAGMENT = /* glsl */ `
     // changes with time of day and contradicts the photographic terrain.
     float bakedCliffVisibility = bakedShoreVisibility(pxy, uBakedSunDir);
 
-    // sun glint (GGX lobe, HDR)
+    // sun glint (GGX lobe, HDR). Full Cook-Torrance normalization: the
+    // 1/(4 NdotV NdotL) denominator is what lets the peak reach genuinely
+    // HDR values (several times scene white) when sun, wave normal, and eye
+    // align — a flat gain in its place kept the peak near 1.0 and AGX
+    // flattened it into ordinary bright water. Clamps stand in for the
+    // missing masking-shadowing term at grazing angles.
     vec3 H = normalize(L + V);
     float LdotH = max(dot(L, H), 0.0);
     float fresL = 0.022 + 0.978 * pow(1.0 - LdotH, 5.0);
     vec3 spec = uSunColor * ggxAniso(H, N, Twind, Bwind, max(sqrt(ax2), 0.002), max(sqrt(ay2), 0.002))
-              * fresL * 0.10 * smoothstep(0.0, 0.06, L.z);
+              * fresL * smoothstep(0.0, 0.06, L.z)
+              / (4.0 * max(NdotV, 0.1) * max(dot(N, L), 0.1));
     // As filtering folds slope variance into the lobe, the glint stops being
     // sparkle and becomes a broad HDR sheen across the sunward half of the
-    // fjord (which AGX then desaturates to milky white). Roll the energy off
-    // as the lobe widens: near-field sparkle keeps ~80%, the far-field sheen
-    // drops to ~a quarter.
-    spec *= 0.02 / (0.02 + slopeVar);
+    // fjord (which AGX then desaturates to milky white). The lobe widening
+    // already drops the peak (energy-conserving); this extra cut only tames
+    // the residual far-field sheen, so keep it gentle or the glitter path
+    // from altitude — the normal viewing condition — goes dull.
+    // Roll off against the FULL-fetch variance, not the fetch-scaled one:
+    // keyed to the scaled variance, calming the water released this rolloff
+    // and painted the mid-fetch band as a hot white stripe brighter than
+    // the open sea. With the full-sea key, brightness varies only through
+    // lobe geometry: glassy water keeps a narrowing direct-sun mirror
+    // streak (the one brightening a calm band is allowed) and fades dark
+    // away from the sun path — no hard fetch gate needed.
+    spec *= 0.06 / (0.06 + slopeVarFull);
 
     float backlight = pow(clamp(dot(L, -V) * 0.5 + 0.5, 0.0, 1.0), 3.0);
     vec3 ambient = mix(uHorizonCool, uZenithColor, 0.4) * 0.65;
@@ -494,7 +582,7 @@ const WATER_FRAGMENT = /* glsl */ `
     // facet lighting from the SWELL slope (cascades 0+1, chop excluded):
     // sunward ridge faces brighten, leeward faces darken. Using the full
     // normal here let metre-scale chop bury the dominant ridge trains.
-    vec2 swellSlope = (D0.xy + D1.xy * f1 * 0.5) * facetGain;
+    vec2 swellSlope = (D0.xy + D1.xy * f1 * 0.5) * facetGain * fetchAmp;
     vec3 Nsw = normalize(vec3(-swellSlope.x, -swellSlope.y, 1.0));
     float facet = (max(dot(Nsw, L), 0.0) - max(L.z, 0.0)) * (1.0 - 0.65 * uCloud);
 
@@ -528,7 +616,16 @@ const WATER_FRAGMENT = /* glsl */ `
     // pixel, replacing the satellite colour with the shader's own sky-lit
     // teal — exactly the veil light the design forbids.
     float veil = wall * (1.0 - exp(-uAbsorb * colDepth)) * 0.35;
-    float bodyW = uOpacity + veil * (1.0 - uOpacity);
+    // Smooth water is DARKER from altitude, not lighter: a lee-shore slick
+    // mirrors the mostly-dark sky away from the sun, while rough water
+    // spreads sun glitter into broad bright sheen. Carry the calm band as
+    // extra radiance-free alpha (the same premultiplied trick as the wall
+    // veil): it darkens the imagery underneath instead of painting the
+    // surface with light of its own. The narrow direct-sun mirror line
+    // survives via the glint term, whose lobe tightens as slopeVar
+    // collapses with the fetch.
+    float slick = (1.0 - smoothstep(0.05, 0.6, vFetch)) * 0.18;
+    float bodyW = uOpacity + (veil + slick * (1.0 - veil)) * (1.0 - uOpacity);
 
     // Reflection gain < 1 stands in for the sky occlusion the analytic dome
     // cannot know about. The terrain imagery contains the cliff shadows the
@@ -540,6 +637,11 @@ const WATER_FRAGMENT = /* glsl */ `
     const float reflectionGain = 0.333333;
     float refl = fresnel * uReflect * bottomReflection * ambientReflection
                * bakedCliffVisibility * reflectionGain;
+    // The grazing-angle sky sheen uses the distance-relaxed normal (~up far
+    // from the camera), so it is blind to the flattened wave field — left
+    // ungated it bleaches the calm band white at oblique view angles. A
+    // small floor keeps the slick from going pitch black at grazing.
+    refl *= mix(0.1, 1.0, smoothstep(0.0, 0.5, vFetch));
     float a = bodyW + refl * (1.0 - bodyW);
     // Only the explicit surface opacity emits body colour. The extra wall
     // alpha carries no radiance, so premultiplied blending uses it to darken
@@ -608,6 +710,7 @@ export function createWebGLWater({
     uBathyExtent: { value: bathyExtent },
     uBathyTexel: { value: bathyExtent / bathySize },
     uAbsorb: { value: 0.25 },
+    uFetchRamp: { value: 3000 },
     uNorthCliffReflectionPadding: { value: NORTH_CLIFF_REFLECTION_MAX_PADDING_M },
   };
 
@@ -736,6 +839,7 @@ export function createWebGLWater({
       uniforms.uReflect.value = params.reflectivity;
       uniforms.uGlintStrength.value = Math.max(0, params.glintStrength ?? 1);
       uniforms.uAbsorb.value = params.absorption;
+      uniforms.uFetchRamp.value = Math.max(0, params.shoreFetchRamp ?? 3000);
       uniforms.uNorthCliffReflectionPadding.value = Math.max(
         0,
         params.northCliffReflectionPadding ?? 0,
