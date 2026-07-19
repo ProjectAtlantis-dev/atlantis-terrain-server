@@ -13,7 +13,7 @@ import { WebGLWaterSimulation } from './webgl-water-sim.js';
 //   - Translucent (premultiplied alpha, no depth write, log-depth tested):
 //     the dropped seabed carries the satellite imagery OF the water, so the
 //     surface lets it show through — colour inheritance is per-pixel and
-//     free, with veil/reflection/glint/foam composited on top. Depth read by
+//     free, with veil/reflection/glint composited on top. Depth read by
 //     the post passes is the seabed, 10 m below the surface — negligible.
 
 const SKY_GLSL = /* glsl */ `
@@ -33,6 +33,46 @@ const SKY_GLSL = /* glsl */ `
   }
 `;
 
+// Stochastic de-tiling: each FFT cascade repeats every uL metres, which
+// reads as a wallpaper grid from altitude. Partition the cascade's uv space
+// into a triangular lattice (~0.44 tiles per cell), give every lattice
+// vertex a fixed random uv offset, and combine the three nearest offset
+// copies of the texture. Weights are smoothed barycentrics normalised to
+// unit L2 — the ocean field is Gaussian, so that combination has the SAME
+// spectrum as one copy: ridge trains and chop statistics survive, the
+// repeat does not. Shared verbatim by vertex (displacement) and fragment
+// (derivatives) so geometry and shading see the same field.
+const DETILE_GLSL = /* glsl */ `
+  vec2 cellHash(vec2 c) {
+    vec3 p3 = fract(vec3(c.xyx) * vec3(0.1031, 0.1030, 0.0973));
+    p3 += dot(p3, p3.yzx + 33.33);
+    return fract((p3.xx + p3.yz) * p3.zy);
+  }
+  void triLattice(vec2 uv, out vec2 o1, out vec2 o2, out vec2 o3, out vec3 w) {
+    vec2 s = mat2(1.0, 0.0, -0.57735027, 1.15470054) * (uv / 0.437);
+    vec2 base = floor(s);
+    vec2 f = fract(s);
+    float c = 1.0 - f.x - f.y;
+    vec2 v1, v2, v3;
+    if (c > 0.0) {
+      w = vec3(c, f.x, f.y);
+      v1 = base; v2 = base + vec2(1.0, 0.0); v3 = base + vec2(0.0, 1.0);
+    } else {
+      // upper-triangle barycentrics: weight 1-f.y belongs to vertex (1,0)
+      // and 1-f.x to (0,1) — pairing them the other way tears the blended
+      // field along every diagonal cell edge (visible water seams)
+      w = vec3(-c, 1.0 - f.y, 1.0 - f.x);
+      v1 = base + vec2(1.0, 1.0); v2 = base + vec2(1.0, 0.0); v3 = base + vec2(0.0, 1.0);
+    }
+    // C1-smooth the weights, then unit-L2: variance-preserving for the
+    // Gaussian wave field (an averaged blend would flatten the waves in
+    // every blend zone and re-draw the grid as lanes of calm water)
+    w = w * w * (3.0 - 2.0 * w);
+    w /= max(length(w), 1e-4);
+    o1 = cellHash(v1); o2 = cellHash(v2); o3 = cellHash(v3);
+  }
+`;
+
 const WATER_VERTEX = /* glsl */ `
   #include <common>
   #include <logdepthbuf_pars_vertex>
@@ -48,6 +88,16 @@ const WATER_VERTEX = /* glsl */ `
   varying float vHeight;
   varying float vDist;
 
+  ${DETILE_GLSL}
+
+  vec3 detiledDisp(sampler2D tex, vec2 uv) {
+    vec2 o1, o2, o3; vec3 w;
+    triLattice(uv, o1, o2, o3, w);
+    return texture2D(tex, uv + o1).xyz * w.x
+         + texture2D(tex, uv + o2).xyz * w.y
+         + texture2D(tex, uv + o3).xyz * w.z;
+  }
+
   void main() {
     vec2 gridXY = position.xy + uMeshOffset;
     float d0 = distance(uCameraLocal, vec3(gridXY, 0.0));
@@ -57,9 +107,9 @@ const WATER_VERTEX = /* glsl */ `
     float f2 = 1.0 / (1.0 + d0 / 420.0);
 
     // sim textures are (Dx, h, Dz): sim x/z horizontal -> local x/y, h -> z
-    vec3 disp = texture2D(uDisp0, gridXY / uL.x).xyz;
-    disp += texture2D(uDisp1, gridXY / uL.y).xyz * f1;
-    disp += texture2D(uDisp2, gridXY / uL.z).xyz * f2;
+    vec3 disp = detiledDisp(uDisp0, gridXY / uL.x);
+    disp += detiledDisp(uDisp1, gridXY / uL.y) * f1;
+    disp += detiledDisp(uDisp2, gridXY / uL.z) * f2;
 
     vec3 localPos = vec3(position.xy + disp.xz, disp.y);
     vPlanePos = vec3(gridXY + disp.xz, disp.y);
@@ -80,8 +130,6 @@ const WATER_FRAGMENT = /* glsl */ `
   uniform sampler2D uDeriv0;
   uniform sampler2D uDeriv1;
   uniform sampler2D uDeriv2;
-  uniform sampler2D uFoam0;
-  uniform sampler2D uFoam1;
   uniform vec3 uL;
   uniform float uTime;
   uniform vec3 uCameraLocal;
@@ -93,23 +141,43 @@ const WATER_FRAGMENT = /* glsl */ `
   uniform vec3 uDeepColor;
   uniform vec3 uScatterColor;
   uniform vec2 uWindDir;       // local xy, direction the wind blows toward
-  uniform float uWindCoverage;
   uniform float uWindFactor;
-  uniform float uFoamAmount;
   uniform float uHs;
   uniform float uCloud;
-  uniform float uPlumeLife;
-  uniform float uFoamFade;     // foam-raft fade e-folding time, seconds
   uniform float uRadiance;     // overall output gain: calibrates the ocean2
                                // palette against this pipeline's AGX exposure
   uniform float uOpacity;      // base veil opacity of the surface body
   uniform float uReflect;      // sky-reflection gain (fjord walls occlude sky)
+  uniform sampler2D uBathy;    // top-down terrain-height capture (R = local z)
+  uniform vec2 uBathyCenter;
+  uniform float uBathyExtent;
+  uniform float uAbsorb;       // Beer-Lambert absorption, 1/m of water column
 
   varying vec3 vPlanePos;
   varying float vHeight;
   varying float vDist;
 
   ${SKY_GLSL}
+  ${DETILE_GLSL}
+
+  // derivatives cascade: slopes are Gaussian -> straight L2-weighted sum;
+  // J deviates about 1, so blend the deviation; .w is a variance, so its
+  // weights square. Gradients come from the un-offset uv (offsets are
+  // constant per cell) with a 2^-0.5 scale standing in for the -0.5 mip
+  // bias the plain samplers used.
+  vec4 detiledDeriv(sampler2D tex, vec2 uv) {
+    vec2 o1, o2, o3; vec3 w;
+    triLattice(uv, o1, o2, o3, w);
+    vec2 gx = dFdx(uv) * 0.71, gy = dFdy(uv) * 0.71;
+    vec4 t1 = texture2DGradEXT(tex, uv + o1, gx, gy);
+    vec4 t2 = texture2DGradEXT(tex, uv + o2, gx, gy);
+    vec4 t3 = texture2DGradEXT(tex, uv + o3, gx, gy);
+    vec4 r;
+    r.xy = t1.xy * w.x + t2.xy * w.y + t3.xy * w.z;
+    r.z = 1.0 + (t1.z - 1.0) * w.x + (t2.z - 1.0) * w.y + (t3.z - 1.0) * w.z;
+    r.w = t1.w * w.x * w.x + t2.w * w.y * w.y + t3.w * w.z * w.z;
+    return r;
+  }
 
   float hash21(vec2 p) {
     p = fract(p * vec2(234.34, 435.345));
@@ -146,13 +214,23 @@ const WATER_FRAGMENT = /* glsl */ `
     vec3 V = normalize(uCameraLocal - vPlanePos);
     vec3 L = uSunDir;
 
+    // ---- water column depth from the bathymetry capture -------------------
+    // The surface sits at local z = 0, so column depth is just -seabed. Where
+    // the capture has no coverage yet, assume the open fjord floor (-10 m).
+    vec2 bUV = (pxy - uBathyCenter) / uBathyExtent + 0.5;
+    float inB = step(abs(bUV.x - 0.5), 0.5) * step(abs(bUV.y - 0.5), 0.5);
+    vec4 bathy = texture2D(uBathy, bUV);
+    float seabed = mix(-10.0, bathy.x, bathy.a * inB);
+    float colDepth = clamp(-seabed, 0.0, 60.0);
+
     // ---- normals & Jacobian from the cascades ----------------------------
-    // -1 mip bias: pre-filtering slopes before (nonlinear) shading erases
-    // crest facets a camera would keep; sample one level sharper and let the
-    // recovered E[s^2]-|E[s]|^2 variance absorb what stays sub-pixel.
-    vec4 D0 = texture2D(uDeriv0, pxy / uL.x, -0.5);
-    vec4 D1 = texture2D(uDeriv1, pxy / uL.y, -0.5);
-    vec4 D2 = texture2D(uDeriv2, pxy / uL.z, -0.5);
+    // de-tiled sampling; the 2^-0.5 gradient scale inside keeps the old
+    // -0.5 mip bias (pre-filtering slopes before nonlinear shading erases
+    // crest facets a camera would keep; the recovered E[s^2]-|E[s]|^2
+    // variance absorbs what stays sub-pixel).
+    vec4 D0 = detiledDeriv(uDeriv0, pxy / uL.x);
+    vec4 D1 = detiledDeriv(uDeriv1, pxy / uL.y);
+    vec4 D2 = detiledDeriv(uDeriv2, pxy / uL.z);
 
     float f1 = 1.0 / (1.0 + d / 5000.0);
     float f2 = 1.0 / (1.0 + d / 900.0);
@@ -189,87 +267,11 @@ const WATER_FRAGMENT = /* glsl */ `
     float facetGain = mix(1.0, 1.35, smoothstep(300.0, 2500.0, d));
     Ns = normalize(vec3(Ns.xy * facetGain, Ns.z));
 
-    // combined folding measure (deviations from 1 add across cascades)
-    float J = D0.z + (D1.z - 1.0) * mix(f1, 1.0, 0.6) + (D2.z - 1.0) * f2 * 0.5;
-
-    // ---- whitecaps --------------------------------------------------------
-    float foamGate = smoothstep(0.015, 0.10, uWindCoverage * uFoamAmount);
-
-    // swell-phase gating: chop breaks preferentially where the underlying
-    // swell crest lifts it, which strings the caps into rows along crest
-    // lines (orthogonal to wind) instead of scattering them uniformly
+    // swell-phase elevation, used by the crest scatter term below.
+    // (The whitecap/foam system that lived here was removed at the user's
+    // request — repeated attempts read as garbage from altitude. The sim's
+    // foam passes went with it; the surface is waves + light only.)
     float hN = clamp(vHeight / max(uHs * 0.5, 0.05), -1.0, 1.5);
-    // breaking requires a computable wave face: the swell's downwind-facing
-    // slope must exceed a steepness the wave cannot sustain. grad(h) points
-    // uphill, so on the forward face -dot(slope, wind) is the face steepness.
-    // Rolling hills (high but gentle) never cap; short steep seas do.
-    vec2 swellS = D0.xy + D1.xy * 0.6;
-    float faceSteep = max(-dot(swellS, uWindDir), 0.0);
-    float breaking = smoothstep(0.045, 0.13, faceSteep);
-    // elevation keeps caps near the crest top rather than mid-face
-    float crestBand = mix(0.02, 1.0, smoothstep(0.10, 0.65, hN) * breaking);
-
-    // the foam cascades tile every 840/160 m, which reads as a repeating cap
-    // pattern from altitude. Non-repeating world-space noise (km-scale and
-    // ~300 m scale) varies the gate per location, so each tile whitens a
-    // different subset of its real folds instead of the same wallpaper.
-    float patchK = fbm(pxy * 0.00071 + vec2(31.7, 11.3));
-    float patchM = fbm(pxy * 0.0029 - vec2(7.3, 19.1));
-
-    // foam buffers: .x = plume energy (bright core, seconds), .y = foam
-    // coverage (lingering raft, fades on uFoamFade), .z = age clock.
-    // Cascade 0 owns the 55 m+ waves, whose folds paint caps tens of metres
-    // across — down-weighted so cap size is set by the chop-scale cascade.
-    vec4 F0 = texture2D(uFoam0, pxy / uL.x);
-    vec4 F1 = texture2D(uFoam1, pxy / uL.y);
-    float acc = F0.x * 0.55 + F1.x * mix(f1, 1.0, 0.5);
-    float cov = F0.y * 0.55 + F1.y * mix(f1, 1.0, 0.5);
-    // youngest contributing foam sets the patch's apparent age
-    float capAge = min(F0.z, F1.z);
-    // de-tiling selection, anisotropic in the wind frame: long correlation
-    // along crest lines, short along wind, so surviving caps band
-    // crest-parallel. The SAME factor must gate both the fresh break and its
-    // accumulated trail — otherwise caps flash on and leave no trail behind.
-    mat2 toWind = mat2(uWindDir.y, uWindDir.x, -uWindDir.x, uWindDir.y);
-    vec2 cw = toWind * pxy;
-    float capSel = fbm(vec2(cw.x * 0.004, cw.y * 0.016) + vec2(3.1, 27.9));
-    // crestBand (breaking face + elevation) is the physical gate; the noise
-    // terms only de-tile and vary density, so they must not stack another
-    // deep cut on top of it
-    float sel = mix(0.35, 1.15, smoothstep(0.26, 0.58, capSel)) * (0.65 + 0.7 * patchM) * crestBand;
-
-    // instantaneous breaking on the crest itself.
-    // J bottoms out around ~0.6-0.7 for a developed sea at any wind, so the
-    // wind dependence lives in this threshold curve, not in J itself.
-    float thr = mix(0.36, 0.80, pow(clamp(uWindCoverage * uFoamAmount, 0.0, 1.0), 0.55));
-    thr += (patchK - 0.5) * 0.20;
-    float inst = (1.0 - smoothstep(thr - 0.22, thr, J)) * sel;
-
-    // streaky breakup texture, stretched and advected along the wind
-    vec2 fw = cw;
-    fw.y -= uTime * (0.6 + uWindFactor * 2.0);
-    float ftex = fbm(fw * vec2(0.16, 0.05)) * 0.45
-               + fbm(fw * vec2(0.85, 0.30)) * 0.35
-               + fbm(fw * vec2(3.1, 1.6)) * 0.20;
-
-    // existence rides on the SLOW coverage channel through a soft saturating
-    // transfer — no clamp plateau. Patches keep interior gradients, and as
-    // the raft decays over uFoamFade the whole level glides down, so foam
-    // thins out gradually instead of collapsing through a threshold. inst
-    // seeds a footprint the moment a crest breaks, before coverage builds.
-    float foamRaw = (1.0 - exp(-(cov * sel * 2.0 + inst * 0.5))) * foamGate;
-
-    // spume lines: organise foam into wind-aligned rows, but only once the
-    // sea is rough enough for them to exist
-    float streak = fbm(fw * vec2(0.22, 0.02));
-    foamRaw *= mix(1.0, smoothstep(0.28, 0.62, streak), 0.75 * smoothstep(0.45, 1.0, uWindCoverage));
-
-    // lacy edges: erode the foam patch with the breakup texture. The WIDE
-    // smoothstep window is the anti-sharp-edge measure — coverage falls off
-    // smoothly at patch rims and over time, and a wide window turns that
-    // gradient into a long soft transition instead of a contour line.
-    float foamMask = smoothstep(0.07, 0.92, foamRaw * (0.30 + 1.05 * ftex));
-    foamMask = clamp(foamMask * (0.55 + 0.65 * ftex), 0.0, 1.0);
 
     // ---- lighting ---------------------------------------------------------
     float NdotV = max(dot(Ns, V), 1e-3);
@@ -279,14 +281,14 @@ const WATER_FRAGMENT = /* glsl */ `
     vec3 R = reflect(-V, Ns);
     R.z = max(R.z, 0.018);
     // filtered specular: fold the sub-pixel slope variance into the GGX lobe
-    float a2 = 0.0009 + 2.0 * slopeVar + 0.12 * foamMask;
+    float a2 = 0.0009 + 2.0 * slopeVar;
     float rough = pow(min(a2, 1.0), 0.25);
 
     // Cox-Munk: mean-square slope along the wind exceeds cross-wind ~60/40,
     // so the filtered glitter lobe must be anisotropic in the wind frame or
     // wind direction becomes invisible at distance
-    float ax2 = 0.0009 + 2.0 * slopeVar * 0.62 + 0.12 * foamMask;
-    float ay2 = 0.0006 + 2.0 * slopeVar * 0.38 + 0.12 * foamMask;
+    float ax2 = 0.0009 + 2.0 * slopeVar * 0.62;
+    float ay2 = 0.0006 + 2.0 * slopeVar * 0.38;
     vec3 Twind = normalize(vec3(uWindDir.x, uWindDir.y, 0.0));
     Twind = normalize(Twind - N * dot(N, Twind));
     vec3 Bwind = cross(N, Twind);
@@ -317,7 +319,7 @@ const WATER_FRAGMENT = /* glsl */ `
     // The terrain under the water mask carries the satellite imagery OF this
     // water, so the 'seabed' showing through IS the faithful local colour —
     // blue at the coast, milky teal toward the glacier outflows. EVERY bit of
-    // surface light except foam/glint must scale with uOpacity: the fjord
+    // surface light except glint must scale with uOpacity: the fjord
     // imagery is dark (near-black in mountain shadow), and any ungated
     // additive veil is several times brighter than that background, which
     // reads as opaque water exactly along shadowed coastline.
@@ -332,40 +334,21 @@ const WATER_FRAGMENT = /* glsl */ `
     // background): sunward ridge faces brighten, leeward darken
     body *= max(1.0 + 1.1 * facet, 0.0);
 
+    // Beer-Lambert veil from the water column (Water-Pro-style shoreline
+    // treatment, world-space): shallow shore water stays glass-clear so the
+    // imagery shows, while the artificial mask-drop walls fade out with
+    // depth instead of standing naked behind a transparent surface.
+    float veil = 1.0 - exp(-uAbsorb * colDepth);
+    float bodyW = uOpacity + veil * (1.0 - uOpacity);
+
     // Reflection gain < 1 stands in for the sky occlusion the analytic dome
     // cannot know about: shadowed fjord walls reflect rock, not bright sky.
     float refl = fresnel * uReflect;
-    float a = uOpacity + refl * (1.0 - uOpacity);
-    vec3 accum = body * uOpacity + skyRefl * refl;
+    float a = bodyW + refl * (1.0 - bodyW);
+    vec3 accum = body * bodyW + skyRefl * refl;
 
     // sun glint: pure added light
-    accum += spec * (1.0 - foamMask);
-
-    // foam shading: diffuse, slightly shadowed in its own troughs. Only the
-    // actively-breaking core is near-white; aged trails and spume streaks are
-    // bubbles dispersed into the water column, so they dim and take its tint.
-    float capShade = 0.72 + 0.40 * fbm(pxy * 0.05 + vec2(17.3, 5.9));
-    vec3 foamCol = vec3(0.74, 0.78, 0.82) * (0.50 + 0.45 * ftex) * capShade;
-    // under cloud the dome is the light source; foam's high albedo keeps it
-    // bright against the darkened water
-    foamCol *= uSunColor * 0.30 * (0.45 + 0.55 * NdotL) + ambient * (0.9 + 1.1 * uCloud);
-
-    // lifecycle: the truly-white core lives on the fast plume clock and a
-    // TIGHT threshold — a fleck at the break point, not the whole patch.
-    // The surrounding raft grays and dims on the slow foam clock, and its
-    // spatial existence fades with the coverage channel above, so there is
-    // no timer that cuts foam off — it just gets thinner, grayer, lacier.
-    float ageW = exp(-capAge / max(uPlumeLife, 0.1));
-    float ageG = exp(-capAge / max(uFoamFade, 1.0));
-    float whiteAmt = clamp(ageW * smoothstep(0.30, 0.80, (acc + inst * 0.8) * (0.4 + 1.0 * ftex)) + inst * 0.4, 0.0, 1.0);
-    // gray tone itself dims continuously as the bubble raft thins
-    vec3 grayCol = (foamCol * 0.50 + bodyCol * 0.40) * (0.45 + 0.55 * ageG);
-    vec3 stageCol = mix(grayCol, foamCol, whiteAmt);
-    // aged foam keeps a floor weight — the mask thinning is the fade-out,
-    // not an age gate; foam covers the imagery, so it composites over
-    float foamW = foamMask * (0.40 + 0.60 * max(ageG, whiteAmt));
-    accum = accum * (1.0 - foamW) + stageCol * foamW;
-    a = mix(a, 0.95, foamW);
+    accum += spec;
 
     // no in-shader haze: scene fog + the aerial perspective pass own that
     gl_FragColor = vec4(accum * uRadiance, clamp(a, 0.0, 1.0));
@@ -377,6 +360,8 @@ export function createWebGLWater({
   renderer,
   geometry,
   resolution = 256,
+  bathySize = 1024,
+  bathyExtent = 30000,
 } = {}) {
   const sim = new WebGLWaterSimulation(renderer, { resolution });
 
@@ -385,7 +370,6 @@ export function createWebGLWater({
     uTime: { value: 0 },
     uDisp0: { value: null }, uDisp1: { value: null }, uDisp2: { value: null },
     uDeriv0: { value: null }, uDeriv1: { value: null }, uDeriv2: { value: null },
-    uFoam0: { value: null }, uFoam1: { value: null },
     uL: { value: new THREE.Vector3(1, 1, 1) },
     uMeshOffset: { value: new THREE.Vector2() },
     uCameraLocal: { value: new THREE.Vector3() },
@@ -397,16 +381,16 @@ export function createWebGLWater({
     uDeepColor: { value: new THREE.Color(0.032, 0.046, 0.048) },
     uScatterColor: { value: new THREE.Color(0.020, 0.16, 0.18) },
     uWindDir: { value: new THREE.Vector2(1, 0) },
-    uWindCoverage: { value: 0.5 },
     uWindFactor: { value: 0.5 },
-    uFoamAmount: { value: 1 },
     uHs: { value: 2 },
     uCloud: { value: 0 },
-    uPlumeLife: { value: 7 },
-    uFoamFade: { value: 60 },
     uRadiance: { value: 1 },
     uOpacity: { value: 0 },
     uReflect: { value: 0.4 },
+    uBathy: { value: null },
+    uBathyCenter: { value: new THREE.Vector2() },
+    uBathyExtent: { value: bathyExtent },
+    uAbsorb: { value: 0.05 },
   };
 
   const material = new THREE.ShaderMaterial({
@@ -423,6 +407,45 @@ export function createWebGLWater({
   mesh.frustumCulled = false;
   mesh.visible = false;
 
+  // Top-down bathymetry capture: terrain local height (z) rendered from an
+  // ortho camera into a half-float target. The surface shader turns it into
+  // water-column depth (surface is z = 0), driving the Beer-Lambert veil.
+  // Alpha 0 where nothing drew = no coverage.
+  const bathyTarget = new THREE.WebGLRenderTarget(bathySize, bathySize, {
+    type: THREE.HalfFloatType,
+    magFilter: THREE.LinearFilter,
+    minFilter: THREE.LinearFilter,
+    depthBuffer: true,
+    stencilBuffer: false,
+  });
+  uniforms.uBathy.value = bathyTarget.texture;
+  const BATHY_CAM_H = 10000;
+  const bathyCamera = new THREE.OrthographicCamera(
+    -bathyExtent / 2, bathyExtent / 2,
+    bathyExtent / 2, -bathyExtent / 2,
+    1, 30000,
+  );
+  // Height override: the capture camera is a terrainRoot child looking down
+  // -z, so view z recovers local height as uCamH + mvPosition.z regardless
+  // of the ECEF model transforms.
+  const bathyMaterial = new THREE.ShaderMaterial({
+    uniforms: { uCamH: { value: BATHY_CAM_H } },
+    vertexShader: /* glsl */ `
+      varying float vZ;
+      void main() {
+        vec4 mv = modelViewMatrix * vec4(position, 1.0);
+        vZ = mv.z;
+        gl_Position = projectionMatrix * mv;
+      }
+    `,
+    fragmentShader: /* glsl */ `
+      varying float vZ;
+      uniform float uCamH;
+      void main() { gl_FragColor = vec4(uCamH + vZ, 0.0, 0.0, 1.0); }
+    `,
+  });
+  const prevClearColor = new THREE.Color();
+
   function bindSimTextures() {
     const c0 = sim.getCascadeTextures(0);
     const c1 = sim.getCascadeTextures(1);
@@ -433,18 +456,15 @@ export function createWebGLWater({
     uniforms.uDeriv0.value = c0.derivatives;
     uniforms.uDeriv1.value = c1.derivatives;
     uniforms.uDeriv2.value = c2.derivatives;
-    uniforms.uFoam0.value = c0.foam;
-    uniforms.uFoam1.value = c1.foam;
     uniforms.uL.value.set(c0.size, c1.size, c2.size);
   }
 
   return {
     mesh,
 
-    setWind({ speed, directionRad, amplitude, alignment, seed, fetchKm, windCoverage }) {
+    setWind({ speed, directionRad, amplitude, alignment, seed, fetchKm }) {
       sim.setWind({ speed, directionRad, amplitude, alignment, seed, fetchKm });
       uniforms.uWindDir.value.set(Math.sin(directionRad), Math.cos(directionRad));
-      uniforms.uWindCoverage.value = windCoverage;
       uniforms.uWindFactor.value = THREE.MathUtils.clamp(speed / 25, 0, 1);
       uniforms.uHs.value = sim.significantWaveHeight;
     },
@@ -463,15 +483,47 @@ export function createWebGLWater({
       uniforms.uDeepColor.value.copy(palette.deep);
       uniforms.uScatterColor.value.copy(palette.scatter);
       uniforms.uCloud.value = params.cloudiness;
-      uniforms.uFoamAmount.value = params.foamAmount;
-      uniforms.uPlumeLife.value = params.plumeLife;
-      uniforms.uFoamFade.value = params.foamFadeLife;
       uniforms.uRadiance.value = params.radiance;
       uniforms.uOpacity.value = params.opacity;
       uniforms.uReflect.value = params.reflectivity;
+      uniforms.uAbsorb.value = params.absorption;
     },
 
+    captureBathymetry({ scene, terrainRoot, centerXY }) {
+      if (bathyCamera.parent !== terrainRoot) terrainRoot.add(bathyCamera);
+      bathyCamera.position.set(centerXY.x, centerXY.y, BATHY_CAM_H);
+
+      const prevTarget = renderer.getRenderTarget();
+      const prevOverride = scene.overrideMaterial;
+      const prevBackground = scene.background;
+      const prevAlpha = renderer.getClearAlpha();
+      renderer.getClearColor(prevClearColor);
+      const prevVisible = mesh.visible;
+      scene.overrideMaterial = bathyMaterial;
+      scene.background = null;
+      mesh.visible = false;
+      renderer.setClearColor(0x000000, 0);
+      try {
+        renderer.setRenderTarget(bathyTarget);
+        renderer.clear();
+        renderer.render(scene, bathyCamera);
+      } finally {
+        renderer.setRenderTarget(prevTarget);
+        renderer.setClearColor(prevClearColor, prevAlpha);
+        scene.overrideMaterial = prevOverride;
+        scene.background = prevBackground;
+        mesh.visible = prevVisible;
+      }
+      uniforms.uBathyCenter.value.set(centerXY.x, centerXY.y);
+      uniforms.uBathyExtent.value = bathyExtent;
+    },
+
+    get bathyExtent() { return bathyExtent; },
+
     dispose() {
+      bathyCamera.parent?.remove(bathyCamera);
+      bathyTarget.dispose();
+      bathyMaterial.dispose();
       sim.dispose();
       material.dispose();
       geometry.dispose();

@@ -18,8 +18,6 @@ import {
 //   2. IFFT: 2 ping-pong butterfly chains (horizontal + vertical stages).
 //   3. assembly: write displacement map (Dx*λ, h, Dz*λ) and derivatives map
 //      (dh/dx, dh/dz, Jacobian) with the (-1)^(x+y) shift correction.
-//   4. foam: accumulate where the Jacobian says the surface is folding,
-//      decay over time -> persistent, lingering whitecaps.
 // ---------------------------------------------------------------------------
 
 const GRAVITY = 9.81;
@@ -139,46 +137,10 @@ const DERIVATIVES_SHADER = /* glsl */ `
   }
 `;
 
-// Whitecap lifecycle, all in place:
-//   R = plume energy: entrained air at the breaking crest. Injected from the
-//       Jacobian, lives seconds. Brightness in the surface shader scales with
-//       this energy, so only violent breaks render truly white.
-//   G = foam coverage: the bubble raft the break leaves behind. Fed by the
-//       same injection but decays an order of magnitude slower — it is the
-//       cap's spatial existence, so foam fades out gradually where it was
-//       made instead of dying with the plume.
-//   B = per-texel age in seconds, the clock for the white -> gray fade.
-// (A drifting residue/scum stage once lived in G — removed, its downwind
-// advection read as wrong streaks. Coverage stays put.)
-const FOAM_SHADER = /* glsl */ `
-  uniform sampler2D uPrev;
-  uniform sampler2D uDeriv;
-  uniform float uN;
-  uniform float uDt;
-  uniform float uDecayP;   // 1 / plume e-folding time
-  uniform float uDecayF;   // 1 / foam-coverage e-folding time
-  uniform float uBias;
-  uniform float uGrow;
-
-  void main() {
-    vec2 uv = gl_FragCoord.xy / uN;
-    float J = texture2D(uDeriv, uv).z;
-    float inject = max(uBias - J, 0.0);
-
-    vec4 prev = texture2D(uPrev, uv);
-    float E = prev.x;
-    float S = prev.y;
-    // per-texel age in seconds. Fresh breaking rejuvenates in proportion to
-    // its violence rather than snapping to zero.
-    float A = prev.z;
-    A = min(A + uDt, 900.0);
-    A *= 1.0 - clamp(inject * uGrow * 0.5, 0.0, 1.0);
-
-    E = E * exp(-uDecayP * uDt) + inject * uGrow * uDt;
-    S = S * exp(-uDecayF * uDt) + inject * uGrow * uDt;
-    gl_FragColor = vec4(clamp(E, 0.0, 1.5), clamp(S, 0.0, 1.0), A, 1.0);
-  }
-`;
+// (A whitecap/foam accumulation pass lived here — Jacobian-injected plume +
+// persistence + age channels. Removed at the user's request: every foam
+// presentation read as garbage from altitude. The Jacobian in the
+// derivatives pass survives untouched for any future attempt.)
 
 // three.js caches the uniform list per program, so every uniform must exist
 // before first render and only its .value may be mutated afterwards.
@@ -217,7 +179,7 @@ function computeRT(n, opts = {}) {
 export class WebGLWaterSimulation {
   /**
    * @param {THREE.WebGLRenderer} renderer
-   * @param {{resolution?: number, cascades?: {size:number, minWave:number, maxWave:number, foam:boolean}[]}} opts
+   * @param {{resolution?: number, cascades?: {size:number, minWave:number, maxWave:number}[]}} opts
    */
   constructor(renderer, opts = {}) {
     this.renderer = renderer;
@@ -238,7 +200,6 @@ export class WebGLWaterSimulation {
     this.matButterfly = makeSimMaterial(BUTTERFLY_SHADER, ['uButterfly', 'uInput', 'uN', 'uStages', 'uStage', 'uVertical']);
     this.matDisp = makeSimMaterial(DISPLACEMENT_SHADER, ['uT0', 'uN', 'uLambda']);
     this.matDeriv = makeSimMaterial(DERIVATIVES_SHADER, ['uT0', 'uT1', 'uN', 'uLambda']);
-    this.matFoam = makeSimMaterial(FOAM_SHADER, ['uPrev', 'uDeriv', 'uN', 'uDt', 'uDecayP', 'uDecayF', 'uBias', 'uGrow']);
 
     const N = this.N;
     this.cascades = this.cascadeDefs.map(def => ({
@@ -249,11 +210,6 @@ export class WebGLWaterSimulation {
       ping: [computeRT(N), computeRT(N), computeRT(N), computeRT(N)],
       displacement: computeRT(N, { type: THREE.HalfFloatType, filter: THREE.LinearFilter, mips: true }),
       derivatives: computeRT(N, { type: THREE.HalfFloatType, filter: THREE.LinearFilter, mips: true }),
-      foam: def.foam ? [
-        computeRT(N, { type: THREE.HalfFloatType, filter: THREE.LinearFilter, mips: true }),
-        computeRT(N, { type: THREE.HalfFloatType, filter: THREE.LinearFilter, mips: true }),
-      ] : null,
-      foamIndex: 0,
     }));
 
     this.significantWaveHeight = 1;
@@ -302,10 +258,7 @@ export class WebGLWaterSimulation {
     return input;
   }
 
-  update(time, dt, {
-    choppiness = 1.1, foamBias = 0.5, foamGrow = 5.0, plumeDecay = 1 / 7,
-    fadeDecay = 1 / 60,
-  } = {}) {
+  update(time, dt, { choppiness = 1.1 } = {}) {
     const prevRT = this.renderer.getRenderTarget();
 
     for (const c of this.cascades) {
@@ -339,23 +292,6 @@ export class WebGLWaterSimulation {
       mv.uN.value = this.N;
       mv.uLambda.value = choppiness;
       this.runPass(this.matDeriv, c.derivatives);
-
-      // 4. persistent foam accumulation
-      if (c.foam) {
-        const src = c.foam[c.foamIndex];
-        const dst = c.foam[c.foamIndex ^ 1];
-        const mf = this.matFoam.uniforms;
-        mf.uPrev.value = src.texture;
-        mf.uDeriv.value = c.derivatives.texture;
-        mf.uN.value = this.N;
-        mf.uDt.value = Math.min(dt, 0.05);
-        mf.uDecayP.value = plumeDecay;
-        mf.uDecayF.value = fadeDecay;
-        mf.uBias.value = foamBias;
-        mf.uGrow.value = foamGrow;
-        this.runPass(this.matFoam, dst);
-        c.foamIndex ^= 1;
-      }
     }
 
     this.renderer.setRenderTarget(prevRT);
@@ -367,7 +303,6 @@ export class WebGLWaterSimulation {
       size: c.def.size,
       displacement: c.displacement.texture,
       derivatives: c.derivatives.texture,
-      foam: c.foam ? c.foam[c.foamIndex].texture : null,
     };
   }
 
@@ -377,11 +312,10 @@ export class WebGLWaterSimulation {
       c.evolve0.dispose(); c.evolve1.dispose();
       c.ping.forEach(p => p.dispose());
       c.displacement.dispose(); c.derivatives.dispose();
-      c.foam?.forEach(f => f.dispose());
     }
     this.butterfly.dispose();
     this.quad.dispose();
-    [this.matEvolve, this.matButterfly, this.matDisp, this.matDeriv, this.matFoam]
+    [this.matEvolve, this.matButterfly, this.matDisp, this.matDeriv]
       .forEach(m => m.dispose());
   }
 }

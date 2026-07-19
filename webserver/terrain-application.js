@@ -430,6 +430,7 @@ const {
 
 // We'll call this after aerialPerspective + cloudsEffect are created.
 function buildTuningControls(ap, ce) {
+  let cloudTuning = null;
   tuningSectionLabel('Date / Time');
   const monthNames = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
   tuningSlider('month', {
@@ -465,11 +466,13 @@ function buildTuningControls(ap, ce) {
     value: ap.inscatter,
     onChange: v => { ap.inscatter = v; }
   });
-  registerTerrainCloudTuning({
+  cloudTuning = registerTerrainCloudTuning({
     effect: ce, controls,
     section: tuningSectionLabel,
     slider: tuningSlider,
     toggle: tuningToggle,
+    // one wind: cloud drift heading follows the water wind direction
+    getWindDirection: () => waterParams.windDirection,
   });
   }
   if (waterRuntime.enabled) {
@@ -483,7 +486,11 @@ function buildTuningControls(ap, ce) {
     min: 0, max: 360, step: 1, value: waterParams.windDirection,
     decimals: 0,
     format: v => `${v.toFixed(0)}°`,
-    onChange: v => { waterParams.windDirection = v; waterRuntime.applyWind(); }
+    onChange: v => {
+      waterParams.windDirection = v;
+      waterRuntime.applyWind();
+      cloudTuning?.syncDrift();
+    }
   });
   tuningSlider('fetch', {
     min: 10, max: 1000, step: 10, value: waterParams.fetchKm,
@@ -499,16 +506,6 @@ function buildTuningControls(ap, ce) {
     min: 0.4, max: 1.6, step: 0.01, value: waterParams.choppiness,
     onChange: v => { waterParams.choppiness = v; }
   });
-  tuningSlider('whitecaps', {
-    min: 0, max: 2, step: 0.01, value: waterParams.foamAmount,
-    onChange: v => { waterParams.foamAmount = v; }
-  });
-  tuningSlider('foam fade', {
-    min: 5, max: 240, step: 5, value: waterParams.foamFadeLife,
-    decimals: 0,
-    format: v => `${v.toFixed(0)}s`,
-    onChange: v => { waterParams.foamFadeLife = v; }
-  });
   tuningSlider('water opacity', {
     min: 0, max: 0.8, step: 0.01, value: waterParams.opacity,
     onChange: v => { waterParams.opacity = v; }
@@ -516,6 +513,11 @@ function buildTuningControls(ap, ce) {
   tuningSlider('water reflect', {
     min: 0, max: 1.5, step: 0.01, value: waterParams.reflectivity,
     onChange: v => { waterParams.reflectivity = v; }
+  });
+  tuningSlider('water absorb', {
+    min: 0, max: 0.4, step: 0.005, value: waterParams.absorption,
+    decimals: 3,
+    onChange: v => { waterParams.absorption = v; }
   });
   tuningSlider('water bright', {
     min: 0.1, max: 6, step: 0.05, value: waterParams.radiance,
@@ -606,7 +608,7 @@ scene.add(terrainRoot);
 // and land occludes it naturally. Inert on backends without createWater.
 const waterParams = { ...DEFAULT_WATER_PARAMS };
 const waterRuntime = createWaterRuntime({
-  backend: renderBackend, terrainRoot,
+  backend: renderBackend, scene, terrainRoot,
   anchorPosition, east, north, up,
   getSunDirection: () => sunDirection,
   params: waterParams,

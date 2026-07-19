@@ -69,6 +69,7 @@ export function registerTerrainCloudTuning({
   section,
   slider,
   toggle,
+  getWindDirection,
 } = {}) {
   section('Clouds');
   const defaultAltitudes = effect.cloudLayers.map(layer => layer.altitude);
@@ -108,10 +109,14 @@ export function registerTerrainCloudTuning({
     onChange: value => { effect.cloudLayers[3].shapeAmount = value; },
   });
 
+  // One wind: cloud drift heading is slaved to the water wind direction
+  // (compass "blows toward" degrees, 0 = north / 90 = east) instead of an
+  // independent slider, so waves, whitecap streaks and weather all move
+  // together. Compass converts to the weather-uv math frame (+x east, ccw).
   let driftSpeed = 0.00004;
-  let driftAngle = 0;
   const updateDrift = () => {
-    const radians = driftAngle * Math.PI / 180;
+    const compass = getWindDirection?.() ?? 90;
+    const radians = (90 - compass) * Math.PI / 180;
     effect.localWeatherVelocity.set(
       Math.cos(radians) * driftSpeed,
       Math.sin(radians) * driftSpeed,
@@ -121,9 +126,6 @@ export function registerTerrainCloudTuning({
     min: 0, max: 0.002, step: 0.00005, value: driftSpeed, decimals: 6,
     onChange: value => { driftSpeed = value; updateDrift(); },
   });
-  slider('drift direction', {
-    min: 0, max: 360, step: 5, value: driftAngle, decimals: 0,
-    format: value => `${value}°`,
-    onChange: value => { driftAngle = value; updateDrift(); },
-  });
+  updateDrift();
+  return { syncDrift: updateDrift };
 }

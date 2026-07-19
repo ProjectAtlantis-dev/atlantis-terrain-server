@@ -7,16 +7,10 @@ export const GRAVITY = 9.81;
 // Band-limited cascades: patch size in metres and the wavelength band each
 // one owns. Bands cross-fade in k-space so no wavelength is counted twice.
 export const DEFAULT_CASCADES = [
-  { size: 840, minWave: 55, maxWave: 1e6, foam: true },
-  { size: 160, minWave: 7.5, maxWave: 55, foam: true },
-  { size: 22, minWave: 0.4, maxWave: 7.5, foam: false },
+  { size: 840, minWave: 55, maxWave: 1e6 },
+  { size: 160, minWave: 7.5, maxWave: 55 },
+  { size: 22, minWave: 0.4, maxWave: 7.5 },
 ];
-
-// Visual whitecap coverage curve: nothing below ~3 m/s, saturating ~24 m/s.
-export function windCoverage(windSpeed) {
-  const t = Math.min(Math.max((windSpeed - 3) / 21, 0), 1);
-  return t * t * (3 - 2 * t);
-}
 
 function bitReverse(i, bits) {
   let r = 0;
@@ -110,7 +104,7 @@ export function buildInitialSpectra({
   const wz = Math.cos(directionRad);
   const smallDamp = 0.1;                    // metres; kills sub-decimetre noise
 
-  // Fetch-limited JONSWAP peak: a fjord sea keeps its wind (and whitecaps)
+  // Fetch-limited JONSWAP peak: a fjord sea keeps its wind
   // but has only tens of km to grow, so the spectral peak sits at a higher
   // frequency than the fully-developed Pierson-Moskowitz sea. At 13 m/s the
   // PM peak wavelength is ~150 m — open-Atlantic swell that destroys the
