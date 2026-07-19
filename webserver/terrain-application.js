@@ -485,6 +485,12 @@ function buildTuningControls(ap, ce) {
     format: v => `${v.toFixed(0)}°`,
     onChange: v => { waterParams.windDirection = v; waterRuntime.applyWind(); }
   });
+  tuningSlider('fetch', {
+    min: 10, max: 1000, step: 10, value: waterParams.fetchKm,
+    decimals: 0,
+    format: v => `${v.toFixed(0)}km`,
+    onChange: v => { waterParams.fetchKm = v; waterRuntime.applyWind(); }
+  });
   tuningSlider('swell scale', {
     min: 0.3, max: 2, step: 0.01, value: waterParams.amplitude,
     onChange: v => { waterParams.amplitude = v; waterRuntime.applyWind(); }
@@ -497,9 +503,19 @@ function buildTuningControls(ap, ce) {
     min: 0, max: 2, step: 0.01, value: waterParams.foamAmount,
     onChange: v => { waterParams.foamAmount = v; }
   });
-  tuningSlider('water tint', {
-    min: 0, max: 1, step: 0.01, value: waterParams.tintStrength,
-    onChange: v => { waterParams.tintStrength = v; }
+  tuningSlider('foam fade', {
+    min: 5, max: 240, step: 5, value: waterParams.foamFadeLife,
+    decimals: 0,
+    format: v => `${v.toFixed(0)}s`,
+    onChange: v => { waterParams.foamFadeLife = v; }
+  });
+  tuningSlider('water opacity', {
+    min: 0, max: 0.8, step: 0.01, value: waterParams.opacity,
+    onChange: v => { waterParams.opacity = v; }
+  });
+  tuningSlider('water reflect', {
+    min: 0, max: 1.5, step: 0.01, value: waterParams.reflectivity,
+    onChange: v => { waterParams.reflectivity = v; }
   });
   tuningSlider('water bright', {
     min: 0.1, max: 6, step: 0.05, value: waterParams.radiance,
@@ -590,7 +606,7 @@ scene.add(terrainRoot);
 // and land occludes it naturally. Inert on backends without createWater.
 const waterParams = { ...DEFAULT_WATER_PARAMS };
 const waterRuntime = createWaterRuntime({
-  backend: renderBackend, scene, terrainRoot,
+  backend: renderBackend, terrainRoot,
   anchorPosition, east, north, up,
   getSunDirection: () => sunDirection,
   params: waterParams,
@@ -923,9 +939,6 @@ const terrainTileSet = createTerrainTileSet({
   events: {
     onMutated: markSceneMutated,
     onMaterialApplied: () => {
-      // Texture arrival/upgrade does not bump sceneMutationVersion (that
-      // tracks mesh add/remove), so tell the water colour capture directly.
-      waterRuntime.markColorDirty();
       requestRender();
     },
   },
@@ -2046,7 +2059,7 @@ function render() {
 
   // Keep classifier colors—including the effective-water pink—unobstructed.
   waterRuntime.update({
-    dt, nowMs, camera,
+    dt, camera,
     visible: !controls.mapMode && !classifierRuntime.active,
   });
 

@@ -10,13 +10,11 @@ import { WebGLWaterSimulation } from './webgl-water-sim.js';
 //   - No sky dome and no in-shader haze: the scene pipeline owns atmosphere
 //     (Takram aerial perspective + clouds + scene fog). The analytic skyColor
 //     stays only as the Fresnel reflection environment.
-//   - Opaque + depth write + logarithmic depth, so the dropped seabed is
-//     occluded and the post passes treat water like any other surface.
-//   - Water colour inherits from the satellite imagery painted on the seabed
-//     (blue coastal water -> milky teal toward the glacier outflows): a
-//     periodic top-down ortho capture of the loaded terrain becomes a colour
-//     map that reskins uDeepColor/uScatterColor per-location, falling back to
-//     the palette defaults where nothing is loaded.
+//   - Translucent (premultiplied alpha, no depth write, log-depth tested):
+//     the dropped seabed carries the satellite imagery OF the water, so the
+//     surface lets it show through — colour inheritance is per-pixel and
+//     free, with veil/reflection/glint/foam composited on top. Depth read by
+//     the post passes is the seabed, 10 m below the surface — negligible.
 
 const SKY_GLSL = /* glsl */ `
   vec3 skyColor(vec3 dir, vec3 sunDir, vec3 horizonWarm, vec3 horizonCool, vec3 zenithCol, vec3 sunCol, float cloud) {
@@ -100,17 +98,12 @@ const WATER_FRAGMENT = /* glsl */ `
   uniform float uFoamAmount;
   uniform float uHs;
   uniform float uCloud;
-  uniform float uGhost;
   uniform float uPlumeLife;
-  uniform float uResidueLife;
+  uniform float uFoamFade;     // foam-raft fade e-folding time, seconds
   uniform float uRadiance;     // overall output gain: calibrates the ocean2
                                // palette against this pipeline's AGX exposure
-  uniform sampler2D uColorMap; // top-down capture of loaded terrain textures
-  uniform vec2 uColorMapCenter;
-  uniform float uColorMapExtent;
-  uniform float uTintStrength;
-  uniform float uTintExposure;
-  uniform float uTintScatterGain;
+  uniform float uOpacity;      // base veil opacity of the surface body
+  uniform float uReflect;      // sky-reflection gain (fjord walls occlude sky)
 
   varying vec3 vPlanePos;
   varying float vHeight;
@@ -223,11 +216,14 @@ const WATER_FRAGMENT = /* glsl */ `
     float patchK = fbm(pxy * 0.00071 + vec2(31.7, 11.3));
     float patchM = fbm(pxy * 0.0029 - vec2(7.3, 19.1));
 
-    // two-stage foam buffers: .x = plume energy (whitecap), .y = residue
+    // foam buffers: .x = plume energy (bright core, seconds), .y = foam
+    // coverage (lingering raft, fades on uFoamFade), .z = age clock.
+    // Cascade 0 owns the 55 m+ waves, whose folds paint caps tens of metres
+    // across — down-weighted so cap size is set by the chop-scale cascade.
     vec4 F0 = texture2D(uFoam0, pxy / uL.x);
     vec4 F1 = texture2D(uFoam1, pxy / uL.y);
-    float acc = F0.x + F1.x * mix(f1, 1.0, 0.5);
-    float resid = F0.y + F1.y * mix(f1, 1.0, 0.5);
+    float acc = F0.x * 0.55 + F1.x * mix(f1, 1.0, 0.5);
+    float cov = F0.y * 0.55 + F1.y * mix(f1, 1.0, 0.5);
     // youngest contributing foam sets the patch's apparent age
     float capAge = min(F0.z, F1.z);
     // de-tiling selection, anisotropic in the wind frame: long correlation
@@ -241,11 +237,6 @@ const WATER_FRAGMENT = /* glsl */ `
     // terms only de-tile and vary density, so they must not stack another
     // deep cut on top of it
     float sel = mix(0.35, 1.15, smoothstep(0.26, 0.58, capSel)) * (0.65 + 0.7 * patchM) * crestBand;
-    // age comes from the RAW buffer level — selection decides whether a cap
-    // exists here, not how old it is. Folding sel into the age read made
-    // every thinned cap render as dim aged foam.
-    float accRaw = acc;
-    acc *= sel;
 
     // instantaneous breaking on the crest itself.
     // J bottoms out around ~0.6-0.7 for a developed sea at any wind, so the
@@ -261,33 +252,24 @@ const WATER_FRAGMENT = /* glsl */ `
                + fbm(fw * vec2(0.85, 0.30)) * 0.35
                + fbm(fw * vec2(3.1, 1.6)) * 0.20;
 
-    // cap existence rides on plume + residue: after the plume degasses
-    // (seconds) the cap's ghost persists on the residue clock (minutes),
-    // eroding away from its lacy edges instead of being erased on a timer
-    float residCap = resid * sel;
-    float foamRaw = clamp(acc * 2.2 + inst * 0.7 + residCap * uGhost, 0.0, 1.0) * foamGate;
+    // existence rides on the SLOW coverage channel through a soft saturating
+    // transfer — no clamp plateau. Patches keep interior gradients, and as
+    // the raft decays over uFoamFade the whole level glides down, so foam
+    // thins out gradually instead of collapsing through a threshold. inst
+    // seeds a footprint the moment a crest breaks, before coverage builds.
+    float foamRaw = (1.0 - exp(-(cov * sel * 2.0 + inst * 0.5))) * foamGate;
 
     // spume lines: organise foam into wind-aligned rows, but only once the
     // sea is rough enough for them to exist
     float streak = fbm(fw * vec2(0.22, 0.02));
     foamRaw *= mix(1.0, smoothstep(0.28, 0.62, streak), 0.75 * smoothstep(0.45, 1.0, uWindCoverage));
 
-    // lacy edges: erode the foam patch with the breakup texture. The high
-    // threshold keeps only the core of each cap — from altitude a whitecap
-    // is a fleck a few metres across, not the whole disturbed patch.
-    float foamMask = smoothstep(0.24, 0.66, foamRaw * (0.3 + 1.15 * ftex));
-    foamMask = clamp(foamMask * (0.7 + 0.55 * ftex), 0.0, 1.0);
-
-    // ---- inherited water colour ------------------------------------------
-    // The satellite imagery of the water (painted on the dropped seabed) is
-    // the ground truth for local water colour: blue at the coast, milky teal
-    // toward the glacier outflows. Sample the ortho capture where available;
-    // its alpha is 0 wherever nothing was loaded, falling back to defaults.
-    vec2 cmUV = (pxy - uColorMapCenter) / uColorMapExtent + 0.5;
-    float inMap = step(abs(cmUV.x - 0.5), 0.5) * step(abs(cmUV.y - 0.5), 0.5);
-    vec4 cm = texture2D(uColorMap, cmUV);
-    float cmW = cm.a * inMap * uTintStrength;
-    vec3 scatCol = mix(uScatterColor, cm.rgb * uTintScatterGain, cmW);
+    // lacy edges: erode the foam patch with the breakup texture. The WIDE
+    // smoothstep window is the anti-sharp-edge measure — coverage falls off
+    // smoothly at patch rims and over time, and a wide window turns that
+    // gradient into a long soft transition instead of a contour line.
+    float foamMask = smoothstep(0.07, 0.92, foamRaw * (0.30 + 1.05 * ftex));
+    foamMask = clamp(foamMask * (0.55 + 0.65 * ftex), 0.0, 1.0);
 
     // ---- lighting ---------------------------------------------------------
     float NdotV = max(dot(Ns, V), 1e-3);
@@ -320,33 +302,44 @@ const WATER_FRAGMENT = /* glsl */ `
     vec3 spec = uSunColor * ggxAniso(H, N, Twind, Bwind, max(sqrt(ax2), 0.002), max(sqrt(ay2), 0.002))
               * fresL * 0.10 * smoothstep(0.0, 0.06, L.z);
 
-    // upwelling water colour with crest subsurface scattering
     float backlight = pow(clamp(dot(L, -V) * 0.5 + 0.5, 0.0, 1.0), 3.0);
     vec3 ambient = mix(uHorizonCool, uZenithColor, 0.4) * 0.65;
-    // Faithful colour inheritance: where the capture has coverage, the
-    // imagery IS this water's top-down appearance, so it becomes the body
-    // radiance directly — NOT a deep-colour pushed through the blue ambient
-    // product, which hue-shifts teal to navy and buries local variation.
-    // The aerial-perspective pass relights water and terrain identically, so
-    // matching the seabed imagery radiance here lands on screen looking like
-    // the same imagery does on land. uTintExposure trims the level.
-    vec3 waterCol = mix(uDeepColor * ambient * 4.0, cm.rgb * uTintExposure, cmW);
+    vec3 bodyCol = uDeepColor * ambient * 4.0;
+
+    // facet lighting from the SWELL slope (cascades 0+1, chop excluded):
+    // sunward ridge faces brighten, leeward faces darken. Using the full
+    // normal here let metre-scale chop bury the dominant ridge trains.
+    vec2 swellSlope = (D0.xy + D1.xy * f1 * 0.5) * facetGain;
+    vec3 Nsw = normalize(vec3(-swellSlope.x, -swellSlope.y, 1.0));
+    float facet = (max(dot(Nsw, L), 0.0) - max(L.z, 0.0)) * (1.0 - 0.65 * uCloud);
+
+    // ---- premultiplied composition over the seabed imagery ----------------
+    // The terrain under the water mask carries the satellite imagery OF this
+    // water, so the 'seabed' showing through IS the faithful local colour —
+    // blue at the coast, milky teal toward the glacier outflows. EVERY bit of
+    // surface light except foam/glint must scale with uOpacity: the fjord
+    // imagery is dark (near-black in mountain shadow), and any ungated
+    // additive veil is several times brighter than that background, which
+    // reads as opaque water exactly along shadowed coastline.
     // crest transmission is a close-range effect (thin backlit crests); from
     // altitude elevation must not modulate colour or swells read as pale
     // cloudy blobs under the surface
     float crestFade = 1.0 / (1.0 + d * 0.004);
-    waterCol += scatCol * max(hN, 0.0) * (0.06 + 0.50 * backlight) * (0.35 + 0.65 * NdotL) * crestFade;
-    waterCol += scatCol * uSunColor * 0.015 * NdotL;
+    vec3 body = bodyCol;
+    body += uScatterColor * max(hN, 0.0) * (0.06 + 0.50 * backlight) * (0.35 + 0.65 * NdotL) * crestFade
+           + uScatterColor * uSunColor * 0.015 * NdotL;
+    // facet shading multiplies the body (it is our own light, unlike the
+    // background): sunward ridge faces brighten, leeward darken
+    body *= max(1.0 + 1.1 * facet, 0.0);
 
-    vec3 col = mix(waterCol, skyRefl, fresnel) + spec * (1.0 - foamMask);
-    // facet lighting from the SWELL slope (cascades 0+1, chop excluded):
-    // sunward ridge faces brighten, leeward faces darken. Using the full
-    // normal here let metre-scale chop bury the dominant ridge trains —
-    // the chop still shades through Fresnel and specular.
-    vec2 swellSlope = (D0.xy + D1.xy * f1 * 0.5) * facetGain;
-    vec3 Nsw = normalize(vec3(-swellSlope.x, -swellSlope.y, 1.0));
-    float swellNdotL = max(dot(Nsw, L), 0.0);
-    col *= 1.0 + 1.1 * (1.0 - 0.65 * uCloud) * (swellNdotL - max(L.z, 0.0));
+    // Reflection gain < 1 stands in for the sky occlusion the analytic dome
+    // cannot know about: shadowed fjord walls reflect rock, not bright sky.
+    float refl = fresnel * uReflect;
+    float a = uOpacity + refl * (1.0 - uOpacity);
+    vec3 accum = body * uOpacity + skyRefl * refl;
+
+    // sun glint: pure added light
+    accum += spec * (1.0 - foamMask);
 
     // foam shading: diffuse, slightly shadowed in its own troughs. Only the
     // actively-breaking core is near-white; aged trails and spume streaks are
@@ -357,32 +350,25 @@ const WATER_FRAGMENT = /* glsl */ `
     // bright against the darkened water
     foamCol *= uSunColor * 0.30 * (0.45 + 0.55 * NdotL) + ambient * (0.9 + 1.1 * uCloud);
 
-    // continuous lifecycle colour driven by the per-texel age clock — two
-    // overlapping exponentials, so brightness glides white -> cream -> gray
-    // -> residual with no plateaus and no sliding-timer pop
-    vec3 residueLight = (uSunColor * 0.12 + ambient) * 0.32;
+    // lifecycle: the truly-white core lives on the fast plume clock and a
+    // TIGHT threshold — a fleck at the break point, not the whole patch.
+    // The surrounding raft grays and dims on the slow foam clock, and its
+    // spatial existence fades with the coverage channel above, so there is
+    // no timer that cuts foam off — it just gets thinner, grayer, lacier.
     float ageW = exp(-capAge / max(uPlumeLife, 0.1));
-    float ageG = exp(-capAge / max(uResidueLife * 0.5, 1.0));
-    float whiteAmt = clamp(ageW * smoothstep(0.10, 0.55, accRaw + inst * 0.8) + inst * 0.5, 0.0, 1.0);
+    float ageG = exp(-capAge / max(uFoamFade, 1.0));
+    float whiteAmt = clamp(ageW * smoothstep(0.30, 0.80, (acc + inst * 0.8) * (0.4 + 1.0 * ftex)) + inst * 0.4, 0.0, 1.0);
     // gray tone itself dims continuously as the bubble raft thins
-    vec3 grayCol = (foamCol * 0.50 + waterCol * 0.40) * (0.55 + 0.45 * ageG);
+    vec3 grayCol = (foamCol * 0.50 + bodyCol * 0.40) * (0.45 + 0.55 * ageG);
     vec3 stageCol = mix(grayCol, foamCol, whiteAmt);
-    stageCol = mix(col * 0.80 + residueLight, stageCol, max(ageG, whiteAmt));
-    // older rafts also thin out spatially, not just in tone
-    col = mix(col, stageCol, foamMask * mix(0.45, 1.0, ageG));
-
-    // bubble residue: pale streaky patches that persist for minutes, drift
-    // downwind in the sim, and lighten the water rather than painting it
-    // white. Langmuir windrows: residue collects in convergence lanes
-    // parallel to the wind, which also breaks the foam tile repetition.
-    float rsel = fbm(vec2(cw.x * 0.02, cw.y * 0.0035) + vec2(8.7, 41.2));
-    float resTex = fbm(fw * vec2(0.045, 0.011));
-    float resMask = smoothstep(0.20, 1.0, resid * mix(0.2, 1.3, smoothstep(0.28, 0.66, rsel)) * (0.45 + 0.95 * resTex))
-                  * (1.0 - foamMask);
-    col = mix(col, col * 0.72 + residueLight, resMask * 0.6 * foamGate);
+    // aged foam keeps a floor weight — the mask thinning is the fade-out,
+    // not an age gate; foam covers the imagery, so it composites over
+    float foamW = foamMask * (0.40 + 0.60 * max(ageG, whiteAmt));
+    accum = accum * (1.0 - foamW) + stageCol * foamW;
+    a = mix(a, 0.95, foamW);
 
     // no in-shader haze: scene fog + the aerial perspective pass own that
-    gl_FragColor = vec4(col * uRadiance, 1.0);
+    gl_FragColor = vec4(accum * uRadiance, clamp(a, 0.0, 1.0));
     #include <fog_fragment>
   }
 `;
@@ -391,8 +377,6 @@ export function createWebGLWater({
   renderer,
   geometry,
   resolution = 256,
-  colorMapSize = 1024,
-  colorMapExtent = 60000,
 } = {}) {
   const sim = new WebGLWaterSimulation(renderer, { resolution });
 
@@ -418,16 +402,11 @@ export function createWebGLWater({
     uFoamAmount: { value: 1 },
     uHs: { value: 2 },
     uCloud: { value: 0 },
-    uGhost: { value: 2 },
     uPlumeLife: { value: 7 },
-    uResidueLife: { value: 150 },
+    uFoamFade: { value: 60 },
     uRadiance: { value: 1 },
-    uColorMap: { value: null },
-    uColorMapCenter: { value: new THREE.Vector2() },
-    uColorMapExtent: { value: colorMapExtent },
-    uTintStrength: { value: 1 },
-    uTintExposure: { value: 1 },
-    uTintScatterGain: { value: 2.2 },
+    uOpacity: { value: 0 },
+    uReflect: { value: 0.4 },
   };
 
   const material = new THREE.ShaderMaterial({
@@ -435,31 +414,14 @@ export function createWebGLWater({
     vertexShader: WATER_VERTEX,
     fragmentShader: WATER_FRAGMENT,
     fog: true,
+    transparent: true,
+    depthWrite: false,
+    premultipliedAlpha: true,
   });
 
   const mesh = new THREE.Mesh(geometry, material);
   mesh.frustumCulled = false;
   mesh.visible = false;
-
-  // Top-down colour capture of whatever terrain textures are streamed in.
-  // Rendered into a half-float target (linear working space, no output
-  // transform) with alpha 0 where nothing drew, so the surface shader can
-  // fall back to palette colours. Mips + linear filtering do the blurring.
-  const colorTarget = new THREE.WebGLRenderTarget(colorMapSize, colorMapSize, {
-    type: THREE.HalfFloatType,
-    magFilter: THREE.LinearFilter,
-    minFilter: THREE.LinearMipmapLinearFilter,
-    generateMipmaps: true,
-    depthBuffer: true,
-    stencilBuffer: false,
-  });
-  const captureCamera = new THREE.OrthographicCamera(
-    -colorMapExtent / 2, colorMapExtent / 2,
-    colorMapExtent / 2, -colorMapExtent / 2,
-    1, 30000,
-  );
-  const prevClearColor = new THREE.Color();
-  uniforms.uColorMap.value = colorTarget.texture;
 
   function bindSimTextures() {
     const c0 = sim.getCascadeTextures(0);
@@ -479,8 +441,8 @@ export function createWebGLWater({
   return {
     mesh,
 
-    setWind({ speed, directionRad, amplitude, alignment, seed, windCoverage }) {
-      sim.setWind({ speed, directionRad, amplitude, alignment, seed });
+    setWind({ speed, directionRad, amplitude, alignment, seed, fetchKm, windCoverage }) {
+      sim.setWind({ speed, directionRad, amplitude, alignment, seed, fetchKm });
       uniforms.uWindDir.value.set(Math.sin(directionRad), Math.cos(directionRad));
       uniforms.uWindCoverage.value = windCoverage;
       uniforms.uWindFactor.value = THREE.MathUtils.clamp(speed / 25, 0, 1);
@@ -502,47 +464,14 @@ export function createWebGLWater({
       uniforms.uScatterColor.value.copy(palette.scatter);
       uniforms.uCloud.value = params.cloudiness;
       uniforms.uFoamAmount.value = params.foamAmount;
-      uniforms.uGhost.value = params.ghostStrength;
       uniforms.uPlumeLife.value = params.plumeLife;
-      uniforms.uResidueLife.value = params.residueLife;
+      uniforms.uFoamFade.value = params.foamFadeLife;
       uniforms.uRadiance.value = params.radiance;
-      uniforms.uTintStrength.value = params.tintStrength;
+      uniforms.uOpacity.value = params.opacity;
+      uniforms.uReflect.value = params.reflectivity;
     },
-
-    captureColorMap({ scene, terrainRoot, centerXY }) {
-      if (captureCamera.parent !== terrainRoot) terrainRoot.add(captureCamera);
-      captureCamera.position.set(centerXY.x, centerXY.y, 10000);
-
-      const prevTarget = renderer.getRenderTarget();
-      const prevFog = scene.fog;
-      const prevBackground = scene.background;
-      const prevAlpha = renderer.getClearAlpha();
-      renderer.getClearColor(prevClearColor);
-      const prevVisible = mesh.visible;
-      scene.fog = null;
-      scene.background = null;
-      mesh.visible = false;
-      renderer.setClearColor(0x000000, 0);
-      try {
-        renderer.setRenderTarget(colorTarget);
-        renderer.clear();
-        renderer.render(scene, captureCamera);
-      } finally {
-        renderer.setRenderTarget(prevTarget);
-        renderer.setClearColor(prevClearColor, prevAlpha);
-        scene.fog = prevFog;
-        scene.background = prevBackground;
-        mesh.visible = prevVisible;
-      }
-      uniforms.uColorMapCenter.value.set(centerXY.x, centerXY.y);
-      uniforms.uColorMapExtent.value = colorMapExtent;
-    },
-
-    get colorMapExtent() { return colorMapExtent; },
 
     dispose() {
-      captureCamera.parent?.remove(captureCamera);
-      colorTarget.dispose();
       sim.dispose();
       material.dispose();
       geometry.dispose();

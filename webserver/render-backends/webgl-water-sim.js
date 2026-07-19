@@ -139,22 +139,24 @@ const DERIVATIVES_SHADER = /* glsl */ `
   }
 `;
 
-// Two-stage whitecap lifecycle:
+// Whitecap lifecycle, all in place:
 //   R = plume energy: entrained air at the breaking crest. Injected from the
 //       Jacobian, lives seconds. Brightness in the surface shader scales with
 //       this energy, so only violent breaks render truly white.
-//   G = residue: bubble scum left behind as the plume degasses. Fed by the
-//       plume, lightens the water (not white), drifts downwind with Stokes
-//       drift, persists for minutes.
+//   G = foam coverage: the bubble raft the break leaves behind. Fed by the
+//       same injection but decays an order of magnitude slower — it is the
+//       cap's spatial existence, so foam fades out gradually where it was
+//       made instead of dying with the plume.
+//   B = per-texel age in seconds, the clock for the white -> gray fade.
+// (A drifting residue/scum stage once lived in G — removed, its downwind
+// advection read as wrong streaks. Coverage stays put.)
 const FOAM_SHADER = /* glsl */ `
   uniform sampler2D uPrev;
   uniform sampler2D uDeriv;
   uniform float uN;
   uniform float uDt;
   uniform float uDecayP;   // 1 / plume e-folding time
-  uniform float uDecayR;   // 1 / residue e-folding time
-  uniform float uTransfer; // plume -> residue feed rate
-  uniform vec2 uDrift;     // residue drift, texture units / s (Stokes)
+  uniform float uDecayF;   // 1 / foam-coverage e-folding time
   uniform float uBias;
   uniform float uGrow;
 
@@ -163,18 +165,17 @@ const FOAM_SHADER = /* glsl */ `
     float J = texture2D(uDeriv, uv).z;
     float inject = max(uBias - J, 0.0);
 
-    float E = texture2D(uPrev, uv).x;
-    // residue drifts downwind; the plume stays with the crest that made it
-    float S = texture2D(uPrev, uv - uDrift * uDt).y;
-    // per-texel age in seconds: the continuous clock for the white -> cream
-    // -> gray -> residual fade. Fresh breaking rejuvenates in proportion to
+    vec4 prev = texture2D(uPrev, uv);
+    float E = prev.x;
+    float S = prev.y;
+    // per-texel age in seconds. Fresh breaking rejuvenates in proportion to
     // its violence rather than snapping to zero.
-    float A = texture2D(uPrev, uv).z;
+    float A = prev.z;
     A = min(A + uDt, 900.0);
     A *= 1.0 - clamp(inject * uGrow * 0.5, 0.0, 1.0);
 
     E = E * exp(-uDecayP * uDt) + inject * uGrow * uDt;
-    S = S * exp(-uDecayR * uDt) + E * uTransfer * uDt;
+    S = S * exp(-uDecayF * uDt) + inject * uGrow * uDt;
     gl_FragColor = vec4(clamp(E, 0.0, 1.5), clamp(S, 0.0, 1.0), A, 1.0);
   }
 `;
@@ -237,9 +238,7 @@ export class WebGLWaterSimulation {
     this.matButterfly = makeSimMaterial(BUTTERFLY_SHADER, ['uButterfly', 'uInput', 'uN', 'uStages', 'uStage', 'uVertical']);
     this.matDisp = makeSimMaterial(DISPLACEMENT_SHADER, ['uT0', 'uN', 'uLambda']);
     this.matDeriv = makeSimMaterial(DERIVATIVES_SHADER, ['uT0', 'uT1', 'uN', 'uLambda']);
-    this.matFoam = makeSimMaterial(FOAM_SHADER, ['uPrev', 'uDeriv', 'uN', 'uDt', 'uDecayP', 'uDecayR', 'uTransfer', 'uDrift', 'uBias', 'uGrow']);
-    this.matFoam.uniforms.uDrift.value = new THREE.Vector2();
-    this.windDrift = new THREE.Vector2();   // world m/s, set by setWind
+    this.matFoam = makeSimMaterial(FOAM_SHADER, ['uPrev', 'uDeriv', 'uN', 'uDt', 'uDecayP', 'uDecayF', 'uBias', 'uGrow']);
 
     const N = this.N;
     this.cascades = this.cascadeDefs.map(def => ({
@@ -260,14 +259,13 @@ export class WebGLWaterSimulation {
     this.significantWaveHeight = 1;
   }
 
-  setWind({ speed, directionRad, amplitude = 1, alignment = 1, seed = 1 }) {
-    const { spectra, significantWaveHeight, driftX, driftY } = buildInitialSpectra({
+  setWind({ speed, directionRad, amplitude = 1, alignment = 1, seed = 1, fetchKm }) {
+    const { spectra, significantWaveHeight } = buildInitialSpectra({
       resolution: this.N,
       cascades: this.cascadeDefs,
-      speed, directionRad, amplitude, alignment, seed,
+      speed, directionRad, amplitude, alignment, seed, fetchKm,
     });
     this.significantWaveHeight = significantWaveHeight;
-    this.windDrift.set(driftX, driftY);
 
     this.cascades.forEach((c, i) => {
       if (c.h0) c.h0.dispose();
@@ -305,8 +303,8 @@ export class WebGLWaterSimulation {
   }
 
   update(time, dt, {
-    choppiness = 1.1, foamBias = 0.5, foamGrow = 5.0,
-    plumeDecay = 1 / 7, residueDecay = 1 / 150, foamTransfer = 0.05,
+    choppiness = 1.1, foamBias = 0.5, foamGrow = 5.0, plumeDecay = 1 / 7,
+    fadeDecay = 1 / 60,
   } = {}) {
     const prevRT = this.renderer.getRenderTarget();
 
@@ -352,9 +350,7 @@ export class WebGLWaterSimulation {
         mf.uN.value = this.N;
         mf.uDt.value = Math.min(dt, 0.05);
         mf.uDecayP.value = plumeDecay;
-        mf.uDecayR.value = residueDecay;
-        mf.uTransfer.value = foamTransfer;
-        mf.uDrift.value.copy(this.windDrift).divideScalar(c.def.size);
+        mf.uDecayF.value = fadeDecay;
         mf.uBias.value = foamBias;
         mf.uGrow.value = foamGrow;
         this.runPass(this.matFoam, dst);

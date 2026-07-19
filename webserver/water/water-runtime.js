@@ -4,10 +4,12 @@ import { createWaterPalette, computeWaterPalette } from './water-sky.js';
 import { windCoverage } from './water-spectrum.js';
 
 // Backend-neutral fjord water orchestration: owns parameters, the camera-
-// local/sun-local frame math, sim pacing, and the colour-map capture cadence.
-// The backend supplies the actual renderer work via createWater() (WebGL
-// today; a WGSL/TSL port plugs in behind the same interface). Backends
-// without water simply don't implement createWater and this runtime is inert.
+// local/sun-local frame math, and sim pacing. The backend supplies the
+// actual renderer work via createWater() (WebGL today; a WGSL/TSL port plugs
+// in behind the same interface). Backends without water simply don't
+// implement createWater and this runtime is inert. Colour inheritance needs
+// no orchestration: the surface is translucent and the seabed imagery —
+// which is satellite photography OF the water — shows through per-pixel.
 
 // Fjords are NOT fetch-limited: they are long enough to channel the east-west
 // winds, so the default sea state stays ocean-grade — wind along the fjord
@@ -15,26 +17,28 @@ import { windCoverage } from './water-spectrum.js';
 export const DEFAULT_WATER_PARAMS = {
   windSpeed: 13,          // m/s
   windDirection: 90,      // degrees the wind blows toward (90 = east)
+  fetchKm: 100,           // wave-growth fetch: sets the JONSWAP peak so a
+                          // windy fjord sea stays short (~60-70 m waves at
+                          // 13 m/s) instead of open-Atlantic 150 m swell
   alignment: 1.0,         // directional spreading of the spectrum
   choppiness: 1.38,       // horizontal displacement scale (drives breaking)
   amplitude: 1.0,
   foamAmount: 1.0,
   plumeLife: 7,           // whitecap (plume) e-folding life, seconds
-  residueLife: 150,       // bubble-residue e-folding life, seconds
-  foamTransfer: 0.12,     // plume -> residue feed rate (per second)
-  ghostStrength: 2.0,     // how strongly residue keeps the cap's ghost visible
+  foamFadeLife: 60,       // lingering foam-raft e-folding life, seconds —
+                          // the slow, in-place fade after the cap dies
   cloudiness: 0,          // 0 clear -> 1 overcast
-  tintStrength: 1.0,      // how much local imagery colour replaces defaults
+  opacity: 0,             // surface body veil — 0 by choice: the seabed
+                          // imagery carries the water colour entirely, the
+                          // surface adds only reflection, glint and foam
+  reflectivity: 0.4,      // sky-reflection gain (fjord walls occlude the sky)
   radiance: 1.0,          // output gain vs the scene's tone-mapping exposure
   timeScale: 1.0,
   seed: 1,
 };
 
-const CAPTURE_MIN_INTERVAL_MS = 750;
-
 export function createWaterRuntime({
   backend,
-  scene,
   terrainRoot,
   anchorPosition,
   east,
@@ -47,7 +51,7 @@ export function createWaterRuntime({
   if (!water?.mesh) {
     return {
       enabled: false, params,
-      applyWind() {}, markColorDirty() {}, update() {}, dispose() {},
+      applyWind() {}, update() {}, dispose() {},
     };
   }
   terrainRoot.add(water.mesh);
@@ -57,10 +61,7 @@ export function createWaterRuntime({
   const cameraLocal = new THREE.Vector3();
   const sunLocal = new THREE.Vector3();
   const meshOffset = new THREE.Vector2();
-  const lastCaptureCenter = new THREE.Vector2(Infinity, Infinity);
   const simParams = {};
-  let lastCaptureMs = 0;
-  let colorDirty = true;
   let simTime = 0;
 
   function applyWind() {
@@ -70,12 +71,13 @@ export function createWaterRuntime({
       amplitude: params.amplitude,
       alignment: params.alignment,
       seed: params.seed,
+      fetchKm: params.fetchKm,
       windCoverage: windCoverage(params.windSpeed),
     });
   }
   applyWind();
 
-  function update({ dt, nowMs, camera, visible }) {
+  function update({ dt, camera, visible }) {
     water.mesh.visible = visible;
     if (!visible) return;
 
@@ -100,37 +102,18 @@ export function createWaterRuntime({
     );
     simParams.foamGrow = 4.0;
     simParams.plumeDecay = 1 / params.plumeLife;
-    simParams.residueDecay = 1 / params.residueLife;
-    simParams.foamTransfer = params.foamTransfer;
+    simParams.fadeDecay = 1 / params.foamFadeLife;
 
     water.update({
       simTime, dt: scaledDt, meshOffset, cameraLocal, sunLocal,
       palette, params, simParams,
     });
-
-    // Colour-map capture is event-driven: markColorDirty() fires on actual
-    // texture application (tile arrival/upgrade), movement re-centres the
-    // window. The interval is only a coalescer — tiles apply in bursts of a
-    // few per frame and must not become a capture per frame.
-    if (water.captureColorMap && nowMs - lastCaptureMs >= CAPTURE_MIN_INTERVAL_MS) {
-      const moved = lastCaptureCenter.distanceTo(meshOffset)
-        > water.colorMapExtent * 0.12;
-      if (moved || colorDirty) {
-        water.captureColorMap({ scene, terrainRoot, centerXY: meshOffset });
-        lastCaptureCenter.copy(meshOffset);
-        lastCaptureMs = nowMs;
-        colorDirty = false;
-      }
-    }
   }
 
   return {
     enabled: true,
     params,
     applyWind,
-    // Call when a terrain texture is applied or upgraded; the next update
-    // (past the coalescing interval) re-captures the colour map.
-    markColorDirty() { colorDirty = true; },
     update,
     dispose() {
       terrainRoot.remove(water.mesh);
