@@ -32,6 +32,8 @@ export const DEFAULT_WATER_PARAMS = {
                           // imagery carries the water colour entirely, the
                           // surface adds only reflection and glint
   reflectivity: 0.4,      // sky-reflection gain (fjord walls occlude the sky)
+  glintStrength: 1.0,     // direct-sun glitter gain, independent of the
+                          // deliberately subdued ambient sky reflection
   absorption: 0.25,       // Beer-Lambert 1/m, applied only inside the
                           // wall-slope gate: open water stays fully clear,
                           // the -10 m mask-drop walls fade hard with depth

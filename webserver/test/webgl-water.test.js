@@ -5,12 +5,17 @@ import * as THREE from 'three';
 import {
   prepareBathymetryTerrainTiles,
 } from '../render-backends/webgl-water.js';
-import { createWaterRuntime } from '../water/water-runtime.js';
+import { createWaterRuntime, DEFAULT_WATER_PARAMS } from '../water/water-runtime.js';
 import {
   NORTH_CLIFF_REFLECTION_MAX_PADDING_M,
   northCliffReflectionKeepForDistance,
   northCliffReflectionPaddingForSlope,
 } from '../water/water-reflection-mask.js';
+
+test('direct sun glint has an independent full-strength control', () => {
+  assert.equal(DEFAULT_WATER_PARAMS.glintStrength, 1);
+  assert.ok(DEFAULT_WATER_PARAMS.glintStrength > DEFAULT_WATER_PARAMS.reflectivity);
+});
 
 test('north-cliff reflection padding is negligible on flat shores and proportional to slope', () => {
   assert.equal(northCliffReflectionPaddingForSlope(0), 0);

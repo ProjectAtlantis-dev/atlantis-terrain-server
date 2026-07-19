@@ -1,7 +1,6 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import test from 'node:test';
-import { Color } from 'three';
 
 import {
   headingAlignedPriorityDistance,
@@ -25,7 +24,7 @@ import {
 } from '../terrain-tile-set.js';
 import { createTerrainMeshBuilder, decodeTerrainHeightmap } from '../terrain-mesh-builder.js';
 import { applyTerrainAvailabilityStatus } from '../terrain-status-controller.js';
-import { collectTerrainDebugMeshes, createTerrainHoverOutlineController, createTerrainMapGridController, summarizeTerrainMesh, terrainSeamColorForTile } from '../terrain-debug-runtime.js';
+import { analyzeTerrainSeams, collectTerrainDebugMeshes, createTerrainHoverOutlineController, createTerrainMapGridController, formatTerrainSeamDiagnostic, summarizeTerrainMesh } from '../terrain-debug-runtime.js';
 import { createTerrainFetchRuntime } from '../terrain-fetch-runtime.js';
 import { restoreTerrainCameraState, terrainCameraState } from '../terrain-camera-state.js';
 import { createTerrainClientLogger } from '../terrain-client-logging.js';
@@ -1217,6 +1216,7 @@ test('shared terrain mesh builder preserves heightmap geometry and metadata', ()
     10, 20, 2, 10, 20, -58,
   ]);
   assert.equal(mesh.userData.tileId, '1-2-3');
+  assert.equal(mesh.userData.resolution, 2);
   assert.deepEqual([...scatterHeightmap], [1, 2, 3, 4]);
 });
 
@@ -1273,38 +1273,52 @@ test('shared terrain hover outline owns replacement and cleanup', () => {
   assert.equal(changes, 2);
 });
 
-test('map grid uses the exact rendered mesh bounds', () => {
+test('seam grid colors shared edges by measured failure and reports both tiles', () => {
   const root = {
     children: [],
     add(child) { this.children.push(child); },
     remove(child) { this.children = this.children.filter(item => item !== child); },
   };
   const grid = createTerrainMapGridController({ terrainRoot: root });
+  const build = createTerrainMeshBuilder({ exaggeration: 1, attachScatter() {} });
+  const encoded = values => Buffer.from(new Float32Array(values).buffer).toString('base64');
   const meshes = [
-    { userData: { tileId: '11-1-1', bbox: [0, 0, 8, 8] } },
-    { userData: { tileId: '12-2-2', bbox: [8, 0, 12, 4] } },
+    build({ id: '11-1-1', resolution: 2, bbox: [0, 0, 8, 8], heightmap: encoded([0, 0, 0, 0]) }),
+    build({ id: '12-2-2', resolution: 2, bbox: [8, 0, 12, 4], heightmap: encoded([2, 2, 2, 2]) }),
   ];
   grid.setVisible(true);
   assert.equal(grid.update(meshes), true);
-  assert.equal(grid.lines.geometry.attributes.position.count, 16);
-  assert.equal(grid.lines.geometry.attributes.color.count, 16);
+  assert.equal(grid.lines.geometry.attributes.position.count, 2);
+  assert.equal(grid.lines.geometry.attributes.color.count, 2);
   assert.equal(grid.lines.material.vertexColors, true);
   assert.equal(grid.lines.material.toneMapped, false);
   assert.equal(grid.lines.material.depthWrite, false);
-  const colors = grid.lines.geometry.attributes.color;
-  const depth11 = new Color(terrainSeamColorForTile('11-1-1'));
-  const depth12 = new Color(terrainSeamColorForTile('12-2-2'));
-  assert.ok(Math.abs(colors.getX(0) - depth11.r) < 1e-6);
-  assert.ok(Math.abs(colors.getY(0) - depth11.g) < 1e-6);
-  assert.ok(Math.abs(colors.getZ(0) - depth11.b) < 1e-6);
-  assert.ok(Math.abs(colors.getX(8) - depth12.r) < 1e-6);
-  assert.notEqual(terrainSeamColorForTile('11-1-1'), terrainSeamColorForTile('12-2-2'));
+  assert.equal(grid.diagnostics.length, 1);
+  assert.equal(grid.diagnostics[0].severity, 'bad');
+  assert.equal(grid.diagnostics[0].maxHeightGap, 2);
+  assert.equal(grid.diagnostics[0].depthDelta, 1);
+  assert.match(formatTerrainSeamDiagnostic(grid.diagnosticsForTile('11-1-1')[0]), /12-2-2.*2\.00m gap.*cross-LOD/);
+  assert.match(formatTerrainSeamDiagnostic(grid.diagnosticsForTile('12-2-2')[0]), /11-1-1.*2\.00m gap.*cross-LOD/);
   assert.equal(grid.lines.visible, true);
   assert.equal(grid.update(meshes), false);
   grid.setVisible(false);
   assert.equal(grid.lines.visible, false);
   grid.dispose();
   assert.equal(root.children.length, 0);
+});
+
+test('seam analysis leaves aligned geometry quiet and detects normal-only seams', () => {
+  const build = createTerrainMeshBuilder({ exaggeration: 1, attachScatter() {} });
+  const encoded = values => Buffer.from(new Float32Array(values).buffer).toString('base64');
+  const flat = build({ id: '12-0-0', resolution: 2, bbox: [0, 0, 1, 1], heightmap: encoded([0, 0, 0, 0]) });
+  const aligned = build({ id: '12-1-0', resolution: 2, bbox: [1, 0, 2, 1], heightmap: encoded([0, 0, 0, 0]) });
+  assert.equal(analyzeTerrainSeams([flat, aligned])[0].severity, 'healthy');
+
+  const slope = build({ id: '12-1-0', resolution: 2, bbox: [1, 0, 2, 1], heightmap: encoded([0, 10, 0, 10]) });
+  const seam = analyzeTerrainSeams([flat, slope])[0];
+  assert.equal(seam.maxHeightGap, 0);
+  assert.equal(seam.severity, 'bad');
+  assert.ok(seam.maxNormalAngle > 20);
 });
 
 test('shared fetch runtime preserves initial response transition ordering', async () => {

@@ -136,6 +136,7 @@ export function createTerrainMeshBuilder({ exaggeration, attachScatter }) {
     Object.assign(mesh.userData, {
       tileId: tile.id,
       bbox: tile.bbox,
+      resolution,
       skirtDepth,
       terrainColorAttribute,
       classifierColorAttribute,

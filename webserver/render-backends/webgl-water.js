@@ -179,6 +179,7 @@ const WATER_FRAGMENT = /* glsl */ `
                                // palette against this pipeline's AGX exposure
   uniform float uOpacity;      // base veil opacity of the surface body
   uniform float uReflect;      // sky-reflection gain (fjord walls occlude sky)
+  uniform float uGlintStrength; // direct-sun glitter gain
   uniform sampler2D uBathy;    // top-down capture: R = local z, G = image brightness
   uniform vec2 uBathyCenter;
   uniform float uBathyExtent;
@@ -533,9 +534,9 @@ const WATER_FRAGMENT = /* glsl */ `
     // cannot know about. The terrain imagery contains the cliff shadows the
     // reflection model lacks, so dark water suppresses the entire analytic
     // reflection—not only the narrow direct-sun glint.
-    // Apply the requested two-thirds reduction at final composition, after
-    // all HDR reflection sources have been evaluated. Reducing only the sun
-    // disk or only GGX still lets the other path tone-map to the same white.
+    // Keep the analytic sky reflection subdued so it does not bleach the
+    // satellite water colour. Direct-sun glint is intentionally separate:
+    // when sun, wave normal, and eye align it must retain its HDR peak.
     const float reflectionGain = 0.333333;
     float refl = fresnel * uReflect * bottomReflection * ambientReflection
                * bakedCliffVisibility * reflectionGain;
@@ -559,7 +560,7 @@ const WATER_FRAGMENT = /* glsl */ `
     // Cliff occlusion is absent from the analytic sun model. The satellite
     // image already contains the desired shadowed-water colour, so use its
     // darkness as the cheap local occlusion proxy for direct sun glint.
-    accum += spec * bottomReflection * northCliffReflection * reflectionGain;
+    accum += spec * bottomReflection * northCliffReflection * uGlintStrength;
 
     // no in-shader haze: scene fog + the aerial perspective pass own that
     gl_FragColor = vec4(accum * uRadiance, clamp(a, 0.0, 1.0));
@@ -601,6 +602,7 @@ export function createWebGLWater({
     uRadiance: { value: 1 },
     uOpacity: { value: 0 },
     uReflect: { value: 0.4 },
+    uGlintStrength: { value: 1 },
     uBathy: { value: null },
     uBathyCenter: { value: new THREE.Vector2() },
     uBathyExtent: { value: bathyExtent },
@@ -732,6 +734,7 @@ export function createWebGLWater({
       uniforms.uRadiance.value = params.radiance;
       uniforms.uOpacity.value = params.opacity;
       uniforms.uReflect.value = params.reflectivity;
+      uniforms.uGlintStrength.value = Math.max(0, params.glintStrength ?? 1);
       uniforms.uAbsorb.value = params.absorption;
       uniforms.uNorthCliffReflectionPadding.value = Math.max(
         0,

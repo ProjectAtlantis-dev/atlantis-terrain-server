@@ -27,7 +27,7 @@ import { createTileHistory, terrainFogDistance, tileDepthFromId } from './terrai
 import { createTextureStreamer, rendererTextureAnisotropy } from './terrain-texture-streamer.js';
 import { evaluateTerrainRefetch, summarizeTerrainCamera, terrainCameraCoordinates, terrainCameraGridPosition, terrainCameraStereoPosition } from './terrain-tile-fetch.js';
 import { applyTerrainAvailabilityStatus } from './terrain-status-controller.js';
-import { collectTerrainDebugMeshes, createTerrainHoverOutlineController, createTerrainMapGridController, summarizeTerrainMesh } from './terrain-debug-runtime.js';
+import { collectTerrainDebugMeshes, createTerrainHoverOutlineController, createTerrainMapGridController, formatTerrainSeamDiagnostic, summarizeTerrainMesh } from './terrain-debug-runtime.js';
 import { createTerrainFetchRuntime } from './terrain-fetch-runtime.js';
 import { createTerrainTileSet } from './terrain-tile-set.js';
 import { createTerrainClassifierRuntime } from './terrain-classifier-runtime.js';
@@ -346,6 +346,24 @@ tileInfoEl.style.cssText = [
 ].join(';');
 document.body.appendChild(tileInfoEl);
 
+const seamLegendEl = document.createElement('div');
+seamLegendEl.setAttribute('aria-label', 'Seam diagnostic legend');
+seamLegendEl.style.cssText = [
+  'position:absolute', 'right:12px', 'bottom:12px', 'display:none', 'z-index:6',
+  'color:#e2e8f0', 'background:rgba(2,6,23,0.88)', 'padding:8px 12px',
+  'border:1px solid #334155', 'border-radius:6px',
+  'font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace',
+  'pointer-events:none',
+].join(';');
+seamLegendEl.innerHTML = [
+  '<b>Shared-edge health</b>',
+  '<span style="color:#ff1744">●</span> bad: &gt;1m height or &gt;20° normals',
+  '<span style="color:#f59e0b">●</span> inspect: &gt;5cm height or &gt;5° normals',
+  '<span style="color:#64748b">●</span> aligned',
+  'Hover a tile for exact edge + neighbor.',
+].join('<br>');
+document.body.appendChild(seamLegendEl);
+
 // --- Atmosphere / Clouds tuning panel ---
 const tuningPanel = document.createElement('div');
 tuningPanel.style.cssText = [
@@ -530,6 +548,10 @@ function buildTuningControls(ap, ce) {
   tuningSlider('water reflect', {
     min: 0, max: 1.5, step: 0.01, value: waterParams.reflectivity,
     onChange: v => { waterParams.reflectivity = v; }
+  });
+  tuningSlider('sun glint', {
+    min: 0, max: 4, step: 0.05, value: waterParams.glintStrength,
+    onChange: v => { waterParams.glintStrength = v; }
   });
   tuningSlider('water absorb', {
     min: 0, max: 0.4, step: 0.005, value: waterParams.absorption,
@@ -1813,6 +1835,7 @@ function syncMapModePresentation() {
   mapLocationMarkerEl.style.display = controls.mapMode && !heatmapActive ? 'block' : 'none';
   renderer.domElement.style.visibility = heatmapActive ? 'hidden' : 'visible';
   tuningPanel.style.display = controls.mapMode ? 'none' : '';
+  seamLegendEl.style.display = controls.seamMode && !heatmapActive ? 'block' : 'none';
 }
 
 function toggleHeatmap() {
@@ -2054,9 +2077,19 @@ renderer.domElement.addEventListener('mousemove', event => {
   const src = texSource.get(info.tileId) || 'none';
   const srcLabel = `<span style="color:#f80">${src || 'no texture'}</span>`;
   const matHex = info.color !== '-' ? info.color : '#ffffff';
+  const seamRows = controls.seamMode ? mapGridController.diagnosticsForTile(info.tileId) : [];
+  const badSeams = seamRows.filter(seam => seam.severity === 'bad').length;
+  const warningSeams = seamRows.filter(seam => seam.severity === 'warning').length;
   tileInfoEl.innerHTML = [
     `<b style="color:${matHex}">${info.tileId}</b>`,
     `tex: ${info.hasTexture ? 'YES' : 'NO'} ${info.textureSize}  source: ${srcLabel}`,
+    controls.seamMode
+      ? `<b>shared edges: ${seamRows.length} · <span style="color:#ff1744">${badSeams} bad</span> · <span style="color:#f59e0b">${warningSeams} inspect</span></b>`
+      : null,
+    ...seamRows.slice(0, 8).map(seam => {
+      const color = seam.severity === 'bad' ? '#ff1744' : seam.severity === 'warning' ? '#f59e0b' : '#94a3b8';
+      return `<span style="color:${color}">${formatTerrainSeamDiagnostic(seam)}</span>`;
+    }),
     `<b>overlaps: ${overlappingMeshes.length}</b>`,
     overlapLines.length > 0 ? overlapLines.join('<br>') : null
   ].filter(Boolean).join('<br>');
