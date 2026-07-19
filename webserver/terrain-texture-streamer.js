@@ -162,6 +162,18 @@ export function createTextureStreamer({
     return Boolean(texture);
   }
 
+  function releaseTileDemand(tileId) {
+    // Ordinary heatmap motion removes scene residency, not cached paint.
+    // Retaining the decoded texture makes a heading reversal an immediate
+    // materialization instead of a grey fetch/decode/repaint cycle.
+    texInflight.get(tileId)?.abort();
+    texInflight.delete(tileId);
+    texFetching.delete(tileId);
+    texRetryAtMs.delete(tileId);
+    texRetryCount.delete(tileId);
+    ancestorLogged.delete(tileId);
+  }
+
   function abortAll() {
     for (const controller of texInflight.values()) controller.abort();
     texInflight.clear();
@@ -191,7 +203,8 @@ export function createTextureStreamer({
 
   return {
     texCache, texSource, texInflight, texFetching, texRetryAtMs, texRetryCount,
-    ancestorLogged, pump, invalidate, releaseTile, abortAll, setRoadDebug,
+    ancestorLogged, pump, invalidate, releaseTile, releaseTileDemand,
+    abortAll, setRoadDebug,
     releaseStaleTexture,
     get roadDebug() { return roadDebug; },
     get version() { return version; },

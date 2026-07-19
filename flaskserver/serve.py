@@ -56,6 +56,42 @@ _UPGRADEABLE_SOURCES = {
 # Tiles we've already tried to fetch and found no COG data (ocean, etc).
 # Seeded from DB on startup, updated as new tiles are discovered.
 _no_data_cache = set()
+LOD_COARSEN_RATIO = 0.75
+
+
+def _lod_complete_ancestors(leaf_ids):
+    """Index previously subdivided tiles in O(leaves * tree depth)."""
+    covered = set()
+    max_depth = 0
+    for tile_id in leaf_ids or ():
+        try:
+            tile_depth, tile_col, tile_row = map(int, tile_id.split('-'))
+        except (AttributeError, TypeError, ValueError):
+            continue
+        covered.add((tile_depth, tile_col, tile_row))
+        max_depth = max(max_depth, tile_depth)
+
+    complete_ancestors = set()
+    for tile_depth in range(max_depth, 0, -1):
+        quadrants_by_parent = {}
+        for depth, col, row in covered:
+            if depth != tile_depth:
+                continue
+            parent = (depth - 1, col // 2, row // 2)
+            quadrants_by_parent.setdefault(parent, set()).add(
+                (col & 1) * 2 + (row & 1)
+            )
+        for parent, quadrants in quadrants_by_parent.items():
+            if len(quadrants) != 4:
+                continue
+            complete_ancestors.add(parent)
+            covered.add(parent)
+    return complete_ancestors
+
+
+def _lod_leaf_descendants_cover(depth, col, row, leaf_ids):
+    """Whether strict descendant leaves completely cover this tile."""
+    return (depth, col, row) in _lod_complete_ancestors(leaf_ids)
 
 
 def load_no_data_cache(db):
@@ -101,46 +137,11 @@ def _distance_to_bbox(x, y, bbox):
     return math.sqrt(dx * dx + dy * dy)
 
 
-def bbox_in_view_oval(qx, qy, heading, bbox, max_range,
-                      forward_scale=2.0):
-    """Return whether a tile intersects the heading-aligned coverage oval.
-
-    The camera sits behind the oval's center, giving it ``max_range`` of
-    coverage behind/abeam and ``forward_scale * max_range`` straight ahead.
-    Projecting the bbox half-extents onto the oval axes makes the test
-    conservative for large quadtree tiles, so boundary tiles are retained.
-    """
+def bbox_in_view_circle(qx, qy, bbox, max_range):
+    """Return whether a tile intersects the heading-independent demand circle."""
     if max_range <= 0:
         return True
-    if not isinstance(heading, (int, float)) or not math.isfinite(heading):
-        return _distance_to_bbox(qx, qy, bbox) <= max_range
-
-    forward_range = max_range * max(1.0, forward_scale)
-    center_offset = (forward_range - max_range) / 2
-    forward_radius = (forward_range + max_range) / 2
-    # Widen the oval just enough that its cross-section through the camera is
-    # max_range. This preserves the old lateral coverage while adding reach.
-    offset_ratio = center_offset / forward_radius
-    side_radius = max_range / math.sqrt(max(1e-9, 1 - offset_ratio ** 2))
-
-    fwd_x, fwd_y = -math.sin(heading), math.cos(heading)
-    side_x, side_y = fwd_y, -fwd_x
-    oval_x = qx + fwd_x * center_offset
-    oval_y = qy + fwd_y * center_offset
-    tile_x = (bbox[0] + bbox[2]) / 2
-    tile_y = (bbox[1] + bbox[3]) / 2
-    half_x = (bbox[2] - bbox[0]) / 2
-    half_y = (bbox[3] - bbox[1]) / 2
-    dx, dy = tile_x - oval_x, tile_y - oval_y
-
-    local_forward = dx * fwd_x + dy * fwd_y
-    local_side = dx * side_x + dy * side_y
-    forward_extent = abs(fwd_x) * half_x + abs(fwd_y) * half_y
-    side_extent = abs(side_x) * half_x + abs(side_y) * half_y
-    forward_gap = max(abs(local_forward) - forward_extent, 0.0)
-    side_gap = max(abs(local_side) - side_extent, 0.0)
-    return ((forward_gap / forward_radius) ** 2
-            + (side_gap / side_radius) ** 2) <= 1.0
+    return _distance_to_bbox(qx, qy, bbox) <= max_range
 
 
 def _fetch_tile(db, tile_id, bbox, allow_overwrite=False):
@@ -213,7 +214,8 @@ def _ensure_children(db, depth, col, row):
 
 
 def _traverse(db, depth, col, row, qx, qy, max_depth, error_threshold,
-              results, missing, max_range=0.0, altitude=0.0, heading=None):
+              results, missing, max_range=0.0, altitude=0.0, heading=None,
+              previous_subdivided=None):
     """Recursive quadtree traversal with error-based LOD.
 
     A tile subdivides if geometric_error / distance > threshold, depth < max_depth,
@@ -222,8 +224,7 @@ def _traverse(db, depth, col, row, qx, qy, max_depth, error_threshold,
     Tiles with real data are added to results. Tiles that are empty but the LOD
     says should have data are added to missing for background fetching.
 
-    max_range: base radius of the coverage oval (meters). With a heading the
-        oval reaches twice as far forward; without one this remains circular.
+    max_range: radius of the heading-independent coverage circle (meters).
     """
     tid = _tile_id(depth, col, row)
     meta = read_tile_metadata(db, tid)
@@ -251,17 +252,15 @@ def _traverse(db, depth, col, row, qx, qy, max_depth, error_threshold,
     if _debug:
         log_trav.debug(f"{tid}: source={meta['source']} real={has_real_data} geo_err={geo_err:.1f} (orig={meta['geometric_error']:.1f})")
 
-    # Coverage cutoff — terrain outside the local view oval is not part of
+    # Coverage cutoff — terrain outside the local demand circle is not part of
     # this response. Boundary-intersecting tiles are retained by the oval
     # test itself, so the requested region still has coarse edge coverage.
     dist_to_tile = _distance_to_bbox(qx, qy, meta['bbox'])
-    in_coverage = bbox_in_view_oval(
-        qx, qy, heading, meta['bbox'], max_range
-    )
+    in_coverage = bbox_in_view_circle(qx, qy, meta['bbox'], max_range)
     if not in_coverage:
         if _debug:
             log_trav.debug(
-                f"{tid}: outside view oval (distance={dist_to_tile:.0f}, "
+                f"{tid}: outside view circle (distance={dist_to_tile:.0f}, "
                 f"base_range={max_range:.0f}), real={has_real_data}"
             )
         return
@@ -284,7 +283,12 @@ def _traverse(db, depth, col, row, qx, qy, max_depth, error_threshold,
         if _debug:
             log_trav.debug(f"{tid}: screen_error={screen_error:.6f} threshold={error_threshold:.6f} dist={dist:.0f}")
 
-        if screen_error > error_threshold:
+        was_subdivided = (depth, col, row) in (previous_subdivided or ())
+        active_threshold = error_threshold * (
+            LOD_COARSEN_RATIO if was_subdivided else 1.0
+        )
+
+        if screen_error > active_threshold:
             # Hard subdivision ceiling for the current terrain dataset.
             if depth >= MAX_TILE_DEPTH:
                 if _debug:
@@ -360,7 +364,7 @@ def _traverse(db, depth, col, row, qx, qy, max_depth, error_threshold,
                 _traverse(
                     db, depth+1, cc, cr, qx, qy, max_depth,
                     error_threshold, results, missing, max_range, altitude,
-                    heading,
+                    heading, previous_subdivided,
                 )
     else:
         if _debug:
@@ -373,12 +377,11 @@ def _traverse(db, depth, col, row, qx, qy, max_depth, error_threshold,
 
 def query_tiles_stereo(db, qx, qy, error_threshold=0.001, max_depth=None,
                        max_range=0.0, log=print, altitude=0.0,
-                       heading=None, preview=False):
+                       heading=None, preview=False, lod_history=None):
     """Query tiles using error-based LOD with stereo coords directly.
 
     Same as query_tiles() but takes EPSG:3413 coords instead of lat/lon.
-    max_range: base coverage radius in meters. With heading, coverage extends
-        to twice this distance ahead while retaining this distance elsewhere.
+        max_range: circular coverage radius in meters.
     altitude: camera altitude in meters — increases effective distance to tiles below.
     heading: camera heading in radians (JS convention: 0 = north, positive
     turns west). When given, the missing-tile fetch batch is ordered by view
@@ -386,7 +389,8 @@ def query_tiles_stereo(db, qx, qy, error_threshold=0.001, max_depth=None,
     preview: initial quick-paint pass — keeps the closest-first flood.
     """
     return _query_tiles_impl(db, qx, qy, error_threshold, max_depth, max_range,
-                             log, altitude, heading=heading, preview=preview)
+                             log, altitude, heading=heading, preview=preview,
+                             lod_history=lod_history)
 
 
 def query_tiles(db, lat, lon, error_threshold=0.001, max_depth=None,
@@ -433,7 +437,8 @@ def bbox_view_priority(qx, qy, fwd_x, fwd_y, bbox, forward_scale=2.0):
 
 
 def _query_tiles_impl(db, qx, qy, error_threshold, max_depth, max_range, log,
-                      altitude=0.0, heading=None, preview=False):
+                      altitude=0.0, heading=None, preview=False,
+                      lod_history=None):
     from database import get_metadata
     from collections import Counter
 
@@ -449,9 +454,11 @@ def _query_tiles_impl(db, qx, qy, error_threshold, max_depth, max_range, log,
 
     leaf_ids = []
     missing_raw = []
+    previous_subdivided = _lod_complete_ancestors(lod_history)
     _traverse(
         db, 0, 0, 0, qx, qy, max_depth, error_threshold,
         leaf_ids, missing_raw, max_range, altitude, heading,
+        previous_subdivided,
     )
 
     # Tile budget: if LOD produced too many tiles, drop the deepest/farthest.
@@ -560,6 +567,10 @@ def _query_tiles_impl(db, qx, qy, error_threshold, max_depth, max_range, log,
             f"depths {dict(sorted(miss_depths.items()))}")
     if skip_count:
         log(f"  [NO DATA] {skip_count} tiles known to have no COG data (ocean/cached skip)")
+
+    if lod_history is not None:
+        lod_history.clear()
+        lod_history.update(tile['id'] for tile in results)
 
     return results, missing
 

@@ -16,6 +16,8 @@ import { createWaterPalette, computeWaterPalette } from './water-sky.js';
 // (No foam/whitecap params: the foam system was removed — every presentation
 // read as garbage from altitude. Waves + light only.)
 export const DEFAULT_WATER_PARAMS = {
+  enabled: true,           // hide/pause the dynamic surface when disabled;
+                          // the underlying fjord imagery remains visible
   windSpeed: 13,          // m/s
   windDirection: 90,      // degrees the wind blows toward (90 = east)
   fetchKm: 100,           // wave-growth fetch: sets the JONSWAP peak so a

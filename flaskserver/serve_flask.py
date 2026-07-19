@@ -875,6 +875,7 @@ def _queue_texture_fetch(
 
 
 _api_tiles_state: dict[str, str | None] = {"last_result": None}
+_terrain_lod_history: set[str] = set()
 _last_camera: dict[str, float] | None = None  # last /api/tiles pose, feeds /api/heatmap
 _BUILDING_QUERY_RANGE_M = 25000.0
 
@@ -933,6 +934,7 @@ def api_tiles():
       altitude=alt,
       heading=heading if has_heading else None,
       preview=preview,
+      lod_history=_terrain_lod_history,
       log=lambda msg: log.debug(f"[/api/tiles] {msg}"),
     )
   except Exception as exc:
@@ -1566,7 +1568,7 @@ def api_heatmap():
   import numpy as np
   from database import CONFIDENCE, GRID_N, _decompress_uint8
   from tiles import build_lod_tree, get_leaves
-  from serve import bbox_in_view_oval
+  from serve import bbox_in_view_circle
 
   cam = _last_camera
   if cam is None:
@@ -1590,8 +1592,8 @@ def api_heatmap():
   # expose the coarse leaves covering the rest of Greenland's root quadtree.
   leaves = [
     leaf for leaf in get_leaves(root)
-    if bbox_in_view_oval(
-      qx, qy, heading,
+    if bbox_in_view_circle(
+      qx, qy,
       [leaf.center[0], leaf.center[1], leaf.center[0], leaf.center[1]],
       max_range,
     )

@@ -197,7 +197,7 @@ const mapCam = new THREE.OrthographicCamera(-1, 1, 1, -1, 1, MAP_CAM_ALT + 5000)
 mapCam.up.copy(north);
 mapCam.layers.enable(0);
 const DEFAULT_MAP_ZOOM = 20000;
-// Enough headroom to inspect the complete local forward coverage oval.
+// Enough headroom to inspect the complete local coverage circle.
 const MAX_MAP_ZOOM = 100000;
 
 const controls = {
@@ -211,7 +211,7 @@ const controls = {
   mapZoom: DEFAULT_MAP_ZOOM,
   mapPanEast: 0,
   mapPanNorth: 0,
-  terrainRange: 20000,
+  terrainRange: 30000,
   keys: {}
 };
 const terrainViewForward = new THREE.Vector3();
@@ -360,11 +360,17 @@ tuningPanel.addEventListener('change', requestRender);
 
 const tuningHeader = document.createElement('div');
 tuningHeader.style.cssText = 'padding:8px 12px;cursor:pointer;display:flex;justify-content:space-between;align-items:center';
-tuningHeader.innerHTML = '<span>Atmosphere</span><span id="tuning-toggle">&#9660;</span>';
+tuningHeader.innerHTML = '<span>Scene settings</span><span id="tuning-toggle">&#9660;</span>';
 tuningPanel.appendChild(tuningHeader);
 
 const tuningBody = document.createElement('div');
-tuningBody.style.cssText = 'padding:0 12px 10px;display:none';
+tuningBody.style.cssText = [
+  'padding:0 12px 10px',
+  'display:none',
+  'max-height:calc(100vh - 70px)',
+  'overflow-y:auto',
+  'overscroll-behavior:contain'
+].join(';');
 tuningPanel.appendChild(tuningBody);
 
 let tuningPanelOpen = false;
@@ -477,6 +483,10 @@ function buildTuningControls(ap, ce) {
   }
   if (waterRuntime.enabled) {
   tuningSectionLabel('Water');
+  tuningToggle('dynamic water', {
+    value: waterParams.enabled,
+    onChange: v => { waterParams.enabled = v; }
+  });
   tuningSlider('wind speed', {
     min: 1, max: 28, step: 0.1, value: waterParams.windSpeed,
     decimals: 1,
@@ -1195,19 +1205,13 @@ const TERRAIN_DEMAND_HEADING_THRESHOLD = 2 * Math.PI / 180;
 const TERRAIN_DEMAND_HEADING_SETTLE_MS = 200;
 
 function commitTerrainDemandHeading(previousHeading, heading) {
-  textureStreamer.abortAll();
-  terrainTileSet.resetTextureApplications();
-  // A rotated oval exposes new horizon ground, so establish complete coarse
-  // coverage before resuming the budgeted full-detail pass.
-  terrainFetchRuntime.reset(1);
-  terrainPipelineState.lastTiles = null;
-  terrainPipelineState.heightmapsMissing = 0;
-  terrainPipelineState.heightmapsDownloading = 0;
-  terrainPipelineState.lastFetchTriggerMs = performance.now();
+  // Circular geometry demand is heading-independent. Turning only reranks
+  // paint within the existing footprint; it must not rebuild tile residency.
+  terrainTileSet.refreshTextures();
   enqueueClientLog('info', 'terrainDemand.heading.reset', {
     previousHeading, heading,
   });
-  terrainFetchRuntime.request();
+  requestRender();
 }
 const terrainHeadingDemand = createTerrainHeadingDemandController({
   initialHeading: initialTerrainDemandHeading,
@@ -2062,7 +2066,7 @@ function render() {
   // Keep classifier colors—including the effective-water pink—unobstructed.
   waterRuntime.update({
     dt, camera,
-    visible: !controls.mapMode && !classifierRuntime.active,
+    visible: waterParams.enabled && !controls.mapMode && !classifierRuntime.active,
   });
 
   // Terrain streaming: check if camera moved far enough to re-fetch

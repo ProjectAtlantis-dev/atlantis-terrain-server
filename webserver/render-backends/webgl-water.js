@@ -159,6 +159,7 @@ const WATER_FRAGMENT = /* glsl */ `
   uniform float uTime;
   uniform vec3 uCameraLocal;
   uniform vec3 uSunDir;        // terrainRoot-local, z up
+  uniform vec3 uBakedSunDir;   // fixed southern light implied by the imagery
   uniform vec3 uSunColor;
   uniform vec3 uZenithColor;
   uniform vec3 uHorizonColor;
@@ -173,7 +174,7 @@ const WATER_FRAGMENT = /* glsl */ `
                                // palette against this pipeline's AGX exposure
   uniform float uOpacity;      // base veil opacity of the surface body
   uniform float uReflect;      // sky-reflection gain (fjord walls occlude sky)
-  uniform sampler2D uBathy;    // top-down terrain-height capture (R = local z)
+  uniform sampler2D uBathy;    // top-down capture: R = local z, G = image brightness
   uniform vec2 uBathyCenter;
   uniform float uBathyExtent;
   uniform float uBathyTexel;   // world metres per bathy texel
@@ -228,11 +229,36 @@ const WATER_FRAGMENT = /* glsl */ `
 
   // local terrain height under the water plane; -10 m (the synthetic fjord
   // floor) wherever the capture has no coverage
-  float seabedAt(vec2 p) {
+  vec4 bathyAt(vec2 p) {
     vec2 uv = (p - uBathyCenter) / uBathyExtent + 0.5;
     float inB = step(abs(uv.x - 0.5), 0.5) * step(abs(uv.y - 0.5), 0.5);
     vec4 b = texture2D(uBathy, uv);
-    return mix(-10.0, b.x, b.a * inB);
+    return mix(vec4(-10.0, 0.0, 0.0, 0.0), b, b.a * inB);
+  }
+  float seabedAt(vec2 p) {
+    return bathyAt(p).r;
+  }
+
+  // Cheap, deterministic approximation of the broad shadow implied by the
+  // baked southern light. This deliberately uses only two filtered terrain
+  // samples: full per-pixel horizon tracing starves the terrain texture
+  // streamer and exposes its grey fallbacks while tiles repaint.
+  float bakedShoreVisibility(vec2 p, vec3 ray) {
+    float horizontal = length(ray.xy);
+    if (horizontal < 0.02 || ray.z <= 0.0) return 1.0;
+    vec2 direction = ray.xy / horizontal;
+    float rise = ray.z / horizontal;
+    float nearDistance = uBathyTexel * 6.0;
+    float farDistance = uBathyTexel * 20.0;
+    vec4 nearTerrain = bathyAt(p + direction * nearDistance);
+    vec4 farTerrain = bathyAt(p + direction * farDistance);
+    float nearBlocked = nearTerrain.a
+                      * smoothstep(nearDistance * rise - 12.0,
+                                   nearDistance * rise + 24.0, nearTerrain.r);
+    float farBlocked = farTerrain.a
+                     * smoothstep(farDistance * rise - 20.0,
+                                  farDistance * rise + 40.0, farTerrain.r);
+    return 1.0 - max(nearBlocked, farBlocked * 0.75);
   }
 
   // anisotropic GGX in the surface tangent frame (T = along wind)
@@ -251,8 +277,14 @@ const WATER_FRAGMENT = /* glsl */ `
 
     // ---- water column depth from the bathymetry capture -------------------
     // The surface sits at local z = 0, so column depth is just -seabed.
-    float seabed = seabedAt(pxy);
+    vec4 bathySample = bathyAt(pxy);
+    float seabed = bathySample.r;
     float colDepth = clamp(-seabed, 0.0, 60.0);
+    // Luminance is a poor darkness proxy for blue fjord water because it
+    // heavily discounts the blue channel. Only call a pixel black when all
+    // three channels are nearly absent. In linear space this begins restoring
+    // reflection above ~2% sRGB and reaches full strength around ~17% sRGB.
+    float bottomReflection = smoothstep(0.0005, 0.025, bathySample.g) * bathySample.a;
 
     // Wall detection: the open fjord floor is a flat synthetic -10 m plane —
     // the only steep thing under the surface is the artificial mask-drop wall
@@ -343,7 +375,29 @@ const WATER_FRAGMENT = /* glsl */ `
     // pull rough reflections toward the open-sky average — gently, or facet
     // shading vanishes at distance and waves read as smooth mounds
     vec3 Rr = normalize(mix(R, vec3(0.0, 0.0, 1.0), rough * 0.25));
-    vec3 skyRefl = skyColor(Rr, L, uHorizonColor, uHorizonCool, uZenithColor, uSunColor * 0.4, uCloud);
+    vec3 skyRefl = skyColor(Rr, L, uHorizonColor, uHorizonCool, uZenithColor,
+                            uSunColor * 0.4, uCloud);
+
+    // The analytic dome has no horizon occlusion and its daylight anti-sun
+    // side is still bright enough to bleach the satellite water colour.
+    // Preserve that colour when the sun is behind the viewer (R points away
+    // from the sun), then open the reflection toward the sun where the real
+    // circumsolar sky and glint should turn the surface white.  At high sun
+    // there is no meaningful horizontal sun direction, so retain a small,
+    // neutral sky contribution instead of choosing an unstable azimuth.
+    float sunHorizontal = length(L.xy);
+    float reflectedSunAzimuth = dot(normalize(Rr.xy + vec2(1e-5, 0.0)),
+                                    normalize(L.xy + vec2(1e-5, 0.0)));
+    float sunwardSky = smoothstep(-0.35, 0.65, reflectedSunAzimuth);
+    float ambientReflection = mix(0.06, 1.0, sunwardSky);
+    ambientReflection = mix(0.12, ambientReflection,
+                            smoothstep(0.08, 0.25, sunHorizontal));
+    // Two suns deliberately coexist here. The satellite terrain already has
+    // shadows baked from a fixed light in the southern sky, while L is the
+    // astronomical sun used by the atmosphere and live glint. The broad dark
+    // water below the baked cliff shadow must follow the former; otherwise it
+    // changes with time of day and contradicts the photographic terrain.
+    float bakedCliffVisibility = bakedShoreVisibility(pxy, uBakedSunDir);
 
     // sun glint (GGX lobe, HDR)
     vec3 H = normalize(L + V);
@@ -391,21 +445,37 @@ const WATER_FRAGMENT = /* glsl */ `
     // Beer-Lambert veil from the water column, gated to the mask-drop walls:
     // shallow shore water stays glass-clear so the imagery shows, and the
     // wall band fades out with depth instead of standing naked behind a
-    // transparent surface. The gate matters: ungated, the uniform -10 m
+    // transparent surface. This is extinction only: feeding its weight into
+    // the sky-lit body colour creates an opaque cyan ribbon along the shore.
+    // Cap it so even a full-depth mask wall only darkens rather than becoming
+    // a replacement surface. The gate matters: ungated, the uniform -10 m
     // floor made the veil a de facto 40% opacity over EVERY open-water
     // pixel, replacing the satellite colour with the shader's own sky-lit
     // teal — exactly the veil light the design forbids.
-    float veil = wall * (1.0 - exp(-uAbsorb * colDepth));
+    float veil = wall * (1.0 - exp(-uAbsorb * colDepth)) * 0.35;
     float bodyW = uOpacity + veil * (1.0 - uOpacity);
 
     // Reflection gain < 1 stands in for the sky occlusion the analytic dome
-    // cannot know about: shadowed fjord walls reflect rock, not bright sky.
-    float refl = fresnel * uReflect;
+    // cannot know about. The terrain imagery contains the cliff shadows the
+    // reflection model lacks, so dark water suppresses the entire analytic
+    // reflection—not only the narrow direct-sun glint.
+    // Apply the requested two-thirds reduction at final composition, after
+    // all HDR reflection sources have been evaluated. Reducing only the sun
+    // disk or only GGX still lets the other path tone-map to the same white.
+    const float reflectionGain = 0.333333;
+    float refl = fresnel * uReflect * bottomReflection * ambientReflection
+               * bakedCliffVisibility * reflectionGain;
     float a = bodyW + refl * (1.0 - bodyW);
-    vec3 accum = body * bodyW + skyRefl * refl;
+    // Only the explicit surface opacity emits body colour. The extra wall
+    // alpha carries no radiance, so premultiplied blending uses it to darken
+    // the terrain underneath instead of painting the wall cyan.
+    vec3 accum = body * uOpacity + skyRefl * refl;
 
     // sun glint: pure added light
-    accum += spec;
+    // Cliff occlusion is absent from the analytic sun model. The satellite
+    // image already contains the desired shadowed-water colour, so use its
+    // darkness as the cheap local occlusion proxy for direct sun glint.
+    accum += spec * bottomReflection * reflectionGain;
 
     // no in-shader haze: scene fog + the aerial perspective pass own that
     gl_FragColor = vec4(accum * uRadiance, clamp(a, 0.0, 1.0));
@@ -431,6 +501,9 @@ export function createWebGLWater({
     uMeshOffset: { value: new THREE.Vector2() },
     uCameraLocal: { value: new THREE.Vector3() },
     uSunDir: { value: new THREE.Vector3(0, 0, 1) },
+    // Match procgen/library.ts's fixed baked-light convention. Water local is
+    // east/north/up, so negative y places this implied sun in the south.
+    uBakedSunDir: { value: new THREE.Vector3(0.33, -0.5, 0.8).normalize() },
     uSunColor: { value: new THREE.Color() },
     uZenithColor: { value: new THREE.Color() },
     uHorizonColor: { value: new THREE.Color() },
@@ -488,20 +561,43 @@ export function createWebGLWater({
   // -z, so view z recovers local height as uCamH + mvPosition.z regardless
   // of the ECEF model transforms.
   const bathyMaterial = new THREE.ShaderMaterial({
-    uniforms: { uCamH: { value: BATHY_CAM_H } },
+    uniforms: {
+      uCamH: { value: BATHY_CAM_H },
+      uMap: { value: null },
+      uUseMap: { value: 0 },
+      uUseVertexColor: { value: 0 },
+      uMaterialColor: { value: new THREE.Color(1, 1, 1) },
+    },
     vertexShader: /* glsl */ `
       varying float vZ;
+      varying vec2 vUv;
+      varying vec3 vColor;
       void main() {
         vec4 mv = modelViewMatrix * vec4(position, 1.0);
         vZ = mv.z;
+        vUv = uv;
+        vColor = color;
         gl_Position = projectionMatrix * mv;
       }
     `,
     fragmentShader: /* glsl */ `
       varying float vZ;
+      varying vec2 vUv;
+      varying vec3 vColor;
       uniform float uCamH;
-      void main() { gl_FragColor = vec4(uCamH + vZ, 0.0, 0.0, 1.0); }
+      uniform sampler2D uMap;
+      uniform float uUseMap;
+      uniform float uUseVertexColor;
+      uniform vec3 uMaterialColor;
+      void main() {
+        vec3 imageColor = uMaterialColor;
+        if (uUseMap > 0.5) imageColor *= texture2D(uMap, vUv).rgb;
+        if (uUseVertexColor > 0.5) imageColor *= vColor;
+        float brightness = max(max(imageColor.r, imageColor.g), imageColor.b);
+        gl_FragColor = vec4(uCamH + vZ, brightness, 0.0, 1.0);
+      }
     `,
+    vertexColors: true,
     depthTest: false,
     depthWrite: false,
   });
@@ -562,6 +658,20 @@ export function createWebGLWater({
       renderer.getClearColor(prevClearColor);
       const prevVisible = mesh.visible;
       const restoreTerrainTiles = prepareBathymetryTerrainTiles(terrainRoot);
+      const renderCallbacks = [];
+      for (const tile of terrainRoot.children) {
+        if (!tile.isMesh || !/^\d+-\d+-\d+$/.test(tile.userData?.tileId ?? '')) continue;
+        const previous = tile.onBeforeRender;
+        renderCallbacks.push([tile, previous]);
+        tile.onBeforeRender = (...args) => {
+          previous?.apply(tile, args);
+          const source = tile.material;
+          bathyMaterial.uniforms.uMap.value = source.map;
+          bathyMaterial.uniforms.uUseMap.value = source.map ? 1 : 0;
+          bathyMaterial.uniforms.uUseVertexColor.value = source.vertexColors ? 1 : 0;
+          bathyMaterial.uniforms.uMaterialColor.value.copy(source.color);
+        };
+      }
       scene.overrideMaterial = bathyMaterial;
       scene.background = null;
       mesh.visible = false;
@@ -578,6 +688,7 @@ export function createWebGLWater({
         scene.background = prevBackground;
         mesh.visible = prevVisible;
         renderer.sortObjects = prevSortObjects;
+        for (const [tile, callback] of renderCallbacks) tile.onBeforeRender = callback;
         restoreTerrainTiles();
       }
       uniforms.uBathyCenter.value.set(centerXY.x, centerXY.y);

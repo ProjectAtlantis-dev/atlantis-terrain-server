@@ -4,7 +4,11 @@ import math
 import unittest
 from unittest.mock import patch
 
-from serve import _traverse, bbox_in_view_oval, bbox_view_priority
+from serve import (
+    _lod_complete_ancestors, _lod_leaf_descendants_cover, _traverse,
+    bbox_in_view_circle,
+    bbox_view_priority,
+)
 
 
 def _bbox_at(cx, cy, size=100.0):
@@ -44,41 +48,50 @@ class TestBboxViewPriority(unittest.TestCase):
         self.assertAlmostEqual(diagonal, expected, places=6)
 
 
-class TestViewCoverageOval(unittest.TestCase):
-    def test_extends_twice_as_far_ahead(self):
-        self.assertTrue(bbox_in_view_oval(
-            0, 0, 0.0, _bbox_at(0, 1900, 10), 1000
-        ))
-        self.assertFalse(bbox_in_view_oval(
-            0, 0, 0.0, _bbox_at(0, 2100, 10), 1000
-        ))
+class TestViewCoverageCircle(unittest.TestCase):
+    def test_lod_history_requires_complete_descendant_coverage(self):
+        complete = {'12-20-40', '12-21-40', '12-20-41', '12-21-41'}
+        self.assertTrue(_lod_leaf_descendants_cover(11, 10, 20, complete))
+        complete.remove('12-21-41')
+        self.assertFalse(_lod_leaf_descendants_cover(11, 10, 20, complete))
 
-    def test_preserves_rear_and_lateral_range(self):
-        for x, y in ((0, -900), (900, 0), (-900, 0)):
-            self.assertTrue(bbox_in_view_oval(
-                0, 0, 0.0, _bbox_at(x, y, 10), 1000
+    def test_traversal_uses_a_lower_threshold_to_coarsen(self):
+        parent = {
+            'source': 'arcticdem', 'bbox': [100, 0, 200, 100],
+            'geometric_error': 0.08,
+        }
+        child = {
+            'source': 'arcticdem', 'bbox': [100, 0, 150, 50],
+            'geometric_error': 0.01,
+        }
+        previous = {'12-20-40', '12-21-40', '12-20-41', '12-21-41'}
+
+        def metadata(_db, tile_id):
+            return parent if tile_id == '11-10-20' else child
+
+        without_history, with_history = [], []
+        with patch('serve.read_tile_metadata', side_effect=metadata):
+            _traverse(
+                None, 11, 10, 20, 0, 0, 12, 0.001,
+                without_history, [], max_range=1000,
+            )
+            _traverse(
+                None, 11, 10, 20, 0, 0, 12, 0.001,
+                with_history, [], max_range=1000,
+                previous_subdivided=_lod_complete_ancestors(previous),
+            )
+        self.assertEqual(without_history, ['11-10-20'])
+        self.assertEqual(set(with_history), previous)
+
+    def test_uses_the_configured_radius_in_every_direction(self):
+        for x, y in ((0, 900), (0, -900), (900, 0), (-900, 0)):
+            self.assertTrue(bbox_in_view_circle(
+                0, 0, _bbox_at(x, y, 10), 1000
             ))
-        for x, y in ((0, -1100), (1100, 0), (-1100, 0)):
-            self.assertFalse(bbox_in_view_oval(
-                0, 0, 0.0, _bbox_at(x, y, 10), 1000
+        for x, y in ((0, 1100), (0, -1100), (1100, 0), (-1100, 0)):
+            self.assertFalse(bbox_in_view_circle(
+                0, 0, _bbox_at(x, y, 10), 1000
             ))
-
-    def test_rotates_with_heading(self):
-        # Positive pi/2 faces west (-X).
-        self.assertTrue(bbox_in_view_oval(
-            0, 0, math.pi / 2, _bbox_at(-1900, 0, 10), 1000
-        ))
-        self.assertFalse(bbox_in_view_oval(
-            0, 0, math.pi / 2, _bbox_at(1900, 0, 10), 1000
-        ))
-
-    def test_missing_heading_retains_circular_fallback(self):
-        self.assertTrue(bbox_in_view_oval(
-            0, 0, None, _bbox_at(0, 900, 10), 1000
-        ))
-        self.assertFalse(bbox_in_view_oval(
-            0, 0, None, _bbox_at(0, 1100, 10), 1000
-        ))
 
     def test_traversal_does_not_return_greenland_wide_outside_parent(self):
         metadata = {

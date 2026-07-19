@@ -598,15 +598,16 @@ test('shared reconciler spends dirty-paint budget in heatmap order', () => {
   });
 });
 
-test('preview reconciliation completes coarse coverage beyond the build budget', () => {
+test('preview reconciliation completes heatmap coverage beyond the build budget', () => {
   const built = [];
+  const deferredTiles = new Map();
   const terrainRoot = {
     children: [],
     add(mesh) { this.children.push(mesh); },
   };
   const reconcile = createTerrainTileReconciler({
     terrainRoot,
-    deferredTiles: new Map(),
+    deferredTiles,
     lifecycle: { sweepStaleParents: () => 0 },
     priorityForTile: tile => tile.priority,
     textureCache: new Map(),
@@ -627,6 +628,7 @@ test('preview reconciliation completes coarse coverage beyond the build budget',
     { id: 'far', bbox: [10, 10, 11, 11], heightmap: 'hm', priority: 2 },
   ], new Set(), { completeCoverage: true });
   assert.deepEqual(built, ['near', 'far']);
+  assert.deepEqual([...deferredTiles.keys()], ['near', 'far']);
   assert.equal(terrainRoot.children.length, 2);
 });
 
@@ -674,6 +676,56 @@ test('reconciliation releases old heatmap tiles but retains a complete fallback 
   assert.deepEqual(releasedTextures, ['8-10-10']);
   assert.deepEqual(terrainRoot.children, [parent]);
   assert.equal(result.released, 1);
+});
+
+test('textured parent remains while demanded children are untextured', () => {
+  const parent = {
+    isMesh: true,
+    userData: { tileId: '11-10-20', bbox: [0, 0, 8, 8] },
+    material: { map: {}, dispose() {} },
+    geometry: { dispose() {} },
+    children: [],
+  };
+  const terrainRoot = {
+    children: [parent],
+    add(mesh) { this.children.push(mesh); },
+    remove(mesh) { this.children = this.children.filter(item => item !== mesh); },
+  };
+  const lifecycle = createTileLifecycle({
+    terrainRoot, disposeScatter: () => {}, log: () => {},
+  });
+  const children = [
+    { id: '12-20-40', bbox: [0, 0, 4, 4], heightmap: 'water' },
+    { id: '12-21-40', bbox: [4, 0, 8, 4], heightmap: 'water' },
+    { id: '12-20-41', bbox: [0, 4, 4, 8], heightmap: 'water' },
+    { id: '12-21-41', bbox: [4, 4, 8, 8], heightmap: 'water' },
+  ];
+
+  const result = reconcileTerrainTiles({
+    tiles: children,
+    currentTileIds: new Set([parent.userData.tileId]),
+    deferredTiles: new Map(),
+    terrainRoot,
+    lifecycle,
+    priorityForTile: () => 0,
+    textureCache: new Map(),
+    materialize() {},
+    buildMesh: tile => ({
+      isMesh: true,
+      userData: { tileId: tile.id, bbox: tile.bbox },
+      material: { map: null, dispose() {} },
+      geometry: { dispose() {} },
+      children: [],
+    }),
+    prepareUntexturedMesh() {},
+    log() {},
+    buildBudget: 4,
+  });
+
+  assert.deepEqual(
+    terrainRoot.children.map(mesh => mesh.userData.tileId).sort(),
+    [parent.userData.tileId],
+  );
 });
 
 test('terrain tile set owns reconciliation, scene residency, and texture demand', () => {
@@ -736,6 +788,48 @@ test('terrain tile set owns reconciliation, scene residency, and texture demand'
   assert.equal(terrainRoot.children[0].material.map.desaturated, true);
   assert.equal(tileSet.setClassifierMode(false), false);
   assert.equal(terrainRoot.children[0].material.map, baseTexture);
+});
+
+test('terrain tile set does not queue excess geometry on animation frames', () => {
+  const frames = [];
+  const terrainRoot = {
+    children: [],
+    add(mesh) { this.children.push(mesh); },
+    remove(mesh) { this.children = this.children.filter(child => child !== mesh); },
+  };
+  const tileSet = createTerrainTileSet({
+    terrainRoot,
+    textureStreamer: {
+      texCache: new Map(), texSource: new Map(), pump() {}, releaseTile() {},
+    },
+    terrain: {},
+    renderBackend: { kind: 'webgl', prepareUntexturedTerrain() {} },
+    view: { controls: { mapMode: false } },
+    log() {},
+    testOverrides: {
+      buildBudget: 1,
+      scheduleFrame: callback => frames.push(callback),
+      priorityForTile: tile => tile.priority,
+      getVisibilityDistance: () => 1000,
+      buildMesh: tile => ({
+        isMesh: true,
+        children: [],
+        userData: { tileId: tile.id, bbox: tile.bbox },
+        material: { map: null, color: { set() {} }, dispose() {} },
+        geometry: { dispose() {} },
+      }),
+    },
+  });
+  const tiles = [
+    { id: '8-0-0', bbox: [0, 0, 1, 1], heightmap: 'hm', priority: 1 },
+    { id: '8-1-0', bbox: [1, 0, 2, 1], heightmap: 'hm', priority: 2 },
+  ];
+  tileSet.reconcile(tiles, { completeCoverage: true });
+  assert.deepEqual(
+    terrainRoot.children.map(mesh => mesh.userData.tileId),
+    ['8-0-0', '8-1-0'],
+  );
+  assert.equal(frames.length, 0);
 });
 
 test('terrain origin and pipeline decisions preserve two-pass behavior', () => {
@@ -1424,6 +1518,16 @@ test('flushing texture work always advances the server demand generation', () =>
   streamer.abortAll();
   assert.ok(firstFlush > initial);
   assert.ok(streamer.version > firstFlush);
+});
+
+test('leaving heading demand retains cached paint for immediate reuse', () => {
+  const streamer = createTextureStreamer({ log: () => {} });
+  const texture = { dispose() { assert.fail('cached paint must not be disposed'); } };
+  streamer.texCache.set('11-10-20', texture);
+  streamer.texSource.set('11-10-20', 'dataforsyningen');
+  streamer.releaseTileDemand('11-10-20');
+  assert.equal(streamer.texCache.get('11-10-20'), texture);
+  assert.equal(streamer.texSource.get('11-10-20'), 'dataforsyningen');
 });
 
 test('road debug invalidates cached variants and marks texture requests', async () => {
