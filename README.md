@@ -45,11 +45,16 @@ Real imagery down to depth 12, invented detail below it.
 3. Dataforsyningen WMS requires EPSG:3184 (not 3413). The fetch reprojects 3413→3184 for the request, then warps the result back to 3413 with Lanczos resampling.
 4. Dataforsyningen runs out of detail around depth 13 (SPOT is 1.6 m/px). Below that, accuracy vs reality stops mattering: **depth 12 already tells us what goes where**. A coarse class map at d12 scale (water / grey / dark slopes & shadows / green / white — see `flaskserver/classifier/storage.py`) is the entire semantic contract.
 
-Coastal terrain uses the public Greenland `Åbent Land` GTK50 map as its
-authoritative land/sea boundary. The raw DEM remains unchanged in the canonical
-`tiles.heightmap` payload. An independent mask in `coastline_masks` is applied
-to a copy when terrain is read or rendered, and the classifier uses the same
-mask to force mapped sea into its water class. This prevents
+Coastal terrain uses the `Åbent Land` GTK50 map as its authoritative land/sea
+boundary, preferring the **1:50k vector edition** (Dataforsyningen Databoks,
+`tidalwater_s` minus `island_s`, sea only — lakes keep their elevation) for any
+area whose 100 km blocks have been downloaded into `flaskserver/gtk50_blocks/`
+via `ingest_coastline.py <block>|--lat/--lon`; elsewhere it falls back to
+decoding the rendered `gl_aabent_land` WMS from `gis.govmin.gl` (set
+`COASTLINE_VECTOR=0` to force the fallback everywhere). The raw DEM remains
+unchanged in the canonical `tiles.heightmap` payload. An independent mask in
+`coastline_masks` is applied to a copy when terrain is read or rendered, and
+the classifier uses the same mask to force mapped sea into its water class. This prevents
 ArcticDEM/Copernicus artifacts from closing fjords or producing islands in open
 water without destroying source elevation samples. The source is served by the
 Government of Greenland at `gis.govmin.gl`; ASIAQ's higher-detail technical
@@ -119,6 +124,8 @@ DATAFORSYNINGEN_TOKEN=<your-token>
 
 To get a free token: [create a user account](https://dataforsyningen.dk/) (click "Log ind" → "Opret Profil"), confirm via email, then log in and go to your profile → "Administrer token til webservice og API'er" to generate a token.
 
+Databoks file downloads (`ftps://ftp.dataforsyningen.dk`, implicit TLS on port 990) use your Dataforsyningen account login rather than the token — set `DATAFORSYNINGEN_FTP_USER` / `DATAFORSYNINGEN_FTP_PASS` in `flaskserver/.env`.
+
 ### Asset Server (TypeScript + SQLite)
 
 The asset server manages vehicles, structures, and their placement via a SQLite database (`assets.db`). It must be running for vehicles and structures to load in the frontend. Still WIP — schema and endpoints may change.
@@ -160,6 +167,7 @@ Scripts log to their respective directories (`runAssetServer.log`, `runFlaskServ
 
 This project uses the following external data sources:
 
+- **Coastline vectors**: Indeholder data fra Klimadatastyrelsen. Dataset: "Åbent Land Grønland" 1:50,000 vector blocks (GL50), downloaded via Dataforsyningen Databoks. Free for commercial and non-commercial use with attribution.
 - **Satellite orthophotos**: Indeholder data fra Klimadatastyrelsen (formerly Styrelsen for Dataforsyning og Infrastruktur). Datasets: "Grønland Satellitfoto" (SPOT 6/7 1.6m regional orthophoto, 0.2m aerial orthophoto). Fetched on demand via [Dataforsyningen WMS](https://dataforsyningen.dk/). Data is free for both commercial and non-commercial use with attribution. [Terms of use](https://dataforsyningen.dk/vilkaar).
 - **Heightmaps (primary)**: [ArcticDEM v4.1](https://www.pgc.umn.edu/data/arcticdem/) 10m mosaic, provided by the Polar Geospatial Center under NSF-OPP awards 1043681, 1559691, and 1542736. CC-BY-4.0, free for commercial use with attribution. Fetched on demand via S3. [Acknowledgement policy](https://www.pgc.umn.edu/guides/stereo-derived-elevation-models/pgc-dem-products-arcticdem-rema-and-earthdem/).
 - **Heightmaps (fallback)**: [Copernicus GLO-30 DEM](https://spacedata.copernicus.eu/collections/copernicus-digital-elevation-model), provided by the European Space Agency. Free for commercial use with attribution. Fetched on demand via S3.

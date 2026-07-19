@@ -267,6 +267,7 @@ _cog_fetching_tiles: set[str] = set()
 _cog_fetched_total = 0      # lifetime count of COG tiles fetched from S3
 _cog_skipped_total = 0      # lifetime count of tiles skipped (already had data)
 _cog_already_fetched: set[str] = set()  # tile IDs we've already fetched this session
+_COG_TILE_WORKERS = max(1, _env_int("COG_TILE_WORKERS", 6))
 
 def _bootstrap_backend() -> None:
   global _backend_ready, _backend_error
@@ -845,6 +846,7 @@ def api_tiles():
 
       def _bg_cog_fetch(missing_list):
         global _cog_fetched_total, _cog_skipped_total
+        db = None
         try:
           from concurrent.futures import ThreadPoolExecutor, as_completed
           from ingest import _read_cog_heightmap, _resample_from_parent
@@ -874,7 +876,7 @@ def api_tiles():
           fetched, no_data_count, parent_resampled_count = 0, 0, 0
           # Collect tiles that COG couldn't resolve for a second-pass parent resample
           cog_failed = []
-          with ThreadPoolExecutor(max_workers=6) as pool:
+          with ThreadPoolExecutor(max_workers=_COG_TILE_WORKERS) as pool:
             futs = {pool.submit(_worker, tid, bbox): tid for tid, bbox in missing_list}
             for fut in as_completed(futs):
               tid = futs[fut]
@@ -944,8 +946,9 @@ def api_tiles():
               no_data_count += 1
 
           log_cog.info(f"Done: {fetched} fetched, {parent_resampled_count} parent-resampled, {no_data_count} no data (session totals: {_cog_fetched_total} fetched, {_cog_skipped_total} skipped)")
-          db.close()
         finally:
+          if db is not None:
+            db.close()
           _cog_fetching_tiles.clear()
           _cog_fetch_lock.release()
 
@@ -1303,23 +1306,22 @@ def api_classifier_tile(tile_id: str):
   depth, col, row = parsed
   found = None
   db = _get_db()
-  while depth >= 0:
+  while found is None:
     candidate_id = f"{depth}-{col}-{row}"
     found = db.execute(
       "SELECT class_schema, width, height, class_map, source "
       "FROM classifier_tiles WHERE tile_id = ?",
       (candidate_id,),
     ).fetchone()
-    if found is not None:
-      break
-    if depth == 0:
-      return Response(
-        b"", status=404,
-        headers={"Cache-Control": "no-store", "X-Classifier-Status": "missing"},
-      )
-    depth -= 1
-    col //= 2
-    row //= 2
+    if found is None:
+      if depth == 0:
+        return Response(
+          b"", status=404,
+          headers={"Cache-Control": "no-store", "X-Classifier-Status": "missing"},
+        )
+      depth -= 1
+      col //= 2
+      row //= 2
 
   class_schema, width, height, class_blob, source = found
   try:

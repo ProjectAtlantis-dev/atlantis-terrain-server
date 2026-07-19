@@ -4,6 +4,7 @@ import test from 'node:test';
 import {
   headingForward2D,
   priorityHeading,
+  viewHeadingChanged,
   terrainTilePriority,
 } from './terrain-priority.js';
 import { compassHeading } from './terrain-hud.js';
@@ -609,7 +610,7 @@ test('terrain tile set owns reconciliation, scene residency, and texture demand'
     terrainRoot,
     textureStreamer,
     terrain: {},
-    renderBackend: {},
+    renderBackend: { prepareUntexturedTerrain() {} },
     view: { controls: { mapMode: false } },
     log() {},
     testOverrides: {
@@ -794,6 +795,25 @@ test('shared fetch runtime rejects overlapping requests', async () => {
     ox: 0, oy: 0, qx: 0, qy: 0, tiles: [], missing: [], downloading: [], texFetching: 0,
   }) });
   await first;
+});
+
+test('shared fetch runtime rejects an HTTP error before terrain reconciliation', async () => {
+  let reportedError = null;
+  const { runtime, state } = createTestFetchRuntime({
+    fetchImpl: async () => ({
+      ok: false,
+      status: 500,
+      json: async () => ({ error: 'database is locked' }),
+    }),
+    events: {
+      onError(error) { reportedError = error; },
+    },
+  });
+  await runtime.request();
+  assert.match(reportedError?.message ?? '', /terrain tile request failed \(500\): database is locked/);
+  assert.equal(state.firstLoad, true);
+  assert.equal(state.lastTiles, null);
+  assert.equal(state.fetching, false);
 });
 
 test('reset aborts the active terrain generation and ignores its completion', async () => {
@@ -1100,6 +1120,15 @@ test('stationary vehicle heading wins over orbiting camera yaw', () => {
   assert.equal(priorityHeading(false, 1.25, -0.75), -0.75);
 });
 
+test('view heading reset detection wraps angles and catches any real motion', () => {
+  const threshold = 2 * Math.PI / 180;
+  assert.equal(viewHeadingChanged(0, Number.EPSILON), true);
+  assert.equal(viewHeadingChanged(0, 1 * Math.PI / 180, threshold), false);
+  assert.equal(viewHeadingChanged(0, 3 * Math.PI / 180, threshold), true);
+  assert.equal(viewHeadingChanged(Math.PI - 0.01, -Math.PI + 0.01, threshold), false);
+  assert.equal(viewHeadingChanged(Math.PI - 0.03, -Math.PI + 0.03, threshold), true);
+});
+
 test('tile ahead of vehicle is hotter than tile behind it', () => {
   const options = {
     cameraX: 0,
@@ -1269,6 +1298,16 @@ test('texture heatmap refines equivalent coverage before coarse parents', () => 
   assert.deepEqual(result.scored.map(item => item.tile.id), [
     '12-1398-780', '11-699-390', '8-87-48', '12-2000-2000',
   ]);
+});
+
+test('flushing texture work always advances the server demand generation', () => {
+  const streamer = createTextureStreamer({ log: () => {} });
+  const initial = streamer.version;
+  streamer.abortAll();
+  const firstFlush = streamer.version;
+  streamer.abortAll();
+  assert.ok(firstFlush > initial);
+  assert.ok(streamer.version > firstFlush);
 });
 
 test('shared texture pump records HTTP 202 retry state', async () => {

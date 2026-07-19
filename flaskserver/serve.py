@@ -81,10 +81,10 @@ def _cache_coastline(db, tile_id, bbox=None):
 
 
 def _mark_official_ocean(db, tile_id):
+    """Record an all-water classification without changing elevation data."""
     now = datetime.datetime.now(datetime.timezone.utc).isoformat()
     db.execute(
-        "UPDATE tiles SET source = 'official_coastline', heightmap = NULL, "
-        "confidence_map = NULL, geometric_error = 0.0, updated_at = ? "
+        "UPDATE tiles SET source = 'official_coastline', updated_at = ? "
         "WHERE tile_id = ?",
         (now, tile_id),
     )

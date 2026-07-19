@@ -18,6 +18,7 @@ from coastline import (
 )
 os.environ.setdefault("DATAFORSYNINGEN_TOKEN", "test-token")
 from database import GRID_N, open_db, read_tile, seed_tiles, write_tile
+from serve import _mark_official_ocean
 
 
 def _png_bytes(rgb):
@@ -100,6 +101,33 @@ class OfficialCoastlineTest(unittest.TestCase):
     def test_network_failure_does_not_create_a_mask(self):
         with patch("coastline._fetch_url", side_effect=OSError("offline")):
             self.assertIsNone(fetch_official_water_mask((0, 0, 1, 1), 2))
+
+    def test_marking_official_ocean_preserves_stored_elevation_payload(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db = open_db(str(Path(directory) / "terrain.db"))
+            seed_tiles(db, max_depth=0)
+            raw = np.full((GRID_N, GRID_N), 37.0, dtype=np.float32)
+            confidence = np.full(raw.shape, 6, dtype=np.uint8)
+            write_tile(db, "0-0-0", raw, confidence, "arcticdem_10m")
+            before = db.execute(
+                "SELECT heightmap, confidence_map, geometric_error "
+                "FROM tiles WHERE tile_id = '0-0-0'"
+            ).fetchone()
+
+            _mark_official_ocean(db, "0-0-0")
+
+            after = db.execute(
+                "SELECT heightmap, confidence_map, geometric_error "
+                "FROM tiles WHERE tile_id = '0-0-0'"
+            ).fetchone()
+            self.assertEqual(after, before)
+            self.assertEqual(
+                db.execute(
+                    "SELECT source FROM tiles WHERE tile_id = '0-0-0'"
+                ).fetchone()[0],
+                "official_coastline",
+            )
+            db.close()
 
 
 if __name__ == "__main__":

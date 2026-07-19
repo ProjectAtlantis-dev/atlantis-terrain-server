@@ -8,8 +8,9 @@ import {
   ToneMappingMode,
 } from 'postprocessing';
 import { DitheringEffect } from '../three-geospatial/packages/effects/src/index.ts';
+import { createWebGLWater } from './webgl-water.js';
 
-export function createWebGLTerrainBackend({
+export function createTerrainBackend({
   width,
   height,
   pixelRatio,
@@ -42,12 +43,21 @@ export function createWebGLTerrainBackend({
 
   const backend = {
     kind: 'webgl',
-    isWebGPU: false,
+    defaultFogStrength: 4.5,
     renderer,
     get sceneMutationVersion() { return sceneMutationVersion; },
     setFogDensity(value) { sceneFog.density = value; },
     setMapMode(active) { scene.fog = active ? null : sceneFog; },
-    setWaterVisibility(mesh, visible) { mesh.visible = visible; },
+    createWater: createWebGLWater,
+    prepareUntexturedTerrain(mesh) {
+      if (!mesh?.material || mesh.material.map) return;
+      if (!mesh.material.vertexColors) {
+        mesh.material.vertexColors = true;
+        mesh.material.needsUpdate = true;
+      }
+      mesh.material.color.set(0xffffff);
+      backend.markSceneMutated();
+    },
     configureScenePipeline({ scene, camera, normalPass, cloudsEffect, aerialPerspective }) {
       // IMPORTANT — verified visual regression fix:
       // postprocessing decodes logarithmic depth in readDepth(), while the
@@ -80,8 +90,14 @@ export function createWebGLTerrainBackend({
       renderer.setSize(nextWidth, nextHeight);
       composer?.setSize(nextWidth, nextHeight);
     },
-    renderMap(scene, camera) {
-      renderer.render(scene, camera);
+    renderMap(scene, camera, background) {
+      const previousBackground = scene.background;
+      scene.background = background;
+      try {
+        renderer.render(scene, camera);
+      } finally {
+        scene.background = previousBackground;
+      }
     },
     renderScene() {
       composer?.render();

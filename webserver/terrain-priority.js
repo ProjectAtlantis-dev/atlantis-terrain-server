@@ -4,6 +4,15 @@ export function priorityHeading(vehicleActive, vehicleHeading, cameraYaw) {
   return vehicleActive ? vehicleHeading : cameraYaw;
 }
 
+export function viewHeadingChanged(previous, next, threshold = 0) {
+  if (!Number.isFinite(previous) || !Number.isFinite(next)) return false;
+  const delta = Math.abs(Math.atan2(
+    Math.sin(next - previous),
+    Math.cos(next - previous),
+  ));
+  return delta > Math.max(0, threshold);
+}
+
 /** Heading 0 is north (+Y); positive heading turns west (-X). */
 export function headingForward2D(heading) {
   return { x: -Math.sin(heading), y: Math.cos(heading) };

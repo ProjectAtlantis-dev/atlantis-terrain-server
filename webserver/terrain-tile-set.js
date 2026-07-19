@@ -612,19 +612,8 @@ export function createTerrainTileSet({
     }
     if (!resolvedTexture) {
       needsUpdate = selectVertexColors(mesh, mesh.userData?.terrainColorAttribute) || needsUpdate;
-      if (renderBackend?.prepareUntexturedTerrain) {
-        renderBackend.prepareUntexturedTerrain(mesh);
-        return;
-      }
-      if (!mesh.material.vertexColors) {
-        mesh.material.vertexColors = true;
-        needsUpdate = true;
-      }
-      mesh.material.color.set(0xffffff);
-      if (needsUpdate) {
-        mesh.material.needsUpdate = true;
-        onMutated();
-      }
+      if (needsUpdate) mesh.material.needsUpdate = true;
+      renderBackend.prepareUntexturedTerrain(mesh);
       return;
     }
     if (mesh.material.vertexColors) {
@@ -639,7 +628,7 @@ export function createTerrainTileSet({
   }
 
   function prepareUntexturedMesh(mesh) {
-    renderBackend?.prepareUntexturedTerrain?.(mesh);
+    renderBackend.prepareUntexturedTerrain(mesh);
     if (classifierMode) applyClassifierPresentation(mesh);
   }
   const lifecycle = createTileLifecycle({

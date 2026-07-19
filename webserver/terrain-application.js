@@ -17,7 +17,7 @@ import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { NormalPass } from 'postprocessing';
 import { buildAssetLibrary } from './procgen/library.ts';
 import { buildTileScatter, updateScatterVisibility, SCATTER_MIN_DEPTH } from './procgen/scatter.ts';
-import { priorityHeading } from './terrain-priority.js';
+import { priorityHeading, viewHeadingChanged } from './terrain-priority.js';
 import { compassHeading, createTerrainHud, renderGameClock } from './terrain-hud.js';
 import { applyMapDrag, installTerrainKeyboardControls, installTerrainPointerControls } from './terrain-controls.js';
 import { stepVehicleDrive } from './terrain-vehicle.js';
@@ -46,7 +46,10 @@ import { googleMaps3dUrl } from './terrain-google-maps.js';
 import { createTerrainFlyToTileRuntime } from './terrain-fly-to-tile.js';
 import { epsg3413DirectionBearing, epsg3413ToWgs84 } from './terrain-polar-stereo.js';
 
-export async function startTerrainApplication({ backend = 'webgl' } = {}) {
+export async function startTerrainApplication({
+  backend = 'webgl',
+  onToggleRenderBackend = () => {},
+} = {}) {
 if (backend !== 'webgl' && backend !== 'webgpu') {
   throw new TypeError(`unsupported terrain backend: ${backend}`);
 }
@@ -232,22 +235,14 @@ const defaultPitch = Math.asin(Math.max(-1, Math.min(1, initialForward.dot(up)))
 controls.yaw = defaultYaw;
 controls.pitch = defaultPitch;
 
-const renderBackend = USE_WEBGPU_RENDER_BACKEND
-  ? backendModule.createWebGPUTerrainBackend({
-      width: window.innerWidth,
-      height: window.innerHeight,
-      pixelRatio: window.devicePixelRatio,
-      toneMappingExposure: WEBGPU_TONE_MAPPING_EXPOSURE,
-      scene,
-      bootLog,
-    })
-  : backendModule.createWebGLTerrainBackend({
-      width: window.innerWidth,
-      height: window.innerHeight,
-      pixelRatio: window.devicePixelRatio,
-      scene,
-      bootLog,
-    });
+const renderBackend = backendModule.createTerrainBackend({
+  width: window.innerWidth,
+  height: window.innerHeight,
+  pixelRatio: window.devicePixelRatio,
+  toneMappingExposure: WEBGPU_TONE_MAPPING_EXPOSURE,
+  scene,
+  bootLog,
+});
 const webgpuAtmosphere = USE_WEBGPU_RENDER_BACKEND
   ? renderBackend.createAtmosphere({
       scene, camera,
@@ -266,6 +261,7 @@ let heatmapRuntime = null;
 const { hud, alt, gameClock: gameClockEl } = createTerrainHud({
   onToggleMapMode: () => toggleMapMode(),
   onToggleHeatmap: () => toggleHeatmap(),
+  onToggleRenderBackend,
   onClockAction: action => {
     if (action === 'rw') rewindGameClock();
     else if (action === 'stop') stopGameClock();
@@ -528,81 +524,8 @@ scene.add(terrainRoot);
 // Ocean terrain is shaped below sea level, so water floats above the seabed.
 // Land terrain rises well above 0.5 and naturally occludes the water.
 const WATER_EXTENT = 200000; // 200km each direction — covers all visible ocean
-const waterNormalTex = new THREE.TextureLoader().load('/waternormals.jpg', tex => {
-  tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
-});
-const waterMat = new THREE.ShaderMaterial({
-  uniforms: {
-    time: { value: 0 },
-    normalSampler: { value: waterNormalTex },
-    waterColor: { value: new THREE.Color(0x001e3d) },
-    sunDirection: { value: new THREE.Vector3(0.7, 0.7, 0.3) },
-    sunColor: { value: new THREE.Color(0xffffff) },
-  },
-  vertexShader: /* glsl */`
-    #include <common>
-    #include <logdepthbuf_pars_vertex>
-    varying vec2 vLocalPos;
-    varying vec3 vWorldNormal;
-    varying vec3 vWorldPos;
-    void main() {
-      vLocalPos = position.xy * 0.002;
-      vec4 wp = modelMatrix * vec4(position, 1.0);
-      vWorldPos = wp.xyz;
-      vWorldNormal = normalize((modelMatrix * vec4(0.0, 0.0, 1.0, 0.0)).xyz);
-      gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
-      #include <logdepthbuf_vertex>
-    }
-  `,
-  fragmentShader: /* glsl */`
-    #include <common>
-    #include <logdepthbuf_pars_fragment>
-    uniform float time;
-    uniform sampler2D normalSampler;
-    uniform vec3 waterColor;
-    uniform vec3 sunDirection;
-    uniform vec3 sunColor;
-    varying vec2 vLocalPos;
-    varying vec3 vWorldNormal;
-    varying vec3 vWorldPos;
-    vec4 getNoise(vec2 uv) {
-      vec2 uv0 = uv / 1.3 + vec2(time / 17.0, time / 29.0);
-      vec2 uv1 = uv / 1.5 - vec2(time / -19.0, time / 31.0);
-      vec2 uv2 = uv / 3.7 + vec2(time / 101.0, time / 97.0);
-      vec2 uv3 = uv / 2.1 - vec2(time / 109.0, time / -113.0);
-      return (texture2D(normalSampler, uv0) + texture2D(normalSampler, uv1) +
-              texture2D(normalSampler, uv2) + texture2D(normalSampler, uv3)) * 0.5 - 1.0;
-    }
-    void main() {
-      #include <logdepthbuf_fragment>
-      vec4 noise = getNoise(vLocalPos);
-      vec3 surfNormal = normalize(mix(vWorldNormal, normalize(noise.xzy), 0.45));
-      vec3 toEye = normalize(cameraPosition - vWorldPos);
-      vec3 sunDir = normalize(sunDirection);
-      // Fresnel — more reflective at grazing angles
-      float fresnel = 0.04 + 0.96 * pow(1.0 - max(dot(toEye, surfNormal), 0.0), 4.0);
-      // Diffuse ripple shading — waves facing the sun lighten, facing away darken
-      float diffuse = max(dot(surfNormal, sunDir), 0.0);
-      vec3 rippleColor = waterColor * (0.6 + 0.4 * diffuse);
-      // Sun specular
-      vec3 refl = reflect(-sunDir, surfNormal);
-      float spec = pow(max(dot(toEye, refl), 0.0), 80.0) * 2.0;
-      // Blend ripple shading + specular highlight
-      vec3 col = rippleColor + sunColor * spec * 0.6;
-      float alpha = clamp(fresnel * 0.35 + spec * 0.7 + 0.12, 0.0, 0.55);
-      gl_FragColor = vec4(col, alpha);
-    }
-  `,
-  transparent: true,
-  side: THREE.FrontSide,
-  depthWrite: false,
-});
-const waterGeo = new THREE.PlaneGeometry(WATER_EXTENT * 2, WATER_EXTENT * 2, 1, 1);
-const waterMesh = new THREE.Mesh(waterGeo, waterMat);
-waterMesh.position.set(0, 0, 0.5); // just above terrain ocean at z=0
-waterMesh.frustumCulled = false;
-waterMesh.visible = false; // disabled for now
-terrainRoot.add(waterMesh);
+const water = renderBackend.createWater({ extent: WATER_EXTENT });
+if (water.mesh) terrainRoot.add(water.mesh);
 
 const camMarkerGeo = new THREE.ConeGeometry(200, 600, 4);
 const camMarker = new THREE.Mesh(
@@ -854,13 +777,10 @@ createTerrainAtmosphereTextureRuntime({
   bootLog,
 }).loadWithLocalCache();
 
-if (renderBackend.isWebGPU) {
-  webgpuAtmosphere.rebuild(gameClockState.renderedDate);
-} else {
-  renderBackend.configureScenePipeline({
-    scene, camera, normalPass, cloudsEffect, aerialPerspective,
-  });
-}
+renderBackend.configureScenePipeline({
+  scene, camera, normalPass, cloudsEffect, aerialPerspective,
+  date: gameClockState.renderedDate,
+});
 
 // --- Heightmap decode + mesh building (adapted for ENU frame) ---
 
@@ -1180,6 +1100,45 @@ const terrainFetchRuntime = createTerrainFetchRuntime({
   logger: { enqueue: enqueueClientLog, boot: bootLog },
   events: terrainFetchEvents,
 });
+let terrainDemandHeading = priorityHeading(
+  vehicleRuntime.vehicleControlActive,
+  vehicleRuntime.vehicleHeadingRad,
+  controls.yaw,
+);
+const TERRAIN_DEMAND_HEADING_THRESHOLD = 2 * Math.PI / 180;
+
+function rebuildTerrainDemandForViewDirection() {
+  const heading = priorityHeading(
+    vehicleRuntime.vehicleControlActive,
+    vehicleRuntime.vehicleHeadingRad,
+    controls.yaw,
+  );
+  if (terrainPipelineState.firstLoad) {
+    terrainDemandHeading = heading;
+    return false;
+  }
+  if (!viewHeadingChanged(
+    terrainDemandHeading,
+    heading,
+    TERRAIN_DEMAND_HEADING_THRESHOLD,
+  )) {
+    return false;
+  }
+  const previousHeading = terrainDemandHeading;
+  terrainDemandHeading = heading;
+  textureStreamer.abortAll();
+  terrainTileSet.resetTextureApplications();
+  terrainFetchRuntime.reset(2);
+  terrainPipelineState.lastTiles = null;
+  terrainPipelineState.heightmapsMissing = 0;
+  terrainPipelineState.heightmapsDownloading = 0;
+  terrainPipelineState.lastFetchTriggerMs = performance.now();
+  enqueueClientLog('info', 'terrainDemand.heading.reset', {
+    previousHeading, heading,
+  });
+  terrainFetchRuntime.request();
+  return true;
+}
 
 // --- Fly to tile (T key, ?tile= URL param) ---
 
@@ -1590,6 +1549,8 @@ function updateHud() {
   const classifierLine = classifierRuntime.active
     ? `classifier: <span style="color:#8f8">ON</span>  ${classifierRuntime.textures.size} painted  ${classifierRuntime.missing.size} grayscale`
     : 'classifier: off (C)';
+  const renderBackendLabel = backend === 'webgpu' ? 'WebGPU' : 'WebGL';
+  const nextRenderBackendLabel = backend === 'webgpu' ? 'WebGL' : 'WebGPU';
 
   // Game clock display (bottom-left) — always show the date actually being rendered
   const gameDate = gameClockState.renderedDate;
@@ -1603,6 +1564,7 @@ function updateHud() {
   const hudHtml = [
     '<b>Clouds Terrain Managed Flask UX WIP</b>',
     `mode: <b>${modeHtml}</b>`,
+    `renderer: <span id="renderBackendLink" title="Switch to ${nextRenderBackendLabel}" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">${renderBackendLabel}</span>`,
     `fps: <b>${fpsCounter.display}</b>`,
     `lat: ${exactPosition.lat.toFixed(7)}°  lon: ${exactPosition.lon.toFixed(7)}°  alt: ${altM.toFixed(0)}m`,
     lastGoogleCoordinateComparison
@@ -1990,21 +1952,16 @@ function render() {
   applyDate(currentDate, { force: false });
   updateMovement(dt);
   applyCameraOrientation();
+  rebuildTerrainDemandForViewDirection();
   updateHud();
   syncMapModePresentation();
 
   // Update fog density from slider
-  const fogStrength = controls._fogStrength ?? (
-    renderBackend.isWebGPU ? WEBGPU_DEFAULT_HAZE : 4.5
-  );
+  const fogStrength = controls._fogStrength ?? renderBackend.defaultFogStrength;
   renderBackend.setFogDensity(fogStrength / getFogDistance());
   renderBackend.setMapMode(controls.mapMode);
 
-  // Animate water
-  waterMat.uniforms.time.value = clock.elapsedTime * 0.4;
-  waterMat.uniforms.sunDirection.value.copy(sunDirection);
-  // The GLSL water material is not supported by WebGPURenderer.
-  renderBackend.setWaterVisibility(waterMesh, !controls.mapMode);
+  water.update(clock.elapsedTime, sunDirection, !controls.mapMode);
 
   // Terrain streaming: check if camera moved far enough to re-fetch
   if (!terrainPipelineState.firstLoad) {
@@ -2070,9 +2027,7 @@ function render() {
     camMarker.scale.setScalar(markerScale);
     houseRuntime.setMarkerScale(markerScale);
     vehicleRuntime.vehicleMarker.scale.setScalar(markerScale * vehicleRuntime.VEHICLE_MARKER_MAP_SCALE);
-    scene.background = _mapBg;
-    renderBackend.renderMap(scene, mapCam);
-    scene.background = null;
+    renderBackend.renderMap(scene, mapCam, _mapBg);
     renderBackend.stopRenderLoopIfIdle();
     return;
   }

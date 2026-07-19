@@ -9,7 +9,12 @@ function appendPanel(cssText) {
   return element;
 }
 
-export function createTerrainHud({ onToggleMapMode, onToggleHeatmap, onClockAction }) {
+export function createTerrainHud({
+  onToggleMapMode,
+  onToggleHeatmap,
+  onToggleRenderBackend,
+  onClockAction,
+}) {
   const hud = appendPanel([
     'position:absolute', 'top:12px', 'left:12px', 'padding:10px 12px',
     'background:rgba(0,0,0,0.7)', 'color:#dbe5f1',
@@ -22,6 +27,7 @@ export function createTerrainHud({ onToggleMapMode, onToggleHeatmap, onClockActi
     const isLink = (
       event.target.id === 'mapModeLink' ||
       event.target.id === 'heatmapModeLink' ||
+      event.target.id === 'renderBackendLink' ||
       TERRAIN_HUD_LINKS[event.target.id]
     );
     if (!isLink) hud.dataset.selecting = 'true';
@@ -35,6 +41,12 @@ export function createTerrainHud({ onToggleMapMode, onToggleHeatmap, onClockActi
       event.stopPropagation();
       event.preventDefault();
       onToggleHeatmap();
+      return;
+    }
+    if (event.target.id === 'renderBackendLink') {
+      event.stopPropagation();
+      event.preventDefault();
+      onToggleRenderBackend();
       return;
     }
     const url = TERRAIN_HUD_LINKS[event.target.id];
@@ -57,6 +69,7 @@ export function createTerrainHud({ onToggleMapMode, onToggleHeatmap, onClockActi
   hud.addEventListener('click', event => {
     if (
       event.target.id === 'mapModeLink' || event.target.id === 'heatmapModeLink' ||
+      event.target.id === 'renderBackendLink' ||
       TERRAIN_HUD_LINKS[event.target.id]
     ) {
       event.stopPropagation();

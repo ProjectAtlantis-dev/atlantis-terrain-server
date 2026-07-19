@@ -36,6 +36,11 @@ export function createTextureStreamer({
   const demandClient = globalThis.crypto?.randomUUID?.() ?? `terrain-${Date.now()}-${Math.random()}`;
   let version = Date.now();
 
+  function advanceVersion() {
+    version = Math.max(version + 1, Date.now());
+    return version;
+  }
+
   function configureTerrainTexture(texture) {
     texture.generateMipmaps = true;
     texture.minFilter = THREE.LinearMipmapLinearFilter;
@@ -137,8 +142,7 @@ export function createTextureStreamer({
     ancestorLogged.delete(tileId);
     texCache.delete(tileId);
     texSource.delete(tileId);
-    version = Date.now();
-    return version;
+    return advanceVersion();
   }
 
   function abortAll() {
@@ -148,13 +152,13 @@ export function createTextureStreamer({
     texRetryAtMs.clear();
     texRetryCount.clear();
     ancestorLogged.clear();
-    version = Date.now();
+    advanceVersion();
   }
 
   return {
     texCache, texSource, texInflight, texFetching, texRetryAtMs, texRetryCount,
     ancestorLogged, pump, invalidate, abortAll,
     get version() { return version; },
-    bumpVersion() { version = Date.now(); return version; },
+    bumpVersion: advanceVersion,
   };
 }

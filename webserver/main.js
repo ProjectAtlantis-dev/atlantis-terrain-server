@@ -1,3 +1,27 @@
 import { startTerrainApplication } from './terrain-application.js';
+import {
+  alternateTerrainRenderBackend,
+  resolveTerrainRenderBackend,
+  TERRAIN_RENDER_BACKEND_STORAGE_KEY,
+} from './terrain-render-backend.js';
 
-await startTerrainApplication({ backend: 'webgl' });
+const webgpuAvailable = Boolean(navigator.gpu);
+const storedBackend = localStorage.getItem(TERRAIN_RENDER_BACKEND_STORAGE_KEY);
+const backend = resolveTerrainRenderBackend(storedBackend, webgpuAvailable);
+
+if (storedBackend === 'webgpu' && backend !== 'webgpu') {
+  localStorage.setItem(TERRAIN_RENDER_BACKEND_STORAGE_KEY, backend);
+}
+
+await startTerrainApplication({
+  backend,
+  onToggleRenderBackend() {
+    const nextBackend = alternateTerrainRenderBackend(backend);
+    if (nextBackend === 'webgpu' && !webgpuAvailable) {
+      window.alert('WebGPU is not available in this browser.');
+      return;
+    }
+    localStorage.setItem(TERRAIN_RENDER_BACKEND_STORAGE_KEY, nextBackend);
+    window.location.reload();
+  },
+});

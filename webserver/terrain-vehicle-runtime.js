@@ -1,5 +1,6 @@
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
+import { rendererTextureAnisotropy } from './terrain-texture-streamer.js';
 import { tileDepthFromId } from './terrain-tile-runtime.js';
 import {
   createVehiclePersistenceRuntime,
@@ -282,7 +283,7 @@ export function createTerrainVehicleRuntime({
   
   function applyVehicleTextureSampling(texture) {
     if (!texture || !texture.isTexture) return;
-    const maxAniso = renderer.capabilities.getMaxAnisotropy?.() ?? 1;
+    const maxAniso = rendererTextureAnisotropy(renderer);
     texture.anisotropy = Math.max(1, Math.min(maxAniso, VEHICLE_TEXTURE_ANISOTROPY));
     texture.minFilter = THREE.LinearMipmapLinearFilter;
     texture.magFilter = THREE.LinearFilter;

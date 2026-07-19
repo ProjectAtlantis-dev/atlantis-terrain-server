@@ -94,6 +94,13 @@ export function createTerrainFetchRuntime({
     logger.enqueue('info', `fetchTiles.request[pass${pass}]`, request.logDetails);
     const response = await fetchImpl(request.url, { signal });
     const data = await response.json();
+    if (response.ok === false || response.status >= 400) {
+      const detail = typeof data?.error === 'string' ? `: ${data.error}` : '';
+      throw new Error(`terrain tile request failed (${response.status})${detail}`);
+    }
+    if (!Array.isArray(data?.tiles)) {
+      throw new TypeError('terrain tile response is missing a tiles array');
+    }
     const local = testOverrides.getCameraLocalPosition?.() ?? {
       x: cameraCoordinates.eastM,
       y: cameraCoordinates.northM,

@@ -11,6 +11,30 @@ function priorityColor(value) {
   return `rgb(0,${Math.round(224 * (1 - amount))},${Math.round(80 + amount * 175)})`;
 }
 
+export function updateHeatmapViewPriorities(tiles, view) {
+  if (!Array.isArray(tiles) || !view) return;
+  const cameraX = Number(view.cameraX);
+  const cameraY = Number(view.cameraY);
+  const heading = Number(view.yaw);
+  if (![cameraX, cameraY, heading].every(Number.isFinite)) return;
+  const forwardX = -Math.sin(heading);
+  const forwardY = Math.cos(heading);
+  for (const tile of tiles) {
+    const [xMin, yMin, xMax, yMax] = tile.bbox;
+    const dx = (xMin + xMax) / 2 - cameraX;
+    const dy = (yMin + yMax) / 2 - cameraY;
+    const distance = Math.hypot(dx, dy);
+    if (distance <= 0) {
+      tile.priority = 0;
+      continue;
+    }
+    const dot = (dx * forwardX + dy * forwardY) / distance;
+    tile.priority = Math.log(Math.max(distance / Math.max(dot, 0.01), 1));
+  }
+  tiles.sort((a, b) => a.priority - b.priority);
+  tiles.forEach((tile, order) => { tile.order = order; });
+}
+
 export function createTerrainHeatmapRuntime({
   getView,
   onWheel,
@@ -59,10 +83,14 @@ export function createTerrainHeatmapRuntime({
   let height = 0;
   let pollTimer = null;
   let animationFrame = null;
+  let activePollController = null;
+  let pollGeneration = 0;
   let dragging = false;
   let dragButton = 0;
   let dragged = false;
   let lastView = null;
+  let lastPriorityView = null;
+  let lastRequestedHeading = null;
 
   function resize() {
     width = windowImpl.innerWidth;
@@ -113,6 +141,13 @@ export function createTerrainHeatmapRuntime({
     }
 
     const tiles = heatmap?.tiles || [];
+    const priorityView = `${view.cameraX}:${view.cameraY}:${view.yaw}`;
+    if (priorityView !== lastPriorityView) {
+      updateHeatmapViewPriorities(tiles, view);
+      lastPriorityView = priorityView;
+    }
+    const requestedHeading = String(view.yaw);
+    if (requestedHeading !== lastRequestedHeading) rebuildForHeading(view);
     const priorities = tiles.map(tile => tile.priority);
     const minPriority = priorities.length ? Math.min(...priorities) : 0;
     const maxPriority = priorities.length ? Math.max(...priorities) : 0;
@@ -207,28 +242,52 @@ export function createTerrainHeatmapRuntime({
       : 'waiting for /api/heatmap…';
   }
 
-  async function poll() {
+  async function poll(viewOverride = null) {
     if (presentation === 'hidden') return;
+    const requestGeneration = ++pollGeneration;
+    activePollController?.abort();
+    const controller = new AbortController();
+    activePollController = controller;
     let delay = 2000;
     try {
-      const view = getView?.();
+      const view = viewOverride ?? getView?.();
       const params = new URLSearchParams();
       if (view) {
         params.set('qx', String(view.cameraX));
         params.set('qy', String(view.cameraY));
         params.set('alt', String(view.alt));
         params.set('heading', String(view.yaw));
+        lastRequestedHeading = String(view.yaw);
       }
-      const response = await fetchImpl(`/api/heatmap?${params}`);
+      const response = await fetchImpl(`/api/heatmap?${params}`, {
+        signal: controller.signal,
+      });
       if (!response.ok) throw new Error(String(response.status));
       const data = await response.json();
-      if (data) heatmap = data;
+      if (requestGeneration !== pollGeneration) return;
+      if (data) {
+        heatmap = data;
+        lastPriorityView = null;
+      }
       updateMeta();
-    } catch {
+    } catch (error) {
+      if (requestGeneration !== pollGeneration || error?.name === 'AbortError') return;
       delay = 5000;
       meta.textContent = 'heatmap unavailable — retrying…';
     }
-    pollTimer = windowImpl.setTimeout(poll, delay);
+    if (requestGeneration !== pollGeneration || presentation === 'hidden') return;
+    activePollController = null;
+    pollTimer = windowImpl.setTimeout(() => {
+      pollTimer = null;
+      poll();
+    }, delay);
+  }
+
+  function rebuildForHeading(view) {
+    lastRequestedHeading = String(view.yaw);
+    if (pollTimer != null) windowImpl.clearTimeout(pollTimer);
+    pollTimer = null;
+    poll(view);
   }
 
   function setPresentation(next) {
@@ -248,10 +307,14 @@ export function createTerrainHeatmapRuntime({
       poll();
       animationFrame = windowImpl.requestAnimationFrame(draw);
     } else if (!visible && wasVisible) {
+      pollGeneration += 1;
+      activePollController?.abort();
+      activePollController = null;
       if (pollTimer != null) windowImpl.clearTimeout(pollTimer);
       if (animationFrame != null) windowImpl.cancelAnimationFrame(animationFrame);
       pollTimer = null;
       animationFrame = null;
+      lastRequestedHeading = null;
     }
   }
 

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import datetime
 import io
+import os
 import urllib.parse
 import urllib.request
 import zlib
@@ -115,7 +116,13 @@ def apply_water_mask(heightmap, water):
     return result
 
 
-def write_water_mask(db, tile_id: str, water) -> None:
+def write_water_mask(
+    db,
+    tile_id: str,
+    water,
+    source: str = OFFICIAL_COASTLINE_SOURCE,
+    version: int = OFFICIAL_COASTLINE_VERSION,
+) -> None:
     mask = np.asarray(water, dtype=np.uint8)
     if mask.ndim != 2:
         raise ValueError("water mask must be a 2D array")
@@ -131,8 +138,8 @@ def write_water_mask(db, tile_id: str, water) -> None:
             int(mask.shape[1]),
             int(mask.shape[0]),
             zlib.compress(mask.tobytes(), level=6),
-            OFFICIAL_COASTLINE_SOURCE,
-            OFFICIAL_COASTLINE_VERSION,
+            source,
+            version,
             datetime.datetime.now(datetime.timezone.utc).isoformat(),
         ),
     )
@@ -170,6 +177,14 @@ def cache_official_water_mask(db, tile_id: str, bbox=None, resolution=65):
         if row is None:
             return None
         bbox = tuple(float(value) for value in row)
+    water = None
+    if os.environ.get("COASTLINE_VECTOR", "1") != "0":
+        from gtk50_vector import VECTOR_SOURCE, VECTOR_VERSION, vector_water_mask
+
+        water = vector_water_mask(bbox, resolution)
+        if water is not None:
+            write_water_mask(db, tile_id, water, VECTOR_SOURCE, VECTOR_VERSION)
+            return water
     water = fetch_official_water_mask(bbox, resolution)
     if water is not None:
         write_water_mask(db, tile_id, water)
@@ -177,7 +192,12 @@ def cache_official_water_mask(db, tile_id: str, bbox=None, resolution=65):
 
 
 def effective_heightmap(db, tile_id: str, raw_heightmap):
-    """Apply a cached mask at read time while preserving stored raw samples."""
+    """Apply a cached mask at read time while preserving stored raw samples.
+
+    Recomputed on every read. Caching the repaired arrays (or the
+    decompressed masks) is a possible perf win, deliberately deferred
+    until the vector mask pipeline is proven end-to-end.
+    """
     water = read_water_mask(db, tile_id)
     if raw_heightmap is None:
         if water is not None and np.all(water):
