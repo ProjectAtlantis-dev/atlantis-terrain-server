@@ -37,7 +37,12 @@ import { createTerrainFpsCounter } from './terrain-fps-counter.js';
 import { loadTerrainStartupAssets } from './terrain-startup-assets.js';
 import { createTerrainAtmosphereTextureRuntime } from './terrain-atmosphere-textures.js';
 import { createTerrainTuningControls } from './terrain-tuning-controls.js';
-import { bindTerrainCloudComposition, configureTerrainClouds, registerTerrainCloudTuning } from './terrain-cloud-runtime.js';
+import {
+  bindTerrainCloudComposition,
+  configureTerrainClouds,
+  invalidateTerrainCloudHistory,
+  registerTerrainCloudTuning,
+} from './terrain-cloud-runtime.js';
 import { createTerrainHouseSceneRuntime } from './terrain-house-scene-runtime.js';
 import { createTerrainBuildingsRuntime } from './terrain-buildings-runtime.js';
 import { createTerrainTileMenuRuntime } from './terrain-tile-menu-runtime.js';
@@ -208,6 +213,7 @@ const controls = {
   dragging: false,
   dragButton: 0,
   mapMode: false,
+  seamMode: false,
   mapZoom: DEFAULT_MAP_ZOOM,
   mapPanEast: 0,
   mapPanNorth: 0,
@@ -276,6 +282,7 @@ let heatmapRuntime = null;
 
 const { hud, alt, gameClock: gameClockEl } = createTerrainHud({
   onToggleMapMode: () => toggleMapMode(),
+  onToggleSeamMode: () => toggleSeamMode(),
   onToggleHeatmap: () => toggleHeatmap(),
   onToggleRenderBackend: () => {
     // beforeunload normally saves this too, but make the renderer transition
@@ -677,7 +684,10 @@ const hoverOutlineController = createTerrainHoverOutlineController({
   terrainRoot,
   onChanged: () => { markSceneMutated(); requestRender(); },
 });
-const mapGridController = createTerrainMapGridController({ terrainRoot });
+const mapGridController = createTerrainMapGridController({
+  terrainRoot,
+  color: 0x14e6ff,
+});
 
 // --- Terrain streaming state ---
 const EXAG = 1.0;
@@ -841,6 +851,7 @@ aerialPerspective.shadowSampleCount = 12;
 
 // Wire up tuning panel now that effects exist
 const sunDirection = new THREE.Vector3();
+let restoreCloudTemporalHistory = null;
 
 function applyDate(date, { force = true } = {}) {
   const dateMs = date.getTime();
@@ -853,7 +864,11 @@ function applyDate(date, { force = true } = {}) {
   }
   gameClockState.lastSunSyncTimeMs = dateMs;
   gameClockState.renderedDate = new Date(date);
+  const previousSunDirection = sunDirection.clone();
   getSunDirectionECEF(date, sunDirection);
+  if (!previousSunDirection.equals(sunDirection)) {
+    restoreCloudTemporalHistory = invalidateTerrainCloudHistory(cloudsEffect);
+  }
   aerialPerspective.sunDirection.copy(sunDirection);
   cloudsEffect.sunDirection.copy(sunDirection);
   webgpuAtmosphere?.updateDate(date, sunDirection);
@@ -1625,9 +1640,11 @@ function updateHud() {
   }
   const modeLabel = heatmapRuntime?.active
     ? 'HEATMAP'
-    : controls.mapMode
-      ? 'MAP'
-      : (vehicleRuntime.vehicleControlActive ? 'VEHICLE' : 'FLIGHT');
+    : controls.seamMode
+      ? 'SEAMS'
+      : controls.mapMode
+        ? 'MAP'
+        : (vehicleRuntime.vehicleControlActive ? 'VEHICLE' : 'FLIGHT');
   const modeHtml = vehicleRuntime.vehicleControlActive
     ? '<span style="color:#ff3b30">VEHICLE</span>'
     : modeLabel;
@@ -1669,7 +1686,8 @@ function updateHud() {
       ? 'W/S drive, A/D steer, mouse orbit camera, Esc exits vehicle control'
       : 'WASD or Arrows move, Q/Z altitude, drag look',
     'map: left-drag rotate, right-drag pan, wheel zoom',
-    `<span id="mapModeLink" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">${controls.mapMode && !heatmapRuntime?.active ? '3D view' : 'map mode'}</span> (M)` +
+    `<span id="mapModeLink" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">${controls.mapMode && !controls.seamMode && !heatmapRuntime?.active ? '3D view' : 'map mode'}</span> (M)` +
+      ` · <span id="seamModeLink" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">${controls.seamMode ? '3D view' : 'seam view'}</span>` +
       ` · <span id="heatmapModeLink" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">${heatmapRuntime?.active ? '3D view' : 'heatmap'}</span> (H)` +
       ' · Google 3D (G)' +
       ` · <span id="roadDebugLink" style="color:${roadDebugColor};text-decoration:underline;cursor:pointer;pointer-events:auto">${roadDebugLabel}</span> (R)` +
@@ -1697,7 +1715,9 @@ function updateHud() {
     `  FOV ${camera.fov.toFixed(0)}°` +
     (heatmapRuntime?.active
       ? '  [HEATMAP]'
-      : (controls.mapMode ? '  [MAP]' : (vehicleRuntime.vehicleControlActive ? '  [VEHICLE]' : '')));
+      : (controls.seamMode
+        ? '  [SEAMS]'
+        : (controls.mapMode ? '  [MAP]' : (vehicleRuntime.vehicleControlActive ? '  [VEHICLE]' : ''))));
   if (altText !== lastAltText) {
     alt.textContent = altText;
     lastAltText = altText;
@@ -1716,6 +1736,7 @@ function resetView() {
   controls.dragging = false;
   controls.dragButton = 0;
   controls.mapMode = false;
+  controls.seamMode = false;
   heatmapRuntime?.setPresentation('hidden');
   vehicleRuntime.setVehicleControlActive(false, 'reset');
   controls.mapPanEast = 0;
@@ -1780,9 +1801,11 @@ function toggleHeatmap() {
   const transition = resolveTerrainViewToggle({
     mapMode: controls.mapMode,
     heatmapActive: heatmapRuntime.active,
+    seamMode: controls.seamMode,
   }, 'heatmap');
   if (!transition.accepted) return;
   controls.mapMode = transition.mapMode;
+  controls.seamMode = transition.seamMode;
   if (transition.heatmapActive) {
     cameraRuntimeState.driftMode = false;
     controls.strafeSpeed = 0;
@@ -1803,9 +1826,11 @@ function toggleMapMode() {
   const transition = resolveTerrainViewToggle({
     mapMode: controls.mapMode,
     heatmapActive: heatmapRuntime.active,
+    seamMode: controls.seamMode,
   }, 'map');
   if (!transition.accepted) return;
   controls.mapMode = transition.mapMode;
+  controls.seamMode = transition.seamMode;
   heatmapRuntime.setPresentation('hidden');
   cameraRuntimeState.driftMode = false;
   controls.strafeSpeed = 0;
@@ -1824,6 +1849,34 @@ function toggleMapMode() {
   if (terrainPipelineState.lastTiles) {
     terrainTileSet.refreshTextures();
   }
+}
+
+function toggleSeamMode() {
+  const transition = resolveTerrainViewToggle({
+    mapMode: controls.mapMode,
+    heatmapActive: heatmapRuntime.active,
+    seamMode: controls.seamMode,
+  }, 'seam');
+  if (!transition.accepted) return;
+  controls.mapMode = transition.mapMode;
+  controls.seamMode = transition.seamMode;
+  heatmapRuntime.setPresentation('hidden');
+  cameraRuntimeState.driftMode = false;
+  controls.strafeSpeed = 0;
+  if (controls.mapMode) {
+    vehicleRuntime.setVehicleControlActive(false, 'seam-mode');
+  }
+  controls.mapPanEast = 0;
+  controls.mapPanNorth = 0;
+  if (controls.mapMode) {
+    updateMapCamera();
+  } else {
+    hideTileInfo();
+    hideTileMenu();
+  }
+  syncMapModePresentation();
+  updateHud();
+  requestRender();
 }
 
 function toggleClassifierMode() {
@@ -2112,7 +2165,7 @@ function render() {
   vehicleRuntime.updateVehicleShadowSystem();
   houseRuntime.update(nowMs, controls.mapMode);
   vehicleRuntime.vehicleMarkerLayer.visible = controls.mapMode;
-  mapGridController.setVisible(controls.mapMode && !heatmapRuntime.active);
+  mapGridController.setVisible(controls.seamMode && !heatmapRuntime.active);
   if (controls.mapMode) {
     if (!heatmapRuntime.active) {
       mapGridController.update(collectTerrainDebugMeshes(terrainRoot, debugIntersectables));
@@ -2145,7 +2198,12 @@ function render() {
   }
   if (SCATTER_ENABLED && _scatterLib) updateScatterVisibility(terrainRoot, camera);
   webgpuAtmosphere?.updateCloudShadows(clock.elapsedTime);
-  renderBackend.renderScene(scene, camera);
+  try {
+    renderBackend.renderScene(scene, camera);
+  } finally {
+    restoreCloudTemporalHistory?.();
+    restoreCloudTemporalHistory = null;
+  }
   renderBackend.stopRenderLoopIfIdle();
 }
 

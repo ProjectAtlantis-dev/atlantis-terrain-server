@@ -63,6 +63,34 @@ export function bindTerrainCloudComposition(cloudsEffect, aerialPerspective) {
   };
 }
 
+const pendingHistoryRestores = new WeakMap();
+
+export function invalidateTerrainCloudHistory(effect) {
+  let restore = pendingHistoryRestores.get(effect);
+  if (restore != null) return restore;
+
+  const uniforms = [
+    effect?.shadowPass?.resolveMaterial?.uniforms?.temporalAlpha,
+    effect?.cloudsPass?.resolveMaterial?.uniforms?.temporalAlpha,
+  ].filter(Boolean);
+  const previousValues = uniforms.map(uniform => uniform.value);
+
+  // Reprojection only follows camera and cascade transforms. A changed sun
+  // direction changes the ray-marched lighting field itself, so retaining the
+  // old samples creates contour-like ghost bands on smooth receivers (water is
+  // especially revealing). Give the next resolve full current-frame weight.
+  for (const uniform of uniforms) uniform.value = 1;
+
+  restore = () => {
+    for (let index = 0; index < uniforms.length; index += 1) {
+      uniforms[index].value = previousValues[index];
+    }
+    pendingHistoryRestores.delete(effect);
+  };
+  pendingHistoryRestores.set(effect, restore);
+  return restore;
+}
+
 export function registerTerrainCloudTuning({
   effect,
   controls,

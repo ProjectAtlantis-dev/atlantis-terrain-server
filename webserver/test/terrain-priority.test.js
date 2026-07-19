@@ -32,7 +32,12 @@ import { loadTerrainStartupAssets, normalizeTerrainStartupAssets } from '../terr
 import { createTerrainAtmosphereTextureRuntime } from '../terrain-atmosphere-textures.js';
 import { paintClassifierGridBorder } from '../terrain-classifier-texture.js';
 import { createTerrainTuningControls } from '../terrain-tuning-controls.js';
-import { bindTerrainCloudComposition, configureTerrainClouds, registerTerrainCloudTuning } from '../terrain-cloud-runtime.js';
+import {
+  bindTerrainCloudComposition,
+  configureTerrainClouds,
+  invalidateTerrainCloudHistory,
+  registerTerrainCloudTuning,
+} from '../terrain-cloud-runtime.js';
 import { createTerrainHouseConfiguration, createTerrainHouseMarkerRuntime, createTerrainHouseModelController, disposeTerrainHouseTree, markTerrainHousesNeedSnap, terrainHouseLocalPosition, terrainHouseShadowCoverage, terrainHouseZSummary } from '../terrain-house-runtime.js';
 import {
   buildTerrainTilesRequest,
@@ -354,6 +359,24 @@ test('shared cloud runtime configures layers and synchronizes atmosphere composi
   assert.equal(aerial.shadowLength, 84);
   binding.dispose();
   assert.equal(listeners.has('change'), false);
+});
+
+test('cloud history invalidation uses one current-only resolve frame', () => {
+  const shadowAlpha = { value: 0.01 };
+  const cloudsAlpha = { value: 0.1 };
+  const effect = {
+    shadowPass: { resolveMaterial: { uniforms: { temporalAlpha: shadowAlpha } } },
+    cloudsPass: { resolveMaterial: { uniforms: { temporalAlpha: cloudsAlpha } } },
+  };
+
+  const restore = invalidateTerrainCloudHistory(effect);
+  assert.equal(shadowAlpha.value, 1);
+  assert.equal(cloudsAlpha.value, 1);
+  assert.equal(invalidateTerrainCloudHistory(effect), restore);
+
+  restore();
+  assert.equal(shadowAlpha.value, 0.01);
+  assert.equal(cloudsAlpha.value, 0.1);
 });
 
 test('shared cloud tuning registers controls and applies altitude, cirrus, and drift changes', () => {

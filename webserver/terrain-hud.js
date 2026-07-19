@@ -11,6 +11,7 @@ function appendPanel(cssText) {
 
 export function createTerrainHud({
   onToggleMapMode,
+  onToggleSeamMode,
   onToggleHeatmap,
   onToggleRenderBackend,
   onToggleRoadDebug,
@@ -28,6 +29,7 @@ export function createTerrainHud({
   hud.addEventListener('mousedown', event => {
     const isLink = (
       event.target.id === 'mapModeLink' ||
+      event.target.id === 'seamModeLink' ||
       event.target.id === 'heatmapModeLink' ||
       event.target.id === 'renderBackendLink' ||
       event.target.id === 'roadDebugLink' ||
@@ -39,6 +41,12 @@ export function createTerrainHud({
       event.stopPropagation();
       event.preventDefault();
       onToggleMapMode();
+      return;
+    }
+    if (event.target.id === 'seamModeLink') {
+      event.stopPropagation();
+      event.preventDefault();
+      onToggleSeamMode();
       return;
     }
     if (event.target.id === 'heatmapModeLink') {
@@ -84,7 +92,8 @@ export function createTerrainHud({
   window.addEventListener('blur', clearSelecting);
   hud.addEventListener('click', event => {
     if (
-      event.target.id === 'mapModeLink' || event.target.id === 'heatmapModeLink' ||
+      event.target.id === 'mapModeLink' || event.target.id === 'seamModeLink' ||
+      event.target.id === 'heatmapModeLink' ||
       event.target.id === 'renderBackendLink' ||
       event.target.id === 'roadDebugLink' || event.target.id === 'resetViewLink' ||
       TERRAIN_HUD_LINKS[event.target.id]
