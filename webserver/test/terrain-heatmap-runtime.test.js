@@ -3,7 +3,7 @@ import test from 'node:test';
 import {
   createTerrainHeatmapRuntime,
   updateHeatmapViewPriorities,
-} from './terrain-heatmap-runtime.js';
+} from '../terrain-heatmap-runtime.js';
 
 class FakeElement {
   constructor(tagName, context = null) {

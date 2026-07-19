@@ -98,6 +98,9 @@ export function createTerrainVectorLayerRuntime({
     },
     getVisible: () => visible,
     getMesh: () => mesh,
+    reconcile(items) {
+      if (Array.isArray(items)) applyItems(items);
+    },
     refresh: () => maybeFetch({ force: true }),
   };
 }

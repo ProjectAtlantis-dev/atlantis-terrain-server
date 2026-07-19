@@ -1,7 +1,10 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { buildBuildingsGeometry, createTerrainBuildingsRuntime } from './terrain-buildings-runtime.js';
+import {
+  buildBuildingsGeometry,
+  createTerrainBuildingsRuntime,
+} from '../terrain-buildings-runtime.js';
 
 const squareBuilding = {
   id: '0600NUK_TEST_1',
@@ -70,42 +73,23 @@ test('buildBuildingsGeometry skips degenerate rings', () => {
   assert.equal(buildBuildingsGeometry([]), null);
 });
 
-test('runtime fetches once frame is ready and skips small moves', async () => {
-  const calls = [];
-  const pipelineState = {
-    ready: true, frameOffsetReady: true,
-    originX: 1000, originY: 2000, frameOffsetX: 5, frameOffsetY: -5,
-    lastFetchX: 1000, lastFetchY: 2000,
-  };
-  const terrainRoot = { add() {}, remove() {} };
+test('runtime reconciles Flask tile-response buildings without an HTTP fetch', () => {
+  let fetches = 0;
   const runtime = createTerrainBuildingsRuntime({
-    terrainRoot, pipelineState,
-    fetchImpl: async url => {
-      calls.push(url);
-      return { ok: true, json: async () => ({ buildings: [squareBuilding], count: 1 }) };
+    terrainRoot: { add() {}, remove() {} },
+    pipelineState: {
+      originX: 1000, originY: 2000, frameOffsetX: 5, frameOffsetY: -5,
+    },
+    fetchImpl: async () => {
+      fetches += 1;
+      throw new Error('unexpected building fetch');
     },
   });
-  await runtime.start();
-  runtime.stop();
-  assert.equal(calls.length, 1);
-  assert.match(calls[0], /sx=1000&sy=2000/);
-  assert.match(calls[0], /ox=1000&oy=2000/);
+
+  runtime.reconcile([squareBuilding]);
+
   assert.ok(runtime.getMesh());
-
-  // Camera barely moved: no refetch.
-  pipelineState.lastFetchX = 1400;
-  await runtime.start();
-  runtime.stop();
-  assert.equal(calls.length, 1);
-
-  // A newly applied terrain texture explicitly refreshes sampled colors even
-  // when the camera has not crossed the movement threshold.
-  await runtime.refresh();
-  assert.equal(calls.length, 2);
-
-  // Camera moved beyond the refetch distance: refetch.
-  pipelineState.lastFetchX = 30000;
-  await runtime.start();
-  runtime.stop();
-  assert.equal(calls.length, 3);
+  assert.equal(fetches, 0);
+  assert.equal(runtime.start, undefined);
+  assert.equal(runtime.refresh, undefined);
 });

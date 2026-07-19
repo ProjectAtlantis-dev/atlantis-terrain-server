@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { createTerrainHeadingDemandController } from './terrain-heading-demand.js';
+import { createTerrainHeadingDemandController } from '../terrain-heading-demand.js';
 
 test('heading demand waits for turning to settle and commits only the final heading', () => {
   const scheduled = new Map();

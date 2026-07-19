@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { buildRoadsGeometry } from './terrain-roads-runtime.js';
+import { buildRoadsGeometry } from '../terrain-roads-runtime.js';
 
 const straightRoad = {
   id: '0600NUK_VEJMIDTE_1',

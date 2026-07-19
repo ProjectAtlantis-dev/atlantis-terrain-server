@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { installTerrainKeyboardControls } from './terrain-controls.js';
-import { googleMaps3dCamera, googleMaps3dUrl } from './terrain-google-maps.js';
+import { installTerrainKeyboardControls } from '../terrain-controls.js';
+import { googleMaps3dCamera, googleMaps3dUrl } from '../terrain-google-maps.js';
 
 test('Google Maps camera preserves heading and translates view elevation', () => {
   assert.deepEqual(googleMaps3dCamera({

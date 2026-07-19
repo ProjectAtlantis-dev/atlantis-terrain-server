@@ -35,10 +35,16 @@ export function createTerrainMeshBuilder({ exaggeration, attachScatter }) {
     const resolution = tile.resolution;
     const heightmap = decodeTerrainHeightmap(tile.heightmap);
     const [xMin, yMin, xMax, yMax] = tile.bbox;
-    const positions = new Float32Array(resolution * resolution * 3);
-    const colors = new Float32Array(resolution * resolution * 3);
-    const classifierFallbackColors = new Float32Array(resolution * resolution * 3);
-    const uvs = new Float32Array(resolution * resolution * 2);
+    const surfaceVertexCount = resolution * resolution;
+    // Each edge gets an independent top/bottom pair per surface vertex. The
+    // resulting vertical skirts hide sub-pixel cracks between separately
+    // rasterized tiles without changing the repaired surface edge itself.
+    const skirtVertexCount = resolution * 2 * 4;
+    const vertexCount = surfaceVertexCount + skirtVertexCount;
+    const positions = new Float32Array(vertexCount * 3);
+    const colors = new Float32Array(vertexCount * 3);
+    const classifierFallbackColors = new Float32Array(vertexCount * 3);
+    const uvs = new Float32Array(vertexCount * 2);
 
     for (let row = 0; row < resolution; row++) for (let column = 0; column < resolution; column++) {
       const index = row * resolution + column;
@@ -59,6 +65,61 @@ export function createTerrainMeshBuilder({ exaggeration, attachScatter }) {
       const a = row * resolution + column, b = a + 1, d = a + resolution, f = d + 1;
       indices.push(a, b, d, b, f, d);
     }
+
+    const geometricError = Number.isFinite(Number(tile.geometric_error))
+      ? Math.max(0, Number(tile.geometric_error))
+      : 0;
+    const skirtDepth = Math.max(30, geometricError * 2) * Math.abs(exaggeration);
+    let nextVertex = surfaceVertexCount;
+    function appendSkirt(surfaceIndices, outwardWinding) {
+      const skirtStart = nextVertex;
+      for (const surfaceIndex of surfaceIndices) {
+        const top = nextVertex++;
+        const bottom = nextVertex++;
+        for (let component = 0; component < 3; component++) {
+          const value = positions[surfaceIndex * 3 + component];
+          positions[top * 3 + component] = value;
+          positions[bottom * 3 + component] = value;
+          colors[top * 3 + component] = colors[surfaceIndex * 3 + component];
+          colors[bottom * 3 + component] = colors[surfaceIndex * 3 + component];
+          classifierFallbackColors[top * 3 + component]
+            = classifierFallbackColors[surfaceIndex * 3 + component];
+          classifierFallbackColors[bottom * 3 + component]
+            = classifierFallbackColors[surfaceIndex * 3 + component];
+        }
+        positions[bottom * 3 + 2] -= skirtDepth;
+        uvs[top * 2] = uvs[surfaceIndex * 2];
+        uvs[top * 2 + 1] = uvs[surfaceIndex * 2 + 1];
+        uvs[bottom * 2] = uvs[surfaceIndex * 2];
+        uvs[bottom * 2 + 1] = uvs[surfaceIndex * 2 + 1];
+      }
+      for (let index = 0; index < surfaceIndices.length - 1; index++) {
+        const topA = skirtStart + index * 2;
+        const bottomA = topA + 1;
+        const topB = topA + 2;
+        const bottomB = topA + 3;
+        if (outwardWinding) {
+          indices.push(topA, bottomA, topB, topB, bottomA, bottomB);
+        } else {
+          indices.push(topA, topB, bottomA, topB, bottomB, bottomA);
+        }
+      }
+    }
+    const south = Array.from({ length: resolution }, (_, column) => column);
+    const north = Array.from(
+      { length: resolution },
+      (_, column) => (resolution - 1) * resolution + column,
+    );
+    const west = Array.from({ length: resolution }, (_, row) => row * resolution);
+    const east = Array.from(
+      { length: resolution },
+      (_, row) => row * resolution + resolution - 1,
+    );
+    appendSkirt(south, true);
+    appendSkirt(north, false);
+    appendSkirt(west, false);
+    appendSkirt(east, true);
+
     if (indices.length === 0) return null;
     const geometry = new THREE.BufferGeometry();
     geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
@@ -75,6 +136,7 @@ export function createTerrainMeshBuilder({ exaggeration, attachScatter }) {
     Object.assign(mesh.userData, {
       tileId: tile.id,
       bbox: tile.bbox,
+      skirtDepth,
       terrainColorAttribute,
       classifierColorAttribute,
     });

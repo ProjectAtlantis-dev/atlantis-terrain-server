@@ -3,7 +3,7 @@ import * as THREE from 'three';
 import { createTerrainVectorLayerRuntime } from './terrain-vector-layer-runtime.js';
 
 // Grey extruded buildings from Asiaq Teknisk Grundkort footprints. Flask
-// reads them from the shared catalog and serves GET /api/buildings. Rings
+// reads them from the shared catalog while processing /api/tiles. Rings
 // arrive origin-relative (same ox/oy
 // convention as /api/tiles) with per-vertex surveyed roof elevations; each
 // building is extruded from its ingest-sampled ground up to the real roof
@@ -110,16 +110,20 @@ export function buildBuildingsGeometry(buildings, {
 }
 
 export function createTerrainBuildingsRuntime({
-  terrainRoot, pipelineState, exaggeration = 1,
-  endpoint = '/api/buildings',
-  bootLog, onMutated, requestRender, fetchImpl,
+  terrainRoot, pipelineState, exaggeration = 1, onMutated, requestRender,
 }) {
-  return createTerrainVectorLayerRuntime({
+  const layer = createTerrainVectorLayerRuntime({
     terrainRoot, pipelineState,
-    endpoint, itemsKey: 'buildings', logLabel: 'Buildings',
+    endpoint: null, itemsKey: 'buildings', logLabel: 'Buildings',
     buildKeyForItem: item => `${item.id}:${item.colorVersion ?? ''}:${item.color?.join(',') ?? ''}`,
     buildGeometry: (items, { offsetX, offsetY }) =>
       buildBuildingsGeometry(items, { offsetX, offsetY, exaggeration }),
-    bootLog, onMutated, requestRender, fetchImpl,
+    onMutated, requestRender,
   });
+  return {
+    reconcile: layer.reconcile,
+    setVisible: layer.setVisible,
+    getVisible: layer.getVisible,
+    getMesh: layer.getMesh,
+  };
 }

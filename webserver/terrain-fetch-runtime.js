@@ -24,6 +24,7 @@ export function createTerrainFetchRuntime({
 }) {
   const {
     onResponseApplied = () => {},
+    onBuildings = () => {},
     onAvailability = () => {},
     onSkip = () => {},
     onError = () => {},
@@ -145,6 +146,8 @@ export function createTerrainFetchRuntime({
       state.firstLoad = false;
       logger.enqueue('info', 'fetchTiles.origin.set', origin.logDetails);
     }
+
+    if (Array.isArray(data.buildings)) onBuildings(data.buildings);
 
     const reconciliation = terrain.reconcile(data.tiles, {
       onDiff: details => logger.enqueue('info', `fetchTiles.diff[pass${pass}]`, {

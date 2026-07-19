@@ -652,7 +652,7 @@ def _tile_priority(bbox: list[float], qx: float, qy: float, fwd_x: float, fwd_y:
   return dist / max(dot, 0.01)
 
 
-_METATILE_FINAL_SOURCE = "dataforsyningen_metatile4h"
+_METATILE_FINAL_SOURCE = "dataforsyningen_metatile4h2"
 _METATILE_UPGRADEABLE_SOURCES = {
   "sentinel2_crop",
   "ancestor_crop",
@@ -660,6 +660,7 @@ _METATILE_UPGRADEABLE_SOURCES = {
   "dataforsyningen",
   "dataforsyningen_metatile",
   "dataforsyningen_metatile4",
+  "dataforsyningen_metatile4h",
 }
 
 
@@ -855,6 +856,18 @@ def _queue_texture_fetch(
 
 _api_tiles_state: dict[str, str | None] = {"last_result": None}
 _last_camera: dict[str, float] | None = None  # last /api/tiles pose, feeds /api/heatmap
+_BUILDING_QUERY_RANGE_M = 25000.0
+
+
+def _buildings_for_tile_query(qx: float, qy: float, ox: float, oy: float):
+  """Resolve scene buildings as part of the terrain-tile transaction."""
+  from asset_catalog import color_buildings_from_textures, query_buildings
+
+  buildings = query_buildings(
+    _get_assets_db(), qx, qy, _BUILDING_QUERY_RANGE_M, ox, oy
+  )
+  color_buildings_from_textures(_get_db(), buildings, ox, oy)
+  return buildings
 
 
 @app.get("/api/tiles")
@@ -1110,6 +1123,16 @@ def api_tiles():
 
   downloading = list(_cog_fetching_tiles)
 
+  try:
+    buildings = _buildings_for_tile_query(qx, qy, ox, oy)
+  except Exception as exc:
+    # Terrain delivery remains usable if the optional asset catalog is being
+    # rebuilt. Omit the field so the client preserves its current mesh.
+    buildings = None
+    log.warning(
+      f"[/api/tiles] building query FAILED: {type(exc).__name__}: {exc}"
+    )
+
   return jsonify(
     {
       "tiles": tile_data,
@@ -1124,6 +1147,8 @@ def api_tiles():
       "texQueued": len(tex_fetching),
       "texRetryQueue": len(_tex_retry_queue),
       "texStatusCounts": tex_status_counts,
+      "buildings": buildings,
+      "buildingCount": len(buildings) if buildings is not None else None,
     }
   )
 
@@ -1244,6 +1269,7 @@ def api_texture(tile_id: str):
     "dataforsyningen",  # legacy independent fetch; upgrade to aligned metatile
     "dataforsyningen_metatile",  # legacy 2x2 group; upgrade to aligned 4x4
     "dataforsyningen_metatile4",  # legacy 4x4 group without harmonization
+    "dataforsyningen_metatile4h",  # legacy conservative harmonization
   }
   if row is not None:
     cached, source = row[0], row[1]
@@ -1524,7 +1550,7 @@ def api_classifier_tile(tile_id: str):
     "X-Classifier-Schema": str(class_schema),
     "X-Classifier-Source": str(source),
   }
-  if effective_water is not None:
+  if effective_water is not None and water_source_row is not None:
     headers["X-Water-Mask-Source"] = str(water_source_row[0])
   if found is not None and depth != child_depth:
     headers["X-Classifier-Ancestor"] = f"{depth}-{col}-{row}"

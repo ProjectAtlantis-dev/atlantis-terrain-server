@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { resolveTerrainViewToggle } from './terrain-view-mode.js';
+import { resolveTerrainViewToggle } from '../terrain-view-mode.js';
 
 test('H toggles directly between 3D and heatmap', () => {
   assert.deepEqual(

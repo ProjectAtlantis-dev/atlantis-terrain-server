@@ -844,14 +844,6 @@ const {
   texCache, texSource, texInflight, texFetching,
 } = textureStreamer;
 let buildingsRuntime = null;
-let buildingTextureRefreshTimer = null;
-function requestBuildingTextureRefresh() {
-  if (buildingTextureRefreshTimer != null) return;
-  buildingTextureRefreshTimer = setTimeout(() => {
-    buildingTextureRefreshTimer = null;
-    buildingsRuntime?.refresh();
-  }, 500);
-}
 const terrainTileSet = createTerrainTileSet({
   terrainRoot,
   textureStreamer,
@@ -867,7 +859,6 @@ const terrainTileSet = createTerrainTileSet({
     onMutated: markSceneMutated,
     onMaterialApplied: () => {
       requestRender();
-      requestBuildingTextureRefresh();
     },
   },
 });
@@ -882,8 +873,6 @@ buildingsRuntime = createTerrainBuildingsRuntime({
   terrainRoot,
   pipelineState: terrainPipelineState,
   exaggeration: EXAG,
-  endpoint: '/api/buildings',
-  bootLog,
   onMutated: markSceneMutated,
   requestRender,
 });
@@ -1079,6 +1068,7 @@ function runStreamingMaintenance() {
 
 const terrainFetchEvents = {
   onResponseApplied: requestRender,
+  onBuildings: buildings => buildingsRuntime?.reconcile(buildings),
   onAvailability: markMissing,
   onSkip: () => enqueueClientLog('debug', 'fetchTiles.skip', {
     reason: 'already fetching', ...getCameraLogSnapshot(),
@@ -1272,7 +1262,6 @@ if (!bootFlyToTileId || !flyToTileRuntime.flyToTile(bootFlyToTileId).ok) {
   terrainFetchRuntime.request();
 }
 houseRuntime.start();
-buildingsRuntime.start();
 vehicleRuntime.loadVehicleState();
 vehicleRuntime.loadVehicleModel();
 

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { renderGameClock } from './terrain-hud.js';
+import { renderGameClock } from '../terrain-hud.js';
 
 test('renderGameClock only rewrites the DOM when the display changes', () => {
   const element = { innerHTML: '', dataset: {} };

@@ -4,7 +4,7 @@ import test from 'node:test';
 import {
   alternateTerrainRenderBackend,
   resolveTerrainRenderBackend,
-} from './terrain-render-backend.js';
+} from '../terrain-render-backend.js';
 
 test('renderer selection defaults to WebGL and restores supported WebGPU', () => {
   assert.equal(resolveTerrainRenderBackend(null, true), 'webgl');

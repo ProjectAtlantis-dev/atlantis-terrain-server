@@ -2,7 +2,7 @@
 
 TEXTURE UPGRADE CHAIN — DO NOT FUCK WITH THE ORDER:
 
-    ancestor_crop → dataforsyningen_metatile4h
+    ancestor_crop → dataforsyningen_metatile4h2
 
 TEXTURE SOURCE STATES:
 - ancestor_crop:            Cropped from parent at subdivision time. Fresh, untried.
@@ -18,9 +18,10 @@ TEXTURE SOURCE STATES:
 - dataforsyningen:          Legacy independently-fetched tile. Re-fetchable.
 - dataforsyningen_metatile: Legacy aligned 2x2 metatile. Re-fetchable.
 - dataforsyningen_metatile4: Legacy unharmonized 4x4 metatile. Re-fetchable.
-- dataforsyningen_metatile4h: Primary source (SPOT 6/7, 1.6m/0.2m via
-                              EPSG:3184), fetched/reprojected as an aligned
-                              4x4 group with feathered color harmonization.
+- dataforsyningen_metatile4h: Legacy conservative harmonization. Re-fetchable.
+- dataforsyningen_metatile4h2: Primary source (SPOT 6/7, 1.6m/0.2m via
+                               EPSG:3184), fetched/reprojected as an aligned
+                               4x4 group with edge-driven color harmonization.
 - write_texture() has an expected_upgrades whitelist. If you add a new source,
   update that whitelist or you'll get TEX CLOBBER warnings.
 
@@ -280,10 +281,10 @@ def harmonize_texture_metatile(
     image_bytes,
     child_resolution=256,
     grid_size=4,
-    strip_width=4,
+    strip_width=1,
     feather_width=48,
     smooth_radius=12,
-    max_shift=24.0,
+    max_shift=40.0,
 ):
     """Feather low-frequency provider-mosaic jumps across child boundaries.
 
@@ -415,6 +416,15 @@ def write_texture(db, tile_id, jpeg_bytes, source):
             ("dataforsyningen", "dataforsyningen_metatile4h"),
             ("dataforsyningen_metatile", "dataforsyningen_metatile4h"),
             ("dataforsyningen_metatile4", "dataforsyningen_metatile4h"),
+            ("sentinel2_crop", "dataforsyningen_metatile4h2"),
+            ("ancestor_crop", "dataforsyningen_metatile4h2"),
+            ("ancestor_crop_ratelimit", "dataforsyningen_metatile4h2"),
+            ("ocean_nodata", "dataforsyningen_metatile4h2"),
+            ("sentinel2", "dataforsyningen_metatile4h2"),
+            ("dataforsyningen", "dataforsyningen_metatile4h2"),
+            ("dataforsyningen_metatile", "dataforsyningen_metatile4h2"),
+            ("dataforsyningen_metatile4", "dataforsyningen_metatile4h2"),
+            ("dataforsyningen_metatile4h", "dataforsyningen_metatile4h2"),
         }
         msg = (
             f"{tile_id}: replacing {ex_source} "

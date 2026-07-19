@@ -143,6 +143,8 @@ class TextureMetatileFetchTest(unittest.TestCase):
         children, error = serve_flask._fetch_texture_metatile("12-1407-765")
 
         self.assertIsNone(error)
+        self.assertIsNotNone(children)
+        assert children is not None
         self.assertEqual(calls, [([10, 351, 191, 552], 1024, True)])
         self.assertEqual(len(children), 16)
         self.assertEqual(children["12-1404-764"], b"0-0")
@@ -171,8 +173,8 @@ class TextureMetatileFetchTest(unittest.TestCase):
         self.assertEqual(written, {"2-0-0", "2-0-1"})
         self.assertEqual(no_coverage, {"2-1-1"})
         sources = dict(db.execute("SELECT tile_id, source FROM textures"))
-        self.assertEqual(sources["2-0-0"], "dataforsyningen_metatile4h")
-        self.assertEqual(sources["2-0-1"], "dataforsyningen_metatile4h")
+        self.assertEqual(sources["2-0-0"], "dataforsyningen_metatile4h2")
+        self.assertEqual(sources["2-0-1"], "dataforsyningen_metatile4h2")
         self.assertEqual(sources["2-1-0"], "ocean_nodata")
 
 

@@ -6,32 +6,32 @@ import {
   priorityHeading,
   viewHeadingChanged,
   terrainTilePriority,
-} from './terrain-priority.js';
-import { compassHeading } from './terrain-hud.js';
-import { applyMapDrag } from './terrain-controls.js';
-import { createVehiclePersistenceRuntime, normalizeSavedVehicleState, stepSuspension, stepVehicleDrive, vehicleLocalToLatLon, vehicleStateSnapshot } from './terrain-vehicle.js';
-import { scoreTextureTiles, textureRetryDelay, tileDepthFromId } from './terrain-tile-runtime.js';
-import { createTextureStreamer, rendererTextureAnisotropy } from './terrain-texture-streamer.js';
+} from '../terrain-priority.js';
+import { compassHeading } from '../terrain-hud.js';
+import { applyMapDrag } from '../terrain-controls.js';
+import { createVehiclePersistenceRuntime, normalizeSavedVehicleState, stepSuspension, stepVehicleDrive, vehicleLocalToLatLon, vehicleStateSnapshot } from '../terrain-vehicle.js';
+import { scoreTextureTiles, textureRetryDelay, tileDepthFromId } from '../terrain-tile-runtime.js';
+import { createTextureStreamer, rendererTextureAnisotropy } from '../terrain-texture-streamer.js';
 import {
   createTerrainTextureController,
   createTerrainTileReconciler,
   createTerrainTileSet,
   createTileLifecycle,
   reconcileTerrainTiles,
-} from './terrain-tile-set.js';
-import { createTerrainMeshBuilder, decodeTerrainHeightmap } from './terrain-mesh-builder.js';
-import { applyTerrainAvailabilityStatus } from './terrain-status-controller.js';
-import { collectTerrainDebugMeshes, createTerrainHoverOutlineController, createTerrainMapGridController, summarizeTerrainMesh } from './terrain-debug-runtime.js';
-import { createTerrainFetchRuntime } from './terrain-fetch-runtime.js';
-import { restoreTerrainCameraState, terrainCameraState } from './terrain-camera-state.js';
-import { createTerrainClientLogger } from './terrain-client-logging.js';
-import { createTerrainFpsCounter } from './terrain-fps-counter.js';
-import { loadTerrainStartupAssets, normalizeTerrainStartupAssets } from './terrain-startup-assets.js';
-import { createTerrainAtmosphereTextureRuntime } from './terrain-atmosphere-textures.js';
-import { paintClassifierGridBorder } from './terrain-classifier-texture.js';
-import { createTerrainTuningControls } from './terrain-tuning-controls.js';
-import { bindTerrainCloudComposition, configureTerrainClouds, registerTerrainCloudTuning } from './terrain-cloud-runtime.js';
-import { createTerrainHouseConfiguration, createTerrainHouseMarkerRuntime, createTerrainHouseModelController, disposeTerrainHouseTree, markTerrainHousesNeedSnap, terrainHouseLocalPosition, terrainHouseShadowCoverage, terrainHouseZSummary } from './terrain-house-runtime.js';
+} from '../terrain-tile-set.js';
+import { createTerrainMeshBuilder, decodeTerrainHeightmap } from '../terrain-mesh-builder.js';
+import { applyTerrainAvailabilityStatus } from '../terrain-status-controller.js';
+import { collectTerrainDebugMeshes, createTerrainHoverOutlineController, createTerrainMapGridController, summarizeTerrainMesh } from '../terrain-debug-runtime.js';
+import { createTerrainFetchRuntime } from '../terrain-fetch-runtime.js';
+import { restoreTerrainCameraState, terrainCameraState } from '../terrain-camera-state.js';
+import { createTerrainClientLogger } from '../terrain-client-logging.js';
+import { createTerrainFpsCounter } from '../terrain-fps-counter.js';
+import { loadTerrainStartupAssets, normalizeTerrainStartupAssets } from '../terrain-startup-assets.js';
+import { createTerrainAtmosphereTextureRuntime } from '../terrain-atmosphere-textures.js';
+import { paintClassifierGridBorder } from '../terrain-classifier-texture.js';
+import { createTerrainTuningControls } from '../terrain-tuning-controls.js';
+import { bindTerrainCloudComposition, configureTerrainClouds, registerTerrainCloudTuning } from '../terrain-cloud-runtime.js';
+import { createTerrainHouseConfiguration, createTerrainHouseMarkerRuntime, createTerrainHouseModelController, disposeTerrainHouseTree, markTerrainHousesNeedSnap, terrainHouseLocalPosition, terrainHouseShadowCoverage, terrainHouseZSummary } from '../terrain-house-runtime.js';
 import {
   buildTerrainTilesRequest,
   adoptTerrainOrigin,
@@ -46,7 +46,7 @@ import {
   terrainCameraGridPosition,
   terrainCameraStereoPosition,
   terrainPipelineStatus,
-} from './terrain-tile-fetch.js';
+} from '../terrain-tile-fetch.js';
 
 test('classifier grid border is baked into all four texture edges', () => {
   const fills = [];
@@ -960,8 +960,16 @@ test('shared terrain mesh builder preserves heightmap geometry and metadata', ()
   const mesh = build({
     id: '1-2-3', resolution: 2, bbox: [10, 20, 12, 22], heightmap: encoded,
   });
-  assert.deepEqual([...mesh.geometry.attributes.position.array], [
+  assert.deepEqual([...mesh.geometry.attributes.position.array.slice(0, 12)], [
     10, 20, 2, 12, 20, 4, 10, 22, 6, 12, 22, 8,
+  ]);
+  assert.equal(mesh.geometry.attributes.position.count, 20);
+  assert.equal(mesh.geometry.attributes.color.count, 20);
+  assert.equal(mesh.geometry.attributes.uv.count, 20);
+  assert.equal(mesh.geometry.index.count, 30);
+  assert.equal(mesh.userData.skirtDepth, 60);
+  assert.deepEqual([...mesh.geometry.attributes.position.array.slice(12, 18)], [
+    10, 20, 2, 10, 20, -58,
   ]);
   assert.equal(mesh.userData.tileId, '1-2-3');
   assert.deepEqual([...scatterHeightmap], [1, 2, 3, 4]);
@@ -1079,11 +1087,15 @@ test('shared fetch runtime preserves initial response transition ordering', asyn
       enqueue(_level, name) { events.push(name); },
       boot(name) { events.push(name); },
     },
-    events: { onAvailability() { events.push('missing'); } },
+    events: {
+      onBuildings(buildings) { events.push(`buildings:${buildings.length}`); },
+      onAvailability() { events.push('missing'); },
+    },
     fetchImpl: async () => ({
       status: 200,
       json: async () => ({
-        ox: 10, oy: 20, qx: 11, qy: 21, tiles: [], missing: [], downloading: [],
+        ox: 10, oy: 20, qx: 11, qy: 21, tiles: [], buildings: [{ id: 'b' }],
+        missing: [], downloading: [],
         texFetching: 0, texRetryQueue: 0, texStatusCounts: {},
       }),
     }),
@@ -1096,7 +1108,7 @@ test('shared fetch runtime preserves initial response transition ordering', asyn
   assert.deepEqual(events, [
     'fetchTiles.request[pass1]', 'fetchTiles.frame.offset.set',
     'fetchTiles.response[pass1]', 'tiles.initial-fetch.response',
-    'fetchTiles.origin.set', 'fetchTiles.diff[pass1]', 'fetchTiles.built[pass1]',
+    'fetchTiles.origin.set', 'buildings:1', 'fetchTiles.diff[pass1]', 'fetchTiles.built[pass1]',
     'textures', 'missing',
   ]);
 });

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { epsg3413DirectionBearing, epsg3413ToWgs84 } from './terrain-polar-stereo.js';
+import { epsg3413DirectionBearing, epsg3413ToWgs84 } from '../terrain-polar-stereo.js';
 
 test('EPSG:3413 inverse matches the Nuuk-area WGS84 reference', () => {
   const result = epsg3413ToWgs84(-321798.6734463132, -2833594.578052482);

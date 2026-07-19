@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { epsg3413ToWgs84 } from './terrain-polar-stereo.js';
+import { epsg3413ToWgs84 } from '../terrain-polar-stereo.js';
 import {
   TILE_GRID_ROOT_BBOX,
   createTerrainFlyToTileRuntime,
@@ -9,7 +9,7 @@ import {
   tileBbox,
   tileMapZoom,
   tileViewAltitude,
-} from './terrain-fly-to-tile.js';
+} from '../terrain-fly-to-tile.js';
 
 test('parseTileId accepts depth-col-row and rejects malformed ids', () => {
   assert.deepEqual(parseTileId('12-1461-786'), { depth: 12, col: 1461, row: 786, id: '12-1461-786' });
@@ -203,7 +203,7 @@ test('T key clears its pressed state and asks for a tile', async () => {
     removeEventListener(type) { listeners.delete(type); },
   };
   try {
-    const { installTerrainKeyboardControls } = await import('./terrain-controls.js');
+    const { installTerrainKeyboardControls } = await import('../terrain-controls.js');
     const controls = { keys: {} };
     let flyRequests = 0;
     const dispose = installTerrainKeyboardControls({
