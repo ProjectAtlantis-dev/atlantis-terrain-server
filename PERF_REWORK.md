@@ -418,3 +418,17 @@ at runtime forces a full material recompile — never do it mid-measurement.
   **16.7/17.6/66.7 ms**, with no WebGPU validation error. Slow-down restored
   the correct procgen cell in 990.6 ms without showing the stale root; its warm
   rewrite was still 163.6 ms and remains over the 50 ms hitch gate.
+- **2026-07-19 (all-layer camera-pop correction)** — A rejected global
+  readiness gate waited for every deferred terrain texture; 29 legitimate
+  distant texture waits never drained, so procgen vanished and the apparent
+  speedup was only missing work. It was replaced by a 1,024 m local geometry
+  override: fine height meshes under procgen may materialize untextured while
+  imagery continues asynchronously, without changing distant residency. The
+  remaining view-dependent disappearance was a stale camera inverse: both
+  GroundRing and Forests culled before Three refreshed that matrix, and the
+  demand-render loop could stop with the previous view's frustum. An explicit
+  pre-cull matrix update made a turn-away/turn-back probe visually stable at
+  the same heading/cell/depth-12 sources (9,501 grass, 70 plants and 3,216
+  rocks visible after return). Settled GPU readback showed rock origins aligned
+  to depth-12 terrain with deliberate base sink. Tests pass 86/86 and the Vite
+  build passes; no WebGPU validation error was emitted.

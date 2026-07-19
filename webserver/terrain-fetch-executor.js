@@ -42,6 +42,7 @@ export function createTerrainFetchExecutor({
   applyMissing,
   updateTextures,
   prepareUntexturedMesh,
+  forceUntexturedBuild = () => false,
   onMeshAdded,
   onWorldIdentity = () => {},
   onTilesReceived = () => {},
@@ -134,7 +135,7 @@ export function createTerrainFetchExecutor({
       deferredTiles, terrainRoot, lifecycle, priorityForTile,
       textureCache, materialize, buildMesh, log: tileLog,
       buildBudget: pass === 1 ? previewBuildBudget : fullBuildBudget,
-      prepareUntexturedMesh, onMeshAdded,
+      prepareUntexturedMesh, forceUntexturedBuild, onMeshAdded,
       onDiff: details => enqueueLog('info', `fetchTiles.diff[pass${pass}]`, {
         pass, passLabel: pass === 1 ? 'preview' : 'full', ...details,
       }),

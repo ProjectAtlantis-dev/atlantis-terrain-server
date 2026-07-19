@@ -593,7 +593,11 @@ export class Forests {
             compact: this.compact,
             groupBase: offsets[g] ?? 0,
             fade: fadeFor(pool.cls, ring),
-            surfaceDither: pool.cls >= 18,
+            // Whole-instance thresholds made individual tundra plants blink
+            // between geometry rings as the camera translated. Ground flora
+            // and rigid rocks use a stable object-surface dissolve; only tree
+            // crowns retain the cheaper per-instance transition.
+            surfaceDither: pool.cls >= 18 || isUnderClass(pool.cls),
             wind: windBind,
             // flower classes (12–15) + morphology tundra plants (24–31) carry a
             // part-id vdata.x, so their flower heads collapse out of bloom.
@@ -827,19 +831,25 @@ export class Forests {
         // sight line) — casters intentionally skip BOTH (an off-screen or
         // ridge-hidden tree still casts into the visible scene)
         const visMain = inFrustum(center, rad).toVar();
-        If(visMain.greaterThan(0.5).and(dist.greaterThan(140)), () => {
-          const top = vec3(A.x, A.y.add(hgt), A.z);
-          const occ = float(0).toVar();
-          for (let st = 1; st <= 7; st++) {
-            const t = st / 8;
-            const sp = camU.mul(1 - t).add(top.mul(t)) as unknown as NV3;
-            const th = hf.sampleHeightNearest(vec2(sp.x, sp.z));
-            occ.assign(occ.max(th.sub(sp.y)));
-          }
-          If(occ.greaterThan(4), () => {
-            visMain.assign(0);
+        // The seven-tap ridge test is useful for tall trees, but applying its
+        // hard 4 m decision to ground rocks made them pop as a small camera
+        // translation changed the nearest-height samples. Rocks are bounded
+        // by their distance/frustum LODs and grounded by GTAO/contact instead.
+        if (kind === 'trees') {
+          If(visMain.greaterThan(0.5).and(dist.greaterThan(140)), () => {
+            const top = vec3(A.x, A.y.add(hgt), A.z);
+            const occ = float(0).toVar();
+            for (let st = 1; st <= 7; st++) {
+              const t = st / 8;
+              const sp = camU.mul(1 - t).add(top.mul(t)) as unknown as NV3;
+              const th = hf.sampleHeightNearest(vec2(sp.x, sp.z));
+              occ.assign(occ.max(th.sub(sp.y)));
+            }
+            If(occ.greaterThan(4), () => {
+              visMain.assign(0);
+            });
           });
-        });
+        }
 
         if (kind === 'trees') {
           const pool = cls.mul(4).add(variant).toInt();

@@ -4940,6 +4940,17 @@ function getTerrainRequestFocus(cameraLL) {
 
 const PROCGEN_FIELD_PREFETCH_COUNT = 32;
 const PROCGEN_FIELD_PREFETCH_LEAD_MAX = 768;
+const PROCGEN_FINE_GEOMETRY_HALF_SPAN = 512;
+function tileOverlapsProcgenGeometryWindow(tile) {
+  if (!greenlandPatch || !Array.isArray(tile?.bbox) || tile.bbox.length !== 4) return false;
+  const relative = camera.position.clone().sub(anchorPosition);
+  const x = relative.dot(east);
+  const y = relative.dot(north);
+  return tile.bbox[2] >= x - PROCGEN_FINE_GEOMETRY_HALF_SPAN
+    && tile.bbox[0] <= x + PROCGEN_FINE_GEOMETRY_HALF_SPAN
+    && tile.bbox[3] >= y - PROCGEN_FINE_GEOMETRY_HALF_SPAN
+    && tile.bbox[1] <= y + PROCGEN_FINE_GEOMETRY_HALF_SPAN;
+}
 function prefetchProcgenFields(tiles) {
   if (!greenlandPatch || !Array.isArray(tiles) || tiles.length === 0) return;
   const relative = camera.position.clone().sub(anchorPosition);
@@ -5162,6 +5173,7 @@ const performTileFetch = createTerrainFetchExecutor({
   textureCache: texCache,
   materialize: materializeTile, buildMesh, tileLog, applyMissing: markMissing, updateTextures,
   prepareUntexturedMesh: applyWebGPUUntexturedTerrainMaterial,
+  forceUntexturedBuild: tileOverlapsProcgenGeometryWindow,
   onMeshAdded: () => { markSceneMutated(); markShadowCastersChanged(); },
   onWorldIdentity: identity => greenlandPatch?.setWorldIdentity(identity),
   onTilesReceived: prefetchProcgenFields,
@@ -6418,6 +6430,12 @@ function render() {
     stopRenderLoopIfIdle();
     return;
   }
+  // Procgen culling runs before renderScene(), but Three normally refreshes
+  // camera.matrixWorldInverse inside renderScene().  Without this explicit
+  // update the GPU cull saw the previous view while terrain rendered from the
+  // current view.  When the demand-driven loop stopped after a drag, that
+  // stale frustum persisted and grass/rocks popped on camera rotation.
+  camera.updateMatrixWorld(true);
   updateNearFieldScatter();
   if (renderBackend.isWebGPU && renderer.backend?.isWebGPUBackend === true && greenlandPatch) {
     // The first response is a deliberately coarse preview. Building LAAS from

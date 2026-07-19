@@ -271,3 +271,44 @@ generating/loading classifier fields before later warm reads fell to 4.5 ms.
   build passed (373 modules), no shader/pipeline/WebGPU validation error was
   emitted, and a fresh frame at 64.18455, -51.70203 showed no visible mask
   edge or terrain-darkening regression.
+
+### 2026-07-19 - Local geometry readiness and view-stable procgen correction
+
+Status: implemented and live-probed after the user reported that procgen first
+vanished, then grass/plants/rocks changed when only the camera view moved.
+
+- A first attempted readiness condition required the entire deferred terrain
+  queue to reach zero. This was wrong and was removed: 29 distant entries can
+  legitimately remain deferred while awaiting imagery, so the condition made
+  local procgen permanently unavailable and made the client appear fast only
+  because its detail workload was absent.
+- The terrain reconciler now has a narrowly scoped override for the 1,024 m
+  local procgen geometry window. Fine height meshes in that window may be
+  materialized untextured beneath a textured stale parent while their imagery
+  remains deferred. Distant tiles keep the normal textured-parent handoff.
+  Two regression tests cover both the local override and the unchanged distant
+  behavior.
+- The camera-turn pop had a separate cause. Procgen's `Forests` and
+  `GroundRing` culls ran before `renderScene`, but relied on the camera inverse
+  matrix that Three normally refreshes inside `renderScene`. With the
+  demand-driven render loop, the previous-view frustum could persist after a
+  drag ended. The camera world/inverse matrices are now explicitly updated
+  before either GPU cull.
+- At latitude 64.18697, longitude -51.68571 and altitude 75 m, an automated
+  turn-away/turn-back probe returned to the identical heading, patch cell
+  `1728:384`, depth-12 source set, 9,498 generated plants and 24,002 generated
+  rocks. Before/returned frames matched visually instead of reproducing the
+  user's all-layer disappearance. The returned counters reported 70 visible
+  plants, 3,216 visible rocks and 9,501 grass instances.
+- GPU buffer readback at that location found 4,472 large extras and 19,530
+  stones. Sampled rock origins matched the resident depth-12 terrain and were
+  deliberately sunk by their base offset; no floating placement equation was
+  found in the settled window.
+- The seven-sample hard terrain-occlusion rejection is now limited to trees;
+  applying it to ground rocks made visibility flip around a 4 m nearest-sample
+  threshold. Tundra flora and rigid objects use stable surface LOD dissolution
+  instead of whole-instance transitions.
+- Automated Web tests pass 86/86 and the Vite production build passes at 373
+  modules. The only browser warning in the probe was the already-known optional
+  asset service on port 8787 being unavailable; no shader/pipeline/WebGPU
+  validation error was emitted.

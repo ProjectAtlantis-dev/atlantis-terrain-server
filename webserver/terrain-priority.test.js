@@ -612,6 +612,67 @@ test('shared reconciler spends dirty-paint budget in heatmap order', () => {
   assert.deepEqual(diffDetails, { added: 2, removed: 0, purgedDeferred: 0, sceneMeshes: 0 });
 });
 
+test('shared reconciler can materialize local fine geometry beneath a textured stale parent', () => {
+  const child = { id: '12-10-20', bbox: [0, 0, 10, 10], heightmap: 'fine-hm' };
+  const parent = {
+    isMesh: true,
+    userData: { tileId: '11-5-10', bbox: [-10, -10, 20, 20] },
+    material: { map: { id: 'stale-texture' } },
+  };
+  const terrainRoot = {
+    children: [parent],
+    add(mesh) { this.children.push(mesh); },
+  };
+  const deferredTiles = new Map();
+  const built = [];
+  const logs = [];
+  const result = reconcileTerrainTiles({
+    tiles: [child], currentTileIds: new Set(['11-5-10']),
+    deferredTiles, terrainRoot,
+    lifecycle: { sweepStaleParents: () => 0 },
+    priorityForTile: () => 0,
+    textureCache: new Map(), materialize: () => assert.fail('unexpected materialize'),
+    buildMesh: tile => {
+      built.push(tile.id);
+      return {
+        isMesh: true, userData: { tileId: tile.id, bbox: tile.bbox },
+        material: { map: null },
+      };
+    },
+    log: (id, message) => logs.push(`${id}: ${message}`),
+    forceUntexturedBuild: tile => tile.id === child.id,
+  });
+  assert.deepEqual(built, [child.id]);
+  assert.equal(deferredTiles.get(child.id), child);
+  assert.equal(terrainRoot.children.length, 2);
+  assert.equal(result.sceneMeshes, 2);
+  assert.ok(logs.some(message => message.includes('fine untextured geometry for procgen window')));
+});
+
+test('shared reconciler still defers fine geometry outside the local override window', () => {
+  const child = { id: '12-10-20', bbox: [0, 0, 10, 10], heightmap: 'fine-hm' };
+  const terrainRoot = {
+    children: [{
+      isMesh: true,
+      userData: { tileId: '11-5-10', bbox: [-10, -10, 20, 20] },
+      material: { map: { id: 'stale-texture' } },
+    }],
+    add(mesh) { this.children.push(mesh); },
+  };
+  let builds = 0;
+  const result = reconcileTerrainTiles({
+    tiles: [child], currentTileIds: new Set(['11-5-10']),
+    deferredTiles: new Map(), terrainRoot,
+    lifecycle: { sweepStaleParents: () => 0 },
+    priorityForTile: () => 0,
+    textureCache: new Map(), materialize: () => assert.fail('unexpected materialize'),
+    buildMesh: () => { builds += 1; return null; },
+    log: () => {},
+  });
+  assert.equal(builds, 0);
+  assert.equal(result.sceneMeshes, 1);
+});
+
 test('terrain origin and pipeline decisions preserve two-pass behavior', () => {
   const origin = adoptTerrainOrigin({
     data: { ox: -100.25, oy: 200.25, qx: -90, qy: 210 },

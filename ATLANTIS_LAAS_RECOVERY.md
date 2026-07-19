@@ -412,3 +412,50 @@ Status: implemented and live-probed; continuous cell residency remains open.
   generation can take seconds before it becomes a warm cache hit, and the
   long-term retained-cell/macro-rock tier is not implemented. These are not
   hidden by the successful cruise result.
+
+### 2026-07-19 - Procgen disappearance and camera-only population changes
+
+Status: the accidental no-procgen gate is removed; the same-view population
+regression is fixed and verified against the live WebGPU client.
+
+- The first surface-readiness experiment required `deferredTiles.size === 0`.
+  Runtime instrumentation showed the full pass stabilizing at 382 requested
+  heightmaps, 365 scene meshes and 29 deferred texture waits. Those waits are
+  legal and may persist, so global queue emptiness is not a local-terrain
+  readiness signal. This explains both observed effects: procgen was dead and
+  FPS suddenly rose because the complete procedural workload was suppressed.
+- The replacement is spatial. The reconciler can immediately build fine,
+  untextured height geometry only for tiles overlapping a 512 m half-span
+  around the camera. Texture loading remains deferred and the textured stale
+  parent continues to cover all other areas. Local height geometry and procgen
+  therefore converge without waiting for the 20 km imagery queue.
+- Two new reconciler tests prove that stale-parent coverage is overridden only
+  inside that callback-selected local window and remains deferred by default.
+- The user's 17:04:46 and 17:05:12 images showed identical position, altitude
+  and heading but radically different grass/plant populations. The shared
+  cause was not random seeds or a tile refetch: both `Forests.update` and
+  `GroundRing.update` built their GPU frusta from a previous-frame
+  `camera.matrixWorldInverse`. Three refreshed it later in `renderScene`; if
+  the demand-driven loop stopped after the last drag event, the wrong frustum
+  remained indefinitely. `camera.updateMatrixWorld(true)` now runs after all
+  gameplay camera changes and immediately before both procgen culls.
+- A headless WebGPU reproduction at 64.18697, -51.68571, altitude 75 m turned
+  away and returned to the exact starting yaw. Both settled frames used cell
+  `1728:384`, the same four depth-12 sources, 9,498 generated plants and
+  24,002 generated rocks, and matched visually. Returned async counters were
+  9,501 grass, 70 plants and 3,216 rocks.
+- A separate storage-buffer grounding readback at the same site found 4,472
+  extras and 19,530 stones. Sampled origins followed the resident depth-12
+  triangle surface with the intended 0.2-1.0 m base sink; the settled placement
+  data was not floating. The earlier extreme overhead-rock capture occurred
+  during coarse/fine startup investigation and is not being used as proof that
+  the settled grounding defect remains.
+- The hard seven-tap terrain occlusion threshold now applies only to trees.
+  Ground rocks remain frustum/distance bounded, avoiding threshold flips as a
+  nearest height sample changes. Tundra flora joins rigid props in using
+  stable object-surface LOD dissolution so an entire plant no longer crosses a
+  single per-instance visibility threshold at once.
+- Verification: all 86 Web tests and the Vite production build pass. The live
+  probe emitted no WebGPU shader, pipeline, validation or command-buffer error.
+  The optional model service on port 8787 remained unavailable and produced
+  its existing startup fallback warning.
