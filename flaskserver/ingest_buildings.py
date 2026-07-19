@@ -43,6 +43,7 @@ CREATE TABLE IF NOT EXISTS buildings (
     cx          REAL NOT NULL,
     cy          REAL NOT NULL,
     ground_z    REAL NOT NULL,
+    ground_sampled INTEGER NOT NULL DEFAULT 1,
     ring        TEXT NOT NULL,
     updated_at  TEXT NOT NULL
 );
@@ -179,6 +180,11 @@ def ingest(zip_path, db_path):
     import sqlite3
     db = sqlite3.connect(str(db_path))
     db.executescript(BUILDINGS_SCHEMA)
+    columns = {row[1] for row in db.execute("PRAGMA table_info(buildings)")}
+    if "ground_sampled" not in columns:
+        db.execute(
+            "ALTER TABLE buildings ADD COLUMN ground_sampled INTEGER NOT NULL DEFAULT 1"
+        )
     sampler = GroundSampler(db)
     if not sampler.tiles:
         log.warning("tiles table has no heightmaps — ground will fall back to roof-derived estimate")
@@ -208,6 +214,7 @@ def ingest(zip_path, db_path):
         cy = sum(ty) / len(ty)
         roof_min = min(zs)
         ground = sampler.sample(cx, cy)
+        ground_sampled = ground is not None
         if ground is None:
             ground = roof_min - 3.0
             no_ground += 1
@@ -222,13 +229,15 @@ def ingest(zip_path, db_path):
         ]
         db.execute(
             "INSERT OR REPLACE INTO buildings "
-            "(building_id, settlement, b_number, use_type, cx, cy, ground_z, ring, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "(building_id, settlement, b_number, use_type, cx, cy, ground_z, "
+            "ground_sampled, ring, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 building_id, settlement,
                 attributes.get("B_nummer") or None,
                 attributes.get("bygningsbr") or None,
-                cx, cy, round(ground, 2), json.dumps(ring_3413), now,
+                cx, cy, round(ground, 2), 1 if ground_sampled else 0,
+                json.dumps(ring_3413), now,
             ),
         )
         written += 1

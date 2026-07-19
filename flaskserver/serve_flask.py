@@ -345,6 +345,9 @@ def _bootstrap_backend() -> None:
     log.info(f"Terrain backend ready. DB={DB_PATH}")
     log_db.info(f"No-data cache: {no_data_count} tiles")
 
+    import grundkort
+    grundkort.ensure_grundkort_async()
+
   except Exception as exc:  # pragma: no cover - runtime setup path
     _backend_error = (
       f"Terrain backend unavailable: {type(exc).__name__}: {exc}. "
@@ -1006,6 +1009,9 @@ def api_buildings():
   ).fetchone()
   if not has_table:
     return jsonify({"buildings": [], "count": 0, "qx": qx, "qy": qy})
+
+  import grundkort
+  grundkort.repair_unsampled_ground(db, qx, qy, max_range)
 
   rows = db.execute(
     "SELECT building_id, b_number, use_type, ground_z, ring FROM buildings "

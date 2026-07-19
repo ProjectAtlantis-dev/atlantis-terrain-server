@@ -73,13 +73,13 @@ Classifier output lives in `terrain.db`'s `classifier_tiles` table as a zlib-com
 
 ## Buildings & Roads
 
-Real 3D buildings and roads from Asiaq's Teknisk Grundkort (surveyed outlines with per-vertex elevations). Download a settlement's `*_TekniskGrundkort_SHP.zip` from [kortforsyning.asiaq.gl](https://kortforsyning.asiaq.gl/) and ingest it:
+Real 3D buildings and roads from Asiaq's Teknisk Grundkort (surveyed outlines with per-vertex elevations). Download a settlement's `*_TekniskGrundkort_SHP.zip` from [kortforsyning.asiaq.gl](https://kortforsyning.asiaq.gl/) and drop it into `flaskserver/grundkort/` (gitignored). On startup the server ingests any settlement missing from the `buildings`/`roads` tables, so a flushed terrain.db repopulates itself. The manual scripts still work too:
 
     cd flaskserver
-    ./venv/bin/python ingest_buildings.py 0600NUK_TekniskGrundkort_SHP.zip
-    ./venv/bin/python ingest_roads.py 0600NUK_TekniskGrundkort_SHP.zip
+    ./venv/bin/python ingest_buildings.py grundkort/0600NUK_TekniskGrundkort_SHP.zip
+    ./venv/bin/python ingest_roads.py grundkort/0600NUK_TekniskGrundkort_SHP.zip
 
-This fills the `buildings` and `roads` tables in terrain.db (geometry reprojected to EPSG:3413; building ground is sampled from cached heightmaps, so ingest after the area's heightmaps exist). The frontend fetches `/api/buildings` and `/api/roads` around the camera and renders grey extrusions and category-tinted road/path ribbons in both renderers. Toggle via `takramDebug.setBuildingsVisible(false)` / `setRoadsVisible(false)`.
+Geometry is reprojected to EPSG:3413. Building ground is sampled from cached heightmaps; buildings ingested before their area's heightmaps exist get a roof-derived estimate (`ground_sampled = 0`) and are re-sampled automatically by `/api/buildings` once heightmaps stream in — ingest order no longer matters. The frontend fetches `/api/buildings` and `/api/roads` around the camera and renders grey extrusions and category-tinted road/path ribbons in both renderers. Toggle via `takramDebug.setBuildingsVisible(false)` / `setRoadsVisible(false)`.
 
 ## Troubleshooting
 

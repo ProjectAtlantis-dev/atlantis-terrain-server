@@ -15,6 +15,7 @@ from __future__ import annotations
 import datetime
 import io
 import os
+import threading
 import urllib.parse
 import urllib.request
 import zlib
@@ -32,6 +33,12 @@ OFFICIAL_COASTLINE_SOURCE = "govmin_gl_aabent_land"
 _WMS_URL = "https://gis.govmin.gl/geoserver/wms"
 _WMS_LAYER = "Greenland:gl_aabent_land"
 _OVERSAMPLE = 8
+
+# Terrain tiles are read repeatedly while the camera is stationary.  Keep the
+# operational proof useful without emitting the same coastline line on every
+# /api/tiles request.
+_logged_effective_tiles: set[str] = set()
+_logged_effective_tiles_lock = threading.Lock()
 
 
 def _fetch_url(url: str, timeout: int = 30) -> bytes:
@@ -205,4 +212,26 @@ def effective_heightmap(db, tile_id: str, raw_heightmap):
         return None
     if water is None:
         return raw_heightmap
-    return apply_water_mask(raw_heightmap, water)
+    result = apply_water_mask(raw_heightmap, water)
+    with _logged_effective_tiles_lock:
+        should_log = tile_id not in _logged_effective_tiles
+        if should_log:
+            _logged_effective_tiles.add(tile_id)
+    if should_log:
+        raw = np.asarray(raw_heightmap, dtype=np.float32)
+        finite_water = water & np.isfinite(raw)
+        raised_water = finite_water & (raw > 0.0)
+        source_row = db.execute(
+            "SELECT source FROM coastline_masks WHERE tile_id = ?", (tile_id,)
+        ).fetchone()
+        mask_source = source_row[0] if source_row is not None else "unknown"
+        raw_water_max = (
+            float(np.max(raw[finite_water])) if np.any(finite_water) else float("nan")
+        )
+        log_coast.info(
+            f"[coastline-apply] tile={tile_id} source={mask_source} "
+            f"water_vertices={int(np.sum(water))} "
+            f"clamped_vertices={int(np.sum(raised_water))} "
+            f"raw_water_max_m={raw_water_max:.3f}"
+        )
+    return result
