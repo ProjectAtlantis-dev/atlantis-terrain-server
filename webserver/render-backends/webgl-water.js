@@ -33,6 +33,31 @@ const SKY_GLSL = /* glsl */ `
   }
 `;
 
+const BATHYMETRY_LAYER = 31;
+
+export function prepareBathymetryTerrainTiles(terrainRoot) {
+  const restore = [];
+  for (const tile of terrainRoot?.children ?? []) {
+    if (!tile.isMesh || !/^\d+-\d+-\d+$/.test(tile.userData?.tileId ?? '')) continue;
+    restore.push({
+      tile,
+      layerMask: tile.layers.mask,
+      renderOrder: tile.renderOrder,
+    });
+    tile.layers.set(BATHYMETRY_LAYER);
+    // The capture material does not depth-test: parents establish fallback
+    // coverage first, then finer tiles overwrite them regardless of whether
+    // the coarse shoreline happens to be geometrically higher.
+    tile.renderOrder = Number.parseInt(tile.userData.tileId, 10);
+  }
+  return () => {
+    for (const state of restore) {
+      state.tile.layers.mask = state.layerMask;
+      state.tile.renderOrder = state.renderOrder;
+    }
+  };
+}
+
 // Stochastic de-tiling: each FFT cascade repeats every uL metres, which
 // reads as a wallpaper grid from altitude. Partition the cascade's uv space
 // into a triangular lattice (~0.44 tiles per cell), give every lattice
@@ -151,6 +176,7 @@ const WATER_FRAGMENT = /* glsl */ `
   uniform sampler2D uBathy;    // top-down terrain-height capture (R = local z)
   uniform vec2 uBathyCenter;
   uniform float uBathyExtent;
+  uniform float uBathyTexel;   // world metres per bathy texel
   uniform float uAbsorb;       // Beer-Lambert absorption, 1/m of water column
 
   varying vec3 vPlanePos;
@@ -200,6 +226,15 @@ const WATER_FRAGMENT = /* glsl */ `
     return v;
   }
 
+  // local terrain height under the water plane; -10 m (the synthetic fjord
+  // floor) wherever the capture has no coverage
+  float seabedAt(vec2 p) {
+    vec2 uv = (p - uBathyCenter) / uBathyExtent + 0.5;
+    float inB = step(abs(uv.x - 0.5), 0.5) * step(abs(uv.y - 0.5), 0.5);
+    vec4 b = texture2D(uBathy, uv);
+    return mix(-10.0, b.x, b.a * inB);
+  }
+
   // anisotropic GGX in the surface tangent frame (T = along wind)
   float ggxAniso(vec3 H, vec3 N, vec3 T, vec3 B, float ax, float ay) {
     float hx = dot(H, T), hy = dot(H, B), hz = max(dot(H, N), 1e-4);
@@ -215,13 +250,20 @@ const WATER_FRAGMENT = /* glsl */ `
     vec3 L = uSunDir;
 
     // ---- water column depth from the bathymetry capture -------------------
-    // The surface sits at local z = 0, so column depth is just -seabed. Where
-    // the capture has no coverage yet, assume the open fjord floor (-10 m).
-    vec2 bUV = (pxy - uBathyCenter) / uBathyExtent + 0.5;
-    float inB = step(abs(bUV.x - 0.5), 0.5) * step(abs(bUV.y - 0.5), 0.5);
-    vec4 bathy = texture2D(uBathy, bUV);
-    float seabed = mix(-10.0, bathy.x, bathy.a * inB);
+    // The surface sits at local z = 0, so column depth is just -seabed.
+    float seabed = seabedAt(pxy);
     float colDepth = clamp(-seabed, 0.0, 60.0);
+
+    // Wall detection: the open fjord floor is a flat synthetic -10 m plane —
+    // the only steep thing under the surface is the artificial mask-drop wall
+    // at the shoreline (10 m over a texel or two). The veil below must hide
+    // exactly that band and nothing else, so measure seabed slope in world
+    // metres (central differences one texel apart, resolution-independent).
+    float h = uBathyTexel;
+    vec2 sgrad = vec2(seabedAt(pxy + vec2(h, 0.0)) - seabedAt(pxy - vec2(h, 0.0)),
+                      seabedAt(pxy + vec2(0.0, h)) - seabedAt(pxy - vec2(0.0, h)))
+               / (2.0 * h);
+    float wall = smoothstep(0.04, 0.15, length(sgrad));
 
     // ---- normals & Jacobian from the cascades ----------------------------
     // de-tiled sampling; the 2^-0.5 gradient scale inside keeps the old
@@ -276,7 +318,13 @@ const WATER_FRAGMENT = /* glsl */ `
     // ---- lighting ---------------------------------------------------------
     float NdotV = max(dot(Ns, V), 1e-3);
     float NdotL = max(dot(Ns, L), 0.0);
-    float fresnel = 0.022 + 0.978 * pow(1.0 - NdotV, 5.0);
+    // Grazing-angle EXCESS only, no 0.022 base: the satellite imagery is a
+    // photo of lit water, so the near-nadir sky reflection is already baked
+    // into the background colour. Adding full Fresnel double-counts it and
+    // washes the whole fjord toward the analytic sky. This term is exactly
+    // zero looking straight down and only adds the shine a satellite could
+    // not have seen.
+    float fresnel = 0.978 * pow(1.0 - NdotV, 5.0);
 
     vec3 R = reflect(-V, Ns);
     R.z = max(R.z, 0.018);
@@ -303,6 +351,12 @@ const WATER_FRAGMENT = /* glsl */ `
     float fresL = 0.022 + 0.978 * pow(1.0 - LdotH, 5.0);
     vec3 spec = uSunColor * ggxAniso(H, N, Twind, Bwind, max(sqrt(ax2), 0.002), max(sqrt(ay2), 0.002))
               * fresL * 0.10 * smoothstep(0.0, 0.06, L.z);
+    // As filtering folds slope variance into the lobe, the glint stops being
+    // sparkle and becomes a broad HDR sheen across the sunward half of the
+    // fjord (which AGX then desaturates to milky white). Roll the energy off
+    // as the lobe widens: near-field sparkle keeps ~80%, the far-field sheen
+    // drops to ~a quarter.
+    spec *= 0.02 / (0.02 + slopeVar);
 
     float backlight = pow(clamp(dot(L, -V) * 0.5 + 0.5, 0.0, 1.0), 3.0);
     vec3 ambient = mix(uHorizonCool, uZenithColor, 0.4) * 0.65;
@@ -334,11 +388,14 @@ const WATER_FRAGMENT = /* glsl */ `
     // background): sunward ridge faces brighten, leeward darken
     body *= max(1.0 + 1.1 * facet, 0.0);
 
-    // Beer-Lambert veil from the water column (Water-Pro-style shoreline
-    // treatment, world-space): shallow shore water stays glass-clear so the
-    // imagery shows, while the artificial mask-drop walls fade out with
-    // depth instead of standing naked behind a transparent surface.
-    float veil = 1.0 - exp(-uAbsorb * colDepth);
+    // Beer-Lambert veil from the water column, gated to the mask-drop walls:
+    // shallow shore water stays glass-clear so the imagery shows, and the
+    // wall band fades out with depth instead of standing naked behind a
+    // transparent surface. The gate matters: ungated, the uniform -10 m
+    // floor made the veil a de facto 40% opacity over EVERY open-water
+    // pixel, replacing the satellite colour with the shader's own sky-lit
+    // teal — exactly the veil light the design forbids.
+    float veil = wall * (1.0 - exp(-uAbsorb * colDepth));
     float bodyW = uOpacity + veil * (1.0 - uOpacity);
 
     // Reflection gain < 1 stands in for the sky occlusion the analytic dome
@@ -390,7 +447,8 @@ export function createWebGLWater({
     uBathy: { value: null },
     uBathyCenter: { value: new THREE.Vector2() },
     uBathyExtent: { value: bathyExtent },
-    uAbsorb: { value: 0.05 },
+    uBathyTexel: { value: bathyExtent / bathySize },
+    uAbsorb: { value: 0.25 },
   };
 
   const material = new THREE.ShaderMaterial({
@@ -425,6 +483,7 @@ export function createWebGLWater({
     bathyExtent / 2, -bathyExtent / 2,
     1, 30000,
   );
+  bathyCamera.layers.set(BATHYMETRY_LAYER);
   // Height override: the capture camera is a terrainRoot child looking down
   // -z, so view z recovers local height as uCamH + mvPosition.z regardless
   // of the ECEF model transforms.
@@ -443,6 +502,8 @@ export function createWebGLWater({
       uniform float uCamH;
       void main() { gl_FragColor = vec4(uCamH + vZ, 0.0, 0.0, 1.0); }
     `,
+    depthTest: false,
+    depthWrite: false,
   });
   const prevClearColor = new THREE.Color();
 
@@ -497,11 +558,14 @@ export function createWebGLWater({
       const prevOverride = scene.overrideMaterial;
       const prevBackground = scene.background;
       const prevAlpha = renderer.getClearAlpha();
+      const prevSortObjects = renderer.sortObjects;
       renderer.getClearColor(prevClearColor);
       const prevVisible = mesh.visible;
+      const restoreTerrainTiles = prepareBathymetryTerrainTiles(terrainRoot);
       scene.overrideMaterial = bathyMaterial;
       scene.background = null;
       mesh.visible = false;
+      renderer.sortObjects = true;
       renderer.setClearColor(0x000000, 0);
       try {
         renderer.setRenderTarget(bathyTarget);
@@ -513,6 +577,8 @@ export function createWebGLWater({
         scene.overrideMaterial = prevOverride;
         scene.background = prevBackground;
         mesh.visible = prevVisible;
+        renderer.sortObjects = prevSortObjects;
+        restoreTerrainTiles();
       }
       uniforms.uBathyCenter.value.set(centerXY.x, centerXY.y);
       uniforms.uBathyExtent.value = bathyExtent;
