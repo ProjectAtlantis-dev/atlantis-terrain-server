@@ -24,6 +24,7 @@ export function createTerrainFetchRuntime({
 }) {
   const {
     onResponseApplied = () => {},
+    onBuildings = () => {},
     onAvailability = () => {},
     onSkip = () => {},
     onError = () => {},
@@ -78,11 +79,13 @@ export function createTerrainFetchRuntime({
       lat: lat ?? cameraCoordinates.lat,
       lon: lon ?? cameraCoordinates.lon,
       altitude: cameraCoordinates.alt,
-      heading: testOverrides.getHeading?.() ?? priorityHeading(
-        vehicle.vehicleControlActive,
-        vehicle.vehicleHeadingRad,
-        view.controls.yaw,
-      ),
+      heading: testOverrides.getHeading?.()
+        ?? view.getHeading?.()
+        ?? priorityHeading(
+          vehicle.vehicleControlActive,
+          vehicle.vehicleHeadingRad,
+          view.controls.yaw,
+        ),
       range: testOverrides.getRange?.() ?? view.controls.terrainRange,
       pass,
       previewMaxDepth, isFirstLoad: state.firstLoad,
@@ -94,6 +97,13 @@ export function createTerrainFetchRuntime({
     logger.enqueue('info', `fetchTiles.request[pass${pass}]`, request.logDetails);
     const response = await fetchImpl(request.url, { signal });
     const data = await response.json();
+    if (response.ok === false || response.status >= 400) {
+      const detail = typeof data?.error === 'string' ? `: ${data.error}` : '';
+      throw new Error(`terrain tile request failed (${response.status})${detail}`);
+    }
+    if (!Array.isArray(data?.tiles)) {
+      throw new TypeError('terrain tile response is missing a tiles array');
+    }
     const local = testOverrides.getCameraLocalPosition?.() ?? {
       x: cameraCoordinates.eastM,
       y: cameraCoordinates.northM,
@@ -139,7 +149,10 @@ export function createTerrainFetchRuntime({
       logger.enqueue('info', 'fetchTiles.origin.set', origin.logDetails);
     }
 
+    if (Array.isArray(data.buildings)) onBuildings(data.buildings);
+
     const reconciliation = terrain.reconcile(data.tiles, {
+      completeCoverage: pass === 1,
       onDiff: details => logger.enqueue('info', `fetchTiles.diff[pass${pass}]`, {
         pass, passLabel: pass === 1 ? 'preview' : 'full', ...details,
       }),
@@ -158,7 +171,7 @@ export function createTerrainFetchRuntime({
 
     state.cameraStereoX = state.lastFetchX = data.qx;
     state.cameraStereoY = state.lastFetchY = data.qy;
-    const pipeline = terrainPipelineStatus(data, wasFirstLoad);
+    const pipeline = terrainPipelineStatus(data, wasFirstLoad, pass);
     state.heightmapsMissing = pipeline.missing;
     state.heightmapsDownloading = pipeline.downloading;
     state.serverTexturesFetching = pipeline.textureFetching;

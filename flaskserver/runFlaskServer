@@ -7,6 +7,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 PYTHON_BIN="${PYTHON_BIN:-$SCRIPT_DIR/venv/bin/python}"
+FLASK_NOFILE_LIMIT="${FLASK_NOFILE_LIMIT:-4096}"
 
 if [ ! -x "$PYTHON_BIN" ]; then
   echo "Python not found at $PYTHON_BIN"
@@ -21,4 +22,9 @@ if [ -f "$SCRIPT_DIR/.env" ]; then
 fi
 
 cd "$ROOT_DIR"
+if ulimit -n "$FLASK_NOFILE_LIMIT" 2>/dev/null; then
+  echo "Flask open-file limit: $(ulimit -n)"
+else
+  echo "Warning: could not raise Flask open-file limit to $FLASK_NOFILE_LIMIT" >&2
+fi
 "$PYTHON_BIN" flaskserver/serve_flask.py 2>&1 | tee "$SCRIPT_DIR/runFlaskServer.log"

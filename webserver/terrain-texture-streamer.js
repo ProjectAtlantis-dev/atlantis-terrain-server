@@ -33,8 +33,15 @@ export function createTextureStreamer({
   const texRetryAtMs = new Map();
   const texRetryCount = new Map();
   const ancestorLogged = new Set();
+  const staleTextures = new Set();
   const demandClient = globalThis.crypto?.randomUUID?.() ?? `terrain-${Date.now()}-${Math.random()}`;
   let version = Date.now();
+  let roadDebug = false;
+
+  function advanceVersion() {
+    version = Math.max(version + 1, Date.now());
+    return version;
+  }
 
   function configureTerrainTexture(texture) {
     texture.generateMipmaps = true;
@@ -67,7 +74,8 @@ export function createTextureStreamer({
 
       const controller = new AbortController();
       texInflight.set(tileId, controller);
-      fetchImpl(`/api/texture/${tileId}.jpg?v=${version}&demand=${version}&demandClient=${encodeURIComponent(demandClient)}`, { signal: controller.signal })
+      const debugQuery = roadDebug ? '&roadDebug=1' : '';
+      fetchImpl(`/api/texture/${tileId}.jpg?v=${version}&demand=${version}&demandClient=${encodeURIComponent(demandClient)}${debugQuery}`, { signal: controller.signal })
         .then(response => {
           texInflight.delete(tileId);
           if (response.status === 202) {
@@ -137,8 +145,21 @@ export function createTextureStreamer({
     ancestorLogged.delete(tileId);
     texCache.delete(tileId);
     texSource.delete(tileId);
-    version = Date.now();
-    return version;
+    return advanceVersion();
+  }
+
+  function releaseTile(tileId) {
+    texInflight.get(tileId)?.abort();
+    texInflight.delete(tileId);
+    texFetching.delete(tileId);
+    texRetryAtMs.delete(tileId);
+    texRetryCount.delete(tileId);
+    ancestorLogged.delete(tileId);
+    const texture = texCache.get(tileId);
+    texCache.delete(tileId);
+    texSource.delete(tileId);
+    texture?.dispose?.();
+    return Boolean(texture);
   }
 
   function abortAll() {
@@ -148,13 +169,32 @@ export function createTextureStreamer({
     texRetryAtMs.clear();
     texRetryCount.clear();
     ancestorLogged.clear();
-    version = Date.now();
+    advanceVersion();
+  }
+
+  function setRoadDebug(enabled) {
+    const next = Boolean(enabled);
+    if (roadDebug === next) return roadDebug;
+    roadDebug = next;
+    abortAll();
+    for (const texture of texCache.values()) staleTextures.add(texture);
+    texCache.clear();
+    texSource.clear();
+    return roadDebug;
+  }
+
+  function releaseStaleTexture(texture) {
+    if (!texture || !staleTextures.delete(texture)) return false;
+    texture.dispose?.();
+    return true;
   }
 
   return {
     texCache, texSource, texInflight, texFetching, texRetryAtMs, texRetryCount,
-    ancestorLogged, pump, invalidate, abortAll,
+    ancestorLogged, pump, invalidate, releaseTile, abortAll, setRoadDebug,
+    releaseStaleTexture,
+    get roadDebug() { return roadDebug; },
     get version() { return version; },
-    bumpVersion() { version = Date.now(); return version; },
+    bumpVersion: advanceVersion,
   };
 }

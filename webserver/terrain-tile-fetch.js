@@ -20,7 +20,9 @@ export function buildTerrainTilesRequest({
     ? `sx=${queryX}&sy=${queryY}`
     : `lat=${lat}&lon=${lon}`;
   let url = `/api/tiles?${positionQuery}&alt=${altitude}&heading=${heading}&range=${range}`;
-  if (preview) url += `&maxDepth=${previewMaxDepth}`;
+  // preview=1 keeps the server's closest-first flood for the quick paint;
+  // full passes let it order heightmap fetches by view priority instead.
+  if (preview) url += `&maxDepth=${previewMaxDepth}&preview=1`;
   if (!isFirstLoad || frameOffsetReady) url += `&ox=${originX}&oy=${originY}`;
   return {
     url,
@@ -201,7 +203,7 @@ export function summarizeTerrainCamera(coordinates, {
   };
 }
 
-export function terrainPipelineStatus(data, wasFirstLoad) {
+export function terrainPipelineStatus(data, wasFirstLoad, pass = wasFirstLoad ? 1 : 2) {
   const missing = data?.missing?.length ?? 0;
   const downloading = data?.downloading?.length ?? 0;
   const textureFetching = data?.texFetching ?? 0;
@@ -211,7 +213,7 @@ export function terrainPipelineStatus(data, wasFirstLoad) {
     textureFetching,
     textureRetryQueue: data?.texRetryQueue ?? 0,
     textureStatusCounts: data?.texStatusCounts || {},
-    nextAction: wasFirstLoad
+    nextAction: pass === 1
       ? 'full-pass'
       : (missing > 0 || downloading > 0 || textureFetching > 0 ? 'poll' : 'idle'),
   };

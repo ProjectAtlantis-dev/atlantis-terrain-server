@@ -8,11 +8,13 @@ import {
   ToneMappingMode,
 } from 'postprocessing';
 import { DitheringEffect } from '../three-geospatial/packages/effects/src/index.ts';
+import { createWebGLWater } from './webgl-water.js';
 
-export function createWebGLTerrainBackend({
+export function createTerrainBackend({
   width,
   height,
   pixelRatio,
+  toneMappingExposure = 10,
   scene,
   bootLog = () => {},
 } = {}) {
@@ -27,7 +29,7 @@ export function createWebGLTerrainBackend({
   renderer.shadowMap.type = THREE.PCFSoftShadowMap;
   renderer.shadowMap.autoUpdate = true;
   renderer.toneMapping = THREE.NoToneMapping;
-  renderer.toneMappingExposure = 10;
+  renderer.toneMappingExposure = toneMappingExposure;
   let composer = null;
   let demandRendering = null;
   let animationLoopActive = false;
@@ -38,16 +40,27 @@ export function createWebGLTerrainBackend({
   bootLog('renderer.ready', {
     backend: 'webgl', width, height, pixelRatio,
     shadowMap: renderer.shadowMap.type,
+    logarithmicDepthBuffer: renderer.capabilities.logarithmicDepthBuffer,
+    toneMapping: 'agx', toneMappingExposure,
   });
 
   const backend = {
     kind: 'webgl',
-    isWebGPU: false,
+    defaultFogStrength: 4.5,
     renderer,
     get sceneMutationVersion() { return sceneMutationVersion; },
     setFogDensity(value) { sceneFog.density = value; },
     setMapMode(active) { scene.fog = active ? null : sceneFog; },
-    setWaterVisibility(mesh, visible) { mesh.visible = visible; },
+    createWater(options) { return createWebGLWater({ renderer, ...options }); },
+    prepareUntexturedTerrain(mesh) {
+      if (!mesh?.material || mesh.material.map) return;
+      if (mesh.material.vertexColors) {
+        mesh.material.vertexColors = false;
+        mesh.material.needsUpdate = true;
+      }
+      mesh.material.color.set(0x29313a);
+      backend.markSceneMutated();
+    },
     configureScenePipeline({ scene, camera, normalPass, cloudsEffect, aerialPerspective }) {
       // IMPORTANT — verified visual regression fix:
       // postprocessing decodes logarithmic depth in readDepth(), while the
@@ -80,8 +93,14 @@ export function createWebGLTerrainBackend({
       renderer.setSize(nextWidth, nextHeight);
       composer?.setSize(nextWidth, nextHeight);
     },
-    renderMap(scene, camera) {
-      renderer.render(scene, camera);
+    renderMap(scene, camera, background) {
+      const previousBackground = scene.background;
+      scene.background = background;
+      try {
+        renderer.render(scene, camera);
+      } finally {
+        scene.background = previousBackground;
+      }
     },
     renderScene() {
       composer?.render();

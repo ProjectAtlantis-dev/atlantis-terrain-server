@@ -7,6 +7,10 @@ The front end in /webserver folder is running vite. The entry point is `main.js`
 
 The backend in /flaskserver manages terrain heightmaps and textures in a SQLite db (terrain.db). It always assumes the user starts from scratch and will rebuild all missing data as needed. FIRST VISIT TO ANY LOCATION WILL BE SLOW — heightmaps and textures are fetched on demand and cached in the DB. Subsequent visits are fast. All tile demand is driven from the frontend heatmap.
 
+Rendered tile seams are cached in `terrain_seam_cache` by the exact normalized physical-edge key `(tile_a, direction, tile_b)`. Same-depth and cross-LOD repairs use the same lookup. Writing new heightmap data deletes every cached seam that names the changed tile on either side, so repaired edges are rebuilt on the next terrain query.
+
+Dataforsyningen imagery is fetched in aligned 4x4 metatiles: the grandparent extent is requested and reprojected once at 1024x1024, source-mosaic color jumps are edge-matched and feathered across internal boundaries, then the result is split into sixteen 256x256 child textures. Older texture sources upgrade on demand to `dataforsyningen_metatile4h2`; one child request fills the whole group.
+
 ## Data Sources
 
 | Data | Source | Resolution | Notes |
@@ -15,6 +19,7 @@ The backend in /flaskserver manages terrain heightmaps and textures in a SQLite 
 | Heightmaps (fallback) | [Copernicus GLO-30](https://spacedata.copernicus.eu/) via S3 | 30m | Used when ArcticDEM has no coverage |
 | Textures | [Dataforsyningen](https://dataforsyningen.dk/) WMS | 0.2m–1.6m | SPOT 6/7 + aerial ortho, requires free API token |
 | Labeling reference | Google satellite tiles | ~0.26 m/px (z18) | Classification ground truth only — measured, never shipped |
+| Building footprints | [Asiaq Teknisk Grundkort](https://kortforsyning.asiaq.gl/) | surveyed vectors | PolygonZ roof outlines per settlement, ingested via `ingest_buildings.py` |
 
 ## Coordinate Systems
 
@@ -41,13 +46,44 @@ Real imagery down to depth 12, invented detail below it.
 2. **tex-worker** fetches from Dataforsyningen WMS (SPOT 6/7 1.6m, EPSG:3184) on demand. If it fails (rate limit, timeout, no coverage), the tile stays uncached and an ancestor texture is cropped and served as a placeholder until the next request retries.
 3. Dataforsyningen WMS requires EPSG:3184 (not 3413). The fetch reprojects 3413→3184 for the request, then warps the result back to 3413 with Lanczos resampling.
 4. Dataforsyningen runs out of detail around depth 13 (SPOT is 1.6 m/px). Below that, accuracy vs reality stops mattering: **depth 12 already tells us what goes where**. A coarse class map at d12 scale (water / grey / dark slopes & shadows / green / white — see `flaskserver/classifier/storage.py`) is the entire semantic contract.
+
+Coastal terrain uses the `Åbent Land` GTK50 map as its authoritative land/sea
+boundary, preferring the **1:50k vector edition** (Dataforsyningen Databoks,
+`tidalwater_s` minus `island_s`, sea only — lakes keep their elevation) for any
+area whose 100 km blocks have been downloaded into `flaskserver/gtk50_blocks/`
+via `ingest_coastline.py <block>|--lat/--lon`; elsewhere it falls back to
+decoding the rendered `gl_aabent_land` WMS from `gis.govmin.gl` (set
+`COASTLINE_VECTOR=0` to force the fallback everywhere). The raw DEM remains
+unchanged in the canonical `tiles.heightmap` payload. An independent mask in
+`coastline_masks` is applied to a copy when terrain is read or rendered, and
+the classifier uses the same mask to force mapped sea into its water class. This prevents
+ArcticDEM/Copernicus artifacts from closing fjords or producing islands in open
+water without destroying source elevation samples. The source is served by the
+Government of Greenland at `gis.govmin.gl`; ASIAQ's higher-detail technical
+coastline remains locality-only and cannot cover the surrounding fjords.
+
+Schema v3 preserves payloads written by the earlier destructive coastline
+pipeline, queues those rows for on-demand restoration, and replaces them with
+fresh raw ArcticDEM/Copernicus samples as the affected tiles are requested.
 5. **Everything below depth 12 is procedural** (work in progress): per-class texture and asset synthesis, seeded from absolute EPSG:3413 coordinates so every visit renders identical detail, color-anchored to the real d12 imagery so the transition doesn't pop. Judged on looks, not fidelity. Google imagery is a labeling/measurement reference only and never ships.
 
-Retired approaches, kept in git history only: SUPIR/ComfyUI enhance (`dataforsyningen_enhanced`/`upscaled` sources — never worked right), bathymetry flattening, and learned recoloring from external reference imagery.
+Retired approaches, kept in git history only: bathymetry flattening and learned recoloring from external reference imagery.
 
 The eyeball harness is the **tile inspector** (`pipeline.html?tile=<id>`): a tile's progress through heightmap → southness → texture → procgen, with per-stage status and keyboard navigation across tiles and depths.
 
-Classifier output lives in `terrain.db`'s `classifier_tiles` table as a zlib-compressed, image-oriented `uint8` label raster plus a class-schema name, dimensions, optional confidence raster, source/model identifier, and timestamp. A fresh database contains no classifier rows. In the 3D view, press **C** to toggle classifier presentation: missing tiles keep their satellite imagery but desaturate it, while available `coarse_v1` tiles are painted as grey / green / dark / white / water classes. Grayscale elevation is used only while a satellite texture is still loading. Deeper terrain tiles inherit a nearest-neighbor crop from the closest classified ancestor.
+Classifier output lives in `terrain.db`'s `classifier_tiles` table as a zlib-compressed, image-oriented `uint8` label raster plus a class-schema name, dimensions, optional confidence raster, source/model identifier, and timestamp. A fresh database contains no classifier rows. In the 3D view, press **C** to toggle classifier presentation: missing tiles keep their satellite imagery but desaturate it, while available `coarse_v1` tiles are painted as grey / green / dark / white / water classes. Both presentations paint cyan tile borders directly into their terrain textures, producing a terrain-conforming grid with normal hidden-surface removal. Grayscale elevation is used only while a satellite texture is still loading. Deeper terrain tiles inherit a nearest-neighbor crop from the closest classified ancestor.
+
+## Buildings & Roads
+
+Real 3D buildings and texture-painted roads from Asiaq's Teknisk Grundkort (surveyed outlines with per-vertex elevations). Fully automatic: on startup the server downloads any settlement listed in `terrain_config.GRUNDKORT_SETTLEMENTS` (default: Nuuk) from [kortforsyning.asiaq.gl](https://kortforsyning.asiaq.gl/) into `flaskserver/grundkort/` (gitignored), then ingests whatever is missing from the `buildings`/`roads` tables — a fresh clone or a flushed terrain.db repopulates itself. To cover more settlements, add their folder names to that list, or drop a `*_TekniskGrundkort_SHP.zip` into `grundkort/` manually. The manual scripts still work too:
+
+    cd flaskserver
+    ./venv/bin/python ingest_buildings.py grundkort/0600NUK_TekniskGrundkort_SHP.zip
+    ./venv/bin/python ingest_roads.py grundkort/0600NUK_TekniskGrundkort_SHP.zip
+
+Geometry is reprojected to EPSG:3413. Building ground is sampled from cached heightmaps; buildings ingested before their area's heightmaps exist get a roof-derived estimate (`ground_sampled = 0`) and a background loop re-samples them once heightmaps stream in — ingest order doesn't matter.
+
+`assetserver/assets.db` is the catalog of record for buildings and roads. After ingest, `grundkort.py` syncs both feature types with EPSG:3413 bounds for spatial queries. The viewer only talks to Flask: Flask serves repaired building geometry at `/api/buildings` and paints intersecting road/path centerlines onto a clean copy of every tile texture returned by `/api/texture/<tile>.jpg`. The cached satellite image remains unmodified, so asset edits can be composited again.
 
 ## Troubleshooting
 
@@ -55,13 +91,17 @@ Classifier output lives in `terrain.db`'s `classifier_tiles` table as a zlib-com
 
 ## Default Camera
 
-The camera starts facing north at Nuuk (64.18°N, 51.72°W). You can override this via URL params, e.g. `?lat=66.5&lon=-53.2`. Press **R** to reset the view if shit gets crazy (e.g. the world suddenly turns into a blue ball).
+The camera starts facing north at Nuuk (64.18°N, 51.72°W). Press **R** to toggle the red road-texture diagnostic; use the clickable **reset** link in the HUD to restore the default view.
+
+## Fly to Tile
+
+Press **T** and enter a tile id (`depth-col-row`, e.g. `12-1461-786`) to teleport the camera to a north-up, near-top-down view centered over that tile, at an altitude where the tile roughly fills the screen. Once the tile's heightmap streams in, the camera auto-lifts to keep the same height above the actual ground (useful over the ice sheet). Starting the app with `?tile=12-1461-786` flies there on boot, overriding the saved camera. Also available from the console as `takramDebug.flyToTile('12-1461-786')`.
 
 ## Map Mode
 
 Press **M** to toggle a 2D map view (no clouds/atmosphere) for navigation and tile debugging. Right-click on a tile to inspect its metadata or open it in the tile inspector.
 
-Press **H** to swap the map canvas for the live tile-priority heatmap. Press **H** again to return to the regular map; both views retain the same heading, pan, and zoom. Regular map mode outlines the terrain meshes currently being rendered as a thin grey grid, with the tile under the pointer outlined in red.
+Press **H** from the 3D view to toggle the live tile-priority heatmap. Press **H** again to return directly to 3D. Map and heatmap are separate views: return to 3D before switching between them. Both retain the same heading, pan, and zoom. Regular map mode outlines the terrain meshes currently being rendered as a thin grey grid, with the tile under the pointer outlined in red.
 
 In 3D mode, atmosphere sliders allow adjusting cloud density, coverage, and lighting parameters. (WIP — still working out some bugs.)
 
@@ -88,6 +128,8 @@ DATAFORSYNINGEN_TOKEN=<your-token>
 
 To get a free token: [create a user account](https://dataforsyningen.dk/) (click "Log ind" → "Opret Profil"), confirm via email, then log in and go to your profile → "Administrer token til webservice og API'er" to generate a token.
 
+Databoks file downloads (`ftps://ftp.dataforsyningen.dk`, implicit TLS on port 990) use your Dataforsyningen account login rather than the token — set `DATAFORSYNINGEN_FTP_USER` / `DATAFORSYNINGEN_FTP_PASS` in `flaskserver/.env`.
+
 ### Asset Server (TypeScript + SQLite)
 
 The asset server manages vehicles, structures, and their placement via a SQLite database (`assets.db`). It must be running for vehicles and structures to load in the frontend. Still WIP — schema and endpoints may change.
@@ -110,18 +152,18 @@ npm install
 
 ### Running
 ```bash
-# Terminal 1 — asset server (assets.db)
-./assetserver/runAssetServer
-
-# Terminal 2 — terrain backend (terrain.db)
+# Terminal 1 — terrain backend (terrain.db + viewer-facing asset access)
 ./flaskserver/runFlaskServer
 
-# Terminal 3 — frontend (snazzy 3d ux)
+# Terminal 2 — frontend (snazzy 3d ux)
 ./webserver/runViteServer
+
+# Optional — asset editing/management API; the viewer does not call it
+./assetserver/runAssetServer
 ```
 
-Browser asset calls go directly to `http://127.0.0.1:8787` by default.
-Override in the frontend URL with `?assetServer=http://<host>:<port>`.
+All browser API calls go through Flask. Flask reads `assetserver/assets.db`
+directly; override that path for deployments with `ASSET_DB_PATH`.
 
 Scripts log to their respective directories (`runAssetServer.log`, `runFlaskServer.log`, `runViteServer.log`).
 
@@ -129,9 +171,11 @@ Scripts log to their respective directories (`runAssetServer.log`, `runFlaskServ
 
 This project uses the following external data sources:
 
+- **Coastline vectors**: Indeholder data fra Klimadatastyrelsen. Dataset: "Åbent Land Grønland" 1:50,000 vector blocks (GL50), downloaded via Dataforsyningen Databoks. Free for commercial and non-commercial use with attribution.
 - **Satellite orthophotos**: Indeholder data fra Klimadatastyrelsen (formerly Styrelsen for Dataforsyning og Infrastruktur). Datasets: "Grønland Satellitfoto" (SPOT 6/7 1.6m regional orthophoto, 0.2m aerial orthophoto). Fetched on demand via [Dataforsyningen WMS](https://dataforsyningen.dk/). Data is free for both commercial and non-commercial use with attribution. [Terms of use](https://dataforsyningen.dk/vilkaar).
 - **Heightmaps (primary)**: [ArcticDEM v4.1](https://www.pgc.umn.edu/data/arcticdem/) 10m mosaic, provided by the Polar Geospatial Center under NSF-OPP awards 1043681, 1559691, and 1542736. CC-BY-4.0, free for commercial use with attribution. Fetched on demand via S3. [Acknowledgement policy](https://www.pgc.umn.edu/guides/stereo-derived-elevation-models/pgc-dem-products-arcticdem-rema-and-earthdem/).
 - **Heightmaps (fallback)**: [Copernicus GLO-30 DEM](https://spacedata.copernicus.eu/collections/copernicus-digital-elevation-model), provided by the European Space Agency. Free for commercial use with attribution. Fetched on demand via S3.
+- **Building footprints**: Contains data from Asiaq, Greenland Survey — Teknisk Grundkort (settlement base maps, PolygonZ roof outlines), obtained 2026 via [Asiaq Kortforsyning](https://kortforsyning.asiaq.gl/). Free for commercial and non-commercial use with attribution. [Terms of use](https://www.asiaq.gl/wp-content/uploads/2026/04/EN_Terms_of_use_for_Asiaq_geodata.pdf).
 - **Atmosphere & clouds**: [three-geospatial](https://github.com/takram-design-engineering/three-geospatial) by Takram.
 
 ## About

@@ -1,4 +1,26 @@
 import * as THREE from 'three';
+import { paintClassifierGridBorder } from './terrain-classifier-texture.js';
+
+export function createClassifierGridTexture(bitmap, documentImpl = globalThis.document) {
+  const width = Number(bitmap?.naturalWidth ?? bitmap?.videoWidth ?? bitmap?.width);
+  const height = Number(bitmap?.naturalHeight ?? bitmap?.videoHeight ?? bitmap?.height);
+  if (!documentImpl?.createElement || !bitmap || width <= 0 || height <= 0) return null;
+  const canvas = documentImpl.createElement('canvas');
+  canvas.width = width;
+  canvas.height = height;
+  const context = canvas.getContext('2d');
+  if (!context) return null;
+  context.drawImage(bitmap, 0, 0, width, height);
+  paintClassifierGridBorder(context, width, height);
+  const texture = new THREE.CanvasTexture(canvas);
+  texture.flipY = false;
+  texture.colorSpace = THREE.SRGBColorSpace;
+  texture.generateMipmaps = true;
+  texture.minFilter = THREE.NearestMipmapLinearFilter;
+  texture.magFilter = THREE.NearestFilter;
+  texture.needsUpdate = true;
+  return texture;
+}
 
 /** Loads optional semantic tile overlays. Missing rows intentionally stay
  * cached as missing for this session; toggling shows desaturated satellite
@@ -8,6 +30,7 @@ export function createTerrainClassifierRuntime({
   terrainTiles,
   fetchImpl = (...args) => fetch(...args),
   decodeImage = (...args) => createImageBitmap(...args),
+  documentImpl = globalThis.document,
   onChanged = () => {},
 }) {
   const textures = new Map();
@@ -32,13 +55,8 @@ export function createTerrainClassifierRuntime({
       })
       .then(bitmap => {
         if (!bitmap) return;
-        const texture = new THREE.Texture(bitmap);
-        texture.flipY = false;
-        texture.colorSpace = THREE.SRGBColorSpace;
-        texture.generateMipmaps = true;
-        texture.minFilter = THREE.NearestMipmapLinearFilter;
-        texture.magFilter = THREE.NearestFilter;
-        texture.needsUpdate = true;
+        const texture = createClassifierGridTexture(bitmap, documentImpl);
+        if (!texture) throw new Error('classifier texture canvas unavailable');
         textures.set(tile.id, texture);
         terrainTiles.setClassifierTexture(tile.id, texture);
         onChanged();

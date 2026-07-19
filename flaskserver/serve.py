@@ -15,6 +15,7 @@ LOD edge stitching eliminates cross-depth seams at query time.
 
 import math
 import os
+import datetime
 import numpy as np
 
 from colored_log import get_logger
@@ -26,13 +27,31 @@ from database import (
     open_db, read_tile, read_tile_metadata, write_tile, TileClobberError,
     GRID_N, CONFIDENCE, _tile_id, _tile_bbox, compute_geometric_error,
 )
-from terrain_config import ENHANCE_DEPTH
+from terrain_config import MAX_TILE_DEPTH
+from terrain_seams import SqliteSeamCache, repair_lod_seams as _stitch_lod_edges
 
 
-REAL_SOURCES = ('arcticdem', 'arcticdem_10m', 'copernicus', 'upscaled', 'supir_upscaled', 'parent_resampled')
+REAL_SOURCES = (
+    'arcticdem', 'arcticdem_10m', 'copernicus', 'parent_resampled',
+    'official_coastline',
+    'unmasked_arcticdem', 'unmasked_arcticdem_10m',
+    'unmasked_copernicus', 'unmasked_parent_resampled',
+    'clobbered_arcticdem_10m', 'clobbered_copernicus',
+    'clobbered_parent_resampled', 'clobbered_official_coastline',
+)
 
 # Sources that should be refetched at higher DEM resolution
-_UPGRADEABLE_SOURCES = {'arcticdem'}  # old 32m data
+_UPGRADEABLE_SOURCES = {
+    'arcticdem',  # old 32m data
+    'unmasked_arcticdem',
+    'unmasked_arcticdem_10m',
+    'unmasked_copernicus',
+    'unmasked_parent_resampled',
+    'clobbered_arcticdem_10m',
+    'clobbered_copernicus',
+    'clobbered_parent_resampled',
+    'clobbered_official_coastline',
+}
 
 # Tiles we've already tried to fetch and found no COG data (ocean, etc).
 # Seeded from DB on startup, updated as new tiles are discovered.
@@ -54,11 +73,74 @@ def mark_no_data(db, tile_id):
     db.commit()
 
 
+def _cache_coastline(db, tile_id, bbox=None):
+    """Cache the independent official mask; never modify the stored DEM."""
+    from coastline import cache_official_water_mask
+
+    return cache_official_water_mask(db, tile_id, bbox, GRID_N)
+
+
+def _mark_official_ocean(db, tile_id):
+    """Record an all-water classification without changing elevation data."""
+    now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    db.execute(
+        "UPDATE tiles SET source = 'official_coastline', updated_at = ? "
+        "WHERE tile_id = ?",
+        (now, tile_id),
+    )
+    from terrain_seams import invalidate_tile_seams
+
+    invalidate_tile_seams(db, tile_id)
+    db.commit()
+
+
 def _distance_to_bbox(x, y, bbox):
     """Distance from point (x, y) to nearest edge of bbox. 0 if inside."""
     dx = max(bbox[0] - x, 0, x - bbox[2])
     dy = max(bbox[1] - y, 0, y - bbox[3])
     return math.sqrt(dx * dx + dy * dy)
+
+
+def bbox_in_view_oval(qx, qy, heading, bbox, max_range,
+                      forward_scale=2.0):
+    """Return whether a tile intersects the heading-aligned coverage oval.
+
+    The camera sits behind the oval's center, giving it ``max_range`` of
+    coverage behind/abeam and ``forward_scale * max_range`` straight ahead.
+    Projecting the bbox half-extents onto the oval axes makes the test
+    conservative for large quadtree tiles, so boundary tiles are retained.
+    """
+    if max_range <= 0:
+        return True
+    if not isinstance(heading, (int, float)) or not math.isfinite(heading):
+        return _distance_to_bbox(qx, qy, bbox) <= max_range
+
+    forward_range = max_range * max(1.0, forward_scale)
+    center_offset = (forward_range - max_range) / 2
+    forward_radius = (forward_range + max_range) / 2
+    # Widen the oval just enough that its cross-section through the camera is
+    # max_range. This preserves the old lateral coverage while adding reach.
+    offset_ratio = center_offset / forward_radius
+    side_radius = max_range / math.sqrt(max(1e-9, 1 - offset_ratio ** 2))
+
+    fwd_x, fwd_y = -math.sin(heading), math.cos(heading)
+    side_x, side_y = fwd_y, -fwd_x
+    oval_x = qx + fwd_x * center_offset
+    oval_y = qy + fwd_y * center_offset
+    tile_x = (bbox[0] + bbox[2]) / 2
+    tile_y = (bbox[1] + bbox[3]) / 2
+    half_x = (bbox[2] - bbox[0]) / 2
+    half_y = (bbox[3] - bbox[1]) / 2
+    dx, dy = tile_x - oval_x, tile_y - oval_y
+
+    local_forward = dx * fwd_x + dy * fwd_y
+    local_side = dx * side_x + dy * side_y
+    forward_extent = abs(fwd_x) * half_x + abs(fwd_y) * half_y
+    side_extent = abs(side_x) * half_x + abs(side_y) * half_y
+    forward_gap = max(abs(local_forward) - forward_extent, 0.0)
+    side_gap = max(abs(local_side) - side_extent, 0.0)
+    return ((forward_gap / forward_radius) ** 2
+            + (side_gap / side_radius) ** 2) <= 1.0
 
 
 def _fetch_tile(db, tile_id, bbox, allow_overwrite=False):
@@ -72,18 +154,24 @@ def _fetch_tile(db, tile_id, bbox, allow_overwrite=False):
 
     # Fallback: resample from parent tile if COG returned nothing
     if data is None:
+        water = _cache_coastline(db, tile_id, bbox)
+        if water is not None and np.all(water):
+            _mark_official_ocean(db, tile_id)
+            return True
         data, src_name = _resample_from_parent(db, tile_id, bbox, GRID_N)
 
     if data is None:
         mark_no_data(db, tile_id)
         return False
 
-    conf = CONFIDENCE.get(src_name, CONFIDENCE['arcticdem'])
+    source_name = src_name if isinstance(src_name, str) else 'arcticdem'
+    conf = CONFIDENCE.get(source_name, CONFIDENCE['arcticdem'])
     cm = np.where(np.isnan(data), np.uint8(0), np.uint8(conf))
     hm = np.where(np.isnan(data), 0.0, data).astype(np.float32)
     try:
-        write_tile(db, tile_id, hm, cm, src_name, reconcile=False,
+        write_tile(db, tile_id, hm, cm, source_name, reconcile=False,
                    allow_overwrite=allow_overwrite)
+        _cache_coastline(db, tile_id, bbox)
     except TileClobberError:
         return False
     return True
@@ -125,7 +213,7 @@ def _ensure_children(db, depth, col, row):
 
 
 def _traverse(db, depth, col, row, qx, qy, max_depth, error_threshold,
-              results, missing, max_range=0.0, altitude=0.0):
+              results, missing, max_range=0.0, altitude=0.0, heading=None):
     """Recursive quadtree traversal with error-based LOD.
 
     A tile subdivides if geometric_error / distance > threshold, depth < max_depth,
@@ -134,7 +222,8 @@ def _traverse(db, depth, col, row, qx, qy, max_depth, error_threshold,
     Tiles with real data are added to results. Tiles that are empty but the LOD
     says should have data are added to missing for background fetching.
 
-    max_range: if > 0, skip tiles entirely beyond this distance (meters).
+    max_range: base radius of the coverage oval (meters). With a heading the
+        oval reaches twice as far forward; without one this remains circular.
     """
     tid = _tile_id(depth, col, row)
     meta = read_tile_metadata(db, tid)
@@ -146,7 +235,10 @@ def _traverse(db, depth, col, row, qx, qy, max_depth, error_threshold,
         return
 
     has_real_data = meta['source'] in REAL_SOURCES
-    is_placeholder = meta['source'] == 'parent_resampled'
+    is_placeholder = meta['source'] in (
+        'parent_resampled', 'unmasked_parent_resampled',
+        'clobbered_parent_resampled',
+    )
 
     # Unfetched tiles have geometric_error=0 from seeding — assume high
     # error so the traversal subdivides through them to find smaller tiles
@@ -159,14 +251,19 @@ def _traverse(db, depth, col, row, qx, qy, max_depth, error_threshold,
     if _debug:
         log_trav.debug(f"{tid}: source={meta['source']} real={has_real_data} geo_err={geo_err:.1f} (orig={meta['geometric_error']:.1f})")
 
-    # Distance cutoff — don't subdivide beyond max_range, but still
-    # include this tile if it has data (no holes at the boundary)
+    # Coverage cutoff — terrain outside the local view oval is not part of
+    # this response. Boundary-intersecting tiles are retained by the oval
+    # test itself, so the requested region still has coarse edge coverage.
     dist_to_tile = _distance_to_bbox(qx, qy, meta['bbox'])
-    if max_range > 0 and dist_to_tile > max_range:
+    in_coverage = bbox_in_view_oval(
+        qx, qy, heading, meta['bbox'], max_range
+    )
+    if not in_coverage:
         if _debug:
-            log_trav.debug(f"{tid}: beyond max_range ({dist_to_tile:.0f} > {max_range:.0f}), real={has_real_data}")
-        if has_real_data:
-            results.append(tid)
+            log_trav.debug(
+                f"{tid}: outside view oval (distance={dist_to_tile:.0f}, "
+                f"base_range={max_range:.0f}), real={has_real_data}"
+            )
         return
 
     # Parent-resampled tiles are terminal — don't subdivide further.
@@ -188,10 +285,10 @@ def _traverse(db, depth, col, row, qx, qy, max_depth, error_threshold,
             log_trav.debug(f"{tid}: screen_error={screen_error:.6f} threshold={error_threshold:.6f} dist={dist:.0f}")
 
         if screen_error > error_threshold:
-            # Hard subdivision ceiling — enhanced textures are the final quality.
-            if depth >= ENHANCE_DEPTH:
+            # Hard subdivision ceiling for the current terrain dataset.
+            if depth >= MAX_TILE_DEPTH:
                 if _debug:
-                    log_trav.debug(f"{tid}: depth>={depth} — NOT subdividing (depth-{ENHANCE_DEPTH} ceiling) real={has_real_data}")
+                    log_trav.debug(f"{tid}: depth>={depth} — NOT subdividing (depth-{MAX_TILE_DEPTH} ceiling) real={has_real_data}")
                 if has_real_data:
                     results.append(tid)
                 elif tid not in _no_data_cache:
@@ -260,7 +357,11 @@ def _traverse(db, depth, col, row, qx, qy, max_depth, error_threshold,
             if _debug:
                 log_trav.debug(f"{tid}: all children ready, subdividing")
             for cc, cr in children:
-                _traverse(db, depth+1, cc, cr, qx, qy, max_depth, error_threshold, results, missing, max_range, altitude)
+                _traverse(
+                    db, depth+1, cc, cr, qx, qy, max_depth,
+                    error_threshold, results, missing, max_range, altitude,
+                    heading,
+                )
     else:
         if _debug:
             log_trav.debug(f"{tid}: leaf node, real={has_real_data}")
@@ -271,14 +372,21 @@ def _traverse(db, depth, col, row, qx, qy, max_depth, error_threshold,
 
 
 def query_tiles_stereo(db, qx, qy, error_threshold=0.001, max_depth=None,
-                       max_range=0.0, log=print, altitude=0.0):
+                       max_range=0.0, log=print, altitude=0.0,
+                       heading=None, preview=False):
     """Query tiles using error-based LOD with stereo coords directly.
 
     Same as query_tiles() but takes EPSG:3413 coords instead of lat/lon.
-    max_range: if > 0, skip tiles beyond this distance in meters.
+    max_range: base coverage radius in meters. With heading, coverage extends
+        to twice this distance ahead while retaining this distance elsewhere.
     altitude: camera altitude in meters — increases effective distance to tiles below.
+    heading: camera heading in radians (JS convention: 0 = north, positive
+    turns west). When given, the missing-tile fetch batch is ordered by view
+    priority instead of plain distance.
+    preview: initial quick-paint pass — keeps the closest-first flood.
     """
-    return _query_tiles_impl(db, qx, qy, error_threshold, max_depth, max_range, log, altitude)
+    return _query_tiles_impl(db, qx, qy, error_threshold, max_depth, max_range,
+                             log, altitude, heading=heading, preview=preview)
 
 
 def query_tiles(db, lat, lon, error_threshold=0.001, max_depth=None,
@@ -307,7 +415,25 @@ def query_tiles(db, lat, lon, error_threshold=0.001, max_depth=None,
     return _query_tiles_impl(db, qx, qy, error_threshold, max_depth, max_range, log, altitude)
 
 
-def _query_tiles_impl(db, qx, qy, error_threshold, max_depth, max_range, log, altitude=0.0):
+def bbox_view_priority(qx, qy, fwd_x, fwd_y, bbox, forward_scale=2.0):
+    """Heading-weighted fetch priority (lower = sooner), matching the texture
+    priority in serve_flask: distance divided by how far ahead the tile is."""
+    cx = (bbox[0] + bbox[2]) / 2
+    cy = (bbox[1] + bbox[3]) / 2
+    dx, dy = cx - qx, cy - qy
+    dist = math.hypot(dx, dy)
+    if dist <= 0:
+        return 0.0
+    along = dx * fwd_x + dy * fwd_y
+    across = dx * fwd_y - dy * fwd_x
+    scaled_along = along / max(1.0, forward_scale) if along > 0 else along
+    priority_dist = math.hypot(across, scaled_along)
+    dot = along / dist
+    return priority_dist / max(dot, 0.01)
+
+
+def _query_tiles_impl(db, qx, qy, error_threshold, max_depth, max_range, log,
+                      altitude=0.0, heading=None, preview=False):
     from database import get_metadata
     from collections import Counter
 
@@ -323,7 +449,10 @@ def _query_tiles_impl(db, qx, qy, error_threshold, max_depth, max_range, log, al
 
     leaf_ids = []
     missing_raw = []
-    _traverse(db, 0, 0, 0, qx, qy, max_depth, error_threshold, leaf_ids, missing_raw, max_range, altitude)
+    _traverse(
+        db, 0, 0, 0, qx, qy, max_depth, error_threshold,
+        leaf_ids, missing_raw, max_range, altitude, heading,
+    )
 
     # Tile budget: if LOD produced too many tiles, drop the deepest/farthest.
     # Keep coarse tiles (coverage) and nearest deep tiles (detail where it matters).
@@ -340,12 +469,6 @@ def _query_tiles_impl(db, qx, qy, error_threshold, max_depth, max_range, log, al
         dropped = len(leaf_ids) - MAX_TILES
         leaf_ids = leaf_ids[:MAX_TILES]
         log(f"  [BUDGET] dropped {dropped} deepest/farthest tiles, capped at {MAX_TILES}")
-
-    # Cap missing tiles: sort by distance to camera, closest first.
-    # Progressive loading — fetch nearest tiles first, re-query for more.
-    MAX_FETCH_BATCH = 500
-    missing_raw.sort(key=lambda tb: _distance_to_bbox(qx, qy, tb[1]))
-    missing = missing_raw[:MAX_FETCH_BATCH]
 
     # Read full tile data for leaves
     results = []
@@ -371,20 +494,55 @@ def _query_tiles_impl(db, qx, qy, error_threshold, max_depth, max_range, log, al
             'geometric_error': tile['geometric_error'],
         })
 
-    # Queue background refetch for tiles with outdated DEM resolution.
-    # They keep serving the old heightmap until the new one arrives.
-    upgrade_count = 0
+    # Treat raw restoration and ordinary misses as one priority queue.  The
+    # previous implementation appended upgrades after capping ordinary misses,
+    # so thousands of stale rows bypassed the cap and nearby visible tiles sat
+    # behind coarse restoration work.
+    upgrade_candidates = []
     for t in results:
         if t['source'] in _UPGRADEABLE_SOURCES:
-            tid = t['id']
-            if (tid, t['bbox']) not in missing:
-                missing.append((tid, t['bbox']))
-                upgrade_count += 1
-    if upgrade_count:
-        log(f"  [DEM UPGRADE] {upgrade_count} tiles queued for 10m refetch")
+            upgrade_candidates.append((t['id'], t['bbox']))
+
+    candidates_by_id = {
+        tid: (tid, bbox) for tid, bbox in (*missing_raw, *upgrade_candidates)
+    }
+    missing_candidates = list(candidates_by_id.values())
+    if preview or heading is None:
+        missing_candidates.sort(
+            key=lambda tb: _distance_to_bbox(qx, qy, tb[1])
+        )
+    else:
+        fwd_x = -math.sin(heading)
+        fwd_y = math.cos(heading)
+        missing_candidates.sort(
+            key=lambda tb: bbox_view_priority(qx, qy, fwd_x, fwd_y, tb[1])
+        )
+    # Small batches on purpose: the background fetcher holds its lock for a
+    # whole batch, then the next request reprioritizes from the live camera.
+    MAX_FETCH_BATCH = 100
+    missing = missing_candidates[:MAX_FETCH_BATCH]
+    if upgrade_candidates:
+        upgrade_ids = {candidate[0] for candidate in upgrade_candidates}
+        selected_upgrades = sum(
+            tid in upgrade_ids for tid, _ in missing
+        )
+        log(
+            f"  [DEM RESTORE] {selected_upgrades}/{len(upgrade_candidates)} "
+            "visible stale tiles selected in this batch"
+        )
 
     results = sorted(results, key=lambda t: -t['depth'])
-    _stitch_lod_edges(results)
+    seam_cache = SqliteSeamCache(db)
+    seam_repairs = _stitch_lod_edges(results, cache=seam_cache)
+    if seam_repairs["cache_writes"]:
+        db.commit()
+    if seam_repairs["same_depth"] or seam_repairs["cross_lod"]:
+        log(
+            "[SEAM CACHE] "
+            f"same={seam_repairs['same_depth']} cross={seam_repairs['cross_lod']} "
+            f"hits={seam_repairs['cache_hits']} misses={seam_repairs['cache_misses']} "
+            f"writes={seam_repairs['cache_writes']}"
+        )
 
     # --- Clear logging: what came from where ---
     db_depths = Counter(t['depth'] for t in results)
@@ -440,6 +598,7 @@ def fetch_missing_tiles(db, missing, max_workers=6, log=print):
 
     # Check which tiles already exist with upgradeable sources
     upgrade_tids = set()
+    bbox_by_id = {tid: bbox for tid, bbox in missing}
     for tid, bbox in missing:
         meta = read_tile_metadata(db, tid)
         if meta and meta['source'] in _UPGRADEABLE_SOURCES:
@@ -460,6 +619,11 @@ def fetch_missing_tiles(db, missing, max_workers=6, log=print):
 
                 # Fallback: resample from parent if COG returned nothing
                 if data is None:
+                    water = _cache_coastline(db, tile_id, bbox_by_id[tile_id])
+                    if water is not None and np.all(water):
+                        _mark_official_ocean(db, tile_id)
+                        fetched += 1
+                        continue
                     data, src_name = _resample_from_parent(db, tile_id, bbox=None, resolution=GRID_N)
                     # bbox not needed — _resample_from_parent uses tile_id to find parent
 
@@ -469,15 +633,17 @@ def fetch_missing_tiles(db, missing, max_workers=6, log=print):
                     no_data += 1
                     continue
 
-                conf = CONFIDENCE.get(src_name, CONFIDENCE['arcticdem'])
+                source_name = src_name if isinstance(src_name, str) else 'arcticdem'
+                conf = CONFIDENCE.get(source_name, CONFIDENCE['arcticdem'])
                 cm = np.where(np.isnan(data), np.uint8(0), np.uint8(conf))
                 hm = np.where(np.isnan(data), 0.0, data).astype(np.float32)
                 overwrite = tid in upgrade_tids
-                write_tile(db, tile_id, hm, cm, src_name, reconcile=False,
+                write_tile(db, tile_id, hm, cm, source_name, reconcile=False,
                            allow_overwrite=overwrite)
+                _cache_coastline(db, tile_id, bbox_by_id[tile_id])
                 fetched += 1
                 if overwrite:
-                    log(f"  [DEM UPGRADE] {tid}: {src_name} replaced old 32m data")
+                    log(f"  [DEM UPGRADE] {tid}: {source_name} replaced old 32m data")
             except TileClobberError as exc:
                 clobbered += 1
                 log(
@@ -496,159 +662,3 @@ def fetch_missing_tiles(db, missing, max_workers=6, log=print):
     # Rebuild affected parents so coarser LOD levels are available ? might be obsolete
 
     return fetched
-
-
-def _stitch_lod_edges(tiles):
-    """Snap fine tile edges to coarser neighbors to eliminate cross-depth seams.
-
-    Same-depth edges are guaranteed seamless by _resample_native() in ingest.py
-    (world-coordinate bilinear interp ensures shared edges get identical values).
-    Cross-depth seams still need stitching because a depth-7 tile's edge values
-    won't match the coarser depth-6 tile's interpolated grid. This function
-    handles that by averaging same-depth edges and resampling coarse->fine.
-
-    Modifies heightmaps in-place (query results only — DB is untouched).
-    """
-    if not tiles:
-        return
-
-    # Build spatial index: map bbox corners to tiles for fast neighbor lookup
-    # Use a dict keyed by (depth, col, row) for O(1) lookup
-    by_address = {}
-    for t in tiles:
-        parts = t['id'].split('-')
-        d, c, r = int(parts[0]), int(parts[1]), int(parts[2])
-        by_address[(d, c, r)] = t
-
-    for t in tiles:
-        hm = t['heightmap']
-        if hm is None:
-            continue
-
-        parts = t['id'].split('-')
-        d, c, r = int(parts[0]), int(parts[1]), int(parts[2])
-        bbox = t['bbox']
-        n = hm.shape[0]  # GRID_N
-
-        # Check each edge for a same-depth neighbor
-        neighbors = {
-            'west':  (d, c - 1, r),
-            'east':  (d, c + 1, r),
-            'south': (d, c, r - 1),
-            'north': (d, c, r + 1),
-        }
-
-        for direction, (nd, nc, nr) in neighbors.items():
-            if nc < 0 or nr < 0:
-                continue
-
-            if (nd, nc, nr) in by_address:
-                # Same-depth neighbor exists — average shared edges
-                nbr = by_address[(nd, nc, nr)]
-                nhm = nbr['heightmap']
-                if nhm is None:
-                    continue
-                if direction == 'east':
-                    avg = (hm[:, -1] + nhm[:, 0]) * 0.5
-                    hm[:, -1] = avg
-                    nhm[:, 0] = avg
-                elif direction == 'north':
-                    avg = (hm[-1, :] + nhm[0, :]) * 0.5
-                    hm[-1, :] = avg
-                    nhm[0, :] = avg
-                # west/south handled when the neighbor processes its east/north
-                continue
-
-            # No same-depth neighbor — find the coarser tile covering this edge
-            coarse = _find_coarser_covering_tile(by_address, d, c, r, direction)
-            if coarse is None:
-                continue
-
-            chm = coarse['heightmap']
-            if chm is None:
-                continue
-
-            # Resample coarse tile's heightmap at fine tile's edge positions
-            _resample_edge(hm, bbox, chm, coarse['bbox'], direction, n)
-
-
-def _find_coarser_covering_tile(by_address, depth, col, row, direction):
-    """Walk up the quadtree to find a coarser tile in the result set
-    that covers the neighbor area on the given edge."""
-    # The neighbor at (depth, ncol, nrow) isn't in results.
-    # Walk up: at each coarser level, the neighbor's parent might be a leaf.
-    if direction == 'west':
-        ncol, nrow = col - 1, row
-    elif direction == 'east':
-        ncol, nrow = col + 1, row
-    elif direction == 'south':
-        ncol, nrow = col, row - 1
-    elif direction == 'north':
-        ncol, nrow = col, row + 1
-    else:
-        return None
-
-    # Walk up from the neighbor's position
-    cd, cc, cr = depth, ncol, nrow
-    for _ in range(depth):
-        cd -= 1
-        cc //= 2
-        cr //= 2
-        if (cd, cc, cr) in by_address:
-            return by_address[(cd, cc, cr)]
-
-    return None
-
-
-def _resample_edge(fine_hm, fine_bbox, coarse_hm, coarse_bbox, direction, n):
-    """Resample a coarse tile's heightmap along the fine tile's edge and
-    overwrite the fine tile's boundary row/column in-place."""
-    fb = fine_bbox
-    cb = coarse_bbox
-
-    # Compute the fine tile's edge positions in world coordinates
-    if direction == 'west':
-        # Fine tile's west column (col 0): x = fb[0], y varies
-        edge_x = np.full(n, fb[0])
-        edge_y = np.linspace(fb[1], fb[3], n)
-    elif direction == 'east':
-        edge_x = np.full(n, fb[2])
-        edge_y = np.linspace(fb[1], fb[3], n)
-    elif direction == 'south':
-        edge_x = np.linspace(fb[0], fb[2], n)
-        edge_y = np.full(n, fb[1])
-    elif direction == 'north':
-        edge_x = np.linspace(fb[0], fb[2], n)
-        edge_y = np.full(n, fb[3])
-    else:
-        return
-
-    # Convert world positions to fractional pixel coords in coarse tile
-    cx_frac = (edge_x - cb[0]) / (cb[2] - cb[0]) * (n - 1)
-    cy_frac = (edge_y - cb[1]) / (cb[3] - cb[1]) * (n - 1)
-
-    # Bilinear interpolation from coarse heightmap
-    cx0 = np.clip(np.floor(cx_frac).astype(int), 0, n - 2)
-    cy0 = np.clip(np.floor(cy_frac).astype(int), 0, n - 2)
-    cx1 = cx0 + 1
-    cy1 = cy0 + 1
-    cxf = cx_frac - cx0
-    cyf = cy_frac - cy0
-
-    # coarse_hm is (row, col) = (y, x)
-    vals = (
-        coarse_hm[cy0, cx0] * (1 - cxf) * (1 - cyf) +
-        coarse_hm[cy0, cx1] * cxf * (1 - cyf) +
-        coarse_hm[cy1, cx0] * (1 - cxf) * cyf +
-        coarse_hm[cy1, cx1] * cxf * cyf
-    )
-
-    # Overwrite fine tile's edge
-    if direction == 'west':
-        fine_hm[:, 0] = vals
-    elif direction == 'east':
-        fine_hm[:, -1] = vals
-    elif direction == 'south':
-        fine_hm[0, :] = vals
-    elif direction == 'north':
-        fine_hm[-1, :] = vals

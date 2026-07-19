@@ -8,7 +8,7 @@ import { createWebGPUAtmosphereController } from './webgpu-atmosphere.js';
  * Atmosphere node construction remains outside temporarily and is attached via
  * setPostProcessing() until it moves behind this backend as well.
  */
-export function createWebGPUTerrainBackend({
+export function createTerrainBackend({
   width,
   height,
   pixelRatio,
@@ -20,7 +20,7 @@ export function createWebGPUTerrainBackend({
     antialias: true,
     samples: 4,
     depth: true,
-    logarithmicDepthBuffer: false,
+    logarithmicDepthBuffer: true,
   });
   renderer.setSize(width, height);
   renderer.setPixelRatio(pixelRatio);
@@ -41,21 +41,13 @@ export function createWebGPUTerrainBackend({
   bootLog('renderer.ready', {
     backend: 'webgpu', width, height, pixelRatio,
     shadowMap: renderer.shadowMap.type,
-  });
-
-  renderer.init().then(() => {
-    ready = true;
-    bootLog('renderer.webgpu.ready');
-  }).catch(error => {
-    bootLog('renderer.webgpu.error', {
-      message: error?.message ?? String(error),
-      stack: error?.stack ?? null,
-    }, 'error');
+    logarithmicDepthBuffer: renderer.logarithmicDepthBuffer,
+    toneMapping: 'agx', toneMappingExposure,
   });
 
   const backend = {
     kind: 'webgpu',
-    isWebGPU: true,
+    defaultFogStrength: 6.5,
     renderer,
     get ready() { return ready; },
     get animationLoopActive() { return animationLoopActive; },
@@ -68,9 +60,11 @@ export function createWebGPUTerrainBackend({
       });
       return atmosphere;
     },
+    configureScenePipeline({ date }) {
+      atmosphere?.rebuild(date);
+    },
     setFogDensity(value) { fogDensity.value = value; },
     setMapMode(active) { fogDensity.value = active ? 0 : fogDensity.value; },
-    setWaterVisibility(mesh) { mesh.visible = false; },
     prepareUntexturedTerrain(mesh) {
       if (!mesh?.material || mesh.material.map) return;
       let needsUpdate = false;
@@ -81,14 +75,24 @@ export function createWebGPUTerrainBackend({
       mesh.material.color.set(0x29313a);
       if (needsUpdate) {
         mesh.material.needsUpdate = true;
-        backend.markSceneMutated();
       }
+      backend.markSceneMutated();
     },
     resize(nextWidth, nextHeight) {
       renderer.setSize(nextWidth, nextHeight);
     },
-    renderMap(scene, camera) {
-      if (ready) renderer.render(scene, camera);
+    renderMap(scene, camera, background) {
+      if (!ready) return;
+      const previousBackground = scene.background;
+      const previousBackgroundNode = scene.backgroundNode;
+      scene.background = background;
+      scene.backgroundNode = null;
+      try {
+        renderer.render(scene, camera);
+      } finally {
+        scene.background = previousBackground;
+        scene.backgroundNode = previousBackgroundNode;
+      }
     },
     renderScene(scene, camera) {
       if (!ready) return;
@@ -129,5 +133,19 @@ export function createWebGPUTerrainBackend({
       renderer.dispose();
     },
   };
+  renderer.init().then(() => {
+    ready = true;
+    bootLog('renderer.webgpu.ready');
+    // Build the atmosphere against the initialized WebGPU device. The removed
+    // water runtime used to trigger this rebuild incidentally when it became
+    // ready; lighting must not depend on an unrelated optional surface.
+    atmosphere?.rebuild?.();
+    backend.requestRender();
+  }).catch(error => {
+    bootLog('renderer.webgpu.error', {
+      message: error?.message ?? String(error),
+      stack: error?.stack ?? null,
+    }, 'error');
+  });
   return backend;
 }

@@ -19,9 +19,9 @@ import zlib
 import datetime
 import numpy as np
 
-from tiles import Tile, GREENLAND_BBOX
+from tiles import GREENLAND_BBOX
 from colored_log import get_logger
-from terrain_config import ENHANCE_DEPTH
+from terrain_config import MAX_TILE_DEPTH
 
 log_db = get_logger("terrain.db")
 
@@ -38,9 +38,12 @@ CONFIDENCE = {
     'external':   4,
     'arcticdem':  5,
     'arcticdem_10m': 6,
+    'official_coastline': 6,
 }
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
+SCHEMA_VERSION = 3
+_SCHEMA_VERSION_KEY = "schema_version"
 
 
 class TileClobberError(RuntimeError):
@@ -103,18 +106,30 @@ CREATE TABLE IF NOT EXISTS metadata (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS coastline_masks (
+    tile_id    TEXT PRIMARY KEY,
+    width      INTEGER NOT NULL CHECK (width > 0),
+    height     INTEGER NOT NULL CHECK (height > 0),
+    mask       BLOB NOT NULL,
+    source     TEXT NOT NULL,
+    version    INTEGER NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY (tile_id) REFERENCES tiles(tile_id) ON DELETE CASCADE
+);
 """
 
 # see texture.py for the texture table
 
 
-def _retire_legacy_terrain_data(db):
-    """Discard data produced or retained by retired terrain pipelines.
+def _migrate_to_v1(db):
+    """Remove storage and data left by retired terrain pipelines.
 
     Bathymetry rewrote the canonical heightmap and kept a second copy in
     ``bathy_originals``.  Neither copy is trustworthy: reset every tile the
     old pipeline touched so the normal missing-tile path reloads it from the
-    source COG, then remove the obsolete storage.
+    source COG, then remove the obsolete storage. The seam and water-mask
+    tables belonged to the same retired pipeline and have no remaining readers.
     """
     tables = {
         row[0]
@@ -153,11 +168,120 @@ def _retire_legacy_terrain_data(db):
 
     db.execute("DROP TABLE IF EXISTS bathy_originals")
     db.execute("DROP TABLE IF EXISTS google_refs")
+    db.execute("DROP TABLE IF EXISTS seam_jobs")
+    db.execute("DROP TABLE IF EXISTS water_masks")
 
     columns = {row[1] for row in db.execute("PRAGMA table_info(tiles)")}
     for column in ("has_sealevel_water", "has_flattened_water"):
         if column in columns:
             db.execute(f"ALTER TABLE tiles DROP COLUMN {column}")
+
+
+def _migrate_to_v2(db):
+    """Queue cached terrain for a non-destructive coastline-aware refresh."""
+    source_map = {
+        "arcticdem": "unmasked_arcticdem",
+        "arcticdem_10m": "unmasked_arcticdem_10m",
+        "copernicus": "unmasked_copernicus",
+        "parent_resampled": "unmasked_parent_resampled",
+    }
+    upgrade_ids = [
+        row[0]
+        for row in db.execute(
+            f"SELECT tile_id FROM tiles WHERE source IN "
+            f"({','.join('?' for _ in source_map)})",
+            tuple(source_map),
+        )
+    ]
+    for old_source, queued_source in source_map.items():
+        db.execute(
+            "UPDATE tiles SET source = ? WHERE source = ?",
+            (queued_source, old_source),
+        )
+
+    # Old no-data rows have no payload worth preserving. Reopen them so the
+    # official mask can resolve all-ocean tiles even when both DEMs are empty.
+    no_data_ids = [
+        row[0]
+        for row in db.execute("SELECT tile_id FROM tiles WHERE source = 'no_data'")
+    ]
+    if no_data_ids:
+        now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        db.executemany(
+            "UPDATE tiles SET heightmap = NULL, confidence_map = NULL, "
+            "geometric_error = 0.0, source = 'empty', updated_at = ? "
+            "WHERE tile_id = ?",
+            ((now, tile_id) for tile_id in no_data_ids),
+        )
+
+    if upgrade_ids:
+        tables = {
+            row[0]
+            for row in db.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        if "classifier_tiles" in tables:
+            db.executemany(
+                "DELETE FROM classifier_tiles WHERE tile_id = ?",
+                ((tile_id,) for tile_id in upgrade_ids),
+            )
+        log_db.info(
+            f"Queued {len(upgrade_ids)} terrain tiles for official coastline refresh"
+        )
+
+
+def _migrate_to_v3(db):
+    """Queue heightmaps modified by schema v2 for raw cloud restoration."""
+    source_map = {
+        "arcticdem_10m": "clobbered_arcticdem_10m",
+        "copernicus": "clobbered_copernicus",
+        "parent_resampled": "clobbered_parent_resampled",
+        "official_coastline": "clobbered_official_coastline",
+    }
+    restored_count = 0
+    for old_source, queued_source in source_map.items():
+        cursor = db.execute(
+            "UPDATE tiles SET source = ? WHERE source = ?",
+            (queued_source, old_source),
+        )
+        restored_count += cursor.rowcount
+    if restored_count:
+        log_db.info(
+            f"Queued {restored_count} coastline-modified heightmaps for raw restoration"
+        )
+
+
+def _migrate_schema(db):
+    row = db.execute(
+        "SELECT value FROM metadata WHERE key = ?", (_SCHEMA_VERSION_KEY,)
+    ).fetchone()
+    version = int(row[0]) if row is not None else 0
+    if version > SCHEMA_VERSION:
+        raise RuntimeError(
+            f"Database schema version {version} is newer than supported "
+            f"version {SCHEMA_VERSION}"
+        )
+    if version < 1:
+        _migrate_to_v1(db)
+        db.execute(
+            "INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)",
+            (_SCHEMA_VERSION_KEY, "1"),
+        )
+        version = 1
+    if version < 2:
+        _migrate_to_v2(db)
+        db.execute(
+            "INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)",
+            (_SCHEMA_VERSION_KEY, "2"),
+        )
+        version = 2
+    if version < 3:
+        _migrate_to_v3(db)
+        db.execute(
+            "INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)",
+            (_SCHEMA_VERSION_KEY, "3"),
+        )
 
 
 def open_db(path=None):
@@ -178,7 +302,7 @@ def open_db(path=None):
     db.execute("PRAGMA synchronous=NORMAL")
     existing = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
     db.executescript(_SCHEMA)
-    _retire_legacy_terrain_data(db)
+    _migrate_schema(db)
     db.commit()
     for tbl in ("tiles", "metadata"):
         if tbl not in existing:
@@ -192,6 +316,14 @@ def open_db(path=None):
     # tile store. Heightmaps remain the canonical geometry payload.
     from classifier.storage import init_classifier_tiles
     init_classifier_tiles(db)
+
+    from terrain_seams import init_seam_cache
+    init_seam_cache(db)
+    if "terrain_seam_cache" not in existing:
+        log_db.info("Created table: terrain_seam_cache")
+
+    from coastline import ensure_water_floor_version
+    ensure_water_floor_version(db)
 
     return db
 
@@ -294,7 +426,7 @@ def compute_geometric_error(heightmap):
 # Seed tiles
 # ---------------------------------------------------------------------------
 
-def seed_tiles(db, max_depth=ENHANCE_DEPTH, root_bbox=None):
+def seed_tiles(db, max_depth=MAX_TILE_DEPTH, root_bbox=None):
     """Populate the tiles table with the full quadtree structure.
 
     Creates tile rows for depths 0 through max_depth with IDs, bboxes,
@@ -423,6 +555,12 @@ def _reconcile_edges(db, tile_id, heightmap, confidence_map):
                 (_compress_array(nbr_hm), _compress_array(nbr_cm),
                  nbr_error, now, nbr_id)
             )
+            from terrain_seams import invalidate_tile_seams
+            invalidated = invalidate_tile_seams(db, nbr_id)
+            if invalidated:
+                log_db.info(
+                    f"[seam-cache] {nbr_id}: invalidated {invalidated} seams"
+                )
 
 
 # ---------------------------------------------------------------------------
@@ -489,6 +627,10 @@ def write_tile(
         )
         if cursor.rowcount == 0:
             raise KeyError(f"Unknown tile_id: {tile_id}")
+        from terrain_seams import invalidate_tile_seams
+        invalidated = invalidate_tile_seams(db, tile_id)
+        if invalidated:
+            log_db.info(f"[seam-cache] {tile_id}: invalidated {invalidated} seams")
         db.commit()
         return True
 
@@ -500,6 +642,10 @@ def write_tile(
         (hm_blob, cm_blob, error, source, now, tile_id)
     )
     if cursor.rowcount == 1:
+        from terrain_seams import invalidate_tile_seams
+        invalidated = invalidate_tile_seams(db, tile_id)
+        if invalidated:
+            log_db.info(f"[seam-cache] {tile_id}: invalidated {invalidated} seams")
         db.commit()
         return True
 
@@ -554,6 +700,9 @@ def read_tile(db, tile_id):
     n = GRID_N
     hm_blob, cm_blob = row[12], row[13]
 
+    raw_heightmap = _decompress_float32(hm_blob, (n, n)) if hm_blob else None
+    from coastline import effective_heightmap
+
     return {
         'tile_id': row[0],
         'depth': row[1],
@@ -564,26 +713,9 @@ def read_tile(db, tile_id):
         'geometric_error': row[9],
         'source': row[10],
         'updated_at': row[11],
-        'heightmap': _decompress_float32(hm_blob, (n, n)) if hm_blob else None,
+        'heightmap': effective_heightmap(db, tile_id, raw_heightmap),
         'confidence_map': _decompress_uint8(cm_blob, (n, n)) if cm_blob else None,
     }
-
-
-def read_tiles_at_depth(db, depth):
-    """Read all tile IDs at a given depth.
-
-    Args:
-        db: sqlite3 connection
-        depth: integer depth level
-
-    Returns:
-        list of tile_id strings
-    """
-    rows = db.execute(
-        "SELECT tile_id FROM tiles WHERE depth = ? ORDER BY tile_id",
-        (depth,)
-    ).fetchall()
-    return [r[0] for r in rows]
 
 
 def read_tile_metadata(db, tile_id):
@@ -617,25 +749,3 @@ def get_metadata(db, key):
     """Read a metadata value by key."""
     row = db.execute("SELECT value FROM metadata WHERE key = ?", (key,)).fetchone()
     return row[0] if row else None
-
-
-def tile_count(db, depth=None, source=None):
-    """Count tiles, optionally filtered by depth and/or source.
-
-    Args:
-        db: sqlite3 connection
-        depth: optional depth filter
-        source: optional source filter
-
-    Returns:
-        int count
-    """
-    query = "SELECT COUNT(*) FROM tiles WHERE 1=1"
-    params = []
-    if depth is not None:
-        query += " AND depth = ?"
-        params.append(depth)
-    if source is not None:
-        query += " AND source = ?"
-        params.append(source)
-    return db.execute(query, params).fetchone()[0]

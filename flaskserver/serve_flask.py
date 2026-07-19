@@ -7,11 +7,10 @@ import logging
 import math
 import os
 import re
+import socket
 import sqlite3
 import threading
 import time
-import urllib.parse
-import urllib.request
 import zlib
 from concurrent.futures import ThreadPoolExecutor
 from logging import FileHandler
@@ -21,7 +20,7 @@ from typing import Any, cast
 import asyncio
 
 from colored_log import get_logger
-from terrain_config import BOOTSTRAP_SEED_DEPTH, ENHANCE_DEPTH, ENHANCE_ENABLED
+from terrain_config import BOOTSTRAP_SEED_DEPTH, MAX_TILE_DEPTH
 
 log = get_logger("terrain")
 log_db = get_logger("terrain.db")
@@ -38,6 +37,9 @@ CLIENT_LOG_HTML_PATH = ROOT / "webserver" / "client_log.html"
 FLASK_DIR = Path(__file__).resolve().parent
 LOCAL_DB_PATH = FLASK_DIR / "terrain.db"
 CLIENT_LOG_PATH = FLASK_DIR / os.environ.get("CLIENT_LOG_FILE", "client_debug.log")
+ASSETS_DB_PATH = Path(
+  os.environ.get("ASSET_DB_PATH", ROOT / "assetserver" / "assets.db")
+).expanduser().resolve()
 
 
 def _resolve_db_path() -> Path:
@@ -67,6 +69,19 @@ def _env_int(name: str, default: int) -> int:
     return int(raw)
   except (TypeError, ValueError):
     return default
+
+
+def _require_available_port(host: str, port: int) -> None:
+  """Abort startup before backend initialization when Flask cannot bind."""
+  family = socket.AF_INET6 if ":" in host else socket.AF_INET
+  try:
+    with socket.socket(family, socket.SOCK_STREAM) as probe:
+      probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+      probe.bind((host, port))
+  except OSError as exc:
+    raise SystemExit(
+      f"Flask startup aborted: cannot bind to {host}:{port}: {exc}"
+    ) from exc
 
 
 # In-memory ring buffer of raw client log entries for the HTML viewer.
@@ -164,15 +179,17 @@ _read_texture: Any = None
 _write_texture: Any = None
 _fetch_sentinel2_texture: Any = None
 _fetch_dataforsyningen_texture: Any = None
-_fetch_enhanced_texture: Any = None
+_split_texture_metatile: Any = None
+_harmonize_texture_metatile: Any = None
 _init_textures: Any = None
 _init_classifier_tiles: Any = None
-_enqueue_seam_jobs: Any = None
 
 _tex_pool = ThreadPoolExecutor(max_workers=4)
 _tex_fetching: dict[str, tuple[str, int]] = {}
 _tex_fetching_lock = threading.Lock()
 _tex_demand_generations: dict[str, int] = {}
+_tex_metatile_locks: dict[str, threading.Lock] = {}
+_tex_metatile_locks_guard = threading.Lock()
 
 
 def _texture_demand_is_stale(client_id: str, generation: int) -> bool:
@@ -240,25 +257,29 @@ def _tex_retry_worker() -> None:
       cur_row = db.execute(
         "SELECT source, texture FROM textures WHERE tile_id = ?", (tile_id,)
       ).fetchone()
-      if cur_row and cur_row[0] not in ("ancestor_crop", "ancestor_crop_ratelimit"):
+      if cur_row and cur_row[0] not in _METATILE_UPGRADEABLE_SOURCES:
         log_tex.debug(f"[tex-retry] {tile_id}: already upgraded to {cur_row[0]}, skipping")
         continue
 
-      jpeg, fail_reason = _fetch_dataforsyningen_texture(list(bbox), resolution=256)
-      if jpeg is not None:
-        jpeg = _repair_white_ocean_jpeg(db, tile_id, jpeg)
-        _write_texture(db, tile_id, jpeg, "dataforsyningen")
-        log_tex.info(f"[tex-retry] {tile_id}: SUCCESS on attempt {attempt + 1}")
-      elif fail_reason == 'no_coverage':
-        _resolve_no_coverage(db, tile_id, cur_row[1] if cur_row else None, "[tex-retry]")
-      else:
-        # Still transient
-        if attempt + 1 < _TEX_RETRY_MAX:
-          _tex_retry_enqueue(tile_id, bbox, attempt + 1)
-          log_tex.debug(f"[tex-retry] {tile_id}: still transient, re-queued attempt {attempt + 2}")
-        else:
-          log_tex.warning(f"[tex-retry] {tile_id}: max retries exhausted")
+      metatile_id, _, _, _ = _texture_metatile_spec(tile_id)
+      with _texture_metatile_lock(metatile_id):
+        children, fail_reason = _fetch_texture_metatile(tile_id)
+        if children is not None:
+          written, no_coverage = _store_texture_metatile(db, children)
+          if tile_id in written:
+            log_tex.info(f"[tex-retry] {tile_id}: SUCCESS on attempt {attempt + 1}")
+          elif tile_id in no_coverage:
+            _resolve_no_coverage(db, tile_id, cur_row[1] if cur_row else None, "[tex-retry]")
+        elif fail_reason == 'no_coverage':
           _resolve_no_coverage(db, tile_id, cur_row[1] if cur_row else None, "[tex-retry]")
+        else:
+          # Still transient
+          if attempt + 1 < _TEX_RETRY_MAX:
+            _tex_retry_enqueue(tile_id, bbox, attempt + 1)
+            log_tex.debug(f"[tex-retry] {tile_id}: still transient, re-queued attempt {attempt + 2}")
+          else:
+            log_tex.warning(f"[tex-retry] {tile_id}: max retries exhausted")
+            _resolve_no_coverage(db, tile_id, cur_row[1] if cur_row else None, "[tex-retry]")
     except Exception as exc:
       log_tex.error(f"[tex-retry] {tile_id}: FAILED: {type(exc).__name__}: {exc}")
     finally:
@@ -266,174 +287,20 @@ def _tex_retry_worker() -> None:
         db.close()
 
 
-_enhance_pool = ThreadPoolExecutor(max_workers=2)
-_enhancing: set[str] = set()
-_enhancing_lock = threading.Lock()
-ENHANCE_MAX_QUEUED = 4  # max tiles in ComfyUI queue at once
-
 _cog_fetch_lock = threading.Lock()
 _cog_fetching_tiles: set[str] = set()
 _cog_fetched_total = 0      # lifetime count of COG tiles fetched from S3
 _cog_skipped_total = 0      # lifetime count of tiles skipped (already had data)
 _cog_already_fetched: set[str] = set()  # tile IDs we've already fetched this session
+_COG_TILE_WORKERS = max(1, _env_int("COG_TILE_WORKERS", 6))
 
-_SUPIR_TILE_RE = re.compile(r"\b(?:supir|upscaled)_(\d+-\d+-\d+)\b")
-_INPUT_TILE_RE = re.compile(r"\btile_(\d+-\d+-\d+)_(?:texture|heightmap)\.png\b")
-
-
-def _recover_comfy_jobs():
-  """On startup, check ComfyUI /queue for in-flight tile jobs and resume tracking them."""
-  if not ENHANCE_ENABLED:
-    log_tex.info("[ENHANCE RECOVERY] skipped — SUPIR upscaling disabled (ENHANCE_ENABLED=False)")
-    return
-  from texture import COMFY_URL
-  log_tex.info(f"[ENHANCE RECOVERY] checking ComfyUI at {COMFY_URL}")
-  try:
-    resp = urllib.request.urlopen(f"{COMFY_URL}/queue", timeout=10)
-    queue = json.loads(resp.read())
-  except Exception as e:
-    log_tex.warning(f"[ENHANCE RECOVERY] can't reach ComfyUI: {e}")
-    return
-
-  # Extract (prompt_id, tile_id) pairs from running + pending
-  jobs: list[tuple[str, str]] = []  # (prompt_id, tile_id)
-  ignored_wrong_depth = 0
-  for item in queue.get("queue_running", []) + queue.get("queue_pending", []):
-    # prompt_id is item[1] in the list format comfy uses
-    prompt_id = item[1] if isinstance(item, (list, tuple)) and len(item) > 1 else None
-    if not prompt_id:
-      continue
-    # find tile IDs in the prompt data
-    found: set[str] = set()
-    for text in _iter_all_strings(item):
-      for m in _SUPIR_TILE_RE.findall(text):
-        found.add(m)
-      for m in _INPUT_TILE_RE.findall(text):
-        found.add(m)
-    for tid in found:
-      parsed = _parse_tile_id(tid)
-      if parsed is None or parsed[0] != ENHANCE_DEPTH:
-        ignored_wrong_depth += 1
-        continue
-      jobs.append((prompt_id, tid))
-
-  if not jobs:
-    if ignored_wrong_depth:
-      log_tex.info(f"[ENHANCE RECOVERY] ignored {ignored_wrong_depth} non-depth-{ENHANCE_DEPTH} jobs")
-    return
-
-  # Filter out tiles that are already enhanced in the DB
-  db = sqlite3.connect(str(DB_PATH), check_same_thread=False)
-  try:
-    already = set()
-    for _, tid in jobs:
-      row = db.execute(
-        "SELECT source FROM textures WHERE tile_id = ?", (tid,)
-      ).fetchone()
-      if row and row[0] in ("dataforsyningen_enhanced", "sentinel2_enhanced", "upscaled"):
-        already.add(tid)
-  finally:
-    db.close()
-
-  jobs = [(pid, tid) for pid, tid in jobs if tid not in already]
-  if not jobs:
-    if already:
-      log_tex.info(f"[ENHANCE RECOVERY] {len(already)} comfy jobs already enhanced, nothing to recover")
-    return
-
-  tile_ids = [tid for _, tid in jobs]
-  log_tex.info(f"[ENHANCE RECOVERY] recovering {len(jobs)} in-flight comfy jobs: {tile_ids}")
-  with _enhancing_lock:
-    for _, tid in jobs:
-      _enhancing.add(tid)
-
-  for prompt_id, tid in jobs:
-    _enhance_pool.submit(_recover_worker, prompt_id, tid)
-
-
-def _iter_all_strings(value):
-  """Recursively yield all strings from a nested structure."""
-  if isinstance(value, str):
-    yield value
-  elif isinstance(value, dict):
-    for v in value.values():
-      yield from _iter_all_strings(v)
-  elif isinstance(value, (list, tuple)):
-    for v in value:
-      yield from _iter_all_strings(v)
-
-
-def _recover_worker(prompt_id: str, tile_id: str):
-  """Poll ComfyUI for a pre-existing job and save the result when done."""
-  from texture import COMFY_URL
-  log_tex.info(f"[ENHANCE RECOVERY] waiting for {tile_id} (prompt={prompt_id[:8]}...)")
-  start = time.time()
-  wdb = None
-  try:
-    while time.time() - start < 600:
-      time.sleep(3)
-      try:
-        resp = urllib.request.urlopen(f"{COMFY_URL}/history/{prompt_id}", timeout=10)
-        history = json.loads(resp.read())
-      except Exception:
-        continue
-      if prompt_id not in history:
-        continue
-      entry = history[prompt_id]
-      status = entry.get("status", {})
-      status_str = status.get("status_str", "")
-
-      if status_str == "error":
-        log_tex.error(f"[ENHANCE RECOVERY] {tile_id} failed on comfy")
-        return
-
-      if status_str == "success" or status.get("completed"):
-        # Download result image
-        outputs = entry.get("outputs", {})
-        for nid, out in outputs.items():
-          if "images" not in out:
-            continue
-          for img_info in out["images"]:
-            fname = img_info["filename"]
-            subfolder = img_info.get("subfolder", "")
-            img_type = img_info.get("type", "output")
-            view_url = (
-              f"{COMFY_URL}/view?"
-              f"filename={urllib.parse.quote(fname)}"
-              f"&type={img_type}"
-            )
-            if subfolder:
-              view_url += f"&subfolder={urllib.parse.quote(subfolder)}"
-            with urllib.request.urlopen(view_url, timeout=30) as dl:
-              result_png = dl.read()
-            from PIL import Image as _PILImage
-            result_img = _PILImage.open(io.BytesIO(result_png)).convert("RGB")
-            buf = io.BytesIO()
-            result_img.save(buf, format="JPEG", quality=90)
-            jpeg_bytes = buf.getvalue()
-            wdb = sqlite3.connect(str(DB_PATH), check_same_thread=False)
-            wdb.execute("PRAGMA journal_mode=WAL")
-            if _init_textures is not None:
-              _init_textures(wdb)
-            _write_texture(wdb, tile_id, jpeg_bytes, "dataforsyningen_enhanced")
-            log_tex.info(f"[ENHANCE RECOVERY] {tile_id} saved ({len(jpeg_bytes)} bytes)")
-            return
-        log_tex.warning(f"[ENHANCE RECOVERY] {tile_id} completed but no output images")
-        return
-
-    log_tex.warning(f"[ENHANCE RECOVERY] {tile_id} timed out after 600s")
-  except Exception as e:
-    log_tex.error(f"[ENHANCE RECOVERY] {tile_id} error: {e}")
-  finally:
-    if wdb is not None:
-      wdb.close()
-    with _enhancing_lock:
-      _enhancing.discard(tile_id)
 def _bootstrap_backend() -> None:
   global _backend_ready, _backend_error
   global _np, _Image, _to_stereo, _query_tiles_stereo, _load_no_data_cache
   global _GRID_N, _tile_bbox, _texture_ids_in, _read_texture, _write_texture
-  global _fetch_sentinel2_texture, _fetch_dataforsyningen_texture, _fetch_enhanced_texture, _init_textures, _init_classifier_tiles, _enqueue_seam_jobs
+  global _fetch_sentinel2_texture, _fetch_dataforsyningen_texture, _split_texture_metatile
+  global _harmonize_texture_metatile
+  global _init_textures, _init_classifier_tiles
 
   if _backend_ready or _backend_error is not None:
     return
@@ -445,14 +312,14 @@ def _bootstrap_backend() -> None:
     from coords import to_stereo
     from classifier.storage import init_classifier_tiles
     from database import GRID_N, _tile_bbox as terrain_tile_bbox, seed_tiles, open_db
-    from seam_queue import enqueue_tile_and_neighbors
     from serve import load_no_data_cache, query_tiles_stereo
     from texture import (
       fetch_dataforsyningen_texture,
-      fetch_enhanced_texture,
       fetch_sentinel2_texture,
+      harmonize_texture_metatile,
       init_textures,
       read_texture,
+      split_texture_metatile,
       texture_ids_in,
       write_texture,
     )
@@ -461,10 +328,10 @@ def _bootstrap_backend() -> None:
 
     tile_count = db.execute("SELECT COUNT(*) FROM tiles").fetchone()[0]
     if tile_count == 0:
-      seed_depth = max(0, min(BOOTSTRAP_SEED_DEPTH, ENHANCE_DEPTH))
+      seed_depth = max(0, min(BOOTSTRAP_SEED_DEPTH, MAX_TILE_DEPTH))
       log_db.info(
         f"Empty tiles table — fast bootstrap seed to depth {seed_depth} "
-        f"(target ceiling depth {ENHANCE_DEPTH})..."
+        f"(target ceiling depth {MAX_TILE_DEPTH})..."
       )
       seed_tiles(db, max_depth=seed_depth)
       tile_count = db.execute("SELECT COUNT(*) FROM tiles").fetchone()[0]
@@ -476,10 +343,10 @@ def _bootstrap_backend() -> None:
     # Keep traversal ceiling metadata at full target depth, even if bootstrap
     # seeded fewer levels initially.
     cur_max = db.execute("SELECT value FROM metadata WHERE key = 'max_depth'").fetchone()
-    if cur_max is None or int(cur_max[0]) < ENHANCE_DEPTH:
-      db.execute("INSERT OR REPLACE INTO metadata (key, value) VALUES ('max_depth', ?)", (str(ENHANCE_DEPTH),))
+    if cur_max is None or int(cur_max[0]) < MAX_TILE_DEPTH:
+      db.execute("INSERT OR REPLACE INTO metadata (key, value) VALUES ('max_depth', ?)", (str(MAX_TILE_DEPTH),))
       db.commit()
-      log_db.info(f"Updated max_depth metadata to {ENHANCE_DEPTH}")
+      log_db.info(f"Updated max_depth metadata to {MAX_TILE_DEPTH}")
 
     try:
       no_data_count = load_no_data_cache(db)
@@ -500,15 +367,20 @@ def _bootstrap_backend() -> None:
     _write_texture = write_texture
     _fetch_sentinel2_texture = fetch_sentinel2_texture
     _fetch_dataforsyningen_texture = fetch_dataforsyningen_texture
-    _fetch_enhanced_texture = fetch_enhanced_texture
+    _split_texture_metatile = split_texture_metatile
+    _harmonize_texture_metatile = harmonize_texture_metatile
     _init_textures = init_textures
     _init_classifier_tiles = init_classifier_tiles
-    _enqueue_seam_jobs = enqueue_tile_and_neighbors
 
     _backend_ready = True
     log.info(f"Terrain backend ready. DB={DB_PATH}")
     log_db.info(f"No-data cache: {no_data_count} tiles")
-    _recover_comfy_jobs()
+
+    import grundkort
+    grundkort.ensure_grundkort_async()
+
+    from ingest_coastline import ensure_gtk50_blocks
+    threading.Thread(target=ensure_gtk50_blocks, daemon=True).start()
 
   except Exception as exc:  # pragma: no cover - runtime setup path
     _backend_error = (
@@ -516,19 +388,6 @@ def _bootstrap_backend() -> None:
       "Install dependencies into ./venv and ensure pipeline modules are present."
     )
     log.error(_backend_error)
-
-
-def _queue_seam_jobs_for_tile(db: sqlite3.Connection, tile_id: str) -> None:
-  if _enqueue_seam_jobs is None:
-    return
-  parsed = _parse_tile_id(tile_id)
-  if parsed is None or parsed[0] != ENHANCE_DEPTH:
-    return
-  try:
-    _enqueue_seam_jobs(db, tile_id, center_priority=120, neighbor_priority=80)
-    log_tex.info(f"[SEAM] queued blend jobs for {tile_id} and neighbors")
-  except Exception as exc:
-    log_tex.warning(f"[SEAM] failed to queue jobs for {tile_id}: {type(exc).__name__}: {exc}")
 
 
 def _terrain_unavailable_response(status: int = 503):
@@ -557,6 +416,18 @@ def _close_db(exc: BaseException | None) -> None:
   db = cast(sqlite3.Connection | None, g.pop("terrain_db", None))
   if db is not None:
     db.close()
+  assets_db = cast(sqlite3.Connection | None, g.pop("assets_db", None))
+  if assets_db is not None:
+    assets_db.close()
+
+
+def _get_assets_db() -> sqlite3.Connection:
+  db = cast(sqlite3.Connection | None, g.get("assets_db"))
+  if db is None:
+    from asset_catalog import connect
+    db = connect(ASSETS_DB_PATH)
+    g.assets_db = db
+  return db
 
 
 
@@ -598,6 +469,10 @@ def _is_ocean_tile(db, tile_id: str) -> bool:
   if row is None:
     return False
   source, hm_blob = row
+  from coastline import read_water_mask
+  official_water = read_water_mask(db, tile_id)
+  if official_water is not None:
+    return bool(_np.all(official_water))
   if source == 'no_data':
     return True
   if hm_blob is None:
@@ -621,6 +496,8 @@ def _repair_white_ocean_jpeg(db, tile_id: str, jpeg: bytes) -> bytes:
   if not row or row[0] is None:
     return jpeg
   hm = _np.frombuffer(zlib.decompress(row[0]), dtype=_np.float32).reshape(_GRID_N, _GRID_N)
+  from coastline import effective_heightmap
+  hm = effective_heightmap(db, tile_id, hm)
   repaired = repair_white_ocean(jpeg, hm)
   if repaired is not None:
     log_tex.info(f"[tex-repair] {tile_id}: filled white ocean pixels with OCEAN_RGB")
@@ -778,15 +655,114 @@ def _parse_tile_id(tile_id: str) -> tuple[int, int, int] | None:
 
 
 
-def _tile_priority(bbox: list[float], qx: float, qy: float, fwd_x: float, fwd_y: float) -> float:
+def _tile_priority(bbox: list[float], qx: float, qy: float,
+                   fwd_x: float, fwd_y: float,
+                   forward_scale: float = 2.0) -> float:
   tcx = (bbox[0] + bbox[2]) / 2
   tcy = (bbox[1] + bbox[3]) / 2
   dx, dy = tcx - qx, tcy - qy
   dist = math.sqrt(dx * dx + dy * dy)
   if dist <= 0:
     return 0.0
-  dot = (dx * fwd_x + dy * fwd_y) / dist
-  return dist / max(dot, 0.01)
+  along = dx * fwd_x + dy * fwd_y
+  across = dx * fwd_y - dy * fwd_x
+  scaled_along = along / max(1.0, forward_scale) if along > 0 else along
+  priority_dist = math.hypot(across, scaled_along)
+  dot = along / dist
+  return priority_dist / max(dot, 0.01)
+
+
+_METATILE_FINAL_SOURCE = "dataforsyningen_metatile4h2"
+_METATILE_UPGRADEABLE_SOURCES = {
+  "sentinel2_crop",
+  "ancestor_crop",
+  "ancestor_crop_ratelimit",
+  "dataforsyningen",
+  "dataforsyningen_metatile",
+  "dataforsyningen_metatile4",
+  "dataforsyningen_metatile4h",
+}
+
+
+def _texture_metatile_spec(tile_id: str) -> tuple[str, tuple, int, dict[str, tuple[int, int]]]:
+  """Return aligned fetch information for the 4x4 group containing tile_id."""
+  parsed = _parse_tile_id(tile_id)
+  if parsed is None:
+    raise ValueError(f"invalid tile id: {tile_id}")
+  depth, column, row = parsed
+  if depth == 0:
+    return tile_id, tuple(_tile_bbox(depth, column, row)), 256, {tile_id: (0, 0)}
+
+  depth_step = min(2, depth)
+  grid_size = 1 << depth_step
+  parent_depth = depth - depth_step
+  parent_column = column // grid_size
+  parent_row = row // grid_size
+  metatile_id = f"{parent_depth}-{parent_column}-{parent_row}"
+  children = {
+    f"{depth}-{parent_column * grid_size + column_bit}-{parent_row * grid_size + row_bit}":
+      (column_bit, row_bit)
+    for column_bit in range(grid_size)
+    for row_bit in range(grid_size)
+  }
+  return (
+    metatile_id,
+    tuple(_tile_bbox(parent_depth, parent_column, parent_row)),
+    256 * grid_size,
+    children,
+  )
+
+
+def _texture_metatile_lock(metatile_id: str) -> threading.Lock:
+  with _tex_metatile_locks_guard:
+    return _tex_metatile_locks.setdefault(metatile_id, threading.Lock())
+
+
+def _fetch_texture_metatile(tile_id: str) -> tuple[dict[str, bytes] | None, str | None]:
+  """Fetch and split one aligned metatile, without touching the database."""
+  _, bbox, resolution, child_offsets = _texture_metatile_spec(tile_id)
+  jpeg, fail_reason = _fetch_dataforsyningen_texture(
+    list(bbox), resolution=resolution, lossless=resolution > 256
+  )
+  if jpeg is None:
+    return None, fail_reason
+  if resolution == 256:
+    return {tile_id: jpeg}, None
+  jpeg = _harmonize_texture_metatile(
+    jpeg,
+    child_resolution=256,
+    grid_size=resolution // 256,
+  )
+  quadrants = _split_texture_metatile(
+    jpeg,
+    child_resolution=256,
+    grid_size=resolution // 256,
+  )
+  return {
+    child_id: quadrants[offset]
+    for child_id, offset in child_offsets.items()
+  }, None
+
+
+def _store_texture_metatile(db, children: dict[str, bytes]) -> tuple[set[str], set[str]]:
+  """Store valid metatile children without clobbering terminal/final states."""
+  from texture import is_no_coverage_fill_jpeg
+
+  written = set()
+  no_coverage = set()
+  for child_id, jpeg in children.items():
+    if is_no_coverage_fill_jpeg(jpeg):
+      no_coverage.add(child_id)
+      continue
+    existing = db.execute(
+      "SELECT source FROM textures WHERE tile_id = ?", (child_id,)
+    ).fetchone()
+    if existing and existing[0] not in _METATILE_UPGRADEABLE_SOURCES:
+      continue
+    jpeg = _repair_white_ocean_jpeg(db, child_id, jpeg)
+    _write_texture(db, child_id, jpeg, _METATILE_FINAL_SOURCE)
+    written.add(child_id)
+  return written, no_coverage
 
 
 
@@ -807,7 +783,7 @@ def _queue_texture_fetch(
         return
     _tex_fetching[tile_id] = (demand_client, demand_generation)
 
-  _RE_FETCHABLE = {"sentinel2_crop", "ancestor_crop"}
+  _RE_FETCHABLE = _METATILE_UPGRADEABLE_SOURCES - {"ancestor_crop_ratelimit"}
 
   def _worker() -> None:
     db = None
@@ -837,31 +813,55 @@ def _queue_texture_fetch(
           parent_id = f"{d - 1}-{c // 2}-{r // 2}"
           _seed_children_from_parent(db, parent_id)
 
-      # Step 2: try Dataforsyningen. If it succeeds, overwrite ancestor_crop.
-      log_tex.debug(f"[tex-worker] {tile_id}: fetching texture bbox={bbox}")
-      jpeg, fail_reason = _fetch_dataforsyningen_texture(list(bbox), resolution=256)
-      if _texture_demand_is_stale(demand_client, demand_generation):
-        log_tex.debug(f"[tex-worker] {tile_id}: demand changed during fetch, discarding")
-        return
-      if jpeg is not None:
-        log_tex.debug(f"[tex-worker] {tile_id}: got {len(jpeg)} bytes from dataforsyningen")
-        jpeg = _repair_white_ocean_jpeg(db, tile_id, jpeg)
-        _write_texture(db, tile_id, jpeg, "dataforsyningen")
-      elif fail_reason == 'no_coverage':
-        # Permanent — mark so we never retry automatically.
+      # Step 2: fetch the aligned grandparent extent once and split all exact
+      # children from the same reprojection. Concurrent sibling workers share
+      # this lock and observe the first worker's writes instead of refetching.
+      metatile_id, metatile_bbox, _, _ = _texture_metatile_spec(tile_id)
+      with _texture_metatile_lock(metatile_id):
         existing = db.execute(
-          "SELECT texture FROM textures WHERE tile_id = ?", (tile_id,)
+          "SELECT source FROM textures WHERE tile_id = ?", (tile_id,)
         ).fetchone()
-        _resolve_no_coverage(db, tile_id, existing[0] if existing else None, "[tex-worker]")
-      else:
-        # Transient (rate limit / timeout). Mark and enqueue for retry.
-        existing = db.execute(
-          "SELECT texture FROM textures WHERE tile_id = ?", (tile_id,)
-        ).fetchone()
-        if existing and existing[0]:
-          _write_texture(db, tile_id, existing[0], "ancestor_crop_ratelimit")
-        _tex_retry_enqueue(tile_id, bbox, attempt=0)
-        log_tex.debug(f"[tex-worker] {tile_id}: transient → ancestor_crop_ratelimit, queued for retry")
+        if existing and existing[0] == _METATILE_FINAL_SOURCE:
+          log_tex.debug(f"[tex-worker] {tile_id}: metatile sibling already filled it")
+          return
+
+        log_tex.debug(
+          f"[tex-worker] {tile_id}: fetching metatile {metatile_id} bbox={metatile_bbox}"
+        )
+        children, fail_reason = _fetch_texture_metatile(tile_id)
+        if _texture_demand_is_stale(demand_client, demand_generation):
+          log_tex.debug(f"[tex-worker] {tile_id}: demand changed during fetch, discarding")
+          return
+        if children is not None:
+          written, no_coverage = _store_texture_metatile(db, children)
+          log_tex.debug(
+            f"[tex-worker] {tile_id}: metatile wrote {len(written)} children"
+          )
+          if tile_id in no_coverage:
+            existing = db.execute(
+              "SELECT texture FROM textures WHERE tile_id = ?", (tile_id,)
+            ).fetchone()
+            _resolve_no_coverage(
+              db, tile_id, existing[0] if existing else None, "[tex-worker]"
+            )
+        elif fail_reason == 'no_coverage':
+          # Permanent for the requested child. Sibling requests can still try
+          # their group if provider coverage behavior changes at the boundary.
+          existing = db.execute(
+            "SELECT texture FROM textures WHERE tile_id = ?", (tile_id,)
+          ).fetchone()
+          _resolve_no_coverage(db, tile_id, existing[0] if existing else None, "[tex-worker]")
+        else:
+          # Transient (rate limit / timeout). Mark and enqueue for retry.
+          existing = db.execute(
+            "SELECT texture FROM textures WHERE tile_id = ?", (tile_id,)
+          ).fetchone()
+          if existing and existing[0]:
+            _write_texture(db, tile_id, existing[0], "ancestor_crop_ratelimit")
+          _tex_retry_enqueue(tile_id, bbox, attempt=0)
+          log_tex.debug(
+            f"[tex-worker] {tile_id}: transient → ancestor_crop_ratelimit, queued for retry"
+          )
     except Exception as exc:  # pragma: no cover - runtime fetch path
       log_tex.error(f"[tex-worker] {tile_id} FAILED: {type(exc).__name__}: {exc}")
     finally:
@@ -876,6 +876,18 @@ def _queue_texture_fetch(
 
 _api_tiles_state: dict[str, str | None] = {"last_result": None}
 _last_camera: dict[str, float] | None = None  # last /api/tiles pose, feeds /api/heatmap
+_BUILDING_QUERY_RANGE_M = 25000.0
+
+
+def _buildings_for_tile_query(qx: float, qy: float, ox: float, oy: float):
+  """Resolve scene buildings as part of the terrain-tile transaction."""
+  from asset_catalog import color_buildings_from_textures, query_buildings
+
+  buildings = query_buildings(
+    _get_assets_db(), qx, qy, _BUILDING_QUERY_RANGE_M, ox, oy
+  )
+  color_buildings_from_textures(_get_db(), buildings, ox, oy)
+  return buildings
 
 
 @app.get("/api/tiles")
@@ -885,7 +897,7 @@ def api_tiles():
     return unavailable
 
   error = _arg_float("error", 0.0005)
-  max_depth = min(_arg_int("maxDepth", ENHANCE_DEPTH), ENHANCE_DEPTH)
+  max_depth = min(_arg_int("maxDepth", MAX_TILE_DEPTH), MAX_TILE_DEPTH)
   max_range = _arg_float("range", 16000.0)
 
   if "sx" in request.args and "sy" in request.args:
@@ -902,10 +914,13 @@ def api_tiles():
   oy = _arg_float("oy", qy)
   alt = _arg_float("alt", 0.0)
   heading = _arg_float("heading", 0.0)
+  # Preview passes flood closest-first; full passes fetch by view priority.
+  preview = _arg_int("preview", 0) == 1
+  has_heading = request.args.get("heading") is not None
 
   global _last_camera
   _last_camera = {"qx": qx, "qy": qy, "alt": alt, "heading": heading,
-                  "maxDepth": max_depth}
+                  "maxDepth": max_depth, "range": max_range}
 
   try:
     tiles, missing = _query_tiles_stereo(
@@ -916,6 +931,8 @@ def api_tiles():
       max_depth=max_depth,
       max_range=max_range,
       altitude=alt,
+      heading=heading if has_heading else None,
+      preview=preview,
       log=lambda msg: log.debug(f"[/api/tiles] {msg}"),
     )
   except Exception as exc:
@@ -1013,15 +1030,28 @@ def api_tiles():
 
       def _bg_cog_fetch(missing_list):
         global _cog_fetched_total, _cog_skipped_total
+        db = None
         try:
           from concurrent.futures import ThreadPoolExecutor, as_completed
           from ingest import _read_cog_heightmap, _resample_from_parent
           from database import CONFIDENCE, write_tile
-          from serve import mark_no_data
+          from serve import (
+            mark_no_data, _UPGRADEABLE_SOURCES, _cache_coastline,
+            _mark_official_ocean,
+          )
 
           db = sqlite3.connect(str(DB_PATH), check_same_thread=False)
           db.execute("PRAGMA journal_mode=WAL")
           log_cog.info(f"Starting {len(missing_list)} tiles from S3... (session: {_cog_fetched_total} fetched, {_cog_skipped_total} skipped)")
+
+          upgrade_ids = set()
+          bbox_by_id = {tid: bbox for tid, bbox in missing_list}
+          for tid, _ in missing_list:
+            row = db.execute(
+              "SELECT source FROM tiles WHERE tile_id = ?", (tid,)
+            ).fetchone()
+            if row and row[0] in _UPGRADEABLE_SOURCES:
+              upgrade_ids.add(tid)
 
           def _worker(tile_id, bbox):
             log_cog.debug(f"[cog-worker] {tile_id}: reading bbox=[{bbox[0]:.0f},{bbox[1]:.0f},{bbox[2]:.0f},{bbox[3]:.0f}]")
@@ -1030,22 +1060,36 @@ def api_tiles():
           fetched, no_data_count, parent_resampled_count = 0, 0, 0
           # Collect tiles that COG couldn't resolve for a second-pass parent resample
           cog_failed = []
-          with ThreadPoolExecutor(max_workers=6) as pool:
+          with ThreadPoolExecutor(max_workers=_COG_TILE_WORKERS) as pool:
             futs = {pool.submit(_worker, tid, bbox): tid for tid, bbox in missing_list}
             for fut in as_completed(futs):
               tid = futs[fut]
               try:
                 tile_id, (data, src_name) = fut.result()
                 if data is None:
+                  water = _cache_coastline(db, tile_id, bbox_by_id[tile_id])
+                  if water is not None and _np.all(water):
+                    _mark_official_ocean(db, tile_id)
+                    fetched += 1
+                    _cog_fetched_total += 1
+                    continue
                   cog_failed.append(tile_id)
                   continue
                 conf = CONFIDENCE.get(src_name, CONFIDENCE['arcticdem'])
                 cm = _np.where(_np.isnan(data), _np.uint8(0), _np.uint8(conf))
                 hm = _np.where(_np.isnan(data), 0.0, data).astype(_np.float32)
-                write_tile(db, tile_id, hm, cm, src_name, reconcile=False)
+                write_tile(
+                  db, tile_id, hm, cm, src_name, reconcile=False,
+                  allow_overwrite=tile_id in upgrade_ids,
+                )
+                _cache_coastline(db, tile_id, bbox_by_id[tile_id])
                 fetched += 1
                 _cog_fetched_total += 1
-              except Exception:
+              except Exception as exc:
+                log_cog.warning(
+                  f"  [COG FETCH] {tid}: failed after source read: "
+                  f"{type(exc).__name__}: {exc}"
+                )
                 cog_failed.append(tid)
               finally:
                 _cog_fetching_tiles.discard(tid)
@@ -1065,7 +1109,11 @@ def api_tiles():
                 hm = _np.where(_np.isnan(data), 0.0, data).astype(_np.float32)
                 from database import TileClobberError
                 try:
-                  write_tile(db, tile_id, hm, cm, source_name, reconcile=False)
+                  write_tile(
+                    db, tile_id, hm, cm, source_name, reconcile=False,
+                    allow_overwrite=tile_id in upgrade_ids,
+                  )
+                  _cache_coastline(db, tile_id, bbox_by_id[tile_id])
                   parent_resampled_count += 1
                   _cog_fetched_total += 1
                   log_cog.info(f"  [PARENT RESAMPLE] {tile_id}: filled from parent")
@@ -1082,8 +1130,9 @@ def api_tiles():
               no_data_count += 1
 
           log_cog.info(f"Done: {fetched} fetched, {parent_resampled_count} parent-resampled, {no_data_count} no data (session totals: {_cog_fetched_total} fetched, {_cog_skipped_total} skipped)")
-          db.close()
         finally:
+          if db is not None:
+            db.close()
           _cog_fetching_tiles.clear()
           _cog_fetch_lock.release()
 
@@ -1093,6 +1142,16 @@ def api_tiles():
       threading.Thread(target=_bg_cog_fetch, args=(deduped,), daemon=True).start()
 
   downloading = list(_cog_fetching_tiles)
+
+  try:
+    buildings = _buildings_for_tile_query(qx, qy, ox, oy)
+  except Exception as exc:
+    # Terrain delivery remains usable if the optional asset catalog is being
+    # rebuilt. Omit the field so the client preserves its current mesh.
+    buildings = None
+    log.warning(
+      f"[/api/tiles] building query FAILED: {type(exc).__name__}: {exc}"
+    )
 
   return jsonify(
     {
@@ -1108,8 +1167,73 @@ def api_tiles():
       "texQueued": len(tex_fetching),
       "texRetryQueue": len(_tex_retry_queue),
       "texStatusCounts": tex_status_counts,
+      "buildings": buildings,
+      "buildingCount": len(buildings) if buildings is not None else None,
     }
   )
+
+
+@app.get("/api/assets")
+def api_assets():
+  """Viewer-facing startup assets, read by Flask from the shared catalog."""
+  from asset_catalog import get_assets_response
+  return jsonify(get_assets_response(_get_assets_db()))
+
+
+@app.post("/api/vehicle_state")
+def api_vehicle_state():
+  """Persist vehicle state without exposing the asset service to the viewer."""
+  from asset_catalog import save_vehicle_state
+  payload, status = save_vehicle_state(_get_assets_db(), request.get_json(silent=True) or {})
+  return jsonify(payload), status
+
+
+@app.get("/api/roads")
+def api_roads():
+  """Compatibility endpoint; road rendering now comes from painted textures."""
+  unavailable = _terrain_unavailable_response()
+  if unavailable is not None:
+    return unavailable
+  if "sx" in request.args and "sy" in request.args:
+    qx = _arg_float("sx", 0.0)
+    qy = _arg_float("sy", 0.0)
+  else:
+    lat = _arg_float("lat", 64.175)
+    lon = _arg_float("lon", -51.7388)
+    qx, qy = _to_stereo(lat, lon)
+  max_range = _arg_float("range", 20000.0)
+  ox = _arg_float("ox", qx)
+  oy = _arg_float("oy", qy)
+
+  from asset_catalog import query_roads
+  bbox = (qx - max_range, qy - max_range, qx + max_range, qy + max_range)
+  rows = query_roads(_get_assets_db(), bbox)
+  roads = [{
+    **road,
+    "path": [[x - ox, y - oy, z] for x, y, z in road["path"]],
+  } for road in rows]
+  log.debug(f"[/api/roads] {len(roads)} polylines near qx={qx:.0f} qy={qy:.0f} range={max_range:.0f}")
+  return jsonify({"roads": roads, "count": len(roads), "qx": qx, "qy": qy})
+
+
+def _painted_texture_response(
+  jpeg: bytes,
+  bbox: tuple[float, float, float, float],
+  *,
+  headers: dict[str, str],
+  road_debug: bool = False,
+) -> Response:
+  """Apply terrain-coupled catalog overlays to a clean cached texture copy."""
+  from asset_catalog import paint_roads
+  painted, road_count = paint_roads(jpeg, bbox, ASSETS_DB_PATH, debug=road_debug)
+  response_headers = dict(headers)
+  response_headers["X-Road-Overlay-Count"] = str(road_count)
+  response_headers["X-Road-Debug"] = "1" if road_debug else "0"
+  if road_count:
+    # Asset edits must be visible on the next texture request; the canonical
+    # imagery remains cached in terrain.db and is never painted in place.
+    response_headers["Cache-Control"] = "no-cache"
+  return Response(painted, mimetype="image/jpeg", headers=response_headers)
 
 
 @app.get("/api/texture/<tile_id>.jpg")
@@ -1123,6 +1247,14 @@ def api_texture(tile_id: str):
 
   log_tex.debug(f"[/api/texture] tile_id={tile_id}")
 
+  parsed = _parse_tile_id(tile_id)
+  if parsed is None:
+    log_tex.warning(f"[/api/texture] {tile_id}: invalid tile_id format")
+    return Response(b"", status=400)
+  d, c, r = parsed
+  texture_bbox = _tile_bbox(d, c, r)
+  road_debug = request.args.get("roadDebug") == "1"
+
   db = _get_db()
   row = db.execute(
     "SELECT texture, source FROM textures WHERE tile_id = ?",
@@ -1131,15 +1263,24 @@ def api_texture(tile_id: str):
 
   cached_crop = None
   # Sources that are temporary placeholders — serve them but let client re-fetch
-  _TEX_TEMPORARY = {"sentinel2_crop", "ancestor_crop", "ancestor_crop_ratelimit"}
+  _TEX_TEMPORARY = {
+    "sentinel2_crop",
+    "ancestor_crop",
+    "ancestor_crop_ratelimit",
+    "dataforsyningen",  # legacy independent fetch; upgrade to aligned metatile
+    "dataforsyningen_metatile",  # legacy 2x2 group; upgrade to aligned 4x4
+    "dataforsyningen_metatile4",  # legacy 4x4 group without harmonization
+    "dataforsyningen_metatile4h",  # legacy conservative harmonization
+  }
   if row is not None:
     cached, source = row[0], row[1]
     log_tex.debug(f"[/api/texture] {tile_id}: cache HIT source={source} size={len(cached)} bytes")
     if source not in _TEX_TEMPORARY:
       is_crop = source == "ancestor_crop_nodata"
-      return Response(
+      return _painted_texture_response(
         cached,
-        mimetype="image/jpeg",
+        texture_bbox,
+        road_debug=road_debug,
         headers={
           "Cache-Control": "public, max-age=86400" if not is_crop else "public, max-age=3600",
           "X-Tex-Source": source,
@@ -1149,12 +1290,6 @@ def api_texture(tile_id: str):
         },
       )
     cached_crop = cached
-
-  parsed = _parse_tile_id(tile_id)
-  if parsed is None:
-    log_tex.warning(f"[/api/texture] {tile_id}: invalid tile_id format")
-    return Response(b"", status=400)
-  d, c, r = parsed
 
   if row is None:
     log_tex.debug(f"[/api/texture] {tile_id}: cache MISS, queuing fetch (depth={d} col={c} row={r})")
@@ -1166,15 +1301,17 @@ def api_texture(tile_id: str):
     _queue_texture_fetch(tile_id, _tile_bbox(d, c, r), demand_generation, demand_client)
 
   if cached_crop is not None:
-    return Response(
+    return _painted_texture_response(
       _repair_white_ocean_jpeg(db, tile_id, cached_crop),
-      mimetype="image/jpeg",
+      texture_bbox,
+      road_debug=road_debug,
       headers={
         "Cache-Control": "no-store",
         "X-Tex-Ancestor": "precomputed_crop",
         "X-Tex-Status": "ancestor_fallback",
         "X-Tex-Quality": "ancestor_crop",
         "X-Tex-Temporary": "1",
+        "X-Tex-Source": source or "",
       },
     )
 
@@ -1223,9 +1360,10 @@ def api_texture(tile_id: str):
   buf = io.BytesIO()
   cropped.save(buf, format="JPEG", quality=85)
 
-  return Response(
+  return _painted_texture_response(
     _repair_white_ocean_jpeg(db, tile_id, buf.getvalue()),
-    mimetype="image/jpeg",
+    texture_bbox,
+    road_debug=road_debug,
     headers={
       "Cache-Control": "no-store",
       "X-Tex-Ancestor": ancestor_id,
@@ -1338,49 +1476,68 @@ def api_classifier_tile(tile_id: str):
   import io as _io
 
   from PIL import Image as _Image
+  from classifier.rendering import smooth_effective_water_mask
   from classifier.storage import colorize_class_map, decode_class_map
+  from coastline import read_water_mask
 
   child_depth, child_col, child_row = parsed
   depth, col, row = parsed
   found = None
   db = _get_db()
-  while depth >= 0:
+  effective_water = read_water_mask(db, tile_id)
+  water_source_row = db.execute(
+    "SELECT source FROM coastline_masks WHERE tile_id = ?", (tile_id,)
+  ).fetchone() if effective_water is not None else None
+  while found is None:
     candidate_id = f"{depth}-{col}-{row}"
     found = db.execute(
       "SELECT class_schema, width, height, class_map, source "
       "FROM classifier_tiles WHERE tile_id = ?",
       (candidate_id,),
     ).fetchone()
-    if found is not None:
-      break
-    if depth == 0:
-      return Response(
-        b"", status=404,
-        headers={"Cache-Control": "no-store", "X-Classifier-Status": "missing"},
-      )
-    depth -= 1
-    col //= 2
-    row //= 2
+    if found is None:
+      if depth == 0:
+        if effective_water is not None:
+          break
+        return Response(
+          b"", status=404,
+          headers={"Cache-Control": "no-store", "X-Classifier-Status": "missing"},
+        )
+      depth -= 1
+      col //= 2
+      row //= 2
 
-  class_schema, width, height, class_blob, source = found
   try:
-    labels = decode_class_map(class_blob, width, height)
-    label_image = _Image.fromarray(labels, mode="L")
-    if depth != child_depth:
-      levels = child_depth - depth
-      divisions = 1 << levels
-      sub_col = child_col % divisions
-      sub_row = child_row % divisions
-      x0 = sub_col * width // divisions
-      x1 = (sub_col + 1) * width // divisions
-      # Class maps are image-oriented: row zero is north.
-      y0 = (divisions - 1 - sub_row) * height // divisions
-      y1 = (divisions - sub_row) * height // divisions
-      label_image = label_image.crop((x0, y0, x1, y1))
-    label_image = label_image.resize(
-      (resolution, resolution), _Image.Resampling.NEAREST,
-    )
-    rgb = colorize_class_map(_np.asarray(label_image), class_schema)
+    if found is None:
+      class_schema, source = "effective_water_only", "coastline_masks"
+      rgb = _np.full((resolution, resolution, 3), 42, dtype=_np.uint8)
+    else:
+      class_schema, width, height, class_blob, source = found
+      labels = decode_class_map(class_blob, width, height)
+      label_image = _Image.fromarray(labels, mode="L")
+      if depth != child_depth:
+        levels = child_depth - depth
+        divisions = 1 << levels
+        sub_col = child_col % divisions
+        sub_row = child_row % divisions
+        x0 = sub_col * width // divisions
+        x1 = (sub_col + 1) * width // divisions
+        # Class maps are image-oriented: row zero is north.
+        y0 = (divisions - 1 - sub_row) * height // divisions
+        y1 = (divisions - sub_row) * height // divisions
+        label_image = label_image.crop((x0, y0, x1, y1))
+      label_image = label_image.resize(
+        (resolution, resolution), _Image.Resampling.NEAREST,
+      )
+      rgb = colorize_class_map(_np.asarray(label_image), class_schema)
+    if effective_water is not None:
+      # Reconstruct the terrain-grid boundary at the output resolution before
+      # painting it. The midpoint threshold preserves a binary authoritative
+      # mask while avoiding visibly enlarged 65x65 grid steps.
+      render_water = smooth_effective_water_mask(
+        effective_water, resolution, resolution,
+      )
+      rgb[render_water] = (255, 42, 161)
   except (TypeError, ValueError, zlib.error):
     return Response(
       b"", status=500,
@@ -1389,12 +1546,14 @@ def api_classifier_tile(tile_id: str):
   buf = _io.BytesIO()
   _Image.fromarray(rgb, mode="RGB").save(buf, format="PNG")
   headers = {
-    "Cache-Control": "public, max-age=86400",
+    "Cache-Control": "no-store",
     "X-Classifier-Status": "ready",
     "X-Classifier-Schema": str(class_schema),
     "X-Classifier-Source": str(source),
   }
-  if depth != child_depth:
+  if effective_water is not None and water_source_row is not None:
+    headers["X-Water-Mask-Source"] = str(water_source_row[0])
+  if found is not None and depth != child_depth:
     headers["X-Classifier-Ancestor"] = f"{depth}-{col}-{row}"
   return Response(buf.getvalue(), mimetype="image/png", headers=headers)
 
@@ -1407,6 +1566,7 @@ def api_heatmap():
   import numpy as np
   from database import CONFIDENCE, GRID_N, _decompress_uint8
   from tiles import build_lod_tree, get_leaves
+  from serve import bbox_in_view_oval
 
   cam = _last_camera
   if cam is None:
@@ -1416,16 +1576,26 @@ def api_heatmap():
   qy = _arg_float("qy", cam["qy"])
   alt = _arg_float("alt", cam["alt"])
   heading = _arg_float("heading", cam["heading"])
+  max_range = _arg_float("range", cam.get("range", 20000.0))
   # This is a diagnostic view of the terrain traversal, not a speculative
   # quadtree. Never advertise leaves deeper than the renderer can request.
   max_depth = min(
     _arg_int("maxDepth", int(cam["maxDepth"])),
-    ENHANCE_DEPTH,
+    MAX_TILE_DEPTH,
   )
   lod_factor = _arg_float("lod", 2.0)
 
   root = build_lod_tree(qx, qy, max_depth=max_depth, lod_factor=lod_factor)
-  leaves = get_leaves(root)
+  # The heatmap visualizes the same local demand region as /api/tiles. Do not
+  # expose the coarse leaves covering the rest of Greenland's root quadtree.
+  leaves = [
+    leaf for leaf in get_leaves(root)
+    if bbox_in_view_oval(
+      qx, qy, heading,
+      [leaf.center[0], leaf.center[1], leaf.center[0], leaf.center[1]],
+      max_range,
+    )
+  ]
 
   fwd_x = -math.sin(heading) if heading else 0.0
   fwd_y = math.cos(heading) if heading else 1.0
@@ -1484,7 +1654,10 @@ def api_heatmap():
 
   return jsonify({
     "timestamp": time.time(),
-    "camera": {"qx": qx, "qy": qy, "alt": alt, "heading": heading},
+    "camera": {
+      "qx": qx, "qy": qy, "alt": alt, "heading": heading,
+      "range": max_range,
+    },
     "tiles": tiles,
   })
 
@@ -1562,248 +1735,6 @@ def api_coverage_index():
   ]
   return jsonify({"tiles": tiles})
 
-
-@app.post("/api/texture/<tile_id>/enhance")
-def api_texture_enhance(tile_id: str):
-  unavailable = _terrain_unavailable_response()
-  if unavailable is not None:
-    return unavailable
-
-  # Parse optional prompt overrides from JSON body
-  positive_prompt = None
-  negative_prompt = None
-  if request.is_json:
-    body = request.get_json(silent=True) or {}
-    positive_prompt = body.get("positive_prompt") or None
-    negative_prompt = body.get("negative_prompt") or None
-
-  db = _get_db()
-  row = db.execute(
-    "SELECT texture, source FROM textures WHERE tile_id = ?",
-    (tile_id,),
-  ).fetchone()
-  if row is None:
-    return Response(b"", status=404)
-
-  existing_jpeg, source = row[0], row[1]
-  # Already enhanced — return cached result
-  if source in ("dataforsyningen_enhanced", "sentinel2_enhanced", "upscaled"):
-    return Response(
-      existing_jpeg,
-      mimetype="image/jpeg",
-      headers={
-        "X-Tex-Source": source,
-        "X-Tex-Status": "ready",
-        "X-Tex-Quality": "full",
-        "X-Tex-Temporary": "0",
-      },
-    )
-
-  if not ENHANCE_ENABLED:
-    log_tex.info(f"[ENHANCE] {tile_id}: rejected — SUPIR upscaling disabled (ENHANCE_ENABLED=False)")
-    return Response(b"", status=503, headers={"X-Tex-Status": "enhance_disabled"})
-
-  parsed = _parse_tile_id(tile_id)
-  if parsed is None:
-    return Response(b"", status=400)
-  d, c, r = parsed
-
-  # Only upscale target depth tiles
-  if d != ENHANCE_DEPTH:
-    log_tex.info(f"[ENHANCE] {tile_id}: rejected — depth {d} != target {ENHANCE_DEPTH}")
-    return Response(b"", status=204, headers={"X-Tex-Status": "wrong_depth"})
-
-  # Already in flight or queue full?
-  with _enhancing_lock:
-    if tile_id in _enhancing:
-      return Response(
-        b"",
-        status=202,
-        headers={"X-Tex-Status": "enhancing"},
-      )
-    if len(_enhancing) >= ENHANCE_MAX_QUEUED:
-      return Response(
-        b"",
-        status=429,
-        headers={"X-Tex-Status": "queue_full"},
-      )
-
-  if source != "dataforsyningen":
-    log_tex.info(f"[ENHANCE] {tile_id}: rejected — source is '{source}', need 'dataforsyningen'")
-    return Response(b"", status=204, headers={"X-Tex-Status": f"wrong_source_{source}"})
-
-  bbox = _tile_bbox(d, c, r)
-
-  # Fire off background upscale — return 202 immediately
-  with _enhancing_lock:
-    _enhancing.add(tile_id)
-
-  def _enhance_worker():
-    wdb = None
-    try:
-      wdb = sqlite3.connect(str(DB_PATH), check_same_thread=False)
-      wdb.execute("PRAGMA journal_mode=WAL")
-      if _init_textures is not None:
-        _init_textures(wdb)
-      enhanced, esrc = _fetch_enhanced_texture(
-        list(bbox), resolution=256, s2_jpeg=existing_jpeg,
-        tile_id=tile_id,
-        positive_prompt=positive_prompt,
-        negative_prompt=negative_prompt,
-      )
-      if enhanced is not None:
-        _write_texture(wdb, tile_id, enhanced, esrc)
-        log_tex.info(f"[ENHANCE] {tile_id}: done, wrote {len(enhanced)} bytes as {esrc}")
-      else:
-        log_tex.warning(f"[ENHANCE] {tile_id}: upscaler returned None")
-    except Exception as e:
-      log_tex.error(f"[ENHANCE] {tile_id} failed: {type(e).__name__}: {e}")
-    finally:
-      if wdb is not None:
-        wdb.close()
-      with _enhancing_lock:
-        _enhancing.discard(tile_id)
-
-  _enhance_pool.submit(_enhance_worker)
-  log_tex.info(f"[ENHANCE] {tile_id}: queued for background upscale")
-  return Response(
-    b"",
-    status=202,
-    headers={"X-Tex-Status": "enhancing"},
-  )
-
-
-@app.post("/api/texture/<tile_id>/discard_enhanced")
-def api_texture_discard_enhanced(tile_id: str):
-  """Discard an enhanced texture, its seam job, and re-queue neighbor seams."""
-  unavailable = _terrain_unavailable_response()
-  if unavailable is not None:
-    return unavailable
-
-  db = _get_db()
-  row = db.execute(
-    "SELECT source FROM textures WHERE tile_id = ?", (tile_id,)
-  ).fetchone()
-  if row is None:
-    return jsonify({"error": "no texture found"}), 404
-
-  source = row[0]
-  if source not in ("dataforsyningen_enhanced", "sentinel2_enhanced", "upscaled"):
-    return jsonify({"error": f"not enhanced (source={source})"}), 400
-
-  db.execute("DELETE FROM textures WHERE tile_id = ?", (tile_id,))
-  db.commit()
-
-  log_tex.info(f"[DISCARD] {tile_id}: discarded {source}")
-  return jsonify({"ok": True, "discarded": source})
-
-
-@app.get("/api/enhance/status")
-def api_enhance_status():
-  unavailable = _terrain_unavailable_response()
-  if unavailable is not None:
-    return unavailable
-  db = _get_db()
-  # Check tiles table exists (may not if bootstrap is still running)
-  has_tiles = db.execute(
-    "SELECT name FROM sqlite_master WHERE type='table' AND name='tiles'"
-  ).fetchone()
-  if not has_tiles:
-    return jsonify({"error": "tiles table not ready yet"}), 503
-  # Seeding progress at target depth (tile rows exist by design; this tracks DEM population).
-  seed_total = db.execute(
-    "SELECT COUNT(*) FROM tiles WHERE depth = ?",
-    (ENHANCE_DEPTH,),
-  ).fetchone()[0]
-  seed_populated = db.execute(
-    "SELECT COUNT(*) FROM tiles WHERE depth = ? AND source <> 'empty'",
-    (ENHANCE_DEPTH,),
-  ).fetchone()[0]
-  seed_with_heightmap = db.execute(
-    "SELECT COUNT(*) FROM tiles WHERE depth = ? AND heightmap IS NOT NULL",
-    (ENHANCE_DEPTH,),
-  ).fetchone()[0]
-  seed_progress_pct = (
-    round((float(seed_populated) * 100.0) / float(seed_total), 2)
-    if seed_total > 0
-    else 0.0
-  )
-
-  # Total target-depth tiles with heightmaps (eligible for enhance)
-  total = db.execute(
-    "SELECT COUNT(*) FROM tiles WHERE depth = ? AND heightmap IS NOT NULL",
-    (ENHANCE_DEPTH,),
-  ).fetchone()[0]
-  # How many already have enhanced textures
-  done = db.execute(
-    """SELECT COUNT(*)
-       FROM textures tx
-       JOIN tiles t ON t.tile_id = tx.tile_id
-       WHERE t.depth = ?
-         AND tx.source IN ('dataforsyningen_enhanced', 'sentinel2_enhanced', 'upscaled')""",
-    (ENHANCE_DEPTH,),
-  ).fetchone()[0]
-  # How many have base sentinel2 textures (could be enhanced)
-  eligible = db.execute(
-    """SELECT COUNT(*) FROM textures t
-       JOIN tiles tl ON t.tile_id = tl.tile_id
-       WHERE tl.depth = ? AND tl.heightmap IS NOT NULL
-         AND t.source IN ('dataforsyningen', 'sentinel2')"""
-    ,
-    (ENHANCE_DEPTH,),
-  ).fetchone()[0]
-  with _enhancing_lock:
-    in_progress = list(_enhancing)
-  return jsonify({
-    "total": total,
-    "eligible": eligible,
-    "done": done,
-    "seed_total": seed_total,
-    "seed_populated": seed_populated,
-    "seed_with_heightmap": seed_with_heightmap,
-    "seed_progress_pct": seed_progress_pct,
-    "in_progress": len(in_progress),
-    "in_progress_tiles": in_progress,
-    "max_queued": ENHANCE_MAX_QUEUED,
-  })
-
-
-@app.get("/api/seam_status")
-def api_seam_status():
-  db = _get_db()
-  has_table = db.execute(
-    "SELECT name FROM sqlite_master WHERE type='table' AND name='seam_jobs'"
-  ).fetchone()
-  if not has_table:
-    return jsonify({"pending": [], "running": [], "done_recent": [], "failed": []})
-  pending = [r[0] for r in db.execute(
-    "SELECT tile_id FROM seam_jobs WHERE status = 'pending' ORDER BY priority DESC"
-  ).fetchall()]
-  running = [r[0] for r in db.execute(
-    "SELECT tile_id FROM seam_jobs WHERE status = 'running'"
-  ).fetchall()]
-  # Recently finished (last 30 seconds) so the UI can flash them briefly
-  done_recent = [r[0] for r in db.execute(
-    "SELECT tile_id FROM seam_jobs WHERE status = 'done' AND updated_at > datetime('now', '-30 seconds')"
-  ).fetchall()]
-  failed = [r[0] for r in db.execute(
-    "SELECT tile_id FROM seam_jobs WHERE status = 'failed'"
-  ).fetchall()]
-  return jsonify({
-    "pending": pending,
-    "running": running,
-    "done_recent": done_recent,
-    "failed": failed,
-  })
-
-
-@app.post("/api/seam_retry_failed")
-def api_seam_retry_failed():
-  from seam_queue import retry_failed
-  db = _get_db()
-  count = retry_failed(db)
-  log.info(f"[SEAM] retried {count} failed jobs")
-  return jsonify({"retried": count})
 
 
 @app.post("/api/tile_inspect")
@@ -2122,6 +2053,9 @@ def static_files(path: str):
 
 if __name__ == "__main__":
   logging.getLogger("werkzeug").setLevel(logging.WARNING)
+  host = os.environ.get("FLASK_HOST", "127.0.0.1")
+  port = int(os.environ.get("FLASK_PORT", "5180"))
+  _require_available_port(host, port)
   if DIST_DIR.exists():
     log.info(f"Serving static dist from: {DIST_DIR}")
   else:
@@ -2131,8 +2065,6 @@ if __name__ == "__main__":
   _bootstrap_backend()
   if not _backend_ready:
     raise SystemExit(f"Backend init failed: {_backend_error}")
-  host = os.environ.get("FLASK_HOST", "127.0.0.1")
-  port = int(os.environ.get("FLASK_PORT", "5180"))
   ws_port = int(os.environ.get("WS_PORT", "5181"))
   ws_thread = threading.Thread(target=_start_ws_server, args=(host, ws_port), daemon=True)
   ws_thread.start()

@@ -37,6 +37,11 @@ export class CloudShadowAerialPerspectiveNode extends AerialPerspectiveNode {
 
   constructor(atmosphereContext, colorNode, depthNode, normalNode, cloudShadow) {
     super(atmosphereContext, colorNode, depthNode, normalNode);
+    // A null normal buffer selects the continuous ellipsoid-normal fallback
+    // in setup(). Keep surface illumination enabled so terrain still receives
+    // direct sun plus spectral sky/ambient light without cross-LOD
+    // seams from independently computed tile normals.
+    this.lighting = true;
     this.cloudShadow = cloudShadow;
   }
 

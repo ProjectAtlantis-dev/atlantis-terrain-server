@@ -5,7 +5,10 @@ ArcticDEM v4.1 10m mosaic from S3, Copernicus 30m fallback.
 """
 from __future__ import annotations
 
+from contextlib import contextmanager
 import math
+import os
+import threading
 import numpy as np
 import rasterio
 from rasterio.crs import CRS
@@ -19,6 +22,21 @@ from colored_log import get_logger
 from database import GRID_N
 
 log_cog = get_logger("terrain.cog")
+
+# GDAL can hold several descriptors per remote COG. Bound dataset lifetimes
+# process-wide while still allowing both tile-level and multi-COG parallelism.
+try:
+    _REMOTE_COG_OPEN_LIMIT = max(1, int(os.environ.get("COG_OPEN_LIMIT", "12")))
+except ValueError:
+    _REMOTE_COG_OPEN_LIMIT = 12
+_remote_cog_open_slots = threading.BoundedSemaphore(_REMOTE_COG_OPEN_LIMIT)
+
+
+@contextmanager
+def _open_remote_cog(url):
+    with _remote_cog_open_slots:
+        with rasterio.open(url) as source:
+            yield source
 
 # ---------------------------------------------------------------------------
 # EGM2008 geoid correction for ArcticDEM (ellipsoidal → orthometric heights)
@@ -139,7 +157,7 @@ _MAX_ARCTIC_TILES = 16       # Don't attempt more than this many ArcticDEM COGs 
 _ARCTIC_COG_WORKERS = 6      # Parallel HTTP readers for ArcticDEM
 
 
-def _read_cog_heightmap(bbox, resolution=GRID_N):
+def _read_cog_heightmap(bbox, resolution=GRID_N, arctic_workers=_ARCTIC_COG_WORKERS):
     """Read heightmap from ArcticDEM and Copernicus, compare, pick best.
 
     ArcticDEM COG tiles are fetched in parallel (up to _ARCTIC_COG_WORKERS).
@@ -159,13 +177,17 @@ def _read_cog_heightmap(bbox, resolution=GRID_N):
     if len(tiles_needed) > _MAX_ARCTIC_TILES:
         log_cog.info(f"  ArcticDEM: {len(tiles_needed)} COG tiles needed — too many (cap={_MAX_ARCTIC_TILES}), skipping")
     else:
-        log_cog.info(f"  ArcticDEM: {len(tiles_needed)} COG tile(s), fetching with {_ARCTIC_COG_WORKERS} workers")
+        worker_count = max(1, min(int(arctic_workers), len(tiles_needed)))
+        log_cog.info(
+            f"  ArcticDEM: {len(tiles_needed)} COG tile(s), "
+            f"fetching with {worker_count} worker(s)"
+        )
 
         def _fetch_one(row, col):
             """Fetch one ArcticDEM COG tile, resample to output grid."""
             url = _tile_url(row, col)
             log_cog.info(f"    ArcticDEM row={row} col={col} URL={url}")
-            with rasterio.open(url) as src:
+            with _open_remote_cog(url) as src:
                 window = window_from_bounds(*bbox, src.transform)  # type: ignore[call-arg]
                 win_c0 = int(np.floor(window.col_off)) - 1
                 win_r0 = int(np.floor(window.row_off)) - 1
@@ -180,19 +202,29 @@ def _read_cog_heightmap(bbox, resolution=GRID_N):
 
                 return _resample_native(data, src.window_transform(int_window), bbox, resolution)
 
-        with ThreadPoolExecutor(max_workers=_ARCTIC_COG_WORKERS) as pool:
-            futs = {pool.submit(_fetch_one, r, c): (r, c) for r, c in tiles_needed}
-            for fut in as_completed(futs):
-                row, col = futs[fut]
+        def _merge_arctic(resampled):
+            nonlocal arctic
+            if arctic is None:
+                arctic = resampled
+            else:
+                fill = np.isnan(arctic) & ~np.isnan(resampled)
+                arctic[fill] = resampled[fill]
+
+        if worker_count == 1:
+            for row, col in tiles_needed:
                 try:
-                    resampled = fut.result()
-                    if arctic is None:
-                        arctic = resampled
-                    else:
-                        fill = np.isnan(arctic) & ~np.isnan(resampled)
-                        arctic[fill] = resampled[fill]
+                    _merge_arctic(_fetch_one(row, col))
                 except Exception as exc:
                     log_cog.warning(f"    ArcticDEM FAILED row={row} col={col}: {type(exc).__name__}: {exc}")
+        else:
+            with ThreadPoolExecutor(max_workers=worker_count) as pool:
+                futs = {pool.submit(_fetch_one, r, c): (r, c) for r, c in tiles_needed}
+                for fut in as_completed(futs):
+                    row, col = futs[fut]
+                    try:
+                        _merge_arctic(fut.result())
+                    except Exception as exc:
+                        log_cog.warning(f"    ArcticDEM FAILED row={row} col={col}: {type(exc).__name__}: {exc}")
 
     # --- EGM2008 geoid correction (ellipsoidal → orthometric) ---
     if arctic is not None and np.any(~np.isnan(arctic)):
@@ -209,7 +241,7 @@ def _read_cog_heightmap(bbox, resolution=GRID_N):
         log_cog.info(f"  Copernicus URL={cop_url} (center lon={cop_lon:.3f} lat={cop_lat:.3f})")
         dst_transform = transform_from_bounds(*bbox, resolution, resolution)  # type: ignore[call-arg]
         cop_data = np.empty((resolution, resolution), dtype=np.float32)
-        with rasterio.open(cop_url) as src:
+        with _open_remote_cog(cop_url) as src:
             reproject(
                 source=rasterio.band(src, 1),  # type: ignore[call-arg]
                 destination=cop_data,
@@ -233,7 +265,7 @@ def _read_cog_heightmap(bbox, resolution=GRID_N):
             log_cog.info(f"  Copernicus retry (expanded bbox +10%): URL={cop_url2}")
             dst_transform2 = transform_from_bounds(*bbox, resolution, resolution)
             cop_data2 = np.empty((resolution, resolution), dtype=np.float32)
-            with rasterio.open(cop_url2) as src:
+            with _open_remote_cog(cop_url2) as src:
                 reproject(
                     source=rasterio.band(src, 1),
                     destination=cop_data2,
@@ -274,6 +306,9 @@ def _read_cog_heightmap(bbox, resolution=GRID_N):
     else:
         log_cog.info(f"  Copernicus: no valid data")
 
+    selected = None
+    selected_source = None
+
     if arctic_ok and cop_ok:
         assert arctic is not None and cop is not None
         # Compare: difference between the two
@@ -290,18 +325,21 @@ def _read_cog_heightmap(bbox, resolution=GRID_N):
         cop_valid = np.sum(~np.isnan(cop))
         if arctic_valid >= cop_valid:
             log_cog.info(f"  WINNER: ArcticDEM ({arctic_valid} vs {cop_valid} valid pixels)")
-            return arctic, 'arcticdem_10m'
+            selected, selected_source = arctic, 'arcticdem_10m'
         else:
             log_cog.info(f"  WINNER: Copernicus ({cop_valid} vs {arctic_valid} valid pixels)")
-            return cop, 'copernicus'
+            selected, selected_source = cop, 'copernicus'
 
-    if arctic_ok:
+    elif arctic_ok:
         log_cog.info(f"  Using ArcticDEM (only source with data)")
-        return arctic, 'arcticdem_10m'
+        selected, selected_source = arctic, 'arcticdem_10m'
 
-    if cop_ok:
+    elif cop_ok:
         log_cog.info(f"  Using Copernicus (only source with data)")
-        return cop, 'copernicus'
+        selected, selected_source = cop, 'copernicus'
+
+    if selected is not None:
+        return selected, selected_source or 'official_coastline'
 
     log_cog.info(f"  No data from any source for bbox=[{bbox[0]:.0f},{bbox[1]:.0f},{bbox[2]:.0f},{bbox[3]:.0f}]")
     return None, None
