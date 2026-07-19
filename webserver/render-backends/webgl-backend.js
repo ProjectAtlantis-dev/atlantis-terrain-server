@@ -13,6 +13,7 @@ export function createTerrainBackend({
   width,
   height,
   pixelRatio,
+  toneMappingExposure = 10,
   scene,
   bootLog = () => {},
 } = {}) {
@@ -27,7 +28,7 @@ export function createTerrainBackend({
   renderer.shadowMap.type = THREE.PCFSoftShadowMap;
   renderer.shadowMap.autoUpdate = true;
   renderer.toneMapping = THREE.NoToneMapping;
-  renderer.toneMappingExposure = 10;
+  renderer.toneMappingExposure = toneMappingExposure;
   let composer = null;
   let demandRendering = null;
   let animationLoopActive = false;
@@ -38,6 +39,8 @@ export function createTerrainBackend({
   bootLog('renderer.ready', {
     backend: 'webgl', width, height, pixelRatio,
     shadowMap: renderer.shadowMap.type,
+    logarithmicDepthBuffer: renderer.capabilities.logarithmicDepthBuffer,
+    toneMapping: 'agx', toneMappingExposure,
   });
 
   const backend = {

@@ -101,6 +101,48 @@ def _distance_to_bbox(x, y, bbox):
     return math.sqrt(dx * dx + dy * dy)
 
 
+def bbox_in_view_oval(qx, qy, heading, bbox, max_range,
+                      forward_scale=2.0):
+    """Return whether a tile intersects the heading-aligned coverage oval.
+
+    The camera sits behind the oval's center, giving it ``max_range`` of
+    coverage behind/abeam and ``forward_scale * max_range`` straight ahead.
+    Projecting the bbox half-extents onto the oval axes makes the test
+    conservative for large quadtree tiles, so boundary tiles are retained.
+    """
+    if max_range <= 0:
+        return True
+    if not isinstance(heading, (int, float)) or not math.isfinite(heading):
+        return _distance_to_bbox(qx, qy, bbox) <= max_range
+
+    forward_range = max_range * max(1.0, forward_scale)
+    center_offset = (forward_range - max_range) / 2
+    forward_radius = (forward_range + max_range) / 2
+    # Widen the oval just enough that its cross-section through the camera is
+    # max_range. This preserves the old lateral coverage while adding reach.
+    offset_ratio = center_offset / forward_radius
+    side_radius = max_range / math.sqrt(max(1e-9, 1 - offset_ratio ** 2))
+
+    fwd_x, fwd_y = -math.sin(heading), math.cos(heading)
+    side_x, side_y = fwd_y, -fwd_x
+    oval_x = qx + fwd_x * center_offset
+    oval_y = qy + fwd_y * center_offset
+    tile_x = (bbox[0] + bbox[2]) / 2
+    tile_y = (bbox[1] + bbox[3]) / 2
+    half_x = (bbox[2] - bbox[0]) / 2
+    half_y = (bbox[3] - bbox[1]) / 2
+    dx, dy = tile_x - oval_x, tile_y - oval_y
+
+    local_forward = dx * fwd_x + dy * fwd_y
+    local_side = dx * side_x + dy * side_y
+    forward_extent = abs(fwd_x) * half_x + abs(fwd_y) * half_y
+    side_extent = abs(side_x) * half_x + abs(side_y) * half_y
+    forward_gap = max(abs(local_forward) - forward_extent, 0.0)
+    side_gap = max(abs(local_side) - side_extent, 0.0)
+    return ((forward_gap / forward_radius) ** 2
+            + (side_gap / side_radius) ** 2) <= 1.0
+
+
 def _fetch_tile(db, tile_id, bbox, allow_overwrite=False):
     """Fetch a single tile from COG, write to DB. Returns True if data found."""
     if tile_id in _no_data_cache:
@@ -171,7 +213,7 @@ def _ensure_children(db, depth, col, row):
 
 
 def _traverse(db, depth, col, row, qx, qy, max_depth, error_threshold,
-              results, missing, max_range=0.0, altitude=0.0):
+              results, missing, max_range=0.0, altitude=0.0, heading=None):
     """Recursive quadtree traversal with error-based LOD.
 
     A tile subdivides if geometric_error / distance > threshold, depth < max_depth,
@@ -180,7 +222,8 @@ def _traverse(db, depth, col, row, qx, qy, max_depth, error_threshold,
     Tiles with real data are added to results. Tiles that are empty but the LOD
     says should have data are added to missing for background fetching.
 
-    max_range: if > 0, skip tiles entirely beyond this distance (meters).
+    max_range: base radius of the coverage oval (meters). With a heading the
+        oval reaches twice as far forward; without one this remains circular.
     """
     tid = _tile_id(depth, col, row)
     meta = read_tile_metadata(db, tid)
@@ -208,12 +251,18 @@ def _traverse(db, depth, col, row, qx, qy, max_depth, error_threshold,
     if _debug:
         log_trav.debug(f"{tid}: source={meta['source']} real={has_real_data} geo_err={geo_err:.1f} (orig={meta['geometric_error']:.1f})")
 
-    # Distance cutoff — don't subdivide beyond max_range, but still
-    # include this tile if it has data (no holes at the boundary)
+    # Coverage cutoff — don't subdivide outside the view oval, but still
+    # include this tile if it has data (no holes at the boundary).
     dist_to_tile = _distance_to_bbox(qx, qy, meta['bbox'])
-    if max_range > 0 and dist_to_tile > max_range:
+    in_coverage = bbox_in_view_oval(
+        qx, qy, heading, meta['bbox'], max_range
+    )
+    if not in_coverage:
         if _debug:
-            log_trav.debug(f"{tid}: beyond max_range ({dist_to_tile:.0f} > {max_range:.0f}), real={has_real_data}")
+            log_trav.debug(
+                f"{tid}: outside view oval (distance={dist_to_tile:.0f}, "
+                f"base_range={max_range:.0f}), real={has_real_data}"
+            )
         if has_real_data:
             results.append(tid)
         return
@@ -309,7 +358,11 @@ def _traverse(db, depth, col, row, qx, qy, max_depth, error_threshold,
             if _debug:
                 log_trav.debug(f"{tid}: all children ready, subdividing")
             for cc, cr in children:
-                _traverse(db, depth+1, cc, cr, qx, qy, max_depth, error_threshold, results, missing, max_range, altitude)
+                _traverse(
+                    db, depth+1, cc, cr, qx, qy, max_depth,
+                    error_threshold, results, missing, max_range, altitude,
+                    heading,
+                )
     else:
         if _debug:
             log_trav.debug(f"{tid}: leaf node, real={has_real_data}")
@@ -325,7 +378,8 @@ def query_tiles_stereo(db, qx, qy, error_threshold=0.001, max_depth=None,
     """Query tiles using error-based LOD with stereo coords directly.
 
     Same as query_tiles() but takes EPSG:3413 coords instead of lat/lon.
-    max_range: if > 0, skip tiles beyond this distance in meters.
+    max_range: base coverage radius in meters. With heading, coverage extends
+        to twice this distance ahead while retaining this distance elsewhere.
     altitude: camera altitude in meters — increases effective distance to tiles below.
     heading: camera heading in radians (JS convention: 0 = north, positive
     turns west). When given, the missing-tile fetch batch is ordered by view
@@ -392,7 +446,10 @@ def _query_tiles_impl(db, qx, qy, error_threshold, max_depth, max_range, log,
 
     leaf_ids = []
     missing_raw = []
-    _traverse(db, 0, 0, 0, qx, qy, max_depth, error_threshold, leaf_ids, missing_raw, max_range, altitude)
+    _traverse(
+        db, 0, 0, 0, qx, qy, max_depth, error_threshold,
+        leaf_ids, missing_raw, max_range, altitude, heading,
+    )
 
     # Tile budget: if LOD produced too many tiles, drop the deepest/farthest.
     # Keep coarse tiles (coverage) and nearest deep tiles (detail where it matters).

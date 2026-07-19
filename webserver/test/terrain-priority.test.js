@@ -610,7 +610,7 @@ test('terrain tile set owns reconciliation, scene residency, and texture demand'
     terrainRoot,
     textureStreamer,
     terrain: {},
-    renderBackend: { prepareUntexturedTerrain() {} },
+    renderBackend: { kind: 'webgpu', prepareUntexturedTerrain() {} },
     view: { controls: { mapMode: false } },
     log() {},
     testOverrides: {
@@ -634,6 +634,9 @@ test('terrain tile set owns reconciliation, scene residency, and texture demand'
   const reconciliation = tileSet.reconcile([tile]);
   tileSet.updateTextures([tile]);
   assert.equal(terrainRoot.children.length, 1);
+  assert.equal(terrainRoot.children[0].material.polygonOffset, false);
+  assert.equal(terrainRoot.children[0].material.polygonOffsetFactor, 0);
+  assert.equal(terrainRoot.children[0].material.polygonOffsetUnits, 0);
   assert.equal(tileSet.deferredTiles.get(tile.id), tile);
   assert.equal(tileSet.currentTileIds, reconciliation.nextTileIds);
   assert.deepEqual(textureRequests, [tile.id]);

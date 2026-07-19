@@ -58,11 +58,12 @@ const USE_WEBGPU_RENDER_BACKEND = backend === 'webgpu';
 const backendModule = USE_WEBGPU_RENDER_BACKEND
   ? await import('./render-backends/webgpu-backend.js')
   : await import('./render-backends/webgl-backend.js');
-// Calibrated against the cloudless WebGL reference. WebGL uses exposure 10
-// after relative-luminance normalization; this pair gives the WebGPU AgX path
-// a comparable pre-tone-map scale without changing physical scattering.
-const WEBGPU_ATMOSPHERE_LUMINANCE_SCALE = 5.0;
+// Both backends use AgX, but their pre-tone-map luminance units differ. WebGL's
+// relative-luminance pipeline needs exposure 10; WebGPU's physical atmosphere
+// is calibrated at 2.5. Treat these as input normalization, not different looks.
+const WEBGL_TONE_MAPPING_EXPOSURE = 10;
 const WEBGPU_TONE_MAPPING_EXPOSURE = 2.5;
+const WEBGPU_ATMOSPHERE_LUMINANCE_SCALE = 5.0;
 const WEBGPU_DEFAULT_HAZE = 6.5;
 const WEBGPU_SUN_ANGULAR_RADIUS = 0.02;
 const WEBGPU_ATMOSPHERE_DEFAULTS = Object.freeze({
@@ -240,7 +241,9 @@ const renderBackend = backendModule.createTerrainBackend({
   width: window.innerWidth,
   height: window.innerHeight,
   pixelRatio: window.devicePixelRatio,
-  toneMappingExposure: WEBGPU_TONE_MAPPING_EXPOSURE,
+  toneMappingExposure: USE_WEBGPU_RENDER_BACKEND
+    ? WEBGPU_TONE_MAPPING_EXPOSURE
+    : WEBGL_TONE_MAPPING_EXPOSURE,
   scene,
   bootLog,
 });
@@ -363,15 +366,23 @@ tuningHeader.onclick = () => {
 // --- Tuning panel persistence ---
 const TUNING_STORAGE_KEY = 'clouds-tuning';
 const tuningState = JSON.parse(localStorage.getItem(TUNING_STORAGE_KEY) || '{}');
-const WEBGPU_CALIBRATION_VERSION = 3;
+const WEBGPU_CALIBRATION_VERSION = 5;
 if (tuningState.webgpuCalibrationVersion !== WEBGPU_CALIBRATION_VERSION) {
-  if (tuningState['webgpu exposure'] == null || tuningState['webgpu exposure'] === 1.5) {
+  if (
+    tuningState['webgpu exposure'] == null
+    || tuningState['webgpu exposure'] === 1.5
+    || tuningState['webgpu exposure'] === 10
+  ) {
     tuningState['webgpu exposure'] = WEBGPU_TONE_MAPPING_EXPOSURE;
   }
   if (tuningState['webgpu luminance'] == null || tuningState['webgpu luminance'] === 3.8) {
     tuningState['webgpu luminance'] = WEBGPU_ATMOSPHERE_LUMINANCE_SCALE;
   }
-  if (tuningState.brightness == null || tuningState.brightness === 2.2) {
+  if (
+    tuningState.brightness == null
+    || tuningState.brightness === 2.2
+    || tuningState.brightness === 10
+  ) {
     tuningState.brightness = WEBGPU_TONE_MAPPING_EXPOSURE;
   }
   if (tuningState.haze == null || tuningState.haze === 4.5) {

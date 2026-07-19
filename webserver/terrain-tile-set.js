@@ -174,8 +174,15 @@ export function createTileLifecycle({
   return { evict, evictCoveredAncestors, replaceForMaterialized, sweepStaleParents };
 }
 
-function applyDepthOffset(mesh, depth) {
-  if (!mesh?.material || !Number.isFinite(depth)) return;
+function applyDepthOffset(mesh, depth, enabled = true) {
+  if (!mesh?.material) return;
+  if (!enabled) {
+    mesh.material.polygonOffset = false;
+    mesh.material.polygonOffsetFactor = 0;
+    mesh.material.polygonOffsetUnits = 0;
+    return;
+  }
+  if (!Number.isFinite(depth)) return;
   mesh.material.polygonOffset = true;
   mesh.material.polygonOffsetFactor = -depth;
   mesh.material.polygonOffsetUnits = -depth;
@@ -194,6 +201,7 @@ export function createTerrainMeshRuntime({
   vehicleNearTile = () => false,
   getVehicleDepth = () => -1,
   requestVehicleResnap = () => {},
+  depthOffsetEnabled = true,
 }) {
   function materialize(tileId, texture) {
     const tile = deferredTiles.get(tileId);
@@ -204,7 +212,7 @@ export function createTerrainMeshRuntime({
     if (!mesh) return null;
     applyMaterial(mesh, texture);
     const depth = tileDepth(tileId);
-    applyDepthOffset(mesh, depth);
+    applyDepthOffset(mesh, depth, depthOffsetEnabled);
     lifecycle.replaceForMaterialized(mesh, getCurrentTileIds());
     if (vehicleNearTile(mesh.userData?.bbox)) {
       const previousDepth = getVehicleDepth();
@@ -372,11 +380,9 @@ export function createTerrainTextureController({
 
 const overlaps = (a, b) => a[0] < b[2] && a[2] > b[0] && a[1] < b[3] && a[3] > b[1];
 
-function applyTileDepthOffset(mesh, tileId) {
+function applyTileDepthOffset(mesh, tileId, enabled = true) {
   const depth = Number.parseInt(tileId.split('-')[0], 10);
-  mesh.material.polygonOffset = true;
-  mesh.material.polygonOffsetFactor = -depth;
-  mesh.material.polygonOffsetUnits = -depth;
+  applyDepthOffset(mesh, depth, enabled);
 }
 
 export function reconcileTerrainTiles({
@@ -394,6 +400,7 @@ export function reconcileTerrainTiles({
   prepareUntexturedMesh = () => {},
   onMeshAdded = () => {},
   onDiff = () => {},
+  depthOffsetEnabled = true,
 }) {
   const { nextTileIds, added, removed } = diffTerrainTileIds(tiles, currentTileIds);
   let purged = 0;
@@ -408,8 +415,12 @@ export function reconcileTerrainTiles({
   for (const mesh of terrainRoot.children) {
     const tileId = mesh.userData?.tileId;
     if (!mesh.isMesh || !tileId) continue;
-    if (nextTileIds.has(tileId) && mesh.material?.map && !mesh.material.polygonOffset) {
-      applyTileDepthOffset(mesh, tileId);
+    if (
+      nextTileIds.has(tileId)
+      && mesh.material?.map
+      && mesh.material.polygonOffset !== depthOffsetEnabled
+    ) {
+      applyTileDepthOffset(mesh, tileId, depthOffsetEnabled);
       mesh.material.needsUpdate = true;
     }
   }
@@ -451,7 +462,7 @@ export function reconcileTerrainTiles({
         log(tile.id, 'added — untextured fallback (no stale coverage)');
         const mesh = buildMesh(tile);
         if (mesh) {
-          applyTileDepthOffset(mesh, tile.id);
+          applyTileDepthOffset(mesh, tile.id, depthOffsetEnabled);
           prepareUntexturedMesh(mesh);
           terrainRoot.add(mesh);
           onMeshAdded(mesh);
@@ -484,6 +495,7 @@ export function createTerrainTileReconciler({
   buildBudget = 200,
   prepareUntexturedMesh = () => {},
   onMeshAdded = () => {},
+  depthOffsetEnabled = true,
 }) {
   return (tiles, currentTileIds, { onDiff = () => {} } = {}) => reconcileTerrainTiles({
     tiles,
@@ -500,6 +512,7 @@ export function createTerrainTileReconciler({
     prepareUntexturedMesh,
     onMeshAdded,
     onDiff,
+    depthOffsetEnabled,
   });
 }
 
@@ -544,6 +557,10 @@ export function createTerrainTileSet({
     return terrainVisibilityDistance(altitude);
   });
   const buildBudget = testOverrides.buildBudget ?? 200;
+  // WebGPU turns these values into native depth bias. At cross-LOD edges that
+  // can pull depth-12 and depth-11 terrain apart, so keep this WebGL-only while
+  // diagnosing the visible WebGPU seams.
+  const depthOffsetEnabled = renderBackend.kind !== 'webgpu';
   const desaturateTexture = testOverrides.createDesaturatedTexture
     ?? createDesaturatedTerrainTexture;
   const deferredTiles = new Map();
@@ -651,6 +668,7 @@ export function createTerrainTileSet({
     vehicleNearTile: vehicle.vehicleNearTileBbox,
     getVehicleDepth: () => vehicle.vehicleLastContactDepth,
     requestVehicleResnap: vehicle.requestVehicleTerrainResnap,
+    depthOffsetEnabled,
   });
   const updateTextureDemand = createTerrainTextureController({
     terrainRoot,
@@ -685,6 +703,7 @@ export function createTerrainTileSet({
       prepareUntexturedMesh,
       onMeshAdded: onMutated,
       onDiff,
+      depthOffsetEnabled,
     });
     currentTileIds = result.nextTileIds;
     for (const [tileId, cached] of desaturatedTextures) {

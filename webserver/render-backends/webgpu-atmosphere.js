@@ -141,7 +141,12 @@ export function createWebGPUAtmosphereController({
       context,
       scenePass.getTextureNode('output'),
       scenePass.getTextureNode('depth'),
-      scenePass.getTextureNode('normal'),
+      // Terrain tiles compute normals independently. At cross-LOD boundaries
+      // the depth-11 and depth-12 edge normals differ even where the geometry
+      // meets exactly, and atmosphere relighting turns that into a dark seam.
+      // Use the continuous ellipsoid-normal fallback for direct sun and
+      // spectral sky/ambient illumination across all terrain LODs.
+      null,
       cloudShadows,
     );
     postProcessing.outputNode = atmosphereNode;

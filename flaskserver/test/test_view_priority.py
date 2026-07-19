@@ -3,7 +3,7 @@
 import math
 import unittest
 
-from serve import bbox_view_priority
+from serve import bbox_in_view_oval, bbox_view_priority
 
 
 def _bbox_at(cx, cy, size=100.0):
@@ -36,6 +36,43 @@ class TestBboxViewPriority(unittest.TestCase):
         diagonal = bbox_view_priority(0, 0, fwd_x, fwd_y, _bbox_at(1000, 1000))
         expected = math.hypot(1000, 1000) / (1000 / math.hypot(1000, 1000))
         self.assertAlmostEqual(diagonal, expected, places=6)
+
+
+class TestViewCoverageOval(unittest.TestCase):
+    def test_extends_twice_as_far_ahead(self):
+        self.assertTrue(bbox_in_view_oval(
+            0, 0, 0.0, _bbox_at(0, 1900, 10), 1000
+        ))
+        self.assertFalse(bbox_in_view_oval(
+            0, 0, 0.0, _bbox_at(0, 2100, 10), 1000
+        ))
+
+    def test_preserves_rear_and_lateral_range(self):
+        for x, y in ((0, -900), (900, 0), (-900, 0)):
+            self.assertTrue(bbox_in_view_oval(
+                0, 0, 0.0, _bbox_at(x, y, 10), 1000
+            ))
+        for x, y in ((0, -1100), (1100, 0), (-1100, 0)):
+            self.assertFalse(bbox_in_view_oval(
+                0, 0, 0.0, _bbox_at(x, y, 10), 1000
+            ))
+
+    def test_rotates_with_heading(self):
+        # Positive pi/2 faces west (-X).
+        self.assertTrue(bbox_in_view_oval(
+            0, 0, math.pi / 2, _bbox_at(-1900, 0, 10), 1000
+        ))
+        self.assertFalse(bbox_in_view_oval(
+            0, 0, math.pi / 2, _bbox_at(1900, 0, 10), 1000
+        ))
+
+    def test_missing_heading_retains_circular_fallback(self):
+        self.assertTrue(bbox_in_view_oval(
+            0, 0, None, _bbox_at(0, 900, 10), 1000
+        ))
+        self.assertFalse(bbox_in_view_oval(
+            0, 0, None, _bbox_at(0, 1100, 10), 1000
+        ))
 
 
 if __name__ == "__main__":

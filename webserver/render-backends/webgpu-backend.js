@@ -20,7 +20,7 @@ export function createTerrainBackend({
     antialias: true,
     samples: 4,
     depth: true,
-    logarithmicDepthBuffer: false,
+    logarithmicDepthBuffer: true,
   });
   renderer.setSize(width, height);
   renderer.setPixelRatio(pixelRatio);
@@ -41,6 +41,8 @@ export function createTerrainBackend({
   bootLog('renderer.ready', {
     backend: 'webgpu', width, height, pixelRatio,
     shadowMap: renderer.shadowMap.type,
+    logarithmicDepthBuffer: renderer.logarithmicDepthBuffer,
+    toneMapping: 'agx', toneMappingExposure,
   });
 
   const backend = {
@@ -134,6 +136,10 @@ export function createTerrainBackend({
   renderer.init().then(() => {
     ready = true;
     bootLog('renderer.webgpu.ready');
+    // Build the atmosphere against the initialized WebGPU device. The removed
+    // water runtime used to trigger this rebuild incidentally when it became
+    // ready; lighting must not depend on an unrelated optional surface.
+    atmosphere?.rebuild?.();
     backend.requestRender();
   }).catch(error => {
     bootLog('renderer.webgpu.error', {
