@@ -51,6 +51,20 @@ test('buildBuildingsGeometry applies frame offsets and handles CW rings', () => 
   assert.equal(Math.max(...xs), 110);
 });
 
+test('buildBuildingsGeometry uses sampled roof color and shaded wall variants', () => {
+  const geometry = buildBuildingsGeometry([{
+    ...squareBuilding,
+    color: [204, 102, 51],
+    colorVersion: '12-1-1:v1',
+  }]);
+  const colors = geometry.getAttribute('color');
+  assert.ok(Math.abs(colors.getX(0) - 0.8) < 1e-6);
+  assert.ok(Math.abs(colors.getY(0) - 0.4) < 1e-6);
+  assert.ok(Math.abs(colors.getZ(0) - 0.2) < 1e-6);
+  assert.ok(colors.getX(4) < colors.getX(0));
+  assert.ok(colors.getY(4) < colors.getY(0));
+});
+
 test('buildBuildingsGeometry skips degenerate rings', () => {
   assert.equal(buildBuildingsGeometry([{ id: 'x', groundZ: 0, ring: [[0, 0, 1], [1, 0, 1]] }]), null);
   assert.equal(buildBuildingsGeometry([]), null);

@@ -20,6 +20,15 @@ function shadeForEdge(dx, dy) {
   return 0.55 + 0.17 * dot;
 }
 
+function normalizedBuildingColor(building) {
+  if (!Array.isArray(building.color) || building.color.length < 3) {
+    const fallback = roofShade(building.id ?? '');
+    return [fallback, fallback, fallback];
+  }
+  return building.color.slice(0, 3).map(channel =>
+    Math.max(0, Math.min(1, Number(channel) / 255)));
+}
+
 function roofShade(buildingId) {
   let hash = 0;
   for (let index = 0; index < buildingId.length; index++) {
@@ -53,7 +62,7 @@ export function buildBuildingsGeometry(buildings, {
     }
 
     const baseZ = (building.groundZ - WALL_BASE_SINK_M) * exaggeration;
-    const roofColor = roofShade(building.id ?? '');
+    const roofColor = normalizedBuildingColor(building);
 
     // Roof cap: triangulate the footprint, lift each vertex to its own roof Z.
     const contour = xs.map((x, index) => new THREE.Vector2(x, ys[index]));
@@ -66,7 +75,7 @@ export function buildBuildingsGeometry(buildings, {
     const roofStart = positions.length / 3;
     for (let index = 0; index < xs.length; index++) {
       positions.push(xs[index], ys[index], zs[index]);
-      colors.push(roofColor, roofColor, roofColor);
+      colors.push(...roofColor);
     }
     for (const [a, b, c] of triangles) {
       indices.push(roofStart + a, roofStart + b, roofStart + c);
@@ -83,7 +92,8 @@ export function buildBuildingsGeometry(buildings, {
         xs[next], ys[next], zs[next],
         xs[index], ys[index], zs[index],
       );
-      for (let corner = 0; corner < 4; corner++) colors.push(shade, shade, shade);
+      const wallColor = roofColor.map(channel => Math.max(0, Math.min(1, channel * shade)));
+      for (let corner = 0; corner < 4; corner++) colors.push(...wallColor);
       indices.push(wallStart, wallStart + 1, wallStart + 2, wallStart, wallStart + 2, wallStart + 3);
     }
   }
@@ -107,6 +117,8 @@ export function createTerrainBuildingsRuntime({
   return createTerrainVectorLayerRuntime({
     terrainRoot, pipelineState,
     endpoint, itemsKey: 'buildings', logLabel: 'Buildings',
+    buildKeyForItem: item => `${item.id}:${item.colorVersion ?? ''}:${item.color?.join(',') ?? ''}`,
+    refreshIntervalMs: 10000,
     buildGeometry: (items, { offsetX, offsetY }) =>
       buildBuildingsGeometry(items, { offsetX, offsetY, exaggeration }),
     bootLog, onMutated, requestRender, fetchImpl,

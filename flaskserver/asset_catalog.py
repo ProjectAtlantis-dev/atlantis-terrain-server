@@ -10,7 +10,9 @@ import io
 import json
 import math
 import sqlite3
+import statistics
 import time
+import colorsys
 from pathlib import Path
 from typing import Any
 
@@ -22,16 +24,28 @@ DEFAULT_ASSETS_DB_PATH = ROOT / "assetserver" / "assets.db"
 DEFAULT_METADATA_PATH = ROOT / "assetserver" / "assets_metadata.json"
 
 ROAD_COLORS = {
-    "road:Hovedvej": (51, 51, 54),
-    "road:Lokalvej": (61, 61, 64),
-    "road:Adgangsvej": (71, 71, 74),
-    "road:Kørespor": (97, 92, 84),
-    "road:Under anlæg": (107, 102, 92),
-    "road:Tunnel": (41, 41, 43),
-    "path:Anlagt": (102, 99, 94),
-    "path:Natursti": (122, 112, 97),
+    "road:Hovedvej": (66, 65, 64),
+    "road:Lokalvej": (72, 71, 70),
+    "road:Adgangsvej": (79, 77, 74),
+    "road:Kørespor": (105, 98, 87),
+    "road:Under anlæg": (112, 105, 92),
+    "road:Tunnel": (48, 48, 49),
+    "path:Anlagt": (112, 105, 91),
+    "path:Natursti": (128, 112, 88),
 }
-DEFAULT_ROAD_COLOR = (77, 77, 77)
+DEFAULT_ROAD_COLOR = (82, 80, 77)
+ROAD_WIDTH_SCALE = {
+    "road:Hovedvej": 1.35,
+    "road:Lokalvej": 1.25,
+    "road:Adgangsvej": 1.25,
+    "road:Kørespor": 1.15,
+    "road:Under anlæg": 1.2,
+    "road:Tunnel": 1.2,
+    "path:Anlagt": 1.15,
+    "path:Natursti": 1.1,
+}
+ROAD_SUPERSAMPLE = 4
+_BUILDING_COLOR_CACHE: dict[tuple[str, str, str], tuple[int, int, int]] = {}
 
 
 def connect(path: Path = DEFAULT_ASSETS_DB_PATH) -> sqlite3.Connection:
@@ -100,6 +114,157 @@ def query_buildings(
     return result
 
 
+def _point_in_polygon(x: float, y: float, polygon: list[tuple[float, float]]) -> bool:
+    inside = False
+    previous = polygon[-1]
+    for current in polygon:
+        if ((current[1] > y) != (previous[1] > y)):
+            crossing = (
+                (previous[0] - current[0]) * (y - current[1])
+                / (previous[1] - current[1]) + current[0]
+            )
+            if x < crossing:
+                inside = not inside
+        previous = current
+    return inside
+
+
+def _roof_color(pixels: list[tuple[int, int, int]]) -> tuple[int, int, int] | None:
+    """Weighted roof color, preferring non-earth pixels inside the footprint."""
+    weighted: list[tuple[tuple[int, int, int], float]] = []
+    for pixel in pixels:
+        red, green, blue = pixel
+        brightness = (red + green + blue) / 3
+        if brightness < 20 or brightness > 248:
+            continue
+        hue, saturation, _ = colorsys.rgb_to_hsv(red / 255, green / 255, blue / 255)
+        earth_tone = 0.055 <= hue <= 0.46 and saturation >= 0.12
+        if earth_tone:
+            weight = 1.0
+        elif saturation < 0.12:
+            weight = 2.0  # neutral metal/concrete roofs
+        else:
+            weight = 4.0  # red/blue/cyan roof material
+        weighted.append((pixel, weight))
+    if not weighted:
+        return None
+    total = sum(weight for _, weight in weighted)
+    return tuple(
+        int(round(sum(pixel[channel] * weight for pixel, weight in weighted) / total))
+        for channel in range(3)
+    )
+
+
+def _sample_footprint_color(
+    image: Image.Image,
+    ring: list[list[float]],
+    bbox: tuple[float, float, float, float],
+) -> tuple[int, int, int] | None:
+    width, height = image.size
+    x_min, y_min, x_max, y_max = bbox
+    span_x, span_y = x_max - x_min, y_max - y_min
+    polygon = [
+        ((point[0] - x_min) / span_x * width,
+         (y_max - point[1]) / span_y * height)
+        for point in ring
+    ]
+    left = max(0, int(math.floor(min(point[0] for point in polygon))))
+    right = min(width - 1, int(math.ceil(max(point[0] for point in polygon))))
+    top = max(0, int(math.floor(min(point[1] for point in polygon))))
+    bottom = min(height - 1, int(math.ceil(max(point[1] for point in polygon))))
+    pixels = [
+        image.getpixel((x, y))[:3]
+        for y in range(top, bottom + 1)
+        for x in range(left, right + 1)
+        if _point_in_polygon(x + 0.5, y + 0.5, polygon)
+    ]
+    if not pixels:
+        center_x = max(0, min(width - 1, int(round(sum(p[0] for p in polygon) / len(polygon)))))
+        center_y = max(0, min(height - 1, int(round(sum(p[1] for p in polygon) / len(polygon)))))
+        pixels = [image.getpixel((center_x, center_y))[:3]]
+    return _roof_color(pixels)
+
+
+def color_buildings_from_textures(
+    terrain_db: sqlite3.Connection,
+    buildings: list[dict[str, Any]],
+    ox: float,
+    oy: float,
+) -> None:
+    """Attach derived roof colors from the deepest cached imagery in-place."""
+    if not buildings:
+        return
+    absolute_rings = {
+        building["id"]: [[point[0] + ox, point[1] + oy, point[2]] for point in building["ring"]]
+        for building in buildings
+    }
+    centers = {
+        asset_id: (
+            sum(point[0] for point in ring) / len(ring),
+            sum(point[1] for point in ring) / len(ring),
+        )
+        for asset_id, ring in absolute_rings.items()
+    }
+    query_bounds = (
+        min(center[0] for center in centers.values()),
+        min(center[1] for center in centers.values()),
+        max(center[0] for center in centers.values()),
+        max(center[1] for center in centers.values()),
+    )
+    try:
+        tiles = terrain_db.execute(
+            "SELECT t.tile_id,t.depth,t.x_min,t.y_min,t.x_max,t.y_max,x.updated_at "
+            "FROM tiles t JOIN textures x ON x.tile_id=t.tile_id "
+            "WHERE t.x_min <= ? AND t.x_max >= ? AND t.y_min <= ? AND t.y_max >= ? "
+            "ORDER BY t.depth DESC",
+            (query_bounds[2], query_bounds[0], query_bounds[3], query_bounds[1]),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return
+
+    assignments: dict[str, tuple] = {}
+    for building in buildings:
+        cx, cy = centers[building["id"]]
+        for tile in tiles:
+            if tile[2] <= cx < tile[4] and tile[3] <= cy < tile[5]:
+                assignments[building["id"]] = tile
+                break
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for building in buildings:
+        tile = assignments.get(building["id"])
+        if tile:
+            grouped.setdefault(tile[0], []).append(building)
+    for tile_id, group in grouped.items():
+        tile = assignments[group[0]["id"]]
+        version = str(tile[6])
+        uncached = [
+            building for building in group
+            if (building["id"], tile_id, version) not in _BUILDING_COLOR_CACHE
+        ]
+        image = None
+        if uncached:
+            row = terrain_db.execute(
+                "SELECT texture FROM textures WHERE tile_id=?", (tile_id,)
+            ).fetchone()
+            if row:
+                image = Image.open(io.BytesIO(row[0])).convert("RGB")
+        tile_bbox = (tile[2], tile[3], tile[4], tile[5])
+        for building in group:
+            cache_key = (building["id"], tile_id, version)
+            color = _BUILDING_COLOR_CACHE.get(cache_key)
+            if color is None and image is not None:
+                color = _sample_footprint_color(
+                    image, absolute_rings[building["id"]], tile_bbox
+                )
+                if color is not None:
+                    if len(_BUILDING_COLOR_CACHE) > 20000:
+                        _BUILDING_COLOR_CACHE.clear()
+                    _BUILDING_COLOR_CACHE[cache_key] = color
+            if color is not None:
+                building["color"] = list(color)
+                building["colorVersion"] = f"{tile_id}:{version}"
+
+
 def query_roads(
     db: sqlite3.Connection, bbox: tuple[float, float, float, float]
 ) -> list[dict[str, Any]]:
@@ -122,10 +287,90 @@ def query_roads(
     return result
 
 
+def _smooth_points(points: list[tuple[float, float]], passes: int = 2) -> list[tuple[float, float]]:
+    """Corner-cut a survey polyline while preserving its exact endpoints."""
+    result = points
+    for _ in range(passes):
+        if len(result) < 3:
+            break
+        smoothed = [result[0]]
+        for first, second in zip(result, result[1:]):
+            smoothed.extend((
+                (first[0] * 0.75 + second[0] * 0.25,
+                 first[1] * 0.75 + second[1] * 0.25),
+                (first[0] * 0.25 + second[0] * 0.75,
+                 first[1] * 0.25 + second[1] * 0.75),
+            ))
+        smoothed.append(result[-1])
+        result = smoothed
+    return result
+
+
+def _draw_round_line(draw: ImageDraw.ImageDraw, points, fill, width: int) -> None:
+    if len(points) < 2 or width <= 0:
+        return
+    draw.line(points, fill=fill, width=width, joint="curve")
+    radius = width / 2
+    for x, y in (points[0], points[-1]):
+        draw.ellipse((x - radius, y - radius, x + radius, y + radius), fill=fill)
+
+
+def _sample_underlying_color(
+    image: Image.Image,
+    points: list[tuple[float, float]],
+    coordinate_scale: int,
+) -> tuple[int, int, int] | None:
+    """Median RGB under a road, sampled evenly along all visible segments."""
+    width, height = image.size
+    samples: list[tuple[int, int, int]] = []
+    for first, second in zip(points, points[1:]):
+        x0, y0 = first[0] / coordinate_scale, first[1] / coordinate_scale
+        x1, y1 = second[0] / coordinate_scale, second[1] / coordinate_scale
+        length = math.hypot(x1 - x0, y1 - y0)
+        steps = max(1, min(32, int(math.ceil(length / 8))))
+        for step in range(steps + 1):
+            amount = step / steps
+            x = int(round(x0 + (x1 - x0) * amount))
+            y = int(round(y0 + (y1 - y0) * amount))
+            if not (0 <= x < width and 0 <= y < height):
+                continue
+            # A tiny cross-section is more robust than trusting one JPEG pixel.
+            for dx, dy in ((0, 0), (-1, 0), (1, 0), (0, -1), (0, 1)):
+                sx, sy = x + dx, y + dy
+                if 0 <= sx < width and 0 <= sy < height:
+                    samples.append(image.getpixel((sx, sy))[:3])
+    if not samples:
+        return None
+    return tuple(int(statistics.median(pixel[channel] for pixel in samples)) for channel in range(3))
+
+
+def _pavement_color(sampled: tuple[int, int, int]) -> tuple[int, int, int]:
+    """Keep local brightness/hue while gently muting orthophoto noise."""
+    red, green, blue = sampled
+    luminance = red * 0.2126 + green * 0.7152 + blue * 0.0722
+    return tuple(
+        max(0, min(255, int(round((channel * 0.58 + luminance * 0.42) * 0.88))))
+        for channel in (red, green, blue)
+    )
+
+
+def _trail_color(
+    sampled: tuple[int, int, int], natural: bool
+) -> tuple[int, int, int]:
+    """A terrain-derived, warm trail tone that remains readable over earth."""
+    target = (112, 91, 62) if natural else (105, 98, 82)
+    darkness = 0.65 if natural else 0.72
+    return tuple(
+        max(0, min(255, int(round((source * 0.62 + warm * 0.38) * darkness))))
+        for source, warm in zip(sampled, target)
+    )
+
+
 def paint_roads(
     jpeg: bytes,
     bbox: tuple[float, float, float, float],
     db_path: Path = DEFAULT_ASSETS_DB_PATH,
+    debug: bool = False,
 ) -> tuple[bytes, int]:
     """Paint catalog roads onto a copy of a tile JPEG."""
     if not jpeg or not db_path.exists():
@@ -139,7 +384,6 @@ def paint_roads(
         return jpeg, 0
 
     image = Image.open(io.BytesIO(jpeg)).convert("RGB")
-    draw = ImageDraw.Draw(image)
     width, height = image.size
     x_min, y_min, x_max, y_max = bbox
     span_x = x_max - x_min
@@ -147,6 +391,9 @@ def paint_roads(
     if span_x <= 0 or span_y <= 0:
         return jpeg, 0
 
+    scale = ROAD_SUPERSAMPLE
+    overlay = Image.new("RGBA", (width * scale, height * scale), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
     painted = 0
     for road in roads:
         points = []
@@ -154,22 +401,43 @@ def paint_roads(
             if not isinstance(point, list) or len(point) < 2:
                 continue
             points.append((
-                (float(point[0]) - x_min) / span_x * width,
-                (y_max - float(point[1])) / span_y * height,
+                (float(point[0]) - x_min) / span_x * width * scale,
+                (y_max - float(point[1])) / span_y * height * scale,
             ))
         if len(points) < 2:
             continue
+        points = _smooth_points(points)
         width_m = float(road.get("widthM", 4.0))
-        line_width = max(1, int(round(width_m / span_x * width)))
         key = f"{road.get('kind', 'road')}:{road.get('category', '')}"
-        color = ROAD_COLORS.get(key, DEFAULT_ROAD_COLOR)
-        draw.line(points, fill=color, width=line_width, joint="curve")
+        color = (255, 20, 20) if debug else ROAD_COLORS.get(key, DEFAULT_ROAD_COLOR)
+        sampled = None if debug else _sample_underlying_color(image, points, scale)
+        if sampled is not None and road.get("kind") == "road":
+            color = _pavement_color(sampled)
+        elif sampled is not None and road.get("kind") == "path":
+            color = _trail_color(sampled, road.get("category") == "Natursti")
+        profile_scale = ROAD_WIDTH_SCALE.get(key, 1.25 if road.get("kind") == "road" else 1.1)
+        width_px = width_m * profile_scale / span_x * width * scale
+        if road.get("kind") == "road":
+            minimum_screen_px = 1.5
+        elif road.get("category") == "Anlagt":
+            minimum_screen_px = 2.0
+        else:
+            minimum_screen_px = 1.5
+        minimum_px = minimum_screen_px * scale
+        fill_width = max(1, int(round(max(width_px, minimum_px))))
+        # One continuous two-lane surface. Supersampling supplies the edge
+        # transition; extra casing/crown strokes incorrectly imply separate
+        # carriageways and a median.
+        alpha = 230 if debug else (215 if road.get("kind") == "path" else 145)
+        _draw_round_line(draw, points, (*color, alpha), fill_width)
         painted += 1
 
     if not painted:
         return jpeg, 0
+    overlay = overlay.resize((width, height), Image.Resampling.LANCZOS)
+    image = Image.alpha_composite(image.convert("RGBA"), overlay).convert("RGB")
     output = io.BytesIO()
-    image.save(output, format="JPEG", quality=90, optimize=True)
+    image.save(output, format="JPEG", quality=92, optimize=True)
     return output.getvalue(), painted
 
 

@@ -59,3 +59,35 @@ test('G key opens Google Maps once and ignores key repeat', () => {
     globalThis.window = previousWindow;
   }
 });
+
+test('R toggles road debug and does not reset the view', () => {
+  const previousWindow = globalThis.window;
+  const listeners = new Map();
+  globalThis.window = {
+    addEventListener(type, callback) { listeners.set(type, callback); },
+    removeEventListener(type) { listeners.delete(type); },
+  };
+  let roadToggles = 0;
+  let resets = 0;
+  const noop = () => {};
+  const dispose = installTerrainKeyboardControls({
+    controls: { keys: {} },
+    isVehicleActive: () => false,
+    onForwardDoubleTap: noop,
+    onEscapeVehicle: noop,
+    onToggleMap: noop,
+    onToggleRoadDebug: () => { roadToggles += 1; },
+    onReset: () => { resets += 1; },
+    onHouseAction: noop,
+    onToggleHeadlights: noop,
+  });
+  try {
+    listeners.get('keydown')({ code: 'KeyR', repeat: false });
+    listeners.get('keydown')({ code: 'KeyR', repeat: true });
+    assert.equal(roadToggles, 1);
+    assert.equal(resets, 0);
+  } finally {
+    dispose();
+    globalThis.window = previousWindow;
+  }
+});

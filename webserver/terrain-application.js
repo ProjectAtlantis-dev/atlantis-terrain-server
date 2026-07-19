@@ -268,6 +268,8 @@ const { hud, alt, gameClock: gameClockEl } = createTerrainHud({
     savePosition();
     onToggleRenderBackend();
   },
+  onToggleRoadDebug: () => toggleRoadDebug(),
+  onReset: () => resetView(),
   onClockAction: action => {
     if (action === 'rw') rewindGameClock();
     else if (action === 'stop') stopGameClock();
@@ -1549,6 +1551,8 @@ function updateHud() {
     : 'classifier: off (C)';
   const renderBackendLabel = backend === 'webgpu' ? 'WebGPU' : 'WebGL';
   const nextRenderBackendLabel = backend === 'webgpu' ? 'WebGL' : 'WebGPU';
+  const roadDebugColor = textureStreamer.roadDebug ? '#ff3b30' : '#0af';
+  const roadDebugLabel = textureStreamer.roadDebug ? 'roads RED' : 'roads';
 
   // Game clock display (bottom-left) — always show the date actually being rendered
   const gameDate = gameClockState.renderedDate;
@@ -1583,7 +1587,9 @@ function updateHud() {
     `<span id="mapModeLink" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">${controls.mapMode && !heatmapRuntime?.active ? '3D view' : 'map mode'}</span> (M)` +
       ` · <span id="heatmapModeLink" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">${heatmapRuntime?.active ? '3D view' : 'heatmap'}</span> (H)` +
       ' · Google 3D (G)' +
-      ' · R reset · <span id="debugLogLink" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">debug log</span>'
+      ` · <span id="roadDebugLink" style="color:${roadDebugColor};text-decoration:underline;cursor:pointer;pointer-events:auto">${roadDebugLabel}</span> (R)` +
+      ' · <span id="resetViewLink" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">reset</span>' +
+      ' · <span id="debugLogLink" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">debug log</span>'
   ].join('<br>');
   // Rewriting innerHTML every rendered frame forces a DOM parse + relayout
   // even when nothing changed — only write when the content differs. The
@@ -1658,6 +1664,16 @@ function resetView() {
   terrainPipelineState.frameOffsetReady = false;
   houseRuntime.markHousesNeedSnap();
   terrainFetchRuntime.request();
+}
+
+function toggleRoadDebug() {
+  const enabled = textureStreamer.setRoadDebug(!textureStreamer.roadDebug);
+  terrainTileSet.resetTextureApplications();
+  terrainTileSet.refreshTextures();
+  enqueueClientLog('info', 'roads.debug.toggle', { enabled });
+  updateHud();
+  requestRender();
+  return enabled;
 }
 
 function syncMapModePresentation() {
@@ -1745,8 +1761,8 @@ installTerrainKeyboardControls({
   onOpenGoogleMaps: openGoogleMapsView,
   onToggleHeatmap: toggleHeatmap,
   onToggleClassifier: toggleClassifierMode,
+  onToggleRoadDebug: toggleRoadDebug,
   onFlyToTile: promptFlyToTile,
-  onReset: resetView,
   onHouseAction: load => load
     ? houseRuntime.loadHouseModel('keyboard')
     : houseRuntime.setHousesRuntimeVisible(!houseRuntime.housesRuntimeVisible, 'keyboard'),

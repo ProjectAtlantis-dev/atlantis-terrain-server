@@ -11,6 +11,7 @@ export function createWebGLWater({ extent }) {
       waterColor: { value: new THREE.Color(0x001e3d) },
       sunDirection: { value: new THREE.Vector3(0.7, 0.7, 0.3) },
       sunColor: { value: new THREE.Color(0xffffff) },
+      debugHighlight: { value: 0 },
     },
     vertexShader: /* glsl */`
       #include <common>

@@ -240,9 +240,13 @@ export function createTerrainTextureController({
 
   function applyTexture(mesh, tile, texture) {
     const placeholderTexture = mesh.userData?.terrainPlaceholderTexture;
+    const previousTexture = mesh.material?.map;
     if (mesh.userData) delete mesh.userData.terrainPlaceholderTexture;
     applyMaterial(mesh, texture);
     if (placeholderTexture && placeholderTexture !== texture) placeholderTexture.dispose?.();
+    if (previousTexture && previousTexture !== texture && previousTexture !== placeholderTexture) {
+      textureStreamer.releaseStaleTexture?.(previousTexture);
+    }
     onMaterialApplied(mesh);
     return mesh;
   }

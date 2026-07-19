@@ -89,7 +89,7 @@ Geometry is reprojected to EPSG:3413. Building ground is sampled from cached hei
 
 ## Default Camera
 
-The camera starts facing north at Nuuk (64.18°N, 51.72°W). You can override this via URL params, e.g. `?lat=66.5&lon=-53.2`. Press **R** to reset the view if shit gets crazy (e.g. the world suddenly turns into a blue ball).
+The camera starts facing north at Nuuk (64.18°N, 51.72°W). Press **R** to toggle the red road-texture diagnostic; use the clickable **reset** link in the HUD to restore the default view.
 
 ## Fly to Tile
 

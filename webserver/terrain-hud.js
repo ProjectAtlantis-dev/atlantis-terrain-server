@@ -13,6 +13,8 @@ export function createTerrainHud({
   onToggleMapMode,
   onToggleHeatmap,
   onToggleRenderBackend,
+  onToggleRoadDebug,
+  onReset,
   onClockAction,
 }) {
   const hud = appendPanel([
@@ -28,6 +30,8 @@ export function createTerrainHud({
       event.target.id === 'mapModeLink' ||
       event.target.id === 'heatmapModeLink' ||
       event.target.id === 'renderBackendLink' ||
+      event.target.id === 'roadDebugLink' ||
+      event.target.id === 'resetViewLink' ||
       TERRAIN_HUD_LINKS[event.target.id]
     );
     if (!isLink) hud.dataset.selecting = 'true';
@@ -47,6 +51,18 @@ export function createTerrainHud({
       event.stopPropagation();
       event.preventDefault();
       onToggleRenderBackend();
+      return;
+    }
+    if (event.target.id === 'roadDebugLink') {
+      event.stopPropagation();
+      event.preventDefault();
+      onToggleRoadDebug();
+      return;
+    }
+    if (event.target.id === 'resetViewLink') {
+      event.stopPropagation();
+      event.preventDefault();
+      onReset();
       return;
     }
     const url = TERRAIN_HUD_LINKS[event.target.id];
@@ -70,6 +86,7 @@ export function createTerrainHud({
     if (
       event.target.id === 'mapModeLink' || event.target.id === 'heatmapModeLink' ||
       event.target.id === 'renderBackendLink' ||
+      event.target.id === 'roadDebugLink' || event.target.id === 'resetViewLink' ||
       TERRAIN_HUD_LINKS[event.target.id]
     ) {
       event.stopPropagation();

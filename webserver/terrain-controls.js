@@ -82,8 +82,8 @@ export function installTerrainKeyboardControls({
   onOpenGoogleMaps = () => {},
   onToggleHeatmap = () => {},
   onToggleClassifier = () => {},
+  onToggleRoadDebug = () => {},
   onFlyToTile = () => {},
-  onReset,
   onHouseAction,
   onToggleHeadlights,
   onChanged = () => {},
@@ -120,7 +120,7 @@ export function installTerrainKeyboardControls({
       controls.keys[event.code] = false;
       return onFlyToTile();
     }
-    if (event.code === 'KeyR') return onReset();
+    if (event.code === 'KeyR') return onToggleRoadDebug();
     if (event.code === 'KeyH') {
       if (event.shiftKey) return onHouseAction(true);
       return onToggleHeatmap();

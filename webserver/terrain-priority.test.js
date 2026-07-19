@@ -1310,6 +1310,31 @@ test('flushing texture work always advances the server demand generation', () =>
   assert.ok(streamer.version > firstFlush);
 });
 
+test('road debug invalidates cached variants and marks texture requests', async () => {
+  let requestedUrl = null;
+  const stale = { disposed: false, dispose() { this.disposed = true; } };
+  const streamer = createTextureStreamer({
+    log: () => {},
+    fetchImpl: async url => {
+      requestedUrl = url;
+      return { status: 202, ok: false };
+    },
+  });
+  streamer.texCache.set('12-1-2', stale);
+  assert.equal(streamer.setRoadDebug(true), true);
+  assert.equal(streamer.texCache.size, 0);
+  assert.equal(stale.disposed, false);
+  streamer.pump([{ tile: { id: '12-1-2', bbox: [0, 0, 1, 1] } }], {
+    isCovered: () => false,
+    onPlaceholder: () => {},
+    onTexture: () => {},
+  });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.match(requestedUrl, /roadDebug=1/);
+  assert.equal(streamer.releaseStaleTexture(stale), true);
+  assert.equal(stale.disposed, true);
+});
+
 test('shared texture pump records HTTP 202 retry state', async () => {
   const streamer = createTextureStreamer({
     log: () => {},

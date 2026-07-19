@@ -1026,8 +1026,9 @@ def api_buildings():
   max_range = _arg_float("range", 20000.0)
   ox = _arg_float("ox", qx)
   oy = _arg_float("oy", qy)
-  from asset_catalog import query_buildings
+  from asset_catalog import color_buildings_from_textures, query_buildings
   buildings = query_buildings(_get_assets_db(), qx, qy, max_range, ox, oy)
+  color_buildings_from_textures(_get_db(), buildings, ox, oy)
   return jsonify({"buildings": buildings, "count": len(buildings), "qx": qx, "qy": qy})
 
 
@@ -1064,12 +1065,14 @@ def _painted_texture_response(
   bbox: tuple[float, float, float, float],
   *,
   headers: dict[str, str],
+  road_debug: bool = False,
 ) -> Response:
   """Apply terrain-coupled catalog overlays to a clean cached texture copy."""
   from asset_catalog import paint_roads
-  painted, road_count = paint_roads(jpeg, bbox, ASSETS_DB_PATH)
+  painted, road_count = paint_roads(jpeg, bbox, ASSETS_DB_PATH, debug=road_debug)
   response_headers = dict(headers)
   response_headers["X-Road-Overlay-Count"] = str(road_count)
+  response_headers["X-Road-Debug"] = "1" if road_debug else "0"
   if road_count:
     # Asset edits must be visible on the next texture request; the canonical
     # imagery remains cached in terrain.db and is never painted in place.
@@ -1094,6 +1097,7 @@ def api_texture(tile_id: str):
     return Response(b"", status=400)
   d, c, r = parsed
   texture_bbox = _tile_bbox(d, c, r)
+  road_debug = request.args.get("roadDebug") == "1"
 
   db = _get_db()
   row = db.execute(
@@ -1112,6 +1116,7 @@ def api_texture(tile_id: str):
       return _painted_texture_response(
         cached,
         texture_bbox,
+        road_debug=road_debug,
         headers={
           "Cache-Control": "public, max-age=86400" if not is_crop else "public, max-age=3600",
           "X-Tex-Source": source,
@@ -1135,6 +1140,7 @@ def api_texture(tile_id: str):
     return _painted_texture_response(
       _repair_white_ocean_jpeg(db, tile_id, cached_crop),
       texture_bbox,
+      road_debug=road_debug,
       headers={
         "Cache-Control": "no-store",
         "X-Tex-Ancestor": "precomputed_crop",
@@ -1192,6 +1198,7 @@ def api_texture(tile_id: str):
   return _painted_texture_response(
     _repair_white_ocean_jpeg(db, tile_id, buf.getvalue()),
     texture_bbox,
+    road_debug=road_debug,
     headers={
       "Cache-Control": "no-store",
       "X-Tex-Ancestor": ancestor_id,

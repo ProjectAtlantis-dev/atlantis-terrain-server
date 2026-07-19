@@ -33,8 +33,10 @@ export function createTextureStreamer({
   const texRetryAtMs = new Map();
   const texRetryCount = new Map();
   const ancestorLogged = new Set();
+  const staleTextures = new Set();
   const demandClient = globalThis.crypto?.randomUUID?.() ?? `terrain-${Date.now()}-${Math.random()}`;
   let version = Date.now();
+  let roadDebug = false;
 
   function advanceVersion() {
     version = Math.max(version + 1, Date.now());
@@ -72,7 +74,8 @@ export function createTextureStreamer({
 
       const controller = new AbortController();
       texInflight.set(tileId, controller);
-      fetchImpl(`/api/texture/${tileId}.jpg?v=${version}&demand=${version}&demandClient=${encodeURIComponent(demandClient)}`, { signal: controller.signal })
+      const debugQuery = roadDebug ? '&roadDebug=1' : '';
+      fetchImpl(`/api/texture/${tileId}.jpg?v=${version}&demand=${version}&demandClient=${encodeURIComponent(demandClient)}${debugQuery}`, { signal: controller.signal })
         .then(response => {
           texInflight.delete(tileId);
           if (response.status === 202) {
@@ -155,9 +158,27 @@ export function createTextureStreamer({
     advanceVersion();
   }
 
+  function setRoadDebug(enabled) {
+    const next = Boolean(enabled);
+    if (roadDebug === next) return roadDebug;
+    roadDebug = next;
+    abortAll();
+    for (const texture of texCache.values()) staleTextures.add(texture);
+    texCache.clear();
+    texSource.clear();
+    return roadDebug;
+  }
+
+  function releaseStaleTexture(texture) {
+    if (!texture || !staleTextures.delete(texture)) return false;
+    texture.dispose?.();
+    return true;
+  }
+
   return {
     texCache, texSource, texInflight, texFetching, texRetryAtMs, texRetryCount,
-    ancestorLogged, pump, invalidate, abortAll,
+    ancestorLogged, pump, invalidate, abortAll, setRoadDebug, releaseStaleTexture,
+    get roadDebug() { return roadDebug; },
     get version() { return version; },
     bumpVersion: advanceVersion,
   };
