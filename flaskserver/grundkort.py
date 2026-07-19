@@ -10,9 +10,9 @@ same way tiles and masks do; extra zips dropped in manually are ingested
 too.
 
 After ingest, buildings are synced into the asset server's ``assets.db``
-as ``type='building'`` rows — the asset server is the catalog of record
-for structures and serves them spatially via its ``/api/buildings``; the
-old flask endpoint is gone.
+as ``type='building'`` rows. Flask reads that catalog while processing
+``/api/tiles`` and includes the matching buildings in the tile response;
+the browser never contacts the asset server or a separate building endpoint.
 
 Fresh-DB ordering is handled by deferral: buildings ingested before the
 area's heightmaps exist get ``ground_sampled = 0`` (roof-derived ground

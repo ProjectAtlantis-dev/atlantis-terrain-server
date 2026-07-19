@@ -1168,25 +1168,6 @@ def api_vehicle_state():
   return jsonify(payload), status
 
 
-@app.get("/api/buildings")
-def api_buildings():
-  """Terrain-facing buildings read from assets.db through Flask."""
-  if "sx" in request.args and "sy" in request.args:
-    qx = _arg_float("sx", 0.0)
-    qy = _arg_float("sy", 0.0)
-  else:
-    qx, qy = _to_stereo(
-      _arg_float("lat", 64.175), _arg_float("lon", -51.7388)
-    )
-  max_range = _arg_float("range", 20000.0)
-  ox = _arg_float("ox", qx)
-  oy = _arg_float("oy", qy)
-  from asset_catalog import color_buildings_from_textures, query_buildings
-  buildings = query_buildings(_get_assets_db(), qx, qy, max_range, ox, oy)
-  color_buildings_from_textures(_get_db(), buildings, ox, oy)
-  return jsonify({"buildings": buildings, "count": len(buildings), "qx": qx, "qy": qy})
-
-
 @app.get("/api/roads")
 def api_roads():
   """Compatibility endpoint; road rendering now comes from painted textures."""
@@ -1475,6 +1456,7 @@ def api_classifier_tile(tile_id: str):
   import io as _io
 
   from PIL import Image as _Image
+  from classifier.rendering import smooth_effective_water_mask
   from classifier.storage import colorize_class_map, decode_class_map
   from coastline import read_water_mask
 
@@ -1529,14 +1511,13 @@ def api_classifier_tile(tile_id: str):
       )
       rgb = colorize_class_map(_np.asarray(label_image), class_schema)
     if effective_water is not None:
-      # The render mask is stored south-first; paint its exact effective area
-      # over the classifier in hot pink so the derived fjord geometry and the
-      # debug presentation cannot disagree.
-      water_image = _Image.fromarray(
-        _np.ascontiguousarray(_np.asarray(effective_water, dtype=_np.uint8)[::-1]),
-        mode="L",
-      ).resize((resolution, resolution), _Image.Resampling.NEAREST)
-      rgb[_np.asarray(water_image, dtype=_np.uint8) != 0] = (255, 42, 161)
+      # Reconstruct the terrain-grid boundary at the output resolution before
+      # painting it. The midpoint threshold preserves a binary authoritative
+      # mask while avoiding visibly enlarged 65x65 grid steps.
+      render_water = smooth_effective_water_mask(
+        effective_water, resolution, resolution,
+      )
+      rgb[render_water] = (255, 42, 161)
   except (TypeError, ValueError, zlib.error):
     return Response(
       b"", status=500,
