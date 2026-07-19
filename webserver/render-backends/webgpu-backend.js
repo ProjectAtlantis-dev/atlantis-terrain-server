@@ -63,9 +63,6 @@ export function createTerrainBackend({
     },
     setFogDensity(value) { fogDensity.value = value; },
     setMapMode(active) { fogDensity.value = active ? 0 : fogDensity.value; },
-    createWater() {
-      return { mesh: null, update() {}, dispose() {} };
-    },
     prepareUntexturedTerrain(mesh) {
       if (!mesh?.material || mesh.material.map) return;
       let needsUpdate = false;

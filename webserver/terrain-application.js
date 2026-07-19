@@ -527,14 +527,6 @@ Ellipsoid.WGS84
   .decompose(terrainRoot.position, terrainRoot.quaternion, terrainRoot.scale);
 scene.add(terrainRoot);
 
-// --- Water plane ---
-// Large flat water surface at z=0.5 in terrainRoot local coords.
-// Ocean terrain is shaped below sea level, so water floats above the seabed.
-// Land terrain rises well above 0.5 and naturally occludes the water.
-const WATER_EXTENT = 200000; // 200km each direction — covers all visible ocean
-const water = renderBackend.createWater({ extent: WATER_EXTENT });
-if (water.mesh) terrainRoot.add(water.mesh);
-
 const camMarkerGeo = new THREE.ConeGeometry(200, 600, 4);
 const camMarker = new THREE.Mesh(
   camMarkerGeo,
@@ -1984,9 +1976,6 @@ function render() {
   const fogStrength = controls._fogStrength ?? renderBackend.defaultFogStrength;
   renderBackend.setFogDensity(fogStrength / getFogDistance());
   renderBackend.setMapMode(controls.mapMode);
-
-  // Keep classifier colors—including the effective-water pink—unobstructed.
-  water.update(clock.elapsedTime, sunDirection, !controls.mapMode && !classifierRuntime.active);
 
   // Terrain streaming: check if camera moved far enough to re-fetch
   if (!terrainPipelineState.firstLoad) {

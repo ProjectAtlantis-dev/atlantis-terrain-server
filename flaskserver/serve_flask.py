@@ -7,6 +7,7 @@ import logging
 import math
 import os
 import re
+import socket
 import sqlite3
 import threading
 import time
@@ -68,6 +69,19 @@ def _env_int(name: str, default: int) -> int:
     return int(raw)
   except (TypeError, ValueError):
     return default
+
+
+def _require_available_port(host: str, port: int) -> None:
+  """Abort startup before backend initialization when Flask cannot bind."""
+  family = socket.AF_INET6 if ":" in host else socket.AF_INET
+  try:
+    with socket.socket(family, socket.SOCK_STREAM) as probe:
+      probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+      probe.bind((host, port))
+  except OSError as exc:
+    raise SystemExit(
+      f"Flask startup aborted: cannot bind to {host}:{port}: {exc}"
+    ) from exc
 
 
 # In-memory ring buffer of raw client log entries for the HTML viewer.
@@ -2019,6 +2033,9 @@ def static_files(path: str):
 
 if __name__ == "__main__":
   logging.getLogger("werkzeug").setLevel(logging.WARNING)
+  host = os.environ.get("FLASK_HOST", "127.0.0.1")
+  port = int(os.environ.get("FLASK_PORT", "5180"))
+  _require_available_port(host, port)
   if DIST_DIR.exists():
     log.info(f"Serving static dist from: {DIST_DIR}")
   else:
@@ -2028,8 +2045,6 @@ if __name__ == "__main__":
   _bootstrap_backend()
   if not _backend_ready:
     raise SystemExit(f"Backend init failed: {_backend_error}")
-  host = os.environ.get("FLASK_HOST", "127.0.0.1")
-  port = int(os.environ.get("FLASK_PORT", "5180"))
   ws_port = int(os.environ.get("WS_PORT", "5181"))
   ws_thread = threading.Thread(target=_start_ws_server, args=(host, ws_port), daemon=True)
   ws_thread.start()

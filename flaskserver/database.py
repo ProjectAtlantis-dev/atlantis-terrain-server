@@ -322,6 +322,9 @@ def open_db(path=None):
     if "terrain_seam_cache" not in existing:
         log_db.info("Created table: terrain_seam_cache")
 
+    from coastline import ensure_water_floor_version
+    ensure_water_floor_version(db)
+
     return db
 
 

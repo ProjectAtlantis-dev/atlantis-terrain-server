@@ -30,6 +30,12 @@ log_coast = get_logger("terrain.coastline")
 
 OFFICIAL_COASTLINE_VERSION = 1
 OFFICIAL_COASTLINE_SOURCE = "govmin_gl_aabent_land"
+
+# Masked water is dropped below sea level at read time so a sea-level water
+# surface has volume above the seabed. Bump WATER_FLOOR_VERSION whenever the
+# derived geometry changes: open_db() flushes every cached seam on mismatch.
+WATER_FLOOR_DROP_M = 10.0
+WATER_FLOOR_VERSION = 2
 _WMS_URL = "https://gis.govmin.gl/geoserver/wms"
 _WMS_LAYER = "Greenland:gl_aabent_land"
 _OVERSAMPLE = 8
@@ -117,9 +123,10 @@ def apply_water_mask(heightmap, water):
         raise ValueError(
             f"water mask shape {water.shape} does not match DEM {result.shape}"
         )
+    floor = np.float32(-WATER_FLOOR_DROP_M)
     finite_water = water & np.isfinite(result)
-    result[finite_water] = np.minimum(result[finite_water], np.float32(0.0))
-    result[water & ~np.isfinite(result)] = np.float32(0.0)
+    result[finite_water] = np.minimum(result[finite_water], floor)
+    result[water & ~np.isfinite(result)] = floor
     return result
 
 
@@ -198,6 +205,30 @@ def cache_official_water_mask(db, tile_id: str, bbox=None, resolution=65):
     return water
 
 
+def ensure_water_floor_version(db) -> None:
+    """Flush every cached seam once when the derived water geometry changes.
+
+    Seams are baked from effective heightmaps, so a change to how the water
+    floor is derived staleness-poisons the whole seam cache even though no
+    mask row was rewritten.
+    """
+    row = db.execute(
+        "SELECT value FROM metadata WHERE key = 'water_floor_version'"
+    ).fetchone()
+    if row is not None and int(row[0]) == WATER_FLOOR_VERSION:
+        return
+    deleted = db.execute("DELETE FROM terrain_seam_cache").rowcount
+    db.execute(
+        "INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)",
+        ("water_floor_version", str(WATER_FLOOR_VERSION)),
+    )
+    db.commit()
+    log_coast.info(
+        f"[coastline] water floor version -> {WATER_FLOOR_VERSION}, "
+        f"flushed {deleted} cached seams"
+    )
+
+
 def effective_heightmap(db, tile_id: str, raw_heightmap):
     """Apply a cached mask at read time while preserving stored raw samples.
 
@@ -208,7 +239,7 @@ def effective_heightmap(db, tile_id: str, raw_heightmap):
     water = read_water_mask(db, tile_id)
     if raw_heightmap is None:
         if water is not None and np.all(water):
-            return np.zeros(water.shape, dtype=np.float32)
+            return np.full(water.shape, -WATER_FLOOR_DROP_M, dtype=np.float32)
         return None
     if water is None:
         return raw_heightmap

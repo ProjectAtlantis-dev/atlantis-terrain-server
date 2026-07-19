@@ -11,6 +11,7 @@ from PIL import Image
 
 from coastline import (
     _OVERSAMPLE,
+    WATER_FLOOR_DROP_M,
     apply_water_mask,
     fetch_official_water_mask,
     read_water_mask,
@@ -52,13 +53,14 @@ class OfficialCoastlineTest(unittest.TestCase):
             ),
         )
 
-    def test_applies_sea_level_only_to_water(self):
+    def test_drops_water_floor_only_on_water(self):
         heightmap = np.array([[100.0, 20.0], [50.0, np.nan]], dtype=np.float32)
         water = np.array([[True, False], [False, True]])
         original = heightmap.copy()
         result = apply_water_mask(heightmap, water)
+        floor = -WATER_FLOOR_DROP_M
         np.testing.assert_array_equal(
-            result, np.array([[0.0, 20.0], [50.0, 0.0]], dtype=np.float32)
+            result, np.array([[floor, 20.0], [50.0, floor]], dtype=np.float32)
         )
         np.testing.assert_array_equal(heightmap, original)
 
@@ -94,7 +96,7 @@ class OfficialCoastlineTest(unittest.TestCase):
             np.testing.assert_array_equal(read_water_mask(db, "0-0-0"), water)
 
             effective = read_tile(db, "0-0-0")["heightmap"]
-            np.testing.assert_array_equal(effective[:, :10], 0.0)
+            np.testing.assert_array_equal(effective[:, :10], -WATER_FLOOR_DROP_M)
             np.testing.assert_array_equal(effective[:, 10:], 120.0)
             db.close()
 
