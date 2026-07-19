@@ -33,17 +33,17 @@ The backend in /flaskserver manages terrain heightmaps and textures in a SQLite 
 
 ## Texture Pipeline
 
-Real imagery down to depth 12, invented detail below it.
+Real imagery through depth 13, classifier-anchored procedural detail below it.
 
-    dataforsyningen (faithful, depth ≤ 12) → procedural synthesis (gorgeous + deterministic, depth ≥ 13)
+    dataforsyningen (faithful, depth ≤ 13) → procedural synthesis (deterministic, depth ≥ 14)
 
 1. **Bootstrap**: On first run, the server seeds the tile grid as empty skeletons (no heightmaps, no textures). These define the quadtree structure up to the target depth.
 2. **tex-worker** fetches from Dataforsyningen WMS (SPOT 6/7 1.6m, EPSG:3184) on demand. If it fails (rate limit, timeout, no coverage), the tile stays uncached and an ancestor texture is cropped and served as a placeholder until the next request retries.
 3. Dataforsyningen WMS requires EPSG:3184 (not 3413). The fetch reprojects 3413→3184 for the request, then warps the result back to 3413 with Lanczos resampling.
-4. Dataforsyningen runs out of detail around depth 13 (SPOT is 1.6 m/px). Below that, accuracy vs reality stops mattering: **depth 12 already tells us what goes where**. A coarse class map at d12 scale (water / grey / dark slopes & shadows / green / white — see `flaskserver/classifier/biomes.py`) is the entire semantic contract.
-5. **Everything below depth 12 is procedural** (work in progress): per-class texture and asset synthesis, seeded from absolute EPSG:3413 coordinates so every visit renders identical detail, color-anchored to the real d12 imagery so the transition doesn't pop. Judged on looks, not fidelity. Google imagery is a labeling/measurement reference only and never ships.
+4. A 256px depth-13 tile is about 1.3 m/px, enough to deliver the native 1.6 m SPOT source. Finer real tiles would only oversample that imagery and the 10 m DEM. After the full terrain response settles, procgen probes classifier pages from the finest resident tiles back through their ancestors, latches the best available coverage while it overlaps the active area, and only reconsiders it after the player leaves. Depth 12 is therefore a fallback, not a hardcoded classifier ceiling.
+5. **Everything below depth 13 is procedural** (work in progress): per-class material and asset synthesis, seeded from absolute EPSG:3413 coordinates so every visit renders identical detail. Near-field LAAS normals, roughness, scatter and restrained class tint are anchored to the resident satellite albedo, so a generic classifier palette cannot become a camera-following color island. Google imagery is a labeling/measurement reference only and never ships.
 
-Retired approaches, kept in git history only: SUPIR/ComfyUI enhance (`dataforsyningen_enhanced`/`upscaled` sources — never worked right) and the learned recoloring model (`classifier/train_color.py`/`classifier/colorize.py`, served as `?stage=colorized` — RGB imitation of Google produced unstable garbage).
+The SUPIR/ComfyUI enhancer remains an experimental, operator-only path for paid/manual jobs; it is never part of base terrain streaming and stays disabled unless `.env` explicitly opts in. The learned recoloring model (`classifier/train_color.py`/`classifier/colorize.py`, served as `?stage=colorized`) is retired: RGB imitation of Google produced unstable results.
 
 The eyeball harness is the **tile inspector** (`pipeline.html?tile=<id>`): a tile's progress through every stage — heightmap → southness → texture → google ref → buckets → procgen — with per-stage status, keyboard navigation across tiles and depths, and a flag button that files the tile as a classifier regression case.
 
@@ -77,7 +77,7 @@ source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-Create a `.env` file in `flaskserver/` with your API token:
+Copy `flaskserver/.env.example` to `flaskserver/.env` and add your API token:
 ```
 DATAFORSYNINGEN_TOKEN=<your-token>
 ```

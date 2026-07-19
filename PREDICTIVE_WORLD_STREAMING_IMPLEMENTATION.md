@@ -312,3 +312,24 @@ vanished, then grass/plants/rocks changed when only the camera view moved.
   modules. The only browser warning in the probe was the already-known optional
   asset service on port 8787 being unavailable; no shader/pipeline/WebGPU
   validation error was emitted.
+
+### 2026-07-19 - Best-available classifier latch and depth-13 source tier
+
+- Classifier pages now resolve finest-first from the resident render tile
+  through its ancestors after the full terrain response has settled. The
+  selected pages are retained for the lifetime of their overlap with the active
+  procgen window, preventing asynchronous LOD activity from changing placement
+  under a stationary player. Once the area has been left, a revisit is free to
+  select newly available finer pages.
+- The previous `ENHANCE_DEPTH` traversal stop accidentally made the advertised
+  depth-13 full pass unreachable. Terrain now has an independent depth-13
+  ceiling, matching the native 1.6 m SPOT imagery without pretending that
+  depth 14 would add source detail.
+- The near material no longer replaces satellite albedo with a moving generic
+  LAAS color disc. Satellite color remains authoritative and classifier-driven
+  procedural color is a restrained luminance-matched detail contribution.
+- Live verification at the reported location returned 292 depth-13 terrain
+  meshes, selected 12 depth-13 classifier pages with no coarse page used, and
+  preserved 6,753 grass, 36 plant and 6,260 rock draws across an exact mouse
+  turn-away/turn-back. Automated coverage is 89 Web and 19 Python tests; the
+  production build and Python compilation pass.

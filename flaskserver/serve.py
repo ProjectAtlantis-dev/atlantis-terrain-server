@@ -26,7 +26,7 @@ from database import (
     open_db, read_tile, read_tile_metadata, write_tile, TileClobberError,
     GRID_N, CONFIDENCE, _tile_id, _tile_bbox, compute_geometric_error,
 )
-from terrain_config import ENHANCE_DEPTH
+from terrain_config import TERRAIN_MAX_DEPTH
 
 
 REAL_SOURCES = ('arcticdem', 'arcticdem_10m', 'copernicus', 'upscaled', 'supir_upscaled', 'parent_resampled')
@@ -189,10 +189,15 @@ def _traverse(db, depth, col, row, qx, qy, max_depth, error_threshold,
             log_trav.debug(f"{tid}: screen_error={screen_error:.6f} threshold={error_threshold:.6f} dist={dist:.0f}")
 
         if screen_error > error_threshold:
-            # Hard subdivision ceiling — enhanced textures are the final quality.
-            if depth >= ENHANCE_DEPTH:
+            # Hard source-detail ceiling. This is deliberately independent of
+            # the depth-12 ComfyUI enhancement workflow: real SPOT imagery has
+            # useful native detail through depth 13.
+            if depth >= TERRAIN_MAX_DEPTH:
                 if _debug:
-                    log_trav.debug(f"{tid}: depth>={depth} — NOT subdividing (depth-{ENHANCE_DEPTH} ceiling) real={has_real_data}")
+                    log_trav.debug(
+                        f"{tid}: depth>={depth} — NOT subdividing "
+                        f"(depth-{TERRAIN_MAX_DEPTH} source ceiling) real={has_real_data}"
+                    )
                 if has_real_data:
                     results.append(tid)
                 elif tid not in _no_data_cache:

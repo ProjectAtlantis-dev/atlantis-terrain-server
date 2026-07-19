@@ -593,11 +593,12 @@ export class Forests {
             compact: this.compact,
             groupBase: offsets[g] ?? 0,
             fade: fadeFor(pool.cls, ring),
-            // Whole-instance thresholds made individual tundra plants blink
-            // between geometry rings as the camera translated. Ground flora
-            // and rigid rocks use a stable object-surface dissolve; only tree
-            // crowns retain the cheaper per-instance transition.
-            surfaceDither: pool.cls >= 18 || isUnderClass(pool.cls),
+            // Herbaceous cards can dissolve over their surface. Rigid rocks
+            // must use the shared per-instance threshold: high/low rock meshes
+            // have different surfaces, so surface masks overlap and shimmer
+            // under stationary TAA jitter instead of forming a complementary
+            // LOD partition.
+            surfaceDither: isUnderClass(pool.cls),
             wind: windBind,
             // flower classes (12–15) + morphology tundra plants (24–31) carry a
             // part-id vdata.x, so their flower heads collapse out of bloom.

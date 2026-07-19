@@ -153,9 +153,9 @@ export function applyDitherFade(
 ): void {
   // Screen-coordinate IGN made rigid rocks change their visible pixels when
   // the camera merely rotated (sparkle/VCR shimmer and apparent movement).
-  // Instance draws provide a camera-stable threshold shared by both LODs;
-  // rigid rocks use object-surface noise so an opaque boulder does not switch
-  // wholesale. Impostors retain a deterministic vertex-domain fallback.
+  // Instance draws provide a camera-stable threshold shared by both LODs.
+  // Callers may opt flexible card vegetation into object-surface dissolve;
+  // rigid meshes must keep the shared instance threshold across both LODs.
   const ign = stableNoise ?? varying(positionLocal.x.mul(12.9898).sin().mul(43758.5453).fract());
   let draw: NB | null = null;
   if (fade.fadeInAt !== undefined) {
@@ -293,10 +293,9 @@ export function instanceVeg(
     vec3(slotHash(slot, 17), slotHash(slot, 91), slotHash(slot, 333)),
   ) as unknown as NV3;
   if (f && (f.fadeInAt !== undefined || f.fadeOutAt !== undefined)) {
-    // Rigid opaque rocks need a spatial crossfade: one threshold per instance
-    // makes the entire object blink between rings. positionLocal is stable
-    // across camera motion/rotation and is already consumed by rock shading,
-    // so this adds no screen-space crawl and no extra varying location.
+    // Surface dissolve is only safe when corresponding LODs share a surface.
+    // Rigid rock meshes do not, so their caller leaves this disabled and both
+    // rings use the same per-instance threshold.
     const surfaceNoise = positionLocal
       .mul(11.37)
       .dot(vec3(12.9898, 78.233, 37.719))

@@ -626,3 +626,38 @@ the existing full-scene render/streaming problem owned by `PERF_REWORK.md`, not 
 change vehicle behavior. The historical `Math.min(0.05, clock.getDelta())` also remains
 unchanged pending a coordinated shared fixed-step decision after rendering performance is
 healthy.
+
+### 2026-07-19 — live-verifier persistence correction
+
+- The first acceptance script used the real movement and persistence path, so its V-22
+  transition runs unintentionally saved test positions to the live asset database. This was
+  a validation-harness defect, not a renderer visibility result.
+- Restored both records to the exact states captured before the first acceptance run:
+  Patria `64.18867881, -51.68565638`, heading `275.095`, Z `70.644`; Osprey
+  `64.18990439, -51.68699431`, heading `169.456`, Z `613.043`.
+- Added boot-only `?vehiclePersistence=0`. The live verifier now forces this flag while still
+  exercising real movement, controls, visuals, maps, and firing. Normal production sessions
+  retain persistence by default.
+
+### 2026-07-19 — restored-vehicle visibility correction
+
+- Live inspection confirmed Patria loaded all nine meshes but started with its root group
+  explicitly hidden while it waited for the saved terrain depth. In a heavily loaded scene,
+  that streaming wait made the physical vehicle appear permanently missing.
+- Restored vehicles now render immediately at their persisted Z, which is already part of the
+  saved state. The existing terrain-depth gate and initial-snap path remain active and refine
+  ground contact when the requested tile arrives; no terrain fidelity was removed.
+- The live verifier now fails if any loaded vehicle has an invisible group or zero meshes, so
+  this specific disappearance cannot pass acceptance again.
+
+### 2026-07-19 — WebGPU traversal hitch correction
+
+- Direct comparison against the local `atlantis-terrain-server` `vehicle_splitting` working
+  tree confirmed that Patria drive integration, suspension, terrain-contact cadence, and
+  chase-camera transforms already match the fun WebGL reference. Those values remain intact.
+- The WebGPU-only CSM policy was treating every 5 cm of controlled-vehicle travel as an
+  urgent near-cascade invalidation. At normal Patria speed this forced a complete near shadow
+  render on essentially every displayed frame, a cost that does not exist in the reference.
+- During active traversal, near-cascade camera drift now gets an eight-texel window and
+  vehicle-only invalidation is capped at 10 Hz. Stationary camera/sun/stream/recenter policy
+  remains unchanged; TAA and contact shadows cover the small moving-shadow latency.

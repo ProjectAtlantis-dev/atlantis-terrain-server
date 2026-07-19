@@ -19,6 +19,10 @@ import { updateSunUniforms } from './laas/render/VegMaterials.ts';
 import { mountSeasonUI } from './laas/render/Season.ts';
 import { setWindContext } from './laas/render/Wind.ts';
 import { parseTileId } from './procgen/chunk-window.js';
+import {
+  classifierSourceCandidates,
+  classifierSourcesCoverBounds,
+} from './procgen/classifier-source.js';
 import { sampleTriangulatedHeight } from './terrain-height-sampling.js';
 
 const PATCH_WORLD_SIZE = 768; // 384 m half-width: 265 m lush ring + guard band
@@ -89,11 +93,13 @@ function finestSourceAt(tiles, x, y) {
   return best;
 }
 
-function finestFieldSourceAt(tiles, x, y) {
+function finestFieldSourceAt(sources, x, y) {
   let best = null;
-  for (const tile of tiles) {
-    if (!tile.fields || x < tile.xMin || x > tile.xMax || y < tile.yMin || y > tile.yMax) continue;
-    if (!best || tile.metresPerSample < best.metresPerSample) best = tile;
+  for (const source of sources) {
+    if (!source?.fields
+        || x < source.xMin || x > source.xMax
+        || y < source.yMin || y > source.yMax) continue;
+    if (!best || source.metresPerSample < best.metresPerSample) best = source;
   }
   return best;
 }
@@ -147,7 +153,7 @@ function cameraWindowAt(x, y) {
 
 // Sample only the compact player clipmap from the finest resident DEM/field
 // tiles. Missing coverage delays the clipmap instead of inventing terrain.
-function buildWindow(descriptor, sourceTiles) {
+function buildWindow(descriptor, sourceTiles, fieldSources) {
   const heights = new Float32Array(PATCH_RES * PATCH_RES);
   const heightSourceIds = new Set();
   const fieldSourceIds = new Set();
@@ -163,7 +169,7 @@ function buildWindow(descriptor, sourceTiles) {
     for (let col = 0; col < PATCH_RES; col++) {
       const x = descriptor.xMin + ((col + 0.5) / PATCH_RES) * PATCH_WORLD_SIZE;
       const source = finestSourceAt(sourceTiles, x, y);
-      const fieldSource = finestFieldSourceAt(sourceTiles, x, y);
+      const fieldSource = finestFieldSourceAt(fieldSources, x, y);
       if (!source || !fieldSource) return null;
       heightSourceIds.add(source.id);
       fieldSourceIds.add(fieldSource.id);
@@ -299,6 +305,7 @@ async function makeEmptyCanopy(renderer) {
 export class GreenlandPatch {
   constructor(terrainRoot, seedN, {
     loadFields = null,
+    classifierSelectionReady = null,
     getCSM = null,
     getSunLight = null,
     onWindowChanged = null,
@@ -307,6 +314,7 @@ export class GreenlandPatch {
     this.seedN = seedN >>> 0;
     this.procgenVersion = 0;
     this.loadFields = loadFields;
+    this.classifierSelectionReady = classifierSelectionReady;
     this.getCSM = getCSM;
     this.getSunLight = getSunLight;
     this.onWindowChanged = onWindowChanged;
@@ -329,6 +337,7 @@ export class GreenlandPatch {
     this.nextBuildAttempt = 0;
     this.activeSlot = null;
     this.inactiveSlot = null;
+    this.classifierSources = [];
     this.motionDetailActive = true;
     this._diag = 0;
   }
@@ -477,15 +486,72 @@ export class GreenlandPatch {
   }
 
   async _loadClassifier(sourceTiles, descriptor) {
-    if (!this.loadFields) return false;
+    if (!this.loadFields) return null;
     const needed = sourceTiles.filter(tile => (
       tile.xMax >= descriptor.xMin && tile.xMin <= descriptor.xMax &&
       tile.yMax >= descriptor.yMin && tile.yMin <= descriptor.yMax
-    ));
-    await Promise.all(needed.map(async tile => {
-      tile.fields = await this.loadFields(tile.id);
-    }));
-    return needed.some(tile => tile.fields != null);
+    )).sort((a, b) => b.depth - a.depth || a.metresPerSample - b.metresPerSample);
+    if (needed.length === 0) return null;
+
+    const intersectsWindow = source => (
+      source.xMax >= descriptor.xMin && source.xMin <= descriptor.xMax &&
+      source.yMax >= descriptor.yMin && source.yMin <= descriptor.yMax
+    );
+    const coversTile = (source, tile) => (
+      source.xMin <= Math.max(tile.xMin, descriptor.xMin) &&
+      source.xMax >= Math.min(tile.xMax, descriptor.xMax) &&
+      source.yMin <= Math.max(tile.yMin, descriptor.yMin) &&
+      source.yMax >= Math.min(tile.yMax, descriptor.yMax)
+    );
+
+    // Leaving an area releases its choice. Pages still touching the active
+    // window remain latched even if finer render imagery arrives underneath.
+    const latched = this.classifierSources.filter(intersectsWindow);
+    const selected = [...latched];
+    const selectedIds = new Set(selected.map(source => source.id));
+    for (let start = 0; start < needed.length;) {
+      const depth = needed[start].depth;
+      let end = start + 1;
+      while (end < needed.length && needed[end].depth === depth) end++;
+      // A fallback selected for one fine peer must not hide an already-ready
+      // fine page beside it. Only selections from earlier visits/finer depth
+      // groups suppress probes within this group.
+      const groupStartSources = [...selected];
+      for (const tile of needed.slice(start, end)) {
+        if (groupStartSources.some(source => coversTile(source, tile))) continue;
+        let chosen = null;
+        for (const candidate of classifierSourceCandidates(tile)) {
+          if (selectedIds.has(candidate.id)) {
+            chosen = selected.find(source => source.id === candidate.id) ?? null;
+          } else {
+            const fields = await this.loadFields(candidate.id);
+            if (fields) {
+              const res = fields.res ?? 0;
+              chosen = {
+                ...candidate,
+                fields,
+                metresPerSample: res > 1
+                  ? Math.max(
+                      candidate.xMax - candidate.xMin,
+                      candidate.yMax - candidate.yMin,
+                    ) / (res - 1)
+                  : Infinity,
+              };
+            }
+          }
+          if (chosen) break;
+        }
+        if (!chosen) return null;
+        if (!selectedIds.has(chosen.id)) {
+          selected.push(chosen);
+          selectedIds.add(chosen.id);
+        }
+      }
+      if (classifierSourcesCoverBounds(selected, descriptor)) break;
+      start = end;
+    }
+    this.classifierSources = selected;
+    return selected;
   }
 
   _camTerrainLocal(camera) {
@@ -519,6 +585,14 @@ export class GreenlandPatch {
         || speed > DETAIL_PREWARM_SPEED_MAX) return;
     const now = performance.now();
     if (now < this.nextBuildAttempt) return;
+    // The preview response deliberately contains only coarse bootstrap tiles.
+    // Do not permanently latch one of those pages just before the full terrain
+    // response makes finer classifier inputs available. The callback describes
+    // streamer state, not a particular depth, so this remains source-agnostic.
+    if (this.classifierSelectionReady && !this.classifierSelectionReady()) {
+      this.nextBuildAttempt = now + RETRY_MS;
+      return;
+    }
     this.building = true;
     const startedAt = performance.now();
     try {
@@ -529,11 +603,12 @@ export class GreenlandPatch {
         this.nextBuildAttempt = now + RETRY_MS;
         return;
       }
-      if (!await this._loadClassifier(sourceTiles, descriptor)) {
+      const fieldSources = await this._loadClassifier(sourceTiles, descriptor);
+      if (!fieldSources) {
         this.nextBuildAttempt = now + RETRY_MS;
         return;
       }
-      const window = buildWindow(descriptor, sourceTiles);
+      const window = buildWindow(descriptor, sourceTiles, fieldSources);
       if (!window) {
         this.nextBuildAttempt = now + RETRY_MS;
         return;
@@ -554,7 +629,8 @@ export class GreenlandPatch {
         center: descriptor.id,
         worldSeed: this.seedN,
         procgenVersion: this.procgenVersion,
-        sourceTiles: sourceTiles.filter(tile => tile.fields).length,
+        sourceTiles: sourceTiles.length,
+        classifierPages: fieldSources.map(source => source.id),
         spanMetres: PATCH_WORLD_SIZE,
         res: PATCH_RES,
         libraryPools: this.vegLibrary.pools.length,
@@ -580,9 +656,10 @@ export class GreenlandPatch {
     const startedAt = performance.now();
     let fieldsReadyAt = startedAt;
     try {
-      if (!await this._loadClassifier(sourceTiles, descriptor)) return;
+      const fieldSources = await this._loadClassifier(sourceTiles, descriptor);
+      if (!fieldSources) return;
       fieldsReadyAt = performance.now();
-      const window = buildWindow(descriptor, sourceTiles);
+      const window = buildWindow(descriptor, sourceTiles, fieldSources);
       if (!window) return;
       // A second Forests/GroundRing graph caused a measured 12.5 s lazy
       // pipeline-compilation frame when first adopted. Keep one compiled render
@@ -614,7 +691,8 @@ export class GreenlandPatch {
       log('info', 'patch.recenter', {
         center: descriptor.id,
         spanMetres: PATCH_WORLD_SIZE,
-        sourceTiles: sourceTiles.filter(tile => tile.fields).length,
+        sourceTiles: sourceTiles.length,
+        classifierPages: fieldSources.map(source => source.id),
         fields: window.stats,
         timing: this.lastRecenterTiming,
         handoff: 'single-compiled-root-visible-during-rewrite',
@@ -665,7 +743,8 @@ export class GreenlandPatch {
     // window still covers its entire render radius.
     this.vegRoot.visible = wantsDetail && hasCompleteCoverage;
 
-    if (canPrewarm && !this.reseeding && !this.building) {
+    if (canPrewarm && !this.reseeding && !this.building
+        && (!this.classifierSelectionReady || this.classifierSelectionReady())) {
       const sourceTiles = collectTiles(this.terrainRoot);
       const lookahead = Math.min(FLIGHT_LOOKAHEAD_MAX, speed * 1.5);
       const descriptor = cameraWindowAt(

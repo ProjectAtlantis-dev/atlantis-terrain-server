@@ -111,9 +111,15 @@ export function createCloudGodRayShadowLength({
       CLOUD_GODRAY_MAX_DISTANCE_M,
     );
 
-    const jitter = hash12(
-      screenUV.mul(vec2(311.7, 761.3)).add(float(uFrame).mul(0.6180339887)),
-    );
+    // Full-res path: temporal jitter, averaged per-pixel by TAA. Scaled path:
+    // STATIC spatial dither only — animating the jitter at half res turns it
+    // into large coherent blobs that crawl over the terrain every frame
+    // (seen live 2026-07-19; TAA cannot average noise that is spatially
+    // coherent across many output pixels).
+    const jitterCoord = fullRes
+      ? screenUV.mul(vec2(311.7, 761.3)).add(float(uFrame).mul(0.6180339887))
+      : screenUV.mul(vec2(311.7, 761.3));
+    const jitter = hash12(jitterCoord);
 
     const segment = beerShadowMap
       .marchShadowLength(rayOrigin, rayDirection, maxDistance, jitter, {

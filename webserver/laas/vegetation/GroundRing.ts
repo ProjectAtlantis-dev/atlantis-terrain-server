@@ -48,12 +48,10 @@ import {
   instanceIndex,
   instancedArray,
   int,
-  interleavedGradientNoise,
   mix,
   normalLocal,
   positionLocal,
   positionWorld,
-  screenCoordinate,
   smoothstep,
   storage,
   texture,
@@ -98,6 +96,10 @@ const G_NEAR = 30;
 const G_MID = 70;
 /** crossfade half-width — cull overlap and material fade MUST share it */
 const G_BAND = 12;
+// The LAAS heightfield is a resampled representation of the rendered DEM.
+// Keep blade roots just above the triangle surface so tiny interpolation
+// differences cannot bury most of a short tundra blade at grazing angles.
+const GRASS_ROOT_LIFT = 0.08;
 const GRASS_CAPS = [524288, 1048576, 1835008]; // near/mid/far compact regions
 
 /**
@@ -166,6 +168,7 @@ function bandFade(
   fadeIn: number | null,
   fadeOut: number | null,
   band: number,
+  stableNoise: NF,
 ): void {
   const inV =
     fadeIn !== null
@@ -180,11 +183,10 @@ function bandFade(
   // the EXACT same draw condition — a depth-vs-color discard mismatch
   // punches holes at the fade bands. Main pass only (carpets cast no
   // shadows, so maskShadowNode never consults this).
-  const ign = interleavedGradientNoise(screenCoordinate.xy);
   let cond: NB | null = null;
-  if (inV) cond = ign.greaterThanEqual(float(1).sub(inV)) as unknown as NB;
+  if (inV) cond = stableNoise.greaterThanEqual(float(1).sub(inV)) as unknown as NB;
   if (outV) {
-    const c2 = ign.lessThan(outV) as unknown as NB;
+    const c2 = stableNoise.lessThan(outV) as unknown as NB;
     cond = cond ? ((cond as unknown as { and(o: NB): NB }).and(c2)) : c2;
   }
   mat.maskNode = cond as unknown as typeof mat.maskNode;
@@ -943,7 +945,7 @@ export class GroundRing {
     // random lean (shear) — vertical uniform blades read as planted corn
     mat.positionNode = vec3(
       rx.add(tilt.x.mul(ls.y)).add(dx).add(wpos.x),
-      ls.y.add(y).add(dy),
+      ls.y.add(y).add(GRASS_ROOT_LIFT).add(dy),
       rz.add(tilt.y.mul(ls.y)).add(dz).add(wpos.y),
     );
     // Blade shading normal (feedback 2.7+2.9): yaw-rotate the baked rounded
@@ -1043,7 +1045,10 @@ export class GroundRing {
     mat.roughness = 0.88;
     mat.metalness = 0;
     mat.side = DoubleSide;
-    bandFade(mat, dist, fades[0], fades[1], G_BAND);
+    // Use the same world-cell threshold for every grass LOD. A screen-space
+    // threshold changed as the camera pitched, making an otherwise unchanged
+    // carpet disappear even while the GPU draw counts remained constant.
+    bandFade(mat, dist, fades[0], fades[1], G_BAND, h2.x);
     return mat;
   }
 
@@ -1073,7 +1078,7 @@ export class GroundRing {
       return vec3(rx.add(wpos.x), ls.y.add(y).sub(sink), rz.add(wpos.y));
     })();
     const dist = wpos.sub(vec2(vegViewPos.x, vegViewPos.z)).length();
-    bandFade(mat, dist, null, DEB_R - 6, 5);
+    bandFade(mat, dist, null, DEB_R - 6, 5, h2.x);
   }
 
   update(renderer: Renderer, camera: PerspectiveCamera): void {

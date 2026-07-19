@@ -21,7 +21,12 @@ from typing import Any, cast
 import asyncio
 
 from colored_log import get_logger
-from terrain_config import BOOTSTRAP_SEED_DEPTH, ENHANCE_DEPTH, ENHANCE_ENABLED
+from terrain_config import (
+  BOOTSTRAP_SEED_DEPTH,
+  ENHANCE_DEPTH,
+  ENHANCE_ENABLED,
+  TERRAIN_MAX_DEPTH,
+)
 from world_identity import ensure_world_identity, read_world_identity
 
 log = get_logger("terrain")
@@ -475,10 +480,10 @@ def _bootstrap_backend() -> None:
 
     tile_count = db.execute("SELECT COUNT(*) FROM tiles").fetchone()[0]
     if tile_count == 0:
-      seed_depth = max(0, min(BOOTSTRAP_SEED_DEPTH, ENHANCE_DEPTH))
+      seed_depth = max(0, min(BOOTSTRAP_SEED_DEPTH, TERRAIN_MAX_DEPTH))
       log_db.info(
         f"Empty tiles table — fast bootstrap seed to depth {seed_depth} "
-        f"(target ceiling depth {ENHANCE_DEPTH})..."
+        f"(target ceiling depth {TERRAIN_MAX_DEPTH})..."
       )
       seed_tiles(db, max_depth=seed_depth)
       tile_count = db.execute("SELECT COUNT(*) FROM tiles").fetchone()[0]
@@ -490,10 +495,13 @@ def _bootstrap_backend() -> None:
     # Keep traversal ceiling metadata at full target depth, even if bootstrap
     # seeded fewer levels initially.
     cur_max = db.execute("SELECT value FROM metadata WHERE key = 'max_depth'").fetchone()
-    if cur_max is None or int(cur_max[0]) < ENHANCE_DEPTH:
-      db.execute("INSERT OR REPLACE INTO metadata (key, value) VALUES ('max_depth', ?)", (str(ENHANCE_DEPTH),))
+    if cur_max is None or int(cur_max[0]) < TERRAIN_MAX_DEPTH:
+      db.execute(
+        "INSERT OR REPLACE INTO metadata (key, value) VALUES ('max_depth', ?)",
+        (str(TERRAIN_MAX_DEPTH),),
+      )
       db.commit()
-      log_db.info(f"Updated max_depth metadata to {ENHANCE_DEPTH}")
+      log_db.info(f"Updated max_depth metadata to {TERRAIN_MAX_DEPTH}")
 
     world_identity = ensure_world_identity(db)
     log_db.info(
@@ -1001,7 +1009,7 @@ def api_tiles():
     return unavailable
 
   error = _arg_float("error", 0.0005)
-  max_depth = _arg_int("maxDepth", 13)
+  max_depth = _arg_int("maxDepth", TERRAIN_MAX_DEPTH)
   max_range = _arg_float("range", 16000.0)
   manifest_only = request.args.get("manifest", "0").lower() in {"1", "true", "yes"}
   default_budget = 384 if manifest_only else 2500

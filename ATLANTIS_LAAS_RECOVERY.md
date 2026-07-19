@@ -459,3 +459,33 @@ regression is fixed and verified against the live WebGPU client.
   probe emitted no WebGPU shader, pipeline, validation or command-buffer error.
   The optional model service on port 8787 remained unavailable and produced
   its existing startup fallback warning.
+
+### 2026-07-19 - Satellite-anchored ground color and latched best classifier
+
+Status: implemented and live-probed at the user's reported coordinates.
+
+- The moving white/grey island was the LAAS ground material replacing 100% of
+  the resident satellite albedo inside a camera-following 270 m radius. The
+  streamed texture now remains the color/luminance authority. LAAS retains its
+  full normal and roughness response, while its classifier palette contributes
+  only an 18% luminance-matched micro tint.
+- Classifier selection is not fixed to depth 12. On entering an area the client
+  waits for the full terrain response, probes its finest resident render tiles
+  and walks their ancestors only where a field page is unavailable. Chosen
+  pages remain latched while they overlap the active procgen window, so later
+  render-LOD activity cannot change a visible population. Leaving the area
+  releases the choice; a revisit can adopt newly available finer pages.
+- Terrain residency and AI enhancement no longer share a ceiling. Real SPOT
+  imagery streams through depth 13 (about 1.3 m/px for a 256 px tile), while
+  the optional ComfyUI workflow remains a separate depth-12 operation.
+- At 64.18852, -51.68211, 180 m and heading 87 degrees, a mouse turn away and
+  back retained cell `1920:576`, 7,640 plant candidates, 24,707 rock candidates,
+  and identical GPU draw counts: 6,753 grass, 36 plants and 6,260 rocks. All 12
+  classifier pages actually sampled were depth 13. The procgen root remained
+  visible throughout; no browser/WebGPU errors occurred.
+- The local backend returned depth-13 residency and reached the configured
+  ComfyUI queue at `127.0.0.1:8188`. Comfy enhancement is environment-gated
+  and is not suitable as a public anonymous endpoint; billing/authentication
+  must sit in front of it before hosted use.
+- Verification: 89/89 Web tests, 19 Python tests, Python compilation and the
+  Vite production build pass.

@@ -1,6 +1,9 @@
 import { writeFile } from 'node:fs/promises';
 
-const browserUrl = process.argv[2] ?? 'http://127.0.0.1:5173/webgpu.html';
+const requestedUrl = new URL(process.argv[2] ?? 'http://127.0.0.1:5173/webgpu.html');
+// Acceptance drives real gameplay, but it must never move persisted user vehicles.
+requestedUrl.searchParams.set('vehiclePersistence', '0');
+const browserUrl = requestedUrl.href;
 const cdpBase = process.argv[3] ?? 'http://127.0.0.1:9223';
 const sleep = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
 
@@ -93,6 +96,9 @@ const initial = await evaluate(`(() => ({
     return found;
   })(),
 }))()`);
+if (initial.registry.some(entry => entry.loaded && (!entry.visible || entry.meshCount === 0))) {
+  throw new Error(`Loaded vehicle is not physically visible: ${JSON.stringify(initial.registry)}`);
+}
 
 await evaluate(`window.takramDebug.selectVehicle('osprey-01'); window.takramDebug.setVehicleControlActive(true)`);
 await evaluate(`window.dispatchEvent(new KeyboardEvent('keydown', { code: 'KeyE' })); window.dispatchEvent(new KeyboardEvent('keyup', { code: 'KeyE' }))`);
@@ -118,6 +124,9 @@ const googlePanel = await evaluate(`(() => {
 await evaluate(`window.takramDebug.selectVehicle('amv-01'); window.takramDebug.setVehicleControlActive(true); window.takramDebug.setVehicleTurretControlActive(true)`);
 await evaluate(`window.takramDebug.setVehicleFireHeld(true); window.takramDebug.setVehicleFireHeld(false)`);
 const firing = await evaluate(`window.takramDebug.getVehicleFireSummary()`);
+const physicalVisibility = await evaluate(`window.takramDebug.getVehicleRegistry().map(entry => ({
+  id: entry.id, loaded: entry.loaded, visible: entry.visible, meshCount: entry.meshCount,
+}))`);
 
 await evaluate(`window.dispatchEvent(new KeyboardEvent('keydown', { code: 'KeyM' })); window.dispatchEvent(new KeyboardEvent('keyup', { code: 'KeyM' }))`);
 await sleep(2500);
@@ -142,6 +151,7 @@ console.log(JSON.stringify({
     && Math.abs(beforeR.lon - afterR.lon) < 1e-10,
   googlePanel,
   firing,
+  physicalVisibility,
   mapMarkers,
   vehiclePanel,
   browserErrors,

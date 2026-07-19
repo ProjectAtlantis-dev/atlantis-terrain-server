@@ -203,6 +203,7 @@ function bootQueryNumber(name, fallback) {
   const value = Number(raw);
   return Number.isFinite(value) ? value : fallback;
 }
+const VEHICLE_PERSISTENCE_ENABLED = bootQueryNumber('vehiclePersistence', 1) !== 0;
 
 // The main view is controlled entirely through its UI. Discard stale query
 // parameters instead of exposing URL state that does not stay in sync.
@@ -1155,9 +1156,17 @@ scene.add(terrainRoot);
 // receiving LAAS TerrainMaterial as their near-field visual LOD.
 if (typeof window !== 'undefined') window.__enqueueClientLog = enqueueClientLog;
 const PROCGEN_PATCH_ENABLED = BOOT_QUERY.get('procgenPatch') !== '0';
+// A preview pass is useful for immediate terrain, but is intentionally too
+// coarse to make the once-per-area classifier choice. This flips only after a
+// full response has actually settled (not merely when pass 2 is scheduled).
+let classifierSourceSelectionReady = false;
 const greenlandPatch = PROCGEN_PATCH_ENABLED
   ? new GreenlandPatch(terrainRoot, 1337, {
       loadFields: fetchTileFields,
+      // Classifier pages are an area-level decision. Wait for the full terrain
+      // response before choosing so the preview's coarse bootstrap page cannot
+      // win merely by arriving first; no classifier depth is prescribed here.
+      classifierSelectionReady: () => classifierSourceSelectionReady,
       getCSM: () => webgpuCsmShadowNode,
       getSunLight: () => webgpuAtmosphereLight,
       onWindowChanged: () => refreshProcgenTerrainMaterials(),
@@ -2397,6 +2406,7 @@ function createVehicleSaveSnapshot(entry, options = {}) {
 }
 
 async function saveVehicleEntryState(entry, reason = 'manual', options = {}) {
+  if (!VEHICLE_PERSISTENCE_ENABLED) return false;
   if (!entry?.loaded || entry.saveFailureUntil > Date.now()) return false;
   const state = createVehicleSaveSnapshot(entry, options);
   if (state == null) return false;
@@ -2605,7 +2615,11 @@ function loadVehicleModel(entry = groundVehicleState) {
       entry.verticalVelocity = 0;
       entry.lastContactDepth = -1;
       entry.lastContactTileId = null;
-      entry.group.visible = false;
+      // The persisted Z is a valid coarse placement. Keep the vehicle discoverable while
+      // the requested terrain depth streams in, then let the existing initial-snap path
+      // refine its ground contact. Hiding here can make a loaded vehicle appear missing
+      // indefinitely when terrain streaming is slow.
+      entry.group.visible = true;
       entry.marker.position.set(local.x, local.y, HOUSE_MARKER_BASE_LIFT);
       bootLog('vehicle.load.success', {
         id: entry.id,
@@ -4642,20 +4656,31 @@ function applyProcgenTerrainNodes(mesh, tex, contextValue) {
   const cameraDistance = laasPosition.sub(vegViewPos).length();
   const procedural = float(1).sub(smoothstep(270, 350, cameraDistance));
   const satellite = tex ? texture(tex, uv()).rgb : color(COLOR_WEBGPU_UNTEXTURED);
-  material.colorNode = mix(satellite, shading.colorNode, procedural);
-
-  // Blend the derived LAAS normal back to the real DEM normal over the same
-  // handoff. Convert terrain z-up normal -> LAAS y-up, blend, then return to
-  // the mesh's local z-up frame before Three transforms it into ECEF view.
-  const baseLaasNormal = vec3(normalLocal.x, normalLocal.z, normalLocal.y.negate());
-  const blendedLaasNormal = mix(baseLaasNormal, shading.worldNormalNode, procedural).normalize();
-  const terrainNormal = vec3(
-    blendedLaasNormal.x,
-    blendedLaasNormal.z.negate(),
-    blendedLaasNormal.y,
-  );
-  material.normalNode = transformNormalToView(terrainNormal);
-  material.roughnessNode = mix(float(1), shading.roughnessNode, procedural);
+  if (tex) {
+    // Textured imagery is the visual authority. Procedural color and normals
+    // previously made a pale, camera-following island and projected dark
+    // streaks/ovals over the real terrain. The classifier still drives asset
+    // placement, but it must not repaint or emboss satellite imagery.
+    material.colorNode = satellite;
+    material.normalNode = null;
+    material.roughnessNode = null;
+  } else {
+    // Fine height geometry may intentionally materialize before its imagery.
+    // In that short-lived case the classifier palette is better than a dark
+    // placeholder and is replaced as soon as the real texture arrives.
+    material.colorNode = mix(satellite, shading.colorNode, procedural);
+    // No imagery yet: retain the classifier material as a temporary visual
+    // and its derived micro-normal until the source texture arrives.
+    const baseLaasNormal = vec3(normalLocal.x, normalLocal.z, normalLocal.y.negate());
+    const blendedLaasNormal = mix(baseLaasNormal, shading.worldNormalNode, procedural).normalize();
+    const terrainNormal = vec3(
+      blendedLaasNormal.x,
+      blendedLaasNormal.z.negate(),
+      blendedLaasNormal.y,
+    );
+    material.normalNode = transformNormalToView(terrainNormal);
+    material.roughnessNode = mix(float(1), shading.roughnessNode, procedural);
+  }
   material.metalnessNode = float(0);
   material.vertexColors = false;
   mesh.userData.procgenTerrainMaterial = key;
@@ -4710,8 +4735,16 @@ function applyTerrainMaterialMode(mesh, tex) {
     return;
   }
   if (tex && mesh.material.map !== tex) {
+    // Texture→texture rebind keeps the same shader (USE_MAP define unchanged)
+    // — never invalidate the pipeline for it. Setting needsUpdate here made
+    // every streamed texture arrival and every map-mode toggle recompile the
+    // material: hundreds of tiles × pipeline compiles in one frame = the
+    // multi-second freeze on M (measured 2.8 s stall headless, ~25 s in a
+    // cold/contended session, 2026-07-19). null→texture DOES flip the define
+    // and must still recompile.
+    const hadMap = mesh.material.map != null;
     mesh.material.map = tex;
-    needsUpdate = true;
+    if (!hadMap) needsUpdate = true;
   }
   const contextValue = greenlandPatch?.terrainMaterialContext?.();
   if (contextValue && procgenContextIntersectsMesh(contextValue, mesh)) {
@@ -5202,6 +5235,7 @@ const tileFetchScheduler = createTerrainFetchScheduler({
     console.error('Fetch error:', err);
   },
   onSettled: () => {
+    if (tileFetchScheduler.pass === 2) classifierSourceSelectionReady = true;
     // Drain accumulated dt so the next render frame doesn't lurch the camera.
     clock.getDelta();
     requestRender();
@@ -5209,6 +5243,7 @@ const tileFetchScheduler = createTerrainFetchScheduler({
 });
 
 function fetchTiles(lat, lon) {
+  classifierSourceSelectionReady = false;
   return tileFetchScheduler.request(lat, lon);
 }
 
@@ -5407,6 +5442,8 @@ window.takramDebug = {
     id: entry.id,
     vehicleType: entry.vehicleType,
     loaded: entry.loaded,
+    visible: entry.group.visible,
+    meshCount: entry.meshes.length,
     displayName: entry.definition?.displayName ?? null,
     configuredParts: entry.vehicleType === 'aircraft' ? entry.definition?.parts ?? null : null,
     position: entry.group.position.toArray(),
@@ -6502,9 +6539,12 @@ const _shadowCasterScratch = new THREE.Vector3();
 // textured twin), so depth barely changes — coalesce to one refresh per hold
 // window instead of chasing the materialization trickle frame by frame.
 const CSM_REFRESH_POLICY = [
-  { driftTexels: 2, sunRadians: 0.05 * THREE.MathUtils.DEG2RAD, streamHoldMs: 2000, fallbackMs: 5000 },    // 0–500 m
-  { driftTexels: 2, sunRadians: 0.10 * THREE.MathUtils.DEG2RAD, streamHoldMs: 5000, fallbackMs: 15000 },   // 0.5–8 km
-  { driftTexels: 2, sunRadians: 0.20 * THREE.MathUtils.DEG2RAD, streamHoldMs: 10000, fallbackMs: 30000 }   // 8–50 km
+  // The camera and controlled vehicle travel together. During traversal, a wider drift
+  // window plus a 10 Hz vehicle-caster ceiling keeps the near CSM from becoming a mandatory
+  // full shadow render on every animation frame. TAA/contact shadows cover the small lag.
+  { driftTexels: 2, motionDriftTexels: 8, vehicleHoldMs: 100, sunRadians: 0.05 * THREE.MathUtils.DEG2RAD, streamHoldMs: 2000, fallbackMs: 5000 },    // 0–500 m
+  { driftTexels: 2, motionDriftTexels: 4, vehicleHoldMs: 250, sunRadians: 0.10 * THREE.MathUtils.DEG2RAD, streamHoldMs: 5000, fallbackMs: 15000 },   // 0.5–8 km
+  { driftTexels: 2, motionDriftTexels: 2, vehicleHoldMs: 500, sunRadians: 0.20 * THREE.MathUtils.DEG2RAD, streamHoldMs: 10000, fallbackMs: 30000 }   // 8–50 km
 ];
 // Refresh budget: at most N cascade rasters per frame (init exempt — a
 // never-rendered map is garbage, not merely stale). During flythrough all
@@ -6615,6 +6655,8 @@ function updateTerrainShadowBudget() {
     const sunDir = _csmSunScratch
       .subVectors(csm.light.target.position, csm.light.position)
       .normalize();
+    const traversalSpeedMps = traversalMotion().speedMps;
+    const traversalActive = vehicleControlActive && traversalSpeedMps > 0.5;
 
     // Pass 1: collect refresh candidates. Triggers that are consumed by the
     // change detectors above (recenter/projection/vehicle) are latched into
@@ -6648,14 +6690,18 @@ function updateTerrainShadowBudget() {
       const texel = Number.isFinite(shadowCam.right) && Number.isFinite(shadowCam.left)
         ? (shadowCam.right - shadowCam.left) / shadow.mapSize.x
         : 0;
+      const driftTexels = traversalActive
+        ? policy.motionDriftTexels ?? policy.driftTexels
+        : policy.driftTexels;
       if (reason == null && texel > 0 &&
-          lwLight.position.distanceTo(st.fitPos) > policy.driftTexels * texel) {
+          lwLight.position.distanceTo(st.fitPos) > driftTexels * texel) {
         reason = 'drift';
       }
       if (reason == null && sunDir.angleTo(st.sunDir) > policy.sunRadians) {
         reason = 'sun';
       }
-      if (reason == null && st.dirtyVehicle) {
+      if (reason == null && st.dirtyVehicle
+          && nowMs - st.lastMs >= (policy.vehicleHoldMs ?? 0)) {
         reason = 'vehicle';
       }
       if (reason == null && st.dirtyStream && nowMs - st.lastMs > policy.streamHoldMs) {
