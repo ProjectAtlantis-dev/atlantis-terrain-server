@@ -1,6 +1,7 @@
 import * as THREE from 'three';
 import { buildRadialGridGeometry } from './water-grid.js';
 import { createWaterPalette, computeWaterPalette } from './water-sky.js';
+import { NORTH_CLIFF_REFLECTION_MAX_PADDING_M } from './water-reflection-mask.js';
 
 // Backend-neutral fjord water orchestration: owns parameters, the camera-
 // local/sun-local frame math, and sim pacing. The backend supplies the
@@ -34,6 +35,10 @@ export const DEFAULT_WATER_PARAMS = {
   absorption: 0.25,       // Beer-Lambert 1/m, applied only inside the
                           // wall-slope gate: open water stays fully clear,
                           // the -10 m mask-drop walls fade hard with depth
+  northCliffReflectionPadding: NORTH_CLIFF_REFLECTION_MAX_PADDING_M,
+                          // maximum reflection setback; actual
+                          // distance scales from ~0 on flat north shores to
+                          // this value on large, steep north-facing cliffs
   radiance: 1.0,          // output gain vs the scene's tone-mapping exposure
   timeScale: 1.0,
   seed: 1,

@@ -1,5 +1,10 @@
 import * as THREE from 'three';
 import { WebGLWaterSimulation } from './webgl-water-sim.js';
+import {
+  NORTH_CLIFF_REFLECTION_MAX_PADDING_M,
+  NORTH_CLIFF_SLOPE_FULL,
+  NORTH_CLIFF_SLOPE_START,
+} from '../water/water-reflection-mask.js';
 
 // Fjord water surface for the WebGL backend — port of ~/work/ocean2 main.js
 // rotated onto the terrainRoot tangent frame (xy horizontal local metres,
@@ -179,6 +184,7 @@ const WATER_FRAGMENT = /* glsl */ `
   uniform float uBathyExtent;
   uniform float uBathyTexel;   // world metres per bathy texel
   uniform float uAbsorb;       // Beer-Lambert absorption, 1/m of water column
+  uniform float uNorthCliffReflectionPadding; // max reflection setback, metres
 
   varying vec3 vPlanePos;
   varying float vHeight;
@@ -239,6 +245,48 @@ const WATER_FRAGMENT = /* glsl */ `
     return bathyAt(p).r;
   }
 
+  // Replace analytic sky reflections near north-facing coastal cliffs. Local +y is
+  // north, so a north-facing slope rises toward -y (south). Search only on
+  // that axis: east/west/south-facing shores are deliberately unaffected.
+  // The broad derivative also rejects the artificial 10 m sea-floor drop at
+  // an otherwise flat shoreline. Exact shoreline distance is unnecessary;
+  // this is intentionally a coarse, low-frequency visual setback.
+  float northCliffReflectionKeep(vec2 p, vec4 centerBathy) {
+    if (uNorthCliffReflectionPadding <= 0.0) return 1.0;
+    float waterCoverage = centerBathy.a
+                        * (1.0 - smoothstep(-0.5, 0.5, centerBathy.r));
+    if (waterCoverage <= 0.0) return 1.0;
+
+    float sampleStep = uNorthCliffReflectionPadding / 12.0;
+    float baseline = max(uBathyTexel * 2.0, sampleStep * 0.5);
+    float exclusion = 0.0;
+    for (int i = 1; i <= 12; i++) {
+      float distanceSouth = sampleStep * float(i);
+      vec2 q = p + vec2(0.0, -distanceSouth);
+      vec4 terrainSouth = bathyAt(q + vec2(0.0, -baseline));
+      vec4 terrainNorth = bathyAt(q + vec2(0.0, baseline));
+      float coverage = terrainSouth.a * terrainNorth.a;
+      float northFacingSlope = max(
+        (terrainSouth.r - terrainNorth.r) / (2.0 * baseline), 0.0
+      ) * coverage;
+      float cliffWeight = smoothstep(
+        ${NORTH_CLIFF_SLOPE_START.toFixed(2)},
+        ${NORTH_CLIFF_SLOPE_FULL.toFixed(2)},
+        northFacingSlope
+      );
+      float padding = uNorthCliffReflectionPadding * cliffWeight;
+      // Do not create a fully cliff-reflected slab followed by a narrow hard
+      // transition: the dark reflection should relax across the full setback.
+      // Instead the cliff influence decays across its entire proportional
+      // padding distance, both in reach and strength.
+      float candidate = cliffWeight * (
+        1.0 - smoothstep(0.0, max(padding, 1.0), distanceSouth)
+      );
+      exclusion = max(exclusion, candidate);
+    }
+    return 1.0 - exclusion * waterCoverage;
+  }
+
   // Cheap, deterministic approximation of the broad shadow implied by the
   // baked southern light. This deliberately uses only two filtered terrain
   // samples: full per-pixel horizon tracing starves the terrain texture
@@ -280,6 +328,7 @@ const WATER_FRAGMENT = /* glsl */ `
     vec4 bathySample = bathyAt(pxy);
     float seabed = bathySample.r;
     float colDepth = clamp(-seabed, 0.0, 60.0);
+    float northCliffReflection = northCliffReflectionKeep(pxy, bathySample);
     // Luminance is a poor darkness proxy for blue fjord water because it
     // heavily discounts the blue channel. Only call a pixel black when all
     // three channels are nearly absent. In linear space this begins restoring
@@ -469,13 +518,23 @@ const WATER_FRAGMENT = /* glsl */ `
     // Only the explicit surface opacity emits body colour. The extra wall
     // alpha carries no radiance, so premultiplied blending uses it to darken
     // the terrain underneath instead of painting the wall cyan.
-    vec3 accum = body * uOpacity + skyRefl * refl;
+    // A north-facing cliff does not remove the reflection and reveal the
+    // bright source imagery underneath; it replaces reflected sky with the
+    // cliff's dark silhouette. Keep reflection alpha intact and change only
+    // its radiance, otherwise the padded region becomes a flat teal blob.
+    vec3 cliffReflection = uDeepColor * 0.06;
+    vec3 reflectedRadiance = mix(
+      cliffReflection,
+      skyRefl,
+      northCliffReflection
+    );
+    vec3 accum = body * uOpacity + reflectedRadiance * refl;
 
     // sun glint: pure added light
     // Cliff occlusion is absent from the analytic sun model. The satellite
     // image already contains the desired shadowed-water colour, so use its
     // darkness as the cheap local occlusion proxy for direct sun glint.
-    accum += spec * bottomReflection * reflectionGain;
+    accum += spec * bottomReflection * northCliffReflection * reflectionGain;
 
     // no in-shader haze: scene fog + the aerial perspective pass own that
     gl_FragColor = vec4(accum * uRadiance, clamp(a, 0.0, 1.0));
@@ -522,6 +581,7 @@ export function createWebGLWater({
     uBathyExtent: { value: bathyExtent },
     uBathyTexel: { value: bathyExtent / bathySize },
     uAbsorb: { value: 0.25 },
+    uNorthCliffReflectionPadding: { value: NORTH_CLIFF_REFLECTION_MAX_PADDING_M },
   };
 
   const material = new THREE.ShaderMaterial({
@@ -644,6 +704,10 @@ export function createWebGLWater({
       uniforms.uOpacity.value = params.opacity;
       uniforms.uReflect.value = params.reflectivity;
       uniforms.uAbsorb.value = params.absorption;
+      uniforms.uNorthCliffReflectionPadding.value = Math.max(
+        0,
+        params.northCliffReflectionPadding ?? 0,
+      );
     },
 
     captureBathymetry({ scene, terrainRoot, centerXY }) {

@@ -529,6 +529,12 @@ function buildTuningControls(ap, ce) {
     decimals: 3,
     onChange: v => { waterParams.absorption = v; }
   });
+  tuningSlider('north cliff reflection pad', {
+    min: 0, max: 2000, step: 25, value: waterParams.northCliffReflectionPadding,
+    decimals: 0,
+    format: v => `${v.toFixed(0)}m`,
+    onChange: v => { waterParams.northCliffReflectionPadding = v; }
+  });
   tuningSlider('water bright', {
     min: 0.1, max: 6, step: 0.05, value: waterParams.radiance,
     onChange: v => { waterParams.radiance = v; }

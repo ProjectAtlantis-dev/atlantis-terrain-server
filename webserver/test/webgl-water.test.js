@@ -2,7 +2,40 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import * as THREE from 'three';
 
-import { prepareBathymetryTerrainTiles } from '../render-backends/webgl-water.js';
+import {
+  prepareBathymetryTerrainTiles,
+} from '../render-backends/webgl-water.js';
+import {
+  NORTH_CLIFF_REFLECTION_MAX_PADDING_M,
+  northCliffReflectionKeepForDistance,
+  northCliffReflectionPaddingForSlope,
+} from '../water/water-reflection-mask.js';
+
+test('north-cliff reflection padding is negligible on flat shores and proportional to slope', () => {
+  assert.equal(northCliffReflectionPaddingForSlope(0), 0);
+  assert.equal(northCliffReflectionPaddingForSlope(0.12), 0);
+
+  const moderate = northCliffReflectionPaddingForSlope(0.35);
+  const steep = northCliffReflectionPaddingForSlope(0.55);
+  assert.ok(moderate > 0 && moderate < steep);
+  assert.ok(steep < NORTH_CLIFF_REFLECTION_MAX_PADDING_M);
+  assert.equal(
+    northCliffReflectionPaddingForSlope(0.7),
+    NORTH_CLIFF_REFLECTION_MAX_PADDING_M,
+  );
+});
+
+test('north-cliff reflection influence fades across the full padding distance', () => {
+  assert.equal(northCliffReflectionKeepForDistance(0, 0), 1);
+  assert.equal(northCliffReflectionKeepForDistance(0.7, 0), 0);
+
+  const quarter = northCliffReflectionKeepForDistance(0.7, 187.5);
+  const halfway = northCliffReflectionKeepForDistance(0.7, 375);
+  const threeQuarter = northCliffReflectionKeepForDistance(0.7, 562.5);
+  assert.ok(quarter < halfway && halfway < threeQuarter);
+  assert.equal(halfway, 0.5);
+  assert.equal(northCliffReflectionKeepForDistance(0.7, 750), 1);
+});
 
 test('bathymetry capture composites terrain coarse-to-fine and restores scene state', () => {
   const parent = new THREE.Mesh();
