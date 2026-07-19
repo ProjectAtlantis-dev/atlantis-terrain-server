@@ -40,7 +40,6 @@ import { createTerrainTuningControls } from './terrain-tuning-controls.js';
 import { bindTerrainCloudComposition, configureTerrainClouds, registerTerrainCloudTuning } from './terrain-cloud-runtime.js';
 import { createTerrainHouseSceneRuntime } from './terrain-house-scene-runtime.js';
 import { createTerrainBuildingsRuntime } from './terrain-buildings-runtime.js';
-import { createTerrainRoadsRuntime } from './terrain-roads-runtime.js';
 import { createTerrainTileMenuRuntime } from './terrain-tile-menu-runtime.js';
 import { createTerrainHeatmapRuntime } from './terrain-heatmap-runtime.js';
 import { resolveTerrainViewToggle } from './terrain-view-mode.js';
@@ -98,10 +97,10 @@ const webgpuCloudShadowSettings = {
 if (window.location.search) {
   history.replaceState(null, '', `${window.location.pathname}${window.location.hash}`);
 }
-const DEFAULT_ASSET_SERVER_BASE = 'http://127.0.0.1:8787';
-const ASSET_SERVER_BASE = DEFAULT_ASSET_SERVER_BASE;
-const VEHICLE_STATE_ENDPOINT = `${ASSET_SERVER_BASE}/api/vehicle_state`;
-const ASSETS_ENDPOINT = `${ASSET_SERVER_BASE}/api/assets`;
+// Flask is the viewer's only backend. It owns terrain/asset reconciliation
+// and reads the shared catalog without exposing the asset service to clients.
+const VEHICLE_STATE_ENDPOINT = '/api/vehicle_state';
+const ASSETS_ENDPOINT = '/api/assets';
 const ASSETS_FETCH_TIMEOUT_MS = 1500;
 const VEHICLE_SAVE_FETCH_TIMEOUT_MS = 1500;
 const VEHICLE_SAVE_FAILURE_COOLDOWN_MS = 15000;
@@ -869,15 +868,7 @@ const buildingsRuntime = createTerrainBuildingsRuntime({
   terrainRoot,
   pipelineState: terrainPipelineState,
   exaggeration: EXAG,
-  endpoint: `${ASSET_SERVER_BASE}/api/buildings`,
-  bootLog,
-  onMutated: markSceneMutated,
-  requestRender,
-});
-const roadsRuntime = createTerrainRoadsRuntime({
-  terrainRoot,
-  pipelineState: terrainPipelineState,
-  exaggeration: EXAG,
+  endpoint: '/api/buildings',
   bootLog,
   onMutated: markSceneMutated,
   requestRender,
@@ -1268,7 +1259,6 @@ if (!bootFlyToTileId || !flyToTileRuntime.flyToTile(bootFlyToTileId).ok) {
 }
 houseRuntime.start();
 buildingsRuntime.start();
-roadsRuntime.start();
 vehicleRuntime.loadVehicleState();
 vehicleRuntime.loadVehicleModel();
 
@@ -1292,8 +1282,6 @@ window.takramDebug = {
   getHousesVisible: () => houseRuntime.housesRuntimeVisible,
   setBuildingsVisible: visible => buildingsRuntime.setVisible(visible),
   getBuildingsMesh: () => buildingsRuntime.getMesh(),
-  setRoadsVisible: visible => roadsRuntime.setVisible(visible),
-  getRoadsMesh: () => roadsRuntime.getMesh(),
   saveVehicleState: reason => vehicleRuntime.saveVehicleState(reason ?? 'debug-api'),
   loadVehicleState: vehicleRuntime.loadVehicleState,
   setVehicleControlActive: active => vehicleRuntime.setVehicleControlActive(Boolean(active), 'debug-api'),

@@ -36,6 +36,9 @@ CLIENT_LOG_HTML_PATH = ROOT / "webserver" / "client_log.html"
 FLASK_DIR = Path(__file__).resolve().parent
 LOCAL_DB_PATH = FLASK_DIR / "terrain.db"
 CLIENT_LOG_PATH = FLASK_DIR / os.environ.get("CLIENT_LOG_FILE", "client_debug.log")
+ASSETS_DB_PATH = Path(
+  os.environ.get("ASSET_DB_PATH", ROOT / "assetserver" / "assets.db")
+).expanduser().resolve()
 
 
 def _resolve_db_path() -> Path:
@@ -385,6 +388,18 @@ def _close_db(exc: BaseException | None) -> None:
   db = cast(sqlite3.Connection | None, g.pop("terrain_db", None))
   if db is not None:
     db.close()
+  assets_db = cast(sqlite3.Connection | None, g.pop("assets_db", None))
+  if assets_db is not None:
+    assets_db.close()
+
+
+def _get_assets_db() -> sqlite3.Connection:
+  db = cast(sqlite3.Connection | None, g.get("assets_db"))
+  if db is None:
+    from asset_catalog import connect
+    db = connect(ASSETS_DB_PATH)
+    g.assets_db = db
+  return db
 
 
 
@@ -983,16 +998,42 @@ def api_tiles():
   )
 
 
-# Building footprints moved to the asset server: grundkort.py seeds them
-# into assets.db as type='building' rows and the asset server serves them
-# spatially at GET :8787/api/buildings with the same response shape.
+@app.get("/api/assets")
+def api_assets():
+  """Viewer-facing startup assets, read by Flask from the shared catalog."""
+  from asset_catalog import get_assets_response
+  return jsonify(get_assets_response(_get_assets_db()))
+
+
+@app.post("/api/vehicle_state")
+def api_vehicle_state():
+  """Persist vehicle state without exposing the asset service to the viewer."""
+  from asset_catalog import save_vehicle_state
+  payload, status = save_vehicle_state(_get_assets_db(), request.get_json(silent=True) or {})
+  return jsonify(payload), status
+
+
+@app.get("/api/buildings")
+def api_buildings():
+  """Terrain-facing buildings read from assets.db through Flask."""
+  if "sx" in request.args and "sy" in request.args:
+    qx = _arg_float("sx", 0.0)
+    qy = _arg_float("sy", 0.0)
+  else:
+    qx, qy = _to_stereo(
+      _arg_float("lat", 64.175), _arg_float("lon", -51.7388)
+    )
+  max_range = _arg_float("range", 20000.0)
+  ox = _arg_float("ox", qx)
+  oy = _arg_float("oy", qy)
+  from asset_catalog import query_buildings
+  buildings = query_buildings(_get_assets_db(), qx, qy, max_range, ox, oy)
+  return jsonify({"buildings": buildings, "count": len(buildings), "qx": qx, "qy": qy})
 
 
 @app.get("/api/roads")
 def api_roads():
-  """Asiaq road/path centerlines near a point (same ox/oy origin convention
-  as /api/tiles). Paths are [[x, y, surveyedZ], ...]; width_m is assigned
-  per category at ingest. Empty until ingest_roads.py has run."""
+  """Compatibility endpoint; road rendering now comes from painted textures."""
   unavailable = _terrain_unavailable_response()
   if unavailable is not None:
     return unavailable
@@ -1007,32 +1048,33 @@ def api_roads():
   ox = _arg_float("ox", qx)
   oy = _arg_float("oy", qy)
 
-  db = _get_db()
-  has_table = db.execute(
-    "SELECT name FROM sqlite_master WHERE type='table' AND name='roads'"
-  ).fetchone()
-  if not has_table:
-    return jsonify({"roads": [], "count": 0, "qx": qx, "qy": qy})
-
-  rows = db.execute(
-    "SELECT road_id, kind, category, name, width_m, path FROM roads "
-    "WHERE cx BETWEEN ? AND ? AND cy BETWEEN ? AND ? LIMIT 20000",
-    (qx - max_range, qx + max_range, qy - max_range, qy + max_range),
-  ).fetchall()
-
-  roads = []
-  for road_id, kind, category, name, width_m, path_json in rows:
-    path = json.loads(path_json)
-    roads.append({
-      "id": road_id,
-      "kind": kind,
-      "category": category,
-      "name": name,
-      "widthM": width_m,
-      "path": [[x - ox, y - oy, z] for x, y, z in path],
-    })
+  from asset_catalog import query_roads
+  bbox = (qx - max_range, qy - max_range, qx + max_range, qy + max_range)
+  rows = query_roads(_get_assets_db(), bbox)
+  roads = [{
+    **road,
+    "path": [[x - ox, y - oy, z] for x, y, z in road["path"]],
+  } for road in rows]
   log.debug(f"[/api/roads] {len(roads)} polylines near qx={qx:.0f} qy={qy:.0f} range={max_range:.0f}")
   return jsonify({"roads": roads, "count": len(roads), "qx": qx, "qy": qy})
+
+
+def _painted_texture_response(
+  jpeg: bytes,
+  bbox: tuple[float, float, float, float],
+  *,
+  headers: dict[str, str],
+) -> Response:
+  """Apply terrain-coupled catalog overlays to a clean cached texture copy."""
+  from asset_catalog import paint_roads
+  painted, road_count = paint_roads(jpeg, bbox, ASSETS_DB_PATH)
+  response_headers = dict(headers)
+  response_headers["X-Road-Overlay-Count"] = str(road_count)
+  if road_count:
+    # Asset edits must be visible on the next texture request; the canonical
+    # imagery remains cached in terrain.db and is never painted in place.
+    response_headers["Cache-Control"] = "no-cache"
+  return Response(painted, mimetype="image/jpeg", headers=response_headers)
 
 
 @app.get("/api/texture/<tile_id>.jpg")
@@ -1045,6 +1087,13 @@ def api_texture(tile_id: str):
   demand_generation = _register_texture_demand(demand_client, request.args.get("demand"))
 
   log_tex.debug(f"[/api/texture] tile_id={tile_id}")
+
+  parsed = _parse_tile_id(tile_id)
+  if parsed is None:
+    log_tex.warning(f"[/api/texture] {tile_id}: invalid tile_id format")
+    return Response(b"", status=400)
+  d, c, r = parsed
+  texture_bbox = _tile_bbox(d, c, r)
 
   db = _get_db()
   row = db.execute(
@@ -1060,9 +1109,9 @@ def api_texture(tile_id: str):
     log_tex.debug(f"[/api/texture] {tile_id}: cache HIT source={source} size={len(cached)} bytes")
     if source not in _TEX_TEMPORARY:
       is_crop = source == "ancestor_crop_nodata"
-      return Response(
+      return _painted_texture_response(
         cached,
-        mimetype="image/jpeg",
+        texture_bbox,
         headers={
           "Cache-Control": "public, max-age=86400" if not is_crop else "public, max-age=3600",
           "X-Tex-Source": source,
@@ -1072,12 +1121,6 @@ def api_texture(tile_id: str):
         },
       )
     cached_crop = cached
-
-  parsed = _parse_tile_id(tile_id)
-  if parsed is None:
-    log_tex.warning(f"[/api/texture] {tile_id}: invalid tile_id format")
-    return Response(b"", status=400)
-  d, c, r = parsed
 
   if row is None:
     log_tex.debug(f"[/api/texture] {tile_id}: cache MISS, queuing fetch (depth={d} col={c} row={r})")
@@ -1089,9 +1132,9 @@ def api_texture(tile_id: str):
     _queue_texture_fetch(tile_id, _tile_bbox(d, c, r), demand_generation, demand_client)
 
   if cached_crop is not None:
-    return Response(
+    return _painted_texture_response(
       _repair_white_ocean_jpeg(db, tile_id, cached_crop),
-      mimetype="image/jpeg",
+      texture_bbox,
       headers={
         "Cache-Control": "no-store",
         "X-Tex-Ancestor": "precomputed_crop",
@@ -1146,9 +1189,9 @@ def api_texture(tile_id: str):
   buf = io.BytesIO()
   cropped.save(buf, format="JPEG", quality=85)
 
-  return Response(
+  return _painted_texture_response(
     _repair_white_ocean_jpeg(db, tile_id, buf.getvalue()),
-    mimetype="image/jpeg",
+    texture_bbox,
     headers={
       "Cache-Control": "no-store",
       "X-Tex-Ancestor": ancestor_id,

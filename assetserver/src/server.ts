@@ -613,16 +613,18 @@ async function initDb(db: SqliteDb): Promise<void> {
     );
   `);
 
-  // Buildings are spatially queried in EPSG:3413; cx/cy carry the footprint
-  // centroid in that frame. grundkort.py performs the same guarded migration.
+  // Terrain-coupled assets are spatially queried in EPSG:3413. grundkort.py
+  // performs the same guarded migration while syncing buildings and roads.
   const assetColumns = await db.all<{ name: string }[]>("PRAGMA table_info(assets);");
-  if (!assetColumns.some((column) => column.name === "cx")) {
-    await db.exec("ALTER TABLE assets ADD COLUMN cx REAL;");
-  }
-  if (!assetColumns.some((column) => column.name === "cy")) {
-    await db.exec("ALTER TABLE assets ADD COLUMN cy REAL;");
+  for (const column of ["cx", "cy", "min_x", "min_y", "max_x", "max_y"]) {
+    if (!assetColumns.some((existing) => existing.name === column)) {
+      await db.exec(`ALTER TABLE assets ADD COLUMN ${column} REAL;`);
+    }
   }
   await db.exec("CREATE INDEX IF NOT EXISTS idx_assets_cxy ON assets(cx, cy);");
+  await db.exec(
+    "CREATE INDEX IF NOT EXISTS idx_assets_bounds ON assets(type, min_x, max_x, min_y, max_y);",
+  );
 
   // Migrate old tables if they exist
   if (await tableExists(db, "vehicle_instances")) {

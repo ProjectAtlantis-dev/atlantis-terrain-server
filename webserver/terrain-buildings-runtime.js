@@ -2,9 +2,9 @@ import * as THREE from 'three';
 
 import { createTerrainVectorLayerRuntime } from './terrain-vector-layer-runtime.js';
 
-// Grey extruded buildings from Asiaq Teknisk Grundkort footprints, served
-// by the asset server (GET :8787/api/buildings, seeded into assets.db by
-// flaskserver/grundkort.py). Rings arrive origin-relative (same ox/oy
+// Grey extruded buildings from Asiaq Teknisk Grundkort footprints. Flask
+// reads them from the shared catalog and serves GET /api/buildings. Rings
+// arrive origin-relative (same ox/oy
 // convention as /api/tiles) with per-vertex surveyed roof elevations; each
 // building is extruded from its ingest-sampled ground up to the real roof
 // outline. The scene is unlit, so wall shading is baked into vertex colors.

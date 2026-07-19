@@ -160,6 +160,7 @@ def ensure_grundkort(db_path: Path = DB_PATH) -> None:
     _, pending = repair_unsampled_ground(db)
     db.close()
     sync_buildings_to_assets(db_path)
+    sync_roads_to_assets(db_path)
     if pending:
         log.info(
             f"[grundkort] {pending} building grounds still estimated — "
@@ -217,10 +218,14 @@ def _ensure_assets_schema(adb) -> None:
     adb.execute("PRAGMA journal_mode=WAL")
     adb.executescript(_ASSETS_SCHEMA)
     columns = {row[1] for row in adb.execute("PRAGMA table_info(assets)")}
-    for column in ("cx", "cy"):
+    for column in ("cx", "cy", "min_x", "min_y", "max_x", "max_y"):
         if column not in columns:
             adb.execute(f"ALTER TABLE assets ADD COLUMN {column} REAL")
     adb.execute("CREATE INDEX IF NOT EXISTS idx_assets_cxy ON assets(cx, cy)")
+    adb.execute(
+        "CREATE INDEX IF NOT EXISTS idx_assets_bounds "
+        "ON assets(type, min_x, max_x, min_y, max_y)"
+    )
     adb.commit()
 
 
@@ -249,26 +254,86 @@ def sync_buildings_to_assets(
     adb = sqlite3.connect(str(assets_db_path))
     _ensure_assets_schema(adb)
     for building_id, b_number, use_type, cx, cy, ground_z, ring_json in rows:
+        ring = json.loads(ring_json)
+        xs = [point[0] for point in ring]
+        ys = [point[1] for point in ring]
         lat, lon = to_wgs84(cx, cy)
         properties = json.dumps({
             "b": b_number,
             "use": use_type,
             "groundZ": ground_z,
-            "ring": json.loads(ring_json),
+            "ring": ring,
         })
         adb.execute(
             "INSERT INTO assets "
-            "(id, type, enabled, lat, lon, heading_deg, z, properties, cx, cy, updated_at) "
-            "VALUES (?, 'building', 1, ?, ?, 0, ?, ?, ?, ?, CURRENT_TIMESTAMP) "
+            "(id, type, enabled, lat, lon, heading_deg, z, properties, cx, cy, "
+            "min_x, min_y, max_x, max_y, updated_at) "
+            "VALUES (?, 'building', 1, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP) "
             "ON CONFLICT(id) DO UPDATE SET "
             "lat=excluded.lat, lon=excluded.lon, z=excluded.z, "
             "properties=excluded.properties, cx=excluded.cx, cy=excluded.cy, "
+            "min_x=excluded.min_x, min_y=excluded.min_y, "
+            "max_x=excluded.max_x, max_y=excluded.max_y, "
             "updated_at=CURRENT_TIMESTAMP",
-            (building_id, float(lat), float(lon), ground_z, properties, cx, cy),
+            (
+                building_id, float(lat), float(lon), ground_z, properties, cx, cy,
+                min(xs), min(ys), max(xs), max(ys),
+            ),
         )
     adb.commit()
     adb.close()
     log.info(f"[grundkort] synced {len(rows)} buildings into {assets_db_path.name}")
+    return len(rows)
+
+
+def sync_roads_to_assets(
+    db_path: Path = DB_PATH, assets_db_path: Path = ASSETS_DB_PATH
+) -> int:
+    """Upsert terrain.db road/path centerlines into the shared asset catalog."""
+    from coords import to_wgs84
+
+    db = sqlite3.connect(str(db_path))
+    try:
+        rows = db.execute(
+            "SELECT road_id, kind, category, name, width_m, cx, cy, path FROM roads"
+        ).fetchall()
+    except sqlite3.OperationalError:
+        rows = []
+    db.close()
+    if not rows:
+        return 0
+
+    adb = sqlite3.connect(str(assets_db_path))
+    _ensure_assets_schema(adb)
+    for road_id, kind, category, name, width_m, cx, cy, path_json in rows:
+        path = json.loads(path_json)
+        xs = [point[0] for point in path]
+        ys = [point[1] for point in path]
+        lat, lon = to_wgs84(cx, cy)
+        properties = json.dumps({
+            "kind": kind,
+            "category": category,
+            "name": name,
+            "widthM": width_m,
+            "path": path,
+        })
+        adb.execute(
+            "INSERT INTO assets "
+            "(id,type,enabled,lat,lon,heading_deg,z,properties,cx,cy,"
+            "min_x,min_y,max_x,max_y,updated_at) "
+            "VALUES (?,'road',1,?,?,0,NULL,?,?,?,?,?,?,?,CURRENT_TIMESTAMP) "
+            "ON CONFLICT(id) DO UPDATE SET "
+            "lat=excluded.lat,lon=excluded.lon,properties=excluded.properties,"
+            "cx=excluded.cx,cy=excluded.cy,min_x=excluded.min_x,min_y=excluded.min_y,"
+            "max_x=excluded.max_x,max_y=excluded.max_y,updated_at=CURRENT_TIMESTAMP",
+            (
+                road_id, float(lat), float(lon), properties, cx, cy,
+                min(xs), min(ys), max(xs), max(ys),
+            ),
+        )
+    adb.commit()
+    adb.close()
+    log.info(f"[grundkort] synced {len(rows)} roads into {assets_db_path.name}")
     return len(rows)
 
 

@@ -73,7 +73,7 @@ Classifier output lives in `terrain.db`'s `classifier_tiles` table as a zlib-com
 
 ## Buildings & Roads
 
-Real 3D buildings and roads from Asiaq's Teknisk Grundkort (surveyed outlines with per-vertex elevations). Fully automatic: on startup the server downloads any settlement listed in `terrain_config.GRUNDKORT_SETTLEMENTS` (default: Nuuk) from [kortforsyning.asiaq.gl](https://kortforsyning.asiaq.gl/) into `flaskserver/grundkort/` (gitignored), then ingests whatever is missing from the `buildings`/`roads` tables — a fresh clone or a flushed terrain.db repopulates itself. To cover more settlements, add their folder names to that list, or drop a `*_TekniskGrundkort_SHP.zip` into `grundkort/` manually. The manual scripts still work too:
+Real 3D buildings and texture-painted roads from Asiaq's Teknisk Grundkort (surveyed outlines with per-vertex elevations). Fully automatic: on startup the server downloads any settlement listed in `terrain_config.GRUNDKORT_SETTLEMENTS` (default: Nuuk) from [kortforsyning.asiaq.gl](https://kortforsyning.asiaq.gl/) into `flaskserver/grundkort/` (gitignored), then ingests whatever is missing from the `buildings`/`roads` tables — a fresh clone or a flushed terrain.db repopulates itself. To cover more settlements, add their folder names to that list, or drop a `*_TekniskGrundkort_SHP.zip` into `grundkort/` manually. The manual scripts still work too:
 
     cd flaskserver
     ./venv/bin/python ingest_buildings.py grundkort/0600NUK_TekniskGrundkort_SHP.zip
@@ -81,7 +81,7 @@ Real 3D buildings and roads from Asiaq's Teknisk Grundkort (surveyed outlines wi
 
 Geometry is reprojected to EPSG:3413. Building ground is sampled from cached heightmaps; buildings ingested before their area's heightmaps exist get a roof-derived estimate (`ground_sampled = 0`) and a background loop re-samples them once heightmaps stream in — ingest order doesn't matter.
 
-**The asset server is the catalog of record for buildings**: after ingest, `grundkort.py` syncs every building into `assetserver/assets.db` as a `type='building'` row (footprint ring, use type, register B-number in `properties`; centroid in `cx`/`cy` EPSG:3413 columns for spatial queries). The frontend fetches buildings from the asset server (`GET :8787/api/buildings`, so it must be running for buildings to appear) and roads from flask (`/api/roads`), rendering grey extrusions and category-tinted road/path ribbons in both renderers. Toggle via `takramDebug.setBuildingsVisible(false)` / `setRoadsVisible(false)`.
+`assetserver/assets.db` is the catalog of record for buildings and roads. After ingest, `grundkort.py` syncs both feature types with EPSG:3413 bounds for spatial queries. The viewer only talks to Flask: Flask serves repaired building geometry at `/api/buildings` and paints intersecting road/path centerlines onto a clean copy of every tile texture returned by `/api/texture/<tile>.jpg`. The cached satellite image remains unmodified, so asset edits can be composited again.
 
 ## Troubleshooting
 
@@ -150,18 +150,18 @@ npm install
 
 ### Running
 ```bash
-# Terminal 1 — asset server (assets.db)
-./assetserver/runAssetServer
-
-# Terminal 2 — terrain backend (terrain.db)
+# Terminal 1 — terrain backend (terrain.db + viewer-facing asset access)
 ./flaskserver/runFlaskServer
 
-# Terminal 3 — frontend (snazzy 3d ux)
+# Terminal 2 — frontend (snazzy 3d ux)
 ./webserver/runViteServer
+
+# Optional — asset editing/management API; the viewer does not call it
+./assetserver/runAssetServer
 ```
 
-Browser asset calls go directly to `http://127.0.0.1:8787` by default.
-Override in the frontend URL with `?assetServer=http://<host>:<port>`.
+All browser API calls go through Flask. Flask reads `assetserver/assets.db`
+directly; override that path for deployments with `ASSET_DB_PATH`.
 
 Scripts log to their respective directories (`runAssetServer.log`, `runFlaskServer.log`, `runViteServer.log`).
 
