@@ -246,121 +246,107 @@ function copyRenderableProperties(source, destination) {
   destination.userData = { ...source.userData };
 }
 
-/**
- * Replaces each configured grouped wheel mesh with independently rotatable pivots.
- * Geometry is split once at load time; the render loop rotates Object3D pivots only.
- */
+/** Preserve the accepted Patria wheel animation: rotate the original vertex clusters. */
 export function createVehicleWheelRig(THREE, parts) {
   const splitThreshold = parts?.config?.wheelClusterSplitThreshold ?? null;
-  const pivots = [];
+  const clusters = [];
   const sources = [];
   const skipped = [];
-  let crossingTriangleCount = 0;
 
   for (const sourceMesh of parts?.wheels ?? []) {
-    const sourceGeometry = sourceMesh?.geometry;
-    const position = sourceGeometry?.getAttribute?.('position');
+    const position = sourceMesh?.geometry?.getAttribute?.('position');
     if (
       !sourceMesh?.isMesh ||
       sourceMesh.isSkinnedMesh ||
       position == null ||
-      sourceGeometry.morphAttributes?.position?.length > 0 ||
-      Array.isArray(sourceMesh.material) ||
-      sourceMesh.parent == null
+      sourceMesh.geometry.morphAttributes?.position?.length > 0
     ) {
       skipped.push({ name: sourceMesh?.name ?? null, reason: 'unsupported-wheel-mesh' });
       continue;
     }
 
-    const clusters = clusterVertexIndicesByY(position, splitThreshold);
-    const vertexToCluster = new Int32Array(position.count).fill(-1);
-    clusters.forEach((cluster, clusterIndex) => {
-      for (const vertexIndex of cluster) vertexToCluster[vertexIndex] = clusterIndex;
-    });
-    const replacement = new THREE.Group();
-    replacement.name = sourceMesh.name;
-    replacement.position.copy(sourceMesh.position);
-    replacement.quaternion.copy(sourceMesh.quaternion);
-    replacement.scale.copy(sourceMesh.scale);
-    replacement.matrixAutoUpdate = sourceMesh.matrixAutoUpdate;
-    replacement.matrix.copy(sourceMesh.matrix);
-    copyRenderableProperties(sourceMesh, replacement);
-
-    let createdForSource = 0;
-    clusters.forEach((clusterVertices, clusterIndex) => {
-      const result = buildClusterGeometry(
-        THREE,
-        sourceGeometry,
-        clusterVertices,
-        vertexToCluster,
-        clusterIndex
-      );
-      crossingTriangleCount += result.crossingTriangleCount;
-      const geometry = result.geometry;
-      if (geometry == null) return;
-      const center = geometry.boundingBox.getCenter(new THREE.Vector3());
-      const pivot = new THREE.Group();
-      pivot.name = `${sourceMesh.name}-wheel-pivot-${createdForSource}`;
-      // The Patria wheel axle is local X, so X is intentionally not translated.
-      pivot.position.set(0, center.y, center.z);
-      const mesh = new THREE.Mesh(geometry, sourceMesh.material);
-      mesh.name = `${sourceMesh.name}-wheel-${createdForSource}`;
-      geometry.translate(0, -center.y, -center.z);
-      geometry.computeBoundingBox();
-      geometry.computeBoundingSphere();
-      copyRenderableProperties(sourceMesh, mesh);
-      pivot.add(mesh);
-      replacement.add(pivot);
-      pivots.push({ pivot, mesh, sourceName: sourceMesh.name, clusterIndex });
-      createdForSource++;
-    });
-
-    if (createdForSource === 0) {
+    const sourceClusters = clusterVertexIndicesByY(position, splitThreshold);
+    for (const indices of sourceClusters) {
+      if (indices.length === 0) continue;
+      const basePositions = new Float32Array(indices.length * 3);
+      let sumX = 0;
+      let sumY = 0;
+      let sumZ = 0;
+      indices.forEach((vertexIndex, index) => {
+        const x = position.getX(vertexIndex);
+        const y = position.getY(vertexIndex);
+        const z = position.getZ(vertexIndex);
+        basePositions[index * 3] = x;
+        basePositions[index * 3 + 1] = y;
+        basePositions[index * 3 + 2] = z;
+        sumX += x;
+        sumY += y;
+        sumZ += z;
+      });
+      clusters.push({
+        mesh: sourceMesh,
+        sourceName: sourceMesh.name,
+        indices,
+        centerX: sumX / indices.length,
+        centerY: sumY / indices.length,
+        centerZ: sumZ / indices.length,
+        basePositions,
+      });
+    }
+    if (sourceClusters.length === 0) {
       skipped.push({ name: sourceMesh.name, reason: 'no-wheel-triangles' });
       continue;
-    }
-    for (const child of [...sourceMesh.children]) replacement.add(child);
-    const parent = sourceMesh.parent;
-    const siblingIndex = parent.children.indexOf(sourceMesh);
-    parent.remove(sourceMesh);
-    parent.add(replacement);
-    const replacementIndex = parent.children.indexOf(replacement);
-    if (siblingIndex >= 0 && replacementIndex >= 0 && siblingIndex !== replacementIndex) {
-      parent.children.splice(replacementIndex, 1);
-      parent.children.splice(siblingIndex, 0, replacement);
     }
     sources.push({
       name: sourceMesh.name,
       sourceVertexCount: position.count,
-      pivotCount: createdForSource,
+      clusterCount: sourceClusters.length,
     });
   }
 
   return {
     angle: 0,
-    pivots,
+    pivots: [],
+    clusters,
     sources,
     skipped,
-    crossingTriangleCount,
+    crossingTriangleCount: 0,
   };
 }
 
 export function spinVehicleWheelRig(rig, signedDistanceM, tireRadiusM) {
   if (
     rig == null ||
-    rig.pivots.length === 0 ||
+    rig.clusters.length === 0 ||
     !Number.isFinite(signedDistanceM) ||
     !Number.isFinite(tireRadiusM) ||
     tireRadiusM <= 0
   ) return false;
   rig.angle = (rig.angle - signedDistanceM / tireRadiusM) % (Math.PI * 2);
-  for (const wheel of rig.pivots) wheel.pivot.rotation.x = rig.angle;
+  const cos = Math.cos(rig.angle);
+  const sin = Math.sin(rig.angle);
+  const dirtyMeshes = new Set();
+  for (const cluster of rig.clusters) {
+    const position = cluster.mesh.geometry.getAttribute('position');
+    cluster.indices.forEach((vertexIndex, index) => {
+      const y = cluster.basePositions[index * 3 + 1] - cluster.centerY;
+      const z = cluster.basePositions[index * 3 + 2] - cluster.centerZ;
+      position.setY(vertexIndex, cluster.centerY + y * cos - z * sin);
+      position.setZ(vertexIndex, cluster.centerZ + y * sin + z * cos);
+    });
+    dirtyMeshes.add(cluster.mesh);
+  }
+  for (const mesh of dirtyMeshes) {
+    mesh.geometry.getAttribute('position').needsUpdate = true;
+  }
   return signedDistanceM !== 0;
 }
 
 export function summarizeVehicleWheelRig(rig) {
   return {
-    pivotCount: rig?.pivots?.length ?? 0,
+    mode: 'vertex-cluster',
+    pivotCount: 0,
+    clusterCount: rig?.clusters?.length ?? 0,
     sources: (rig?.sources ?? []).map(source => ({ ...source })),
     skipped: (rig?.skipped ?? []).map(item => ({ ...item })),
     crossingTriangleCount: rig?.crossingTriangleCount ?? 0,
@@ -374,8 +360,10 @@ export function getVehicleWheelContactSnapshot(THREE, rig, terrainRoot, vehicleG
   const downWorld = new THREE.Vector3(0, 0, -1)
     .transformDirection(vehicleGroup.matrixWorld)
     .normalize();
-  return rig.pivots.map((wheel, index) => {
-    const centerWorld = wheel.pivot.getWorldPosition(new THREE.Vector3());
+  return (rig.clusters ?? []).map((wheel, index) => {
+    const centerWorld = wheel.mesh.localToWorld(new THREE.Vector3(
+      wheel.centerX, wheel.centerY, wheel.centerZ,
+    ));
     const contactWorld = centerWorld.clone().addScaledVector(downWorld, tireRadiusM);
     const centerTerrainLocal = terrainRoot.worldToLocal(centerWorld.clone());
     const contactTerrainLocal = terrainRoot.worldToLocal(contactWorld.clone());

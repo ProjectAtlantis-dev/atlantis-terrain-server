@@ -539,3 +539,90 @@ all production graphics enabled.
 - No wholesale shared-application merge while parallel terrain/graphics work is active.
   Share the vehicle gameplay boundary first; schedule broader application consolidation as
   a coordinated follow-up so it cannot overwrite active renderer work.
+
+## 2026-07-19 — recovery implementation and verification result
+
+The recovery board above was executed without changing the graphics quality settings or the
+historical render-loop delta clamp.
+
+### Safety and source parity
+
+- Created full-tree safety ref `safety/vehicle-pre-recovery-20260719` at
+  `fab5ddde272e9f807b2416de34fe72802a17ce1c`.
+- Created selective vehicle checkpoint `97775d0` before recovery. Parallel LAAS/cloud/shadow
+  work was not reset or overwritten.
+- Compared the live local `vehicle_splitting` implementation function-for-function. Patria
+  acceleration (24 m/s²), max speed (24 m/s), braking (3 m/s²), steering (1.5 rad/s), slope
+  gravity, terrain probes, suspension, follow camera, turret transforms, and entry/exit flow
+  retain the same math/constants through the renderer-independent helpers.
+
+### Patria restored
+
+- Restored the original vertex-cluster wheel animator. It mutates the original GLB wheel
+  geometry exactly like `vehicle_splitting`; it no longer replaces grouped wheels with newly
+  split pivot meshes.
+- Grounding now raycasts only the static non-wheel body meshes. Visual wheel rotation cannot
+  move the collision floor or make Patria bob as the vertices spin.
+- Restored the accepted CanvasTexture sprite muzzle flash and impacts, classic
+  `MeshBasicMaterial` tracer, original dimensions/colors/lifetimes/range, procedural gunshot
+  sound, camera-center aiming, cadence, pooling, and cleanup. WebGPU live validation created
+  muzzle, tracer, and impact effects with no node material substitution.
+
+### V-22 restored
+
+- Removed persistent collective and manual `F` conversion. Controls are again `E` engine,
+  `W/S` forward/back, `A/D` yaw, `Space/Q` climb/descend, `V` camera, `Esc` exit.
+- Automatic nacelle scheduling is driven by the configured 30–50 m/s transition band. The
+  old hover-speed clamp made that band unreachable, so forward acceleration now correctly
+  continues toward `maxSpeedMs` while conversion remains automatic.
+- Corrected the rig from measured GLB geometry: nacelles rotate about local Y with negative
+  conversion sign; propellers counter-rotate about local Z. Current server metadata and
+  runtime defaults both enforce the correct axes even if a watch server has stale code.
+- Copied all six source PBR masters byte-for-byte into
+  `public/models/v22_textures/`: body albedo, normal, roughness, metallic, glass diffuse, and
+  glass roughness. Runtime binding targets only exact `DefaultWhite` and `Transparent`
+  materials, preserving all 17 cockpit/instrument materials and embedded maps.
+- Aircraft follow camera now writes the same yaw/pitch control state as the accepted Patria
+  camera, preventing the next camera update from snapping to a stale orientation.
+
+### UI and maps restored
+
+- Vehicle HUD is informational only: zero action buttons, actual km/h, aircraft knots and
+  vertical speed, and the keyboard contract in one line. It sits above the existing bottom
+  status row.
+- Bare `R` is inert. `Reset view` lives inside the Atmosphere header and requires confirmation.
+- Restored the corrected WebGPU Google navigator from the local restoration commits:
+  `G` toggle, Satellite/Map tabs, explicit point selection followed by `Navigate`, exact
+  WGS84 ↔ EPSG:3413 placement, and Google 3D camera links.
+- `M` map includes both `vehicle-marker-amv` and `vehicle-marker-osprey-01`; marker children
+  disable frustum/depth loss so they remain discoverable.
+
+### Verification evidence
+
+- `node --test *.test.js`: **72/72 passing** after the final wheel parity test.
+- `npm run build`: production Vite build passes (370 modules).
+- `assetserver npm run typecheck`: passes.
+- `git diff --check`: passes.
+- Full production WebGPU scene in headless Brave, with no graphics ablations:
+  - both Patria and V-22 loaded; no boot errors;
+  - V-22 live input reached 48.78 m/s and `TRANSITION`;
+  - nacelles were `Y=-0.30879`, rotors were spinning/counter-rotating on Z;
+  - exterior materials reported albedo + normal + roughness + metallic and glass diffuse +
+    glass roughness maps by their source filenames;
+  - bare `R` preserved the stationary rendered coordinate;
+  - `G` opened the navigator;
+  - classic firing produced one active muzzle/tracer/impact set;
+  - `M` made both vehicle markers visible;
+  - vehicle HUD contained zero buttons and displayed speed/key hints.
+- The only browser error during scripted firing was the expected browser security rejection
+  for pointer lock without a real user gesture. Actual pointer interaction is the trusted
+  path and remains wired; this was not a render or gameplay exception.
+
+### Separate performance track left intact
+
+The complete headless WebGPU page still took minutes to reach the acceptance state. No
+vegetation, shadows, clouds, materials, resolution, or view distance were reduced. That is
+the existing full-scene render/streaming problem owned by `PERF_REWORK.md`, not a reason to
+change vehicle behavior. The historical `Math.min(0.05, clock.getDelta())` also remains
+unchanged pending a coordinated shared fixed-step decision after rendering performance is
+healthy.

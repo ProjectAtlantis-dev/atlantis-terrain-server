@@ -101,9 +101,9 @@
       "nacelles": {
         "tiltSpeedDegS": 12.2,
         "rotorRadiusM": 5.8,
-        "tiltAxis": "z",
-        "tiltDirection": 1,
-        "rotorAxis": "y",
+        "tiltAxis": "y",
+        "tiltDirection": -1,
+        "rotorAxis": "z",
         "rotorSpeedRpm": 397,
         "rotorResponseSeconds": 3.5,
         "leftCenter": [-1.6, -7.2, 2.5],

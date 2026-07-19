@@ -14,11 +14,11 @@ import {
   createAircraftState,
   setupAircraftModelParts,
   stepAircraftFlight,
-  toggleAircraftConversionMode,
   toggleAircraftEngine,
   updateAircraftVisuals,
 } from './terrain-aircraft-runtime.js';
 import { createVehicleFireRuntime } from './terrain-vehicle-fire.js';
+import { createVehicleWheelRig, spinVehicleWheelRig } from './terrain-vehicle-parts.js';
 import { meshUsesTextureClassification, scoreTextureTiles, textureRetryDelay, tileDepthFromId } from './terrain-tile-runtime.js';
 import { createTextureStreamer, rendererTextureAnisotropy } from './terrain-texture-streamer.js';
 import { createTileLifecycle } from './terrain-tile-lifecycle.js';
@@ -983,7 +983,7 @@ test('shared map pan respects map yaw', () => {
   assert.equal(controls.mapPanNorth, 0);
 });
 
-test('VTOL keyboard keeps engine and conversion on separate game controls', () => {
+test('vehicle keyboard uses E for engine, G for navigator, and leaves bare R inert', () => {
   const originalWindow = globalThis.window;
   const listeners = new Map();
   globalThis.window = {
@@ -993,7 +993,8 @@ test('VTOL keyboard keeps engine and conversion on separate game controls', () =
     },
   };
   let engineToggles = 0;
-  let conversionToggles = 0;
+  let navigatorToggles = 0;
+  let resetCalls = 0;
   try {
     const controls = { keys: {} };
     const cleanup = installTerrainKeyboardControls({
@@ -1002,21 +1003,23 @@ test('VTOL keyboard keeps engine and conversion on separate game controls', () =
       onForwardDoubleTap() {},
       onEscapeVehicle() {},
       onToggleMap() {},
+      onToggleGoogleNavigator() { navigatorToggles += 1; },
       onOpenPipeline() {},
       onOpenHeatmap() {},
-      onReset() {},
+      onReset() { resetCalls += 1; },
       onHouseAction() {},
       onToggleHeadlights() {},
       onToggleAircraftEngine() { engineToggles += 1; },
-      onToggleAircraftConversion() { conversionToggles += 1; },
     });
     const keydown = listeners.get('keydown');
     keydown({ code: 'KeyE', repeat: false, target: null });
-    keydown({ code: 'KeyF', repeat: false, target: null });
+    keydown({ code: 'KeyG', repeat: false, target: null });
+    keydown({ code: 'KeyR', repeat: false, target: null });
     assert.equal(engineToggles, 1);
-    assert.equal(conversionToggles, 1);
+    assert.equal(navigatorToggles, 1);
+    assert.equal(resetCalls, 0);
     assert.equal(controls.keys.KeyE, true);
-    assert.equal(controls.keys.KeyF, true);
+    assert.equal(controls.keys.KeyG, true);
     cleanup();
   } finally {
     globalThis.window = originalWindow;
@@ -1034,7 +1037,29 @@ test('vehicle drive follows heading and respects speed limit', () => {
   assert.equal(step.deltaY, 12);
 });
 
-test('aircraft requires rotor spool and collective before takeoff', () => {
+test('Patria wheel rig preserves original meshes and rotates accepted vertex clusters', () => {
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute('position', new THREE.Float32BufferAttribute([
+    0, -0.05, -1,
+    0, 0.05, 1,
+    1, -0.05, -1,
+    1, 0.05, 1,
+  ], 3));
+  const mesh = new THREE.Mesh(geometry, new THREE.MeshBasicMaterial());
+  mesh.name = 'Object_8';
+  const parent = new THREE.Group();
+  parent.add(mesh);
+  const rig = createVehicleWheelRig(THREE, {
+    wheels: [mesh], config: { wheelClusterSplitThreshold: null },
+  });
+  assert.equal(rig.clusters.length, 1);
+  assert.equal(mesh.parent, parent, 'the accepted animator does not replace the source mesh');
+  assert.equal(spinVehicleWheelRig(rig, Math.PI / 2, 1), true);
+  assert.ok(Math.abs(geometry.getAttribute('position').getY(0) - -1) < 1e-6);
+  assert.ok(geometry.getAttribute('position').version > 0);
+});
+
+test('aircraft uses the accepted engine and direct game-flight controls', () => {
   const group = new THREE.Group();
   group.position.z = 2;
   const marker = { position: { set() {} } };
@@ -1050,21 +1075,14 @@ test('aircraft requires rotor spool and collective before takeoff', () => {
   });
   assert.equal(toggleAircraftEngine(aircraft), true);
   stepAircraftFlight(aircraft, { climb: true }, 1, 0);
-  assert.ok(aircraft.collective > 0.4);
-  assert.equal(group.position.z, 2, 'collective cannot lift stopped rotors');
-
-  for (let index = 0; index < 120; index += 1) updateAircraftVisuals(aircraft, 0.1);
+  assert.ok(group.position.z > 2, 'Space commands a responsive game-like climb');
   stepAircraftFlight(aircraft, { forward: true, climb: true, left: true }, 1.5, 0);
-  assert.ok(aircraft.rotorSpool > 0.95);
-  assert.equal(aircraft.collective, 1);
   assert.ok(aircraft.forwardSpeedMs > 0);
   assert.ok(aircraft.headingRad > 0);
-  assert.ok(group.position.z > 2, 'spooled rotors and raised collective produce takeoff');
+  assert.ok(group.position.z > 2);
   assert.notEqual(aircraft.flightRegime, 'GROUND');
 
   assert.equal(toggleAircraftEngine(aircraft), false);
-  assert.equal(aircraft.collective, 0);
-  assert.equal(aircraft.conversionMode, 'hover');
   group.position.z = -5;
   aircraft.verticalSpeedMs = -20;
   stepAircraftFlight(aircraft, {}, 0.5, 4);
@@ -1072,7 +1090,7 @@ test('aircraft requires rotor spool and collective before takeoff', () => {
   assert.equal(aircraft.verticalSpeedMs, 0);
 });
 
-test('aircraft hover assist damps motion near neutral collective without scripting climb', () => {
+test('aircraft neutral controls damp vertical motion for a stable game hover', () => {
   const group = new THREE.Group();
   group.position.z = 20;
   const aircraft = createAircraftState({
@@ -1083,16 +1101,13 @@ test('aircraft hover assist damps motion near neutral collective without scripti
     marker: null,
   });
   aircraft.engineRunning = true;
-  aircraft.collective = 0.56;
-  aircraft.rotorAngularVelocity = 397 * Math.PI * 2 / 60;
   aircraft.verticalSpeedMs = 3;
   stepAircraftFlight(aircraft, {}, 1, 0);
-  assert.ok(Math.abs(aircraft.verticalSpeedMs) < 0.5);
-  assert.equal(aircraft.collective, 0.56, 'neutral collective remains a persistent control');
+  assert.equal(aircraft.verticalSpeedMs, 0);
   assert.equal(aircraft.flightRegime, 'HOVER');
 });
 
-test('aircraft conversion is pilot-requested and blends toward wing-supported cruise', () => {
+test('aircraft nacelles convert automatically with forward speed', () => {
   const group = new THREE.Group();
   group.position.z = 100;
   const aircraft = createAircraftState({
@@ -1106,24 +1121,15 @@ test('aircraft conversion is pilot-requested and blends toward wing-supported cr
     marker: null,
   });
   aircraft.engineRunning = true;
-  aircraft.collective = 0.7;
-  aircraft.rotorAngularVelocity = 397 * Math.PI * 2 / 60;
-  aircraft.forwardSpeedMs = 35;
-  assert.equal(toggleAircraftConversionMode(aircraft), 'cruise');
-  stepAircraftFlight(aircraft, { forward: true }, 0.5, 0);
-  assert.ok(aircraft.nacelleTiltTarget < 68);
-  assert.ok(aircraft.forwardSpeedMs > 35);
-
-  aircraft.nacelleTiltDeg = 0;
+  aircraft.forwardSpeedMs = 40;
+  stepAircraftFlight(aircraft, { forward: true }, 0.1, 0);
+  assert.ok(aircraft.nacelleTiltTarget > 0 && aircraft.nacelleTiltTarget < 97.5);
   aircraft.forwardSpeedMs = 55;
-  aircraft.verticalSpeedMs = 0;
-  const startZ = group.position.z;
-  stepAircraftFlight(aircraft, {}, 1, 0);
-  assert.ok(Math.abs(group.position.z - startZ) < 0.2, 'wing lift supports cruise without fake climb velocity');
+  stepAircraftFlight(aircraft, { forward: true }, 0.1, 0);
+  assert.equal(aircraft.nacelleTiltTarget, 0);
+  aircraft.nacelleTiltDeg = 0;
+  stepAircraftFlight(aircraft, {}, 0, 0);
   assert.equal(aircraft.flightRegime, 'AIRPLANE');
-  assert.equal(toggleAircraftConversionMode(aircraft), 'hover');
-  stepAircraftFlight(aircraft, {}, 0.1, 0);
-  assert.equal(aircraft.nacelleTiltTarget, 97.5);
 });
 
 test('aircraft rotor setup assigns distinct pivots and counter-rotates with spool response', () => {
@@ -1157,9 +1163,9 @@ test('aircraft rotor setup assigns distinct pivots and counter-rotates with spoo
       },
       nacelles: {
         tiltSpeedDegS: 12.2,
-        tiltAxis: 'z',
-        tiltDirection: 1,
-        rotorAxis: 'y',
+        tiltAxis: 'y',
+        tiltDirection: -1,
+        rotorAxis: 'z',
         rotorSpeedRpm: 397,
         rotorResponseSeconds: 3.5,
       },
@@ -1179,18 +1185,19 @@ test('aircraft rotor setup assigns distinct pivots and counter-rotates with spoo
   aircraft.nacelleTiltTarget = 0;
   updateAircraftVisuals(aircraft, 1);
   assert.ok(aircraft.rotorAngularVelocity > 0);
-  assert.notEqual(leftRotor.rotation.y, 0);
-  assert.equal(rightRotor.rotation.y, -leftRotor.rotation.y);
-  assert.equal(leftRotor.rotation.z, 0);
-  assert.ok(leftNacelle.rotation.z > 0);
-  assert.equal(rightNacelle.rotation.z, leftNacelle.rotation.z);
+  assert.notEqual(leftRotor.rotation.z, 0);
+  assert.equal(rightRotor.rotation.z, -leftRotor.rotation.z);
+  assert.equal(leftRotor.rotation.y, 0);
+  assert.ok(leftNacelle.rotation.y < 0);
+  assert.equal(leftNacelle.rotation.z, 0);
+  assert.equal(rightNacelle.rotation.y, leftNacelle.rotation.y);
   const runningVelocity = aircraft.rotorAngularVelocity;
   aircraft.engineRunning = false;
   updateAircraftVisuals(aircraft, 1);
   assert.ok(aircraft.rotorAngularVelocity < runningVelocity);
 });
 
-test('WebGPU vehicle fire runtime reuses node-material pools and expires effects', () => {
+test('WebGPU vehicle fire runtime restores classic effect pools and expires effects', () => {
   const terrainRoot = new THREE.Group();
   const camera = new THREE.PerspectiveCamera(60, 1, 0.1, 5000);
   camera.position.set(0, -5, 2);
@@ -1215,7 +1222,8 @@ test('WebGPU vehicle fire runtime reuses node-material pools and expires effects
     activeTracers: 1,
     activeImpacts: 1,
     muzzleVisible: true,
-    nodeMaterials: true,
+    nodeMaterials: false,
+    classicMaterials: true,
   });
   runtime.update(4);
   assert.equal(runtime.summary().activeTracers, 0);

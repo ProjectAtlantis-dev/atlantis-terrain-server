@@ -101,12 +101,12 @@ import { installTerrainKeyboardControls, installTerrainPointerControls } from '.
 import { normalizeSavedVehicleState, stepSuspension, stepVehicleDrive, vehicleLocalToLatLon as terrainVehicleLocalToLatLon, vehicleStateSnapshot } from './terrain-vehicle.js';
 import { createVehicleControlUI } from './terrain-vehicle-controls-ui.js';
 import { createVehicleFireRuntime } from './terrain-vehicle-fire.js';
+import { applyV22Materials, loadV22TextureSet } from './terrain-v22-materials.js';
 import {
   AIRCRAFT_CAMERA_MODES,
   createAircraftState,
   setupAircraftModelParts,
   stepAircraftFlight,
-  toggleAircraftConversionMode,
   toggleAircraftEngine,
   updateAircraftVisuals,
 } from './terrain-aircraft-runtime.js';
@@ -133,6 +133,13 @@ import { applyTerrainAvailabilityStatus, createTerrainSeamStatusController } fro
 import { collectTerrainDebugMeshes, createTerrainOutlineController, summarizeTerrainMesh } from './terrain-debug-runtime.js';
 import { createTerrainFetchExecutor } from './terrain-fetch-executor.js';
 import { restoreTerrainCameraState, terrainCameraState } from './terrain-camera-state.js';
+import { googleMaps3dUrl } from './terrain-google-maps.js';
+import { createGoogleNavigator } from './terrain-google-navigator.js';
+import {
+  epsg3413DirectionBearing,
+  epsg3413ToWgs84,
+  wgs84ToEpsg3413,
+} from './terrain-polar-stereo.js';
 import { createTerrainClientLogger } from './terrain-client-logging.js';
 import { createTerrainFpsCounter } from './terrain-fps-counter.js';
 import { loadTerrainStartupAssets } from './terrain-startup-assets.js';
@@ -646,6 +653,7 @@ renderer.domElement.addEventListener('contextmenu', event => event.preventDefaul
 
 const { hud, alt, gameClock: gameClockEl } = createTerrainHud({
   onToggleMapMode: () => toggleMapMode(),
+  onToggleGoogleNavigator: () => googleNavigator.toggle(),
   onClockAction: action => {
     if (action === 'rw') _gcRewind();
     else if (action === 'stop') _gcStop();
@@ -1827,6 +1835,7 @@ function createVehicleMarker(labelText, markerId) {
   label.position.set(0, 0, HOUSE_MARKER_HEIGHT + 900);
   label.renderOrder = 1005;
   marker.add(line, halo, dot, label);
+  marker.traverse(object => { object.frustumCulled = false; });
   return marker;
 }
 const vehicleMarker = createVehicleMarker('AMV', 'amv');
@@ -1995,6 +2004,7 @@ function createGroundVehicleState({ id, definition, instance, group, marker, sun
   marker,
   sunLight,
   meshes: [],
+  collisionMeshes: [],
   loaded: false,
   savedStatePending: null,
   snapPending: true,
@@ -2540,6 +2550,11 @@ function loadVehicleModel(entry = groundVehicleState) {
       const vehiclePartsSummary = summarizeVehicleParts(entry.parts);
       bootLog('vehicle.parts.discovered', { id: entry.id, ...vehiclePartsSummary },
         entry.parts.missing.length > 0 ? 'warn' : 'info');
+      const animatedWheelMeshes = new Set(entry.parts.wheels);
+      entry.collisionMeshes = [];
+      model.traverse(obj => {
+        if (obj.isMesh && !animatedWheelMeshes.has(obj)) entry.collisionMeshes.push(obj);
+      });
       entry.wheelRig = createVehicleWheelRig(THREE, entry.parts);
       const vehicleWheelRigSummary = summarizeVehicleWheelRig(entry.wheelRig);
       bootLog('vehicle.wheels.rigged', { id: entry.id, ...vehicleWheelRigSummary },
@@ -2549,7 +2564,8 @@ function loadVehicleModel(entry = groundVehicleState) {
       const vehicleTurretRigSummary = summarizeVehicleTurretRig(entry.turretRig);
       bootLog('vehicle.turret.rigged', { id: entry.id, ...vehicleTurretRigSummary },
         vehicleTurretRigSummary.warnings.length > 0 ? 'warn' : 'info');
-      // Collect after wheel rigging so collision uses the replacement wheel meshes.
+      // Render the accepted vertex-cluster wheel animation, but ground against the
+      // static body meshes. Wheel rotation must never change the collision floor.
       entry.meshes = [];
       model.traverse(obj => { if (obj.isMesh) entry.meshes.push(obj); });
       const savedState = entry.savedStatePending;
@@ -2610,6 +2626,8 @@ const aircraftCameraWorld = new THREE.Vector3();
 const aircraftLookWorld = new THREE.Vector3();
 const aircraftHeadingQuat = new THREE.Quaternion();
 const aircraftLocalUp = new THREE.Vector3(0, 0, 1);
+const aircraftLookDirLocal = new THREE.Vector3();
+const v22TextureSet = loadV22TextureSet();
 
 function sampleAircraftGroundZ(entry) {
   const terrainMeshes = houseTerrainMeshes();
@@ -2636,6 +2654,7 @@ function loadAircraftModels() {
         } else {
           model.rotation.x = Math.PI * 0.5;
         }
+        const v22Materials = applyV22Materials(model, v22TextureSet);
         model.traverse(object => {
           if (!object.isMesh) return;
           object.castShadow = true;
@@ -2667,6 +2686,7 @@ function loadAircraftModels() {
           url: entry.definition.url,
           scale: Number(scale.toFixed(5)),
           parts,
+          materials: v22Materials,
         });
         markSceneMutated();
         requestRender();
@@ -2701,6 +2721,9 @@ function updateAircraftFollowCamera(entry) {
   camera.position.copy(aircraftCameraWorld);
   camera.up.copy(up);
   camera.lookAt(aircraftLookWorld);
+  aircraftLookDirLocal.copy(aircraftLookLocal).sub(aircraftCameraLocal).normalize();
+  controls.yaw = Math.atan2(-aircraftLookDirLocal.x, aircraftLookDirLocal.y);
+  controls.pitch = Math.asin(THREE.MathUtils.clamp(aircraftLookDirLocal.z, -1, 1));
 }
 
 function syncAircraftSunLights() {
@@ -2922,7 +2945,9 @@ function snapVehicleToTerrain(entry = groundVehicleState, options = {}) {
   entry.group.updateMatrixWorld(true);
   // Step 3: raycast UP from terrain surface to find vehicle bottom
   vehicleUpRaycaster.set(terrainPoint, vehicleUpDirection);
-  const vehicleHits = vehicleUpRaycaster.intersectObjects(entry.meshes);
+  const vehicleHits = vehicleUpRaycaster.intersectObjects(
+    entry.collisionMeshes.length > 0 ? entry.collisionMeshes : entry.meshes,
+  );
   let groundedZ = vehicleTargetLocal.z + entry.terrainLiftM;
   if (vehicleHits.length === 0) {
     // Fallback: just use terrain height + small offset
@@ -3249,29 +3274,7 @@ function toggleSelectedAircraftEngine(reason = 'manual') {
   return running;
 }
 
-function toggleSelectedAircraftConversion(reason = 'manual') {
-  const entry = selectedVehicleEntry();
-  if (entry?.vehicleType !== 'aircraft' || !vehicleControlActive || !entry.engineRunning) {
-    return false;
-  }
-  const mode = toggleAircraftConversionMode(entry);
-  bootLog('vehicle.aircraft.conversion', { id: entry.id, mode, reason });
-  requestRender();
-  return true;
-}
-
-const vehicleControlUI = createVehicleControlUI({
-  onDrive: () => setVehicleControlActive(true, 'control-ui'),
-  onExit: () => setVehicleControlActive(false, 'control-ui'),
-  onCycleCamera: () => cycleVehicleCameraMode('control-ui'),
-  onToggleLights: () => toggleVehicleHeadlights('control-ui'),
-  onToggleTurret: () => setVehicleTurretControlActive(
-    !selectedGroundVehicleEntry()?.turretControlActive,
-    'control-ui'
-  ),
-  onToggleEngine: () => toggleSelectedAircraftEngine('control-ui'),
-  onToggleConversion: () => toggleSelectedAircraftConversion('control-ui'),
-});
+const vehicleControlUI = createVehicleControlUI();
 const vehicleFireRuntime = createVehicleFireRuntime({
   terrainRoot,
   camera,
@@ -4857,6 +4860,63 @@ function getCameraLatLon() {
   return { lat: coordinates.lat, lon: coordinates.lon, alt: coordinates.alt };
 }
 
+const exactCameraGeodetic = new Geodetic();
+function getExactCameraLatLon(position = camera.position) {
+  exactCameraGeodetic.setFromECEF(position);
+  return {
+    lat: exactCameraGeodetic.latitude * 180 / Math.PI,
+    lon: exactCameraGeodetic.longitude * 180 / Math.PI,
+    alt: exactCameraGeodetic.height,
+  };
+}
+
+function getRenderedTerrainLatLon(position = camera.position) {
+  if (!tileFrameOffsetReady) return getExactCameraLatLon(position);
+  const coordinates = terrainCameraCoordinates({
+    position, anchorPosition, east, north, up,
+    anchorLatitude: anchorLat, anchorLongitude: anchorLon, originX, originY,
+  });
+  const grid = {
+    x: originX + coordinates.eastM - tileFrameOffsetX,
+    y: originY + coordinates.northM - tileFrameOffsetY,
+  };
+  return { ...epsg3413ToWgs84(grid.x, grid.y), alt: coordinates.alt, grid };
+}
+
+const googleMapsDirection = new THREE.Vector3();
+const googleMapsEast = new THREE.Vector3();
+const googleMapsNorth = new THREE.Vector3();
+const googleMapsUp = new THREE.Vector3();
+function openGoogleMapsView() {
+  camera.getWorldDirection(googleMapsDirection);
+  const renderedPosition = getRenderedTerrainLatLon();
+  Ellipsoid.WGS84.getEastNorthUpVectors(
+    camera.position, googleMapsEast, googleMapsNorth, googleMapsUp,
+  );
+  const gridBearing = renderedPosition.grid
+    ? epsg3413DirectionBearing({
+        x: renderedPosition.grid.x,
+        y: renderedPosition.grid.y,
+        directionX: googleMapsDirection.dot(east),
+        directionY: googleMapsDirection.dot(north),
+      })
+    : null;
+  const url = googleMaps3dUrl({
+    lat: renderedPosition.lat,
+    lon: renderedPosition.lon,
+    alt: cameraAGL,
+    directionEast: gridBearing == null
+      ? googleMapsDirection.dot(googleMapsEast)
+      : Math.sin(gridBearing * Math.PI / 180),
+    directionNorth: gridBearing == null
+      ? googleMapsDirection.dot(googleMapsNorth)
+      : Math.cos(gridBearing * Math.PI / 180),
+    directionUp: googleMapsDirection.dot(googleMapsUp),
+    fov: camera.fov,
+  });
+  window.open(url, '_blank', 'noopener,noreferrer');
+}
+
 function getCameraLogSnapshot(camLL = null) {
   const coordinates = terrainCameraCoordinates({
     position: camera.position, anchorPosition, east, north, up,
@@ -5026,6 +5086,67 @@ function fetchTiles(lat, lon) {
   return tileFetchScheduler.request(lat, lon);
 }
 
+function navigateCameraTo(lat, lon) {
+  if (!Number.isFinite(lat) || !Number.isFinite(lon)
+      || Math.abs(lat) > 90 || Math.abs(lon) > 180) return false;
+  const altitude = Math.max(MIN_FLIGHT_ALT, getCameraLatLon().alt);
+  const targetGrid = wgs84ToEpsg3413(lat, lon);
+  if (!Number.isFinite(targetGrid.x) || !Number.isFinite(targetGrid.y)) return false;
+
+  if (!tileFrameOffsetReady) {
+    originX = targetGrid.x;
+    originY = targetGrid.y;
+    tileFrameOffsetX = 0;
+    tileFrameOffsetY = 0;
+    tileFrameOffsetReady = true;
+  }
+  const targetEastM = targetGrid.x - originX + tileFrameOffsetX;
+  const targetNorthM = targetGrid.y - originY + tileFrameOffsetY;
+  controls.speed = 0;
+  controls.strafeSpeed = 0;
+  controls.dragging = false;
+  driftMode = false;
+  for (const code of Object.keys(controls.keys)) controls.keys[code] = false;
+  setVehicleControlActive(false, 'google-navigate');
+  camera.position.copy(anchorPosition)
+    .addScaledVector(east, targetEastM)
+    .addScaledVector(north, targetNorthM)
+    .addScaledVector(up, altitude);
+  _lastCamMoveTime = performance.now();
+  applyCameraOrientation();
+  updateMapCamera();
+
+  textureStreamer.abortAll();
+  updateTerrainTextures.reset();
+  abortAllEnhancements();
+  tileFetchScheduler.reset(1);
+  isFirstLoad = true;
+  camStereoX = targetGrid.x;
+  camStereoY = targetGrid.y;
+  lastFetchX = targetGrid.x;
+  lastFetchY = targetGrid.y;
+  markHousesNeedSnap();
+  enqueueClientLog('info', 'google.navigate', {
+    lat: Number(lat.toFixed(7)),
+    lon: Number(lon.toFixed(7)),
+    altitude: Number(altitude.toFixed(1)),
+    gridX: Number(targetGrid.x.toFixed(3)),
+    gridY: Number(targetGrid.y.toFixed(3)),
+    backend: 'webgpu',
+  });
+  fetchTiles(lat, lon);
+  updateHud();
+  requestRender();
+  return true;
+}
+
+const googleNavigator = createGoogleNavigator({
+  getCameraLatLon: getRenderedTerrainLatLon,
+  navigateTo: navigateCameraTo,
+  openGoogle3d: openGoogleMapsView,
+  onChanged: requestRender,
+});
+
 // --- Save/restore camera position ---
 
 function savePosition() {
@@ -5141,6 +5262,9 @@ window.takramDebug = {
       : null,
   flushClientLogQueue: () => flushClientLogQueue(),
   fetchTiles,
+  navigateTo: navigateCameraTo,
+  getCameraLatLon,
+  getRenderedTerrainLatLon,
   loadHouseModel,
   setHousesVisible: visible => setHousesRuntimeVisible(Boolean(visible), 'debug-api'),
   getHousesVisible: () => housesRuntimeVisible,
@@ -5163,10 +5287,8 @@ window.takramDebug = {
     headingDeg: Number(THREE.MathUtils.radToDeg(entry.headingRad).toFixed(3)),
     speedMps: entry.vehicleType === 'aircraft' ? entry.forwardSpeedMs : entry.speed,
     engineRunning: entry.vehicleType === 'aircraft' ? entry.engineRunning : null,
-    collective: entry.vehicleType === 'aircraft' ? Number(entry.collective.toFixed(4)) : null,
     rotorSpool: entry.vehicleType === 'aircraft' ? Number(entry.rotorSpool.toFixed(4)) : null,
     nacelleTiltDeg: entry.vehicleType === 'aircraft' ? Number(entry.nacelleTiltDeg.toFixed(2)) : null,
-    conversionMode: entry.vehicleType === 'aircraft' ? entry.conversionMode : null,
     flightRegime: entry.vehicleType === 'aircraft' ? entry.flightRegime : null,
     altitudeAGL: entry.vehicleType === 'aircraft' ? Number(entry.altitudeAGL.toFixed(2)) : null,
     verticalSpeedMs: entry.vehicleType === 'aircraft' ? Number(entry.verticalSpeedMs.toFixed(3)) : null,
@@ -5625,24 +5747,26 @@ function updateHud() {
     `enu: E ${eastM.toFixed(0)}m  N ${northM.toFixed(0)}m  U ${altM.toFixed(0)}m`,
     `speed: ${speedKmh.toFixed(0)} km/h  heading: ${deg.toFixed(0)}° ${compass}`,
     vehicleControlActive && hudVehicle?.vehicleType === 'aircraft'
-      ? `${hudVehicle.flightRegime} · collective ${Math.round(hudVehicle.collective * 100)}% · rotor ${Math.round(hudVehicle.rotorSpool * 100)}% · nacelles ${hudVehicle.nacelleTiltDeg.toFixed(0)}° · V/S ${hudVehicle.verticalSpeedMs.toFixed(1)} m/s · AGL ${hudVehicle.altitudeAGL.toFixed(0)} m`
+      ? `${hudVehicle.flightRegime} · rotor ${Math.round(hudVehicle.rotorSpool * 100)}% · nacelles ${hudVehicle.nacelleTiltDeg.toFixed(0)}° · V/S ${hudVehicle.verticalSpeedMs.toFixed(1)} m/s · AGL ${hudVehicle.altitudeAGL.toFixed(0)} m`
       : '',
     hmLine,
     texLine,
     hudVehicle?.turretControlActive
       ? 'Mouse aims turret, W/S drive, A/D steer, T or Esc exits turret · firing pending WebGPU validation'
       : vehicleControlActive && hudVehicle?.vehicleType === 'aircraft'
-      ? `E engine (${hudVehicle.engineRunning ? 'ON' : 'OFF'}), Space/Q collective, W/S move, A/D turn, F ${hudVehicle.conversionMode === 'cruise' ? 'convert to hover' : 'convert to cruise'}, V camera (${currentVehicleCameraModeName()}), Esc exit`
+      ? `E engine (${hudVehicle.engineRunning ? 'ON' : 'OFF'}), Space/Q climb/descend, W/S forward/back, A/D yaw, V camera (${currentVehicleCameraModeName()}), Esc exit`
       : vehicleControlActive
       ? `W/S drive, A/D steer, mouse orbit, V camera (${currentVehicleCameraModeName()}), L lights, Esc exit`
       : (hudVehicle != null
-        ? `${hudVehicle.definition?.displayName || 'Vehicle'} selected · right-click it or use Drive`
+        ? `${hudVehicle.definition?.displayName || 'Vehicle'} selected · right-click it to drive`
         : 'WASD or Arrows move, Q/Z altitude, drag look · click vehicle to select, right-click to drive'),
     'map: left-drag rotate, right-drag pan, wheel zoom',
     controls.mapMode
       ? `ocean overlay: ${oceanMapDebugEnabled ? 'ON' : 'OFF'}  (right-click menu; cyan=ocean, magenta=seed, orange=passable)`
       : '',
-    '<span id="mapModeLink" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">map mode</span> (M), R reset · <span id="debugLogLink" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">debug log</span>'
+    '<span id="mapModeLink" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">map mode</span> (M)'
+    + ' · <span id="googleNavigatorLink" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">Google navigator</span> (G)'
+    + ' · <span id="debugLogLink" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">debug log</span>'
     + ' · <span id="pipelineMapLink" title="2D radar in pipeline-map mode — click any tile to open its tile inspector" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">pipeline map</span> (P)'
     + ' · <span id="radarHeatmapLink" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">heatmap</span> (H)'
   ].join('<br>');
@@ -5660,17 +5784,13 @@ function updateHud() {
     displayName: hudVehicle?.definition?.displayName || 'Vehicle',
     id: hudVehicle?.id || '',
     cameraMode: currentVehicleCameraModeName(),
-    speedMps: vehicleControlActive
-      ? (isAircraft ? hudVehicle.forwardSpeedMs : (hudVehicle?.speed ?? 0))
-      : 0,
+    speedMps: isAircraft ? (hudVehicle?.forwardSpeedMs ?? 0) : (hudVehicle?.speed ?? 0),
     hasLights: !isAircraft && (hudVehicle?.headlightSpots?.length ?? 0) > 0,
     lightsOn: headlightsOn,
     hasTurret: !isAircraft && hudVehicle?.turretRig?.gunPivot != null,
     turretActive: Boolean(hudVehicle?.turretControlActive),
     isAircraft,
     engineRunning: Boolean(hudVehicle?.engineRunning),
-    conversionMode: hudVehicle?.conversionMode ?? 'hover',
-    collective: hudVehicle?.collective ?? 0,
     rotorSpool: hudVehicle?.rotorSpool ?? 0,
     altitudeAGL: hudVehicle?.altitudeAGL ?? 0,
     verticalSpeedMs: hudVehicle?.verticalSpeedMs ?? 0,
@@ -5725,6 +5845,28 @@ function resetView() {
   fetchTiles();
 }
 
+const resetViewButton = document.createElement('button');
+resetViewButton.type = 'button';
+resetViewButton.id = 'reset-view-button';
+resetViewButton.textContent = 'Reset view';
+resetViewButton.title = 'Reset camera, tuning, and streamed terrain position';
+resetViewButton.style.cssText = [
+  'padding:4px 7px',
+  'margin-left:auto',
+  'margin-right:8px',
+  'border:1px solid rgba(255,255,255,0.24)',
+  'border-radius:4px',
+  'background:rgba(5,10,16,0.72)',
+  'color:#9aa8b5',
+  'font:11px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace',
+  'cursor:pointer',
+].join(';');
+resetViewButton.addEventListener('click', event => {
+  event.stopPropagation();
+  if (window.confirm('Reset the camera, tuning, and streamed terrain position?')) resetView();
+});
+tuningHeader.insertBefore(resetViewButton, tuningHeader.lastElementChild);
+
 let driftMode = false;
 
 function toggleMapMode() {
@@ -5771,9 +5913,9 @@ installTerrainKeyboardControls({
   },
   onEscapeTurret: () => setVehicleTurretControlActive(false, 'escape'),
   onToggleMap: toggleMapMode,
+  onToggleGoogleNavigator: () => googleNavigator.toggle(),
   onOpenPipeline: () => window.open(HUD_LINKS.pipelineMapLink, '_blank'),
   onOpenHeatmap: () => window.open(HUD_LINKS.radarHeatmapLink, '_blank'),
-  onReset: resetView,
   onHouseAction: load => load
     ? loadHouseModel('keyboard')
     : setHousesRuntimeVisible(!housesRuntimeVisible, 'keyboard'),
@@ -5786,7 +5928,6 @@ installTerrainKeyboardControls({
     'keyboard'
   ),
   onToggleAircraftEngine: () => toggleSelectedAircraftEngine('keyboard'),
-  onToggleAircraftConversion: () => toggleSelectedAircraftConversion('keyboard'),
   onChanged: requestRender,
 });
 

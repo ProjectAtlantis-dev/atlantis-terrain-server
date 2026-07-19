@@ -96,15 +96,14 @@ export function installTerrainKeyboardControls({
   onEscapeVehicle,
   onEscapeTurret = () => {},
   onToggleMap,
+  onToggleGoogleNavigator = () => {},
   onOpenPipeline,
   onOpenHeatmap,
-  onReset,
   onHouseAction,
   onToggleHeadlights,
   onCycleVehicleCamera = () => {},
   onToggleTurret = () => {},
   onToggleAircraftEngine = () => {},
-  onToggleAircraftConversion = () => {},
   onChanged = () => {},
   doubleTapMs = 300,
 }) {
@@ -136,8 +135,8 @@ export function installTerrainKeyboardControls({
       return;
     }
     if (event.code === 'KeyM') return onToggleMap();
+    if (event.code === 'KeyG') return onToggleGoogleNavigator();
     if (event.code === 'KeyP') return onOpenPipeline();
-    if (event.code === 'KeyR') return onReset();
     if (event.code === 'KeyH') {
       if (event.shiftKey) return onHouseAction(true);
       return onOpenHeatmap();
@@ -146,7 +145,6 @@ export function installTerrainKeyboardControls({
     if (event.code === 'KeyV' && isVehicleActive() && !isTurretActive()) onCycleVehicleCamera();
     if (event.code === 'KeyT' && isVehicleActive()) onToggleTurret();
     if (event.code === 'KeyE' && isVehicleActive()) onToggleAircraftEngine();
-    if (event.code === 'KeyF' && isVehicleActive()) onToggleAircraftConversion();
   };
   const onKeyUp = event => {
     controls.keys[event.code] = false;
