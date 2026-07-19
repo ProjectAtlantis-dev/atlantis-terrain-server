@@ -5,14 +5,28 @@ import {
 } from './terrain-tile-fetch.js';
 import { reconcileTerrainTiles } from './terrain-tile-reconciler.js';
 
+export function terrainResidencyBudgetForPass({
+  pass,
+  tileBudget,
+  previewTileBudget,
+}) {
+  const full = Math.max(1, Math.floor(Number(tileBudget) || 1));
+  const preview = Math.max(1, Math.floor(Number(previewTileBudget) || full));
+  return pass === 1 ? Math.min(full, preview) : full;
+}
+
 export function createTerrainFetchExecutor({
   state,
   previewMaxDepth,
   useManifest = false,
   tileBudget = 384,
+  previewTileBudget = 16,
+  previewBuildBudget = 16,
+  fullBuildBudget = 32,
   getHeading,
   getRange,
   getCameraLatLon,
+  getRequestFocus = camera => camera,
   getCameraSnapshot,
   getCameraLocalPosition,
   anchorLatitude,
@@ -29,6 +43,8 @@ export function createTerrainFetchExecutor({
   updateTextures,
   prepareUntexturedMesh,
   onMeshAdded,
+  onWorldIdentity = () => {},
+  onTilesReceived = () => {},
   onResponseApplied = () => {},
   enqueueLog,
   bootLog,
@@ -40,19 +56,28 @@ export function createTerrainFetchExecutor({
     state.pass = pass;
     const started = now();
     const camera = getCameraLatLon();
+    const focus = lat == null || lon == null
+      ? getRequestFocus(camera)
+      : { lat, lon };
     const cameraSnapshot = getCameraSnapshot(camera);
     const request = buildTerrainTilesRequest({
-      lat: lat ?? camera.lat, lon: lon ?? camera.lon, altitude: camera.alt,
+      lat: focus?.lat ?? camera.lat, lon: focus?.lon ?? camera.lon, altitude: camera.alt,
       heading: getHeading(), range: getRange(), pass,
       previewMaxDepth, isFirstLoad: state.isFirstLoad,
       frameOffsetReady: state.frameOffsetReady,
       originX: state.originX, originY: state.originY,
-      useManifest, tileBudget,
+      useManifest,
+      tileBudget: terrainResidencyBudgetForPass({ pass, tileBudget, previewTileBudget }),
       cameraSnapshot,
     });
+    Object.assign(request.logDetails, focus?.logDetails ?? {});
     enqueueLog('info', `fetchTiles.request[pass${pass}]`, request.logDetails);
     const response = await fetchImpl(request.url, { signal });
     const data = await response.json();
+    onWorldIdentity({
+      worldSeed: data?.worldSeed,
+      procgenVersion: data?.procgenVersion,
+    });
     if (data?.manifest) {
       const hydration = await hydrateTerrainHeightmaps(data.tiles, {
         cache: heightmapCache,
@@ -79,6 +104,7 @@ export function createTerrainFetchExecutor({
       });
     }
     offsetTerrainPayload(data, frameOffset.offsetX, frameOffset.offsetY);
+    onTilesReceived(data.tiles);
     enqueueLog('info', `fetchTiles.response[pass${pass}]`, summarizeTerrainResponse({
       data, status: response.status, pass, cameraX: local.x, cameraY: local.y,
       frameOffsetX: frameOffset.offsetX, frameOffsetY: frameOffset.offsetY,
@@ -107,6 +133,7 @@ export function createTerrainFetchExecutor({
       tiles: data.tiles, currentTileIds: state.currentTileIds,
       deferredTiles, terrainRoot, lifecycle, priorityForTile,
       textureCache, materialize, buildMesh, log: tileLog,
+      buildBudget: pass === 1 ? previewBuildBudget : fullBuildBudget,
       prepareUntexturedMesh, onMeshAdded,
       onDiff: details => enqueueLog('info', `fetchTiles.diff[pass${pass}]`, {
         pass, passLabel: pass === 1 ? 'preview' : 'full', ...details,
@@ -131,8 +158,13 @@ export function createTerrainFetchExecutor({
       anchorLatitude, anchorLongitude,
       originX: state.originX, originY: state.originY,
     });
-    state.cameraX = state.lastFetchX = stereo.x;
-    state.cameraY = state.lastFetchY = stereo.y;
+    state.cameraX = stereo.x;
+    state.cameraY = stereo.y;
+    // Track the manifest focus, which may be predicted ahead of the physical
+    // camera. Refetch hysteresis compares the next prediction to this request,
+    // not to wherever the camera happened to be after network/build latency.
+    state.lastFetchX = Number.isFinite(data.qx) ? data.qx : stereo.x;
+    state.lastFetchY = Number.isFinite(data.qy) ? data.qy : stereo.y;
     const pipeline = terrainPipelineStatus(data, wasFirstLoad);
     state.pipeline = pipeline;
     return {

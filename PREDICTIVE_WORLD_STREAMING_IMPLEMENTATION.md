@@ -181,3 +181,93 @@ destination and use a transition, but normal aircraft flight may not.
 - Frozen proposal recorded against clean baseline `e65dc11`.
 - No predictive-streaming implementation code had been changed at the time of
   this entry.
+
+### 2026-07-19 - Stages 1-3 implementation and measured correction
+
+Status: implemented locally and live-probed; not yet the stage-4 continuous
+procedural-cell architecture.
+
+- Terrain transport remains a hole-free quadtree rather than “load every DB
+  row.” The preview asks for 16 leaves, but the current stored pyramid can only
+  collapse the requested footprint to 45 real ancestors without holes. The
+  settled pass is capped at 384 leaves and hydrates only missing versioned
+  height pages. Scene construction is bounded to 16 preview / 32 settled
+  meshes per continuation. Scheduler continuations use a zero-delay task;
+  relying on `requestAnimationFrame` could strand pass 2 when the first WebGPU
+  frame was expensive or the tab was backgrounded.
+- Streaming focus now predicts from position, heading and speed with a bounded
+  4-20 second / 5 km lookahead. Manifest refresh uses predicted displacement
+  with a 1,200 m threshold and 1 s trigger floor. The current position remains
+  authoritative coverage; prediction changes priority, not correctness.
+- Flask now owns a persistent `worldSeed` and `procgenVersion`. Scatter hashes
+  use biased absolute EPSG:3413 grid cells rather than patch-local cells. CPU
+  overlap tests and GPU readback agreed on all 2,524/2,524 large-rock keys in
+  adjacent windows; reconstructed world coordinates differed only by the
+  expected approximately 0.001 m float reconstruction tolerance.
+- Scatter buffers are sized to the actual absolute-grid candidate count rather
+  than theoretical multi-million-instance ceilings. Its dependent clear/tree/
+  understory/extra/stone passes are submitted as one ordered WebGPU batch so a
+  render cannot observe the cleared intermediate scatter state.
+
+### 2026-07-19 - Procedural handoff experiments and rejected approaches
+
+- A resident active/inactive pair was implemented and measured. Data handoff
+  after allocation was approximately 118-142 ms, but the first visibility of
+  the second Forests/GroundRing graph triggered a 12.5 s lazy render-pipeline
+  compilation frame. It was rejected.
+- Explicitly compiling the inactive graph ahead of time was also rejected:
+  `renderer.compileAsync` moved the stall into startup and increased readiness
+  to 40.2 s.
+- The current implementation retains one compiled render/material graph and
+  rewrites its persistent height/classifier/scatter buffers. A coverage guard
+  keeps a stale patch hidden after long-distance travel; during an ordinary
+  adjacent recenter the old patch remains visible only while it still covers
+  the complete 265 m detail radius.
+
+### 2026-07-19 - Speed/altitude tier decision (proposal correction)
+
+The user confirmed that the present game should intentionally use its cached
+12 m satellite/DEM terrain tier during cruise/fast flight, then restore full
+procedural detail after slowing or descending. This supersedes the frozen
+proposal's stage-4 acceptance statement for the current monolithic patch. The
+proposal remains unchanged above so the decision history is visible.
+
+- Micro-detail exits above 45 m/s and re-enters below 30 m/s. It exits above
+  500 m AGL and may prewarm below 650 m. These gates affect only the procedural
+  root; streamed terrain, imagery, water, structures and vehicles remain.
+- Prewarming begins only below the speed exit threshold. Visibility requires
+  both the detail gate and a current window whose full 265 m radius covers the
+  camera. A slow-down therefore cannot flash the old procedural patch at the
+  previous flight position.
+- Keeping full procedural detail active at 141 m/s was measured and rejected:
+  835.5 m in 8 s caused seven recenters and measured 33.3 ms p50, 50.9 ms p95,
+  151 ms p99 and 167.6 ms worst at 1961x1062. The procedural root remained
+  visible, proving the result was cost—not a missing-root artifact.
+- With the intended cruise tier, the same 141 m/s path performed zero
+  procedural recenters. After the grounding optimization below, the measured
+  result was 16.7 ms p50, 17.6 ms p95, 34.2 ms p99 and 66.7 ms worst.
+- A cruise-to-slow handoff after 531.3 m restored detail at the exact predicted
+  cell `-2304:-3264` in 990.6 ms. No stale root was visible before readiness.
+  The warm classifier lookup was 4.5 ms and the persistent-buffer preparation
+  was 159.1 ms (163.6 ms total).
+
+This is a correct bounded fallback, not completion of proposal stage 4. The
+future retained-cell/macro-rock architecture may remove the binary speed gate
+if it meets budget. The current 163.6 ms warm rewrite still fails the 50 ms
+hitch target, and a separate cold source-refinement run spent about 12 s
+generating/loading classifier fields before later warm reads fell to 4.5 ms.
+
+### 2026-07-19 - Half-resolution grounding implementation
+
+- The measured full-resolution GTAO/contact bucket was about 6.7 ms at desktop
+  resolution. LAAS's source design evaluates GTAO at half resolution, so
+  Atlantis now renders only the scalar grounding mask at half width/height and
+  bilinearly reconstructs it over full-resolution scene color. Scene depth,
+  terrain, atmosphere and final color remain full resolution.
+- Cloud god rays and grounding now share one reusable scaled-RTT owner.
+  `?groundingFull=1` retains the full-resolution A/B path.
+- Same-path 141 m/s cruise before this change measured 32.5 ms p50 / 34.2 ms
+  p95 / 84.3 ms worst. After it: 16.7 / 17.6 / 66.7 ms. The Vite production
+  build passed (373 modules), no shader/pipeline/WebGPU validation error was
+  emitted, and a fresh frame at 64.18455, -51.70203 showed no visible mask
+  edge or terrain-darkening regression.

@@ -20,6 +20,7 @@
  *   B = (yaw, leanX, leanZ, idF)   idF = class·8 + variant  (exact in f32)
  */
 
+import { Vector2 } from 'three';
 import type { Renderer } from 'three/webgpu';
 import { StorageTexture, type StorageBufferNode } from 'three/webgpu';
 import {
@@ -36,6 +37,7 @@ import {
   smoothstep,
   texture,
   textureStore,
+  uniform,
   uint,
   uvec2,
   vec2,
@@ -48,6 +50,7 @@ import { LAKE_LEVEL, TREELINE, WORLD_SIZE } from '../../world/WorldConst';
 import { fbm3 } from '../noise/NoiseTSL';
 import { GREENLAND_FLORA, type FloraSpecies } from '../../vegetation/GreenlandFlora';
 import type { NF, NI, NU, NV2, NV4 } from '../TSLTypes';
+import { absoluteScatterGrid } from '../../../procgen-absolute-grid.js';
 
 /** geometry-pool class ids (variant index lives in the low 3 bits of idF) */
 export const enum VegClass {
@@ -111,6 +114,8 @@ export interface ScatterResult {
   extras: ScatterLayer;
   /** stones (3 size classes) + fallen branches — ground-solid coverage */
   stones: ScatterLayer;
+  /** Anchor deterministic candidate hashes to the active absolute EPSG grid. */
+  setWorldCenter(x: number, z: number): void;
   /** Re-run placement into the same buffers after Heightfield.reseed(). */
   reseed(renderer: Renderer): Promise<void>;
 }
@@ -137,12 +142,13 @@ const TAU = 6.2831853;
 
 function pcg2d(p: NV2, salt: number): NV2 {
   // PURE expression chain — no toVar/assign, so it works in material node
-  // graphs too (assign needs a Fn() stack). +40000 keeps negative ring cell
-  // coords positive before the uint cast (world cells span ±~10k).
+  // graphs too (assign needs a Fn() stack). The 2^22 bias keeps absolute
+  // Greenland EPSG:3413 cells positive before uint conversion while remaining
+  // exactly representable in f32 (coordinates are below roughly ±1.2M cells).
   const M = uint(1664525);
   const C = uint(1013904223);
-  const a0 = p.x.add(40000 + (salt & 0x3fff)).toUint();
-  const b0 = p.y.add(40000 + ((salt >> 14) & 0x3fff)).toUint();
+  const a0 = p.x.add(4194304 + (salt & 0x3fff)).toUint();
+  const b0 = p.y.add(4194304 + ((salt >> 14) & 0x3fff)).toUint();
   const a1 = a0.mul(M).add(C);
   const b1 = b0.mul(M).add(C);
   const a2 = a1.add(b1.mul(M));
@@ -217,14 +223,14 @@ interface SiteSamples {
   nrmXZ: NV2;
 }
 
-function sampleSite(hf: Heightfield, wpos: NV2): SiteSamples {
+function sampleSite(hf: Heightfield, wpos: NV2, noisePos: NV2 = wpos): SiteSamples {
   const uv = wpos.div(hf.worldSize).add(0.5);
   const h = hf.sampleHeight(wpos);
   const ns = texture(hf.normalTex, uv, 0) as unknown as NV4;
   // ecotone warp: read the biome classification through a ±26 m wobble
   const warp = vec2(
-    fbm3(vec3(wpos.x.mul(0.011), 3.7, wpos.y.mul(0.011)), 2),
-    fbm3(vec3(wpos.x.mul(0.011), 91.2, wpos.y.mul(0.011)), 2),
+    fbm3(vec3(noisePos.x.mul(0.011), 3.7, noisePos.y.mul(0.011)), 2),
+    fbm3(vec3(noisePos.x.mul(0.011), 91.2, noisePos.y.mul(0.011)), 2),
   ).mul(26);
   const uvW = wpos.add(warp).div(hf.worldSize).add(0.5);
   const bio = texture(
@@ -450,16 +456,75 @@ export async function runScatter(
   renderer: Renderer,
   hf: Heightfield,
   seed: WorldSeed,
+  worldCenter = { x: 0, z: 0 },
 ): Promise<ScatterResult> {
   const worldSize = hf.worldSize;
   const sT = seed.sub('scatter/trees') & 0x7fffffff;
   const sU = seed.sub('scatter/understory') & 0x7fffffff;
   const sE = seed.sub('scatter/extras') & 0x7fffffff;
 
+  const gridBindings: Array<{
+    cellSize: number;
+    count: number;
+    baseU: ReturnType<typeof uniform>;
+    offsetU: ReturnType<typeof uniform>;
+  }> = [];
+  const makeGrid = (cellSize: number) => {
+    const initial = absoluteScatterGrid({
+      centerX: worldCenter.x,
+      centerZ: worldCenter.z,
+      worldSize,
+      cellSize,
+    });
+    const binding = {
+      cellSize,
+      count: initial.gridCount,
+      baseU: uniform(new Vector2(initial.baseCellX, initial.baseCellZ)),
+      offsetU: uniform(new Vector2(initial.localOffsetX, initial.localOffsetZ)),
+    };
+    gridBindings.push(binding);
+    return binding;
+  };
+  const setGridCenter = (centerX: number, centerZ: number) => {
+    for (const binding of gridBindings) {
+      const grid = absoluteScatterGrid({
+        centerX,
+        centerZ,
+        worldSize,
+        cellSize: binding.cellSize,
+      });
+      binding.baseU.value.set(grid.baseCellX, grid.baseCellZ);
+      binding.offsetU.value.set(grid.localOffsetX, grid.localOffsetZ);
+    }
+  };
+  const candidate = (
+    i: typeof instanceIndex,
+    grid: ReturnType<typeof makeGrid>,
+    salt: number,
+  ) => {
+    const localCell = vec2(float(i.mod(grid.count)), float(i.div(grid.count)));
+    const worldCell = localCell.add(grid.baseU as unknown as NV2);
+    const jitter = cellHash2(worldCell, salt);
+    return {
+      cell: worldCell,
+      absolutePosition: worldCell.add(jitter).mul(grid.cellSize) as unknown as NV2,
+      localPosition: localCell
+        .add(jitter)
+        .mul(grid.cellSize)
+        .add(grid.offsetU as unknown as NV2) as unknown as NV2,
+    };
+  };
+  const outsideWindow = (wpos: NV2) => wpos.x
+    .abs()
+    .greaterThan(worldSize * 0.5)
+    .or(wpos.y.abs().greaterThan(worldSize * 0.5));
+
   // ---------------------------------------------------------------- trees --
-  const treeG = Math.round(worldSize / TREE_CELL);
-  const treeA = instancedArray(TREE_CAP, 'vec4');
-  const treeB = instancedArray(TREE_CAP, 'vec4');
+  const treeGrid = makeGrid(TREE_CELL);
+  const treeG = treeGrid.count;
+  const treeCapacity = Math.min(TREE_CAP, treeG * treeG);
+  const treeA = instancedArray(treeCapacity, 'vec4');
+  const treeB = instancedArray(treeCapacity, 'vec4');
   const treeCount = instancedArray(1, 'uint').toAtomic();
 
   const treeK = Fn(() => {
@@ -467,10 +532,12 @@ export async function runScatter(
     If(i.greaterThanEqual(treeG * treeG), () => {
       Return();
     });
-    const cell = vec2(float(i.mod(treeG)), float(i.div(treeG)));
-    const jit = cellHash2(cell, sT);
-    const wpos = cell.add(jit).div(treeG).sub(0.5).mul(worldSize);
-    const s = sampleSite(hf, wpos);
+    const point = candidate(i, treeGrid, sT);
+    const cell = point.cell;
+    const wpos = point.localPosition;
+    const absWpos = point.absolutePosition;
+    If(outsideWindow(wpos), () => { Return(); });
+    const s = sampleSite(hf, wpos, absWpos);
 
     // hard exclusions: open/standing water, river channels, lake shelf
     // LAKE_LEVEL is the synthetic standalone world's absolute water plane.
@@ -485,7 +552,7 @@ export async function runScatter(
       Return();
     });
 
-    const clump = clumpField(wpos, sT ^ 0x51f3);
+    const clump = clumpField(absWpos, sT ^ 0x51f3);
     // GREENLAND: treeless for now — Greenland is largely unforested. Zeroing
     // the per-biome tree density rejects every tree candidate while leaving the
     // understory/grass/rock layers untouched. Restore the original table
@@ -571,7 +638,7 @@ export async function runScatter(
 
     append(
       treeCount,
-      TREE_CAP,
+      treeCapacity,
       treeA,
       treeB,
       vec4(wpos.x, y, wpos.y, scale) as unknown as NV4,
@@ -581,9 +648,11 @@ export async function runScatter(
   treeK.setName('scatterTrees');
 
   // ----------------------------------------------------------- understory --
-  const underG = Math.round(worldSize / UNDER_CELL);
-  const underA = instancedArray(UNDER_CAP, 'vec4');
-  const underB = instancedArray(UNDER_CAP, 'vec4');
+  const underGrid = makeGrid(UNDER_CELL);
+  const underG = underGrid.count;
+  const underCapacity = Math.min(UNDER_CAP, underG * underG);
+  const underA = instancedArray(underCapacity, 'vec4');
+  const underB = instancedArray(underCapacity, 'vec4');
   const underCount = instancedArray(1, 'uint').toAtomic();
 
   const underK = Fn(() => {
@@ -591,10 +660,12 @@ export async function runScatter(
     If(i.greaterThanEqual(underG * underG), () => {
       Return();
     });
-    const cell = vec2(float(i.mod(underG)), float(i.div(underG)));
-    const jit = cellHash2(cell, sU);
-    const wpos = cell.add(jit).div(underG).sub(0.5).mul(worldSize);
-    const s = sampleSite(hf, wpos);
+    const point = candidate(i, underGrid, sU);
+    const cell = point.cell;
+    const wpos = point.localPosition;
+    const absWpos = point.absolutePosition;
+    If(outsideWindow(wpos), () => { Return(); });
+    const s = sampleSite(hf, wpos, absWpos);
 
     if (!hf.external) {
       If(s.h.lessThan(LAKE_LEVEL + 0.35), () => {
@@ -636,7 +707,7 @@ export async function runScatter(
     const seedClump = smoothstep(
       0.42,
       0.66,
-      fbm3(vec3(wpos.x.mul(0.33), 7, wpos.y.mul(0.33)), 2).mul(0.5).add(0.5),
+      fbm3(vec3(absWpos.x.mul(0.33), 7, absWpos.y.mul(0.33)), 2).mul(0.5).add(0.5),
     );
     // moist thickets fill in (dense scrub) rather than thinning into clumps
     const clumpK = seedClump.max(smoothstep(0.4, 0.75, s.moisture)).mul(0.6).add(0.4);
@@ -645,7 +716,7 @@ export async function runScatter(
     // plants root (user). A fine fissure field (ridged high-freq noise) plus
     // moist hollows marks the cracks; rock only suppresses veg AWAY from them.
     const fissure = float(1).sub(
-      fbm3(vec3(wpos.x.mul(0.8), 3, wpos.y.mul(0.8)), 3).mul(0.5).add(0.5).sub(0.5).abs().mul(2),
+      fbm3(vec3(absWpos.x.mul(0.8), 3, absWpos.y.mul(0.8)), 3).mul(0.5).add(0.5).sub(0.5).abs().mul(2),
     );
     const crack = smoothstep(0.55, 0.85, fissure).max(
       smoothstep(0.4, 0.72, s.moisture).mul(0.75),
@@ -669,7 +740,7 @@ export async function runScatter(
     // its colony field — all generated from the typed table, so adding a plant
     // is a data-row edit, not another hand-nested shader branch.
     const wts = GREENLAND_FLORA.map((sp, i) =>
-      speciesWeight(s, wpos, sp, 11 + i * 13.7),
+      speciesWeight(s, absWpos, sp, 11 + i * 13.7),
     );
     let sum: NF = wts[0] as NF;
     for (let i = 1; i < wts.length; i++) sum = sum.add(wts[i] as NF);
@@ -706,7 +777,7 @@ export async function runScatter(
 
     append(
       underCount,
-      UNDER_CAP,
+      underCapacity,
       underA,
       underB,
       vec4(wpos.x, s.h.sub(0.03), wpos.y, scale) as unknown as NV4,
@@ -716,9 +787,11 @@ export async function runScatter(
   underK.setName('scatterUnderstory');
 
   // --------------------------------------------------------------- extras --
-  const extraG = Math.round(worldSize / EXTRA_CELL);
-  const extraA = instancedArray(EXTRA_CAP, 'vec4');
-  const extraB = instancedArray(EXTRA_CAP, 'vec4');
+  const extraGrid = makeGrid(EXTRA_CELL);
+  const extraG = extraGrid.count;
+  const extraCapacity = Math.min(EXTRA_CAP, extraG * extraG);
+  const extraA = instancedArray(extraCapacity, 'vec4');
+  const extraB = instancedArray(extraCapacity, 'vec4');
   const extraCount = instancedArray(1, 'uint').toAtomic();
 
   // GREENLAND toggle: forest-floor deadwood density (logs + stumps). 0 =
@@ -729,10 +802,12 @@ export async function runScatter(
     If(i.greaterThanEqual(extraG * extraG), () => {
       Return();
     });
-    const cell = vec2(float(i.mod(extraG)), float(i.div(extraG)));
-    const jit = cellHash2(cell, sE);
-    const wpos = cell.add(jit).div(extraG).sub(0.5).mul(worldSize);
-    const s = sampleSite(hf, wpos);
+    const point = candidate(i, extraGrid, sE);
+    const cell = point.cell;
+    const wpos = point.localPosition;
+    const absWpos = point.absolutePosition;
+    If(outsideWindow(wpos), () => { Return(); });
+    const s = sampleSite(hf, wpos, absWpos);
 
     if (!hf.external) {
       If(s.h.lessThan(LAKE_LEVEL + 0.3), () => {
@@ -743,7 +818,7 @@ export async function runScatter(
       Return();
     });
 
-    const canopy = clumpField(wpos, sT ^ 0x51f3);
+    const canopy = clumpField(absWpos, sT ^ 0x51f3);
     const forestK = byBiome(s.bioId, [0, 0.3, 1, 1, 0.25, 0.6]).mul(
       canopy.mul(0.7).add(0.3),
     );
@@ -824,7 +899,7 @@ export async function runScatter(
 
     append(
       extraCount,
-      EXTRA_CAP,
+      extraCapacity,
       extraA,
       extraB,
       vec4(wpos.x, s.h.sub(sink), wpos.y, scale) as unknown as NV4,
@@ -839,9 +914,11 @@ export async function runScatter(
   // light scatter on all soil; fallen branches on forest floors. This is
   // the "no bare ground" layer — references show ground GEOMETRY at every
   // distance, never naked splat.
-  const stoneG = Math.round(worldSize / STONE_CELL);
-  const stoneA = instancedArray(STONE_CAP, 'vec4');
-  const stoneB = instancedArray(STONE_CAP, 'vec4');
+  const stoneGrid = makeGrid(STONE_CELL);
+  const stoneG = stoneGrid.count;
+  const stoneCapacity = Math.min(STONE_CAP, stoneG * stoneG);
+  const stoneA = instancedArray(stoneCapacity, 'vec4');
+  const stoneB = instancedArray(stoneCapacity, 'vec4');
   const stoneCount = instancedArray(1, 'uint').toAtomic();
   const sS = seed.sub('scatter/stones') & 0x7fffffff;
 
@@ -850,10 +927,12 @@ export async function runScatter(
     If(i.greaterThanEqual(stoneG * stoneG), () => {
       Return();
     });
-    const cell = vec2(float(i.mod(stoneG)), float(i.div(stoneG)));
-    const jit = cellHash2(cell, sS);
-    const wpos = cell.add(jit).div(stoneG).sub(0.5).mul(worldSize);
-    const s = sampleSite(hf, wpos);
+    const point = candidate(i, stoneGrid, sS);
+    const cell = point.cell;
+    const wpos = point.localPosition;
+    const absWpos = point.absolutePosition;
+    If(outsideWindow(wpos), () => { Return(); });
+    const s = sampleSite(hf, wpos, absWpos);
     if (!hf.external) {
       If(s.h.lessThan(LAKE_LEVEL + 0.25), () => {
         Return();
@@ -867,7 +946,7 @@ export async function runScatter(
       Return();
     });
 
-    const canopy = clumpField(wpos, sT ^ 0x51f3);
+    const canopy = clumpField(absWpos, sT ^ 0x51f3);
     const streamK = smoothstep(0.05, 0.3, s.riverDepth);
     // angle of repose: loose rock can't rest above ~42° — anything clinging
     // to steeper faces reads as stuck-on blobs (user feedback: "random
@@ -885,7 +964,7 @@ export async function runScatter(
     // shared rockiness clumps: one field gates ALL size classes, so big
     // blocks sit inside aprons of smaller fragments with bare gaps between
     // (real scree is patchy and size-mixed, never uniform speckle)
-    const patch = clumpField(wpos, sS ^ 0x77aa).mul(0.78).add(0.22);
+    const patch = clumpField(absWpos, sS ^ 0x77aa).mul(0.78).add(0.22);
     // SCREE / TALUS: loose rock blankets mid-steep slopes (kicks in earlier and
     // packs denser than before, so scree slopes read as real fields of debris,
     // not a light sprinkle). repose (below) still culls it off cliff faces.
@@ -978,7 +1057,7 @@ export async function runScatter(
     const idF = float(cls).mul(8).add(variant);
     append(
       stoneCount,
-      STONE_CAP,
+      stoneCapacity,
       stoneA,
       stoneB,
       vec4(wpos.x, s.h.sub(sink), wpos.y, scale) as unknown as NV4,
@@ -1000,32 +1079,36 @@ export async function runScatter(
 
   const result: ScatterResult = {
     trees: {
-      bufA: treeA, bufB: treeB, cap: TREE_CAP, count: 0,
-      scanCapacity: Math.min(TREE_CAP, treeG * treeG),
+      bufA: treeA, bufB: treeB, cap: treeCapacity, count: 0,
+      scanCapacity: treeCapacity,
     },
     understory: {
-      bufA: underA, bufB: underB, cap: UNDER_CAP, count: 0,
-      scanCapacity: Math.min(UNDER_CAP, underG * underG),
+      bufA: underA, bufB: underB, cap: underCapacity, count: 0,
+      scanCapacity: underCapacity,
     },
     extras: {
-      bufA: extraA, bufB: extraB, cap: EXTRA_CAP, count: 0,
-      scanCapacity: Math.min(EXTRA_CAP, extraG * extraG),
+      bufA: extraA, bufB: extraB, cap: extraCapacity, count: 0,
+      scanCapacity: extraCapacity,
     },
     stones: {
-      bufA: stoneA, bufB: stoneB, cap: STONE_CAP, count: 0,
-      scanCapacity: Math.min(STONE_CAP, stoneG * stoneG),
+      bufA: stoneA, bufB: stoneB, cap: stoneCapacity, count: 0,
+      scanCapacity: stoneCapacity,
+    },
+    setWorldCenter(x: number, z: number): void {
+      setGridCenter(x, z);
     },
     async reseed(activeRenderer: Renderer): Promise<void> {
-      await activeRenderer.computeAsync(clearK);
-      await activeRenderer.computeAsync(treeK);
-      await activeRenderer.computeAsync(underK);
-      await activeRenderer.computeAsync(extraK);
-      await activeRenderer.computeAsync(stoneK);
+      // Submit the dependent clear/placement passes as one ordered command
+      // batch. Awaiting five separate submissions allowed the animation loop
+      // to render the cleared intermediate state during a roaming-window
+      // recenter, which made rocks and plants briefly disappear as the camera
+      // crossed a patch boundary.
+      await activeRenderer.computeAsync([clearK, treeK, underK, extraK, stoneK]);
       const [tc, uc, ec, sc] = await Promise.all([
-        readCount(activeRenderer, treeCount, TREE_CAP),
-        readCount(activeRenderer, underCount, UNDER_CAP),
-        readCount(activeRenderer, extraCount, EXTRA_CAP),
-        readCount(activeRenderer, stoneCount, STONE_CAP),
+        readCount(activeRenderer, treeCount, treeCapacity),
+        readCount(activeRenderer, underCount, underCapacity),
+        readCount(activeRenderer, extraCount, extraCapacity),
+        readCount(activeRenderer, stoneCount, stoneCapacity),
       ]);
       result.trees.count = tc;
       result.understory.count = uc;
@@ -1033,6 +1116,7 @@ export async function runScatter(
       result.stones.count = sc;
     },
   };
+  result.setWorldCenter(worldCenter.x, worldCenter.z);
   await result.reseed(renderer);
   return result;
 }

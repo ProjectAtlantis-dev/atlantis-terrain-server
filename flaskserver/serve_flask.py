@@ -22,6 +22,7 @@ import asyncio
 
 from colored_log import get_logger
 from terrain_config import BOOTSTRAP_SEED_DEPTH, ENHANCE_DEPTH, ENHANCE_ENABLED
+from world_identity import ensure_world_identity, read_world_identity
 
 log = get_logger("terrain")
 log_db = get_logger("terrain.db")
@@ -493,6 +494,13 @@ def _bootstrap_backend() -> None:
       db.execute("INSERT OR REPLACE INTO metadata (key, value) VALUES ('max_depth', ?)", (str(ENHANCE_DEPTH),))
       db.commit()
       log_db.info(f"Updated max_depth metadata to {ENHANCE_DEPTH}")
+
+    world_identity = ensure_world_identity(db)
+    log_db.info(
+      "World identity: seed=%d procgenVersion=%d",
+      world_identity["worldSeed"],
+      world_identity["procgenVersion"],
+    )
 
     try:
       no_data_count = load_no_data_cache(db)
@@ -997,7 +1005,8 @@ def api_tiles():
   max_range = _arg_float("range", 16000.0)
   manifest_only = request.args.get("manifest", "0").lower() in {"1", "true", "yes"}
   default_budget = 384 if manifest_only else 2500
-  tile_budget = max(64, min(2500, _arg_int("budget", default_budget)))
+  minimum_budget = 16 if manifest_only else 64
+  tile_budget = max(minimum_budget, min(2500, _arg_int("budget", default_budget)))
 
   if "sx" in request.args and "sy" in request.args:
     qx = _arg_float("sx", 0.0)
@@ -1236,6 +1245,7 @@ def api_tiles():
       "texStatusCounts": tex_status_counts,
       "manifest": manifest_only,
       "tileBudget": tile_budget,
+      **read_world_identity(_get_db()),
     }
   )
 

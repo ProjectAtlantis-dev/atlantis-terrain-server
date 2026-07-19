@@ -31,8 +31,23 @@ const RECENTER_STEP = 192;
 // screen size, while their ~3.2 M candidate cull and moving-window rebuilds
 // remain fully priced. The streamed terrain/material LOD remains visible.
 const DETAIL_AGL_MAX = 500;
+// Cruise/fast flight uses the streamed 12 m satellite/DEM terrain tier. Full
+// grass/plant/rock detail is a slow-flight and ground-navigation tier. Separate
+// enter/exit thresholds prevent a speed hovering at the boundary from
+// rebuilding every frame.
 const DETAIL_SPEED_DISABLE_MPS = 45;
 const DETAIL_SPEED_ENABLE_MPS = 30;
+// Prepare the destination window just outside the visible-detail gates. The
+// root stays hidden until the prepared window actually covers the camera.
+const DETAIL_PREWARM_AGL_MAX = 650;
+const DETAIL_PREWARM_SPEED_MAX = DETAIL_SPEED_DISABLE_MPS;
+// PATCH_WORLD_SIZE/2 - GroundRing's 265 m outer radius. Within this guard the
+// active patch still supplies a complete detail ring during an async handoff.
+const DETAIL_CAMERA_GUARD = PATCH_WORLD_SIZE * 0.5 - 265;
+// The detailed ring has 119 m of guaranteed coverage beyond the largest
+// camera-to-snap-center offset. Keep speculative lead inside that margin until
+// retained leading-edge cells replace the two-slot window handoff.
+const FLIGHT_LOOKAHEAD_MAX = 20;
 const RETRY_MS = 500;
 
 function log(level, ev, details) {
@@ -290,6 +305,7 @@ export class GreenlandPatch {
   } = {}) {
     this.terrainRoot = terrainRoot;
     this.seedN = seedN >>> 0;
+    this.procgenVersion = 0;
     this.loadFields = loadFields;
     this.getCSM = getCSM;
     this.getSunLight = getSunLight;
@@ -311,8 +327,37 @@ export class GreenlandPatch {
     this.building = false;
     this.reseeding = false;
     this.nextBuildAttempt = 0;
+    this.activeSlot = null;
+    this.inactiveSlot = null;
     this.motionDetailActive = true;
     this._diag = 0;
+  }
+
+  setWorldIdentity({ worldSeed, procgenVersion } = {}) {
+    const nextSeed = Number(worldSeed);
+    const nextVersion = Number(procgenVersion);
+    if (!Number.isInteger(nextSeed) || nextSeed < 0 || nextSeed > 0xffffffff
+        || !Number.isInteger(nextVersion) || nextVersion < 0 || nextVersion > 0xffffffff) {
+      return false;
+    }
+    if (this.ready || this.building) {
+      const matches = this.seedN === (nextSeed >>> 0)
+        && this.procgenVersion === (nextVersion >>> 0);
+      if (!matches) {
+        log('error', 'patch.world-identity.late-change-rejected', {
+          active: { worldSeed: this.seedN, procgenVersion: this.procgenVersion },
+          requested: { worldSeed: nextSeed, procgenVersion: nextVersion },
+        });
+      }
+      return matches;
+    }
+    this.seedN = nextSeed >>> 0;
+    this.procgenVersion = nextVersion >>> 0;
+    log('info', 'patch.world-identity', {
+      worldSeed: this.seedN,
+      procgenVersion: this.procgenVersion,
+    });
+    return true;
   }
 
   _disposeForests(renderer) {
@@ -339,7 +384,7 @@ export class GreenlandPatch {
     }
   }
 
-  async _buildForests(renderer, seed) {
+  async _ensureVegLibrary(renderer, seed) {
     if (!this.vegLibrary) {
       this.vegLibrary = await buildVegLibrary(
         renderer,
@@ -354,13 +399,81 @@ export class GreenlandPatch {
         impostors: this.vegLibrary.impostors.size,
       });
     }
-    const scatter = await runScatter(renderer, this.hf, seed);
-    const forests = new Forests(this.hf, scatter, this.vegLibrary, null, null);
+  }
+
+  async _prepareSlot(renderer, slot, seed, window, descriptor) {
+    if (slot) {
+      const startedAt = performance.now();
+      await slot.hf.reseed(
+        renderer,
+        makeWindowSampler(window),
+        false,
+        makeWindowFieldSampler(window),
+      );
+      const heightfieldReadyAt = performance.now();
+      slot.scatter.setWorldCenter(descriptor.centerX, -descriptor.centerY);
+      await slot.scatter.reseed(renderer);
+      const scatterReadyAt = performance.now();
+      slot.root.position.set(descriptor.centerX, descriptor.centerY, 0);
+      slot.window = window;
+      slot.centerId = descriptor.id;
+      slot.lastPrepareTiming = {
+        heightfieldMs: Number((heightfieldReadyAt - startedAt).toFixed(1)),
+        scatterMs: Number((scatterReadyAt - heightfieldReadyAt).toFixed(1)),
+        totalMs: Number((scatterReadyAt - startedAt).toFixed(1)),
+      };
+      return slot;
+    }
+
+    const hf = await Heightfield.fromExternal(renderer, seed, {
+      res: PATCH_RES,
+      worldSize: PATCH_WORLD_SIZE,
+      sampleDEM: makeWindowSampler(window),
+      sampleFields: makeWindowFieldSampler(window),
+      cpuReadback: false,
+      progress: (progress, message) => log('info', 'patch.hf', { progress, message }),
+    });
+    const canopy = await makeEmptyCanopy(renderer);
+    if (hf.noiseA) setWindContext({ noiseA: hf.noiseA, canopyTex: canopy });
+    await this._ensureVegLibrary(renderer, seed);
+    const scatter = await runScatter(renderer, hf, seed, {
+      x: descriptor.centerX,
+      // LAAS local +z maps to terrain/EPSG -y.
+      z: -descriptor.centerY,
+    });
+    const forests = new Forests(hf, scatter, this.vegLibrary, null, null);
     forests.setCSM(this.getCSM?.() ?? null);
     forests.init(renderer);
-    this.scatter = scatter;
-    this.forests = forests;
-    return forests;
+    // Atlantis currently uses Three r182 and renders beneath an ENU/ECEF
+    // transform. LAAS's r184 EqualDepth twins do not remain depth-identical,
+    // so GroundRing uses normal shaded passes until the versions are unified.
+    const ground = new GroundRing(hf, canopy, seed, null, false);
+    ground.init(null);
+    const root = new THREE.Group();
+    root.name = 'greenland-procgen-clipmap';
+    root.quaternion.setFromAxisAngle(new THREE.Vector3(1, 0, 0), Math.PI / 2);
+    root.position.set(descriptor.centerX, descriptor.centerY, 0);
+    root.add(ground.group);
+    root.add(forests.group);
+    root.visible = false;
+    this.terrainRoot.add(root);
+    return { hf, canopy, scatter, forests, ground, root, window, centerId: descriptor.id };
+  }
+
+  _adoptSlot(slot) {
+    if (this.activeSlot && this.activeSlot !== slot) this.activeSlot.root.visible = false;
+    this.activeSlot = slot;
+    this.hf = slot.hf;
+    this.ground = slot.ground;
+    this.forests = slot.forests;
+    this.scatter = slot.scatter;
+    this.vegRoot = slot.root;
+    this.window = slot.window;
+    this.centerId = slot.centerId;
+    // Visibility is a residency decision made by update(). In particular, a
+    // window built while descending from the satellite tier must not flash for
+    // one frame before its altitude/speed/coverage gates are evaluated.
+    slot.root.visible = false;
   }
 
   async _loadClassifier(sourceTiles, descriptor) {
@@ -399,11 +512,15 @@ export class GreenlandPatch {
     };
   }
 
-  async build(renderer, camera, cameraAGL) {
-    if (this.building || this.ready || !camera || cameraAGL > DETAIL_AGL_MAX) return;
+  async build(renderer, camera, cameraAGL, traversal = {}) {
+    const speed = Number.isFinite(traversal.speedMps) ? Math.abs(traversal.speedMps) : 0;
+    if (this.building || this.ready || !camera
+        || cameraAGL > DETAIL_PREWARM_AGL_MAX
+        || speed > DETAIL_PREWARM_SPEED_MAX) return;
     const now = performance.now();
     if (now < this.nextBuildAttempt) return;
     this.building = true;
+    const startedAt = performance.now();
     try {
       const sourceTiles = collectTiles(this.terrainRoot);
       const camTR = this._camTerrainLocal(camera);
@@ -423,47 +540,20 @@ export class GreenlandPatch {
       }
 
       const seed = new WorldSeed(this.seedN);
-      this.hf = await Heightfield.fromExternal(renderer, seed, {
-        res: PATCH_RES,
-        worldSize: PATCH_WORLD_SIZE,
-        sampleDEM: makeWindowSampler(window),
-        sampleFields: makeWindowFieldSampler(window),
-        cpuReadback: false,
-        progress: (progress, message) => log('info', 'patch.hf', { progress, message }),
-      });
-      const canopy = await makeEmptyCanopy(renderer);
-      if (this.hf.noiseA) setWindContext({ noiseA: this.hf.noiseA, canopyTex: canopy });
-      const forests = await this._buildForests(renderer, seed);
-      // Atlantis currently uses Three r182 and renders beneath an ENU/ECEF
-      // transform. LAAS's r184 EqualDepth vegetation twins do not remain
-      // depth-identical in that graph and visibly erase the terrain. Keep the
-      // same GroundRing placement/material/indirect draws, but render its
-      // shaded passes normally until the renderer versions are unified.
-      this.ground = new GroundRing(this.hf, canopy, seed, null, false);
-      this.ground.init(null);
-
-      this.vegRoot = new THREE.Group();
-      this.vegRoot.name = 'greenland-procgen-clipmap';
-      this.vegRoot.quaternion.setFromAxisAngle(new THREE.Vector3(1, 0, 0), Math.PI / 2);
-      this.vegRoot.position.set(
-        descriptor.centerX,
-        descriptor.centerY,
-        0,
-      );
-      this.vegRoot.add(this.ground.group);
-      this.vegRoot.add(forests.group);
-      this.terrainRoot.add(this.vegRoot);
+      const slot = await this._prepareSlot(renderer, null, seed, window, descriptor);
+      this._adoptSlot(slot);
+      const activeReadyAt = performance.now();
 
       if (typeof document !== 'undefined' && !document.getElementById('season-ui')) {
         mountSeasonUI();
       }
 
-      this.window = window;
-      this.centerId = descriptor.id;
       this.ready = true;
       this.onWindowChanged?.(this);
       log('info', 'patch.ready', {
         center: descriptor.id,
+        worldSeed: this.seedN,
+        procgenVersion: this.procgenVersion,
         sourceTiles: sourceTiles.filter(tile => tile.fields).length,
         spanMetres: PATCH_WORLD_SIZE,
         res: PATCH_RES,
@@ -471,6 +561,10 @@ export class GreenlandPatch {
         plants: this.scatter.understory.count,
         rocks: this.scatter.extras.count + this.scatter.stones.count,
         fields: window.stats,
+        timing: {
+          activeSlotMs: Number((activeReadyAt - startedAt).toFixed(1)),
+          totalMs: Number((activeReadyAt - startedAt).toFixed(1)),
+        },
       });
     } catch (err) {
       this.nextBuildAttempt = now + RETRY_MS;
@@ -485,36 +579,36 @@ export class GreenlandPatch {
     this.reseeding = true;
     const startedAt = performance.now();
     let fieldsReadyAt = startedAt;
-    let heightfieldReadyAt = startedAt;
     try {
       if (!await this._loadClassifier(sourceTiles, descriptor)) return;
       fieldsReadyAt = performance.now();
       const window = buildWindow(descriptor, sourceTiles);
       if (!window) return;
-      await this.hf.reseed(
+      // A second Forests/GroundRing graph caused a measured 12.5 s lazy
+      // pipeline-compilation frame when first adopted. Keep one compiled render
+      // graph and rewrite its persistent data buffers in place; the root stays
+      // visible and retains its last indirect draw state while preparation is
+      // in progress. Incremental strip updates remain the follow-up that will
+      // reduce the bounded rewrite hitch further.
+      const reusedSlot = Boolean(this.activeSlot);
+      const nextSlot = await this._prepareSlot(
         renderer,
-        makeWindowSampler(window),
-        false,
-        makeWindowFieldSampler(window),
+        this.activeSlot,
+        new WorldSeed(this.seedN),
+        window,
+        descriptor,
       );
-      heightfieldReadyAt = performance.now();
-      // Heightfield.reseed keeps the texture objects stable. Refill the
-      // existing scatter buffers so Forests retains its compiled cull kernels,
-      // indirect buffers, draw geometry and materials across window moves.
-      await this.scatter.reseed(renderer);
-      const scatterReadyAt = performance.now();
-      this.vegRoot.position.set(
-        descriptor.centerX,
-        descriptor.centerY,
-        0,
-      );
-      this.window = window;
-      this.centerId = descriptor.id;
+      const preparedAt = performance.now();
+      // Preserve the compiled object/material graph and publish the new window
+      // metadata only after its persistent buffers have been rewritten.
+      this._adoptSlot(nextSlot);
+      this.inactiveSlot = null;
       this.lastRecenterTiming = {
         fieldsMs: Number((fieldsReadyAt - startedAt).toFixed(1)),
-        heightfieldMs: Number((heightfieldReadyAt - fieldsReadyAt).toFixed(1)),
-        scatterMs: Number((scatterReadyAt - heightfieldReadyAt).toFixed(1)),
-        totalMs: Number((scatterReadyAt - startedAt).toFixed(1)),
+        prepareSlotMs: Number((preparedAt - fieldsReadyAt).toFixed(1)),
+        totalMs: Number((preparedAt - startedAt).toFixed(1)),
+        reusedSlot,
+        slot: nextSlot.lastPrepareTiming ?? null,
       };
       this.onWindowChanged?.(this);
       log('info', 'patch.recenter', {
@@ -523,6 +617,7 @@ export class GreenlandPatch {
         sourceTiles: sourceTiles.filter(tile => tile.fields).length,
         fields: window.stats,
         timing: this.lastRecenterTiming,
+        handoff: 'single-compiled-root-visible-during-rewrite',
       });
     } catch (err) {
       log('error', 'patch.recenter', { error: String(err), stack: String(err?.stack ?? '') });
@@ -531,27 +626,52 @@ export class GreenlandPatch {
     }
   }
 
-  update(renderer, camera, cameraAGL, traversalSpeedMps = 0) {
+  update(renderer, camera, cameraAGL, traversal = {}) {
     if (!this.ready) return;
 
-    const speed = Number.isFinite(traversalSpeedMps) ? Math.abs(traversalSpeedMps) : 0;
-    if (this.motionDetailActive && speed > DETAIL_SPEED_DISABLE_MPS) {
+    const speed = Number.isFinite(traversal.speedMps) ? Math.abs(traversal.speedMps) : 0;
+    const heading = Number.isFinite(traversal.heading) ? traversal.heading : 0;
+    if (this.motionDetailActive && speed >= DETAIL_SPEED_DISABLE_MPS) {
       this.motionDetailActive = false;
-      log('info', 'patch.detail-lod', { active: false, reason: 'speed', speedMps: Math.round(speed) });
-    } else if (!this.motionDetailActive && speed < DETAIL_SPEED_ENABLE_MPS) {
+      log('info', 'patch.detail-lod', {
+        active: false,
+        reason: 'speed',
+        speedMps: Math.round(speed),
+      });
+    } else if (!this.motionDetailActive && speed <= DETAIL_SPEED_ENABLE_MPS) {
       this.motionDetailActive = true;
-      log('info', 'patch.detail-lod', { active: true, reason: 'speed', speedMps: Math.round(speed) });
+      log('info', 'patch.detail-lod', {
+        active: true,
+        reason: 'speed',
+        speedMps: Math.round(speed),
+      });
     }
-    const active = Number.isFinite(cameraAGL)
-      && cameraAGL <= DETAIL_AGL_MAX
-      && this.motionDetailActive;
-    this.vegRoot.visible = active;
-    if (!active) return;
 
     const camTR = this._camTerrainLocal(camera);
-    if (!this.reseeding) {
+    const finiteAGL = Number.isFinite(cameraAGL);
+    const wantsDetail = finiteAGL
+      && cameraAGL <= DETAIL_AGL_MAX
+      && this.motionDetailActive;
+    const canPrewarm = finiteAGL
+      && cameraAGL <= DETAIL_PREWARM_AGL_MAX
+      && speed <= DETAIL_PREWARM_SPEED_MAX;
+    const activeCenter = this.window?.descriptor;
+    const hasCompleteCoverage = activeCenter != null
+      && Math.abs(camTR.x - activeCenter.centerX) <= DETAIL_CAMERA_GUARD
+      && Math.abs(camTR.y - activeCenter.centerY) <= DETAIL_CAMERA_GUARD;
+
+    // The streamed satellite/DEM meshes are not children of vegRoot and remain
+    // visible in every tier. Only show micro-detail when the active local data
+    // window still covers its entire render radius.
+    this.vegRoot.visible = wantsDetail && hasCompleteCoverage;
+
+    if (canPrewarm && !this.reseeding && !this.building) {
       const sourceTiles = collectTiles(this.terrainRoot);
-      const descriptor = cameraWindowAt(camTR.x, camTR.y);
+      const lookahead = Math.min(FLIGHT_LOOKAHEAD_MAX, speed * 1.5);
+      const descriptor = cameraWindowAt(
+        camTR.x - Math.sin(heading) * lookahead,
+        camTR.y + Math.cos(heading) * lookahead,
+      );
       const centerDepth = finestSourceAt(
         sourceTiles,
         descriptor.centerX,
@@ -563,14 +683,12 @@ export class GreenlandPatch {
         void this._recenter(renderer, descriptor, sourceTiles);
       }
     }
-    if (this.reseeding) {
-      // Do not enqueue culls/renders against buffers while the GPU is
-      // rewriting them for the next window. The settled patch returns on the
-      // next frame without reallocating its rendering graph.
-      this.vegRoot.visible = false;
-      return;
-    }
 
+    if (!this.vegRoot.visible) return;
+
+    // Keep submitting the last compiled draw graph during preparation. WebGPU
+    // queue ordering prevents a partially submitted scatter pass from being
+    // observed by a later scene render; no speed threshold hides the root.
     this.vegRoot.updateWorldMatrix(true, false);
     this.proxy.projectionMatrix.copy(camera.projectionMatrix);
     this.proxy.matrixWorldInverse.copy(camera.matrixWorldInverse).multiply(this.vegRoot.matrixWorld);
@@ -595,7 +713,11 @@ export class GreenlandPatch {
         vegetationTriangles: forestHud['veg.tris'] ?? -1,
         pools: this.vegLibrary?.pools.length ?? -1,
         agl: Math.round(cameraAGL),
+        traversalSpeedMps: Math.round(speed),
+        recentering: this.reseeding,
         center: this.centerId,
+        worldSeed: this.seedN,
+        procgenVersion: this.procgenVersion,
         spanMetres: PATCH_WORLD_SIZE,
       });
     }

@@ -43,10 +43,12 @@ import {
 import { gtaoLayer } from './laas/render/Gtao.ts';
 import { hash12 } from './laas/gpu/noise/NoiseTSL.ts';
 import { runiform } from './laas/gpu/RenderUniform.ts';
+import { ScaledRTTNode } from './webgpu-scaled-rtt.js';
 
 const SSCS_STEPS = 12;
 const GROUND_FADE_FAR_M = 240;
 const GROUND_FADE_NEAR_M = 140;
+const GROUNDING_RESOLUTION_SCALE = 0.5;
 
 /**
  * Builds the grounded color node.
@@ -67,6 +69,7 @@ export function createGroundingNode({
   camera,
   getSunDirectionECEF,
   enabled,
+  fullRes = false,
 }) {
   // Live object references — current (TAA-jittered) values at upload time,
   // the same pattern gtaoLayer uses internally.
@@ -103,8 +106,7 @@ export function createGroundingNode({
       })
     : null;
 
-  const node = Fn(() => {
-    const base = vec4(colorNode).toVar();
+  const groundingMask = Fn(() => {
     const d = depthNode.x.toVar();
     // Tolerate either depth convention at far (matches LAAS PostStack).
     const isSky = d.lessThanEqual(1e-7).or(d.greaterThanEqual(0.9999999));
@@ -171,7 +173,20 @@ export function createGroundingNode({
       }
     });
 
-    return vec4(base.rgb.mul(grounding), base.a);
+    return vec4(grounding, 0, 0, 1);
+  });
+
+  // LAAS's source post stack evaluates GTAO at half resolution. Keep scene
+  // color and depth full resolution, but evaluate the low-frequency scalar
+  // occlusion/contact mask at one quarter the pixel count and bilinearly
+  // reconstruct it for composition. ?groundingFull=1 retains a compile-time
+  // A/B path for visual/performance comparisons.
+  const maskSource = fullRes
+    ? groundingMask()
+    : new ScaledRTTNode(groundingMask(), GROUNDING_RESOLUTION_SCALE);
+  const node = Fn(() => {
+    const base = vec4(colorNode).toVar();
+    return vec4(base.rgb.mul(maskSource.x), base.a);
   })();
 
   return { node, uniforms: { uAoStrength, uContactStrength } };

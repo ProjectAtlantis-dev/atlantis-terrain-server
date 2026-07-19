@@ -313,11 +313,14 @@ def query_tiles(db, lat, lon, error_threshold=0.001, max_depth=None,
 
 
 def _collapse_leaf_budget(db, leaf_ids, qx, qy, max_tiles, log):
-    """Collapse complete far sibling quartets into real parents.
+    """Collapse far quadtree regions into real ancestors within ``max_tiles``.
 
-    Unlike dropping deepest leaves, this preserves a hole-free balanced cover.
-    Each collapse replaces four resident meshes/payloads with one and can be
-    repeated up the tree until the requested game residency budget is met.
+    A range-clipped traversal often contains only one, two or three siblings at
+    its boundary. Requiring complete quartets made the advertised budget a soft
+    suggestion (a 64-page preview returned 74 pages). Grouping every resident
+    descendant under each real ancestor preserves coverage and lets boundary
+    regions coarsen too; the parent may conservatively cover some space outside
+    the requested range, but it never creates a hole.
     """
     if max_tiles <= 0 or len(leaf_ids) <= max_tiles:
         return leaf_ids
@@ -331,45 +334,41 @@ def _collapse_leaf_budget(db, leaf_ids, qx, qy, max_tiles, log):
 
     original = len(leaves)
     while len(leaves) > max_tiles:
-        children_by_parent = {}
+        descendants_by_parent = {}
         for tid in leaves:
             depth, col, row = (int(part) for part in tid.split('-'))
-            if depth <= 0:
-                continue
-            parent_id = _tile_id(depth - 1, col // 2, row // 2)
-            children_by_parent.setdefault(parent_id, set()).add(tid)
+            for parent_depth in range(depth - 1, -1, -1):
+                shift = depth - parent_depth
+                parent_id = _tile_id(parent_depth, col >> shift, row >> shift)
+                descendants_by_parent.setdefault(parent_id, set()).add(tid)
 
         candidates = []
-        for parent_id, children in children_by_parent.items():
-            if len(children) != 4:
+        for parent_id, descendants in descendants_by_parent.items():
+            if len(descendants) < 2:
                 continue
             parent = meta(parent_id)
             if parent is None or parent['source'] not in REAL_SOURCES:
                 continue
-            expected = {
-                _tile_id(parent['depth'] + 1, parent['col'] * 2 + dx, parent['row'] * 2 + dy)
-                for dx in (0, 1) for dy in (0, 1)
-            }
-            if children != expected:
-                continue
             distance = _distance_to_bbox(qx, qy, parent['bbox'])
-            candidates.append((distance, parent['depth'], parent_id, children))
+            reduction = len(descendants) - 1
+            candidates.append(
+                (distance, parent['depth'], reduction, parent_id, descendants)
+            )
         if not candidates:
             break
-        # Coarsen the farthest regions first; at equal distance collapse the
-        # finest parent first. Candidate sibling groups are disjoint here.
-        candidates.sort(reverse=True, key=lambda item: (item[0], item[1]))
-        changed = False
-        for _, _, parent_id, children in candidates:
-            if len(leaves) <= max_tiles:
-                break
-            if not children.issubset(leaves):
-                continue
-            leaves.difference_update(children)
-            leaves.add(parent_id)
-            changed = True
-        if not changed:
-            break
+        needed = len(leaves) - max_tiles
+        within_budget = [item for item in candidates if item[2] <= needed]
+        if within_budget:
+            # Preserve detail near the camera: farthest region first, then the
+            # finest viable ancestor and largest useful reduction.
+            chosen = max(within_budget, key=lambda item: (item[0], item[1], item[2]))
+        else:
+            # The final collapse may cross below the ceiling. Choose the
+            # smallest overshoot, using distance/depth only as tie-breakers.
+            chosen = min(candidates, key=lambda item: (item[2], -item[0], -item[1]))
+        _, _, _, parent_id, descendants = chosen
+        leaves.difference_update(descendants)
+        leaves.add(parent_id)
     log(f"  [BALANCED BUDGET] {original} leaves collapsed to {len(leaves)} "
         f"(target {max_tiles})")
     return list(leaves)

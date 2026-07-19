@@ -380,3 +380,35 @@ recenter continuity remains open.
 - **Still open:** a direct cold start at a separate high-altitude coordinate
   can leave `greenlandPatch.ready=false` because the build gate depends on the
   terrain-derived AGL sample. It is tracked separately from rock grounding.
+
+### 2026-07-19 - Cruise satellite tier and safe procgen return
+
+Status: implemented and live-probed; continuous cell residency remains open.
+
+- The user confirmed the intended current design: cruise/fast flight and high
+  altitude render the cached 12 m satellite/DEM terrain without paying for the
+  complete GroundRing/Forests patch. Full procedural grass/plants/rocks return
+  below 30 m/s and 500 m AGL; speed disables above 45 m/s, and altitude may
+  prewarm below 650 m.
+- The previous gate could reveal a procedural patch centered at the old flight
+  position as soon as speed fell. Visibility now also requires that the active
+  window covers the camera's full 265 m detail radius. Destination fields and
+  buffers prepare while hidden, then publish only at the current snapped cell.
+- Scatter's five dependent placement passes now use one ordered WebGPU batch,
+  preventing an animation frame from observing cleared-but-not-refilled rock
+  and plant counters during a recenter.
+- At 141 m/s, deliberately forcing full procgen produced seven recenters over
+  835.5 m and 33.3/50.9/167.6 ms p50/p95/worst. The satellite cruise tier
+  produced no procedural recenter work. A 531.3 m cruise-to-slow test restored
+  exact cell `-2304:-3264` in 990.6 ms with no stale-root frame; warm fields
+  took 4.5 ms and buffer preparation 159.1 ms.
+- The grounding mask now runs at half resolution, matching the LAAS post-stack
+  architecture while retaining full-resolution scene color/depth. Cruise
+  improved from 32.5/34.2/84.3 ms p50/p95/worst to 16.7/17.6/66.7 ms at
+  1961x1062. Production build and live WebGPU validation passed, and the exact
+  visual-probe site produced 12,981 plants plus 19,019 rocks without a mask
+  halo or black-terrain regression.
+- Still open: the warm whole-window rewrite is 163.6 ms, cold classifier field
+  generation can take seconds before it becomes a warm cache hit, and the
+  long-term retained-cell/macro-rock tier is not implemented. These are not
+  hidden by the successful cruise result.

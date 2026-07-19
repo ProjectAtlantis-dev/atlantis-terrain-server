@@ -24,7 +24,6 @@
  */
 
 import * as THREE from 'three/webgpu';
-import { RTTNode } from 'three/webgpu';
 import {
   Fn,
   float,
@@ -36,6 +35,7 @@ import {
 } from 'three/tsl';
 import { hash12 } from './laas/gpu/noise/NoiseTSL.ts';
 import { runiform } from './laas/gpu/RenderUniform.ts';
+import { ScaledRTTNode } from './webgpu-scaled-rtt.js';
 
 // Clouds live in the 900-3300 m band here; beyond ~25 km the march adds
 // nothing god rays could resolve against aerial perspective. The cap is the
@@ -55,26 +55,6 @@ const CLOUD_GODRAY_STEP_SCALE = 1.06;
 // maxDistance mismatch); revisit with a depth-aware upsample + temporal
 // reconstruction if visible (PERF_REWORK.md Tier 3).
 const CLOUD_GODRAY_RESOLUTION_SCALE = 0.5;
-
-// RTTNode auto-resize tracks the FULL drawing buffer; this keeps the target
-// at a fixed fraction of it across window resizes instead.
-const _rttSizeScratch = new THREE.Vector2();
-class ScaledRTTNode extends RTTNode {
-  constructor(node, resolutionScale) {
-    super(node, 1, 1);
-    this.resolutionScale = resolutionScale;
-  }
-
-  updateBefore(frame) {
-    const size = frame.renderer.getDrawingBufferSize(_rttSizeScratch);
-    const w = Math.max(1, Math.floor(size.width * this.resolutionScale));
-    const h = Math.max(1, Math.floor(size.height * this.resolutionScale));
-    if (w !== this.renderTarget.width || h !== this.renderTarget.height) {
-      this.setSize(w, h);
-    }
-    super.updateBefore(frame);
-  }
-}
 
 /**
  * @param {object} args

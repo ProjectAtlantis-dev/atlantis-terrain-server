@@ -403,3 +403,18 @@ at runtime forces a full material recompile — never do it mid-measurement.
   gate and in-place 192 m reseed still hide the whole procedural root. The
   proper follow-up is resident old/new patch handoff or a macro-rock tier, not
   another threshold tweak.
+- **2026-07-19 (cruise tier + half-resolution grounding)** — User clarified
+  that cruise/fast flight should intentionally retain the 12 m satellite/DEM
+  terrain while the monolithic micro-detail patch is inactive, then restore
+  procgen only after slowing/descending. The 30/45 m/s and 500 m AGL gates are
+  therefore retained with a new prewarm/current-coverage handoff; the frozen
+  predictive-streaming proposal records this correction additively. At the
+  Osprey maximum of 141 m/s, forcing procgen on measured 33.3 ms p50, 50.9 ms
+  p95 and seven recenters across 835.5 m. The intended cruise tier performed
+  zero procgen recenters. GTAO/contact's previously measured ~6.7 ms desktop
+  bucket is now evaluated as a half-resolution scalar mask (the LAAS source
+  design) and reconstructed over full-resolution color. Same-size 1961x1062
+  cruise improved from 32.5/34.2/84.3 ms p50/p95/worst to
+  **16.7/17.6/66.7 ms**, with no WebGPU validation error. Slow-down restored
+  the correct procgen cell in 990.6 ms without showing the stale root; its warm
+  rewrite was still 163.6 ms and remains over the 50 ms hitch gate.

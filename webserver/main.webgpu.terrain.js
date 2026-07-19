@@ -96,6 +96,10 @@ import { buildTileScatter, disposeTileScatter, updateScatterVisibility } from '.
 import { createTileLifecycle } from './terrain-tile-lifecycle.js';
 import { createTerrainOceanClassifier } from './classifier/terrain-ocean.js';
 import { priorityHeading, terrainTilePriority } from './terrain-priority.js';
+import {
+  predictTerrainStreamingFocus,
+  predictiveRefetchDecision,
+} from './terrain-streaming-prediction.js';
 import { compassHeading, createTerrainHud, renderGameClock, TERRAIN_HUD_LINKS } from './terrain-hud.js';
 import { installTerrainKeyboardControls, installTerrainPointerControls } from './terrain-controls.js';
 import { normalizeSavedVehicleState, stepSuspension, stepVehicleDrive, vehicleLocalToLatLon as terrainVehicleLocalToLatLon, vehicleStateSnapshot } from './terrain-vehicle.js';
@@ -1461,7 +1465,7 @@ function updateNearFieldScatter() {
 }
 
 let tileLifecycle;
-const REFETCH_DIST = 5000;
+const STREAMING_FOCUS_REFETCH_DIST = 1200;
 let originX = 0, originY = 0;        // stereo scene origin from server
 let camStereoX = 0, camStereoY = 0;  // current cam position in stereo
 let lastFetchX = 0, lastFetchY = 0;
@@ -1469,6 +1473,7 @@ let tileFrameOffsetX = 0;            // shift server stereo-local bboxes into ca
 let tileFrameOffsetY = 0;
 let tileFrameOffsetReady = false;
 let _lastFetchTriggerMs = 0;
+let lastStreamingFocus = null;
 let fetching = false;
 let isFirstLoad = true;
 let _loadPass = 1;  // 1 = preview (low-LOD), 2 = full-depth
@@ -2569,8 +2574,15 @@ function loadVehicleModel(entry = groundVehicleState) {
       entry.meshes = [];
       model.traverse(obj => { if (obj.isMesh) entry.meshes.push(obj); });
       const savedState = entry.savedStatePending;
-      const startLat = Number.isFinite(savedState?.lat) ? savedState.lat : entry.instance.lat;
-      const startLon = Number.isFinite(savedState?.lon) ? savedState.lon : entry.instance.lon;
+      // Asset rows created before geographic placement was required can omit
+      // lat/lon. Never let one incomplete optional vehicle poison its Group
+      // matrix (and every downstream world-space distance) with NaN.
+      const startLat = Number.isFinite(savedState?.lat)
+        ? savedState.lat
+        : Number.isFinite(entry.instance.lat) ? entry.instance.lat : anchorLat;
+      const startLon = Number.isFinite(savedState?.lon)
+        ? savedState.lon
+        : Number.isFinite(entry.instance.lon) ? entry.instance.lon : anchorLon;
       const startHeadingDeg = Number.isFinite(savedState?.headingDeg)
         ? savedState.headingDeg
         : (Number(entry.instance.headingDeg) || 0);
@@ -3317,16 +3329,23 @@ dieselSound.setVolume(0);
 const DIESEL_MAX_VOL = 0;
 const DIESEL_FULL_DIST = 15;   // full volume within 15m
 const DIESEL_ZERO_DIST = 150;  // silent beyond 150m
+const dieselCameraWorld = new THREE.Vector3();
+const dieselVehicleWorld = new THREE.Vector3();
 
 function updateDieselVolume() {
-  if (!dieselSound.isPlaying) return;
+  // Audio is intentionally muted in the current game preset. Avoid two
+  // world-matrix traversals and allocations per frame, and never pass NaN to
+  // Web Audio if an optional asset has malformed transform data.
+  if (!dieselSound.isPlaying || !(DIESEL_MAX_VOL > 0)) return;
   const entry = selectedGroundVehicleEntry() ?? groundVehicleEntries.find(candidate => candidate.loaded);
   if (entry == null) return;
-  const camWorld = new THREE.Vector3();
-  const vehWorld = new THREE.Vector3();
-  camera.getWorldPosition(camWorld);
-  entry.group.getWorldPosition(vehWorld);
-  const dist = camWorld.distanceTo(vehWorld);
+  camera.getWorldPosition(dieselCameraWorld);
+  entry.group.getWorldPosition(dieselVehicleWorld);
+  const dist = dieselCameraWorld.distanceTo(dieselVehicleWorld);
+  if (!Number.isFinite(dist)) {
+    dieselSound.setVolume(0);
+    return;
+  }
   if (dist <= DIESEL_FULL_DIST) {
     dieselSound.setVolume(DIESEL_MAX_VOL);
   } else if (dist >= DIESEL_ZERO_DIST) {
@@ -4257,7 +4276,8 @@ function createWebGPUAtmospherePostProcessing(renderer) {
     enabled: {
       gtao: BOOT_QUERY.get('gtao') !== '0',
       contact: BOOT_QUERY.get('contact') !== '0'
-    }
+    },
+    fullRes: BOOT_QUERY.get('groundingFull') === '1'
   });
 
   const atmosphereNode = webgpuAerialPerspective(
@@ -4860,6 +4880,91 @@ function getCameraLatLon() {
   return { lat: coordinates.lat, lon: coordinates.lon, alt: coordinates.alt };
 }
 
+function traversalMotion() {
+  const controlled = vehicleControlActive ? selectedVehicleEntry() : null;
+  const heading = priorityHeading(
+    vehicleControlActive,
+    controlled?.headingRad ?? controls.yaw,
+    controls.yaw,
+  );
+  const speedMps = controlled?.vehicleType === 'aircraft'
+    ? Math.abs(controlled.forwardSpeedMs ?? 0)
+    : controlled?.vehicleType === 'ground'
+      ? Math.abs(controlled.speed ?? 0)
+      : Math.hypot(controls.speed, controls.strafeSpeed);
+  return { heading, speedMps };
+}
+
+function terrainStreamingFocus(cameraLL = getCameraLatLon()) {
+  const current = terrainCameraStereoPosition({
+    latitude: cameraLL.lat,
+    longitude: cameraLL.lon,
+    anchorLatitude: anchorLat,
+    anchorLongitude: anchorLon,
+    originX,
+    originY,
+  });
+  const motion = traversalMotion();
+  const predicted = predictTerrainStreamingFocus({
+    x: current.x,
+    y: current.y,
+    heading: motion.heading,
+    speedMps: motion.speedMps,
+  });
+  const coordinates = epsg3413ToWgs84(predicted.x, predicted.y);
+  lastStreamingFocus = {
+    ...predicted,
+    lat: coordinates.lat,
+    lon: coordinates.lon,
+    currentX: current.x,
+    currentY: current.y,
+  };
+  return lastStreamingFocus;
+}
+
+function getTerrainRequestFocus(cameraLL) {
+  if (isFirstLoad || !tileFrameOffsetReady) return cameraLL;
+  const focus = terrainStreamingFocus(cameraLL);
+  return {
+    lat: focus.lat,
+    lon: focus.lon,
+    logDetails: {
+      streamFocusX: Number(focus.x.toFixed(1)),
+      streamFocusY: Number(focus.y.toFixed(1)),
+      streamLookaheadM: Number(focus.lookaheadMetres.toFixed(1)),
+      streamLookaheadS: Number(focus.lookaheadSeconds.toFixed(1)),
+      traversalSpeedMps: Number(focus.speedMps.toFixed(1)),
+    },
+  };
+}
+
+const PROCGEN_FIELD_PREFETCH_COUNT = 32;
+const PROCGEN_FIELD_PREFETCH_LEAD_MAX = 768;
+function prefetchProcgenFields(tiles) {
+  if (!greenlandPatch || !Array.isArray(tiles) || tiles.length === 0) return;
+  const relative = camera.position.clone().sub(anchorPosition);
+  const currentX = relative.dot(east);
+  const currentY = relative.dot(north);
+  const motion = traversalMotion();
+  const lead = Math.min(PROCGEN_FIELD_PREFETCH_LEAD_MAX, motion.speedMps * 4);
+  const targetX = currentX - Math.sin(motion.heading) * lead;
+  const targetY = currentY + Math.cos(motion.heading) * lead;
+  const ranked = [];
+  for (const tile of tiles) {
+    const bbox = tile?.bbox;
+    if (!Array.isArray(bbox) || bbox.length !== 4 || !tile.id) continue;
+    const cx = (bbox[0] + bbox[2]) * 0.5;
+    const cy = (bbox[1] + bbox[3]) * 0.5;
+    const currentD2 = (cx - currentX) ** 2 + (cy - currentY) ** 2;
+    const targetD2 = (cx - targetX) ** 2 + (cy - targetY) ** 2;
+    ranked.push({ tile, distance2: Math.min(currentD2, targetD2) });
+  }
+  ranked.sort((a, b) => a.distance2 - b.distance2);
+  for (const { tile } of ranked.slice(0, PROCGEN_FIELD_PREFETCH_COUNT)) {
+    void fetchTileFields(tile.id);
+  }
+}
+
 const exactCameraGeodetic = new Geodetic();
 function getExactCameraLatLon(position = camera.position) {
   exactCameraGeodetic.setFromECEF(position);
@@ -5038,9 +5143,16 @@ const terrainFetchState = {
 
 const performTileFetch = createTerrainFetchExecutor({
   state: terrainFetchState, previewMaxDepth: PREVIEW_MAX_DEPTH,
-  useManifest: true, tileBudget: 384,
+  useManifest: true,
+  tileBudget: 384,
+  previewTileBudget: 16,
+  previewBuildBudget: 16,
+  fullBuildBudget: 32,
   getHeading: () => priorityHeading(vehicleControlActive, selectedVehicleEntry()?.headingRad ?? controls.yaw, controls.yaw),
-  getRange: () => _terrainRange, getCameraLatLon, getCameraSnapshot: getCameraLogSnapshot,
+  getRange: () => _terrainRange,
+  getCameraLatLon,
+  getRequestFocus: getTerrainRequestFocus,
+  getCameraSnapshot: getCameraLogSnapshot,
   getCameraLocalPosition: () => {
     const relative = camera.position.clone().sub(anchorPosition);
     return { x: relative.dot(east), y: relative.dot(north) };
@@ -5051,6 +5163,8 @@ const performTileFetch = createTerrainFetchExecutor({
   materialize: materializeTile, buildMesh, tileLog, applyMissing: markMissing, updateTextures,
   prepareUntexturedMesh: applyWebGPUUntexturedTerrainMaterial,
   onMeshAdded: () => { markSceneMutated(); markShadowCastersChanged(); },
+  onWorldIdentity: identity => greenlandPatch?.setWorldIdentity(identity),
+  onTilesReceived: prefetchProcgenFields,
   onResponseApplied: requestRender,
   enqueueLog: enqueueClientLog, bootLog,
 });
@@ -6195,10 +6309,12 @@ function render() {
     });
     camStereoX = stereo.x;
     camStereoY = stereo.y;
-    const refetch = evaluateTerrainRefetch({
-      cameraX: camStereoX, cameraY: camStereoY, lastFetchX, lastFetchY,
+    const focus = terrainStreamingFocus(camLL);
+    const refetch = predictiveRefetchDecision({
+      focusX: focus.x, focusY: focus.y, lastFocusX: lastFetchX, lastFocusY: lastFetchY,
       nowMs, lastTriggerMs: _lastFetchTriggerMs,
-      distanceThreshold: REFETCH_DIST, triggerIntervalMs: 500,
+      distanceThreshold: STREAMING_FOCUS_REFETCH_DIST,
+      triggerIntervalMs: 1000,
     });
     _lastFetchTriggerMs = refetch.nextTriggerMs;
     if (refetch.shouldFetch) fetchTiles();
@@ -6309,15 +6425,9 @@ function render() {
     // even after the settled terrain pass installs finer coverage.
     const procgenTerrainReady = _loadPass === 2 && !fetching && Array.isArray(lastTiles);
     if (procgenTerrainReady && !greenlandPatch.ready && !greenlandPatch.building) {
-      void greenlandPatch.build(renderer, camera, cameraAGL);
+      void greenlandPatch.build(renderer, camera, cameraAGL, traversalMotion());
     }
-    const controlledVehicle = vehicleControlActive ? selectedVehicleEntry() : null;
-    const traversalSpeedMps = controlledVehicle?.vehicleType === 'aircraft'
-      ? Math.abs(controlledVehicle.forwardSpeedMs ?? 0)
-      : controlledVehicle?.vehicleType === 'ground'
-        ? Math.abs(controlledVehicle.speed ?? 0)
-        : Math.hypot(controls.speed, controls.strafeSpeed);
-    greenlandPatch.update(renderer, camera, cameraAGL, traversalSpeedMps);
+    greenlandPatch.update(renderer, camera, cameraAGL, traversalMotion());
   }
   if (renderBackend.isWebGPU && webgpuCloudShadows != null) {
     // Throttled internally; must run OUTSIDE the render (a compute submit
