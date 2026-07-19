@@ -2,11 +2,12 @@ import * as THREE from 'three';
 
 import { createTerrainVectorLayerRuntime } from './terrain-vector-layer-runtime.js';
 
-// Grey extruded buildings from Asiaq Teknisk Grundkort footprints
-// (/api/buildings). Rings arrive origin-relative (same ox/oy convention as
-// /api/tiles) with per-vertex surveyed roof elevations; each building is
-// extruded from its ingest-sampled ground up to the real roof outline. The
-// scene is unlit, so wall shading is baked into vertex colors.
+// Grey extruded buildings from Asiaq Teknisk Grundkort footprints, served
+// by the asset server (GET :8787/api/buildings, seeded into assets.db by
+// flaskserver/grundkort.py). Rings arrive origin-relative (same ox/oy
+// convention as /api/tiles) with per-vertex surveyed roof elevations; each
+// building is extruded from its ingest-sampled ground up to the real roof
+// outline. The scene is unlit, so wall shading is baked into vertex colors.
 
 const WALL_BASE_SINK_M = 1.5;      // bury the base so slopes don't leave gaps
 const LIGHT_DIR = { x: 0.5, y: -0.85 }; // grid-space sun for wall shading
@@ -100,11 +101,12 @@ export function buildBuildingsGeometry(buildings, {
 
 export function createTerrainBuildingsRuntime({
   terrainRoot, pipelineState, exaggeration = 1,
+  endpoint = '/api/buildings',
   bootLog, onMutated, requestRender, fetchImpl,
 }) {
   return createTerrainVectorLayerRuntime({
     terrainRoot, pipelineState,
-    endpoint: '/api/buildings', itemsKey: 'buildings', logLabel: 'Buildings',
+    endpoint, itemsKey: 'buildings', logLabel: 'Buildings',
     buildGeometry: (items, { offsetX, offsetY }) =>
       buildBuildingsGeometry(items, { offsetX, offsetY, exaggeration }),
     bootLog, onMutated, requestRender, fetchImpl,

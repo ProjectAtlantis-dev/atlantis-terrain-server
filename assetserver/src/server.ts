@@ -30,6 +30,15 @@ import {
 const ASSETS_RESPONSE_SCHEMA_VERSION = 4;
 const DEFAULT_VEHICLE_INSTANCE_ID = "amv-01";
 type SqliteDb = Database<sqlite3.Database, sqlite3.Statement>;
+
+// Asiaq Teknisk Grundkort footprints seeded by flaskserver/grundkort.py.
+// Ring vertices are absolute EPSG:3413 [x, y, roofZ].
+type BuildingProperties = {
+  b?: string | null;
+  use?: string | null;
+  groundZ?: number;
+  ring?: [number, number, number][];
+};
 type SeedVehicleMetadata = VehicleStateCommon & { id: string; headlightsOn: boolean };
 
 const FALLBACK_VEHICLE_DEFINITION: VehicleDefinition = {
@@ -604,6 +613,17 @@ async function initDb(db: SqliteDb): Promise<void> {
     );
   `);
 
+  // Buildings are spatially queried in EPSG:3413; cx/cy carry the footprint
+  // centroid in that frame. grundkort.py performs the same guarded migration.
+  const assetColumns = await db.all<{ name: string }[]>("PRAGMA table_info(assets);");
+  if (!assetColumns.some((column) => column.name === "cx")) {
+    await db.exec("ALTER TABLE assets ADD COLUMN cx REAL;");
+  }
+  if (!assetColumns.some((column) => column.name === "cy")) {
+    await db.exec("ALTER TABLE assets ADD COLUMN cy REAL;");
+  }
+  await db.exec("CREATE INDEX IF NOT EXISTS idx_assets_cxy ON assets(cx, cy);");
+
   // Migrate old tables if they exist
   if (await tableExists(db, "vehicle_instances")) {
     log.info("migrating vehicle_instances → assets", { phase: "assets.migrate.vehicles" });
@@ -996,6 +1016,48 @@ async function main(): Promise<void> {
         error,
       });
       res.status(500).json({ error: "asset endpoint failed" });
+    }
+  });
+
+  app.get("/api/buildings", async (req: Request, res: Response) => {
+    try {
+      const sx = Number(req.query.sx);
+      const sy = Number(req.query.sy);
+      if (!Number.isFinite(sx) || !Number.isFinite(sy)) {
+        res.status(400).json({ error: "sx and sy (EPSG:3413) are required" });
+        return;
+      }
+      const range = Number(req.query.range) || 20000;
+      const ox = Number(req.query.ox);
+      const oy = Number(req.query.oy);
+      const originX = Number.isFinite(ox) ? ox : sx;
+      const originY = Number.isFinite(oy) ? oy : sy;
+      const rows = await db.all<{ id: string; properties: string }[]>(
+        `SELECT id, properties FROM assets
+         WHERE type = 'building' AND enabled = 1
+           AND cx BETWEEN ? AND ? AND cy BETWEEN ? AND ?
+         LIMIT 20000`,
+        [sx - range, sx + range, sy - range, sy + range],
+      );
+      const buildings = [];
+      for (const row of rows) {
+        const props = parseProperties<BuildingProperties>(row.properties);
+        if (!Array.isArray(props.ring) || props.ring.length < 3) continue;
+        buildings.push({
+          id: row.id,
+          b: props.b ?? null,
+          use: props.use ?? null,
+          groundZ: props.groundZ ?? 0,
+          ring: props.ring.map(([x, y, z]) => [x - originX, y - originY, z]),
+        });
+      }
+      res.json({ buildings, count: buildings.length, qx: sx, qy: sy });
+    } catch (error) {
+      log.error("/api/buildings failed", {
+        phase: "assets.api.buildings_failed",
+        error,
+      });
+      res.status(500).json({ error: "buildings endpoint failed" });
     }
   });
 

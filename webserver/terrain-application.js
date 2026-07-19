@@ -17,7 +17,8 @@ import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { NormalPass } from 'postprocessing';
 import { buildAssetLibrary } from './procgen/library.ts';
 import { buildTileScatter, updateScatterVisibility, SCATTER_MIN_DEPTH } from './procgen/scatter.ts';
-import { priorityHeading, viewHeadingChanged } from './terrain-priority.js';
+import { priorityHeading } from './terrain-priority.js';
+import { createTerrainHeadingDemandController } from './terrain-heading-demand.js';
 import { compassHeading, createTerrainHud, renderGameClock } from './terrain-hud.js';
 import { applyMapDrag, installTerrainKeyboardControls, installTerrainPointerControls } from './terrain-controls.js';
 import { stepVehicleDrive } from './terrain-vehicle.js';
@@ -42,6 +43,7 @@ import { createTerrainBuildingsRuntime } from './terrain-buildings-runtime.js';
 import { createTerrainRoadsRuntime } from './terrain-roads-runtime.js';
 import { createTerrainTileMenuRuntime } from './terrain-tile-menu-runtime.js';
 import { createTerrainHeatmapRuntime } from './terrain-heatmap-runtime.js';
+import { resolveTerrainViewToggle } from './terrain-view-mode.js';
 import { googleMaps3dUrl } from './terrain-google-maps.js';
 import { createTerrainFlyToTileRuntime } from './terrain-fly-to-tile.js';
 import { epsg3413DirectionBearing, epsg3413ToWgs84 } from './terrain-polar-stereo.js';
@@ -261,7 +263,12 @@ let heatmapRuntime = null;
 const { hud, alt, gameClock: gameClockEl } = createTerrainHud({
   onToggleMapMode: () => toggleMapMode(),
   onToggleHeatmap: () => toggleHeatmap(),
-  onToggleRenderBackend,
+  onToggleRenderBackend: () => {
+    // beforeunload normally saves this too, but make the renderer transition
+    // self-contained so a fast reload cannot race the camera/frame snapshot.
+    savePosition();
+    onToggleRenderBackend();
+  },
   onClockAction: action => {
     if (action === 'rw') rewindGameClock();
     else if (action === 'stop') stopGameClock();
@@ -817,7 +824,10 @@ const { history: tileHistory, log: tileLog } = createTileHistory({
 
 // --- Texture streaming ---
 
-const TEX_MAX = 120; // max concurrent HTTP texture requests (texFetching 202s don't count)
+// Flask performs texture work with four background workers.  A much larger
+// client fan-out only fills the Vite proxy with idle upstream sockets and can
+// exhaust Flask's descriptor budget before useful work starts.
+const TEX_MAX = 24; // max concurrent HTTP texture requests (texFetching 202s don't count)
 const TEX_RETRY_202_BASE_MS = 2000;   // initial 202 retry delay
 const TEX_RETRY_202_MAX_MS = 30000;   // cap backoff at 30s
 const TEX_RETRY_ERROR_MS = 3000;
@@ -859,6 +869,7 @@ const buildingsRuntime = createTerrainBuildingsRuntime({
   terrainRoot,
   pipelineState: terrainPipelineState,
   exaggeration: EXAG,
+  endpoint: `${ASSET_SERVER_BASE}/api/buildings`,
   bootLog,
   onMutated: markSceneMutated,
   requestRender,
@@ -1100,32 +1111,15 @@ const terrainFetchRuntime = createTerrainFetchRuntime({
   logger: { enqueue: enqueueClientLog, boot: bootLog },
   events: terrainFetchEvents,
 });
-let terrainDemandHeading = priorityHeading(
+const initialTerrainDemandHeading = priorityHeading(
   vehicleRuntime.vehicleControlActive,
   vehicleRuntime.vehicleHeadingRad,
   controls.yaw,
 );
 const TERRAIN_DEMAND_HEADING_THRESHOLD = 2 * Math.PI / 180;
+const TERRAIN_DEMAND_HEADING_SETTLE_MS = 200;
 
-function rebuildTerrainDemandForViewDirection() {
-  const heading = priorityHeading(
-    vehicleRuntime.vehicleControlActive,
-    vehicleRuntime.vehicleHeadingRad,
-    controls.yaw,
-  );
-  if (terrainPipelineState.firstLoad) {
-    terrainDemandHeading = heading;
-    return false;
-  }
-  if (!viewHeadingChanged(
-    terrainDemandHeading,
-    heading,
-    TERRAIN_DEMAND_HEADING_THRESHOLD,
-  )) {
-    return false;
-  }
-  const previousHeading = terrainDemandHeading;
-  terrainDemandHeading = heading;
+function commitTerrainDemandHeading(previousHeading, heading) {
   textureStreamer.abortAll();
   terrainTileSet.resetTextureApplications();
   terrainFetchRuntime.reset(2);
@@ -1137,7 +1131,23 @@ function rebuildTerrainDemandForViewDirection() {
     previousHeading, heading,
   });
   terrainFetchRuntime.request();
-  return true;
+}
+const terrainHeadingDemand = createTerrainHeadingDemandController({
+  initialHeading: initialTerrainDemandHeading,
+  threshold: TERRAIN_DEMAND_HEADING_THRESHOLD,
+  settleMs: TERRAIN_DEMAND_HEADING_SETTLE_MS,
+  onCommit: commitTerrainDemandHeading,
+});
+
+function rebuildTerrainDemandForViewDirection() {
+  const heading = priorityHeading(
+    vehicleRuntime.vehicleControlActive,
+    vehicleRuntime.vehicleHeadingRad,
+    controls.yaw,
+  );
+  return terrainHeadingDemand.observe(heading, {
+    ready: !terrainPipelineState.firstLoad,
+  });
 }
 
 // --- Fly to tile (T key, ?tile= URL param) ---
@@ -1582,8 +1592,8 @@ function updateHud() {
       ? 'W/S drive, A/D steer, mouse orbit camera, Esc exits vehicle control'
       : 'WASD or Arrows move, Q/Z altitude, drag look',
     'map: left-drag rotate, right-drag pan, wheel zoom',
-    '<span id="mapModeLink" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">map mode</span> (M)' +
-      ` · <span id="heatmapModeLink" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">${heatmapRuntime?.active ? 'regular map' : 'heatmap'}</span> (H)` +
+    `<span id="mapModeLink" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">${controls.mapMode && !heatmapRuntime?.active ? '3D view' : 'map mode'}</span> (M)` +
+      ` · <span id="heatmapModeLink" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">${heatmapRuntime?.active ? '3D view' : 'heatmap'}</span> (H)` +
       ' · Google 3D (G)' +
       ' · R reset · <span id="debugLogLink" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">debug log</span>'
   ].join('<br>');
@@ -1678,9 +1688,13 @@ function syncMapModePresentation() {
 }
 
 function toggleHeatmap() {
-  const next = !heatmapRuntime.active;
-  if (next && !controls.mapMode) {
-    controls.mapMode = true;
+  const transition = resolveTerrainViewToggle({
+    mapMode: controls.mapMode,
+    heatmapActive: heatmapRuntime.active,
+  }, 'heatmap');
+  if (!transition.accepted) return;
+  controls.mapMode = transition.mapMode;
+  if (transition.heatmapActive) {
     cameraRuntimeState.driftMode = false;
     controls.strafeSpeed = 0;
     vehicleRuntime.setVehicleControlActive(false, 'heatmap-mode');
@@ -1688,7 +1702,7 @@ function toggleHeatmap() {
     controls.mapPanNorth = 0;
     updateMapCamera();
   }
-  heatmapRuntime.setPresentation(next ? 'heatmap' : 'edges');
+  heatmapRuntime.setPresentation(transition.heatmapActive ? 'heatmap' : 'hidden');
   hideTileInfo();
   hideTileMenu();
   syncMapModePresentation();
@@ -1697,8 +1711,13 @@ function toggleHeatmap() {
 }
 
 function toggleMapMode() {
-  controls.mapMode = !controls.mapMode;
-  if (!controls.mapMode) heatmapRuntime.setPresentation('hidden');
+  const transition = resolveTerrainViewToggle({
+    mapMode: controls.mapMode,
+    heatmapActive: heatmapRuntime.active,
+  }, 'map');
+  if (!transition.accepted) return;
+  controls.mapMode = transition.mapMode;
+  heatmapRuntime.setPresentation('hidden');
   cameraRuntimeState.driftMode = false;
   controls.strafeSpeed = 0;
   if (controls.mapMode) {

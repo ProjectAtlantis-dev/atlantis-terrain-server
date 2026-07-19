@@ -73,13 +73,15 @@ Classifier output lives in `terrain.db`'s `classifier_tiles` table as a zlib-com
 
 ## Buildings & Roads
 
-Real 3D buildings and roads from Asiaq's Teknisk Grundkort (surveyed outlines with per-vertex elevations). Download a settlement's `*_TekniskGrundkort_SHP.zip` from [kortforsyning.asiaq.gl](https://kortforsyning.asiaq.gl/) and drop it into `flaskserver/grundkort/` (gitignored). On startup the server ingests any settlement missing from the `buildings`/`roads` tables, so a flushed terrain.db repopulates itself. The manual scripts still work too:
+Real 3D buildings and roads from Asiaq's Teknisk Grundkort (surveyed outlines with per-vertex elevations). Fully automatic: on startup the server downloads any settlement listed in `terrain_config.GRUNDKORT_SETTLEMENTS` (default: Nuuk) from [kortforsyning.asiaq.gl](https://kortforsyning.asiaq.gl/) into `flaskserver/grundkort/` (gitignored), then ingests whatever is missing from the `buildings`/`roads` tables — a fresh clone or a flushed terrain.db repopulates itself. To cover more settlements, add their folder names to that list, or drop a `*_TekniskGrundkort_SHP.zip` into `grundkort/` manually. The manual scripts still work too:
 
     cd flaskserver
     ./venv/bin/python ingest_buildings.py grundkort/0600NUK_TekniskGrundkort_SHP.zip
     ./venv/bin/python ingest_roads.py grundkort/0600NUK_TekniskGrundkort_SHP.zip
 
-Geometry is reprojected to EPSG:3413. Building ground is sampled from cached heightmaps; buildings ingested before their area's heightmaps exist get a roof-derived estimate (`ground_sampled = 0`) and are re-sampled automatically by `/api/buildings` once heightmaps stream in — ingest order no longer matters. The frontend fetches `/api/buildings` and `/api/roads` around the camera and renders grey extrusions and category-tinted road/path ribbons in both renderers. Toggle via `takramDebug.setBuildingsVisible(false)` / `setRoadsVisible(false)`.
+Geometry is reprojected to EPSG:3413. Building ground is sampled from cached heightmaps; buildings ingested before their area's heightmaps exist get a roof-derived estimate (`ground_sampled = 0`) and a background loop re-samples them once heightmaps stream in — ingest order doesn't matter.
+
+**The asset server is the catalog of record for buildings**: after ingest, `grundkort.py` syncs every building into `assetserver/assets.db` as a `type='building'` row (footprint ring, use type, register B-number in `properties`; centroid in `cx`/`cy` EPSG:3413 columns for spatial queries). The frontend fetches buildings from the asset server (`GET :8787/api/buildings`, so it must be running for buildings to appear) and roads from flask (`/api/roads`), rendering grey extrusions and category-tinted road/path ribbons in both renderers. Toggle via `takramDebug.setBuildingsVisible(false)` / `setRoadsVisible(false)`.
 
 ## Troubleshooting
 
@@ -97,7 +99,7 @@ Press **T** and enter a tile id (`depth-col-row`, e.g. `12-1461-786`) to telepor
 
 Press **M** to toggle a 2D map view (no clouds/atmosphere) for navigation and tile debugging. Right-click on a tile to inspect its metadata or open it in the tile inspector.
 
-Press **H** to swap the map canvas for the live tile-priority heatmap. Press **H** again to return to the regular map; both views retain the same heading, pan, and zoom. Regular map mode outlines the terrain meshes currently being rendered as a thin grey grid, with the tile under the pointer outlined in red.
+Press **H** from the 3D view to toggle the live tile-priority heatmap. Press **H** again to return directly to 3D. Map and heatmap are separate views: return to 3D before switching between them. Both retain the same heading, pan, and zoom. Regular map mode outlines the terrain meshes currently being rendered as a thin grey grid, with the tile under the pointer outlined in red.
 
 In 3D mode, atmosphere sliders allow adjusting cloud density, coverage, and lighting parameters. (WIP — still working out some bugs.)
 

@@ -348,6 +348,9 @@ def _bootstrap_backend() -> None:
     import grundkort
     grundkort.ensure_grundkort_async()
 
+    from ingest_coastline import ensure_gtk50_blocks
+    threading.Thread(target=ensure_gtk50_blocks, daemon=True).start()
+
   except Exception as exc:  # pragma: no cover - runtime setup path
     _backend_error = (
       f"Terrain backend unavailable: {type(exc).__name__}: {exc}. "
@@ -980,63 +983,15 @@ def api_tiles():
   )
 
 
-@app.get("/api/buildings")
-def api_buildings():
-  """Asiaq Teknisk Grundkort building footprints near a point.
-
-  Same origin convention as /api/tiles: coordinates are EPSG:3413 minus
-  (ox, oy). Rings are [[x, y, roofZ], ...] with per-vertex surveyed roof
-  elevations; groundZ is sampled from our heightmaps at ingest time.
-  Empty result until ingest_buildings.py has populated the table.
-  """
-  unavailable = _terrain_unavailable_response()
-  if unavailable is not None:
-    return unavailable
-  if "sx" in request.args and "sy" in request.args:
-    qx = _arg_float("sx", 0.0)
-    qy = _arg_float("sy", 0.0)
-  else:
-    lat = _arg_float("lat", 64.175)
-    lon = _arg_float("lon", -51.7388)
-    qx, qy = _to_stereo(lat, lon)
-  max_range = _arg_float("range", 20000.0)
-  ox = _arg_float("ox", qx)
-  oy = _arg_float("oy", qy)
-
-  db = _get_db()
-  has_table = db.execute(
-    "SELECT name FROM sqlite_master WHERE type='table' AND name='buildings'"
-  ).fetchone()
-  if not has_table:
-    return jsonify({"buildings": [], "count": 0, "qx": qx, "qy": qy})
-
-  import grundkort
-  grundkort.repair_unsampled_ground(db, qx, qy, max_range)
-
-  rows = db.execute(
-    "SELECT building_id, b_number, use_type, ground_z, ring FROM buildings "
-    "WHERE cx BETWEEN ? AND ? AND cy BETWEEN ? AND ? LIMIT 20000",
-    (qx - max_range, qx + max_range, qy - max_range, qy + max_range),
-  ).fetchall()
-
-  buildings = []
-  for building_id, b_number, use_type, ground_z, ring_json in rows:
-    ring = json.loads(ring_json)
-    buildings.append({
-      "id": building_id,
-      "b": b_number,
-      "use": use_type,
-      "groundZ": ground_z,
-      "ring": [[x - ox, y - oy, z] for x, y, z in ring],
-    })
-  log.debug(f"[/api/buildings] {len(buildings)} buildings near qx={qx:.0f} qy={qy:.0f} range={max_range:.0f}")
-  return jsonify({"buildings": buildings, "count": len(buildings), "qx": qx, "qy": qy})
+# Building footprints moved to the asset server: grundkort.py seeds them
+# into assets.db as type='building' rows and the asset server serves them
+# spatially at GET :8787/api/buildings with the same response shape.
 
 
 @app.get("/api/roads")
 def api_roads():
-  """Asiaq road/path centerlines near a point (see /api/buildings for the
-  origin convention). Paths are [[x, y, surveyedZ], ...]; width_m is assigned
+  """Asiaq road/path centerlines near a point (same ox/oy origin convention
+  as /api/tiles). Paths are [[x, y, surveyedZ], ...]; width_m is assigned
   per category at ingest. Empty until ingest_roads.py has run."""
   unavailable = _terrain_unavailable_response()
   if unavailable is not None:

@@ -28,16 +28,20 @@ log_ingest = get_logger("terrain.gtk50.ingest")
 _FTP_BASE = "ftps://ftp.dataforsyningen.dk/DATABOKS_GROENLAND/Vektor_50000"
 
 
-def _credentials() -> str:
+def _credentials(strict: bool = True) -> str | None:
     env = {}
-    for line in (Path(__file__).parent / ".env").read_text().splitlines():
-        if "=" in line and not line.startswith("#"):
-            key, _, value = line.partition("=")
-            env[key.strip()] = value.strip()
+    env_path = Path(__file__).parent / ".env"
+    if env_path.exists():
+        for line in env_path.read_text().splitlines():
+            if "=" in line and not line.startswith("#"):
+                key, _, value = line.partition("=")
+                env[key.strip()] = value.strip()
     user = env.get("DATAFORSYNINGEN_FTP_USER")
     password = env.get("DATAFORSYNINGEN_FTP_PASS")
     if not user or not password:
-        sys.exit("DATAFORSYNINGEN_FTP_USER / _PASS missing from .env")
+        if strict:
+            sys.exit("DATAFORSYNINGEN_FTP_USER / _PASS missing from .env")
+        return None
     return f"{user}:{password}"
 
 
@@ -113,6 +117,67 @@ def _refresh_cached_masks() -> None:
     db.close()
 
 
+def _download_block(block: str, creds: str) -> None:
+    target = block_path(block)
+    url = f"{_FTP_BASE}/{target.name}"
+    subprocess.run(
+        ["curl", "-sS", "--max-time", "600", "--user", creds, url,
+         "-o", str(target)],
+        check=True,
+    )
+
+
+def ensure_gtk50_blocks() -> None:
+    """Startup guard: fetch configured coastline blocks or scream.
+
+    Called from a server startup thread. If blocks are missing and no
+    Dataforsyningen login is configured, this logs a loud error so nobody
+    silently ships WMS-decoded fjords.
+    """
+    from terrain_config import GTK50_BLOCKS
+
+    missing = [b for b in GTK50_BLOCKS if not block_path(b).exists()]
+    if not missing:
+        return
+    creds = _credentials(strict=False)
+    if creds is None:
+        log_ingest.error(
+            "\n" + "=" * 72 + "\n"
+            f"GTK50 VECTOR COASTLINE BLOCKS MISSING: {', '.join(missing)}\n"
+            "No Dataforsyningen account login found (DATAFORSYNINGEN_FTP_USER /\n"
+            "DATAFORSYNINGEN_FTP_PASS in flaskserver/.env), so they cannot be\n"
+            "downloaded. Coastline masks will fall back to decoding the rendered\n"
+            "WMS map — expect phantom lakes at altitude and narrow-fjord dropouts.\n"
+            "Fix: create a free account at https://dataforsyningen.dk, put the\n"
+            "login in flaskserver/.env, and restart. Or run manually:\n"
+            f"  ./venv/bin/python ingest_coastline.py {' '.join(missing)}\n"
+            + "=" * 72
+        )
+        return
+    try:
+        available = _remote_listing(creds)
+        BLOCK_DIR.mkdir(exist_ok=True)
+        for block in missing:
+            if block not in available:
+                log_ingest.warning(
+                    f"[gtk50-ingest] {block}: not offered by FTP (ice/ocean), skipping"
+                )
+                continue
+            _download_block(block, creds)
+            log_ingest.info(
+                f"[gtk50-ingest] startup download {block} "
+                f"({available[block] / 1e6:.0f} MB)"
+            )
+    except Exception as exc:
+        log_ingest.error(
+            f"[gtk50-ingest] startup block download failed "
+            f"({type(exc).__name__}: {exc}) — coastline falls back to WMS "
+            "until the next restart"
+        )
+        return
+    _refresh_cached_masks()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("blocks", nargs="*", help="block ids, e.g. 71_-1")
@@ -146,13 +211,7 @@ def main() -> None:
     done = 0
     start = time.time()
     for index, block in enumerate(plan, 1):
-        target = block_path(block)
-        url = f"{_FTP_BASE}/{target.name}"
-        subprocess.run(
-            ["curl", "-sS", "--max-time", "600", "--user", creds, url,
-             "-o", str(target)],
-            check=True,
-        )
+        _download_block(block, creds)
         done += available[block]
         elapsed = time.time() - start
         eta = elapsed / done * (total - done) if done else 0.0

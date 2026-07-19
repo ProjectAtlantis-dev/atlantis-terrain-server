@@ -51,11 +51,11 @@ export function createTerrainBackend({
     createWater: createWebGLWater,
     prepareUntexturedTerrain(mesh) {
       if (!mesh?.material || mesh.material.map) return;
-      if (!mesh.material.vertexColors) {
-        mesh.material.vertexColors = true;
+      if (mesh.material.vertexColors) {
+        mesh.material.vertexColors = false;
         mesh.material.needsUpdate = true;
       }
-      mesh.material.color.set(0xffffff);
+      mesh.material.color.set(0x29313a);
       backend.markSceneMutated();
     },
     configureScenePipeline({ scene, camera, normalPass, cloudsEffect, aerialPerspective }) {
