@@ -24,7 +24,7 @@ export const DEFAULT_WATER_PARAMS = {
   foamTransfer: 0.12,     // plume -> residue feed rate (per second)
   ghostStrength: 2.0,     // how strongly residue keeps the cap's ghost visible
   cloudiness: 0,          // 0 clear -> 1 overcast
-  tintStrength: 0.85,     // how much local imagery colour replaces defaults
+  tintStrength: 1.0,      // how much local imagery colour replaces defaults
   radiance: 1.0,          // output gain vs the scene's tone-mapping exposure
   timeScale: 1.0,
   seed: 1,
@@ -47,7 +47,7 @@ export function createWaterRuntime({
   if (!water?.mesh) {
     return {
       enabled: false, params,
-      applyWind() {}, update() {}, dispose() {},
+      applyWind() {}, markColorDirty() {}, update() {}, dispose() {},
     };
   }
   terrainRoot.add(water.mesh);
@@ -60,7 +60,7 @@ export function createWaterRuntime({
   const lastCaptureCenter = new THREE.Vector2(Infinity, Infinity);
   const simParams = {};
   let lastCaptureMs = 0;
-  let lastCaptureVersion = -1;
+  let colorDirty = true;
   let simTime = 0;
 
   function applyWind() {
@@ -75,7 +75,7 @@ export function createWaterRuntime({
   }
   applyWind();
 
-  function update({ dt, nowMs, camera, visible, sceneVersion }) {
+  function update({ dt, nowMs, camera, visible }) {
     water.mesh.visible = visible;
     if (!visible) return;
 
@@ -108,18 +108,18 @@ export function createWaterRuntime({
       palette, params, simParams,
     });
 
-    // Colour-map capture: refresh when the camera strays from the captured
-    // window or new terrain textures streamed in, throttled so streaming
-    // bursts don't turn into a capture per frame.
+    // Colour-map capture is event-driven: markColorDirty() fires on actual
+    // texture application (tile arrival/upgrade), movement re-centres the
+    // window. The interval is only a coalescer — tiles apply in bursts of a
+    // few per frame and must not become a capture per frame.
     if (water.captureColorMap && nowMs - lastCaptureMs >= CAPTURE_MIN_INTERVAL_MS) {
       const moved = lastCaptureCenter.distanceTo(meshOffset)
         > water.colorMapExtent * 0.12;
-      const dirty = sceneVersion !== lastCaptureVersion;
-      if (moved || dirty) {
+      if (moved || colorDirty) {
         water.captureColorMap({ scene, terrainRoot, centerXY: meshOffset });
         lastCaptureCenter.copy(meshOffset);
         lastCaptureMs = nowMs;
-        lastCaptureVersion = sceneVersion;
+        colorDirty = false;
       }
     }
   }
@@ -128,6 +128,9 @@ export function createWaterRuntime({
     enabled: true,
     params,
     applyWind,
+    // Call when a terrain texture is applied or upgraded; the next update
+    // (past the coalescing interval) re-captures the colour map.
+    markColorDirty() { colorDirty = true; },
     update,
     dispose() {
       terrainRoot.remove(water.mesh);

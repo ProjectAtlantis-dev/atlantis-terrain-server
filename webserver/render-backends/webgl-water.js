@@ -109,7 +109,7 @@ const WATER_FRAGMENT = /* glsl */ `
   uniform vec2 uColorMapCenter;
   uniform float uColorMapExtent;
   uniform float uTintStrength;
-  uniform float uTintDeepGain;
+  uniform float uTintExposure;
   uniform float uTintScatterGain;
 
   varying vec3 vPlanePos;
@@ -287,7 +287,6 @@ const WATER_FRAGMENT = /* glsl */ `
     float inMap = step(abs(cmUV.x - 0.5), 0.5) * step(abs(cmUV.y - 0.5), 0.5);
     vec4 cm = texture2D(uColorMap, cmUV);
     float cmW = cm.a * inMap * uTintStrength;
-    vec3 deepCol = mix(uDeepColor, cm.rgb * uTintDeepGain, cmW);
     vec3 scatCol = mix(uScatterColor, cm.rgb * uTintScatterGain, cmW);
 
     // ---- lighting ---------------------------------------------------------
@@ -324,7 +323,14 @@ const WATER_FRAGMENT = /* glsl */ `
     // upwelling water colour with crest subsurface scattering
     float backlight = pow(clamp(dot(L, -V) * 0.5 + 0.5, 0.0, 1.0), 3.0);
     vec3 ambient = mix(uHorizonCool, uZenithColor, 0.4) * 0.65;
-    vec3 waterCol = deepCol * ambient * 4.0;
+    // Faithful colour inheritance: where the capture has coverage, the
+    // imagery IS this water's top-down appearance, so it becomes the body
+    // radiance directly — NOT a deep-colour pushed through the blue ambient
+    // product, which hue-shifts teal to navy and buries local variation.
+    // The aerial-perspective pass relights water and terrain identically, so
+    // matching the seabed imagery radiance here lands on screen looking like
+    // the same imagery does on land. uTintExposure trims the level.
+    vec3 waterCol = mix(uDeepColor * ambient * 4.0, cm.rgb * uTintExposure, cmW);
     // crest transmission is a close-range effect (thin backlit crests); from
     // altitude elevation must not modulate colour or swells read as pale
     // cloudy blobs under the surface
@@ -419,8 +425,8 @@ export function createWebGLWater({
     uColorMap: { value: null },
     uColorMapCenter: { value: new THREE.Vector2() },
     uColorMapExtent: { value: colorMapExtent },
-    uTintStrength: { value: 0.85 },
-    uTintDeepGain: { value: 0.5 },
+    uTintStrength: { value: 1 },
+    uTintExposure: { value: 1 },
     uTintScatterGain: { value: 2.2 },
   };
 

@@ -37,6 +37,12 @@ export function buildRadialGridGeometry({
   }
   const geometry = new THREE.BufferGeometry();
   geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+  // Flat +z normals: the relight/aerial-perspective pass reads the normal
+  // buffer and renders normal-less geometry black (see memory: sprites,
+  // Patria, buildings). Wave normals are shader-side only.
+  const normals = new Float32Array(positions.length);
+  for (let i = 2; i < normals.length; i += 3) normals[i] = 1;
+  geometry.setAttribute('normal', new THREE.BufferAttribute(normals, 3));
   geometry.setIndex(new THREE.BufferAttribute(indices, 1));
   return geometry;
 }

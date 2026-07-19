@@ -923,6 +923,9 @@ const terrainTileSet = createTerrainTileSet({
   events: {
     onMutated: markSceneMutated,
     onMaterialApplied: () => {
+      // Texture arrival/upgrade does not bump sceneMutationVersion (that
+      // tracks mesh add/remove), so tell the water colour capture directly.
+      waterRuntime.markColorDirty();
       requestRender();
     },
   },
@@ -2045,7 +2048,6 @@ function render() {
   waterRuntime.update({
     dt, nowMs, camera,
     visible: !controls.mapMode && !classifierRuntime.active,
-    sceneVersion: renderBackend.sceneMutationVersion,
   });
 
   // Terrain streaming: check if camera moved far enough to re-fetch
