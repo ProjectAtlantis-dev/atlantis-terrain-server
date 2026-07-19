@@ -17,7 +17,7 @@ import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { NormalPass } from 'postprocessing';
 import { buildAssetLibrary } from './procgen/library.ts';
 import { buildTileScatter, updateScatterVisibility, SCATTER_MIN_DEPTH } from './procgen/scatter.ts';
-import { priorityHeading } from './terrain-priority.js';
+import { headingFromForward2D } from './terrain-priority.js';
 import { createTerrainHeadingDemandController } from './terrain-heading-demand.js';
 import { compassHeading, createTerrainHud, renderGameClock } from './terrain-hud.js';
 import { applyMapDrag, installTerrainKeyboardControls, installTerrainPointerControls } from './terrain-controls.js';
@@ -46,6 +46,7 @@ import { resolveTerrainViewToggle } from './terrain-view-mode.js';
 import { googleMaps3dUrl } from './terrain-google-maps.js';
 import { createTerrainFlyToTileRuntime } from './terrain-fly-to-tile.js';
 import { epsg3413DirectionBearing, epsg3413ToWgs84 } from './terrain-polar-stereo.js';
+import { createWaterRuntime, DEFAULT_WATER_PARAMS } from './water/water-runtime.js';
 
 export async function startTerrainApplication({
   backend = 'webgl',
@@ -213,6 +214,15 @@ const controls = {
   terrainRange: 20000,
   keys: {}
 };
+const terrainViewForward = new THREE.Vector3();
+function getTerrainViewHeading() {
+  camera.getWorldDirection(terrainViewForward);
+  return headingFromForward2D(
+    terrainViewForward.dot(east),
+    terrainViewForward.dot(north),
+    controls.yaw,
+  );
+}
 const BASE_ACCEL = 1200;
 const BASE_BRAKE = 800;
 const BASE_MAX_SPEED = 5000;
@@ -462,6 +472,40 @@ function buildTuningControls(ap, ce) {
     toggle: tuningToggle,
   });
   }
+  if (waterRuntime.enabled) {
+  tuningSectionLabel('Water');
+  tuningSlider('wind speed', {
+    min: 1, max: 28, step: 0.1, value: waterParams.windSpeed,
+    decimals: 1,
+    onChange: v => { waterParams.windSpeed = v; waterRuntime.applyWind(); }
+  });
+  tuningSlider('wind dir', {
+    min: 0, max: 360, step: 1, value: waterParams.windDirection,
+    decimals: 0,
+    format: v => `${v.toFixed(0)}°`,
+    onChange: v => { waterParams.windDirection = v; waterRuntime.applyWind(); }
+  });
+  tuningSlider('swell scale', {
+    min: 0.3, max: 2, step: 0.01, value: waterParams.amplitude,
+    onChange: v => { waterParams.amplitude = v; waterRuntime.applyWind(); }
+  });
+  tuningSlider('choppiness', {
+    min: 0.4, max: 1.6, step: 0.01, value: waterParams.choppiness,
+    onChange: v => { waterParams.choppiness = v; }
+  });
+  tuningSlider('whitecaps', {
+    min: 0, max: 2, step: 0.01, value: waterParams.foamAmount,
+    onChange: v => { waterParams.foamAmount = v; }
+  });
+  tuningSlider('water tint', {
+    min: 0, max: 1, step: 0.01, value: waterParams.tintStrength,
+    onChange: v => { waterParams.tintStrength = v; }
+  });
+  tuningSlider('water bright', {
+    min: 0.1, max: 6, step: 0.05, value: waterParams.radiance,
+    onChange: v => { waterParams.radiance = v; }
+  });
+  }
   tuningSectionLabel('Terrain');
   tuningSlider('terrain range', {
     min: 10000, max: 50000, step: 1000, value: controls.terrainRange,
@@ -539,6 +583,18 @@ Ellipsoid.WGS84
   .getEastNorthUpFrame(anchorPosition)
   .decompose(terrainRoot.position, terrainRoot.quaternion, terrainRoot.scale);
 scene.add(terrainRoot);
+
+// --- Fjord water (ocean2 FFT port) ---
+// A camera-following FFT water surface at local z=0; masked water terrain is
+// dropped to -10 m server-side, so the surface has volume above the seabed
+// and land occludes it naturally. Inert on backends without createWater.
+const waterParams = { ...DEFAULT_WATER_PARAMS };
+const waterRuntime = createWaterRuntime({
+  backend: renderBackend, scene, terrainRoot,
+  anchorPosition, east, north, up,
+  getSunDirection: () => sunDirection,
+  params: waterParams,
+});
 
 const camMarkerGeo = new THREE.ConeGeometry(200, 600, 4);
 const camMarker = new THREE.Mesh(
@@ -672,7 +728,7 @@ heatmapRuntime = createTerrainHeatmapRuntime({
       cameraX: terrainPipelineState.cameraStereoX,
       cameraY: terrainPipelineState.cameraStereoY,
       alt: relative.dot(up),
-      yaw: controls.yaw,
+      yaw: getTerrainViewHeading(),
       zoom: controls.mapZoom,
       range: controls.terrainRange,
     };
@@ -858,7 +914,10 @@ const terrainTileSet = createTerrainTileSet({
     attachScatter: attachTileScatter,
   },
   renderBackend,
-  view: { camera, anchorPosition, east, north, up, controls },
+  view: {
+    camera, anchorPosition, east, north, up, controls,
+    getHeading: getTerrainViewHeading,
+  },
   log: tileLog,
   vehicle: vehicleRuntime,
   events: {
@@ -1106,24 +1165,23 @@ const terrainFetchRuntime = createTerrainFetchRuntime({
     camera, anchorPosition, east, north, up, controls,
     anchorLatitude: anchorLat,
     anchorLongitude: anchorLon,
+    getHeading: getTerrainViewHeading,
   },
   vehicle: vehicleRuntime,
   terrain: terrainTileSet,
   logger: { enqueue: enqueueClientLog, boot: bootLog },
   events: terrainFetchEvents,
 });
-const initialTerrainDemandHeading = priorityHeading(
-  vehicleRuntime.vehicleControlActive,
-  vehicleRuntime.vehicleHeadingRad,
-  controls.yaw,
-);
+const initialTerrainDemandHeading = getTerrainViewHeading();
 const TERRAIN_DEMAND_HEADING_THRESHOLD = 2 * Math.PI / 180;
 const TERRAIN_DEMAND_HEADING_SETTLE_MS = 200;
 
 function commitTerrainDemandHeading(previousHeading, heading) {
   textureStreamer.abortAll();
   terrainTileSet.resetTextureApplications();
-  terrainFetchRuntime.reset(2);
+  // A rotated oval exposes new horizon ground, so establish complete coarse
+  // coverage before resuming the budgeted full-detail pass.
+  terrainFetchRuntime.reset(1);
   terrainPipelineState.lastTiles = null;
   terrainPipelineState.heightmapsMissing = 0;
   terrainPipelineState.heightmapsDownloading = 0;
@@ -1141,11 +1199,7 @@ const terrainHeadingDemand = createTerrainHeadingDemandController({
 });
 
 function rebuildTerrainDemandForViewDirection() {
-  const heading = priorityHeading(
-    vehicleRuntime.vehicleControlActive,
-    vehicleRuntime.vehicleHeadingRad,
-    controls.yaw,
-  );
+  const heading = getTerrainViewHeading();
   return terrainHeadingDemand.observe(heading, {
     ready: !terrainPipelineState.firstLoad,
   });
@@ -1203,11 +1257,7 @@ function savePosition() {
   const saved = terrainCameraState({
     cameraLatLon: { lat: coordinates.lat, lon: coordinates.lon, alt: coordinates.alt },
     cameraGrid,
-    yaw: priorityHeading(
-      vehicleRuntime.vehicleControlActive,
-      vehicleRuntime.vehicleHeadingRad,
-      controls.yaw,
-    ),
+    yaw: getTerrainViewHeading(),
     pitch: controls.pitch,
     mapZoom: controls.mapZoom,
     terrainFrame: terrainPipelineState.frameOffsetReady
@@ -1990,6 +2040,13 @@ function render() {
   const fogStrength = controls._fogStrength ?? renderBackend.defaultFogStrength;
   renderBackend.setFogDensity(fogStrength / getFogDistance());
   renderBackend.setMapMode(controls.mapMode);
+
+  // Keep classifier colors—including the effective-water pink—unobstructed.
+  waterRuntime.update({
+    dt, nowMs, camera,
+    visible: !controls.mapMode && !classifierRuntime.active,
+    sceneVersion: renderBackend.sceneMutationVersion,
+  });
 
   // Terrain streaming: check if camera moved far enough to re-fetch
   if (!terrainPipelineState.firstLoad) {

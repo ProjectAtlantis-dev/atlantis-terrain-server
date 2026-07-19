@@ -8,6 +8,7 @@ import {
   ToneMappingMode,
 } from 'postprocessing';
 import { DitheringEffect } from '../three-geospatial/packages/effects/src/index.ts';
+import { createWebGLWater } from './webgl-water.js';
 
 export function createTerrainBackend({
   width,
@@ -50,6 +51,7 @@ export function createTerrainBackend({
     get sceneMutationVersion() { return sceneMutationVersion; },
     setFogDensity(value) { sceneFog.density = value; },
     setMapMode(active) { scene.fog = active ? null : sceneFog; },
+    createWater(options) { return createWebGLWater({ renderer, ...options }); },
     prepareUntexturedTerrain(mesh) {
       if (!mesh?.material || mesh.material.map) return;
       if (mesh.material.vertexColors) {

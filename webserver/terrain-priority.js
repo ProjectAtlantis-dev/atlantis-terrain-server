@@ -18,6 +18,13 @@ export function headingForward2D(heading) {
   return { x: -Math.sin(heading), y: Math.cos(heading) };
 }
 
+export function headingFromForward2D(east, north, fallback = 0) {
+  if (!Number.isFinite(east) || !Number.isFinite(north)) return fallback;
+  if (Math.hypot(east, north) < 1e-9) return fallback;
+  const heading = Math.atan2(-east, north);
+  return Object.is(heading, -0) ? 0 : heading;
+}
+
 /** Distance in a view-aligned oval: forward ground is compressed so its
  * priority bands reach farther, while lateral and rear distances are kept. */
 export function headingAlignedPriorityDistance(

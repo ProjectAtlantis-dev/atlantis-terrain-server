@@ -3,6 +3,7 @@ import test from 'node:test';
 
 import {
   headingAlignedPriorityDistance,
+  headingFromForward2D,
   headingForward2D,
   priorityHeading,
   viewHeadingChanged,
@@ -592,7 +593,9 @@ test('shared reconciler spends dirty-paint budget in heatmap order', () => {
   assert.deepEqual(built, ['hot']);
   assert.deepEqual([...deferredTiles.keys()], ['hot', 'far']);
   assert.equal(result.sceneMeshes, 1);
-  assert.deepEqual(diffDetails, { added: 2, removed: 0, purgedDeferred: 0, sceneMeshes: 0 });
+  assert.deepEqual(diffDetails, {
+    added: 2, removed: 0, purgedDeferred: 0, released: 0, sceneMeshes: 0,
+  });
 });
 
 test('preview reconciliation completes coarse coverage beyond the build budget', () => {
@@ -625,6 +628,52 @@ test('preview reconciliation completes coarse coverage beyond the build budget',
   ], new Set(), { completeCoverage: true });
   assert.deepEqual(built, ['near', 'far']);
   assert.equal(terrainRoot.children.length, 2);
+});
+
+test('reconciliation releases old heatmap tiles but retains a complete fallback parent', () => {
+  const evicted = [];
+  const releasedTextures = [];
+  const outside = {
+    isMesh: true,
+    userData: { tileId: '8-10-10', bbox: [100, 100, 110, 110] },
+    material: { map: {} },
+  };
+  const parent = {
+    isMesh: true,
+    userData: { tileId: '8-20-20', bbox: [0, 0, 8, 8] },
+    material: { map: {} },
+  };
+  const terrainRoot = {
+    children: [outside, parent],
+    add(mesh) { this.children.push(mesh); },
+    remove(mesh) { this.children = this.children.filter(item => item !== mesh); },
+  };
+  const children = [
+    { id: '9-40-40', bbox: [0, 0, 4, 4], heightmap: null },
+    { id: '9-41-40', bbox: [4, 0, 8, 4], heightmap: null },
+    { id: '9-40-41', bbox: [0, 4, 4, 8], heightmap: null },
+    { id: '9-41-41', bbox: [4, 4, 8, 8], heightmap: null },
+  ];
+  const result = reconcileTerrainTiles({
+    tiles: children,
+    currentTileIds: new Set(['8-10-10', '8-20-20']),
+    deferredTiles: new Map(),
+    terrainRoot,
+    lifecycle: {
+      evict(mesh) { evicted.push(mesh.userData.tileId); terrainRoot.remove(mesh); },
+      sweepStaleParents: () => 0,
+    },
+    priorityForTile: () => 0,
+    textureCache: new Map(),
+    materialize() {},
+    buildMesh() {},
+    log() {},
+    onReleaseTile: tileId => releasedTextures.push(tileId),
+  });
+  assert.deepEqual(evicted, ['8-10-10']);
+  assert.deepEqual(releasedTextures, ['8-10-10']);
+  assert.deepEqual(terrainRoot.children, [parent]);
+  assert.equal(result.released, 1);
 });
 
 test('terrain tile set owns reconciliation, scene residency, and texture demand', () => {
@@ -699,6 +748,9 @@ test('terrain origin and pipeline decisions preserve two-pass behavior', () => {
   assert.equal(origin.cameraY, 210);
   assert.equal(origin.logDetails.originDeltaX, -5.3);
   assert.equal(terrainPipelineStatus({ missing: [], downloading: [], texFetching: 0 }, true).nextAction, 'full-pass');
+  assert.equal(terrainPipelineStatus(
+    { missing: [], downloading: [], texFetching: 0 }, false, 1,
+  ).nextAction, 'full-pass');
   assert.equal(terrainPipelineStatus({ missing: [{}], downloading: [], texFetching: 0 }, false).nextAction, 'poll');
   assert.equal(terrainPipelineStatus({ missing: [], downloading: [], texFetching: 0 }, false).nextAction, 'idle');
   assert.deepEqual(terrainCameraStereoPosition({
@@ -1161,6 +1213,13 @@ test('cardinal headings use the vehicle convention', () => {
     assert.ok(Math.abs(actual.x - x) < 1e-12);
     assert.ok(Math.abs(actual.y - y) < 1e-12);
   }
+});
+
+test('projected camera direction determines terrain demand heading', () => {
+  assert.equal(headingFromForward2D(0, 1), 0);
+  assert.equal(headingFromForward2D(-1, 0), Math.PI / 2);
+  assert.equal(headingFromForward2D(1, 0), -Math.PI / 2);
+  assert.equal(headingFromForward2D(0, 0, 1.25), 1.25);
 });
 
 test('stationary vehicle heading wins over orbiting camera yaw', () => {

@@ -18,6 +18,41 @@ function parseTileId(tileId) {
   return match ? { depth: Number(match[1]), col: Number(match[2]), row: Number(match[3]) } : null;
 }
 
+function desiredDescendantsCover(parentTileId, desiredTileIds) {
+  const parent = parseTileId(parentTileId);
+  if (!parent || desiredTileIds.size === 0) return false;
+  let maxDepth = parent.depth;
+  const relevantAncestors = new Set();
+  for (const id of desiredTileIds) {
+    const address = parseTileId(id);
+    if (!address || address.depth < parent.depth) continue;
+    const divisor = 2 ** (address.depth - parent.depth);
+    if (
+      Math.floor(address.col / divisor) !== parent.col
+      || Math.floor(address.row / divisor) !== parent.row
+    ) continue;
+    maxDepth = Math.max(maxDepth, address.depth);
+    for (let depth = address.depth; depth >= parent.depth; depth--) {
+      const scale = 2 ** (address.depth - depth);
+      relevantAncestors.add(
+        `${depth}-${Math.floor(address.col / scale)}-${Math.floor(address.row / scale)}`,
+      );
+    }
+  }
+  const covered = (depth, col, row) => {
+    const id = `${depth}-${col}-${row}`;
+    if (desiredTileIds.has(id)) return true;
+    if (depth >= maxDepth || !relevantAncestors.has(id)) return false;
+    for (let dx = 0; dx < 2; dx++) {
+      for (let dy = 0; dy < 2; dy++) {
+        if (!covered(depth + 1, col * 2 + dx, row * 2 + dy)) return false;
+      }
+    }
+    return true;
+  };
+  return covered(parent.depth, parent.col, parent.row);
+}
+
 function disposeTileScatter(tileMesh) {
   for (const child of tileMesh.children) {
     if (!child.userData?.isScatter) continue;
@@ -402,6 +437,7 @@ export function reconcileTerrainTiles({
   onDiff = () => {},
   depthOffsetEnabled = true,
   completeCoverage = false,
+  onReleaseTile = () => {},
 }) {
   const { nextTileIds, added, removed } = diffTerrainTileIds(tiles, currentTileIds);
   let purged = 0;
@@ -410,6 +446,26 @@ export function reconcileTerrainTiles({
       deferredTiles.delete(id);
       purged += 1;
     }
+  }
+
+  // `removed` is the release half of the moving heatmap. Keep an old parent
+  // only when the new desired descendants completely cover its footprint; it
+  // then remains a no-hole fallback until those descendants are textured.
+  let released = 0;
+  const retainedFallbackIds = new Set(
+    removed.filter(id => desiredDescendantsCover(id, nextTileIds)),
+  );
+  const removedIds = new Set(removed);
+  for (const tileId of removedIds) {
+    if (!retainedFallbackIds.has(tileId)) onReleaseTile(tileId);
+  }
+  for (const mesh of [...terrainRoot.children]) {
+    const tileId = mesh.userData?.tileId;
+    if (!mesh.isMesh || !removedIds.has(tileId)) continue;
+    if (retainedFallbackIds.has(tileId)) continue;
+    log(tileId, 'evicted — outside current terrain demand');
+    lifecycle.evict(mesh);
+    released += 1;
   }
 
   const staleRemoved = lifecycle.sweepStaleParents(tiles, nextTileIds);
@@ -429,6 +485,7 @@ export function reconcileTerrainTiles({
     added: added.length,
     removed: removed.length,
     purgedDeferred: purged,
+    released,
     sceneMeshes: terrainRoot.children.filter(mesh => mesh.isMesh).length,
   });
 
@@ -478,6 +535,7 @@ export function reconcileTerrainTiles({
     added,
     removed,
     purged,
+    released,
     staleRemoved,
     sceneMeshes: terrainRoot.children.filter(mesh => mesh.isMesh).length,
     deferred: deferredTiles.size,
@@ -546,7 +604,7 @@ export function createTerrainTileSet({
     return terrainTilePriority(tile, {
       cameraX: relative.dot(view.east),
       cameraY: relative.dot(view.north),
-      heading: priorityHeading(
+      heading: view.getHeading?.() ?? priorityHeading(
         vehicle.vehicleControlActive,
         vehicle.vehicleHeadingRad,
         view.controls.yaw,
@@ -713,6 +771,7 @@ export function createTerrainTileSet({
       onDiff,
       depthOffsetEnabled,
       completeCoverage,
+      onReleaseTile: textureStreamer.releaseTile,
     });
     currentTileIds = result.nextTileIds;
     for (const [tileId, cached] of desaturatedTextures) {

@@ -148,6 +148,20 @@ export function createTextureStreamer({
     return advanceVersion();
   }
 
+  function releaseTile(tileId) {
+    texInflight.get(tileId)?.abort();
+    texInflight.delete(tileId);
+    texFetching.delete(tileId);
+    texRetryAtMs.delete(tileId);
+    texRetryCount.delete(tileId);
+    ancestorLogged.delete(tileId);
+    const texture = texCache.get(tileId);
+    texCache.delete(tileId);
+    texSource.delete(tileId);
+    texture?.dispose?.();
+    return Boolean(texture);
+  }
+
   function abortAll() {
     for (const controller of texInflight.values()) controller.abort();
     texInflight.clear();
@@ -177,7 +191,8 @@ export function createTextureStreamer({
 
   return {
     texCache, texSource, texInflight, texFetching, texRetryAtMs, texRetryCount,
-    ancestorLogged, pump, invalidate, abortAll, setRoadDebug, releaseStaleTexture,
+    ancestorLogged, pump, invalidate, releaseTile, abortAll, setRoadDebug,
+    releaseStaleTexture,
     get roadDebug() { return roadDebug; },
     get version() { return version; },
     bumpVersion: advanceVersion,

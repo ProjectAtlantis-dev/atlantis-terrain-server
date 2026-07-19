@@ -79,11 +79,13 @@ export function createTerrainFetchRuntime({
       lat: lat ?? cameraCoordinates.lat,
       lon: lon ?? cameraCoordinates.lon,
       altitude: cameraCoordinates.alt,
-      heading: testOverrides.getHeading?.() ?? priorityHeading(
-        vehicle.vehicleControlActive,
-        vehicle.vehicleHeadingRad,
-        view.controls.yaw,
-      ),
+      heading: testOverrides.getHeading?.()
+        ?? view.getHeading?.()
+        ?? priorityHeading(
+          vehicle.vehicleControlActive,
+          vehicle.vehicleHeadingRad,
+          view.controls.yaw,
+        ),
       range: testOverrides.getRange?.() ?? view.controls.terrainRange,
       pass,
       previewMaxDepth, isFirstLoad: state.firstLoad,
@@ -169,7 +171,7 @@ export function createTerrainFetchRuntime({
 
     state.cameraStereoX = state.lastFetchX = data.qx;
     state.cameraStereoY = state.lastFetchY = data.qy;
-    const pipeline = terrainPipelineStatus(data, wasFirstLoad);
+    const pipeline = terrainPipelineStatus(data, wasFirstLoad, pass);
     state.heightmapsMissing = pipeline.missing;
     state.heightmapsDownloading = pipeline.downloading;
     state.serverTexturesFetching = pipeline.textureFetching;
