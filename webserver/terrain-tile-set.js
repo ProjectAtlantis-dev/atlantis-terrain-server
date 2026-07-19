@@ -401,6 +401,7 @@ export function reconcileTerrainTiles({
   onMeshAdded = () => {},
   onDiff = () => {},
   depthOffsetEnabled = true,
+  completeCoverage = false,
 }) {
   const { nextTileIds, added, removed } = diffTerrainTileIds(tiles, currentTileIds);
   let purged = 0;
@@ -442,7 +443,7 @@ export function reconcileTerrainTiles({
       const cachedTexture = textureCache.get(tile.id);
       if (cachedTexture) {
         deferredTiles.set(tile.id, tile);
-        if (built < buildBudget) {
+        if (completeCoverage || built < buildBudget) {
           log(tile.id, 'added — immediate build (cached tex)');
           materialize(tile.id, cachedTexture);
           built += 1;
@@ -458,7 +459,7 @@ export function reconcileTerrainTiles({
       ));
       if (hasStaleCoverage) {
         log(tile.id, 'added — deferred (stale coverage exists)');
-      } else if (built < buildBudget) {
+      } else if (completeCoverage || built < buildBudget) {
         log(tile.id, 'added — untextured fallback (no stale coverage)');
         const mesh = buildMesh(tile);
         if (mesh) {
@@ -497,7 +498,10 @@ export function createTerrainTileReconciler({
   onMeshAdded = () => {},
   depthOffsetEnabled = true,
 }) {
-  return (tiles, currentTileIds, { onDiff = () => {} } = {}) => reconcileTerrainTiles({
+  return (tiles, currentTileIds, {
+    onDiff = () => {},
+    completeCoverage = false,
+  } = {}) => reconcileTerrainTiles({
     tiles,
     currentTileIds,
     deferredTiles,
@@ -513,6 +517,7 @@ export function createTerrainTileReconciler({
     onMeshAdded,
     onDiff,
     depthOffsetEnabled,
+    completeCoverage,
   });
 }
 
@@ -686,7 +691,10 @@ export function createTerrainTileSet({
       ? {}
       : { applicationsPerFrame: testOverrides.applicationsPerFrame }),
   });
-  function reconcile(tiles, { onDiff = () => {} } = {}) {
+  function reconcile(tiles, {
+    onDiff = () => {},
+    completeCoverage = false,
+  } = {}) {
     lastTiles = tiles;
     const result = reconcileTerrainTiles({
       tiles,
@@ -704,6 +712,7 @@ export function createTerrainTileSet({
       onMeshAdded: onMutated,
       onDiff,
       depthOffsetEnabled,
+      completeCoverage,
     });
     currentTileIds = result.nextTileIds;
     for (const [tileId, cached] of desaturatedTextures) {

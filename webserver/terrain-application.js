@@ -196,6 +196,8 @@ const mapCam = new THREE.OrthographicCamera(-1, 1, 1, -1, 1, MAP_CAM_ALT + 5000)
 mapCam.up.copy(north);
 mapCam.layers.enable(0);
 const DEFAULT_MAP_ZOOM = 20000;
+// Enough headroom to inspect the complete local forward coverage oval.
+const MAX_MAP_ZOOM = 100000;
 
 const controls = {
   yaw: 0,
@@ -672,11 +674,12 @@ heatmapRuntime = createTerrainHeatmapRuntime({
       alt: relative.dot(up),
       yaw: controls.yaw,
       zoom: controls.mapZoom,
+      range: controls.terrainRange,
     };
   },
   onWheel: deltaY => {
     controls.mapZoom *= deltaY < 0 ? 0.85 : 1.18;
-    controls.mapZoom = Math.max(500, Math.min(40000, controls.mapZoom));
+    controls.mapZoom = Math.max(500, Math.min(MAX_MAP_ZOOM, controls.mapZoom));
     savePosition();
     updateMapCamera();
     requestRender();
@@ -1936,7 +1939,7 @@ renderer.domElement.addEventListener(
     const zoomIn = event.deltaY < 0;
     if (controls.mapMode) {
       controls.mapZoom *= zoomIn ? 0.85 : 1.18;
-      controls.mapZoom = Math.max(500, Math.min(40000, controls.mapZoom));
+      controls.mapZoom = Math.max(500, Math.min(MAX_MAP_ZOOM, controls.mapZoom));
       savePosition();
       updateMapCamera();
       requestRender();

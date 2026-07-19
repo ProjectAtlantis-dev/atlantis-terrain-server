@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
+  headingAlignedPriorityDistance,
   headingForward2D,
   priorityHeading,
   viewHeadingChanged,
@@ -594,6 +595,38 @@ test('shared reconciler spends dirty-paint budget in heatmap order', () => {
   assert.deepEqual(diffDetails, { added: 2, removed: 0, purgedDeferred: 0, sceneMeshes: 0 });
 });
 
+test('preview reconciliation completes coarse coverage beyond the build budget', () => {
+  const built = [];
+  const terrainRoot = {
+    children: [],
+    add(mesh) { this.children.push(mesh); },
+  };
+  const reconcile = createTerrainTileReconciler({
+    terrainRoot,
+    deferredTiles: new Map(),
+    lifecycle: { sweepStaleParents: () => 0 },
+    priorityForTile: tile => tile.priority,
+    textureCache: new Map(),
+    meshRuntime: { materialize: () => assert.fail('unexpected materialize') },
+    buildMesh: tile => {
+      built.push(tile.id);
+      return {
+        isMesh: true,
+        userData: { tileId: tile.id, bbox: tile.bbox },
+        material: { map: null },
+      };
+    },
+    log: () => {},
+    buildBudget: 1,
+  });
+  reconcile([
+    { id: 'near', bbox: [0, 0, 1, 1], heightmap: 'hm', priority: 1 },
+    { id: 'far', bbox: [10, 10, 11, 11], heightmap: 'hm', priority: 2 },
+  ], new Set(), { completeCoverage: true });
+  assert.deepEqual(built, ['near', 'far']);
+  assert.equal(terrainRoot.children.length, 2);
+});
+
 test('terrain tile set owns reconciliation, scene residency, and texture demand', () => {
   const terrainRoot = {
     children: [],
@@ -1156,6 +1189,15 @@ test('tile ahead of vehicle is hotter than tile behind it', () => {
   const ahead = terrainTilePriority({ bbox: [-50, 4950, 50, 5050] }, options);
   const behind = terrainTilePriority({ bbox: [-50, -5050, 50, -4950] }, options);
   assert.ok(ahead < behind);
+});
+
+test('terrain priority distance has a two-times-forward oval', () => {
+  assert.equal(headingAlignedPriorityDistance(0, 40000, 0), 20000);
+  assert.equal(headingAlignedPriorityDistance(0, -20000, 0), 20000);
+  assert.equal(headingAlignedPriorityDistance(20000, 0, 0), 20000);
+  assert.ok(Math.abs(
+    headingAlignedPriorityDistance(-40000, 0, Math.PI / 2) - 20000,
+  ) < 1e-9);
 });
 
 test('HUD compass uses the same heading convention', () => {

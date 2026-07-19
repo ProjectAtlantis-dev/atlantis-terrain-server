@@ -251,8 +251,9 @@ def _traverse(db, depth, col, row, qx, qy, max_depth, error_threshold,
     if _debug:
         log_trav.debug(f"{tid}: source={meta['source']} real={has_real_data} geo_err={geo_err:.1f} (orig={meta['geometric_error']:.1f})")
 
-    # Coverage cutoff — don't subdivide outside the view oval, but still
-    # include this tile if it has data (no holes at the boundary).
+    # Coverage cutoff — terrain outside the local view oval is not part of
+    # this response. Boundary-intersecting tiles are retained by the oval
+    # test itself, so the requested region still has coarse edge coverage.
     dist_to_tile = _distance_to_bbox(qx, qy, meta['bbox'])
     in_coverage = bbox_in_view_oval(
         qx, qy, heading, meta['bbox'], max_range
@@ -263,8 +264,6 @@ def _traverse(db, depth, col, row, qx, qy, max_depth, error_threshold,
                 f"{tid}: outside view oval (distance={dist_to_tile:.0f}, "
                 f"base_range={max_range:.0f}), real={has_real_data}"
             )
-        if has_real_data:
-            results.append(tid)
         return
 
     # Parent-resampled tiles are terminal — don't subdivide further.
@@ -416,7 +415,7 @@ def query_tiles(db, lat, lon, error_threshold=0.001, max_depth=None,
     return _query_tiles_impl(db, qx, qy, error_threshold, max_depth, max_range, log, altitude)
 
 
-def bbox_view_priority(qx, qy, fwd_x, fwd_y, bbox):
+def bbox_view_priority(qx, qy, fwd_x, fwd_y, bbox, forward_scale=2.0):
     """Heading-weighted fetch priority (lower = sooner), matching the texture
     priority in serve_flask: distance divided by how far ahead the tile is."""
     cx = (bbox[0] + bbox[2]) / 2
@@ -425,8 +424,12 @@ def bbox_view_priority(qx, qy, fwd_x, fwd_y, bbox):
     dist = math.hypot(dx, dy)
     if dist <= 0:
         return 0.0
-    dot = (dx * fwd_x + dy * fwd_y) / dist
-    return dist / max(dot, 0.01)
+    along = dx * fwd_x + dy * fwd_y
+    across = dx * fwd_y - dy * fwd_x
+    scaled_along = along / max(1.0, forward_scale) if along > 0 else along
+    priority_dist = math.hypot(across, scaled_along)
+    dot = along / dist
+    return priority_dist / max(dot, 0.01)
 
 
 def _query_tiles_impl(db, qx, qy, error_threshold, max_depth, max_range, log,

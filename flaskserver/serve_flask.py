@@ -655,15 +655,21 @@ def _parse_tile_id(tile_id: str) -> tuple[int, int, int] | None:
 
 
 
-def _tile_priority(bbox: list[float], qx: float, qy: float, fwd_x: float, fwd_y: float) -> float:
+def _tile_priority(bbox: list[float], qx: float, qy: float,
+                   fwd_x: float, fwd_y: float,
+                   forward_scale: float = 2.0) -> float:
   tcx = (bbox[0] + bbox[2]) / 2
   tcy = (bbox[1] + bbox[3]) / 2
   dx, dy = tcx - qx, tcy - qy
   dist = math.sqrt(dx * dx + dy * dy)
   if dist <= 0:
     return 0.0
-  dot = (dx * fwd_x + dy * fwd_y) / dist
-  return dist / max(dot, 0.01)
+  along = dx * fwd_x + dy * fwd_y
+  across = dx * fwd_y - dy * fwd_x
+  scaled_along = along / max(1.0, forward_scale) if along > 0 else along
+  priority_dist = math.hypot(across, scaled_along)
+  dot = along / dist
+  return priority_dist / max(dot, 0.01)
 
 
 _METATILE_FINAL_SOURCE = "dataforsyningen_metatile4h2"
@@ -914,7 +920,7 @@ def api_tiles():
 
   global _last_camera
   _last_camera = {"qx": qx, "qy": qy, "alt": alt, "heading": heading,
-                  "maxDepth": max_depth}
+                  "maxDepth": max_depth, "range": max_range}
 
   try:
     tiles, missing = _query_tiles_stereo(
@@ -1560,6 +1566,7 @@ def api_heatmap():
   import numpy as np
   from database import CONFIDENCE, GRID_N, _decompress_uint8
   from tiles import build_lod_tree, get_leaves
+  from serve import bbox_in_view_oval
 
   cam = _last_camera
   if cam is None:
@@ -1569,6 +1576,7 @@ def api_heatmap():
   qy = _arg_float("qy", cam["qy"])
   alt = _arg_float("alt", cam["alt"])
   heading = _arg_float("heading", cam["heading"])
+  max_range = _arg_float("range", cam.get("range", 20000.0))
   # This is a diagnostic view of the terrain traversal, not a speculative
   # quadtree. Never advertise leaves deeper than the renderer can request.
   max_depth = min(
@@ -1578,7 +1586,16 @@ def api_heatmap():
   lod_factor = _arg_float("lod", 2.0)
 
   root = build_lod_tree(qx, qy, max_depth=max_depth, lod_factor=lod_factor)
-  leaves = get_leaves(root)
+  # The heatmap visualizes the same local demand region as /api/tiles. Do not
+  # expose the coarse leaves covering the rest of Greenland's root quadtree.
+  leaves = [
+    leaf for leaf in get_leaves(root)
+    if bbox_in_view_oval(
+      qx, qy, heading,
+      [leaf.center[0], leaf.center[1], leaf.center[0], leaf.center[1]],
+      max_range,
+    )
+  ]
 
   fwd_x = -math.sin(heading) if heading else 0.0
   fwd_y = math.cos(heading) if heading else 1.0
@@ -1637,7 +1654,10 @@ def api_heatmap():
 
   return jsonify({
     "timestamp": time.time(),
-    "camera": {"qx": qx, "qy": qy, "alt": alt, "heading": heading},
+    "camera": {
+      "qx": qx, "qy": qy, "alt": alt, "heading": heading,
+      "range": max_range,
+    },
     "tiles": tiles,
   })
 

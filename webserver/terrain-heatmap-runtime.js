@@ -1,3 +1,5 @@
+import { headingAlignedPriorityDistance } from './terrain-priority.js';
+
 function priorityColor(value) {
   if (value < 0.33) {
     const amount = value / 0.33;
@@ -29,7 +31,10 @@ export function updateHeatmapViewPriorities(tiles, view) {
       continue;
     }
     const dot = (dx * forwardX + dy * forwardY) / distance;
-    tile.priority = Math.log(Math.max(distance / Math.max(dot, 0.01), 1));
+    const priorityDistance = headingAlignedPriorityDistance(dx, dy, heading);
+    tile.priority = Math.log(Math.max(
+      priorityDistance / Math.max(dot, 0.01), 1,
+    ));
   }
   tiles.sort((a, b) => a.priority - b.priority);
   tiles.forEach((tile, order) => { tile.order = order; });
@@ -257,6 +262,7 @@ export function createTerrainHeatmapRuntime({
         params.set('qy', String(view.cameraY));
         params.set('alt', String(view.alt));
         params.set('heading', String(view.yaw));
+        if (Number.isFinite(view.range)) params.set('range', String(view.range));
         lastRequestedHeading = String(view.yaw);
       }
       const response = await fetchImpl(`/api/heatmap?${params}`, {

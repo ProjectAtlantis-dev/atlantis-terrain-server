@@ -2,8 +2,9 @@
 
 import math
 import unittest
+from unittest.mock import patch
 
-from serve import bbox_in_view_oval, bbox_view_priority
+from serve import _traverse, bbox_in_view_oval, bbox_view_priority
 
 
 def _bbox_at(cx, cy, size=100.0):
@@ -27,14 +28,19 @@ class TestBboxViewPriority(unittest.TestCase):
         far = bbox_view_priority(0, 0, fwd_x, fwd_y, _bbox_at(0, 5000))
         self.assertLess(near, far)
 
+    def test_forward_priority_uses_elongated_distance(self):
+        fwd_x, fwd_y = 0.0, 1.0
+        forward = bbox_view_priority(0, 0, fwd_x, fwd_y, _bbox_at(0, 4000))
+        self.assertAlmostEqual(forward, 2000, places=6)
+
     def test_camera_inside_tile_is_top_priority(self):
         self.assertEqual(bbox_view_priority(0, 0, 0.0, 1.0, _bbox_at(0, 0)), 0.0)
 
     def test_matches_texture_priority_shape(self):
-        # Same formula as serve_flask._tile_priority: dist / max(dot, 0.01).
+        # Forward distance is compressed by 2 while lateral distance is kept.
         fwd_x, fwd_y = 0.0, 1.0
         diagonal = bbox_view_priority(0, 0, fwd_x, fwd_y, _bbox_at(1000, 1000))
-        expected = math.hypot(1000, 1000) / (1000 / math.hypot(1000, 1000))
+        expected = math.hypot(1000, 500) / (1000 / math.hypot(1000, 1000))
         self.assertAlmostEqual(diagonal, expected, places=6)
 
 
@@ -73,6 +79,21 @@ class TestViewCoverageOval(unittest.TestCase):
         self.assertFalse(bbox_in_view_oval(
             0, 0, None, _bbox_at(0, 1100, 10), 1000
         ))
+
+    def test_traversal_does_not_return_greenland_wide_outside_parent(self):
+        metadata = {
+            "source": "arcticdem",
+            "bbox": [2000, 2000, 3000, 3000],
+            "geometric_error": 100,
+        }
+        results, missing = [], []
+        with patch("serve.read_tile_metadata", return_value=metadata):
+            _traverse(
+                None, 1, 0, 0, 0, 0, 10, 0.001,
+                results, missing, max_range=1000, heading=0.0,
+            )
+        self.assertEqual(results, [])
+        self.assertEqual(missing, [])
 
 
 if __name__ == "__main__":

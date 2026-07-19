@@ -150,6 +150,7 @@ export function createTerrainFetchRuntime({
     if (Array.isArray(data.buildings)) onBuildings(data.buildings);
 
     const reconciliation = terrain.reconcile(data.tiles, {
+      completeCoverage: pass === 1,
       onDiff: details => logger.enqueue('info', `fetchTiles.diff[pass${pass}]`, {
         pass, passLabel: pass === 1 ? 'preview' : 'full', ...details,
       }),
