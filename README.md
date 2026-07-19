@@ -9,6 +9,8 @@ The backend in /flaskserver manages terrain heightmaps and textures in a SQLite 
 
 Rendered tile seams are cached in `terrain_seam_cache` by the exact normalized physical-edge key `(tile_a, direction, tile_b)`. Same-depth and cross-LOD repairs use the same lookup. Writing new heightmap data deletes every cached seam that names the changed tile on either side, so repaired edges are rebuilt on the next terrain query.
 
+Dataforsyningen imagery is fetched in aligned 2x2 metatiles: the parent extent is requested and reprojected once at 512x512, then split into four 256x256 child textures. Legacy independently fetched `dataforsyningen` rows are served as temporary fallbacks and upgraded on demand to `dataforsyningen_metatile`; one child request fills all four siblings.
+
 ## Data Sources
 
 | Data | Source | Resolution | Notes |
