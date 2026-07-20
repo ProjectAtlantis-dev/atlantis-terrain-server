@@ -1446,10 +1446,9 @@ def api_classifier_tile(tile_id: str):
   import io as _io
 
   from PIL import Image as _Image
-  from classifier.rendering import paint_navy_water_shadows, smooth_effective_water_mask
+  from classifier.rendering import smooth_effective_water_mask
   from classifier.storage import colorize_class_map, decode_class_map
   from coastline import read_water_mask
-  from texture import read_texture
 
   child_depth, child_col, child_row = parsed
   depth, col, row = parsed
@@ -1509,14 +1508,6 @@ def api_classifier_tile(tile_id: str):
         effective_water, resolution, resolution,
       )
       rgb[render_water] = (255, 42, 161)
-    satellite_jpeg = read_texture(db, tile_id)
-    if satellite_jpeg is not None:
-      satellite_rgb = _np.asarray(
-        _Image.open(_io.BytesIO(satellite_jpeg)).convert("RGB").resize(
-          (resolution, resolution), _Image.Resampling.BILINEAR,
-        )
-      )
-      rgb, _ = paint_navy_water_shadows(rgb, satellite_rgb)
   except (TypeError, ValueError, zlib.error):
     return Response(
       b"", status=500,
