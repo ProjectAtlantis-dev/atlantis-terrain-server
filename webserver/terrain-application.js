@@ -375,7 +375,9 @@ tuningPanel.style.cssText = [
   'position:absolute',
   'top:12px',
   'right:12px',
-  'width:300px',
+  'width:340px',
+  'max-width:calc(100vw - 24px)',
+  'box-sizing:border-box',
   'background:rgba(0,0,0,0.8)',
   'color:#dbe5f1',
   'font:12px/1.4 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace',
@@ -399,6 +401,7 @@ tuningBody.style.cssText = [
   'display:none',
   'max-height:calc(100vh - 70px)',
   'overflow-y:auto',
+  'overflow-x:hidden',
   'overscroll-behavior:contain'
 ].join(';');
 tuningPanel.appendChild(tuningBody);
@@ -526,6 +529,10 @@ function buildTuningControls(ap, ce) {
     toggle: tuningToggle,
     // one wind: cloud drift heading follows the water wind direction
     getWindDirection: () => waterParams.windDirection,
+  });
+  tuningToggle('Takram clouds', {
+    value: renderBackend.takramCloudsEnabled,
+    onChange: enabled => { renderBackend.setTakramCloudsEnabled(enabled); },
   });
   }
   if (waterRuntime.enabled) {
@@ -744,7 +751,7 @@ scene.add(terrainRoot);
 
 // --- Fjord water (ocean2 FFT port) ---
 // A camera-following FFT water surface at local z=0; masked water terrain is
-// dropped to -10 m server-side, so the surface has volume above the seabed
+// dropped to -3 m server-side, so the surface has volume above the seabed
 // and land occludes it naturally. Inert on backends without createWater.
 const waterParams = { ...DEFAULT_WATER_PARAMS };
 // Bumped whenever a tile's displayed texture actually changes; the water
@@ -1023,6 +1030,7 @@ createTerrainAtmosphereTextureRuntime({
 
 renderBackend.configureScenePipeline({
   scene, camera, normalPass, cloudsEffect, aerialPerspective,
+  sunDirection,
   date: gameClockState.renderedDate,
 });
 

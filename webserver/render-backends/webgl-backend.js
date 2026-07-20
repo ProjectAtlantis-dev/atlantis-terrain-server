@@ -7,8 +7,9 @@ import {
   ToneMappingEffect,
   ToneMappingMode,
 } from 'postprocessing';
-import { DitheringEffect, LensFlareEffect } from '../three-geospatial/packages/effects/src/index.ts';
+import { DitheringEffect } from '../three-geospatial/packages/effects/src/index.ts';
 import { createWebGLWater } from './webgl-water.js';
+import { TerrainSunFlareEffect } from '../terrain-sun-flare-effect.js';
 
 export function createTerrainBackend({
   width,
@@ -31,9 +32,13 @@ export function createTerrainBackend({
   renderer.toneMapping = THREE.NoToneMapping;
   renderer.toneMappingExposure = toneMappingExposure;
   let composer = null;
+  let atmospherePass = null;
+  let cloudsEffectRef = null;
+  let aerialPerspectiveRef = null;
+  let takramCloudsEnabled = true;
   // HDR lens flare (sun disk + water glint). Created here, before the
   // composer, so the tuning UI can bind to it ahead of pipeline configure.
-  const lensFlare = new LensFlareEffect();
+  const lensFlare = new TerrainSunFlareEffect();
   let demandRendering = null;
   let animationLoopActive = false;
   let sceneMutationVersion = 0;
@@ -52,6 +57,7 @@ export function createTerrainBackend({
     defaultFogStrength: 4.5,
     renderer,
     lensFlare,
+    get takramCloudsEnabled() { return takramCloudsEnabled; },
     get sceneMutationVersion() { return sceneMutationVersion; },
     setFogDensity(value) { sceneFog.density = value; },
     setMapMode(active) { scene.fog = active ? null : sceneFog; },
@@ -65,7 +71,30 @@ export function createTerrainBackend({
       mesh.material.color.set(0x29313a);
       backend.markSceneMutated();
     },
-    configureScenePipeline({ scene, camera, normalPass, cloudsEffect, aerialPerspective }) {
+    setTakramCloudsEnabled(enabled) {
+      takramCloudsEnabled = Boolean(enabled);
+      if (atmospherePass != null && cloudsEffectRef != null && aerialPerspectiveRef != null) {
+        if (takramCloudsEnabled) {
+          aerialPerspectiveRef.overlay = cloudsEffectRef.atmosphereOverlay;
+          aerialPerspectiveRef.shadow = cloudsEffectRef.atmosphereShadow;
+          aerialPerspectiveRef.shadowLength = cloudsEffectRef.atmosphereShadowLength;
+          atmospherePass.setEffects([cloudsEffectRef, aerialPerspectiveRef]);
+        } else {
+          aerialPerspectiveRef.overlay = null;
+          aerialPerspectiveRef.shadow = null;
+          aerialPerspectiveRef.shadowLength = null;
+          atmospherePass.setEffects([aerialPerspectiveRef]);
+        }
+        atmospherePass.recompile();
+      }
+      bootLog('clouds.takram.toggle', { enabled: takramCloudsEnabled });
+      backend.markSceneMutated();
+      backend.requestRender();
+    },
+    configureScenePipeline({ scene, camera, normalPass, cloudsEffect, aerialPerspective, sunDirection }) {
+      lensFlare.configure({ camera, sunDirection });
+      cloudsEffectRef = cloudsEffect;
+      aerialPerspectiveRef = aerialPerspective;
       // IMPORTANT — verified visual regression fix:
       // postprocessing decodes logarithmic depth in readDepth(), while the
       // pinned three-geospatial shader applies reverseLogDepth() again. Keep
@@ -83,18 +112,28 @@ export function createTerrainBackend({
         frameBufferType: THREE.HalfFloatType,
         multisampling: Math.min(4, renderer.capabilities.maxSamples),
       });
-      composer.addPass(new RenderPass(scene, camera));
+      const scenePass = new RenderPass(scene, camera);
+      atmospherePass = new EffectPass(camera, cloudsEffect, aerialPerspective);
+      composer.addPass(scenePass);
       composer.addPass(normalPass);
-      composer.addPass(new EffectPass(camera, cloudsEffect, aerialPerspective));
+      composer.addPass(atmospherePass);
+      if (!takramCloudsEnabled) {
+        aerialPerspective.overlay = null;
+        aerialPerspective.shadow = null;
+        aerialPerspective.shadowLength = null;
+        atmospherePass.setEffects([aerialPerspective]);
+        atmospherePass.recompile();
+      }
       // Lens flare runs on the HDR frame AFTER sky/clouds (so the sun disk
       // exists in the buffer) and BEFORE tone mapping. It thresholds bright
       // pixels, so it flares the sun itself and any HDR water glint alike.
-      composer.addPass(new EffectPass(
+      const finalPass = new EffectPass(
         camera,
         lensFlare,
         new ToneMappingEffect({ mode: ToneMappingMode.AGX }),
         new DitheringEffect(),
-      ));
+      );
+      composer.addPass(finalPass);
       bootLog('composer.ready', { passCount: composer.passes.length });
     },
     resize(nextWidth, nextHeight) {

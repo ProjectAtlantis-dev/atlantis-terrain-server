@@ -301,7 +301,7 @@ export function createWebGPUWater({
 
   // --- bathymetry access + lee-shore fetch (shared vertex/fragment) ---------
 
-  // local terrain height under the water plane; -10 m (the synthetic fjord
+  // local terrain height under the water plane; -3 m (the synthetic fjord
   // floor) wherever the capture has no coverage
   // WebGPU stores the scene-rendered capture with V inverted relative to the
   // WebGL twin (quad-pass ping-pong is immune — its uv rides the flipped
@@ -316,7 +316,7 @@ export function createWebGPUWater({
     const inB = step(buv.x.sub(0.5).abs(), float(0.5))
       .mul(step(buv.y.sub(0.5).abs(), float(0.5)));
     const b = texBathy.sample(bathySampleUv(buv));
-    return mix(vec4(-10.0, 0.0, 0.0, 0.0), b, b.a.mul(inB));
+    return mix(vec4(-3.0, 0.0, 0.0, 0.0), b, b.a.mul(inB));
   }
 
   function seabedAt(p) {
@@ -547,9 +547,9 @@ export function createWebGPUWater({
     // only calls a pixel black when all three are nearly absent.
     const bottomReflection = reflectionGateAt(pxy);
 
-    // Wall detection: the open fjord floor is a flat synthetic -10 m plane —
+    // Wall detection: the open fjord floor is a flat synthetic -3 m plane —
     // the only steep thing under the surface is the artificial mask-drop wall
-    // at the shoreline (10 m over a texel or two). The veil below must hide
+    // at the shoreline (3 m over a texel or two). The veil below must hide
     // exactly that band and nothing else, so measure seabed slope in world
     // metres (central differences one texel apart, resolution-independent).
     const h = float(uBathyTexel);

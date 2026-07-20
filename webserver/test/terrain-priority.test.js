@@ -30,6 +30,7 @@ import { createTerrainFetchRuntime } from '../terrain-fetch-runtime.js';
 import { restoreTerrainCameraState, terrainCameraState } from '../terrain-camera-state.js';
 import { createTerrainClientLogger } from '../terrain-client-logging.js';
 import { createTerrainFpsCounter } from '../terrain-fps-counter.js';
+import { projectSunDirectionToUv } from '../terrain-sun-flare-effect.js';
 import { loadTerrainStartupAssets, normalizeTerrainStartupAssets } from '../terrain-startup-assets.js';
 import { createTerrainAtmosphereTextureRuntime } from '../terrain-atmosphere-textures.js';
 import { paintClassifierGridBorder } from '../terrain-classifier-texture.js';
@@ -80,6 +81,18 @@ test('vehicle shadow receiver footprint keeps intersecting terrain tiles only', 
   assert.equal(terrainBboxIntersectsCircle([0, 0, 100, 100], 111, 50, 10), false);
   assert.equal(terrainBboxIntersectsCircle([100, 100, 0, 0], 50, 50, 0), true);
   assert.equal(terrainBboxIntersectsCircle(null, 50, 50, 10), false);
+});
+
+test('analytic sun flare projects a moving world direction into screen space', () => {
+  const camera = new THREE.PerspectiveCamera(60, 2, 0.1, 1000);
+  camera.position.set(10, 20, 30);
+  camera.lookAt(10, 20, 29);
+  camera.updateMatrixWorld(true);
+  const uv = new THREE.Vector2();
+  assert.equal(projectSunDirectionToUv(camera, new THREE.Vector3(0, 0, -1), uv), true);
+  assert.ok(Math.abs(uv.x - 0.5) < 1e-12);
+  assert.ok(Math.abs(uv.y - 0.5) < 1e-12);
+  assert.equal(projectSunDirectionToUv(camera, new THREE.Vector3(0, 0, 1), uv), false);
 });
 
 test('terrain camera persistence round-trips pose and frame state', () => {

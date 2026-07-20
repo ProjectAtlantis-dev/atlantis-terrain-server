@@ -41,7 +41,7 @@ export const DEFAULT_WATER_PARAMS = {
                           // deliberately subdued ambient sky reflection
   absorption: 0.25,       // Beer-Lambert 1/m, applied only inside the
                           // wall-slope gate: open water stays fully clear,
-                          // the -10 m mask-drop walls fade hard with depth
+                          // the -3 m mask-drop walls fade hard with depth
   northCliffReflectionPadding: NORTH_CLIFF_REFLECTION_MAX_PADDING_M,
                           // maximum reflection setback; actual
                           // distance scales from ~0 on flat north shores to
@@ -124,7 +124,7 @@ export function createWaterRuntime({
       palette, params, simParams,
     });
 
-    // The seabed is a static -10 m floor — water terrain effectively never
+    // The seabed is a static -3 m floor — water terrain effectively never
     // changes; at most the shoreline sharpens as higher-LOD tiles stream in.
     // Re-capture when movement re-centres the window, when tile textures have
     // changed since the last capture (debounced — streaming arrives in
