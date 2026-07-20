@@ -95,8 +95,8 @@ export function createTerrainBackend({
       backend.markSceneMutated();
       backend.requestRender();
     },
-    configureScenePipeline({ scene, camera, normalPass, cloudsEffect, aerialPerspective, sunDirection }) {
-      lensFlare.configure({ camera, sunDirection });
+    configureScenePipeline({ scene, camera, normalPass, cloudsEffect, aerialPerspective, sunDirection, up }) {
+      lensFlare.configure({ camera, sunDirection, surfaceUp: up });
       cloudsEffectRef = cloudsEffect;
       aerialPerspectiveRef = aerialPerspective;
       // IMPORTANT — verified visual regression fix:

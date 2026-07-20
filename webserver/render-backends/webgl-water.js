@@ -28,7 +28,10 @@ const SKY_GLSL = /* glsl */ `
     vec2 dh = normalize(dir.xy + vec2(1e-5, 0.0));
     vec2 sh = normalize(sunDir.xy + vec2(1e-5, 0.0));
     float az = 0.5 + 0.5 * dot(dh, sh);
-    vec3 horizonCol = mix(horizonCool, horizonWarm, az * az);
+    // Keep the orange sunset reflection in a narrow sunward lane so the
+    // violet off-axis sky remains visible on both sides of the glitter path.
+    float sunward = pow(az, 6.0);
+    vec3 horizonCol = mix(horizonCool, horizonWarm, sunward);
     vec3 col = mix(horizonCol, zenithCol, pow(t, 0.48));
     float sd = max(dot(dir, sunDir), 0.0);
     // sun disk + circumsolar haze; cloud diffuses the disk away

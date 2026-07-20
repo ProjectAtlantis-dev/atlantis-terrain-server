@@ -12,11 +12,13 @@ import * as THREE from 'three';
 
 const DUSK_SUN = new THREE.Color(1.0, 0.42, 0.18);
 const DAY_SUN = new THREE.Color(1.0, 0.96, 0.90);
-const DUSK_ZENITH = new THREE.Color(0.075, 0.13, 0.26);
+const DUSK_ZENITH = new THREE.Color(0.12, 0.09, 0.25);
 const DAY_ZENITH = new THREE.Color(0.115, 0.30, 0.62);
-const DUSK_HORIZON = new THREE.Color(0.85, 0.46, 0.26);
+// Orange is confined to the sunward path; the surrounding dusk water reflects
+// the violet sky on either side.
+const DUSK_HORIZON = new THREE.Color(0.85, 0.42, 0.24);
 const DAY_HORIZON = new THREE.Color(0.55, 0.70, 0.84);
-const DUSK_HORIZON_COOL = new THREE.Color(0.17, 0.23, 0.31);
+const DUSK_HORIZON_COOL = new THREE.Color(0.24, 0.12, 0.32);
 const CLEAR_DEEP = new THREE.Color(0.032, 0.046, 0.048);
 const OVERCAST_DEEP = new THREE.Color(0.024, 0.035, 0.037);
 const CLEAR_SCATTER = new THREE.Color(0.020, 0.16, 0.18);

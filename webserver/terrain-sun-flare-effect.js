@@ -78,6 +78,27 @@ export function projectSunDirectionToUv(camera, sunDirection, target = new Vecto
   return true;
 }
 
+export function sunFlareElevationVisibility(
+  sunDirection,
+  surfaceUp,
+  fadeStartDeg = 2,
+  fadeEndDeg = 16,
+) {
+  if (sunDirection == null || surfaceUp == null) return 0;
+  const denominator = sunDirection.length() * surfaceUp.length();
+  if (!Number.isFinite(denominator) || denominator <= 0) return 0;
+  const sineElevation = Math.max(-1, Math.min(1, sunDirection.dot(surfaceUp) / denominator));
+  const start = Math.sin(fadeStartDeg * Math.PI / 180);
+  const end = Math.sin(fadeEndDeg * Math.PI / 180);
+  if (sineElevation <= start) return 0;
+  if (sineElevation >= end) return 1;
+  const t = Math.max(0, Math.min(1, (sineElevation - start) / Math.max(end - start, 1e-6)));
+  const smooth = t * t * (3 - 2 * t);
+  // HDR tone mapping makes a linear half-strength flare still appear nearly
+  // full-strength. Squaring the ramp produces a visible golden-hour fade.
+  return smooth * smooth;
+}
+
 export class TerrainSunFlareEffect extends Effect {
   constructor({ intensity = 0.005, thresholdLevel = 10, thresholdRange = 1 } = {}) {
     const uniforms = new Map([
@@ -96,13 +117,15 @@ export class TerrainSunFlareEffect extends Effect {
     });
     this.camera = null;
     this.sunDirection = null;
+    this.surfaceUp = null;
     this.edgeLatched = false;
     this.edgeVisibility = 0;
   }
 
-  configure({ camera, sunDirection }) {
+  configure({ camera, sunDirection, surfaceUp }) {
     this.camera = camera;
     this.sunDirection = sunDirection;
+    this.surfaceUp = surfaceUp;
   }
 
   update(_renderer, inputBuffer, deltaTime = 1 / 60) {
@@ -120,9 +143,16 @@ export class TerrainSunFlareEffect extends Effect {
     this.edgeLatched = visible
       && uv.x >= -margin && uv.x <= 1 + margin
       && uv.y >= -margin && uv.y <= 1 + margin;
-    const target = this.edgeLatched ? 1 : 0;
+    // Near the horizon, moving cloud edges repeatedly cross the HDR source
+    // threshold and make the analytic flare flash. Sunset already supplies
+    // its own atmospheric glow, so fade this camera artifact out entirely.
+    const elevationVisibility = sunFlareElevationVisibility(
+      this.sunDirection,
+      this.surfaceUp,
+    );
+    const target = this.edgeLatched ? elevationVisibility : 0;
     const seconds = Number.isFinite(deltaTime) && deltaTime > 0 ? deltaTime : 1 / 60;
-    const timeConstant = target > this.edgeVisibility ? 0.10 : 0.18;
+    const timeConstant = target > this.edgeVisibility ? 0.25 : 0.75;
     const blend = 1 - Math.exp(-seconds / timeConstant);
     this.edgeVisibility += (target - this.edgeVisibility) * blend;
     this.uniforms.get('sunVisible').value = this.edgeVisibility;

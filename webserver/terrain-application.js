@@ -1016,7 +1016,7 @@ createTerrainAtmosphereTextureRuntime({
 
 renderBackend.configureScenePipeline({
   scene, camera, normalPass, cloudsEffect, aerialPerspective,
-  sunDirection,
+  sunDirection, up,
   date: gameClockState.renderedDate,
 });
 

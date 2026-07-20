@@ -30,7 +30,10 @@ import { createTerrainFetchRuntime } from '../terrain-fetch-runtime.js';
 import { restoreTerrainCameraState, terrainCameraState } from '../terrain-camera-state.js';
 import { createTerrainClientLogger } from '../terrain-client-logging.js';
 import { createTerrainFpsCounter } from '../terrain-fps-counter.js';
-import { projectSunDirectionToUv } from '../terrain-sun-flare-effect.js';
+import {
+  projectSunDirectionToUv,
+  sunFlareElevationVisibility,
+} from '../terrain-sun-flare-effect.js';
 import { loadTerrainStartupAssets, normalizeTerrainStartupAssets } from '../terrain-startup-assets.js';
 import { createTerrainAtmosphereTextureRuntime } from '../terrain-atmosphere-textures.js';
 import { createTerrainGridlinesController } from '../terrain-gridlines.js';
@@ -111,6 +114,20 @@ test('analytic sun flare projects a moving world direction into screen space', (
   assert.ok(Math.abs(uv.x - 0.5) < 1e-12);
   assert.ok(Math.abs(uv.y - 0.5) < 1e-12);
   assert.equal(projectSunDirectionToUv(camera, new THREE.Vector3(0, 0, 1), uv), false);
+});
+
+test('analytic sun flare fades gradually through golden hour', () => {
+  const up = new THREE.Vector3(0, 0, 1);
+  const sunAtElevation = degrees => new THREE.Vector3(
+    Math.cos(THREE.MathUtils.degToRad(degrees)),
+    0,
+    Math.sin(THREE.MathUtils.degToRad(degrees)),
+  );
+  assert.ok(sunFlareElevationVisibility(sunAtElevation(2), up) < 1e-12);
+  const midFade = sunFlareElevationVisibility(sunAtElevation(9), up);
+  assert.ok(midFade > 0.2 && midFade < 0.3);
+  assert.ok(1 - sunFlareElevationVisibility(sunAtElevation(16), up) < 1e-12);
+  assert.equal(sunFlareElevationVisibility(sunAtElevation(-2), up), 0);
 });
 
 test('terrain camera persistence round-trips pose and frame state', () => {

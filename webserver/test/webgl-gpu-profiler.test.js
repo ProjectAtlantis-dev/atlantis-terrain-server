@@ -66,6 +66,14 @@ test('GPU profiler samples wrapped passes without synchronously waiting for resu
   assert.equal(summary.passes.scene.averageTriangles, 120);
   assert.equal(summary.passes.scene.percent, 100);
   assert.deepEqual(fake.deleted, [1]);
+
+  pass.render();
+  profiler.endFrame();
+  profiler.beginFrame();
+  const summaryWithWholeFrame = profiler.getSummary();
+  assert.equal(summaryWithWholeFrame.wholeFrameAverageMs, 2.5);
+  assert.equal(summaryWithWholeFrame.passes['whole-frame'].averageMs, 2.5);
+  profiler.endFrame();
 });
 
 test('GPU profiler remains inert when timer queries are unavailable', () => {
@@ -86,6 +94,7 @@ test('GPU profiler remains inert when timer queries are unavailable', () => {
     pendingQueries: 0,
     disjointCount: 0,
     measuredTotalAverageMs: 0,
+    wholeFrameAverageMs: null,
     passes: {},
   });
 });
