@@ -44,7 +44,6 @@ test('G key opens Google Maps once and C remains unassigned', () => {
     onOpenGoogleMaps: () => { opens += 1; },
     onToggleGridlines: () => { gridlinesToggles += 1; },
     onReset: noop,
-    onHouseAction: noop,
     onToggleHeadlights: noop,
   });
   try {
@@ -78,7 +77,6 @@ test('H and R remain unassigned to heatmap and road debug', () => {
     onToggleMap: noop,
     onToggleRoadDebug: () => { roadToggles += 1; },
     onToggleHeatmap: () => { heatmapToggles += 1; },
-    onHouseAction: noop,
     onToggleHeadlights: noop,
   });
   try {

@@ -214,7 +214,6 @@ test('T key clears its pressed state and asks for a tile', async () => {
       onToggleMap: () => {},
       onFlyToTile: () => { flyRequests += 1; },
       onReset: () => {},
-      onHouseAction: () => {},
       onToggleHeadlights: () => {},
     });
     listeners.get('keydown')({ code: 'KeyT', repeat: false });

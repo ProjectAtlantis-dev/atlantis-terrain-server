@@ -1,9 +1,7 @@
 export function defaultTerrainStartupAssets() {
   return {
     vehicle_definition: {},
-    structure_definition: {},
     vehicle_instances: [],
-    structure_instances: [],
   };
 }
 
@@ -14,16 +12,8 @@ export function normalizeTerrainStartupAssets(payload) {
   if (payload.vehicle_definition != null && typeof payload.vehicle_definition === 'object') {
     normalized.vehicle_definition = { ...payload.vehicle_definition };
   }
-  if (payload.structure_definition != null && typeof payload.structure_definition === 'object') {
-    normalized.structure_definition = { ...payload.structure_definition };
-  }
   if (Array.isArray(payload.vehicle_instances)) {
     normalized.vehicle_instances = payload.vehicle_instances
-      .filter(value => value != null && typeof value === 'object')
-      .map(value => ({ ...value }));
-  }
-  if (Array.isArray(payload.structure_instances)) {
-    normalized.structure_instances = payload.structure_instances
       .filter(value => value != null && typeof value === 'object')
       .map(value => ({ ...value }));
   }
@@ -69,7 +59,6 @@ export async function loadTerrainStartupAssets({
       status: response.status,
       source,
       schemaVersion,
-      structureCount: normalized.structure_instances.length,
       vehicleCount: normalized.vehicle_instances.length,
     });
     return {

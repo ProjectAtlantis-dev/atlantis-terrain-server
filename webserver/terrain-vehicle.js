@@ -29,6 +29,13 @@ export function vehicleLocalToLatLon(x, y, anchorLat, anchorLon) {
   };
 }
 
+export function vehicleLatLonToLocal(lat, lon, anchorLat, anchorLon) {
+  return {
+    x: (lon - anchorLon) * 111320 * Math.cos(anchorLat * Math.PI / 180),
+    y: (lat - anchorLat) * 111320,
+  };
+}
+
 export function vehicleStateSnapshot({ loaded, position, headingRad, anchorLat, anchorLon }) {
   if (!loaded) return null;
   const latLon = vehicleLocalToLatLon(position.x, position.y, anchorLat, anchorLon);

@@ -13,7 +13,6 @@ import {
   Turbulence
 } from '@takram/three-clouds';
 import { Ellipsoid, Geodetic, radians } from '@takram/three-geospatial';
-import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { NormalPass } from 'postprocessing';
 import { buildAssetLibrary } from './procgen/library.ts';
 import { buildTileScatter, updateScatterVisibility, SCATTER_MIN_DEPTH } from './procgen/scatter.ts';
@@ -43,7 +42,6 @@ import {
   invalidateTerrainCloudHistory,
   registerTerrainCloudTuning,
 } from './terrain-cloud-runtime.js';
-import { createTerrainHouseSceneRuntime } from './terrain-house-scene-runtime.js';
 import { createTerrainBuildingsRuntime } from './terrain-buildings-runtime.js';
 import { createTerrainTileMenuRuntime } from './terrain-tile-menu-runtime.js';
 import { createTerrainHeatmapRuntime } from './terrain-heatmap-runtime.js';
@@ -164,7 +162,6 @@ const startupAssetsResponse = await loadTerrainStartupAssets({
   bootLog,
 });
 const VEHICLE_DEFINITION = startupAssetsResponse.vehicle_definition;
-const STRUCTURE_DEFINITION = startupAssetsResponse.structure_definition;
 const VEHICLE_HEADLIGHTS = (
   VEHICLE_DEFINITION.headlights != null &&
   typeof VEHICLE_DEFINITION.headlights === 'object'
@@ -929,31 +926,18 @@ function paramNumber(_name, fallback) {
 const ASSET_VEHICLE_INSTANCES = Array.isArray(startupAssetsResponse.vehicle_instances)
   ? startupAssetsResponse.vehicle_instances
   : [];
-const houseRuntime = createTerrainHouseSceneRuntime({
-  structureDefinition: STRUCTURE_DEFINITION, startupAssetsResponse,
-  scene, renderer, terrainRoot, controls, camera, mapCam, mouseNDC, raycaster,
-  up, east, north, anchorLat, anchorLon, paramNumber, bootLog,
-  getSunDirection: () => sunDirection,
-});
 const vehicleRuntime = createTerrainVehicleRuntime({
   vehicleDefinition: VEHICLE_DEFINITION,
   vehicleHeadlights: VEHICLE_HEADLIGHTS,
   assetVehicleInstances: ASSET_VEHICLE_INSTANCES,
-  startupAssetsResponse, houseSites: houseRuntime.houseSites,
+  startupAssetsResponse,
   vehicleStateEndpoint: VEHICLE_STATE_ENDPOINT,
   vehicleSaveTimeoutMs: VEHICLE_SAVE_FETCH_TIMEOUT_MS,
   vehicleSaveFailureCooldownMs: VEHICLE_SAVE_FAILURE_COOLDOWN_MS,
-  houseMarkerBaseLift: houseRuntime.HOUSE_MARKER_BASE_LIFT,
-  houseMarkerHeight: houseRuntime.HOUSE_MARKER_HEIGHT,
-  houseMarkerHaloGeo: houseRuntime.houseMarkerHaloGeo,
-  houseMarkerDotGeo: houseRuntime.houseMarkerDotGeo,
-  createHouseLabelSprite: houseRuntime.createHouseLabelSprite,
   mouseSensitivity: MOUSE_SENS,
   scene, camera, renderer, terrainRoot, controls, mouseNDC, raycaster,
   up, east, north, anchorLat, anchorLon,
   paramNumber, bootLog, enqueueClientLog,
-  houseTerrainMeshes: houseRuntime.houseTerrainMeshes,
-  houseLocalFromLatLon: houseRuntime.houseLocalFromLatLon,
   getSunDirection: () => sunDirection,
 });
 
@@ -1397,8 +1381,14 @@ function rebuildTerrainDemandForViewDirection() {
 
 // --- Fly to tile (T key, ?tile= URL param) ---
 
+function activeTerrainMeshes() {
+  return terrainRoot.children.filter(
+    child => child.isMesh && Boolean(child.userData?.tileId),
+  );
+}
+
 function raycastGroundAltitude(eastM, northM, startAltM) {
-  const terrainMeshes = houseRuntime.houseTerrainMeshes();
+  const terrainMeshes = activeTerrainMeshes();
   if (terrainMeshes.length === 0) return null;
   const rayOrigin = anchorPosition.clone()
     .addScaledVector(east, eastM)
@@ -1507,7 +1497,6 @@ const bootFlyToTileId = new URLSearchParams(window.location.search).get('tile');
 if (!bootFlyToTileId || !flyToTileRuntime.flyToTile(bootFlyToTileId).ok) {
   terrainFetchRuntime.request();
 }
-houseRuntime.start();
 vehicleRuntime.loadVehicleState();
 vehicleRuntime.loadVehicleModel();
 
@@ -1528,18 +1517,12 @@ window.takramDebug = {
   setWaterDebugMode: mode => waterRuntime.setDebugMode?.(mode),
   flushClientLogQueue: () => flushClientLogQueue(),
   fetchTiles: terrainFetchRuntime.request,
-  loadHouseModel: houseRuntime.loadHouseModel,
-  setHousesVisible: visible => houseRuntime.setHousesRuntimeVisible(Boolean(visible), 'debug-api'),
-  getHousesVisible: () => houseRuntime.housesRuntimeVisible,
   setBuildingsVisible: visible => buildingsRuntime.setVisible(visible),
   getBuildingsMesh: () => buildingsRuntime.getMesh(),
   saveVehicleState: reason => vehicleRuntime.saveVehicleState(reason ?? 'debug-api'),
   loadVehicleState: vehicleRuntime.loadVehicleState,
   setVehicleControlActive: active => vehicleRuntime.setVehicleControlActive(Boolean(active), 'debug-api'),
   getVehicleControlActive: () => vehicleRuntime.vehicleControlActive,
-  houseInstances: houseRuntime.houseInstances,
-  houseZSummary: houseRuntime.houseZSummary,
-  houseShadowDebugSummary: houseRuntime.houseShadowDebugSummary,
   terrainRoot,
   texCache,
   deferredTiles: terrainTileSet.deferredTiles,
@@ -1602,7 +1585,7 @@ function isPressed(primary, secondary) {
 }
 
 function updateCameraAGL() {
-  const terrainMeshes = houseRuntime.houseTerrainMeshes();
+  const terrainMeshes = activeTerrainMeshes();
   if (terrainMeshes.length === 0) return;
   aglRaycaster.set(camera.position, up.clone().negate());
   const hits = aglRaycaster.intersectObjects(terrainMeshes);
@@ -1917,7 +1900,6 @@ function resetView() {
   terrainPipelineState.lastFetchX = 0; terrainPipelineState.lastFetchY = 0;
   terrainPipelineState.frameOffsetX = 0; terrainPipelineState.frameOffsetY = 0;
   terrainPipelineState.frameOffsetReady = false;
-  houseRuntime.markHousesNeedSnap();
   terrainFetchRuntime.request();
 }
 
@@ -2072,40 +2054,7 @@ installTerrainPointerControls({
   onChanged: requestRender,
 });
 
-renderer.domElement.addEventListener('pointerdown', event => {
-  console.warn('[CLICK TEST] pointerdown', {
-    x: event.clientX,
-    y: event.clientY,
-    button: event.button,
-  });
-});
-
 renderer.domElement.addEventListener('click', event => {
-  console.warn('[CLICK TEST] click', {
-    x: event.clientX,
-    y: event.clientY,
-    mapMode: controls.mapMode,
-    housesVisible: houseRuntime.housesRuntimeVisible,
-    tileId: null,
-  });
-  enqueueClientLog('info', 'click.test', {
-    x: event.clientX,
-    y: event.clientY,
-    mapMode: controls.mapMode,
-    shadowMode: houseRuntime.HOUSE_SHADOW_MODE,
-    housesVisible: houseRuntime.housesRuntimeVisible,
-    tileId: null,
-  });
-  flushClientLogQueue();
-  try {
-    houseRuntime.probeHouseShadowIntersections(event);
-  } catch (err) {
-    console.error('[CLICK TEST] probe exception', err);
-    bootLog('house.shadow.click_probe.error', {
-      message: err?.message ?? String(err),
-      stack: err?.stack ?? null
-    }, 'error');
-  }
   if (!controls.mapMode) {
     return;
   }
@@ -2333,7 +2282,6 @@ function render() {
   vehicleRuntime.syncVehicleSunLight();
   vehicleRuntime.syncVehicleShadowReceivers();
   vehicleRuntime.updateVehicleShadowSystem();
-  houseRuntime.update(nowMs, controls.mapMode);
   vehicleRuntime.vehicleMarkerLayer.visible = controls.mapMode;
   mapGridController.setVisible(controls.seamMode && !heatmapRuntime.active);
   if (controls.mapMode) {
@@ -2360,7 +2308,6 @@ function render() {
     camMarker.quaternion.setFromUnitVectors(markerForwardLocal, markerHeadingLocal);
     const markerScale = controls.mapZoom / DEFAULT_MAP_ZOOM;
     camMarker.scale.setScalar(markerScale);
-    houseRuntime.setMarkerScale(markerScale);
     vehicleRuntime.vehicleMarker.scale.setScalar(markerScale * vehicleRuntime.VEHICLE_MARKER_MAP_SCALE);
     renderBackend.renderMap(scene, mapCam, _mapBg);
     renderBackend.stopRenderLoopIfIdle();

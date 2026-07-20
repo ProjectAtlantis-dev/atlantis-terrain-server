@@ -13,7 +13,7 @@ import {
 } from '../terrain-priority.js';
 import { compassHeading } from '../terrain-hud.js';
 import { applyMapDrag } from '../terrain-controls.js';
-import { createVehiclePersistenceRuntime, normalizeSavedVehicleState, stepSuspension, stepVehicleDrive, terrainBboxIntersectsCircle, vehicleLocalToLatLon, vehicleStateSnapshot } from '../terrain-vehicle.js';
+import { createVehiclePersistenceRuntime, normalizeSavedVehicleState, stepSuspension, stepVehicleDrive, terrainBboxIntersectsCircle, vehicleLatLonToLocal, vehicleLocalToLatLon, vehicleStateSnapshot } from '../terrain-vehicle.js';
 import { scoreTextureTiles, textureRetryDelay, tileDepthFromId } from '../terrain-tile-runtime.js';
 import { createTextureStreamer, rendererTextureAnisotropy } from '../terrain-texture-streamer.js';
 import {
@@ -43,7 +43,6 @@ import {
   installTerrainCloudHistoryReset,
   registerTerrainCloudTuning,
 } from '../terrain-cloud-runtime.js';
-import { createTerrainHouseConfiguration, createTerrainHouseMarkerRuntime, createTerrainHouseModelController, disposeTerrainHouseTree, markTerrainHousesNeedSnap, terrainHouseLocalPosition, terrainHouseShadowCoverage, terrainHouseZSummary } from '../terrain-house-runtime.js';
 import {
   buildTerrainTilesRequest,
   adoptTerrainOrigin,
@@ -214,15 +213,11 @@ test('startup asset normalization clones valid records and rejects junk', () => 
   const vehicle = { id: 'v1' };
   const normalized = normalizeTerrainStartupAssets({
     vehicle_definition: { model: 'truck' },
-    structure_definition: null,
     vehicle_instances: [vehicle, null, 'bad'],
-    structure_instances: [{ id: 's1' }, 4],
   });
   assert.deepEqual(normalized, {
     vehicle_definition: { model: 'truck' },
-    structure_definition: {},
     vehicle_instances: [{ id: 'v1' }],
-    structure_instances: [{ id: 's1' }],
   });
   assert.notEqual(normalized.vehicle_instances[0], vehicle);
 });
@@ -241,7 +236,7 @@ test('shared startup asset loader preserves metadata and clears timeout', async 
       status: 200,
       json: async () => ({
         source: 'database', schemaVersion: 9, seeded: true,
-        vehicle_instances: [{ id: 'v1' }], structure_instances: [{ id: 's1' }],
+        vehicle_instances: [{ id: 'v1' }],
       }),
     }),
   });
@@ -250,7 +245,6 @@ test('shared startup asset loader preserves metadata and clears timeout', async 
   assert.deepEqual(cleared, [7]);
   assert.equal(logs[0][0], 'assets.fetch.ok');
   assert.equal(logs[0][1].vehicleCount, 1);
-  assert.equal(logs[0][1].structureCount, 1);
 });
 
 test('shared startup asset loader returns complete defaults on failure', async () => {
@@ -264,8 +258,7 @@ test('shared startup asset loader returns complete defaults on failure', async (
     });
     assert.deepEqual(result, {
       source: 'defaults', schemaVersion: 4, seeded: null,
-      vehicle_definition: {}, structure_definition: {},
-      vehicle_instances: [], structure_instances: [],
+      vehicle_definition: {}, vehicle_instances: [],
     });
   } finally {
     console.warn = previousWarn;
@@ -516,106 +509,6 @@ test('shared cloud tuning puts the Takram rendering checkbox first in the Clouds
   assert.deepEqual(order.slice(0, 2), ['section:Clouds', 'toggle:Takram clouds']);
   assert.equal(controls._takramCloudsCheckbox.label, 'Takram clouds');
   assert.deepEqual(renderingStates, [false]);
-});
-
-test('shared house configuration and placement preserve terrain conventions', () => {
-  const logs = [];
-  const configured = createTerrainHouseConfiguration({
-    definition: { url: ' house.glb ', enabled: true, altOffsetM: 2, hotReloadMs: 100 },
-    instances: [{ id: 'h1' }], source: 'database', bootLog: (...args) => logs.push(args),
-  });
-  assert.deepEqual(configured.model, {
-    url: 'house.glb', altOffsetM: 2, hotReloadMs: 500, enabled: true,
-  });
-  assert.deepEqual(configured.sites, [{ id: 'h1' }]);
-  assert.equal(logs.length, 0);
-  const local = terrainHouseLocalPosition(64.1, -51.2, 64, -51);
-  assert.ok(Math.abs(local.y - 11132) < 1e-9);
-});
-
-test('shared house shadow coverage bounds loaded instances', () => {
-  const houses = [
-    { group: { position: { x: 0, y: 10, z: 2 } } },
-    { group: { position: { x: 100, y: 30, z: 4 } } },
-  ];
-  assert.deepEqual(terrainHouseShadowCoverage(houses, {
-    baseRadius: 50, radiusPadding: 10, maxRadius: 500,
-  }), {
-    centerX: 50, centerY: 20, centerZ: 3,
-    minX: 0, minY: 10, maxX: 100, maxY: 30, shadowRadius: 120,
-  });
-});
-
-test('shared house marker runtime creates and updates instance records', () => {
-  const children = [];
-  const markerChildren = [];
-  const runtime = createTerrainHouseMarkerRuntime({
-    documentRef: { createElement: () => ({ width: 0, height: 0, getContext: () => null }) },
-    markerHeight: 100,
-    baseLift: 5,
-    colors: [0xff0000],
-  });
-  const { instances, byId } = runtime.createHouseInstances({
-    sites: [{ id: 'nuuk-h1', tileId: '12-1-2' }],
-    houseLayer: { add: value => children.push(value) },
-    markerLayer: { add: value => markerChildren.push(value) },
-  });
-  assert.equal(instances.length, 1);
-  assert.equal(byId.get('nuuk-h1'), instances[0]);
-  assert.equal(children[0].name, 'house-nuuk-h1');
-  assert.equal(markerChildren[0].name, 'house-marker-nuuk-h1');
-  instances[0].group.position.set(10, 20, 30);
-  runtime.updateHouseMarkerPosition(instances[0]);
-  assert.deepEqual(instances[0].marker.position.toArray(), [10, 20, 35]);
-});
-
-test('shared house model controller rejects stale loads and reloads changed assets', async () => {
-  const loads = [];
-  const templates = [];
-  let signature = 'a';
-  const controller = createTerrainHouseModelController({
-    model: { enabled: true, url: '/house.glb', hotReloadMs: 10 },
-    loader: { load: (url, success) => loads.push({ url, success }) },
-    instanceCount: 2,
-    now: () => 123,
-    onTemplate: template => templates.push(template),
-    fetchImpl: async () => ({
-      ok: true,
-      headers: { get: name => name === 'etag' ? signature : '' },
-    }),
-  });
-  controller.load('first');
-  controller.load('second');
-  loads[0].success({ scene: 'stale' });
-  loads[1].success({ scene: 'current' });
-  assert.deepEqual(templates, ['current']);
-  await controller.updateHotReload(10);
-  signature = 'b';
-  await controller.updateHotReload(20);
-  assert.equal(loads.length, 3);
-  assert.equal(loads[2].url, '/house.glb?cb=123');
-});
-
-test('shared house disposal and snap summaries preserve lifecycle state', () => {
-  let geometryDisposals = 0;
-  let materialDisposals = 0;
-  const material = { dispose: () => { materialDisposals += 1; } };
-  const geometry = { dispose: () => { geometryDisposals += 1; } };
-  disposeTerrainHouseTree({
-    traverse(callback) {
-      callback({ isMesh: true, geometry, material });
-      callback({ isMesh: true, geometry, material });
-    },
-  }, new Set(), new Set());
-  assert.equal(geometryDisposals, 1);
-  assert.equal(materialDisposals, 1);
-  const houses = [{
-    site: { id: 'h1', lat: 1, lon: 2, tileId: '3-4-5' },
-    group: { position: { z: 7.125 } }, snapPending: false,
-  }];
-  assert.equal(terrainHouseZSummary(houses)[0].z, 7.125);
-  markTerrainHousesNeedSnap(houses);
-  assert.equal(houses[0].snapPending, true);
 });
 
 test('terrain preview request preserves boot frame semantics', () => {
@@ -1695,6 +1588,9 @@ test('shared vehicle persistence helpers preserve coordinates and normalize save
   const local = vehicleLocalToLatLon(111320 * Math.cos(anchorLat * Math.PI / 180), 111320, anchorLat, anchorLon);
   assert.ok(Math.abs(local.lat - 65) < 1e-12);
   assert.ok(Math.abs(local.lon - -50) < 1e-12);
+  const roundTrip = vehicleLatLonToLocal(local.lat, local.lon, anchorLat, anchorLon);
+  assert.ok(Math.abs(roundTrip.x - 111320 * Math.cos(anchorLat * Math.PI / 180)) < 1e-6);
+  assert.ok(Math.abs(roundTrip.y - 111320) < 1e-6);
 
   assert.equal(vehicleStateSnapshot({
     loaded: false, position: { x: 0, y: 0, z: 0 }, headingRad: 0, anchorLat, anchorLon,
