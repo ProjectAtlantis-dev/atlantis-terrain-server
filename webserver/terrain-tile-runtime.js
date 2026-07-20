@@ -54,7 +54,12 @@ export function createTileHistory({ getPass, emit, maxTiles = 1000, maxEvents = 
     const events = history.get(tileId);
     events.push(`${timestamp}s ${passTag} ${message}`);
     if (events.length > maxEvents) events.shift();
-    emit({ tileId, pass, msg: message, ts: `${timestamp}s` });
+    // Normal tile chatter is intentionally debug-only, but evictions must be
+    // durable diagnostics. The client logger defaults to an info threshold,
+    // which previously meant every eviction vanished before reaching
+    // client_debug.log and its live ring.
+    const level = message.startsWith('evict') ? 'info' : 'debug';
+    emit({ tileId, pass, msg: message, ts: `${timestamp}s` }, level);
   };
   return { history, log };
 }

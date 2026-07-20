@@ -7,16 +7,10 @@ export const GRAVITY = 9.81;
 // Band-limited cascades: patch size in metres and the wavelength band each
 // one owns. Bands cross-fade in k-space so no wavelength is counted twice.
 export const DEFAULT_CASCADES = [
-  { size: 840, minWave: 55, maxWave: 1e6, foam: true },
-  { size: 160, minWave: 7.5, maxWave: 55, foam: true },
-  { size: 22, minWave: 0.4, maxWave: 7.5, foam: false },
+  { size: 840, minWave: 55, maxWave: 1e6 },
+  { size: 160, minWave: 7.5, maxWave: 55 },
+  { size: 22, minWave: 0.4, maxWave: 7.5 },
 ];
-
-// Visual whitecap coverage curve: nothing below ~3 m/s, saturating ~24 m/s.
-export function windCoverage(windSpeed) {
-  const t = Math.min(Math.max((windSpeed - 3) / 21, 0), 1);
-  return t * t * (3 - 2 * t);
-}
 
 function bitReverse(i, bits) {
   let r = 0;
@@ -92,8 +86,7 @@ function smooth(a, b, x) {
  * matches a Pierson-Moskowitz fully-developed sea for this wind speed.
  *
  * Returns one RGBA Float32Array per cascade — (h0.re, h0.im, h0(-k).re,
- * h0(-k).im) per texel — plus the resulting Hs and the Stokes drift used by
- * the foam residue advection.
+ * h0(-k).im) per texel — plus the resulting significant wave height.
  */
 export function buildInitialSpectra({
   resolution,
@@ -103,13 +96,34 @@ export function buildInitialSpectra({
   amplitude = 1,
   alignment = 1,
   seed = 1,
+  fetchKm = Infinity,
 }) {
   const U = Math.max(speed, 0.01);
   const N = resolution;
-  const Lpm = (U * U) / GRAVITY;            // Phillips largest-wave scale
   const wx = Math.sin(directionRad);
   const wz = Math.cos(directionRad);
   const smallDamp = 0.1;                    // metres; kills sub-decimetre noise
+
+  // Fetch-limited JONSWAP peak: a fjord sea keeps its wind
+  // but has only tens of km to grow, so the spectral peak sits at a higher
+  // frequency than the fully-developed Pierson-Moskowitz sea. At 13 m/s the
+  // PM peak wavelength is ~150 m — open-Atlantic swell that destroys the
+  // sense of scale from altitude; ~100 km of fetch pulls it to ~60-70 m and
+  // Hs from ~3.5 m to ~2 m. Infinite fetch degrades exactly to PM.
+  const omegaPM = 0.855 * GRAVITY / U;
+  let omegaP = omegaPM;
+  let hsBase = 0.205 * (U * U) / GRAVITY;   // fully-developed Hs
+  if (Number.isFinite(fetchKm)) {
+    const F = Math.max(fetchKm, 1) * 1000;
+    const omegaF = 22 * Math.cbrt((GRAVITY * GRAVITY) / (U * F));
+    if (omegaF > omegaP) {
+      omegaP = omegaF;
+      hsBase = Math.min(hsBase, 0.0016 * Math.sqrt(GRAVITY * F) * U / GRAVITY);
+    }
+  }
+  // Phillips low-k cutoff recentred on the (possibly fetch-shifted) peak;
+  // equals the classic U^2/g when the sea is fully developed.
+  const Lpm = 0.731 * GRAVITY / (omegaP * omegaP);
 
   const rand = mulberry32((seed * 2654435761) >>> 0);
   const gaussian = makeGaussian(rand);
@@ -141,7 +155,6 @@ export function buildInitialSpectra({
         // more monochromatic, so they read as regularly spaced ridge trains
         // from altitude instead of irregular lumps.
         const omega = Math.sqrt(GRAVITY * k);
-        const omegaP = 0.855 * GRAVITY / U;
         const sig = omega <= omegaP ? 0.07 : 0.09;
         const rr = Math.exp(-((omega - omegaP) ** 2) / (2 * sig * sig * omegaP * omegaP));
         const peak = Math.pow(6.0, rr);
@@ -186,8 +199,8 @@ export function buildInitialSpectra({
     spectra.push(data);
   }
 
-  // Normalise to a fully-developed-sea significant wave height (capped)
-  const targetHs = Math.min(0.205 * (U * U) / GRAVITY, 14) * amplitude;
+  // Normalise to the (possibly fetch-limited) significant wave height
+  const targetHs = Math.min(hsBase, 14) * amplitude;
   const sigma = Math.sqrt(Math.max(totalVariance, 1e-12) * 0.5);
   const scale = (targetHs / 4) / Math.max(sigma, 1e-9);
   for (const data of spectra) {
@@ -197,8 +210,5 @@ export function buildInitialSpectra({
   return {
     spectra,
     significantWaveHeight: targetHs,
-    // Stokes drift for foam residue: ~1.5% of wind speed, downwind
-    driftX: wx * U * 0.015,
-    driftY: wz * U * 0.015,
   };
 }

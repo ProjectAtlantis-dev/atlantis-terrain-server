@@ -28,6 +28,7 @@ export function createWebGPUAtmosphereController({
   let atmosphereNode = null;
   let postProcessing = null;
   let cloudShadows = null;
+  let lightNodeRegistered = false;
   let lastDate = new Date();
   let lastSunLogMs = 0;
   let lastSunLogDateMs = NaN;
@@ -87,11 +88,14 @@ export function createWebGPUAtmosphereController({
 
   function applyCloudShadowSettings() {
     if (!cloudShadows) return;
-    cloudShadows.enabled.value = false;
+    cloudShadows.enabled.value = cloudShadowSettings.enabled;
     cloudShadows.debugSurface.value = cloudShadowSettings.debugSurface;
     cloudShadows.coverage.value = cloudShadowSettings.coverage;
     cloudShadows.density.value = cloudShadowSettings.density;
     cloudShadows.strength.value = cloudShadowSettings.strength;
+    cloudShadows.shaftsEnabled.value = cloudShadowSettings.shaftsEnabled;
+    cloudShadows.shaftStrength.value = cloudShadowSettings.shaftStrength;
+    cloudShadows.indirectFloor.value = cloudShadowSettings.indirectFloor;
   }
 
   function applyLiveSettings() {
@@ -124,11 +128,22 @@ export function createWebGPUAtmosphereController({
     skyNode = skyBackground(context);
     scene.backgroundNode = skyNode;
     updateDate(date);
-    renderer.library.addLight(CloudShadowAtmosphereLightNode, AtmosphereLight);
+    if (!lightNodeRegistered) {
+      const registeredNode = renderer.library.getLightNodeClass(AtmosphereLight);
+      if (registeredNode == null) {
+        renderer.library.addLight(CloudShadowAtmosphereLightNode, AtmosphereLight);
+      } else if (registeredNode !== CloudShadowAtmosphereLightNode) {
+        throw new Error(
+          `AtmosphereLight already uses ${registeredNode.name}; `
+          + `cannot install ${CloudShadowAtmosphereLightNode.name}`,
+        );
+      }
+      lightNodeRegistered = true;
+    }
     atmosphereLight = new AtmosphereLight(context, maxViewDistance);
     atmosphereLight.name = 'webgpu-atmosphere-light';
     cloudShadows = new WebGPUCloudShadows({
-      anchor, east, north, up, camera, atmosphereContext: context,
+      scene, anchor, east, north, up, camera, atmosphereContext: context,
     });
     applyCloudShadowSettings();
     atmosphereLight.cloudShadow = cloudShadows;

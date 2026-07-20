@@ -18,8 +18,6 @@ import {
 //   2. IFFT: 2 ping-pong butterfly chains (horizontal + vertical stages).
 //   3. assembly: write displacement map (Dx*λ, h, Dz*λ) and derivatives map
 //      (dh/dx, dh/dz, Jacobian) with the (-1)^(x+y) shift correction.
-//   4. foam: accumulate where the Jacobian says the surface is folding,
-//      decay over time -> persistent, lingering whitecaps.
 // ---------------------------------------------------------------------------
 
 const GRAVITY = 9.81;
@@ -44,9 +42,14 @@ const EVOLVE_SHADER = /* glsl */ `
 
     vec4 h0 = texture2D(uH0, (coord + 0.5) / uN);
     float w = sqrt(${GRAVITY.toFixed(3)} * kl);
-    vec2 e = vec2(cos(w * uTime), sin(w * uTime));
+    // e^{-iwt}: with the inverse FFT's e^{+ik.x} convention this makes each
+    // component e^{i(k.x - wt)}, i.e. crests travel toward +k — the +wind
+    // direction the spectrum aligns energy with. The +iwt sign propagated
+    // the swell AGAINST uWindDir, contradicting the micro-ripple advection,
+    // the lee-shore fetch march, and the wind-direction slider semantics.
+    vec2 e = vec2(cos(w * uTime), -sin(w * uTime));
 
-    // h(k,t) = h0(k) e^{iwt} + h0*(-k) e^{-iwt}
+    // h(k,t) = h0(k) e^{-iwt} + h0*(-k) e^{+iwt}
     vec2 h = cmul(h0.xy, e) + cmul(vec2(h0.z, -h0.w), vec2(e.x, -e.y));
 
     vec2 cA, cB;
@@ -139,45 +142,10 @@ const DERIVATIVES_SHADER = /* glsl */ `
   }
 `;
 
-// Two-stage whitecap lifecycle:
-//   R = plume energy: entrained air at the breaking crest. Injected from the
-//       Jacobian, lives seconds. Brightness in the surface shader scales with
-//       this energy, so only violent breaks render truly white.
-//   G = residue: bubble scum left behind as the plume degasses. Fed by the
-//       plume, lightens the water (not white), drifts downwind with Stokes
-//       drift, persists for minutes.
-const FOAM_SHADER = /* glsl */ `
-  uniform sampler2D uPrev;
-  uniform sampler2D uDeriv;
-  uniform float uN;
-  uniform float uDt;
-  uniform float uDecayP;   // 1 / plume e-folding time
-  uniform float uDecayR;   // 1 / residue e-folding time
-  uniform float uTransfer; // plume -> residue feed rate
-  uniform vec2 uDrift;     // residue drift, texture units / s (Stokes)
-  uniform float uBias;
-  uniform float uGrow;
-
-  void main() {
-    vec2 uv = gl_FragCoord.xy / uN;
-    float J = texture2D(uDeriv, uv).z;
-    float inject = max(uBias - J, 0.0);
-
-    float E = texture2D(uPrev, uv).x;
-    // residue drifts downwind; the plume stays with the crest that made it
-    float S = texture2D(uPrev, uv - uDrift * uDt).y;
-    // per-texel age in seconds: the continuous clock for the white -> cream
-    // -> gray -> residual fade. Fresh breaking rejuvenates in proportion to
-    // its violence rather than snapping to zero.
-    float A = texture2D(uPrev, uv).z;
-    A = min(A + uDt, 900.0);
-    A *= 1.0 - clamp(inject * uGrow * 0.5, 0.0, 1.0);
-
-    E = E * exp(-uDecayP * uDt) + inject * uGrow * uDt;
-    S = S * exp(-uDecayR * uDt) + E * uTransfer * uDt;
-    gl_FragColor = vec4(clamp(E, 0.0, 1.5), clamp(S, 0.0, 1.0), A, 1.0);
-  }
-`;
+// (A whitecap/foam accumulation pass lived here — Jacobian-injected plume +
+// persistence + age channels. Removed at the user's request: every foam
+// presentation read as garbage from altitude. The Jacobian in the
+// derivatives pass survives untouched for any future attempt.)
 
 // three.js caches the uniform list per program, so every uniform must exist
 // before first render and only its .value may be mutated afterwards.
@@ -216,7 +184,7 @@ function computeRT(n, opts = {}) {
 export class WebGLWaterSimulation {
   /**
    * @param {THREE.WebGLRenderer} renderer
-   * @param {{resolution?: number, cascades?: {size:number, minWave:number, maxWave:number, foam:boolean}[]}} opts
+   * @param {{resolution?: number, cascades?: {size:number, minWave:number, maxWave:number}[]}} opts
    */
   constructor(renderer, opts = {}) {
     this.renderer = renderer;
@@ -237,9 +205,6 @@ export class WebGLWaterSimulation {
     this.matButterfly = makeSimMaterial(BUTTERFLY_SHADER, ['uButterfly', 'uInput', 'uN', 'uStages', 'uStage', 'uVertical']);
     this.matDisp = makeSimMaterial(DISPLACEMENT_SHADER, ['uT0', 'uN', 'uLambda']);
     this.matDeriv = makeSimMaterial(DERIVATIVES_SHADER, ['uT0', 'uT1', 'uN', 'uLambda']);
-    this.matFoam = makeSimMaterial(FOAM_SHADER, ['uPrev', 'uDeriv', 'uN', 'uDt', 'uDecayP', 'uDecayR', 'uTransfer', 'uDrift', 'uBias', 'uGrow']);
-    this.matFoam.uniforms.uDrift.value = new THREE.Vector2();
-    this.windDrift = new THREE.Vector2();   // world m/s, set by setWind
 
     const N = this.N;
     this.cascades = this.cascadeDefs.map(def => ({
@@ -250,24 +215,18 @@ export class WebGLWaterSimulation {
       ping: [computeRT(N), computeRT(N), computeRT(N), computeRT(N)],
       displacement: computeRT(N, { type: THREE.HalfFloatType, filter: THREE.LinearFilter, mips: true }),
       derivatives: computeRT(N, { type: THREE.HalfFloatType, filter: THREE.LinearFilter, mips: true }),
-      foam: def.foam ? [
-        computeRT(N, { type: THREE.HalfFloatType, filter: THREE.LinearFilter, mips: true }),
-        computeRT(N, { type: THREE.HalfFloatType, filter: THREE.LinearFilter, mips: true }),
-      ] : null,
-      foamIndex: 0,
     }));
 
     this.significantWaveHeight = 1;
   }
 
-  setWind({ speed, directionRad, amplitude = 1, alignment = 1, seed = 1 }) {
-    const { spectra, significantWaveHeight, driftX, driftY } = buildInitialSpectra({
+  setWind({ speed, directionRad, amplitude = 1, alignment = 1, seed = 1, fetchKm }) {
+    const { spectra, significantWaveHeight } = buildInitialSpectra({
       resolution: this.N,
       cascades: this.cascadeDefs,
-      speed, directionRad, amplitude, alignment, seed,
+      speed, directionRad, amplitude, alignment, seed, fetchKm,
     });
     this.significantWaveHeight = significantWaveHeight;
-    this.windDrift.set(driftX, driftY);
 
     this.cascades.forEach((c, i) => {
       if (c.h0) c.h0.dispose();
@@ -304,10 +263,7 @@ export class WebGLWaterSimulation {
     return input;
   }
 
-  update(time, dt, {
-    choppiness = 1.1, foamBias = 0.5, foamGrow = 5.0,
-    plumeDecay = 1 / 7, residueDecay = 1 / 150, foamTransfer = 0.05,
-  } = {}) {
+  update(time, dt, { choppiness = 1.1 } = {}) {
     const prevRT = this.renderer.getRenderTarget();
 
     for (const c of this.cascades) {
@@ -341,25 +297,6 @@ export class WebGLWaterSimulation {
       mv.uN.value = this.N;
       mv.uLambda.value = choppiness;
       this.runPass(this.matDeriv, c.derivatives);
-
-      // 4. persistent foam accumulation
-      if (c.foam) {
-        const src = c.foam[c.foamIndex];
-        const dst = c.foam[c.foamIndex ^ 1];
-        const mf = this.matFoam.uniforms;
-        mf.uPrev.value = src.texture;
-        mf.uDeriv.value = c.derivatives.texture;
-        mf.uN.value = this.N;
-        mf.uDt.value = Math.min(dt, 0.05);
-        mf.uDecayP.value = plumeDecay;
-        mf.uDecayR.value = residueDecay;
-        mf.uTransfer.value = foamTransfer;
-        mf.uDrift.value.copy(this.windDrift).divideScalar(c.def.size);
-        mf.uBias.value = foamBias;
-        mf.uGrow.value = foamGrow;
-        this.runPass(this.matFoam, dst);
-        c.foamIndex ^= 1;
-      }
     }
 
     this.renderer.setRenderTarget(prevRT);
@@ -371,7 +308,6 @@ export class WebGLWaterSimulation {
       size: c.def.size,
       displacement: c.displacement.texture,
       derivatives: c.derivatives.texture,
-      foam: c.foam ? c.foam[c.foamIndex].texture : null,
     };
   }
 
@@ -381,11 +317,10 @@ export class WebGLWaterSimulation {
       c.evolve0.dispose(); c.evolve1.dispose();
       c.ping.forEach(p => p.dispose());
       c.displacement.dispose(); c.derivatives.dispose();
-      c.foam?.forEach(f => f.dispose());
     }
     this.butterfly.dispose();
     this.quad.dispose();
-    [this.matEvolve, this.matButterfly, this.matDisp, this.matDeriv, this.matFoam]
+    [this.matEvolve, this.matButterfly, this.matDisp, this.matDeriv]
       .forEach(m => m.dispose());
   }
 }

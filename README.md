@@ -103,7 +103,10 @@ Press **M** to toggle a 2D map view (no clouds/atmosphere) for navigation and ti
 
 Press **H** from the 3D view to toggle the live tile-priority heatmap. Press **H** again to return directly to 3D. Map and heatmap are separate views: return to 3D before switching between them. Both retain the same heading, pan, and zoom. Regular map mode outlines the terrain meshes currently being rendered as a thin grey grid, with the tile under the pointer outlined in red.
 
-In 3D mode, atmosphere sliders allow adjusting cloud density, coverage, and lighting parameters. (WIP — still working out some bugs.)
+In 3D mode, expand **Scene settings** in the top-right to adjust atmosphere,
+cloud, and lighting parameters. The **Water** section's **dynamic water**
+checkbox toggles the animated water surface on both renderers (WebGL GLSL and
+WebGPU TSL ports of the same FFT sim). (WIP — still working out some bugs.)
 
 Press **G** to open Google Maps' satellite 3D view at the current camera position, heading, tilt, height above ground, and field of view. This is a debugging reference and opens in a new tab.
 

@@ -1,36 +1,58 @@
 import * as THREE from 'three';
 import { buildRadialGridGeometry } from './water-grid.js';
 import { createWaterPalette, computeWaterPalette } from './water-sky.js';
-import { windCoverage } from './water-spectrum.js';
+import { NORTH_CLIFF_REFLECTION_MAX_PADDING_M } from './water-reflection-mask.js';
 
 // Backend-neutral fjord water orchestration: owns parameters, the camera-
-// local/sun-local frame math, sim pacing, and the colour-map capture cadence.
-// The backend supplies the actual renderer work via createWater() (WebGL
-// today; a WGSL/TSL port plugs in behind the same interface). Backends
-// without water simply don't implement createWater and this runtime is inert.
+// local/sun-local frame math, and sim pacing. The backend supplies the
+// actual renderer work via createWater() (WebGL today; a WGSL/TSL port plugs
+// in behind the same interface). Backends without water simply don't
+// implement createWater and this runtime is inert. Colour inheritance needs
+// no orchestration: the surface is translucent and the seabed imagery —
+// which is satellite photography OF the water — shows through per-pixel.
 
 // Fjords are NOT fetch-limited: they are long enough to channel the east-west
 // winds, so the default sea state stays ocean-grade — wind along the fjord
-// axis, real whitecaps. Do not pre-calm; the sliders exist for that.
+// axis. Do not pre-calm; the sliders exist for that.
+// (No foam/whitecap params: the foam system was removed — every presentation
+// read as garbage from altitude. Waves + light only.)
 export const DEFAULT_WATER_PARAMS = {
+  enabled: true,           // hide/pause the dynamic surface when disabled;
+                          // the underlying fjord imagery remains visible
   windSpeed: 13,          // m/s
   windDirection: 90,      // degrees the wind blows toward (90 = east)
+  fetchKm: 100,           // wave-growth fetch: sets the JONSWAP peak so a
+                          // windy fjord sea stays short (~60-70 m waves at
+                          // 13 m/s) instead of open-Atlantic 150 m swell
+  shoreFetchRamp: 3000,   // metres of open water downwind of a lee shore for
+                          // the sea state to build back to full; the spatial
+                          // counterpart of fetchKm (which stays global). This
+                          // calms only wind-FROM-land shorelines, not the
+                          // fjord as a whole — see the note above.
   alignment: 1.0,         // directional spreading of the spectrum
-  choppiness: 1.38,       // horizontal displacement scale (drives breaking)
+  choppiness: 1.38,       // horizontal displacement scale
   amplitude: 1.0,
-  foamAmount: 1.0,
-  plumeLife: 7,           // whitecap (plume) e-folding life, seconds
-  residueLife: 150,       // bubble-residue e-folding life, seconds
-  foamTransfer: 0.12,     // plume -> residue feed rate (per second)
-  ghostStrength: 2.0,     // how strongly residue keeps the cap's ghost visible
   cloudiness: 0,          // 0 clear -> 1 overcast
-  tintStrength: 1.0,      // how much local imagery colour replaces defaults
+  opacity: 0,             // surface body veil — 0 by choice: the seabed
+                          // imagery carries the water colour entirely, the
+                          // surface adds only reflection and glint
+  reflectivity: 0.4,      // sky-reflection gain (fjord walls occlude the sky)
+  glintStrength: 1.0,     // direct-sun glitter gain, independent of the
+                          // deliberately subdued ambient sky reflection
+  absorption: 0.25,       // Beer-Lambert 1/m, applied only inside the
+                          // wall-slope gate: open water stays fully clear,
+                          // the -10 m mask-drop walls fade hard with depth
+  northCliffReflectionPadding: NORTH_CLIFF_REFLECTION_MAX_PADDING_M,
+                          // maximum reflection setback; actual
+                          // distance scales from ~0 on flat north shores to
+                          // this value on large, steep north-facing cliffs
   radiance: 1.0,          // output gain vs the scene's tone-mapping exposure
   timeScale: 1.0,
   seed: 1,
 };
 
-const CAPTURE_MIN_INTERVAL_MS = 750;
+const BATHY_REFRESH_MS = 15000;
+const BATHY_TEXTURE_SETTLE_MS = 2000;
 
 export function createWaterRuntime({
   backend,
@@ -41,13 +63,15 @@ export function createWaterRuntime({
   north,
   up,
   getSunDirection,
+  getTextureVersion = null,
+  log = null,
   params = { ...DEFAULT_WATER_PARAMS },
 }) {
-  const water = backend.createWater?.({ geometry: buildRadialGridGeometry() }) ?? null;
+  const water = backend.createWater?.({ geometry: buildRadialGridGeometry(), log }) ?? null;
   if (!water?.mesh) {
     return {
       enabled: false, params,
-      applyWind() {}, markColorDirty() {}, update() {}, dispose() {},
+      applyWind() {}, update() {}, dispose() {}, setDebugMode() {},
     };
   }
   terrainRoot.add(water.mesh);
@@ -59,9 +83,9 @@ export function createWaterRuntime({
   const meshOffset = new THREE.Vector2();
   const lastCaptureCenter = new THREE.Vector2(Infinity, Infinity);
   const simParams = {};
-  let lastCaptureMs = 0;
-  let colorDirty = true;
   let simTime = 0;
+  let lastCaptureMs = -Infinity;
+  let lastCaptureTextureVersion = null;
 
   function applyWind() {
     water.setWind({
@@ -70,12 +94,12 @@ export function createWaterRuntime({
       amplitude: params.amplitude,
       alignment: params.alignment,
       seed: params.seed,
-      windCoverage: windCoverage(params.windSpeed),
+      fetchKm: params.fetchKm,
     });
   }
   applyWind();
 
-  function update({ dt, nowMs, camera, visible }) {
+  function update({ dt, camera, visible }) {
     water.mesh.visible = visible;
     if (!visible) return;
 
@@ -93,33 +117,48 @@ export function createWaterRuntime({
 
     const scaledDt = dt * params.timeScale;
     simTime += scaledDt;
-    const cov = windCoverage(params.windSpeed) * Math.min(params.foamAmount, 1.5);
     simParams.choppiness = params.choppiness;
-    simParams.foamBias = THREE.MathUtils.lerp(
-      0.34, 0.70, Math.pow(THREE.MathUtils.clamp(cov, 0, 1), 0.55),
-    );
-    simParams.foamGrow = 4.0;
-    simParams.plumeDecay = 1 / params.plumeLife;
-    simParams.residueDecay = 1 / params.residueLife;
-    simParams.foamTransfer = params.foamTransfer;
 
     water.update({
       simTime, dt: scaledDt, meshOffset, cameraLocal, sunLocal,
       palette, params, simParams,
     });
 
-    // Colour-map capture is event-driven: markColorDirty() fires on actual
-    // texture application (tile arrival/upgrade), movement re-centres the
-    // window. The interval is only a coalescer — tiles apply in bursts of a
-    // few per frame and must not become a capture per frame.
-    if (water.captureColorMap && nowMs - lastCaptureMs >= CAPTURE_MIN_INTERVAL_MS) {
+    // The seabed is a static -10 m floor — water terrain effectively never
+    // changes; at most the shoreline sharpens as higher-LOD tiles stream in.
+    // Re-capture when movement re-centres the window, when tile textures have
+    // changed since the last capture (debounced — streaming arrives in
+    // bursts), plus a lazy periodic refresh as a backstop. The texture
+    // trigger matters: the capture bakes tile-texture brightness into the
+    // reflection gate, and with an on-demand render loop the lazy refresh
+    // alone deferred that update to whatever next dirtied the scene — a sun
+    // tick, minutes later — which read as lighting suddenly breaking.
+    if (water.captureBathymetry) {
+      const nowMs = performance.now();
+      const textureVersion = getTextureVersion?.() ?? 0;
       const moved = lastCaptureCenter.distanceTo(meshOffset)
-        > water.colorMapExtent * 0.12;
-      if (moved || colorDirty) {
-        water.captureColorMap({ scene, terrainRoot, centerXY: meshOffset });
+        > water.bathyExtent * 0.12;
+      const texturesSettled = textureVersion !== lastCaptureTextureVersion
+        && nowMs - lastCaptureMs >= BATHY_TEXTURE_SETTLE_MS;
+      if (moved || texturesSettled || nowMs - lastCaptureMs >= BATHY_REFRESH_MS) {
+        const reason = lastCaptureTextureVersion == null ? 'initial'
+          : moved ? 'moved'
+          : texturesSettled ? 'textures-settled'
+          : 'periodic';
+        const sincePreviousMs = Number.isFinite(lastCaptureMs)
+          ? Math.round(nowMs - lastCaptureMs) : null;
+        const stats = water.captureBathymetry({ scene, terrainRoot, centerXY: meshOffset });
         lastCaptureCenter.copy(meshOffset);
         lastCaptureMs = nowMs;
-        colorDirty = false;
+        lastCaptureTextureVersion = textureVersion;
+        log?.('water.bathymetry.capture', {
+          reason,
+          sincePreviousMs,
+          textureVersion,
+          centerX: Math.round(meshOffset.x),
+          centerY: Math.round(meshOffset.y),
+          ...stats,
+        });
       }
     }
   }
@@ -128,10 +167,8 @@ export function createWaterRuntime({
     enabled: true,
     params,
     applyWind,
-    // Call when a terrain texture is applied or upgraded; the next update
-    // (past the coalescing interval) re-captures the colour map.
-    markColorDirty() { colorDirty = true; },
     update,
+    setDebugMode(mode) { water.setDebugMode?.(mode); },
     dispose() {
       terrainRoot.remove(water.mesh);
       water.dispose();

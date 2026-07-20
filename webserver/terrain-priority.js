@@ -25,19 +25,9 @@ export function headingFromForward2D(east, north, fallback = 0) {
   return Object.is(heading, -0) ? 0 : heading;
 }
 
-/** Distance in a view-aligned oval: forward ground is compressed so its
- * priority bands reach farther, while lateral and rear distances are kept. */
-export function headingAlignedPriorityDistance(
-  dx,
-  dy,
-  heading,
-  forwardScale = 2,
-) {
-  const forward = headingForward2D(heading);
-  const along = dx * forward.x + dy * forward.y;
-  const across = dx * forward.y - dy * forward.x;
-  const scaledAlong = along > 0 ? along / Math.max(1, forwardScale) : along;
-  return Math.hypot(across, scaledAlong);
+/** Radial ground distance used by the circular terrain demand. */
+export function radialPriorityDistance(dx, dy) {
+  return Math.hypot(dx, dy);
 }
 
 export function horizontalFrustumDotMin(fovDeg, aspect, margin = 0.8) {
@@ -55,7 +45,6 @@ export function terrainTilePriority(tile, {
   fovDeg,
   aspect,
   nearDistance = 2000,
-  forwardScale = 2,
 }) {
   const tcx = (tile.bbox[0] + tile.bbox[2]) * 0.5;
   const tcy = (tile.bbox[1] + tile.bbox[3]) * 0.5;
@@ -65,9 +54,7 @@ export function terrainTilePriority(tile, {
   if (dist <= 0) return 0;
 
   const forward = headingForward2D(heading);
-  const priorityDistance = headingAlignedPriorityDistance(
-    dx, dy, heading, forwardScale,
-  );
+  const priorityDistance = radialPriorityDistance(dx, dy);
   if (dist < nearDistance) return Math.log(Math.max(priorityDistance, 1));
   const pitchScale = usePitch ? Math.cos(pitch) : 1;
   const dot = (dx * forward.x + dy * forward.y) / dist * pitchScale;

@@ -1,11 +1,16 @@
 import {
+  DepthFormat,
+  DepthTexture,
   HalfFloatType,
   LinearFilter,
+  Matrix4,
   NodeMaterial,
+  OrthographicCamera,
   QuadMesh,
   RedFormat,
   RendererUtils,
   RenderTarget,
+  UnsignedIntType,
   Vector3
 } from 'three/webgpu';
 import {
@@ -26,6 +31,10 @@ import {
   vec4
 } from 'three/tsl';
 import { AtmosphereLightNode } from '@takram/three-atmosphere/webgpu';
+import {
+  ATMOSPHERE_VISIBILITY_SAMPLES,
+  configureSunDepthCamera,
+} from './webgpu-sun-depth-camera.js';
 
 const SHADOW_MAP_SIZE = 512;
 const SHADOW_MAP_SPAN_M = 70_000;
@@ -33,9 +42,12 @@ const SHADOW_RAY_START_M = 14_000;
 const SHADOW_RAY_LENGTH_M = 24_000;
 const SHADOW_MARCH_STEPS = 24;
 const SHADOW_UPDATE_INTERVAL_S = 0.1;
+const OPAQUE_SUN_DEPTH_UPDATE_INTERVAL_S = 0.75;
+const SUN_DEPTH_BIAS = 0.00035;
 
 const vectorScratch = new Vector3();
 const centerScratch = new Vector3();
+const matrixScratch = new Matrix4();
 
 function createShadowTarget() {
   const target = new RenderTarget(SHADOW_MAP_SIZE, SHADOW_MAP_SIZE, {
@@ -47,6 +59,24 @@ function createShadowTarget() {
   target.texture.minFilter = LinearFilter;
   target.texture.magFilter = LinearFilter;
   target.texture.generateMipmaps = false;
+  return target;
+}
+
+function createOpaqueSunDepthTarget() {
+  const target = new RenderTarget(SHADOW_MAP_SIZE, SHADOW_MAP_SIZE, {
+    depthBuffer: true,
+    format: RedFormat,
+    type: HalfFloatType
+  });
+  target.texture.name = 'WebGPUOpaqueSunDepth.color';
+  target.texture.generateMipmaps = false;
+  target.depthTexture = new DepthTexture(
+    SHADOW_MAP_SIZE,
+    SHADOW_MAP_SIZE,
+    UnsignedIntType,
+  );
+  target.depthTexture.name = 'WebGPUOpaqueSunDepth.depth';
+  target.depthTexture.format = DepthFormat;
   return target;
 }
 
@@ -70,14 +100,15 @@ export class CloudShadowAtmosphereLightNode extends AtmosphereLightNode {
       positionECEF = positionECEF.add(atmosphereContext.altitudeCorrectionECEF);
     }
     directLight.lightColor = directLight.lightColor.mul(
-      cloudShadow.getTransmittanceNode(positionECEF)
+      cloudShadow.getSurfaceSunVisibilityNode(positionECEF, positionWorld)
     );
     return directLight;
   }
 }
 
 export class WebGPUCloudShadows {
-  constructor({ anchor, east, north, up, camera, atmosphereContext }) {
+  constructor({ scene, anchor, east, north, up, camera, atmosphereContext }) {
+    this.scene = scene;
     this.camera = camera;
     this.atmosphereContext = atmosphereContext;
     this.anchor = anchor.clone();
@@ -97,16 +128,28 @@ export class WebGPUCloudShadows {
     this.shadowRight = uniform(east.clone()).setName('cloudShadowRight');
     this.shadowUp = uniform(north.clone()).setName('cloudShadowUp');
     this.sunDirection = uniform(new Vector3(0, 0, 1)).setName('cloudShadowSunDirection');
+    this.sunViewProjection = uniform(new Matrix4()).setName('opaqueSunViewProjection');
+    this.sunDepthBias = uniform(SUN_DEPTH_BIAS).setName('opaqueSunDepthBias');
+    this.shaftsEnabled = uniform(true).setName('atmosphereShaftsEnabled');
+    this.shaftStrength = uniform(0.82).setName('atmosphereShaftStrength');
+    this.indirectFloor = uniform(0.28).setName('atmosphereShaftIndirectFloor');
 
     this.renderTarget = createShadowTarget();
     this.material = new NodeMaterial();
     this.material.name = 'WebGPUCloudShadow.opticalDepth';
     this.material.fragmentNode = this.createOpticalDepthNode();
     this.quad = new QuadMesh(this.material);
+    this.opaqueSunTarget = createOpaqueSunDepthTarget();
+    this.sunCamera = new OrthographicCamera();
+    this.sunDepthMaterial = new NodeMaterial();
+    this.sunDepthMaterial.name = 'WebGPUOpaqueSunDepth.material';
+    this.sunDepthMaterial.fragmentNode = vec4(1);
+    this.sunDepthMaterial.fog = false;
     // Must be undefined, not null: three's saveRendererState(renderer, state = {})
     // only substitutes the default object for undefined.
     this.rendererState = undefined;
-    this.lastUpdateSeconds = -Infinity;
+    this.lastCloudUpdateSeconds = -Infinity;
+    this.lastOpaqueUpdateSeconds = -Infinity;
   }
 
   createDensityNode(positionECEF) {
@@ -180,12 +223,115 @@ export class WebGPUCloudShadows {
     return select(this.enabled.and(inside), transmittance, 1);
   }
 
+  getOpaqueSunVisibilityNode(positionWorld) {
+    const clip = this.sunViewProjection.mul(vec4(positionWorld, 1));
+    const ndc = clip.xyz.div(clip.w);
+    // Render-target textures follow WebGPU's top-left texture convention.
+    const shadowUv = vec2(
+      ndc.x.mul(0.5).add(0.5),
+      ndc.y.mul(-0.5).add(0.5),
+    );
+    const inside = shadowUv.x.greaterThanEqual(0)
+      .and(shadowUv.x.lessThanEqual(1))
+      .and(shadowUv.y.greaterThanEqual(0))
+      .and(shadowUv.y.lessThanEqual(1))
+      .and(ndc.z.greaterThanEqual(0))
+      .and(ndc.z.lessThanEqual(1));
+    const storedDepth = texture(this.opaqueSunTarget.depthTexture, shadowUv).r;
+    const lit = storedDepth.add(this.sunDepthBias).greaterThanEqual(ndc.z);
+    return select(inside, select(lit, 1, 0), 1);
+  }
+
+  getAtmosphereVisibilityNode(cameraPositionECEF, endPositionECEF) {
+    return Fn(() => {
+      const visibility = float(0).toVar('atmosphereSunVisibility');
+      Loop(ATMOSPHERE_VISIBILITY_SAMPLES, ({ i }) => {
+        const amount = float(i).add(0.5).div(ATMOSPHERE_VISIBILITY_SAMPLES);
+        const positionECEF = mix(cameraPositionECEF, endPositionECEF, amount);
+        const positionWorld = this.atmosphereContext.matrixECEFToWorld
+          .mul(vec4(positionECEF, 1)).xyz;
+        visibility.addAssign(
+          this.getOpaqueSunVisibilityNode(positionWorld)
+            .mul(this.getTransmittanceNode(positionECEF)),
+        );
+      });
+      const meanVisibility = visibility.div(ATMOSPHERE_VISIBILITY_SAMPLES);
+      const shaftVisibility = mix(
+        this.indirectFloor,
+        1,
+        meanVisibility,
+      );
+      return select(
+        this.shaftsEnabled,
+        mix(1, shaftVisibility, this.shaftStrength),
+        1,
+      );
+    })();
+  }
+
+  getSurfaceSunVisibilityNode(positionECEF, positionWorld = null) {
+    const worldPosition = positionWorld ?? this.atmosphereContext.matrixECEFToWorld
+      .mul(vec4(positionECEF, 1)).xyz;
+    const opaqueVisibility = select(
+      this.shaftsEnabled,
+      this.getOpaqueSunVisibilityNode(worldPosition),
+      1,
+    );
+    return opaqueVisibility.mul(this.getTransmittanceNode(positionECEF));
+  }
+
+  renderOpaqueSunDepth(renderer) {
+    if (!this.scene) return;
+    configureSunDepthCamera(this.sunCamera, {
+      center: this.shadowCenter.value,
+      sunDirection: this.sunDirection.value,
+      up: this.shadowUp.value,
+      span: this.mapSpan.value,
+    });
+
+    const previousOverride = this.scene.overrideMaterial;
+    const previousBackground = this.scene.background;
+    const previousBackgroundNode = this.scene.backgroundNode;
+    const previousShadowAutoUpdate = renderer.shadowMap.autoUpdate;
+    this.scene.overrideMaterial = this.sunDepthMaterial;
+    this.scene.background = null;
+    this.scene.backgroundNode = null;
+    renderer.shadowMap.autoUpdate = false;
+    try {
+      renderer.setClearColor(0xffffff, 1);
+      renderer.setRenderTarget(this.opaqueSunTarget);
+      renderer.clear();
+      renderer.render(this.scene, this.sunCamera);
+      this.sunViewProjection.value.copy(
+        matrixScratch.multiplyMatrices(
+          this.sunCamera.projectionMatrix,
+          this.sunCamera.matrixWorldInverse,
+        ),
+      );
+    } finally {
+      this.scene.overrideMaterial = previousOverride;
+      this.scene.background = previousBackground;
+      this.scene.backgroundNode = previousBackgroundNode;
+      renderer.shadowMap.autoUpdate = previousShadowAutoUpdate;
+    }
+  }
+
   update(renderer, elapsedSeconds) {
     this.driftTime.value = elapsedSeconds;
-    if (elapsedSeconds - this.lastUpdateSeconds < SHADOW_UPDATE_INTERVAL_S) {
+    if (!this.enabled.value && !this.shaftsEnabled.value) {
       return;
     }
-    this.lastUpdateSeconds = elapsedSeconds;
+    const updateCloudDepth = this.enabled.value && (
+      elapsedSeconds - this.lastCloudUpdateSeconds >= SHADOW_UPDATE_INTERVAL_S
+    );
+    const updateOpaqueDepth = this.shaftsEnabled.value && (
+      elapsedSeconds - this.lastOpaqueUpdateSeconds >= OPAQUE_SUN_DEPTH_UPDATE_INTERVAL_S
+    );
+    if (!updateCloudDepth && !updateOpaqueDepth) {
+      return;
+    }
+    if (updateCloudDepth) this.lastCloudUpdateSeconds = elapsedSeconds;
+    if (updateOpaqueDepth) this.lastOpaqueUpdateSeconds = elapsedSeconds;
     this.sunDirection.value.copy(this.atmosphereContext.sunDirectionECEF.value).normalize();
 
     const right = this.shadowRight.value;
@@ -204,14 +350,24 @@ export class WebGPUCloudShadows {
     this.shadowCenter.value.copy(centerScratch);
 
     this.rendererState = RendererUtils.resetRendererState(renderer, this.rendererState);
-    renderer.setRenderTarget(this.renderTarget);
-    this.quad.render(renderer);
-    RendererUtils.restoreRendererState(renderer, this.rendererState);
+    try {
+      if (updateCloudDepth) {
+        renderer.setRenderTarget(this.renderTarget);
+        this.quad.render(renderer);
+      }
+      if (updateOpaqueDepth) {
+        this.renderOpaqueSunDepth(renderer);
+      }
+    } finally {
+      RendererUtils.restoreRendererState(renderer, this.rendererState);
+    }
   }
 
   dispose() {
     this.renderTarget.dispose();
+    this.opaqueSunTarget.dispose();
     this.material.dispose();
+    this.sunDepthMaterial.dispose();
   }
 
   debugSummary() {
@@ -223,6 +379,9 @@ export class WebGPUCloudShadows {
       coverage: this.coverage.value,
       density: this.density.value,
       strength: this.strength.value,
+      shaftsEnabled: this.shaftsEnabled.value,
+      shaftStrength: this.shaftStrength.value,
+      indirectFloor: this.indirectFloor.value,
       center: this.shadowCenter.value.toArray(),
       sunDirection: this.sunDirection.value.toArray()
     };

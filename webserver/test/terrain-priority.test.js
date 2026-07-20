@@ -1,8 +1,9 @@
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import test from 'node:test';
 
 import {
-  headingAlignedPriorityDistance,
+  radialPriorityDistance,
   headingFromForward2D,
   headingForward2D,
   priorityHeading,
@@ -23,7 +24,7 @@ import {
 } from '../terrain-tile-set.js';
 import { createTerrainMeshBuilder, decodeTerrainHeightmap } from '../terrain-mesh-builder.js';
 import { applyTerrainAvailabilityStatus } from '../terrain-status-controller.js';
-import { collectTerrainDebugMeshes, createTerrainHoverOutlineController, createTerrainMapGridController, summarizeTerrainMesh } from '../terrain-debug-runtime.js';
+import { analyzeTerrainSeams, collectTerrainDebugMeshes, createTerrainHoverOutlineController, createTerrainMapGridController, formatTerrainSeamDiagnostic, summarizeTerrainMesh } from '../terrain-debug-runtime.js';
 import { createTerrainFetchRuntime } from '../terrain-fetch-runtime.js';
 import { restoreTerrainCameraState, terrainCameraState } from '../terrain-camera-state.js';
 import { createTerrainClientLogger } from '../terrain-client-logging.js';
@@ -32,7 +33,13 @@ import { loadTerrainStartupAssets, normalizeTerrainStartupAssets } from '../terr
 import { createTerrainAtmosphereTextureRuntime } from '../terrain-atmosphere-textures.js';
 import { paintClassifierGridBorder } from '../terrain-classifier-texture.js';
 import { createTerrainTuningControls } from '../terrain-tuning-controls.js';
-import { bindTerrainCloudComposition, configureTerrainClouds, registerTerrainCloudTuning } from '../terrain-cloud-runtime.js';
+import {
+  bindTerrainCloudComposition,
+  configureTerrainClouds,
+  invalidateTerrainCloudHistory,
+  installTerrainCloudHistoryReset,
+  registerTerrainCloudTuning,
+} from '../terrain-cloud-runtime.js';
 import { createTerrainHouseConfiguration, createTerrainHouseMarkerRuntime, createTerrainHouseModelController, disposeTerrainHouseTree, markTerrainHousesNeedSnap, terrainHouseLocalPosition, terrainHouseShadowCoverage, terrainHouseZSummary } from '../terrain-house-runtime.js';
 import {
   buildTerrainTilesRequest,
@@ -356,6 +363,57 @@ test('shared cloud runtime configures layers and synchronizes atmosphere composi
   assert.equal(listeners.has('change'), false);
 });
 
+test('cloud history invalidation seeds every temporal-upscale phase from the current frame', () => {
+  // The install anchors on takram's real cloudsResolve.frag; a mocked shader
+  // would only validate our own assumptions about it. resolveMaterial receives
+  // the source verbatim modulo include resolution, which touches neither anchor.
+  const takramResolveShader = readFileSync(
+    new URL(
+      '../three-geospatial/packages/clouds/src/shaders/cloudsResolve.frag',
+      import.meta.url,
+    ),
+    'utf8',
+  );
+  const shadowAlpha = { value: 0.01 };
+  const cloudsAlpha = { value: 0.1 };
+  const resolveMaterial = {
+    uniforms: { temporalAlpha: cloudsAlpha },
+    fragmentShader: takramResolveShader,
+  };
+  const effect = {
+    temporalUpscale: true,
+    shadowPass: { resolveMaterial: { uniforms: { temporalAlpha: shadowAlpha } } },
+    cloudsPass: { resolveMaterial },
+  };
+
+  assert.equal(installTerrainCloudHistoryReset(effect), true);
+  assert.match(resolveMaterial.fragmentShader, /uniform float terrainHistoryReset;/);
+  // The reset must land inside temporalUpscale(), ahead of the current-phase
+  // branch, so it overrides all 16 Bayer phases — not temporalAntialiasing().
+  const resetIndex = resolveMaterial.fragmentShader.indexOf('terrainHistoryReset > 0.5');
+  const currentFrameIndex = resolveMaterial.fragmentShader.indexOf('if (currentFrame) {');
+  const antialiasingIndex = resolveMaterial.fragmentShader.indexOf('void temporalAntialiasing');
+  assert.ok(resetIndex >= 0);
+  assert.ok(resetIndex < currentFrameIndex);
+  assert.ok(resetIndex < antialiasingIndex);
+  assert.equal(installTerrainCloudHistoryReset(effect), true);
+  assert.equal(
+    resolveMaterial.fragmentShader.match(/terrainHistoryReset > 0\.5/g).length,
+    1,
+  );
+
+  const restore = invalidateTerrainCloudHistory(effect);
+  assert.equal(resolveMaterial.uniforms.terrainHistoryReset.value, 1);
+  assert.equal(shadowAlpha.value, 1);
+  assert.equal(cloudsAlpha.value, 1);
+  assert.equal(invalidateTerrainCloudHistory(effect), restore);
+
+  restore();
+  assert.equal(resolveMaterial.uniforms.terrainHistoryReset.value, 0);
+  assert.equal(shadowAlpha.value, 0.01);
+  assert.equal(cloudsAlpha.value, 0.1);
+});
+
 test('shared cloud tuning registers controls and applies altitude, cirrus, and drift changes', () => {
   const definitions = new Map();
   const sections = [];
@@ -367,24 +425,28 @@ test('shared cloud tuning registers controls and applies altitude, cirrus, and d
     localWeatherVelocity: { values: [], set(...values) { this.values = values; } },
   };
   const controls = {};
-  registerTerrainCloudTuning({
+  const tuning = registerTerrainCloudTuning({
     effect, controls,
     section: label => sections.push(label),
     slider: (label, options) => { definitions.set(label, options); return { label }; },
     toggle: (label, options) => { definitions.set(label, options); return { label }; },
+    getWindDirection: () => 0,
   });
   assert.deepEqual(sections, ['Clouds']);
-  assert.equal(definitions.size, 8);
+  assert.equal(definitions.size, 7);
   assert.equal(controls._cirrusCheckbox.label, 'cirrus');
 
   definitions.get('cloud altitude').onChange(-2000);
   assert.deepEqual(effect.cloudLayers.map(layer => layer.altitude), [0, 0, 6300, 7100]);
   definitions.get('cirrus').onChange(true);
   assert.equal(effect.cloudLayers[3].densityScale, 0.004);
+  // Drift heading is slaved to the water wind (compass "blows toward" 0 =
+  // north), so speed changes re-resolve the heading instead of a dedicated
+  // direction slider. Compass north maps to +y in the weather-uv frame.
   definitions.get('drift speed').onChange(0.001);
-  definitions.get('drift direction').onChange(90);
   assert.ok(Math.abs(effect.localWeatherVelocity.values[0]) < 1e-12);
   assert.ok(Math.abs(effect.localWeatherVelocity.values[1] - 0.001) < 1e-12);
+  assert.equal(typeof tuning.syncDrift, 'function');
 });
 
 test('shared house configuration and placement preserve terrain conventions', () => {
@@ -598,15 +660,16 @@ test('shared reconciler spends dirty-paint budget in heatmap order', () => {
   });
 });
 
-test('preview reconciliation completes coarse coverage beyond the build budget', () => {
+test('preview reconciliation completes heatmap coverage beyond the build budget', () => {
   const built = [];
+  const deferredTiles = new Map();
   const terrainRoot = {
     children: [],
     add(mesh) { this.children.push(mesh); },
   };
   const reconcile = createTerrainTileReconciler({
     terrainRoot,
-    deferredTiles: new Map(),
+    deferredTiles,
     lifecycle: { sweepStaleParents: () => 0 },
     priorityForTile: tile => tile.priority,
     textureCache: new Map(),
@@ -627,7 +690,111 @@ test('preview reconciliation completes coarse coverage beyond the build budget',
     { id: 'far', bbox: [10, 10, 11, 11], heightmap: 'hm', priority: 2 },
   ], new Set(), { completeCoverage: true });
   assert.deepEqual(built, ['near', 'far']);
+  assert.deepEqual([...deferredTiles.keys()], ['near', 'far']);
   assert.equal(terrainRoot.children.length, 2);
+});
+
+test('reconciliation rebuilds a resident tile when repaired seam geometry changes', () => {
+  const oldMesh = {
+    isMesh: true,
+    userData: {
+      tileId: '12-20-40', bbox: [0, 0, 4, 4], heightmapPayload: 'old-repair',
+    },
+    material: { map: null },
+  };
+  const terrainRoot = {
+    children: [oldMesh],
+    add(mesh) { this.children.push(mesh); },
+    remove(mesh) { this.children = this.children.filter(item => item !== mesh); },
+  };
+  const evicted = [];
+  const sceneSizesAtEviction = [];
+  const built = [];
+  const nextTile = {
+    id: '12-20-40', bbox: [0, 0, 4, 4], heightmap: 'new-repair', priority: 1,
+  };
+
+  const result = reconcileTerrainTiles({
+    tiles: [nextTile],
+    currentTileIds: new Set([nextTile.id]),
+    deferredTiles: new Map(),
+    terrainRoot,
+    lifecycle: {
+      evict(mesh) {
+        evicted.push(mesh.userData.tileId);
+        sceneSizesAtEviction.push(terrainRoot.children.length);
+        terrainRoot.remove(mesh);
+      },
+      sweepStaleParents: () => 0,
+    },
+    priorityForTile: () => 0,
+    textureCache: new Map(),
+    materialize() {},
+    buildMesh(tile) {
+      built.push(tile.id);
+      return {
+        isMesh: true,
+        userData: {
+          tileId: tile.id, bbox: tile.bbox, heightmapPayload: tile.heightmap,
+        },
+        material: { map: null },
+      };
+    },
+    log() {},
+  });
+
+  assert.deepEqual(evicted, [nextTile.id]);
+  assert.deepEqual(sceneSizesAtEviction, [2]);
+  assert.deepEqual(built, [nextTile.id]);
+  assert.equal(terrainRoot.children.length, 1);
+  assert.equal(terrainRoot.children[0].userData.heightmapPayload, 'new-repair');
+  assert.deepEqual(result.added, [nextTile.id]);
+  assert.deepEqual(result.removed, []);
+});
+
+test('seam refresh keeps old geometry when the replacement is build-budget deferred', () => {
+  const oldMesh = {
+    isMesh: true,
+    userData: {
+      tileId: '12-20-40', bbox: [0, 0, 4, 4], heightmapPayload: 'old-repair',
+    },
+    material: { map: null },
+  };
+  const terrainRoot = {
+    children: [oldMesh],
+    add(mesh) { this.children.push(mesh); },
+    remove(mesh) { this.children = this.children.filter(item => item !== mesh); },
+  };
+  const deferredTiles = new Map();
+  let evictions = 0;
+  let builds = 0;
+  const nextTile = {
+    id: oldMesh.userData.tileId,
+    bbox: oldMesh.userData.bbox,
+    heightmap: 'new-repair',
+  };
+
+  reconcileTerrainTiles({
+    tiles: [nextTile],
+    currentTileIds: new Set([nextTile.id]),
+    deferredTiles,
+    terrainRoot,
+    lifecycle: {
+      evict() { evictions += 1; },
+      sweepStaleParents: () => 0,
+    },
+    priorityForTile: () => 0,
+    textureCache: new Map(),
+    materialize() {},
+    buildMesh() { builds += 1; },
+    buildBudget: 0,
+    log() {},
+  });
+
+  assert.equal(evictions, 0);
+  assert.equal(builds, 0);
+  assert.deepEqual(terrainRoot.children, [oldMesh]);
+  assert.equal(deferredTiles.get(nextTile.id), nextTile);
 });
 
 test('reconciliation releases old heatmap tiles but retains a complete fallback parent', () => {
@@ -674,6 +841,107 @@ test('reconciliation releases old heatmap tiles but retains a complete fallback 
   assert.deepEqual(releasedTextures, ['8-10-10']);
   assert.deepEqual(terrainRoot.children, [parent]);
   assert.equal(result.released, 1);
+});
+
+test('circular-boundary parent remains for partial demanded descendants', () => {
+  const parent = {
+    isMesh: true,
+    userData: { tileId: '10-351-206', bbox: [0, 0, 8, 8] },
+    material: { map: {}, dispose() {} },
+    geometry: { dispose() {} },
+    children: [],
+  };
+  const terrainRoot = {
+    children: [parent],
+    add(mesh) { this.children.push(mesh); },
+    remove(mesh) { this.children = this.children.filter(item => item !== mesh); },
+  };
+  const lifecycle = createTileLifecycle({
+    terrainRoot, disposeScatter: () => {}, log: () => {},
+  });
+  const demanded = [
+    { id: '11-702-412', bbox: [0, 0, 4, 4], heightmap: 'hm' },
+    { id: '11-703-412', bbox: [4, 0, 8, 4], heightmap: 'hm' },
+  ];
+
+  const result = reconcileTerrainTiles({
+    tiles: demanded,
+    currentTileIds: new Set([parent.userData.tileId]),
+    deferredTiles: new Map(),
+    terrainRoot,
+    lifecycle,
+    priorityForTile: () => 0,
+    textureCache: new Map(),
+    materialize() {},
+    buildMesh: () => null,
+    log() {},
+  });
+
+  assert.equal(result.released, 0);
+  assert.deepEqual(terrainRoot.children, [parent]);
+  assert.equal(lifecycle.sweepStaleParents(demanded, new Set(demanded.map(tile => tile.id))), 0);
+
+  for (const tile of demanded) {
+    terrainRoot.add({
+      isMesh: true,
+      userData: { tileId: tile.id, bbox: tile.bbox },
+      material: { map: {}, dispose() {} },
+      geometry: { dispose() {} },
+      children: [],
+    });
+  }
+  assert.equal(lifecycle.sweepStaleParents(demanded, new Set(demanded.map(tile => tile.id))), 1);
+  assert.equal(terrainRoot.children.includes(parent), false);
+});
+
+test('textured parent remains while demanded children are untextured', () => {
+  const parent = {
+    isMesh: true,
+    userData: { tileId: '11-10-20', bbox: [0, 0, 8, 8] },
+    material: { map: {}, dispose() {} },
+    geometry: { dispose() {} },
+    children: [],
+  };
+  const terrainRoot = {
+    children: [parent],
+    add(mesh) { this.children.push(mesh); },
+    remove(mesh) { this.children = this.children.filter(item => item !== mesh); },
+  };
+  const lifecycle = createTileLifecycle({
+    terrainRoot, disposeScatter: () => {}, log: () => {},
+  });
+  const children = [
+    { id: '12-20-40', bbox: [0, 0, 4, 4], heightmap: 'water' },
+    { id: '12-21-40', bbox: [4, 0, 8, 4], heightmap: 'water' },
+    { id: '12-20-41', bbox: [0, 4, 4, 8], heightmap: 'water' },
+    { id: '12-21-41', bbox: [4, 4, 8, 8], heightmap: 'water' },
+  ];
+
+  const result = reconcileTerrainTiles({
+    tiles: children,
+    currentTileIds: new Set([parent.userData.tileId]),
+    deferredTiles: new Map(),
+    terrainRoot,
+    lifecycle,
+    priorityForTile: () => 0,
+    textureCache: new Map(),
+    materialize() {},
+    buildMesh: tile => ({
+      isMesh: true,
+      userData: { tileId: tile.id, bbox: tile.bbox },
+      material: { map: null, dispose() {} },
+      geometry: { dispose() {} },
+      children: [],
+    }),
+    prepareUntexturedMesh() {},
+    log() {},
+    buildBudget: 4,
+  });
+
+  assert.deepEqual(
+    terrainRoot.children.map(mesh => mesh.userData.tileId).sort(),
+    [parent.userData.tileId],
+  );
 });
 
 test('terrain tile set owns reconciliation, scene residency, and texture demand', () => {
@@ -736,6 +1004,48 @@ test('terrain tile set owns reconciliation, scene residency, and texture demand'
   assert.equal(terrainRoot.children[0].material.map.desaturated, true);
   assert.equal(tileSet.setClassifierMode(false), false);
   assert.equal(terrainRoot.children[0].material.map, baseTexture);
+});
+
+test('terrain tile set does not queue excess geometry on animation frames', () => {
+  const frames = [];
+  const terrainRoot = {
+    children: [],
+    add(mesh) { this.children.push(mesh); },
+    remove(mesh) { this.children = this.children.filter(child => child !== mesh); },
+  };
+  const tileSet = createTerrainTileSet({
+    terrainRoot,
+    textureStreamer: {
+      texCache: new Map(), texSource: new Map(), pump() {}, releaseTile() {},
+    },
+    terrain: {},
+    renderBackend: { kind: 'webgl', prepareUntexturedTerrain() {} },
+    view: { controls: { mapMode: false } },
+    log() {},
+    testOverrides: {
+      buildBudget: 1,
+      scheduleFrame: callback => frames.push(callback),
+      priorityForTile: tile => tile.priority,
+      getVisibilityDistance: () => 1000,
+      buildMesh: tile => ({
+        isMesh: true,
+        children: [],
+        userData: { tileId: tile.id, bbox: tile.bbox },
+        material: { map: null, color: { set() {} }, dispose() {} },
+        geometry: { dispose() {} },
+      }),
+    },
+  });
+  const tiles = [
+    { id: '8-0-0', bbox: [0, 0, 1, 1], heightmap: 'hm', priority: 1 },
+    { id: '8-1-0', bbox: [1, 0, 2, 1], heightmap: 'hm', priority: 2 },
+  ];
+  tileSet.reconcile(tiles, { completeCoverage: true });
+  assert.deepEqual(
+    terrainRoot.children.map(mesh => mesh.userData.tileId),
+    ['8-0-0', '8-1-0'],
+  );
+  assert.equal(frames.length, 0);
 });
 
 test('terrain origin and pipeline decisions preserve two-pass behavior', () => {
@@ -1060,6 +1370,7 @@ test('shared terrain mesh builder preserves heightmap geometry and metadata', ()
     10, 20, 2, 10, 20, -58,
   ]);
   assert.equal(mesh.userData.tileId, '1-2-3');
+  assert.equal(mesh.userData.resolution, 2);
   assert.deepEqual([...scatterHeightmap], [1, 2, 3, 4]);
 });
 
@@ -1116,26 +1427,52 @@ test('shared terrain hover outline owns replacement and cleanup', () => {
   assert.equal(changes, 2);
 });
 
-test('map grid uses the exact rendered mesh bounds', () => {
+test('seam grid colors shared edges by measured failure and reports both tiles', () => {
   const root = {
     children: [],
     add(child) { this.children.push(child); },
     remove(child) { this.children = this.children.filter(item => item !== child); },
   };
   const grid = createTerrainMapGridController({ terrainRoot: root });
+  const build = createTerrainMeshBuilder({ exaggeration: 1, attachScatter() {} });
+  const encoded = values => Buffer.from(new Float32Array(values).buffer).toString('base64');
   const meshes = [
-    { userData: { tileId: 'parent', bbox: [0, 0, 8, 8] } },
-    { userData: { tileId: 'child', bbox: [8, 0, 12, 4] } },
+    build({ id: '11-1-1', resolution: 2, bbox: [0, 0, 8, 8], heightmap: encoded([0, 0, 0, 0]) }),
+    build({ id: '12-2-2', resolution: 2, bbox: [8, 0, 12, 4], heightmap: encoded([2, 2, 2, 2]) }),
   ];
   grid.setVisible(true);
   assert.equal(grid.update(meshes), true);
-  assert.equal(grid.lines.geometry.attributes.position.count, 16);
+  assert.equal(grid.lines.geometry.attributes.position.count, 2);
+  assert.equal(grid.lines.geometry.attributes.color.count, 2);
+  assert.equal(grid.lines.material.vertexColors, true);
+  assert.equal(grid.lines.material.toneMapped, false);
+  assert.equal(grid.lines.material.depthWrite, false);
+  assert.equal(grid.diagnostics.length, 1);
+  assert.equal(grid.diagnostics[0].severity, 'bad');
+  assert.equal(grid.diagnostics[0].maxHeightGap, 2);
+  assert.equal(grid.diagnostics[0].depthDelta, 1);
+  assert.match(formatTerrainSeamDiagnostic(grid.diagnosticsForTile('11-1-1')[0]), /12-2-2.*2\.00m gap.*cross-LOD/);
+  assert.match(formatTerrainSeamDiagnostic(grid.diagnosticsForTile('12-2-2')[0]), /11-1-1.*2\.00m gap.*cross-LOD/);
   assert.equal(grid.lines.visible, true);
   assert.equal(grid.update(meshes), false);
   grid.setVisible(false);
   assert.equal(grid.lines.visible, false);
   grid.dispose();
   assert.equal(root.children.length, 0);
+});
+
+test('seam analysis leaves aligned geometry quiet and detects normal-only seams', () => {
+  const build = createTerrainMeshBuilder({ exaggeration: 1, attachScatter() {} });
+  const encoded = values => Buffer.from(new Float32Array(values).buffer).toString('base64');
+  const flat = build({ id: '12-0-0', resolution: 2, bbox: [0, 0, 1, 1], heightmap: encoded([0, 0, 0, 0]) });
+  const aligned = build({ id: '12-1-0', resolution: 2, bbox: [1, 0, 2, 1], heightmap: encoded([0, 0, 0, 0]) });
+  assert.equal(analyzeTerrainSeams([flat, aligned])[0].severity, 'healthy');
+
+  const slope = build({ id: '12-1-0', resolution: 2, bbox: [1, 0, 2, 1], heightmap: encoded([0, 10, 0, 10]) });
+  const seam = analyzeTerrainSeams([flat, slope])[0];
+  assert.equal(seam.maxHeightGap, 0);
+  assert.equal(seam.severity, 'bad');
+  assert.ok(seam.maxNormalAngle > 20);
 });
 
 test('shared fetch runtime preserves initial response transition ordering', async () => {
@@ -1250,12 +1587,12 @@ test('tile ahead of vehicle is hotter than tile behind it', () => {
   assert.ok(ahead < behind);
 });
 
-test('terrain priority distance has a two-times-forward oval', () => {
-  assert.equal(headingAlignedPriorityDistance(0, 40000, 0), 20000);
-  assert.equal(headingAlignedPriorityDistance(0, -20000, 0), 20000);
-  assert.equal(headingAlignedPriorityDistance(20000, 0, 0), 20000);
+test('terrain priority distance is circular in every heading', () => {
+  assert.equal(radialPriorityDistance(0, 40000), 40000);
+  assert.equal(radialPriorityDistance(0, -20000), 20000);
+  assert.equal(radialPriorityDistance(20000, 0), 20000);
   assert.ok(Math.abs(
-    headingAlignedPriorityDistance(-40000, 0, Math.PI / 2) - 20000,
+    radialPriorityDistance(-40000, 0) - 40000,
   ) < 1e-9);
 });
 
@@ -1426,6 +1763,16 @@ test('flushing texture work always advances the server demand generation', () =>
   assert.ok(streamer.version > firstFlush);
 });
 
+test('leaving heading demand retains cached paint for immediate reuse', () => {
+  const streamer = createTextureStreamer({ log: () => {} });
+  const texture = { dispose() { assert.fail('cached paint must not be disposed'); } };
+  streamer.texCache.set('11-10-20', texture);
+  streamer.texSource.set('11-10-20', 'dataforsyningen');
+  streamer.releaseTileDemand('11-10-20');
+  assert.equal(streamer.texCache.get('11-10-20'), texture);
+  assert.equal(streamer.texSource.get('11-10-20'), 'dataforsyningen');
+});
+
 test('road debug invalidates cached variants and marks texture requests', async () => {
   let requestedUrl = null;
   const stale = { disposed: false, dispose() { this.disposed = true; } };
@@ -1493,6 +1840,77 @@ test('shared texture pump caches successful exact texture', async () => {
   assert.equal(completed.texture.anisotropy, 8);
 });
 
+test('shared texture pump immediately refills freed concurrency slots', async () => {
+  const requests = [];
+  const resolvers = [];
+  const streamer = createTextureStreamer({
+    log: () => {},
+    maxInflight: 2,
+    fetchImpl: url => new Promise(resolve => {
+      requests.push(url);
+      resolvers.push(resolve);
+    }),
+    decodeImage: async () => ({ width: 256, height: 256 }),
+  });
+  const response = {
+    status: 200,
+    ok: true,
+    headers: { get: () => null },
+    blob: async () => ({}),
+  };
+  const scored = [1, 2, 3].map(index => ({
+    tile: { id: `12-1-${index}`, bbox: [0, 0, 1, 1] },
+  }));
+
+  streamer.pump(scored, {
+    isCovered: () => false,
+    onPlaceholder: () => assert.fail('unexpected placeholder'),
+    onTexture: () => {},
+  });
+  assert.equal(requests.length, 2);
+
+  resolvers[0](response);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(requests.length, 3);
+
+  resolvers[1](response);
+  resolvers[2](response);
+  await new Promise(resolve => setImmediate(resolve));
+});
+
+test('aborted texture demand does not refill cancelled work', async () => {
+  const requests = [];
+  let resolveRequest;
+  const streamer = createTextureStreamer({
+    log: () => {},
+    maxInflight: 1,
+    fetchImpl: url => new Promise(resolve => {
+      requests.push(url);
+      resolveRequest = resolve;
+    }),
+    decodeImage: async () => ({ width: 256, height: 256 }),
+  });
+  const scored = [1, 2].map(index => ({
+    tile: { id: `12-2-${index}`, bbox: [0, 0, 1, 1] },
+  }));
+  streamer.pump(scored, {
+    isCovered: () => false,
+    onPlaceholder: () => assert.fail('unexpected placeholder'),
+    onTexture: () => {},
+  });
+  assert.equal(requests.length, 1);
+
+  streamer.abortAll();
+  resolveRequest({
+    status: 200,
+    ok: true,
+    headers: { get: () => null },
+    blob: async () => ({}),
+  });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(requests.length, 1);
+});
+
 test('texture anisotropy supports both renderer APIs and fails safely', () => {
   assert.equal(rendererTextureAnisotropy({ getMaxAnisotropy: () => 16 }), 16);
   assert.equal(rendererTextureAnisotropy({
@@ -1501,7 +1919,7 @@ test('texture anisotropy supports both renderer APIs and fails safely', () => {
   assert.equal(rendererTextureAnisotropy({ getMaxAnisotropy: () => { throw new Error('not ready'); } }), 1);
 });
 
-test('shared lifecycle keeps parent until all four quadrants are textured', () => {
+test('shared lifecycle retires parent when all demanded descendants are textured', () => {
   const parent = {
     isMesh: true,
     userData: { tileId: '10-1-1', bbox: [0, 0, 10, 10] },
@@ -1520,8 +1938,9 @@ test('shared lifecycle keeps parent until all four quadrants are textured', () =
   const lifecycle = createTileLifecycle({
     terrainRoot: root, disposeScatter: () => {}, log: () => {},
   });
-  assert.equal(lifecycle.sweepStaleParents([], new Set(['11-2-2'])), 0);
+  const demandedIds = new Set(children.map(c => c.userData.tileId));
+  assert.equal(lifecycle.sweepStaleParents([], demandedIds), 0);
   root.children.push(...children.slice(1));
-  assert.equal(lifecycle.sweepStaleParents([], new Set(children.map(c => c.userData.tileId))), 1);
+  assert.equal(lifecycle.sweepStaleParents([], demandedIds), 1);
   assert.deepEqual(root.children, children);
 });

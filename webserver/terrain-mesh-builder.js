@@ -136,7 +136,13 @@ export function createTerrainMeshBuilder({ exaggeration, attachScatter }) {
     Object.assign(mesh.userData, {
       tileId: tile.id,
       bbox: tile.bbox,
+      resolution,
       skirtDepth,
+      // Seam repair is response-dependent: the same physical tile can get a
+      // different boundary when the rendered LOD of its neighbor changes.
+      // Keep the exact payload that produced this mesh so reconciliation can
+      // replace stale geometry without requiring a page refresh.
+      heightmapPayload: tile.heightmap,
       terrainColorAttribute,
       classifierColorAttribute,
     });

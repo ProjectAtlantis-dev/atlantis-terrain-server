@@ -18,39 +18,21 @@ function parseTileId(tileId) {
   return match ? { depth: Number(match[1]), col: Number(match[2]), row: Number(match[3]) } : null;
 }
 
-function desiredDescendantsCover(parentTileId, desiredTileIds) {
+function desiredDescendantIds(parentTileId, desiredTileIds) {
   const parent = parseTileId(parentTileId);
-  if (!parent || desiredTileIds.size === 0) return false;
-  let maxDepth = parent.depth;
-  const relevantAncestors = new Set();
+  if (!parent || desiredTileIds.size === 0) return [];
+  const descendants = [];
   for (const id of desiredTileIds) {
     const address = parseTileId(id);
-    if (!address || address.depth < parent.depth) continue;
+    if (!address || address.depth <= parent.depth) continue;
     const divisor = 2 ** (address.depth - parent.depth);
     if (
       Math.floor(address.col / divisor) !== parent.col
       || Math.floor(address.row / divisor) !== parent.row
     ) continue;
-    maxDepth = Math.max(maxDepth, address.depth);
-    for (let depth = address.depth; depth >= parent.depth; depth--) {
-      const scale = 2 ** (address.depth - depth);
-      relevantAncestors.add(
-        `${depth}-${Math.floor(address.col / scale)}-${Math.floor(address.row / scale)}`,
-      );
-    }
+    descendants.push(id);
   }
-  const covered = (depth, col, row) => {
-    const id = `${depth}-${col}-${row}`;
-    if (desiredTileIds.has(id)) return true;
-    if (depth >= maxDepth || !relevantAncestors.has(id)) return false;
-    for (let dx = 0; dx < 2; dx++) {
-      for (let dy = 0; dy < 2; dy++) {
-        if (!covered(depth + 1, col * 2 + dx, row * 2 + dy)) return false;
-      }
-    }
-    return true;
-  };
-  return covered(parent.depth, parent.col, parent.row);
+  return descendants;
 }
 
 function disposeTileScatter(tileMesh) {
@@ -103,8 +85,10 @@ export function createTileLifecycle({
   log,
   onSceneMutated = () => {},
 }) {
-  function evict(mesh) {
+  function evict(mesh, reason = 'unspecified lifecycle eviction') {
     if (!mesh) return;
+    const tileId = mesh.userData?.tileId || '?';
+    log(tileId, `evicted — ${reason}`);
     terrainRoot.remove(mesh);
     disposeScatter(mesh);
     mesh.userData?.terrainPlaceholderTexture?.dispose?.();
@@ -116,21 +100,38 @@ export function createTileLifecycle({
       mesh.material?.dispose?.();
     }
     onSceneMutated();
+    return true;
   }
 
-  function evictCoveredAncestors(childTileId) {
+  function evictCoveredAncestors(childTileId, desiredTileIds = null) {
     const resident = new Map();
     for (const mesh of terrainRoot.children) {
       if (!mesh.isMesh || !mesh.userData.tileId) continue;
       resident.set(mesh.userData.tileId, Boolean(mesh.material?.map));
     }
-    for (const ancestorId of findCoveredTileAncestors(childTileId, resident)) {
+    const evictable = new Set(findCoveredTileAncestors(childTileId, resident));
+    const child = parseTileId(childTileId);
+    if (child && desiredTileIds instanceof Set) {
+      for (let depth = child.depth - 1; depth >= 0; depth--) {
+        const divisor = 2 ** (child.depth - depth);
+        const ancestorId = `${depth}-${Math.floor(child.col / divisor)}-${Math.floor(child.row / divisor)}`;
+        if (!resident.has(ancestorId) || desiredTileIds.has(ancestorId)) continue;
+        const demanded = desiredDescendantIds(ancestorId, desiredTileIds);
+        if (demanded.length > 0 && demanded.every(id => resident.get(id) === true)) {
+          evictable.add(ancestorId);
+        }
+      }
+    }
+    for (const ancestorId of evictable) {
       const mesh = terrainRoot.children.find(
         child => child.isMesh && child.userData.tileId === ancestorId,
       );
       if (!mesh) continue;
-      log(ancestorId, `evicted — eager complete descendant coverage (triggered by ${childTileId})`);
-      evict(mesh);
+      const reason = desiredTileIds instanceof Set
+        ? `demanded descendants textured (triggered by ${childTileId})`
+        : `complete descendant coverage (triggered by ${childTileId})`;
+      evict(mesh, reason);
+      resident.delete(ancestorId);
     }
   }
 
@@ -151,8 +152,7 @@ export function createTileLifecycle({
         }
       }
       if (!reason) continue;
-      log(existingId || '?', `evicted — ${reason}`);
-      evict(existing);
+      evict(existing, reason);
     }
     terrainRoot.add(mesh);
     onSceneMutated();
@@ -160,48 +160,30 @@ export function createTileLifecycle({
 
   function sweepStaleParents(tiles, currentTileIds) {
     const meshById = new Map();
-    const covered = new Set();
-    let maxDepth = 0;
     for (const mesh of terrainRoot.children) {
       if (!mesh.isMesh || !mesh.userData.tileId) continue;
       const id = mesh.userData.tileId;
       meshById.set(id, mesh);
-      const address = parseTileId(id);
-      if (address) maxDepth = Math.max(maxDepth, address.depth);
-      if (mesh.material?.map) covered.add(id);
-    }
-
-    const descendantCovered = new Set();
-    for (let depth = maxDepth; depth > 0; depth--) {
-      const quadrantsByParent = new Map();
-      for (const id of covered) {
-        const address = parseTileId(id);
-        if (!address || address.depth !== depth) continue;
-        const parentId = `${depth - 1}-${Math.floor(address.col / 2)}-${Math.floor(address.row / 2)}`;
-        const quadrant = (address.col & 1) * 2 + (address.row & 1);
-        let quadrants = quadrantsByParent.get(parentId);
-        if (!quadrants) quadrantsByParent.set(parentId, quadrants = new Set());
-        quadrants.add(quadrant);
-      }
-      for (const [parentId, quadrants] of quadrantsByParent) {
-        if (quadrants.size !== 4) continue;
-        descendantCovered.add(parentId);
-        covered.add(parentId);
-      }
     }
 
     const staleIds = new Set();
-    for (const parentId of descendantCovered) {
-      if (meshById.has(parentId) && !currentTileIds.has(parentId)) staleIds.add(parentId);
+    for (const [parentId] of meshById) {
+      if (currentTileIds.has(parentId)) continue;
+      const demanded = desiredDescendantIds(parentId, currentTileIds);
+      if (
+        demanded.length > 0
+        && demanded.every(id => Boolean(meshById.get(id)?.material?.map))
+      ) {
+        staleIds.add(parentId);
+      }
     }
     for (const parentId of staleIds) {
       const parent = meshById.get(parentId);
       if (!parent) continue;
       const reason = parent.material?.map
-        ? 'evicted — stale parent (children now textured)'
-        : 'evicted — stale noTex parent (children now textured)';
-      log(parentId, reason);
-      evict(parent);
+        ? 'stale parent (children now textured)'
+        : 'stale noTex parent (children now textured)';
+      evict(parent, reason);
     }
     return staleIds.size;
   }
@@ -316,7 +298,7 @@ export function createTerrainTextureController({
     }
     mesh.userData.terrainPlaceholderTexture = texture;
     onMaterialApplied(mesh);
-    lifecycle.evictCoveredAncestors(tile.id);
+    lifecycle.evictCoveredAncestors(tile.id, desiredTileIds);
   }
 
   function drainApplications() {
@@ -344,7 +326,7 @@ export function createTerrainTextureController({
           log(tileId, 'cached but NO mesh in scene');
         }
       }
-      lifecycle.evictCoveredAncestors(tileId);
+      lifecycle.evictCoveredAncestors(tileId, desiredTileIds);
     }
     if (pendingApplications.size > 0) scheduleApplicationFrame();
   }
@@ -439,7 +421,41 @@ export function reconcileTerrainTiles({
   completeCoverage = false,
   onReleaseTile = () => {},
 }) {
-  const { nextTileIds, added, removed } = diffTerrainTileIds(tiles, currentTileIds);
+  const tileById = new Map(tiles.map(tile => [tile.id, tile]));
+  const refreshedIds = new Set();
+
+  // A tile ID alone does not identify its rendered geometry. The server
+  // repairs edges against the neighbors in each response, so an unchanged ID
+  // may carry a new heightmap after a nearby LOD transition. Treat those
+  // payload changes like additions so the stale mesh is rebuilt in place.
+  for (const mesh of [...terrainRoot.children]) {
+    const tileId = mesh.userData?.tileId;
+    const nextTile = tileById.get(tileId);
+    const previousPayload = mesh.userData?.heightmapPayload;
+    if (
+      !mesh.isMesh
+      || !nextTile?.heightmap
+      || typeof previousPayload !== 'string'
+      || previousPayload === nextTile.heightmap
+    ) continue;
+    log(tileId, 'refresh queued — repaired heightmap changed');
+    refreshedIds.add(tileId);
+  }
+
+  // Deferred tiles have no resident mesh to inspect, but must still use the
+  // newest repaired payload when their texture eventually arrives.
+  for (const [tileId, deferredTile] of deferredTiles) {
+    const nextTile = tileById.get(tileId);
+    if (!nextTile) continue;
+    if (deferredTile.heightmap !== nextTile.heightmap) {
+      deferredTiles.set(tileId, nextTile);
+    }
+  }
+
+  const diffBaseIds = refreshedIds.size === 0
+    ? currentTileIds
+    : new Set([...currentTileIds].filter(id => !refreshedIds.has(id)));
+  const { nextTileIds, added, removed } = diffTerrainTileIds(tiles, diffBaseIds);
   let purged = 0;
   for (const id of deferredTiles.keys()) {
     if (!nextTileIds.has(id)) {
@@ -448,12 +464,12 @@ export function reconcileTerrainTiles({
     }
   }
 
-  // `removed` is the release half of the moving heatmap. Keep an old parent
-  // only when the new desired descendants completely cover its footprint; it
-  // then remains a no-hole fallback until those descendants are textured.
+  // Keep a coarse tile whenever the new demand contains descendants inside
+  // it. Only demanded descendants matter: quadrants outside the circular
+  // heatmap are intentionally absent and must not force a boundary hole.
   let released = 0;
   const retainedFallbackIds = new Set(
-    removed.filter(id => desiredDescendantsCover(id, nextTileIds)),
+    removed.filter(id => desiredDescendantIds(id, nextTileIds).length > 0),
   );
   const removedIds = new Set(removed);
   for (const tileId of removedIds) {
@@ -463,8 +479,7 @@ export function reconcileTerrainTiles({
     const tileId = mesh.userData?.tileId;
     if (!mesh.isMesh || !removedIds.has(tileId)) continue;
     if (retainedFallbackIds.has(tileId)) continue;
-    log(tileId, 'evicted — outside current terrain demand');
-    lifecycle.evict(mesh);
+    lifecycle.evict(mesh, 'outside current terrain demand');
     released += 1;
   }
 
@@ -496,7 +511,7 @@ export function reconcileTerrainTiles({
     const candidates = prioritizeTerrainBuildCandidates(tiles, new Set(added), priorityForTile);
     let built = 0;
     for (const { tile } of candidates) {
-      if (existingIds.has(tile.id)) continue;
+      if (existingIds.has(tile.id) && !refreshedIds.has(tile.id)) continue;
       const cachedTexture = textureCache.get(tile.id);
       if (cachedTexture) {
         deferredTiles.set(tile.id, tile);
@@ -511,6 +526,27 @@ export function reconcileTerrainTiles({
       }
 
       deferredTiles.set(tile.id, tile);
+      const existingRefreshMesh = refreshedIds.has(tile.id)
+        ? terrainRoot.children.find(mesh => mesh.isMesh && mesh.userData?.tileId === tile.id)
+        : null;
+      if (existingRefreshMesh) {
+        if (existingRefreshMesh.material?.map) {
+          log(tile.id, 'refresh deferred — textured geometry remains until atomic replacement');
+        } else if (completeCoverage || built < buildBudget) {
+          const mesh = buildMesh(tile);
+          if (mesh) {
+            applyTileDepthOffset(mesh, tile.id, depthOffsetEnabled);
+            prepareUntexturedMesh(mesh);
+            terrainRoot.add(mesh);
+            onMeshAdded(mesh);
+            lifecycle.evict(existingRefreshMesh, 'atomically replaced by repaired geometry');
+          }
+          built += 1;
+        } else {
+          log(tile.id, `refresh deferred — build budget exceeded, built=${built}/${buildBudget}`);
+        }
+        continue;
+      }
       const hasStaleCoverage = terrainRoot.children.some(mesh => (
         mesh.isMesh && mesh.material?.map && mesh.userData?.bbox && overlaps(mesh.userData.bbox, tile.bbox)
       ));

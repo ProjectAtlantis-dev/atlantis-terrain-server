@@ -27,7 +27,7 @@ import { createTileHistory, terrainFogDistance, tileDepthFromId } from './terrai
 import { createTextureStreamer, rendererTextureAnisotropy } from './terrain-texture-streamer.js';
 import { evaluateTerrainRefetch, summarizeTerrainCamera, terrainCameraCoordinates, terrainCameraGridPosition, terrainCameraStereoPosition } from './terrain-tile-fetch.js';
 import { applyTerrainAvailabilityStatus } from './terrain-status-controller.js';
-import { collectTerrainDebugMeshes, createTerrainHoverOutlineController, createTerrainMapGridController, summarizeTerrainMesh } from './terrain-debug-runtime.js';
+import { collectTerrainDebugMeshes, createTerrainHoverOutlineController, createTerrainMapGridController, formatTerrainSeamDiagnostic, summarizeTerrainMesh } from './terrain-debug-runtime.js';
 import { createTerrainFetchRuntime } from './terrain-fetch-runtime.js';
 import { createTerrainTileSet } from './terrain-tile-set.js';
 import { createTerrainClassifierRuntime } from './terrain-classifier-runtime.js';
@@ -37,7 +37,12 @@ import { createTerrainFpsCounter } from './terrain-fps-counter.js';
 import { loadTerrainStartupAssets } from './terrain-startup-assets.js';
 import { createTerrainAtmosphereTextureRuntime } from './terrain-atmosphere-textures.js';
 import { createTerrainTuningControls } from './terrain-tuning-controls.js';
-import { bindTerrainCloudComposition, configureTerrainClouds, registerTerrainCloudTuning } from './terrain-cloud-runtime.js';
+import {
+  bindTerrainCloudComposition,
+  configureTerrainClouds,
+  invalidateTerrainCloudHistory,
+  registerTerrainCloudTuning,
+} from './terrain-cloud-runtime.js';
 import { createTerrainHouseSceneRuntime } from './terrain-house-scene-runtime.js';
 import { createTerrainBuildingsRuntime } from './terrain-buildings-runtime.js';
 import { createTerrainTileMenuRuntime } from './terrain-tile-menu-runtime.js';
@@ -77,20 +82,24 @@ const WEBGPU_ATMOSPHERE_DEFAULTS = Object.freeze({
   groundAlbedo: 0.3
 });
 const WEBGPU_CLOUD_SHADOW_DEFAULTS = Object.freeze({
-  // WebGPU clouds are intentionally unavailable for now. Takram CloudsEffect
-  // is WebGL-only; keep this provisional shadow path hard-disabled until a
-  // complete WebGPU cloud renderer exists.
+  // The dual-depth path is implemented as an opt-in diagnostic until its
+  // sun-depth convention and shaft energy are calibrated visually.
   enabled: false,
   debugSurface: false,
   coverage: 0.52,
   density: 1.15,
-  strength: 1
+  strength: 1,
+  shaftsEnabled: false,
+  shaftStrength: 0.82,
+  indirectFloor: 0.28
 });
 const webgpuAtmosphereSettings = { ...WEBGPU_ATMOSPHERE_DEFAULTS };
 const webgpuCloudShadowSettings = {
   ...WEBGPU_CLOUD_SHADOW_DEFAULTS,
-  // Shareable validation view; the UI toggle remains the normal control.
-  enabled: window.location.hash !== '#no-cloud-shadows',
+  // Shareable opt-in validation views; the UI toggles remain normal controls.
+  enabled: window.location.hash === '#cloud-shadows'
+    || window.location.hash === '#shadow-mask',
+  shaftsEnabled: window.location.hash === '#god-rays',
   debugSurface: window.location.hash === '#shadow-mask'
 };
 
@@ -197,7 +206,7 @@ const mapCam = new THREE.OrthographicCamera(-1, 1, 1, -1, 1, MAP_CAM_ALT + 5000)
 mapCam.up.copy(north);
 mapCam.layers.enable(0);
 const DEFAULT_MAP_ZOOM = 20000;
-// Enough headroom to inspect the complete local forward coverage oval.
+// Enough headroom to inspect the complete local coverage circle.
 const MAX_MAP_ZOOM = 100000;
 
 const controls = {
@@ -208,10 +217,11 @@ const controls = {
   dragging: false,
   dragButton: 0,
   mapMode: false,
+  seamMode: false,
   mapZoom: DEFAULT_MAP_ZOOM,
   mapPanEast: 0,
   mapPanNorth: 0,
-  terrainRange: 20000,
+  terrainRange: 30000,
   keys: {}
 };
 const terrainViewForward = new THREE.Vector3();
@@ -276,6 +286,7 @@ let heatmapRuntime = null;
 
 const { hud, alt, gameClock: gameClockEl } = createTerrainHud({
   onToggleMapMode: () => toggleMapMode(),
+  onToggleSeamMode: () => toggleSeamMode(),
   onToggleHeatmap: () => toggleHeatmap(),
   onToggleRenderBackend: () => {
     // beforeunload normally saves this too, but make the renderer transition
@@ -339,6 +350,24 @@ tileInfoEl.style.cssText = [
 ].join(';');
 document.body.appendChild(tileInfoEl);
 
+const seamLegendEl = document.createElement('div');
+seamLegendEl.setAttribute('aria-label', 'Seam diagnostic legend');
+seamLegendEl.style.cssText = [
+  'position:absolute', 'right:12px', 'bottom:12px', 'display:none', 'z-index:6',
+  'color:#e2e8f0', 'background:rgba(2,6,23,0.88)', 'padding:8px 12px',
+  'border:1px solid #334155', 'border-radius:6px',
+  'font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace',
+  'pointer-events:none',
+].join(';');
+seamLegendEl.innerHTML = [
+  '<b>Shared-edge health</b>',
+  '<span style="color:#ff1744">●</span> bad: &gt;1m height or &gt;20° normals',
+  '<span style="color:#f59e0b">●</span> inspect: &gt;5cm height or &gt;5° normals',
+  '<span style="color:#64748b">●</span> aligned',
+  'Hover a tile for exact edge + neighbor.',
+].join('<br>');
+document.body.appendChild(seamLegendEl);
+
 // --- Atmosphere / Clouds tuning panel ---
 const tuningPanel = document.createElement('div');
 tuningPanel.style.cssText = [
@@ -360,11 +389,17 @@ tuningPanel.addEventListener('change', requestRender);
 
 const tuningHeader = document.createElement('div');
 tuningHeader.style.cssText = 'padding:8px 12px;cursor:pointer;display:flex;justify-content:space-between;align-items:center';
-tuningHeader.innerHTML = '<span>Atmosphere</span><span id="tuning-toggle">&#9660;</span>';
+tuningHeader.innerHTML = '<span>Scene settings</span><span id="tuning-toggle">&#9660;</span>';
 tuningPanel.appendChild(tuningHeader);
 
 const tuningBody = document.createElement('div');
-tuningBody.style.cssText = 'padding:0 12px 10px;display:none';
+tuningBody.style.cssText = [
+  'padding:0 12px 10px',
+  'display:none',
+  'max-height:calc(100vh - 70px)',
+  'overflow-y:auto',
+  'overscroll-behavior:contain'
+].join(';');
 tuningPanel.appendChild(tuningBody);
 
 let tuningPanelOpen = false;
@@ -378,7 +413,7 @@ tuningHeader.onclick = () => {
 // --- Tuning panel persistence ---
 const TUNING_STORAGE_KEY = 'clouds-tuning';
 const tuningState = JSON.parse(localStorage.getItem(TUNING_STORAGE_KEY) || '{}');
-const WEBGPU_CALIBRATION_VERSION = 5;
+const WEBGPU_CALIBRATION_VERSION = 6;
 if (tuningState.webgpuCalibrationVersion !== WEBGPU_CALIBRATION_VERSION) {
   if (
     tuningState['webgpu exposure'] == null
@@ -400,6 +435,10 @@ if (tuningState.webgpuCalibrationVersion !== WEBGPU_CALIBRATION_VERSION) {
   if (tuningState.haze == null || tuningState.haze === 4.5) {
     tuningState.haze = WEBGPU_DEFAULT_HAZE;
   }
+  // Version 6 introduced experimental dual-depth volumetrics. Never carry an
+  // opt-in from an earlier development session into the normal renderer.
+  tuningState['cloud shadows'] = false;
+  tuningState['god rays'] = false;
   tuningState.webgpuCalibrationVersion = WEBGPU_CALIBRATION_VERSION;
 }
 if (tuningState.brightness == null && tuningState['webgpu exposure'] != null) {
@@ -430,6 +469,7 @@ const {
 
 // We'll call this after aerialPerspective + cloudsEffect are created.
 function buildTuningControls(ap, ce) {
+  let cloudTuning = null;
   tuningSectionLabel('Date / Time');
   const monthNames = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
   tuningSlider('month', {
@@ -465,15 +505,34 @@ function buildTuningControls(ap, ce) {
     value: ap.inscatter,
     onChange: v => { ap.inscatter = v; }
   });
-  registerTerrainCloudTuning({
+  if (renderBackend.lensFlare) {
+    tuningSectionLabel('Lens Flare');
+    tuningSlider('flare intensity', {
+      min: 0, max: 0.05, step: 0.001, value: renderBackend.lensFlare.intensity,
+      decimals: 3,
+      onChange: v => { renderBackend.lensFlare.intensity = v; }
+    });
+    tuningSlider('flare threshold', {
+      min: 0, max: 30, step: 0.5, value: renderBackend.lensFlare.thresholdLevel,
+      decimals: 1,
+      onChange: v => { renderBackend.lensFlare.thresholdLevel = v; }
+    });
+  }
+  cloudTuning = registerTerrainCloudTuning({
     effect: ce, controls,
     section: tuningSectionLabel,
     slider: tuningSlider,
     toggle: tuningToggle,
+    // one wind: cloud drift heading follows the water wind direction
+    getWindDirection: () => waterParams.windDirection,
   });
   }
   if (waterRuntime.enabled) {
   tuningSectionLabel('Water');
+  tuningToggle('dynamic water', {
+    value: waterParams.enabled,
+    onChange: v => { waterParams.enabled = v; }
+  });
   tuningSlider('wind speed', {
     min: 1, max: 28, step: 0.1, value: waterParams.windSpeed,
     decimals: 1,
@@ -483,7 +542,23 @@ function buildTuningControls(ap, ce) {
     min: 0, max: 360, step: 1, value: waterParams.windDirection,
     decimals: 0,
     format: v => `${v.toFixed(0)}°`,
-    onChange: v => { waterParams.windDirection = v; waterRuntime.applyWind(); }
+    onChange: v => {
+      waterParams.windDirection = v;
+      waterRuntime.applyWind();
+      cloudTuning?.syncDrift();
+    }
+  });
+  tuningSlider('fetch', {
+    min: 10, max: 1000, step: 10, value: waterParams.fetchKm,
+    decimals: 0,
+    format: v => `${v.toFixed(0)}km`,
+    onChange: v => { waterParams.fetchKm = v; waterRuntime.applyWind(); }
+  });
+  tuningSlider('shore fetch ramp', {
+    min: 0, max: 8000, step: 100, value: waterParams.shoreFetchRamp,
+    decimals: 0,
+    format: v => `${v.toFixed(0)}m`,
+    onChange: v => { waterParams.shoreFetchRamp = v; }
   });
   tuningSlider('swell scale', {
     min: 0.3, max: 2, step: 0.01, value: waterParams.amplitude,
@@ -493,13 +568,28 @@ function buildTuningControls(ap, ce) {
     min: 0.4, max: 1.6, step: 0.01, value: waterParams.choppiness,
     onChange: v => { waterParams.choppiness = v; }
   });
-  tuningSlider('whitecaps', {
-    min: 0, max: 2, step: 0.01, value: waterParams.foamAmount,
-    onChange: v => { waterParams.foamAmount = v; }
+  tuningSlider('water opacity', {
+    min: 0, max: 0.8, step: 0.01, value: waterParams.opacity,
+    onChange: v => { waterParams.opacity = v; }
   });
-  tuningSlider('water tint', {
-    min: 0, max: 1, step: 0.01, value: waterParams.tintStrength,
-    onChange: v => { waterParams.tintStrength = v; }
+  tuningSlider('water reflect', {
+    min: 0, max: 1.5, step: 0.01, value: waterParams.reflectivity,
+    onChange: v => { waterParams.reflectivity = v; }
+  });
+  tuningSlider('sun glint', {
+    min: 0, max: 4, step: 0.05, value: waterParams.glintStrength,
+    onChange: v => { waterParams.glintStrength = v; }
+  });
+  tuningSlider('water absorb', {
+    min: 0, max: 0.4, step: 0.005, value: waterParams.absorption,
+    decimals: 3,
+    onChange: v => { waterParams.absorption = v; }
+  });
+  tuningSlider('north cliff reflection pad', {
+    min: 0, max: 2000, step: 25, value: waterParams.northCliffReflectionPadding,
+    decimals: 0,
+    format: v => `${v.toFixed(0)}m`,
+    onChange: v => { waterParams.northCliffReflectionPadding = v; }
   });
   tuningSlider('water bright', {
     min: 0.1, max: 6, step: 0.05, value: waterParams.radiance,
@@ -537,6 +627,73 @@ function buildTuningControls(ap, ce) {
       onChange: applyWebGPUHaze
     });
     applyWebGPUHaze(Number(tuningState.haze ?? WEBGPU_DEFAULT_HAZE));
+    tuningSectionLabel('Experimental Volumetrics');
+    tuningToggle('cloud shadows', {
+      value: webgpuCloudShadowSettings.enabled,
+      onChange: v => {
+        webgpuCloudShadowSettings.enabled = v;
+        webgpuAtmosphere?.applyCloudShadowSettings();
+      }
+    });
+    tuningSlider('cloud coverage', {
+      min: 0, max: 1, step: 0.01,
+      value: webgpuCloudShadowSettings.coverage,
+      decimals: 2,
+      onChange: v => {
+        webgpuCloudShadowSettings.coverage = v;
+        webgpuAtmosphere?.applyCloudShadowSettings();
+      }
+    });
+    tuningSlider('cloud density', {
+      min: 0, max: 2.5, step: 0.01,
+      value: webgpuCloudShadowSettings.density,
+      decimals: 2,
+      onChange: v => {
+        webgpuCloudShadowSettings.density = v;
+        webgpuAtmosphere?.applyCloudShadowSettings();
+      }
+    });
+    tuningSlider('shadow strength', {
+      min: 0, max: 2, step: 0.01,
+      value: webgpuCloudShadowSettings.strength,
+      decimals: 2,
+      onChange: v => {
+        webgpuCloudShadowSettings.strength = v;
+        webgpuAtmosphere?.applyCloudShadowSettings();
+      }
+    });
+    tuningToggle('god rays', {
+      value: webgpuCloudShadowSettings.shaftsEnabled,
+      onChange: v => {
+        webgpuCloudShadowSettings.shaftsEnabled = v;
+        webgpuAtmosphere?.applyCloudShadowSettings();
+      }
+    });
+    tuningSlider('indirect floor', {
+      min: 0, max: 1, step: 0.01,
+      value: webgpuCloudShadowSettings.indirectFloor,
+      decimals: 2,
+      onChange: v => {
+        webgpuCloudShadowSettings.indirectFloor = v;
+        webgpuAtmosphere?.applyCloudShadowSettings();
+      }
+    });
+    tuningSlider('god ray strength', {
+      min: 0, max: 1, step: 0.01,
+      value: webgpuCloudShadowSettings.shaftStrength,
+      decimals: 2,
+      onChange: v => {
+        webgpuCloudShadowSettings.shaftStrength = v;
+        webgpuAtmosphere?.applyCloudShadowSettings();
+      }
+    });
+    tuningToggle('shadow mask', {
+      value: webgpuCloudShadowSettings.debugSurface,
+      onChange: v => {
+        webgpuCloudShadowSettings.debugSurface = v;
+        webgpuAtmosphere?.applyCloudShadowSettings();
+      }
+    });
   } else {
   tuningSlider('fog strength', {
     min: 1, max: 10, step: 0.5, value: 4.5,
@@ -589,10 +746,18 @@ scene.add(terrainRoot);
 // dropped to -10 m server-side, so the surface has volume above the seabed
 // and land occludes it naturally. Inert on backends without createWater.
 const waterParams = { ...DEFAULT_WATER_PARAMS };
+// Bumped whenever a tile's displayed texture actually changes; the water
+// runtime re-captures its bathymetry (which bakes tile-texture brightness
+// into the reflection gate) once the streaming burst settles instead of
+// serving a stale capture.
+let terrainTextureVersion = 0;
+const appliedTileTextures = new WeakMap();
 const waterRuntime = createWaterRuntime({
   backend: renderBackend, scene, terrainRoot,
   anchorPosition, east, north, up,
   getSunDirection: () => sunDirection,
+  getTextureVersion: () => terrainTextureVersion,
+  log: (event, details) => enqueueClientLog('info', event, details),
   params: waterParams,
 });
 
@@ -807,6 +972,7 @@ aerialPerspective.shadowSampleCount = 12;
 
 // Wire up tuning panel now that effects exist
 const sunDirection = new THREE.Vector3();
+let restoreCloudTemporalHistory = null;
 
 function applyDate(date, { force = true } = {}) {
   const dateMs = date.getTime();
@@ -819,7 +985,14 @@ function applyDate(date, { force = true } = {}) {
   }
   gameClockState.lastSunSyncTimeMs = dateMs;
   gameClockState.renderedDate = new Date(date);
+  const previousSunDirection = sunDirection.clone();
   getSunDirectionECEF(date, sunDirection);
+  if (
+    !USE_WEBGPU_RENDER_BACKEND &&
+    !previousSunDirection.equals(sunDirection)
+  ) {
+    restoreCloudTemporalHistory = invalidateTerrainCloudHistory(cloudsEffect);
+  }
   aerialPerspective.sunDirection.copy(sunDirection);
   cloudsEffect.sunDirection.copy(sunDirection);
   webgpuAtmosphere?.updateDate(date, sunDirection);
@@ -882,7 +1055,7 @@ function markMissing(missing, downloading) {
 // --- Deferred tile system ---
 const { history: tileHistory, log: tileLog } = createTileHistory({
   getPass: () => terrainPipelineState.loadPass,
-  emit: details => enqueueClientLog('debug', 'tile', details),
+  emit: (details, level) => enqueueClientLog(level, 'tile', details),
 });
 
 // --- Texture streaming ---
@@ -922,10 +1095,17 @@ const terrainTileSet = createTerrainTileSet({
   vehicle: vehicleRuntime,
   events: {
     onMutated: markSceneMutated,
-    onMaterialApplied: () => {
-      // Texture arrival/upgrade does not bump sceneMutationVersion (that
-      // tracks mesh add/remove), so tell the water colour capture directly.
-      waterRuntime.markColorDirty();
+    // onMaterialApplied fires for every tile on every application pass, not
+    // just real changes — the reconciler reapplies constantly. Only actual
+    // map swaps may bump the texture version, or the water runtime's
+    // "textures settled" recapture never settles and rebakes the bathymetry
+    // (a full ortho scene render) every debounce interval forever.
+    onMaterialApplied: mesh => {
+      const map = mesh?.material?.map ?? null;
+      if (appliedTileTextures.get(mesh) !== map) {
+        appliedTileTextures.set(mesh, map);
+        terrainTextureVersion += 1;
+      }
       requestRender();
     },
   },
@@ -1099,7 +1279,12 @@ function needsContinuousRender() {
     hasActiveKeyInput() ||
     Math.abs(controls.speed) > 1e-3 ||
     Math.abs(controls.strafeSpeed) > 1e-3 ||
-    vehicleRuntime.vehicleControlActive
+    vehicleRuntime.vehicleControlActive ||
+    // Animated water must hold the loop open on backends that actually idle
+    // (WebGPU; the WebGL backend never stops once started). Mirrors the
+    // waterRuntime.update visibility gate.
+    (waterRuntime.enabled && waterParams.enabled &&
+      !controls.mapMode && !classifierRuntime.active)
   );
 }
 
@@ -1180,19 +1365,13 @@ const TERRAIN_DEMAND_HEADING_THRESHOLD = 2 * Math.PI / 180;
 const TERRAIN_DEMAND_HEADING_SETTLE_MS = 200;
 
 function commitTerrainDemandHeading(previousHeading, heading) {
-  textureStreamer.abortAll();
-  terrainTileSet.resetTextureApplications();
-  // A rotated oval exposes new horizon ground, so establish complete coarse
-  // coverage before resuming the budgeted full-detail pass.
-  terrainFetchRuntime.reset(1);
-  terrainPipelineState.lastTiles = null;
-  terrainPipelineState.heightmapsMissing = 0;
-  terrainPipelineState.heightmapsDownloading = 0;
-  terrainPipelineState.lastFetchTriggerMs = performance.now();
+  // Circular geometry demand is heading-independent. Turning only reranks
+  // paint within the existing footprint; it must not rebuild tile residency.
+  terrainTileSet.refreshTextures();
   enqueueClientLog('info', 'terrainDemand.heading.reset', {
     previousHeading, heading,
   });
-  terrainFetchRuntime.request();
+  requestRender();
 }
 const terrainHeadingDemand = createTerrainHeadingDemandController({
   initialHeading: initialTerrainDemandHeading,
@@ -1337,6 +1516,8 @@ window.takramDebug = {
   bootEvents,
   getBootEvents: () => bootEvents.slice(),
   getCloudShadowDebugSummary: () => webgpuAtmosphere?.debugSummary() ?? null,
+  // Water port bisect: 0 normal | 1 fetch open | 2 +de-tile bypass | 3 data paint
+  setWaterDebugMode: mode => waterRuntime.setDebugMode?.(mode),
   flushClientLogQueue: () => flushClientLogQueue(),
   fetchTiles: terrainFetchRuntime.request,
   loadHouseModel: houseRuntime.loadHouseModel,
@@ -1600,9 +1781,11 @@ function updateHud() {
   }
   const modeLabel = heatmapRuntime?.active
     ? 'HEATMAP'
-    : controls.mapMode
-      ? 'MAP'
-      : (vehicleRuntime.vehicleControlActive ? 'VEHICLE' : 'FLIGHT');
+    : controls.seamMode
+      ? 'SEAMS'
+      : controls.mapMode
+        ? 'MAP'
+        : (vehicleRuntime.vehicleControlActive ? 'VEHICLE' : 'FLIGHT');
   const modeHtml = vehicleRuntime.vehicleControlActive
     ? '<span style="color:#ff3b30">VEHICLE</span>'
     : modeLabel;
@@ -1644,7 +1827,8 @@ function updateHud() {
       ? 'W/S drive, A/D steer, mouse orbit camera, Esc exits vehicle control'
       : 'WASD or Arrows move, Q/Z altitude, drag look',
     'map: left-drag rotate, right-drag pan, wheel zoom',
-    `<span id="mapModeLink" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">${controls.mapMode && !heatmapRuntime?.active ? '3D view' : 'map mode'}</span> (M)` +
+    `<span id="mapModeLink" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">${controls.mapMode && !controls.seamMode && !heatmapRuntime?.active ? '3D view' : 'map mode'}</span> (M)` +
+      ` · <span id="seamModeLink" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">${controls.seamMode ? '3D view' : 'seam view'}</span>` +
       ` · <span id="heatmapModeLink" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">${heatmapRuntime?.active ? '3D view' : 'heatmap'}</span> (H)` +
       ' · Google 3D (G)' +
       ` · <span id="roadDebugLink" style="color:${roadDebugColor};text-decoration:underline;cursor:pointer;pointer-events:auto">${roadDebugLabel}</span> (R)` +
@@ -1672,7 +1856,9 @@ function updateHud() {
     `  FOV ${camera.fov.toFixed(0)}°` +
     (heatmapRuntime?.active
       ? '  [HEATMAP]'
-      : (controls.mapMode ? '  [MAP]' : (vehicleRuntime.vehicleControlActive ? '  [VEHICLE]' : '')));
+      : (controls.seamMode
+        ? '  [SEAMS]'
+        : (controls.mapMode ? '  [MAP]' : (vehicleRuntime.vehicleControlActive ? '  [VEHICLE]' : ''))));
   if (altText !== lastAltText) {
     alt.textContent = altText;
     lastAltText = altText;
@@ -1691,6 +1877,7 @@ function resetView() {
   controls.dragging = false;
   controls.dragButton = 0;
   controls.mapMode = false;
+  controls.seamMode = false;
   heatmapRuntime?.setPresentation('hidden');
   vehicleRuntime.setVehicleControlActive(false, 'reset');
   controls.mapPanEast = 0;
@@ -1749,15 +1936,18 @@ function syncMapModePresentation() {
   mapLocationMarkerEl.style.display = controls.mapMode && !heatmapActive ? 'block' : 'none';
   renderer.domElement.style.visibility = heatmapActive ? 'hidden' : 'visible';
   tuningPanel.style.display = controls.mapMode ? 'none' : '';
+  seamLegendEl.style.display = controls.seamMode && !heatmapActive ? 'block' : 'none';
 }
 
 function toggleHeatmap() {
   const transition = resolveTerrainViewToggle({
     mapMode: controls.mapMode,
     heatmapActive: heatmapRuntime.active,
+    seamMode: controls.seamMode,
   }, 'heatmap');
   if (!transition.accepted) return;
   controls.mapMode = transition.mapMode;
+  controls.seamMode = transition.seamMode;
   if (transition.heatmapActive) {
     cameraRuntimeState.driftMode = false;
     controls.strafeSpeed = 0;
@@ -1778,9 +1968,11 @@ function toggleMapMode() {
   const transition = resolveTerrainViewToggle({
     mapMode: controls.mapMode,
     heatmapActive: heatmapRuntime.active,
+    seamMode: controls.seamMode,
   }, 'map');
   if (!transition.accepted) return;
   controls.mapMode = transition.mapMode;
+  controls.seamMode = transition.seamMode;
   heatmapRuntime.setPresentation('hidden');
   cameraRuntimeState.driftMode = false;
   controls.strafeSpeed = 0;
@@ -1799,6 +1991,34 @@ function toggleMapMode() {
   if (terrainPipelineState.lastTiles) {
     terrainTileSet.refreshTextures();
   }
+}
+
+function toggleSeamMode() {
+  const transition = resolveTerrainViewToggle({
+    mapMode: controls.mapMode,
+    heatmapActive: heatmapRuntime.active,
+    seamMode: controls.seamMode,
+  }, 'seam');
+  if (!transition.accepted) return;
+  controls.mapMode = transition.mapMode;
+  controls.seamMode = transition.seamMode;
+  heatmapRuntime.setPresentation('hidden');
+  cameraRuntimeState.driftMode = false;
+  controls.strafeSpeed = 0;
+  if (controls.mapMode) {
+    vehicleRuntime.setVehicleControlActive(false, 'seam-mode');
+  }
+  controls.mapPanEast = 0;
+  controls.mapPanNorth = 0;
+  if (controls.mapMode) {
+    updateMapCamera();
+  } else {
+    hideTileInfo();
+    hideTileMenu();
+  }
+  syncMapModePresentation();
+  updateHud();
+  requestRender();
 }
 
 function toggleClassifierMode() {
@@ -1958,9 +2178,19 @@ renderer.domElement.addEventListener('mousemove', event => {
   const src = texSource.get(info.tileId) || 'none';
   const srcLabel = `<span style="color:#f80">${src || 'no texture'}</span>`;
   const matHex = info.color !== '-' ? info.color : '#ffffff';
+  const seamRows = controls.seamMode ? mapGridController.diagnosticsForTile(info.tileId) : [];
+  const badSeams = seamRows.filter(seam => seam.severity === 'bad').length;
+  const warningSeams = seamRows.filter(seam => seam.severity === 'warning').length;
   tileInfoEl.innerHTML = [
     `<b style="color:${matHex}">${info.tileId}</b>`,
     `tex: ${info.hasTexture ? 'YES' : 'NO'} ${info.textureSize}  source: ${srcLabel}`,
+    controls.seamMode
+      ? `<b>shared edges: ${seamRows.length} · <span style="color:#ff1744">${badSeams} bad</span> · <span style="color:#f59e0b">${warningSeams} inspect</span></b>`
+      : null,
+    ...seamRows.slice(0, 8).map(seam => {
+      const color = seam.severity === 'bad' ? '#ff1744' : seam.severity === 'warning' ? '#f59e0b' : '#94a3b8';
+      return `<span style="color:${color}">${formatTerrainSeamDiagnostic(seam)}</span>`;
+    }),
     `<b>overlaps: ${overlappingMeshes.length}</b>`,
     overlapLines.length > 0 ? overlapLines.join('<br>') : null
   ].filter(Boolean).join('<br>');
@@ -2046,8 +2276,8 @@ function render() {
 
   // Keep classifier colors—including the effective-water pink—unobstructed.
   waterRuntime.update({
-    dt, nowMs, camera,
-    visible: !controls.mapMode && !classifierRuntime.active,
+    dt, camera,
+    visible: waterParams.enabled && !controls.mapMode && !classifierRuntime.active,
   });
 
   // Terrain streaming: check if camera moved far enough to re-fetch
@@ -2087,7 +2317,7 @@ function render() {
   vehicleRuntime.updateVehicleShadowSystem();
   houseRuntime.update(nowMs, controls.mapMode);
   vehicleRuntime.vehicleMarkerLayer.visible = controls.mapMode;
-  mapGridController.setVisible(controls.mapMode && !heatmapRuntime.active);
+  mapGridController.setVisible(controls.seamMode && !heatmapRuntime.active);
   if (controls.mapMode) {
     if (!heatmapRuntime.active) {
       mapGridController.update(collectTerrainDebugMeshes(terrainRoot, debugIntersectables));
@@ -2120,7 +2350,12 @@ function render() {
   }
   if (SCATTER_ENABLED && _scatterLib) updateScatterVisibility(terrainRoot, camera);
   webgpuAtmosphere?.updateCloudShadows(clock.elapsedTime);
-  renderBackend.renderScene(scene, camera);
+  try {
+    renderBackend.renderScene(scene, camera);
+  } finally {
+    restoreCloudTemporalHistory?.();
+    restoreCloudTemporalHistory = null;
+  }
   renderBackend.stopRenderLoopIfIdle();
 }
 

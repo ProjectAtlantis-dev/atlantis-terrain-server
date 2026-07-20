@@ -7,7 +7,7 @@ import {
   ToneMappingEffect,
   ToneMappingMode,
 } from 'postprocessing';
-import { DitheringEffect } from '../three-geospatial/packages/effects/src/index.ts';
+import { DitheringEffect, LensFlareEffect } from '../three-geospatial/packages/effects/src/index.ts';
 import { createWebGLWater } from './webgl-water.js';
 
 export function createTerrainBackend({
@@ -31,6 +31,9 @@ export function createTerrainBackend({
   renderer.toneMapping = THREE.NoToneMapping;
   renderer.toneMappingExposure = toneMappingExposure;
   let composer = null;
+  // HDR lens flare (sun disk + water glint). Created here, before the
+  // composer, so the tuning UI can bind to it ahead of pipeline configure.
+  const lensFlare = new LensFlareEffect();
   let demandRendering = null;
   let animationLoopActive = false;
   let sceneMutationVersion = 0;
@@ -48,6 +51,7 @@ export function createTerrainBackend({
     kind: 'webgl',
     defaultFogStrength: 4.5,
     renderer,
+    lensFlare,
     get sceneMutationVersion() { return sceneMutationVersion; },
     setFogDensity(value) { sceneFog.density = value; },
     setMapMode(active) { scene.fog = active ? null : sceneFog; },
@@ -82,8 +86,12 @@ export function createTerrainBackend({
       composer.addPass(new RenderPass(scene, camera));
       composer.addPass(normalPass);
       composer.addPass(new EffectPass(camera, cloudsEffect, aerialPerspective));
+      // Lens flare runs on the HDR frame AFTER sky/clouds (so the sun disk
+      // exists in the buffer) and BEFORE tone mapping. It thresholds bright
+      // pixels, so it flares the sun itself and any HDR water glint alike.
       composer.addPass(new EffectPass(
         camera,
+        lensFlare,
         new ToneMappingEffect({ mode: ToneMappingMode.AGX }),
         new DitheringEffect(),
       ));

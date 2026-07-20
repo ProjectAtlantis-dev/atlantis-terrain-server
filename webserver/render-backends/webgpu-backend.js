@@ -2,6 +2,7 @@ import * as THREE from 'three';
 import { WebGPURenderer } from 'three/webgpu';
 import { color, densityFogFactor, fog, uniform } from 'three/tsl';
 import { createWebGPUAtmosphereController } from './webgpu-atmosphere.js';
+import { createWebGPUWater } from './webgpu-water.js';
 
 /**
  * Create the WebGPU renderer adapter used by the shared terrain application.
@@ -31,6 +32,7 @@ export function createTerrainBackend({
   let postProcessing = null;
   let atmosphere = null;
   let ready = false;
+  let pendingAtmosphereDate = null;
   let animationLoopActive = false;
   let sceneMutationVersion = 0;
   let demandRendering = null;
@@ -61,10 +63,12 @@ export function createTerrainBackend({
       return atmosphere;
     },
     configureScenePipeline({ date }) {
-      atmosphere?.rebuild(date);
+      pendingAtmosphereDate = date;
+      if (ready) atmosphere?.rebuild(date);
     },
     setFogDensity(value) { fogDensity.value = value; },
     setMapMode(active) { fogDensity.value = active ? 0 : fogDensity.value; },
+    createWater(options) { return createWebGPUWater({ renderer, ...options }); },
     prepareUntexturedTerrain(mesh) {
       if (!mesh?.material || mesh.material.map) return;
       let needsUpdate = false;
@@ -139,7 +143,7 @@ export function createTerrainBackend({
     // Build the atmosphere against the initialized WebGPU device. The removed
     // water runtime used to trigger this rebuild incidentally when it became
     // ready; lighting must not depend on an unrelated optional surface.
-    atmosphere?.rebuild?.();
+    atmosphere?.rebuild?.(pendingAtmosphereDate ?? undefined);
     backend.requestRender();
   }).catch(error => {
     bootLog('renderer.webgpu.error', {

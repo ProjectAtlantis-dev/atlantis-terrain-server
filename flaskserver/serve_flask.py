@@ -655,23 +655,6 @@ def _parse_tile_id(tile_id: str) -> tuple[int, int, int] | None:
 
 
 
-def _tile_priority(bbox: list[float], qx: float, qy: float,
-                   fwd_x: float, fwd_y: float,
-                   forward_scale: float = 2.0) -> float:
-  tcx = (bbox[0] + bbox[2]) / 2
-  tcy = (bbox[1] + bbox[3]) / 2
-  dx, dy = tcx - qx, tcy - qy
-  dist = math.sqrt(dx * dx + dy * dy)
-  if dist <= 0:
-    return 0.0
-  along = dx * fwd_x + dy * fwd_y
-  across = dx * fwd_y - dy * fwd_x
-  scaled_along = along / max(1.0, forward_scale) if along > 0 else along
-  priority_dist = math.hypot(across, scaled_along)
-  dot = along / dist
-  return priority_dist / max(dot, 0.01)
-
-
 _METATILE_FINAL_SOURCE = "dataforsyningen_metatile4h2"
 _METATILE_UPGRADEABLE_SOURCES = {
   "sentinel2_crop",
@@ -875,6 +858,7 @@ def _queue_texture_fetch(
 
 
 _api_tiles_state: dict[str, str | None] = {"last_result": None}
+_terrain_lod_history: set[str] = set()
 _last_camera: dict[str, float] | None = None  # last /api/tiles pose, feeds /api/heatmap
 _BUILDING_QUERY_RANGE_M = 25000.0
 
@@ -914,10 +898,6 @@ def api_tiles():
   oy = _arg_float("oy", qy)
   alt = _arg_float("alt", 0.0)
   heading = _arg_float("heading", 0.0)
-  # Preview passes flood closest-first; full passes fetch by view priority.
-  preview = _arg_int("preview", 0) == 1
-  has_heading = request.args.get("heading") is not None
-
   global _last_camera
   _last_camera = {"qx": qx, "qy": qy, "alt": alt, "heading": heading,
                   "maxDepth": max_depth, "range": max_range}
@@ -931,8 +911,7 @@ def api_tiles():
       max_depth=max_depth,
       max_range=max_range,
       altitude=alt,
-      heading=heading if has_heading else None,
-      preview=preview,
+      lod_history=_terrain_lod_history,
       log=lambda msg: log.debug(f"[/api/tiles] {msg}"),
     )
   except Exception as exc:
@@ -961,11 +940,6 @@ def api_tiles():
     tex_fetching = list(_tex_fetching)
   tex_fetching_set = set(tex_fetching)
 
-  # JS/vehicle convention: heading 0 points north and positive heading turns
-  # toward west, hence east/X is -sin(heading).
-  fwd_x = -math.sin(heading) if heading else 0.0
-  fwd_y = math.cos(heading) if heading else 1.0
-
   tile_data = []
   tex_status_counts = {
     "ready": 0,
@@ -980,7 +954,6 @@ def api_tiles():
 
     bbox = tile["bbox"]
     tid = tile["id"]
-    priority = _tile_priority(bbox, qx, qy, fwd_x, fwd_y)
     tex_flags = _texture_flags(tid, texture_ids, tex_fetching_set)
     tex_status = str(tex_flags["status"])
     if tex_status in tex_status_counts:
@@ -999,18 +972,15 @@ def api_tiles():
         "texIsPlaceholder": bool(tex_flags["is_placeholder"]),
         "texAncestorId": tex_flags["ancestor_id"],
         "texIsFetching": bool(tex_flags["is_fetching"]),
-        "texPriority": math.log(max(priority, 1.0)),
       }
     )
 
   missing_data = []
   for tid, bbox in missing:
-    priority = _tile_priority(list(bbox), qx, qy, fwd_x, fwd_y)
     missing_data.append(
       {
         "id": tid,
         "bbox": [bbox[0] - ox, bbox[1] - oy, bbox[2] - ox, bbox[3] - oy],
-        "priority": priority,
       }
     )
 
@@ -1476,9 +1446,10 @@ def api_classifier_tile(tile_id: str):
   import io as _io
 
   from PIL import Image as _Image
-  from classifier.rendering import smooth_effective_water_mask
+  from classifier.rendering import paint_navy_water_shadows, smooth_effective_water_mask
   from classifier.storage import colorize_class_map, decode_class_map
   from coastline import read_water_mask
+  from texture import read_texture
 
   child_depth, child_col, child_row = parsed
   depth, col, row = parsed
@@ -1538,6 +1509,14 @@ def api_classifier_tile(tile_id: str):
         effective_water, resolution, resolution,
       )
       rgb[render_water] = (255, 42, 161)
+    satellite_jpeg = read_texture(db, tile_id)
+    if satellite_jpeg is not None:
+      satellite_rgb = _np.asarray(
+        _Image.open(_io.BytesIO(satellite_jpeg)).convert("RGB").resize(
+          (resolution, resolution), _Image.Resampling.BILINEAR,
+        )
+      )
+      rgb, _ = paint_navy_water_shadows(rgb, satellite_rgb)
   except (TypeError, ValueError, zlib.error):
     return Response(
       b"", status=500,
@@ -1566,7 +1545,7 @@ def api_heatmap():
   import numpy as np
   from database import CONFIDENCE, GRID_N, _decompress_uint8
   from tiles import build_lod_tree, get_leaves
-  from serve import bbox_in_view_oval
+  from serve import bbox_in_view_circle
 
   cam = _last_camera
   if cam is None:
@@ -1590,15 +1569,12 @@ def api_heatmap():
   # expose the coarse leaves covering the rest of Greenland's root quadtree.
   leaves = [
     leaf for leaf in get_leaves(root)
-    if bbox_in_view_oval(
-      qx, qy, heading,
+    if bbox_in_view_circle(
+      qx, qy,
       [leaf.center[0], leaf.center[1], leaf.center[0], leaf.center[1]],
       max_range,
     )
   ]
-
-  fwd_x = -math.sin(heading) if heading else 0.0
-  fwd_y = math.cos(heading) if heading else 1.0
 
   # Only count permanently cached textures — temporary placeholder sources
   # would make /api/texture queue an upstream re-fetch when the map page
@@ -1617,12 +1593,10 @@ def api_heatmap():
   tiles = []
   for leaf in leaves:
     bbox = list(leaf.bbox)
-    priority = _tile_priority(bbox, qx, qy, fwd_x, fwd_y)
     tile = {
       "id": leaf.id,
       "bbox": bbox,
       "depth": leaf.depth,
-      "priority": math.log(max(priority, 1.0)),
       "hasTexture": leaf.id in texture_ids,
     }
     terrain_row = terrain_rows.get(leaf.id)
@@ -1646,11 +1620,6 @@ def api_heatmap():
           },
         }
     tiles.append(tile)
-
-  # Sort by priority (lowest = closest/hottest) and add render order index
-  tiles.sort(key=lambda t: t["priority"])
-  for i, t in enumerate(tiles):
-    t["order"] = i
 
   return jsonify({
     "timestamp": time.time(),
