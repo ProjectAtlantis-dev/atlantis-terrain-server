@@ -33,7 +33,7 @@ test('G key opens Google Maps once and C remains unassigned', () => {
     removeEventListener(type) { listeners.delete(type); },
   };
   let opens = 0;
-  let classifierToggles = 0;
+  let gridlinesToggles = 0;
   const noop = () => {};
   const dispose = installTerrainKeyboardControls({
     controls: { keys: {} },
@@ -42,7 +42,7 @@ test('G key opens Google Maps once and C remains unassigned', () => {
     onEscapeVehicle: noop,
     onToggleMap: noop,
     onOpenGoogleMaps: () => { opens += 1; },
-    onToggleClassifier: () => { classifierToggles += 1; },
+    onToggleGridlines: () => { gridlinesToggles += 1; },
     onReset: noop,
     onHouseAction: noop,
     onToggleHeadlights: noop,
@@ -53,7 +53,7 @@ test('G key opens Google Maps once and C remains unassigned', () => {
     listeners.get('keydown')({ code: 'KeyC', repeat: false });
     listeners.get('keydown')({ code: 'KeyC', repeat: true });
     assert.equal(opens, 1);
-    assert.equal(classifierToggles, 0);
+    assert.equal(gridlinesToggles, 0);
   } finally {
     dispose();
     globalThis.window = previousWindow;

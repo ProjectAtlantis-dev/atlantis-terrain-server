@@ -71,7 +71,7 @@ Retired approaches, kept in git history only: bathymetry flattening and learned 
 
 The eyeball harness is the **tile inspector** (`pipeline.html?tile=<id>`): a tile's progress through heightmap → southness → texture → procgen, with per-stage status and keyboard navigation across tiles and depths.
 
-Classifier output lives in `terrain.db`'s `classifier_tiles` table as a zlib-compressed, image-oriented `uint8` label raster plus a class-schema name, dimensions, optional confidence raster, source/model identifier, and timestamp. A fresh database contains no classifier rows. In the 3D view, use the **classifier** link in the HUD to toggle classifier presentation: missing tiles keep their satellite imagery but desaturate it, while available `coarse_v1` tiles are painted as grey / green / dark / white / water classes. Both presentations paint cyan tile borders directly into their terrain textures, producing a terrain-conforming grid with normal hidden-surface removal. Grayscale elevation is used only while a satellite texture is still loading. Deeper terrain tiles inherit a nearest-neighbor crop from the closest classified ancestor.
+Classifier output lives in `terrain.db`'s `classifier_tiles` table as a zlib-compressed, image-oriented `uint8` label raster plus a class-schema name, dimensions, optional confidence raster, source/model identifier, and timestamp. A fresh database contains no classifier rows. In the 3D view, the **gridlines** HUD link toggles cyan terrain-conforming tile boundaries. Gridlines are a single batched line overlay; they do not fetch classifier output, alter imagery, replace textures, or change water rendering.
 
 ## Buildings & Roads
 

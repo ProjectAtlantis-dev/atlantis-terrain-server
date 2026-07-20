@@ -60,35 +60,6 @@ export function createTerrainHoverOutlineController({ terrainRoot, onChanged = (
       return changed;
     }
 
-    if (nextPresentation === 'classifier') {
-      outline = new THREE.Mesh(
-        mesh.geometry,
-        new THREE.MeshBasicMaterial({
-          color: 0xffb000,
-          transparent: true,
-          opacity: 0.38,
-          depthTest: true,
-          depthWrite: false,
-          side: THREE.DoubleSide,
-          polygonOffset: true,
-          polygonOffsetFactor: -4,
-          polygonOffsetUnits: -4,
-        }),
-      );
-      outline.position.copy(mesh.position);
-      outline.quaternion.copy(mesh.quaternion);
-      outline.scale.copy(mesh.scale);
-      outline.renderOrder = 998;
-      // The highlight is presentation-only and must never become a pick target.
-      outline.raycast = () => {};
-      terrainRoot.add(outline);
-      tileId = nextTileId;
-      presentation = nextPresentation;
-      ownsGeometry = false;
-      onChanged();
-      return true;
-    }
-
     const bbox = mesh.userData?.bbox;
     let bounds;
     if (Array.isArray(bbox) && bbox.length === 4 && bbox.every(Number.isFinite)) {

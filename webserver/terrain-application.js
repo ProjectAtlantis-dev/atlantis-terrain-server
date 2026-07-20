@@ -30,7 +30,7 @@ import { applyTerrainAvailabilityStatus } from './terrain-status-controller.js';
 import { collectTerrainDebugMeshes, createTerrainHoverOutlineController, createTerrainMapGridController, formatTerrainSeamDiagnostic, summarizeTerrainMesh } from './terrain-debug-runtime.js';
 import { createTerrainFetchRuntime } from './terrain-fetch-runtime.js';
 import { createTerrainTileSet } from './terrain-tile-set.js';
-import { createTerrainClassifierRuntime } from './terrain-classifier-runtime.js';
+import { createTerrainGridlinesRuntime } from './terrain-gridlines-runtime.js';
 import { restoreTerrainCameraState, terrainCameraState } from './terrain-camera-state.js';
 import { createTerrainClientLogger } from './terrain-client-logging.js';
 import { createTerrainFpsCounter } from './terrain-fps-counter.js';
@@ -288,7 +288,7 @@ const { hud, alt, gameClock: gameClockEl } = createTerrainHud({
   onToggleMapMode: () => toggleMapMode(),
   onToggleSeamMode: () => toggleSeamMode(),
   onToggleHeatmap: () => toggleHeatmap(),
-  onToggleClassifier: () => toggleClassifierMode(),
+  onToggleGridlines: () => toggleGridlines(),
   onToggleRenderBackend: () => {
     // beforeunload normally saves this too, but make the renderer transition
     // self-contained so a fast reload cannot race the camera/frame snapshot.
@@ -463,7 +463,6 @@ gameClockState.running = !(hasSavedMonth || hasSavedHour);
 const {
   reset: resetTuningUI,
   section: tuningSectionLabel,
-  select: tuningSelect,
   slider: tuningSlider,
   toggle: tuningToggle,
 } = createTerrainTuningControls({
@@ -521,17 +520,6 @@ function buildTuningControls(ap, ce) {
       min: 0, max: 30, step: 0.5, value: renderBackend.lensFlare.thresholdLevel,
       decimals: 1,
       onChange: v => { renderBackend.lensFlare.thresholdLevel = v; }
-    });
-  }
-  if (renderBackend.colorGradingPresets) {
-    tuningSectionLabel('Color Grade');
-    tuningSelect('color LUT', {
-      value: renderBackend.colorGradingPreset,
-      options: Object.fromEntries(
-        Object.entries(renderBackend.colorGradingPresets)
-          .map(([name, preset]) => [name, preset.label]),
-      ),
-      onChange: value => { renderBackend.setColorGradingPreset(value); },
     });
   }
   cloudTuning = registerTerrainCloudTuning({
@@ -1131,8 +1119,8 @@ const terrainTileSet = createTerrainTileSet({
     },
   },
 });
-const classifierRuntime = createTerrainClassifierRuntime({
-  terrainTiles: terrainTileSet,
+const gridlinesRuntime = createTerrainGridlinesRuntime({
+  terrainRoot,
   onChanged: () => {
     updateHud();
     requestRender();
@@ -1304,8 +1292,7 @@ function needsContinuousRender() {
     // Animated water must hold the loop open on backends that actually idle
     // (WebGPU; the WebGL backend never stops once started). Mirrors the
     // waterRuntime.update visibility gate.
-    (waterRuntime.enabled && waterParams.enabled &&
-      !controls.mapMode && !classifierRuntime.active)
+    (waterRuntime.enabled && waterParams.enabled && !controls.mapMode)
   );
 }
 
@@ -1333,7 +1320,7 @@ function runStreamingMaintenance() {
   }
   if (terrainPipelineState.lastTiles) {
     terrainTileSet.updateTextures(terrainPipelineState.lastTiles);
-    classifierRuntime.update(terrainPipelineState.lastTiles);
+    gridlinesRuntime.update();
   }
   if (dateChanged || renderBackend.sceneMutationVersion !== before) {
     requestRender();
@@ -1810,9 +1797,9 @@ function updateHud() {
   const modeHtml = vehicleRuntime.vehicleControlActive
     ? '<span style="color:#ff3b30">VEHICLE</span>'
     : modeLabel;
-  const classifierLine = classifierRuntime.active
-    ? `classifier: <span id="classifierModeLink" style="color:#8f8;text-decoration:underline;cursor:pointer;pointer-events:auto">ON</span>  ${classifierRuntime.textures.size} painted  ${classifierRuntime.missing.size} grayscale`
-    : 'classifier: <span id="classifierModeLink" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">off</span>';
+  const gridlinesLine = gridlinesRuntime.active
+    ? 'gridlines: <span id="gridlinesModeLink" style="color:#8f8;text-decoration:underline;cursor:pointer;pointer-events:auto">ON</span>'
+    : 'gridlines: <span id="gridlinesModeLink" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">off</span>';
   const renderBackendLabel = backend === 'webgpu' ? 'WebGPU' : 'WebGL';
   const nextRenderBackendLabel = backend === 'webgpu' ? 'WebGL' : 'WebGPU';
   const roadDebugColor = textureStreamer.roadDebug ? '#ff3b30' : '#0af';
@@ -1843,7 +1830,7 @@ function updateHud() {
     `speed: ${speedKmh.toFixed(0)} km/h  heading: ${deg.toFixed(0)}° ${compass}`,
     hmLine,
     texLine,
-    classifierLine,
+    gridlinesLine,
     vehicleRuntime.vehicleControlActive
       ? 'W/S drive, A/D steer, mouse orbit camera, Esc exits vehicle control'
       : 'WASD or Arrows move, Q/Z altitude, drag look',
@@ -2042,10 +2029,9 @@ function toggleSeamMode() {
   requestRender();
 }
 
-function toggleClassifierMode() {
+function toggleGridlines() {
   if (controls.mapMode) return;
-  const active = classifierRuntime.toggle(terrainPipelineState.lastTiles ?? []);
-  if (!active) hideTileInfo();
+  gridlinesRuntime.toggle();
 }
 
 installTerrainKeyboardControls({
@@ -2095,15 +2081,12 @@ renderer.domElement.addEventListener('pointerdown', event => {
 });
 
 renderer.domElement.addEventListener('click', event => {
-  const classifierTileId = classifierRuntime.active && !controls.mapMode
-    ? hoverOutlineController.tileId
-    : null;
   console.warn('[CLICK TEST] click', {
     x: event.clientX,
     y: event.clientY,
     mapMode: controls.mapMode,
     housesVisible: houseRuntime.housesRuntimeVisible,
-    tileId: classifierTileId,
+    tileId: null,
   });
   enqueueClientLog('info', 'click.test', {
     x: event.clientX,
@@ -2111,7 +2094,7 @@ renderer.domElement.addEventListener('click', event => {
     mapMode: controls.mapMode,
     shadowMode: houseRuntime.HOUSE_SHADOW_MODE,
     housesVisible: houseRuntime.housesRuntimeVisible,
-    tileId: classifierTileId,
+    tileId: null,
   });
   flushClientLogQueue();
   try {
@@ -2165,8 +2148,8 @@ renderer.domElement.addEventListener('click', event => {
 });
 
 renderer.domElement.addEventListener('mousemove', event => {
-  const classifier3dHover = classifierRuntime.active && !controls.mapMode;
-  if ((!controls.mapMode && !classifier3dHover) || controls.dragging) {
+  const gridlines3dHover = gridlinesRuntime.active && !controls.mapMode;
+  if ((!controls.mapMode && !gridlines3dHover) || controls.dragging) {
     hideTileInfo();
     return;
   }
@@ -2185,8 +2168,8 @@ renderer.domElement.addEventListener('mousemove', event => {
   }
 
   const mesh = hits[0].object;
-  hoverOutlineController.show(mesh, classifier3dHover ? 'classifier' : 'outline');
-  if (classifier3dHover) {
+  if (gridlines3dHover) {
+    hoverOutlineController.show(null);
     tileInfoEl.textContent = `tile: ${mesh.userData.tileId}`;
     tileInfoEl.style.left = `${Math.max(8, Math.min(event.clientX + 14, window.innerWidth - 180))}px`;
     tileInfoEl.style.top = `${Math.max(8, Math.min(event.clientY + 14, window.innerHeight - 42))}px`;
@@ -2194,6 +2177,7 @@ renderer.domElement.addEventListener('mousemove', event => {
     tileInfoEl.style.display = 'block';
     return;
   }
+  hoverOutlineController.show(mesh, 'outline');
   tileInfoEl.style.left = 'auto';
   tileInfoEl.style.top = '12px';
   tileInfoEl.style.right = '12px';
@@ -2309,10 +2293,9 @@ function render() {
   renderBackend.setFogDensity(fogStrength / getFogDistance());
   renderBackend.setMapMode(controls.mapMode);
 
-  // Keep classifier colors—including the effective-water pink—unobstructed.
   waterRuntime.update({
     dt, camera,
-    visible: waterParams.enabled && !controls.mapMode && !classifierRuntime.active,
+    visible: waterParams.enabled && !controls.mapMode,
   });
 
   // Terrain streaming: check if camera moved far enough to re-fetch

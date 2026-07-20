@@ -2,7 +2,6 @@ import * as THREE from 'three';
 import {
   EffectComposer,
   EffectPass,
-  LUT3DEffect,
   NormalPass,
   RenderPass,
   ToneMappingEffect,
@@ -11,10 +10,6 @@ import {
 import { DitheringEffect } from '../three-geospatial/packages/effects/src/index.ts';
 import { createWebGLWater } from './webgl-water.js';
 import { TerrainSunFlareEffect } from '../terrain-sun-flare-effect.js';
-import {
-  loadTerrainColorGradingTexture,
-  TERRAIN_COLOR_GRADING_PRESETS,
-} from '../terrain-color-grading.js';
 
 export function createTerrainBackend({
   width,
@@ -38,7 +33,6 @@ export function createTerrainBackend({
   renderer.toneMappingExposure = toneMappingExposure;
   let composer = null;
   let atmospherePass = null;
-  let finalPass = null;
   let cloudsEffectRef = null;
   let aerialPerspectiveRef = null;
   let takramCloudsEnabled = true;
@@ -48,23 +42,8 @@ export function createTerrainBackend({
   let demandRendering = null;
   let animationLoopActive = false;
   let sceneMutationVersion = 0;
-  let colorGradingPreset = 'off';
-  let colorGradingEffect = null;
-  let colorGradingLoadVersion = 0;
-  const colorGradingTextures = new Map();
-  const toneMappingEffect = new ToneMappingEffect({ mode: ToneMappingMode.AGX });
-  const ditheringEffect = new DitheringEffect();
   const sceneFog = new THREE.FogExp2(0x000000, 0.00009);
   scene.fog = sceneFog;
-
-  const syncFinalEffects = () => {
-    if (finalPass == null) return;
-    const effects = colorGradingEffect == null
-      ? [lensFlare, toneMappingEffect, ditheringEffect]
-      : [lensFlare, toneMappingEffect, colorGradingEffect, ditheringEffect];
-    finalPass.setEffects(effects);
-    finalPass.recompile();
-  };
 
   bootLog('renderer.ready', {
     backend: 'webgl', width, height, pixelRatio,
@@ -78,8 +57,6 @@ export function createTerrainBackend({
     defaultFogStrength: 4.5,
     renderer,
     lensFlare,
-    colorGradingPresets: TERRAIN_COLOR_GRADING_PRESETS,
-    get colorGradingPreset() { return colorGradingPreset; },
     get takramCloudsEnabled() { return takramCloudsEnabled; },
     get sceneMutationVersion() { return sceneMutationVersion; },
     setFogDensity(value) { sceneFog.density = value; },
@@ -113,45 +90,6 @@ export function createTerrainBackend({
       bootLog('clouds.takram.toggle', { enabled: takramCloudsEnabled });
       backend.markSceneMutated();
       backend.requestRender();
-    },
-    async setColorGradingPreset(name) {
-      const presetName = Object.hasOwn(TERRAIN_COLOR_GRADING_PRESETS, name) ? name : 'off';
-      const preset = TERRAIN_COLOR_GRADING_PRESETS[presetName];
-      colorGradingPreset = presetName;
-      const loadVersion = ++colorGradingLoadVersion;
-      if (preset.url == null) {
-        colorGradingEffect = null;
-        syncFinalEffects();
-        bootLog('color-grading.changed', { preset: presetName });
-        backend.markSceneMutated();
-        backend.requestRender();
-        return;
-      }
-      try {
-        let texture = colorGradingTextures.get(presetName);
-        if (texture == null) {
-          texture = await loadTerrainColorGradingTexture(preset.url);
-          colorGradingTextures.set(presetName, texture);
-        }
-        if (loadVersion !== colorGradingLoadVersion) return;
-        colorGradingEffect = new LUT3DEffect(texture, {
-          inputColorSpace: THREE.SRGBColorSpace,
-          tetrahedralInterpolation: true,
-        });
-        syncFinalEffects();
-        bootLog('color-grading.changed', { preset: presetName });
-        backend.markSceneMutated();
-        backend.requestRender();
-      } catch (error) {
-        if (loadVersion !== colorGradingLoadVersion) return;
-        colorGradingPreset = 'off';
-        colorGradingEffect = null;
-        syncFinalEffects();
-        bootLog('color-grading.error', {
-          preset: presetName,
-          message: error?.message ?? String(error),
-        }, 'error');
-      }
     },
     configureScenePipeline({ scene, camera, normalPass, cloudsEffect, aerialPerspective, sunDirection }) {
       lensFlare.configure({ camera, sunDirection });
@@ -189,12 +127,11 @@ export function createTerrainBackend({
       // Lens flare runs on the HDR frame AFTER sky/clouds (so the sun disk
       // exists in the buffer) and BEFORE tone mapping. It thresholds bright
       // pixels, so it flares the sun itself and any HDR water glint alike.
-      finalPass = new EffectPass(
+      const finalPass = new EffectPass(
         camera,
         lensFlare,
-        toneMappingEffect,
-        ...(colorGradingEffect == null ? [] : [colorGradingEffect]),
-        ditheringEffect,
+        new ToneMappingEffect({ mode: ToneMappingMode.AGX }),
+        new DitheringEffect(),
       );
       composer.addPass(finalPass);
       bootLog('composer.ready', { passCount: composer.passes.length });
@@ -229,8 +166,6 @@ export function createTerrainBackend({
       renderer.setAnimationLoop(null);
       animationLoopActive = false;
       composer?.dispose?.();
-      for (const texture of colorGradingTextures.values()) texture.dispose();
-      colorGradingTextures.clear();
       renderer.dispose();
     },
   };

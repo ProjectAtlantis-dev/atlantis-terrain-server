@@ -33,9 +33,8 @@ import { createTerrainFpsCounter } from '../terrain-fps-counter.js';
 import { projectSunDirectionToUv } from '../terrain-sun-flare-effect.js';
 import { loadTerrainStartupAssets, normalizeTerrainStartupAssets } from '../terrain-startup-assets.js';
 import { createTerrainAtmosphereTextureRuntime } from '../terrain-atmosphere-textures.js';
-import { paintClassifierGridBorder } from '../terrain-classifier-texture.js';
+import { createTerrainGridlinesController } from '../terrain-gridlines.js';
 import { createTerrainTuningControls } from '../terrain-tuning-controls.js';
-import { haldImageDataTo3D } from '../terrain-color-grading.js';
 import { waterCascadeUpdateDue, waterCascadeUpdateRate } from '../water/water-spectrum.js';
 import {
   bindTerrainCloudComposition,
@@ -61,20 +60,25 @@ import {
   terrainPipelineStatus,
 } from '../terrain-tile-fetch.js';
 
-test('classifier grid border is baked into all four texture edges', () => {
-  const fills = [];
-  const context = {
-    fillStyle: null,
-    fillRect(...args) { fills.push(args); },
-  };
-  assert.equal(paintClassifierGridBorder(context, 512, 256), 2);
-  assert.deepEqual(fills, [
-    [0, 0, 512, 2],
-    [0, 254, 512, 2],
-    [0, 2, 2, 252],
-    [510, 2, 2, 252],
-  ]);
-  assert.equal(context.fillStyle, 'rgba(20, 230, 255, 0.9)');
+test('gridlines batch terrain-conforming tile edges without replacing textures', () => {
+  const terrainRoot = new THREE.Group();
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute('position', new THREE.Float32BufferAttribute([
+    0, 0, 10, 1, 0, 20, 0, 1, 30, 1, 1, 40,
+  ], 3));
+  const mesh = new THREE.Mesh(geometry, new THREE.MeshBasicMaterial({ map: {} }));
+  mesh.userData = { tileId: '1-0-0', resolution: 2 };
+  terrainRoot.add(mesh);
+  const originalTexture = mesh.material.map;
+  const grid = createTerrainGridlinesController({ terrainRoot });
+  grid.setVisible(true);
+  assert.equal(grid.lines.geometry.getAttribute('position').count, 24);
+  assert.equal(grid.lines.isMesh, true);
+  assert.equal(grid.lines.material.side, THREE.DoubleSide);
+  assert.equal(grid.lines.visible, true);
+  assert.equal(mesh.material.map, originalTexture);
+  grid.setVisible(false);
+  assert.equal(grid.lines.visible, false);
 });
 
 test('water cascade pacing slows long and aerial waves without starving updates', () => {
@@ -88,19 +92,6 @@ test('water cascade pacing slows long and aerial waves without starving updates'
   assert.equal(waterCascadeUpdateDue(schedule, 0.03, 0, 0), false);
   assert.equal(waterCascadeUpdateDue(schedule, 1 / 15, 0, 0), true);
   assert.equal(waterCascadeUpdateDue(schedule, 0.01, 0, 0), true);
-});
-
-test('Hald color grading images convert to compact 3D textures in RGB order', () => {
-  const data = new Uint8ClampedArray(8 * 8 * 4);
-  for (let index = 0; index < 64; index += 1) {
-    data[index * 4] = index;
-    data[index * 4 + 1] = 100 + index;
-    data[index * 4 + 2] = 200 + index;
-    data[index * 4 + 3] = 17;
-  }
-  const result = haldImageDataTo3D({ width: 8, height: 8, data }, 4);
-  assert.equal(result.length, 4 ** 3 * 4);
-  assert.deepEqual(Array.from(result.slice(20, 24)), [5, 105, 205, 255]);
 });
 
 test('vehicle shadow receiver footprint keeps intersecting terrain tiles only', () => {
@@ -344,7 +335,7 @@ test('shared tuning controls initialize, persist, update, and reset widgets', ()
     return element;
   } };
   const body = documentImpl.createElement('section');
-  const state = { exposure: 2, clouds: false, look: 'natural' };
+  const state = { exposure: 2, clouds: false };
   const changes = [];
   let saves = 0;
   const tuning = createTerrainTuningControls({
@@ -359,28 +350,21 @@ test('shared tuning controls initialize, persist, update, and reset widgets', ()
   const toggle = tuning.toggle('clouds', {
     value: true, onChange: value => changes.push(['clouds', value]),
   });
-  const select = tuning.select('look', {
-    value: 'off', options: { off: 'Off', natural: 'Natural' },
-    onChange: value => changes.push(['look', value]),
-  });
-  assert.deepEqual(changes, [['exposure', 2], ['clouds', false], ['look', 'natural']]);
+  assert.deepEqual(changes, [['exposure', 2], ['clouds', false]]);
 
   slider.value = '3.5';
   slider.oninput();
   toggle.checked = true;
   toggle.onchange();
-  select.value = 'off';
-  select.onchange();
-  assert.deepEqual(state, { exposure: 3.5, clouds: true, look: 'off' });
-  assert.equal(saves, 3);
+  assert.deepEqual(state, { exposure: 3.5, clouds: true });
+  assert.equal(saves, 2);
 
   tuning.setSliderValue('exposure', 2.25);
   assert.equal(slider.value, 2.25);
   tuning.reset();
   assert.equal(slider.value, 1);
   assert.equal(toggle.checked, true);
-  assert.equal(select.value, 'off');
-  assert.deepEqual(changes.slice(-3), [['exposure', 1], ['clouds', true], ['look', 'off']]);
+  assert.deepEqual(changes.slice(-2), [['exposure', 1], ['clouds', true]]);
 });
 
 test('shared cloud runtime configures layers and synchronizes atmosphere composition', () => {
@@ -975,8 +959,8 @@ test('circular-boundary parent remains for partial demanded descendants', () => 
       children: [],
     });
   }
-  assert.equal(lifecycle.sweepStaleParents(demanded, new Set(demanded.map(tile => tile.id))), 1);
-  assert.equal(terrainRoot.children.includes(parent), false);
+  assert.equal(lifecycle.sweepStaleParents(demanded, new Set(demanded.map(tile => tile.id))), 0);
+  assert.equal(terrainRoot.children.includes(parent), true);
 });
 
 test('textured parent remains while demanded children are untextured', () => {
@@ -1061,7 +1045,6 @@ test('terrain tile set owns reconciliation, scene residency, and texture demand'
       }),
       priorityForTile: () => 0,
       getVisibilityDistance: () => 1000,
-      createDesaturatedTexture: source => ({ source, desaturated: true, dispose() {} }),
     },
   });
   const tile = { id: '1-0-0', bbox: [0, 0, 1, 1], heightmap: 'hm' };
@@ -1078,16 +1061,6 @@ test('terrain tile set owns reconciliation, scene residency, and texture demand'
 
   terrainRoot.children[0].material.map = baseTexture;
   terrainRoot.children[0].userData.terrainBaseTexture = baseTexture;
-  assert.equal(terrainRoot.children[0].material.map, baseTexture);
-  assert.equal(tileSet.setClassifierMode(true), true);
-  assert.equal(terrainRoot.children[0].material.map.desaturated, true);
-  assert.equal(terrainRoot.children[0].material.map.source, baseTexture);
-  const classifierTexture = { classifier: true };
-  tileSet.setClassifierTexture(tile.id, classifierTexture);
-  assert.equal(terrainRoot.children[0].material.map, classifierTexture);
-  tileSet.setClassifierTexture(tile.id, null);
-  assert.equal(terrainRoot.children[0].material.map.desaturated, true);
-  assert.equal(tileSet.setClassifierMode(false), false);
   assert.equal(terrainRoot.children[0].material.map, baseTexture);
 });
 
@@ -1421,11 +1394,12 @@ test('ancestor crops materialize deferred child slots and yield to exact texture
   callbacks.onPlaceholder({ tileId: tile.id, tile, texture: placeholder });
   assert.equal(deferredTiles.has(tile.id), false);
   assert.equal(terrainRoot.children[0].material.map, placeholder);
-  assert.equal(ancestorEvictions, 1);
+  assert.equal(ancestorEvictions, 0);
 
   textureCache.set(tile.id, exact);
   callbacks.onTexture({ tileId: tile.id, tile, texture: exact });
   frames.shift()();
+  assert.equal(ancestorEvictions, 1);
   assert.equal(terrainRoot.children[0].material.map, exact);
   assert.equal(placeholder.disposed, true);
   assert.equal(terrainRoot.children[0].userData.terrainPlaceholderTexture, undefined);
@@ -1510,33 +1484,6 @@ test('shared terrain hover outline owns replacement and cleanup', () => {
   assert.equal(hover.show(null), true);
   assert.equal(root.children.length, 0);
   assert.equal(changes, 2);
-});
-
-test('classifier terrain hover uses a distinct surface highlight without owning tile geometry', () => {
-  const root = {
-    children: [],
-    add(child) { this.children.push(child); },
-    remove(child) { this.children = this.children.filter(item => item !== child); },
-  };
-  const hover = createTerrainHoverOutlineController({ terrainRoot: root });
-  const geometry = new THREE.BufferGeometry();
-  const mesh = new THREE.Mesh(geometry, new THREE.MeshBasicMaterial());
-  mesh.userData.tileId = '12-1-2';
-
-  assert.equal(hover.show(mesh, 'classifier'), true);
-  assert.equal(hover.presentation, 'classifier');
-  assert.equal(hover.outline.isMesh, true);
-  assert.equal(hover.outline.geometry, geometry);
-  assert.equal(hover.outline.material.color.getHex(), 0xffb000);
-  assert.equal(hover.outline.material.depthWrite, false);
-  assert.equal(hover.show(mesh, 'classifier'), false);
-
-  let geometryDisposed = false;
-  geometry.addEventListener('dispose', () => { geometryDisposed = true; });
-  assert.equal(hover.clear(), true);
-  assert.equal(geometryDisposed, false);
-  mesh.material.dispose();
-  geometry.dispose();
 });
 
 test('seam grid colors shared edges by measured failure and reports both tiles', () => {
@@ -2053,6 +2000,37 @@ test('shared lifecycle retires parent when all demanded descendants are textured
   const demandedIds = new Set(children.map(c => c.userData.tileId));
   assert.equal(lifecycle.sweepStaleParents([], demandedIds), 0);
   root.children.push(...children.slice(1));
-  assert.equal(lifecycle.sweepStaleParents([], demandedIds), 1);
+  lifecycle.evictCoveredAncestors(children.at(-1).userData.tileId, demandedIds);
   assert.deepEqual(root.children, children);
+});
+
+test('shared lifecycle excludes ancestor-crop placeholders from final coverage', () => {
+  const parent = {
+    isMesh: true,
+    userData: { tileId: '11-719-386' },
+    material: { map: {}, dispose() {} },
+    geometry: { dispose() {} },
+  };
+  const children = ['12-1438-772', '12-1438-773', '12-1439-772', '12-1439-773']
+    .map(tileId => ({
+      isMesh: true,
+      userData: { tileId },
+      material: { map: {}, dispose() {} },
+      geometry: { dispose() {} },
+    }));
+  children[3].userData.terrainPlaceholderTexture = children[3].material.map;
+  const root = {
+    children: [parent, ...children],
+    remove(mesh) { this.children = this.children.filter(item => item !== mesh); },
+  };
+  const lifecycle = createTileLifecycle({
+    terrainRoot: root, disposeScatter: () => {}, log: () => {},
+  });
+
+  lifecycle.evictCoveredAncestors(children[3].userData.tileId);
+  assert.equal(root.children.includes(parent), true);
+
+  delete children[3].userData.terrainPlaceholderTexture;
+  lifecycle.evictCoveredAncestors(children[3].userData.tileId);
+  assert.equal(root.children.includes(parent), false);
 });

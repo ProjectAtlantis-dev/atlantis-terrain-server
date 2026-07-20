@@ -13,7 +13,7 @@ export function createTerrainHud({
   onToggleMapMode,
   onToggleSeamMode,
   onToggleHeatmap,
-  onToggleClassifier,
+  onToggleGridlines,
   onToggleRenderBackend,
   onToggleRoadDebug,
   onReset,
@@ -32,7 +32,7 @@ export function createTerrainHud({
       event.target.id === 'mapModeLink' ||
       event.target.id === 'seamModeLink' ||
       event.target.id === 'heatmapModeLink' ||
-      event.target.id === 'classifierModeLink' ||
+      event.target.id === 'gridlinesModeLink' ||
       event.target.id === 'renderBackendLink' ||
       event.target.id === 'roadDebugLink' ||
       event.target.id === 'resetViewLink' ||
@@ -57,10 +57,10 @@ export function createTerrainHud({
       onToggleHeatmap();
       return;
     }
-    if (event.target.id === 'classifierModeLink') {
+    if (event.target.id === 'gridlinesModeLink') {
       event.stopPropagation();
       event.preventDefault();
-      onToggleClassifier();
+      onToggleGridlines();
       return;
     }
     if (event.target.id === 'renderBackendLink') {
@@ -102,7 +102,7 @@ export function createTerrainHud({
     if (
       event.target.id === 'mapModeLink' || event.target.id === 'seamModeLink' ||
       event.target.id === 'heatmapModeLink' ||
-      event.target.id === 'classifierModeLink' ||
+      event.target.id === 'gridlinesModeLink' ||
       event.target.id === 'renderBackendLink' ||
       event.target.id === 'roadDebugLink' || event.target.id === 'resetViewLink' ||
       TERRAIN_HUD_LINKS[event.target.id]
