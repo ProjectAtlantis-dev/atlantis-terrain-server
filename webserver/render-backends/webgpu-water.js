@@ -468,7 +468,7 @@ export function createWebGPUWater({
   // Replace analytic sky reflections near north-facing coastal cliffs. Local
   // +y is north, so a north-facing slope rises toward -y (south). Search only
   // on that axis: east/west/south-facing shores are deliberately unaffected.
-  // The broad derivative also rejects the artificial 10 m sea-floor drop at
+  // The broad derivative also rejects the artificial 3 m sea-floor drop at
   // an otherwise flat shoreline. Exact shoreline distance is unnecessary;
   // this is intentionally a coarse, low-frequency visual setback.
   function northCliffReflectionKeep(p, centerBathy) {
