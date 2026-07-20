@@ -26,6 +26,9 @@ export function normalizeSavedVehicleState(state) {
   const headingDeg = Number(state.headingDeg);
   const z = Number(state.z);
   const terrainDepthRaw = Number(state.terrainDepth);
+  const terrainTileId = typeof state.terrainTileId === 'string' && state.terrainTileId.trim()
+    ? state.terrainTileId.trim()
+    : null;
   if (!Number.isFinite(lat) || !Number.isFinite(lon) || !Number.isFinite(headingDeg)) {
     return null;
   }
@@ -37,6 +40,7 @@ export function normalizeSavedVehicleState(state) {
     terrainDepth: Number.isFinite(terrainDepthRaw)
       ? Math.max(0, Math.floor(terrainDepthRaw))
       : null,
+    terrainTileId,
   };
 }
 

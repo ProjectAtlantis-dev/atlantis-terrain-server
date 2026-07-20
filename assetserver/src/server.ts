@@ -7,6 +7,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { log } from "./logger.js";
 import {
+  type AircraftFlightConfig,
   type AssetMetadata,
   type AssetRow,
   type AssetType,
@@ -20,23 +21,39 @@ import {
   type StructureInstance,
   type StructureProperties,
   type VehicleDefinition,
+  type VehicleDefinitionCatalog,
   type VehicleHeadlights,
   type VehicleInstance,
+  type NacelleConfig,
+  type VehicleParts,
   type VehicleProperties,
   type VehicleSeedInstance,
   type VehicleStateCommon,
 } from "./types.js";
 
-const ASSETS_RESPONSE_SCHEMA_VERSION = 4;
+const ASSETS_RESPONSE_SCHEMA_VERSION = 5;
 const DEFAULT_VEHICLE_INSTANCE_ID = "amv-01";
 type SqliteDb = Database<sqlite3.Database, sqlite3.Statement>;
-type SeedVehicleMetadata = VehicleStateCommon & { id: string; headlightsOn: boolean };
+type SeedVehicleMetadata = VehicleStateCommon & {
+  id: string;
+  definitionId?: string;
+  headlightsOn: boolean;
+};
 
 const FALLBACK_VEHICLE_DEFINITION: VehicleDefinition = {
   url: "/models/patria_amv.glb",
+  displayName: "Patria AMV",
   realLengthM: 7.7,
   tireDiameterM: 1.27,
   altOffsetM: 0.05,
+  parts: {
+    wheels: ["Object_8", "Object_9", "Object_10"],
+    turret: "Object_3",
+    gun: "Object_2",
+    body: ["Object_4", "Object_5", "Object_6"],
+    shield: ["Object_7"],
+  },
+  wheelClusterSplitThreshold: 3500,
 };
 
 const FALLBACK_STRUCTURE_DEFINITION: StructureDefinition = {
@@ -64,11 +81,21 @@ const DEFAULT_VEHICLE_HEADLIGHTS: VehicleHeadlights = {
 const FALLBACK_SEED_VEHICLE_INSTANCES: SeedVehicleMetadata[] = [
   {
     id: "amv-01",
+    definitionId: "patria-amv",
     lat: 64.18423381,
     lon: -51.70139232,
     headingDeg: 234.341,
     z: 16.279,
     headlightsOn: true,
+  },
+  {
+    id: "osprey-01",
+    definitionId: "v22-osprey",
+    lat: 64.19094,
+    lon: -51.67814,
+    headingDeg: 46,
+    z: 85,
+    headlightsOn: false,
   },
 ];
 
@@ -239,12 +266,135 @@ function sanitizeVehicleHeadlights(raw: unknown): VehicleHeadlights {
   return out;
 }
 
+function sanitizeVehicleParts(raw: unknown): VehicleParts | undefined {
+  if (raw == null || typeof raw !== "object") {
+    return undefined;
+  }
+  const source = raw as JsonObject;
+  const stringList = (value: unknown): string[] => Array.isArray(value)
+    ? value
+      .filter((item): item is string => typeof item === "string")
+      .map(item => item.trim())
+      .filter(Boolean)
+    : [];
+  const optionalName = (value: unknown): string | null | undefined => {
+    if (value === null) return null;
+    if (typeof value !== "string") return undefined;
+    const name = value.trim();
+    return name || undefined;
+  };
+
+  const wheels = stringList(source.wheels);
+  const turret = optionalName(source.turret);
+  const gun = optionalName(source.gun);
+  const body = stringList(source.body);
+  const shield = stringList(source.shield);
+  const leftNacelle = stringList(source.leftNacelle);
+  const rightNacelle = stringList(source.rightNacelle);
+  const leftRotor = optionalName(source.leftRotor);
+  const rightRotor = optionalName(source.rightRotor);
+  const turretPivot = sanitizeNumberTuple3(source.turretPivot);
+  const gunPivot = sanitizeNumberTuple3(source.gunPivot);
+  const muzzle = sanitizeNumberTuple3(source.muzzle);
+  const parts: VehicleParts = {};
+  if (wheels.length > 0) parts.wheels = wheels;
+  if (turret !== undefined) parts.turret = turret;
+  if (gun !== undefined) parts.gun = gun;
+  if (body.length > 0) parts.body = body;
+  if (shield.length > 0) parts.shield = shield;
+  if (leftNacelle.length > 0) parts.leftNacelle = leftNacelle;
+  if (rightNacelle.length > 0) parts.rightNacelle = rightNacelle;
+  if (leftRotor !== undefined) parts.leftRotor = leftRotor;
+  if (rightRotor !== undefined) parts.rightRotor = rightRotor;
+  if (turretPivot !== undefined) parts.turretPivot = turretPivot;
+  if (gunPivot !== undefined) parts.gunPivot = gunPivot;
+  if (muzzle !== undefined) parts.muzzle = muzzle;
+  return parts;
+}
+
+function sanitizeNumberTuple3(raw: unknown): [number, number, number] | undefined {
+  if (!Array.isArray(raw) || raw.length !== 3) return undefined;
+  const values = raw.map(coerceFiniteNumber);
+  if (values.some(value => value == null)) return undefined;
+  return values as [number, number, number];
+}
+
+function sanitizeFlightConfig(raw: unknown): AircraftFlightConfig | undefined {
+  if (raw == null || typeof raw !== "object" || Array.isArray(raw)) return undefined;
+  const source = raw as JsonObject;
+  const keys: Array<keyof AircraftFlightConfig> = [
+    "maxSpeedMs",
+    "hoverMaxSpeedMs",
+    "transitionLowMs",
+    "transitionHighMs",
+    "climbRateMs",
+    "descendRateMs",
+    "accelMs2",
+    "yawRateRad",
+    "pitchRateRad",
+    "rollRateRad",
+  ];
+  const values = Object.fromEntries(keys.map(key => [key, coerceFiniteNumber(source[key])]));
+  if (keys.some(key => values[key] == null || Number(values[key]) < 0)) return undefined;
+  if (Number(values.transitionHighMs) < Number(values.transitionLowMs)) return undefined;
+  return values as unknown as AircraftFlightConfig;
+}
+
+function sanitizeNacelleConfig(raw: unknown): NacelleConfig | undefined {
+  if (raw == null || typeof raw !== "object" || Array.isArray(raw)) return undefined;
+  const source = raw as JsonObject;
+  const tiltSpeedDegS = coerceFiniteNumber(source.tiltSpeedDegS);
+  const rotorRadiusM = coerceFiniteNumber(source.rotorRadiusM);
+  const leftCenter = sanitizeNumberTuple3(source.leftCenter);
+  const rightCenter = sanitizeNumberTuple3(source.rightCenter);
+  const tiltAxis = source.tiltAxis === "x" || source.tiltAxis === "y" || source.tiltAxis === "z"
+    ? source.tiltAxis
+    : undefined;
+  const tiltDirection = source.tiltDirection === -1 || source.tiltDirection === 1
+    ? source.tiltDirection
+    : undefined;
+  const rotorAxis = source.rotorAxis === "x" || source.rotorAxis === "y" || source.rotorAxis === "z"
+    ? source.rotorAxis
+    : undefined;
+  const rotorSpeedRpm = coerceFiniteNumber(source.rotorSpeedRpm);
+  const rotorResponseSeconds = coerceFiniteNumber(source.rotorResponseSeconds);
+  if (tiltSpeedDegS == null || tiltSpeedDegS < 0 || rotorRadiusM == null || rotorRadiusM <= 0
+    || leftCenter == null || rightCenter == null
+    || (rotorSpeedRpm != null && rotorSpeedRpm <= 0)
+    || (rotorResponseSeconds != null && rotorResponseSeconds <= 0)) {
+    return undefined;
+  }
+  return {
+    tiltSpeedDegS,
+    rotorRadiusM,
+    leftCenter,
+    rightCenter,
+    ...(tiltAxis ? { tiltAxis } : {}),
+    ...(tiltDirection != null ? { tiltDirection } : {}),
+    ...(rotorAxis ? { rotorAxis } : {}),
+    ...(rotorSpeedRpm != null ? { rotorSpeedRpm } : {}),
+    ...(rotorResponseSeconds != null ? { rotorResponseSeconds } : {}),
+  };
+}
+
 function sanitizeVehicleDefinition(raw: unknown): VehicleDefinition {
   const source: JsonObject = raw != null && typeof raw === "object" ? (raw as JsonObject) : {};
   const out: VehicleDefinition = { ...FALLBACK_VEHICLE_DEFINITION };
 
   if (typeof source.url === "string" && source.url.trim()) {
     out.url = source.url.trim();
+  }
+
+  if (typeof source.displayName === "string" && source.displayName.trim()) {
+    out.displayName = source.displayName.trim();
+  }
+
+  if (source.vehicleType === "ground" || source.vehicleType === "aircraft") {
+    out.vehicleType = source.vehicleType;
+    if (source.vehicleType === "aircraft") {
+      delete out.tireDiameterM;
+      delete out.wheelClusterSplitThreshold;
+    }
   }
 
   const realLengthM = coerceFiniteNumber(source.realLengthM);
@@ -262,7 +412,58 @@ function sanitizeVehicleDefinition(raw: unknown): VehicleDefinition {
     out.altOffsetM = altOffsetM;
   }
 
+  const headingOffsetDeg = coerceFiniteNumber(source.headingOffsetDeg);
+  if (headingOffsetDeg != null) out.headingOffsetDeg = headingOffsetDeg;
+
+  const modelRotationDeg = sanitizeNumberTuple3(source.modelRotationDeg);
+  if (modelRotationDeg != null) out.modelRotationDeg = modelRotationDeg;
+
+  const parts = sanitizeVehicleParts(source.parts);
+  if (parts != null) {
+    out.parts = parts;
+  }
+
+  const wheelClusterSplitThreshold = coerceFiniteNumber(source.wheelClusterSplitThreshold);
+  if (wheelClusterSplitThreshold != null) {
+    out.wheelClusterSplitThreshold = wheelClusterSplitThreshold > 0
+      ? wheelClusterSplitThreshold
+      : null;
+  } else if (source.wheelClusterSplitThreshold === null) {
+    out.wheelClusterSplitThreshold = null;
+  }
+
+  const flight = sanitizeFlightConfig(source.flight);
+  if (flight != null) out.flight = flight;
+
+  const nacelles = sanitizeNacelleConfig(source.nacelles);
+  if (nacelles != null) out.nacelles = nacelles;
+
   return out;
+}
+
+function sanitizeVehicleDefinitions(
+  raw: unknown,
+  fallbackDefinition: VehicleDefinition,
+  fallbackHeadlights: VehicleHeadlights,
+): VehicleDefinitionCatalog {
+  const catalog: VehicleDefinitionCatalog = {};
+  if (raw != null && typeof raw === "object" && !Array.isArray(raw)) {
+    for (const [rawId, rawDefinition] of Object.entries(raw as Record<string, unknown>)) {
+      const definitionId = rawId.trim();
+      if (!definitionId || rawDefinition == null || typeof rawDefinition !== "object" || Array.isArray(rawDefinition)) {
+        continue;
+      }
+      const definition = sanitizeVehicleDefinition(rawDefinition);
+      const source = rawDefinition as JsonObject;
+      catalog[definitionId] = source.headlights == null
+        ? definition
+        : { ...definition, headlights: sanitizeVehicleHeadlights(source.headlights) };
+    }
+  }
+  if (Object.keys(catalog).length === 0) {
+    catalog.default = { ...fallbackDefinition, headlights: fallbackHeadlights };
+  }
+  return catalog;
 }
 
 function sanitizeStructureDefinition(raw: unknown): StructureDefinition {
@@ -409,8 +610,13 @@ function sanitizeSeedVehicleInstance(raw: unknown, index: number, fallbackSeed: 
     return null;
   }
 
+  const definitionId = typeof source.definitionId === "string" && source.definitionId.trim()
+    ? source.definitionId.trim()
+    : fallbackSeed.definitionId;
+
   return {
     vehicleId,
+    ...(definitionId ? { definitionId } : {}),
     headlightsOn: coerceBool(source.headlightsOn) ?? true,
     state,
   };
@@ -535,6 +741,11 @@ async function loadAssetsMetadata(): Promise<AssetMetadata> {
 
   const structureDefinition = sanitizeStructureDefinition(rawStructureDef);
   const vehicleDefinition = sanitizeVehicleDefinition(rawVehicleDef);
+  const vehicleDefinitions = sanitizeVehicleDefinitions(
+    payload.vehicle_definitions,
+    vehicleDefinition,
+    vehicleHeadlights,
+  );
 
   let seedStructureInstances = sanitizeStructureSites(rawSeedStructures);
   if (seedStructureInstances.length === 0) {
@@ -561,6 +772,7 @@ async function loadAssetsMetadata(): Promise<AssetMetadata> {
     if (defaultState != null) {
       seedVehicleInstances.push({
         vehicleId: DEFAULT_VEHICLE_INSTANCE_ID,
+        ...(fallbackSeed.definitionId ? { definitionId: fallbackSeed.definitionId } : {}),
         headlightsOn: coerceBool(fallbackSeed.headlightsOn) ?? true,
         state: defaultState,
       });
@@ -570,6 +782,7 @@ async function loadAssetsMetadata(): Promise<AssetMetadata> {
   return {
     source,
     vehicleDefinition,
+    vehicleDefinitions,
     vehicleHeadlights,
     structureDefinition,
     seedVehicleInstances,
@@ -675,15 +888,12 @@ async function ensureStructureSeeds(db: SqliteDb, seedInstances: StructureInstan
 }
 
 async function ensureVehicleSeeds(db: SqliteDb, seedInstances: VehicleSeedInstance[]): Promise<boolean> {
-  const row = await db.get<{ count: number }>("SELECT COUNT(*) as count FROM assets WHERE type = 'vehicle'");
-  if ((row?.count ?? 0) > 0) {
-    return false;
-  }
-
   const now = Date.now() / 1000;
+  let insertedAny = false;
   for (const instance of seedInstances) {
     const props: VehicleProperties = {
       headlightsOn: instance.headlightsOn,
+      ...(instance.definitionId ? { definitionId: instance.definitionId } : {}),
     };
     if (instance.state.terrainDepth != null) {
       props.terrainDepth = instance.state.terrainDepth;
@@ -691,9 +901,9 @@ async function ensureVehicleSeeds(db: SqliteDb, seedInstances: VehicleSeedInstan
     if (instance.state.terrainTileId) {
       props.terrainTileId = instance.state.terrainTileId;
     }
-    await db.run(
+    const result = await db.run(
       `
-      INSERT OR REPLACE INTO assets
+      INSERT OR IGNORE INTO assets
       (id, type, enabled, lat, lon, heading_deg, z, properties, saved_at, updated_at)
       VALUES (?, 'vehicle', 1, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
       `,
@@ -707,9 +917,10 @@ async function ensureVehicleSeeds(db: SqliteDb, seedInstances: VehicleSeedInstan
         now,
       ],
     );
+    insertedAny = insertedAny || (result.changes ?? 0) > 0;
   }
 
-  return true;
+  return insertedAny;
 }
 
 function parseProperties<T>(raw: string): T {
@@ -747,6 +958,9 @@ async function loadVehicleInstances(db: SqliteDb): Promise<VehicleInstance[]> {
 
     out.push({
       id: String(row.id),
+      ...(typeof props.definitionId === "string" && props.definitionId
+        ? { definitionId: props.definitionId }
+        : {}),
       headlightsOn: props.headlightsOn !== false,
       ...validated,
       savedAt: row.saved_at ?? 0,
@@ -839,6 +1053,7 @@ async function getAssetsResponse(db: SqliteDb): Promise<AssetsResponse> {
       ...metadata.vehicleDefinition,
       headlights: metadata.vehicleHeadlights,
     },
+    vehicle_definitions: metadata.vehicleDefinitions,
     structure_definition: metadata.structureDefinition,
     vehicle_instances: vehicleInstances,
     structure_instances: structureInstances,
@@ -857,6 +1072,7 @@ async function saveVehicleState(db: SqliteDb, request: SaveVehicleRequest): Prom
   const existingProps = existing ? parseProperties<VehicleProperties>(existing.properties) : { headlightsOn: true };
   const props: VehicleProperties = {
     headlightsOn: existingProps.headlightsOn !== false,
+    ...(existingProps.definitionId ? { definitionId: existingProps.definitionId } : {}),
     ...(request.terrainDepth != null ? { terrainDepth: request.terrainDepth } : {}),
     ...(request.terrainTileId ? { terrainTileId: request.terrainTileId } : {}),
   };

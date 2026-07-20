@@ -138,7 +138,12 @@ def repair_white_ocean(jpeg_bytes, heightmap, max_elev_m=0.5, min_frac=0.005):
     Image.fromarray(arr).save(buf, format="JPEG", quality=85)
     return buf.getvalue()
 
-COMFY_URL = "http://100.106.176.121:8188"
+# SUPIR/ComfyUI endpoint. Deliberately NOT hardcoded: set COMFY_URL in
+# flaskserver/.env (gitignored, sourced by runFlaskServer). Unset = texture
+# enhancement disabled — fetch_enhanced_texture returns the no-enhancement
+# path instead of dialing a stale address. (A previously hardcoded tailscale
+# IP went stale when the GPU box re-enrolled, silently breaking enhancement.)
+COMFY_URL = os.environ.get("COMFY_URL", "").rstrip("/")
 _UPSCALER_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "upscaler")
 
 def _env_bool(name, default=False):
@@ -910,6 +915,9 @@ def fetch_enhanced_texture(bbox, resolution=256, s2_jpeg=None, tile_id=None,
     Returns (jpeg_bytes, source_string) or (None, None).
     """
     if s2_jpeg is None:
+        return None, None
+
+    if not COMFY_URL:
         return None, None
 
     if tile_id is not None:

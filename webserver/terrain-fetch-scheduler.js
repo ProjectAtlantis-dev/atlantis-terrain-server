@@ -2,7 +2,11 @@ export function createTerrainFetchScheduler({
   execute,
   initialPass = 1,
   pollMs = 3000,
-  scheduleFrame = callback => requestAnimationFrame(callback),
+  // Data residency must progress while the tab is occluded/backgrounded and
+  // before the first expensive WebGPU frame has compiled. requestAnimationFrame
+  // can be suspended in both cases, which previously stranded startup forever
+  // after the preview pass.
+  scheduleFrame = callback => setTimeout(callback, 0),
   schedulePoll = (callback, delay) => setTimeout(callback, delay),
   cancelPoll = timer => clearTimeout(timer),
   onSkip = () => {},

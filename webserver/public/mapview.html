@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Terrain navigator</title>
+  <style>html, body, #map { margin:0; padding:0; width:100%; height:100%; background:#000; }</style>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+</head>
+<body>
+  <div id="map"></div>
+  <script>
+    const params = new URLSearchParams(location.search);
+    const initialLat = Number.parseFloat(params.get('lat')) || 64.18;
+    const initialLon = Number.parseFloat(params.get('lon')) || -51.70;
+    const zoom = Number.parseInt(params.get('z'), 10) || 16;
+    const type = params.get('t') || 'k';
+    const map = L.map('map', { zoomControl: false, attributionControl: true })
+      .setView([initialLat, initialLon], zoom);
+    const tileUrl = type === 'k'
+      ? 'https://mt{s}.google.com/vt/lyrs=s,h&x={x}&y={y}&z={z}'
+      : 'https://mt{s}.google.com/vt/lyrs=m&x={x}&y={y}&z={z}';
+    L.tileLayer(tileUrl, {
+      subdomains: '0123', attribution: '© Google', maxZoom: 20, crossOrigin: true,
+    }).addTo(map);
+    let selectionMarker = null;
+    function showSelection(lat, lon) {
+      if (!selectionMarker) selectionMarker = L.marker([lat, lon]).addTo(map);
+      else selectionMarker.setLatLng([lat, lon]);
+    }
+    window.addEventListener('message', event => {
+      if (event.source !== window.parent || !event.data) return;
+      if (event.data.selected?.lat != null && event.data.selected?.lon != null) {
+        showSelection(event.data.selected.lat, event.data.selected.lon);
+      }
+      if (event.data.follow && event.data.lat != null && event.data.lon != null) {
+        map.setView([event.data.lat, event.data.lon], zoom, { animate: false });
+      }
+    });
+    map.on('click', event => {
+      showSelection(event.latlng.lat, event.latlng.lng);
+      window.parent.postMessage({
+        select: true, lat: event.latlng.lat, lon: event.latlng.lng,
+      }, location.origin);
+    });
+    window.parent.postMessage({ ready: true }, location.origin);
+  </script>
+</body>
+</html>

@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import * as THREE from 'three';
 
 import {
   headingForward2D,
@@ -7,8 +8,21 @@ import {
   terrainTilePriority,
 } from './terrain-priority.js';
 import { compassHeading } from './terrain-hud.js';
-import { applyMapDrag } from './terrain-controls.js';
+import { applyMapDrag, installTerrainKeyboardControls } from './terrain-controls.js';
 import { createVehiclePersistenceRuntime, normalizeSavedVehicleState, stepSuspension, stepVehicleDrive, vehicleLocalToLatLon, vehicleStateSnapshot } from './terrain-vehicle.js';
+import {
+  createAircraftState,
+  setupAircraftModelParts,
+  stepAircraftFlight,
+  toggleAircraftEngine,
+  updateAircraftVisuals,
+} from './terrain-aircraft-runtime.js';
+import { createVehicleFireRuntime } from './terrain-vehicle-fire.js';
+import {
+  createVehicleWheelRig,
+  normalizeVehiclePartDefinition,
+  spinVehicleWheelRig,
+} from './terrain-vehicle-parts.js';
 import { meshUsesTextureClassification, scoreTextureTiles, textureRetryDelay, tileDepthFromId } from './terrain-tile-runtime.js';
 import { createTextureStreamer, rendererTextureAnisotropy } from './terrain-texture-streamer.js';
 import { createTileLifecycle } from './terrain-tile-lifecycle.js';
@@ -33,6 +47,7 @@ import {
   adoptTerrainOrigin,
   diffTerrainTileIds,
   evaluateTerrainRefetch,
+  hydrateTerrainHeightmaps,
   offsetTerrainPayload,
   prioritizeTerrainBuildCandidates,
   selectTerrainFrameOffset,
@@ -138,12 +153,14 @@ test('startup asset normalization clones valid records and rejects junk', () => 
   const vehicle = { id: 'v1' };
   const normalized = normalizeTerrainStartupAssets({
     vehicle_definition: { model: 'truck' },
+    vehicle_definitions: { truck: { model: 'truck' }, bad: null },
     structure_definition: null,
     vehicle_instances: [vehicle, null, 'bad'],
     structure_instances: [{ id: 's1' }, 4],
   });
   assert.deepEqual(normalized, {
     vehicle_definition: { model: 'truck' },
+    vehicle_definitions: { truck: { model: 'truck' } },
     structure_definition: {},
     vehicle_instances: [{ id: 'v1' }],
     structure_instances: [{ id: 's1' }],
@@ -187,8 +204,8 @@ test('shared startup asset loader returns complete defaults on failure', async (
       fetchImpl: async () => ({ ok: false, status: 503 }),
     });
     assert.deepEqual(result, {
-      source: 'defaults', schemaVersion: 4, seeded: null,
-      vehicle_definition: {}, structure_definition: {},
+      source: 'defaults', schemaVersion: 5, seeded: null,
+      vehicle_definition: {}, vehicle_definitions: {}, structure_definition: {},
       vehicle_instances: [], structure_instances: [],
     });
   } finally {
@@ -480,6 +497,47 @@ test('terrain full request reuses a restored frame', () => {
   assert.equal(request.logDetails.maxDepth, null);
 });
 
+test('terrain manifest request carries the bounded residency budget', () => {
+  const request = buildTerrainTilesRequest({
+    lat: 64.1, lon: -51.2, altitude: 120, heading: 0.5, range: 20000,
+    pass: 2, previewMaxDepth: 10, isFirstLoad: true,
+    frameOffsetReady: false, originX: 0, originY: 0,
+    useManifest: true, tileBudget: 384,
+  });
+  assert.equal(
+    request.url,
+    '/api/tiles?lat=64.1&lon=-51.2&alt=120&heading=0.5&range=20000&manifest=1&budget=384',
+  );
+});
+
+test('height manifest hydration fetches only new or changed pages', async () => {
+  const cache = new Map();
+  const calls = [];
+  const fetchImpl = async url => {
+    calls.push(url);
+    return {
+      ok: true,
+      arrayBuffer: async () => new Float32Array([1, 2, 3, 4]).buffer,
+    };
+  };
+  const first = [{
+    id: '1-0-0', resolution: 2, heightVersion: 'a', heightmapUrl: '/height-a',
+  }];
+  assert.deepEqual(
+    await hydrateTerrainHeightmaps(first, { cache, fetchImpl, concurrency: 2 }),
+    { requested: 1, resident: 0 },
+  );
+  const second = [{
+    id: '1-0-0', resolution: 2, heightVersion: 'a', heightmapUrl: '/height-a',
+  }];
+  assert.deepEqual(
+    await hydrateTerrainHeightmaps(second, { cache, fetchImpl, concurrency: 2 }),
+    { requested: 0, resident: 1 },
+  );
+  assert.deepEqual(calls, ['/height-a']);
+  assert.deepEqual([...second[0].heightmap], [1, 2, 3, 4]);
+});
+
 test('terrain tile diff and dirty-paint demand are deterministic', () => {
   const tiles = [
     { id: 'new-far', heightmap: 'x', priority: 9 },
@@ -556,6 +614,67 @@ test('shared reconciler spends dirty-paint budget in heatmap order', () => {
   assert.deepEqual([...deferredTiles.keys()], ['hot', 'far']);
   assert.equal(result.sceneMeshes, 1);
   assert.deepEqual(diffDetails, { added: 2, removed: 0, purgedDeferred: 0, sceneMeshes: 0 });
+});
+
+test('shared reconciler can materialize local fine geometry beneath a textured stale parent', () => {
+  const child = { id: '12-10-20', bbox: [0, 0, 10, 10], heightmap: 'fine-hm' };
+  const parent = {
+    isMesh: true,
+    userData: { tileId: '11-5-10', bbox: [-10, -10, 20, 20] },
+    material: { map: { id: 'stale-texture' } },
+  };
+  const terrainRoot = {
+    children: [parent],
+    add(mesh) { this.children.push(mesh); },
+  };
+  const deferredTiles = new Map();
+  const built = [];
+  const logs = [];
+  const result = reconcileTerrainTiles({
+    tiles: [child], currentTileIds: new Set(['11-5-10']),
+    deferredTiles, terrainRoot,
+    lifecycle: { sweepStaleParents: () => 0 },
+    priorityForTile: () => 0,
+    textureCache: new Map(), materialize: () => assert.fail('unexpected materialize'),
+    buildMesh: tile => {
+      built.push(tile.id);
+      return {
+        isMesh: true, userData: { tileId: tile.id, bbox: tile.bbox },
+        material: { map: null },
+      };
+    },
+    log: (id, message) => logs.push(`${id}: ${message}`),
+    forceUntexturedBuild: tile => tile.id === child.id,
+  });
+  assert.deepEqual(built, [child.id]);
+  assert.equal(deferredTiles.get(child.id), child);
+  assert.equal(terrainRoot.children.length, 2);
+  assert.equal(result.sceneMeshes, 2);
+  assert.ok(logs.some(message => message.includes('fine untextured geometry for procgen window')));
+});
+
+test('shared reconciler still defers fine geometry outside the local override window', () => {
+  const child = { id: '12-10-20', bbox: [0, 0, 10, 10], heightmap: 'fine-hm' };
+  const terrainRoot = {
+    children: [{
+      isMesh: true,
+      userData: { tileId: '11-5-10', bbox: [-10, -10, 20, 20] },
+      material: { map: { id: 'stale-texture' } },
+    }],
+    add(mesh) { this.children.push(mesh); },
+  };
+  let builds = 0;
+  const result = reconcileTerrainTiles({
+    tiles: [child], currentTileIds: new Set(['11-5-10']),
+    deferredTiles: new Map(), terrainRoot,
+    lifecycle: { sweepStaleParents: () => 0 },
+    priorityForTile: () => 0,
+    textureCache: new Map(), materialize: () => assert.fail('unexpected materialize'),
+    buildMesh: () => { builds += 1; return null; },
+    log: () => {},
+  });
+  assert.equal(builds, 0);
+  assert.equal(result.sceneMeshes, 1);
 });
 
 test('terrain origin and pipeline decisions preserve two-pass behavior', () => {
@@ -929,6 +1048,49 @@ test('shared map pan respects map yaw', () => {
   assert.equal(controls.mapPanNorth, 0);
 });
 
+test('vehicle keyboard uses E for engine, G for navigator, and leaves bare R inert', () => {
+  const originalWindow = globalThis.window;
+  const listeners = new Map();
+  globalThis.window = {
+    addEventListener(type, listener) { listeners.set(type, listener); },
+    removeEventListener(type, listener) {
+      if (listeners.get(type) === listener) listeners.delete(type);
+    },
+  };
+  let engineToggles = 0;
+  let navigatorToggles = 0;
+  let resetCalls = 0;
+  try {
+    const controls = { keys: {} };
+    const cleanup = installTerrainKeyboardControls({
+      controls,
+      isVehicleActive: () => true,
+      onForwardDoubleTap() {},
+      onEscapeVehicle() {},
+      onToggleMap() {},
+      onToggleGoogleNavigator() { navigatorToggles += 1; },
+      onOpenPipeline() {},
+      onOpenHeatmap() {},
+      onReset() { resetCalls += 1; },
+      onHouseAction() {},
+      onToggleHeadlights() {},
+      onToggleAircraftEngine() { engineToggles += 1; },
+    });
+    const keydown = listeners.get('keydown');
+    keydown({ code: 'KeyE', repeat: false, target: null });
+    keydown({ code: 'KeyG', repeat: false, target: null });
+    keydown({ code: 'KeyR', repeat: false, target: null });
+    assert.equal(engineToggles, 1);
+    assert.equal(navigatorToggles, 1);
+    assert.equal(resetCalls, 0);
+    assert.equal(controls.keys.KeyE, true);
+    assert.equal(controls.keys.KeyG, true);
+    cleanup();
+  } finally {
+    globalThis.window = originalWindow;
+  }
+});
+
 test('vehicle drive follows heading and respects speed limit', () => {
   const step = stepVehicleDrive({
     dt: 1, heading: 0, speed: 0, steer: 0, drive: 1,
@@ -938,6 +1100,214 @@ test('vehicle drive follows heading and respects speed limit', () => {
   assert.equal(step.speed, 12);
   assert.ok(Math.abs(step.deltaX) < 1e-12);
   assert.equal(step.deltaY, 12);
+});
+
+test('Patria wheel rig preserves original meshes and rotates accepted vertex clusters', () => {
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute('position', new THREE.Float32BufferAttribute([
+    0, -0.05, -1,
+    0, 0.05, 1,
+    1, -0.05, -1,
+    1, 0.05, 1,
+  ], 3));
+  const mesh = new THREE.Mesh(geometry, new THREE.MeshBasicMaterial());
+  mesh.name = 'Object_8';
+  const parent = new THREE.Group();
+  parent.add(mesh);
+  const rig = createVehicleWheelRig(THREE, {
+    wheels: [mesh], config: { wheelClusterSplitThreshold: null },
+  });
+  assert.equal(rig.clusters.length, 1);
+  assert.equal(mesh.parent, parent, 'the accepted animator does not replace the source mesh');
+  assert.equal(spinVehicleWheelRig(rig, Math.PI / 2, 1), true);
+  assert.ok(Math.abs(geometry.getAttribute('position').getY(0) - -1) < 1e-6);
+  assert.ok(geometry.getAttribute('position').version > 0);
+});
+
+test('Patria wheel discovery keeps the vehicle_splitting 3500 vertex default', () => {
+  assert.equal(normalizeVehiclePartDefinition({}).wheelClusterSplitThreshold, 3500);
+  assert.equal(
+    normalizeVehiclePartDefinition({ wheelClusterSplitThreshold: null })
+      .wheelClusterSplitThreshold,
+    3500,
+  );
+  assert.equal(
+    normalizeVehiclePartDefinition({ wheelClusterSplitThreshold: 4200 })
+      .wheelClusterSplitThreshold,
+    4200,
+  );
+});
+
+test('aircraft uses the accepted engine and direct game-flight controls', () => {
+  const group = new THREE.Group();
+  group.position.z = 2;
+  const marker = { position: { set() {} } };
+  const aircraft = createAircraftState({
+    id: 'osprey-01',
+    definition: {
+      vehicleType: 'aircraft', altOffsetM: 2,
+      flight: { hoverMaxSpeedMs: 30, climbRateMs: 15, descendRateMs: 10, accelMs2: 15, yawRateRad: 1.05 },
+    },
+    instance: { headingDeg: 0 },
+    group,
+    marker,
+  });
+  assert.equal(toggleAircraftEngine(aircraft), true);
+  stepAircraftFlight(aircraft, { climb: true }, 1, 0);
+  assert.ok(group.position.z > 2, 'Space commands a responsive game-like climb');
+  stepAircraftFlight(aircraft, { forward: true, climb: true, left: true }, 1.5, 0);
+  assert.ok(aircraft.forwardSpeedMs > 0);
+  assert.ok(aircraft.headingRad > 0);
+  assert.ok(group.position.z > 2);
+  assert.notEqual(aircraft.flightRegime, 'GROUND');
+
+  assert.equal(toggleAircraftEngine(aircraft), false);
+  group.position.z = -5;
+  aircraft.verticalSpeedMs = -20;
+  stepAircraftFlight(aircraft, {}, 0.5, 4);
+  assert.equal(group.position.z, 6);
+  assert.equal(aircraft.verticalSpeedMs, 0);
+});
+
+test('aircraft neutral controls damp vertical motion for a stable game hover', () => {
+  const group = new THREE.Group();
+  group.position.z = 20;
+  const aircraft = createAircraftState({
+    id: 'osprey-hover',
+    definition: { vehicleType: 'aircraft', altOffsetM: 2, flight: {} },
+    instance: { headingDeg: 0 },
+    group,
+    marker: null,
+  });
+  aircraft.engineRunning = true;
+  aircraft.verticalSpeedMs = 3;
+  stepAircraftFlight(aircraft, {}, 1, 0);
+  assert.equal(aircraft.verticalSpeedMs, 0);
+  assert.equal(aircraft.flightRegime, 'HOVER');
+});
+
+test('aircraft nacelles convert automatically with forward speed', () => {
+  const group = new THREE.Group();
+  group.position.z = 100;
+  const aircraft = createAircraftState({
+    id: 'osprey-transition',
+    definition: {
+      vehicleType: 'aircraft', altOffsetM: 2,
+      flight: { transitionLowMs: 30, transitionHighMs: 50, maxSpeedMs: 141, hoverMaxSpeedMs: 30 },
+    },
+    instance: { headingDeg: 0 },
+    group,
+    marker: null,
+  });
+  aircraft.engineRunning = true;
+  aircraft.forwardSpeedMs = 40;
+  stepAircraftFlight(aircraft, { forward: true }, 0.1, 0);
+  assert.ok(aircraft.nacelleTiltTarget > 0 && aircraft.nacelleTiltTarget < 97.5);
+  aircraft.forwardSpeedMs = 55;
+  stepAircraftFlight(aircraft, { forward: true }, 0.1, 0);
+  assert.equal(aircraft.nacelleTiltTarget, 0);
+  aircraft.nacelleTiltDeg = 0;
+  stepAircraftFlight(aircraft, {}, 0, 0);
+  assert.equal(aircraft.flightRegime, 'AIRPLANE');
+});
+
+test('aircraft rotor setup assigns distinct pivots and counter-rotates with spool response', () => {
+  const group = new THREE.Group();
+  const model = new THREE.Group();
+  const leftNacelle = new THREE.Group();
+  const rightNacelle = new THREE.Group();
+  const leftHousing = new THREE.Mesh(new THREE.BoxGeometry(2, 4, 2));
+  const rightHousing = new THREE.Mesh(new THREE.BoxGeometry(2, 4, 2));
+  const leftRotor = new THREE.Mesh(new THREE.BoxGeometry(8, 0.2, 8));
+  const rightRotor = new THREE.Mesh(new THREE.BoxGeometry(8, 0.2, 8));
+  leftNacelle.name = 'V22_Nacelle_Left';
+  rightNacelle.name = 'V22_Nacelle_Right';
+  leftRotor.name = 'V22_Rotor_Left';
+  rightRotor.name = 'V22_Rotor_Right';
+  leftNacelle.position.z = 7;
+  rightNacelle.position.z = -7;
+  leftNacelle.add(leftHousing, leftRotor);
+  rightNacelle.add(rightHousing, rightRotor);
+  model.add(leftNacelle, rightNacelle);
+  const aircraft = createAircraftState({
+    id: 'osprey-01',
+    definition: {
+      vehicleType: 'aircraft',
+      flight: {},
+      parts: {
+        leftNacelle: [leftNacelle.name],
+        rightNacelle: [rightNacelle.name],
+        leftRotor: leftRotor.name,
+        rightRotor: rightRotor.name,
+      },
+      nacelles: {
+        tiltSpeedDegS: 12.2,
+        tiltAxis: 'y',
+        tiltDirection: -1,
+        rotorAxis: 'z',
+        rotorSpeedRpm: 397,
+        rotorResponseSeconds: 3.5,
+      },
+    },
+    instance: { headingDeg: 0 },
+    group,
+    marker: null,
+  });
+  const summary = setupAircraftModelParts(aircraft, model);
+  assert.equal(summary.rotorAnimationAvailable, true);
+  assert.equal(summary.nacelleAnimationAvailable, true);
+  assert.equal(aircraft.leftNacellePivot, leftNacelle);
+  assert.equal(aircraft.rightNacellePivot, rightNacelle);
+  assert.equal(aircraft.leftRotorMesh, leftRotor);
+  assert.equal(aircraft.rightRotorMesh, rightRotor);
+  aircraft.engineRunning = true;
+  aircraft.nacelleTiltTarget = 0;
+  updateAircraftVisuals(aircraft, 1);
+  assert.ok(aircraft.rotorAngularVelocity > 0);
+  assert.notEqual(leftRotor.rotation.z, 0);
+  assert.equal(rightRotor.rotation.z, -leftRotor.rotation.z);
+  assert.equal(leftRotor.rotation.y, 0);
+  assert.ok(leftNacelle.rotation.y < 0);
+  assert.equal(leftNacelle.rotation.z, 0);
+  assert.equal(rightNacelle.rotation.y, leftNacelle.rotation.y);
+  const runningVelocity = aircraft.rotorAngularVelocity;
+  aircraft.engineRunning = false;
+  updateAircraftVisuals(aircraft, 1);
+  assert.ok(aircraft.rotorAngularVelocity < runningVelocity);
+});
+
+test('WebGPU vehicle fire runtime restores classic effect pools and expires effects', () => {
+  const terrainRoot = new THREE.Group();
+  const camera = new THREE.PerspectiveCamera(60, 1, 0.1, 5000);
+  camera.position.set(0, -5, 2);
+  camera.lookAt(0, 100, 0);
+  camera.updateMatrixWorld(true);
+  const target = new THREE.Mesh(new THREE.PlaneGeometry(500, 500));
+  target.position.y = 100;
+  terrainRoot.add(target);
+  terrainRoot.updateMatrixWorld(true);
+  const runtime = createVehicleFireRuntime({
+    terrainRoot,
+    camera,
+    getTerrainTargets: () => [target],
+    tracerCount: 2,
+    impactCount: 2,
+  });
+  const vehicleEntry = { id: 'amv-01', lastFireAt: -Infinity };
+  assert.equal(runtime.fire(vehicleEntry, new THREE.Vector3(0, 0, 2), 1), true);
+  assert.equal(runtime.fire(vehicleEntry, new THREE.Vector3(0, 0, 2), 1.05), false);
+  assert.deepEqual(runtime.summary(), {
+    shotsFired: 1,
+    activeTracers: 1,
+    activeImpacts: 1,
+    muzzleVisible: true,
+    nodeMaterials: false,
+    classicMaterials: true,
+  });
+  runtime.update(4);
+  assert.equal(runtime.summary().activeTracers, 0);
+  assert.equal(runtime.summary().activeImpacts, 0);
+  assert.equal(runtime.summary().muzzleVisible, false);
 });
 
 test('shared vehicle persistence helpers preserve coordinates and normalize saved state', () => {
@@ -959,11 +1329,11 @@ test('shared vehicle persistence helpers preserve coordinates and normalize save
   }), { lat: 64, lon: -51, headingDeg: 270, z: 12.346 });
 
   assert.deepEqual(normalizeSavedVehicleState({
-    lat: '64.1', lon: '-51.2', headingDeg: '361.5', z: '8.25', terrainDepth: '7.9',
-  }), { lat: 64.1, lon: -51.2, headingDeg: 361.5, z: 8.25, terrainDepth: 7 });
+    lat: '64.1', lon: '-51.2', headingDeg: '361.5', z: '8.25', terrainDepth: '7.9', terrainTileId: ' 12-1-2 ',
+  }), { lat: 64.1, lon: -51.2, headingDeg: 361.5, z: 8.25, terrainDepth: 7, terrainTileId: '12-1-2' });
   assert.deepEqual(normalizeSavedVehicleState({
     lat: 64, lon: -51, headingDeg: 0, z: 'bad', terrainDepth: -2,
-  }), { lat: 64, lon: -51, headingDeg: 0, z: null, terrainDepth: 0 });
+  }), { lat: 64, lon: -51, headingDeg: 0, z: null, terrainDepth: 0, terrainTileId: null });
   assert.equal(normalizeSavedVehicleState({ lat: 64, lon: 'bad', headingDeg: 0 }), null);
 });
 

@@ -15,12 +15,67 @@ export interface VehicleHeadlights {
   targetXScale: number;
 }
 
+export interface VehicleParts {
+  wheels?: string[];
+  turret?: string | null;
+  gun?: string | null;
+  body?: string[];
+  shield?: string[];
+  leftNacelle?: string[];
+  rightNacelle?: string[];
+  leftRotor?: string | null;
+  rightRotor?: string | null;
+  turretPivot?: [number, number, number];
+  gunPivot?: [number, number, number];
+  muzzle?: [number, number, number];
+}
+
+export type VehicleType = "ground" | "aircraft";
+
+export interface AircraftFlightConfig {
+  maxSpeedMs: number;
+  hoverMaxSpeedMs: number;
+  transitionLowMs: number;
+  transitionHighMs: number;
+  climbRateMs: number;
+  descendRateMs: number;
+  accelMs2: number;
+  yawRateRad: number;
+  pitchRateRad: number;
+  rollRateRad: number;
+}
+
+export interface NacelleConfig {
+  tiltSpeedDegS: number;
+  rotorRadiusM: number;
+  leftCenter: [number, number, number];
+  rightCenter: [number, number, number];
+  tiltAxis?: "x" | "y" | "z";
+  tiltDirection?: -1 | 1;
+  rotorAxis?: "x" | "y" | "z";
+  rotorSpeedRpm?: number;
+  rotorResponseSeconds?: number;
+}
+
 export interface VehicleDefinition {
   url: string;
+  displayName?: string;
+  vehicleType?: VehicleType;
   realLengthM: number;
-  tireDiameterM: number;
+  tireDiameterM?: number;
   altOffsetM: number;
+  headingOffsetDeg?: number;
+  modelRotationDeg?: [number, number, number];
+  parts?: VehicleParts;
+  wheelClusterSplitThreshold?: number | null;
+  flight?: AircraftFlightConfig;
+  nacelles?: NacelleConfig;
 }
+
+export type VehicleDefinitionCatalog = Record<
+  string,
+  VehicleDefinition & { headlights?: VehicleHeadlights }
+>;
 
 export interface StructureDefinition {
   url: string;
@@ -49,12 +104,14 @@ export interface VehicleStateCommon {
 
 export interface VehicleInstance extends VehicleStateCommon {
   id: string;
+  definitionId?: string;
   headlightsOn: boolean;
   savedAt: number;
 }
 
 export interface VehicleSeedInstance {
   vehicleId: string;
+  definitionId?: string;
   headlightsOn: boolean;
   state: VehicleStateCommon;
 }
@@ -62,6 +119,7 @@ export interface VehicleSeedInstance {
 export interface AssetMetadata {
   source: string;
   vehicleDefinition: VehicleDefinition;
+  vehicleDefinitions: VehicleDefinitionCatalog;
   vehicleHeadlights: VehicleHeadlights;
   structureDefinition: StructureDefinition;
   seedVehicleInstances: VehicleSeedInstance[];
@@ -91,6 +149,7 @@ export interface AssetsResponse {
   vehicle_definition: VehicleDefinition & {
     headlights: VehicleHeadlights;
   };
+  vehicle_definitions: VehicleDefinitionCatalog;
   structure_definition: StructureDefinition;
   vehicle_instances: VehicleInstance[];
   structure_instances: StructureInstance[];
@@ -102,6 +161,7 @@ export type AssetType = "vehicle" | "structure";
 
 export interface VehicleProperties {
   headlightsOn: boolean;
+  definitionId?: string;
   terrainDepth?: number;
   terrainTileId?: string;
 }

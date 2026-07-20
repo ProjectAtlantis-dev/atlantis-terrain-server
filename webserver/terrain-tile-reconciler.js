@@ -22,6 +22,7 @@ export function reconcileTerrainTiles({
   log,
   buildBudget = 200,
   prepareUntexturedMesh = () => {},
+  forceUntexturedBuild = () => false,
   onMeshAdded = () => {},
   onDiff = () => {},
 }) {
@@ -75,10 +76,12 @@ export function reconcileTerrainTiles({
       const hasStaleCoverage = terrainRoot.children.some(mesh => (
         mesh.isMesh && mesh.material?.map && mesh.userData?.bbox && overlaps(mesh.userData.bbox, tile.bbox)
       ));
-      if (hasStaleCoverage) {
+      if (hasStaleCoverage && !forceUntexturedBuild(tile)) {
         log(tile.id, 'added — deferred (stale coverage exists)');
       } else if (built < buildBudget) {
-        log(tile.id, 'added — untextured fallback (no stale coverage)');
+        log(tile.id, hasStaleCoverage
+          ? 'added — fine untextured geometry for procgen window'
+          : 'added — untextured fallback (no stale coverage)');
         const mesh = buildMesh(tile);
         if (mesh) {
           applyDepthOffset(mesh, tile.id);

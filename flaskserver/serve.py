@@ -26,7 +26,7 @@ from database import (
     open_db, read_tile, read_tile_metadata, write_tile, TileClobberError,
     GRID_N, CONFIDENCE, _tile_id, _tile_bbox, compute_geometric_error,
 )
-from terrain_config import ENHANCE_DEPTH
+from terrain_config import TERRAIN_MAX_DEPTH
 
 
 REAL_SOURCES = ('arcticdem', 'arcticdem_10m', 'copernicus', 'upscaled', 'supir_upscaled', 'parent_resampled')
@@ -165,8 +165,9 @@ def _traverse(db, depth, col, row, qx, qy, max_depth, error_threshold,
     if max_range > 0 and dist_to_tile > max_range:
         if _debug:
             log_trav.debug(f"{tid}: beyond max_range ({dist_to_tile:.0f} > {max_range:.0f}), real={has_real_data}")
-        if has_real_data:
-            results.append(tid)
+        # The bbox is entirely outside the requested player-centered range.
+        # Appending a coarse real tile here made the traversal retain terrain
+        # across the rest of Greenland and defeated the range contract.
         return
 
     # Parent-resampled tiles are terminal — don't subdivide further.
@@ -188,10 +189,15 @@ def _traverse(db, depth, col, row, qx, qy, max_depth, error_threshold,
             log_trav.debug(f"{tid}: screen_error={screen_error:.6f} threshold={error_threshold:.6f} dist={dist:.0f}")
 
         if screen_error > error_threshold:
-            # Hard subdivision ceiling — enhanced textures are the final quality.
-            if depth >= ENHANCE_DEPTH:
+            # Hard source-detail ceiling. This is deliberately independent of
+            # the depth-12 ComfyUI enhancement workflow: real SPOT imagery has
+            # useful native detail through depth 13.
+            if depth >= TERRAIN_MAX_DEPTH:
                 if _debug:
-                    log_trav.debug(f"{tid}: depth>={depth} — NOT subdividing (depth-{ENHANCE_DEPTH} ceiling) real={has_real_data}")
+                    log_trav.debug(
+                        f"{tid}: depth>={depth} — NOT subdividing "
+                        f"(depth-{TERRAIN_MAX_DEPTH} source ceiling) real={has_real_data}"
+                    )
                 if has_real_data:
                     results.append(tid)
                 elif tid not in _no_data_cache:
@@ -271,18 +277,21 @@ def _traverse(db, depth, col, row, qx, qy, max_depth, error_threshold,
 
 
 def query_tiles_stereo(db, qx, qy, error_threshold=0.001, max_depth=None,
-                       max_range=0.0, log=print, altitude=0.0):
+                       max_range=0.0, log=print, altitude=0.0,
+                       max_tiles=2500, include_heightmaps=True):
     """Query tiles using error-based LOD with stereo coords directly.
 
     Same as query_tiles() but takes EPSG:3413 coords instead of lat/lon.
     max_range: if > 0, skip tiles beyond this distance in meters.
     altitude: camera altitude in meters — increases effective distance to tiles below.
     """
-    return _query_tiles_impl(db, qx, qy, error_threshold, max_depth, max_range, log, altitude)
+    return _query_tiles_impl(db, qx, qy, error_threshold, max_depth, max_range,
+                             log, altitude, max_tiles, include_heightmaps)
 
 
 def query_tiles(db, lat, lon, error_threshold=0.001, max_depth=None,
-                max_range=0.0, log=print, altitude=0.0):
+                max_range=0.0, log=print, altitude=0.0,
+                max_tiles=2500, include_heightmaps=True):
     """Query tiles using error-based LOD.
 
     Returns best-available tiles from the DB plus a list of missing tiles
@@ -304,10 +313,74 @@ def query_tiles(db, lat, lon, error_threshold=0.001, max_depth=None,
             missing: list of (tile_id, bbox) that need COG fetching
     """
     qx, qy = to_stereo(lat, lon)
-    return _query_tiles_impl(db, qx, qy, error_threshold, max_depth, max_range, log, altitude)
+    return _query_tiles_impl(db, qx, qy, error_threshold, max_depth, max_range,
+                             log, altitude, max_tiles, include_heightmaps)
 
 
-def _query_tiles_impl(db, qx, qy, error_threshold, max_depth, max_range, log, altitude=0.0):
+def _collapse_leaf_budget(db, leaf_ids, qx, qy, max_tiles, log):
+    """Collapse far quadtree regions into real ancestors within ``max_tiles``.
+
+    A range-clipped traversal often contains only one, two or three siblings at
+    its boundary. Requiring complete quartets made the advertised budget a soft
+    suggestion (a 64-page preview returned 74 pages). Grouping every resident
+    descendant under each real ancestor preserves coverage and lets boundary
+    regions coarsen too; the parent may conservatively cover some space outside
+    the requested range, but it never creates a hole.
+    """
+    if max_tiles <= 0 or len(leaf_ids) <= max_tiles:
+        return leaf_ids
+    leaves = set(leaf_ids)
+    meta_cache = {}
+
+    def meta(tid):
+        if tid not in meta_cache:
+            meta_cache[tid] = read_tile_metadata(db, tid)
+        return meta_cache[tid]
+
+    original = len(leaves)
+    while len(leaves) > max_tiles:
+        descendants_by_parent = {}
+        for tid in leaves:
+            depth, col, row = (int(part) for part in tid.split('-'))
+            for parent_depth in range(depth - 1, -1, -1):
+                shift = depth - parent_depth
+                parent_id = _tile_id(parent_depth, col >> shift, row >> shift)
+                descendants_by_parent.setdefault(parent_id, set()).add(tid)
+
+        candidates = []
+        for parent_id, descendants in descendants_by_parent.items():
+            if len(descendants) < 2:
+                continue
+            parent = meta(parent_id)
+            if parent is None or parent['source'] not in REAL_SOURCES:
+                continue
+            distance = _distance_to_bbox(qx, qy, parent['bbox'])
+            reduction = len(descendants) - 1
+            candidates.append(
+                (distance, parent['depth'], reduction, parent_id, descendants)
+            )
+        if not candidates:
+            break
+        needed = len(leaves) - max_tiles
+        within_budget = [item for item in candidates if item[2] <= needed]
+        if within_budget:
+            # Preserve detail near the camera: farthest region first, then the
+            # finest viable ancestor and largest useful reduction.
+            chosen = max(within_budget, key=lambda item: (item[0], item[1], item[2]))
+        else:
+            # The final collapse may cross below the ceiling. Choose the
+            # smallest overshoot, using distance/depth only as tie-breakers.
+            chosen = min(candidates, key=lambda item: (item[2], -item[0], -item[1]))
+        _, _, _, parent_id, descendants = chosen
+        leaves.difference_update(descendants)
+        leaves.add(parent_id)
+    log(f"  [BALANCED BUDGET] {original} leaves collapsed to {len(leaves)} "
+        f"(target {max_tiles})")
+    return list(leaves)
+
+
+def _query_tiles_impl(db, qx, qy, error_threshold, max_depth, max_range, log,
+                      altitude=0.0, max_tiles=2500, include_heightmaps=True):
     from database import get_metadata
     from collections import Counter
 
@@ -325,21 +398,7 @@ def _query_tiles_impl(db, qx, qy, error_threshold, max_depth, max_range, log, al
     missing_raw = []
     _traverse(db, 0, 0, 0, qx, qy, max_depth, error_threshold, leaf_ids, missing_raw, max_range, altitude)
 
-    # Tile budget: if LOD produced too many tiles, drop the deepest/farthest.
-    # Keep coarse tiles (coverage) and nearest deep tiles (detail where it matters).
-    MAX_TILES = 2500
-    if len(leaf_ids) > MAX_TILES:
-        # Score each tile: (depth, distance) — drop highest scores first
-        def _tile_score(tid):
-            parts = tid.split('-')
-            d = int(parts[0])
-            bbox = _tile_bbox(d, int(parts[1]), int(parts[2]))
-            dist = _distance_to_bbox(qx, qy, bbox)
-            return (d, dist)
-        leaf_ids.sort(key=_tile_score)
-        dropped = len(leaf_ids) - MAX_TILES
-        leaf_ids = leaf_ids[:MAX_TILES]
-        log(f"  [BUDGET] dropped {dropped} deepest/farthest tiles, capped at {MAX_TILES}")
+    leaf_ids = _collapse_leaf_budget(db, leaf_ids, qx, qy, max_tiles, log)
 
     # Cap missing tiles: sort by distance to camera, closest first.
     # Progressive loading — fetch nearest tiles first, re-query for more.
@@ -350,7 +409,7 @@ def _query_tiles_impl(db, qx, qy, error_threshold, max_depth, max_range, log, al
     # Read full tile data for leaves
     results = []
     for tid in leaf_ids:
-        tile = read_tile(db, tid)
+        tile = read_tile(db, tid) if include_heightmaps else read_tile_metadata(db, tid)
         if tile is None:
             continue
 
@@ -366,9 +425,11 @@ def _query_tiles_impl(db, qx, qy, error_threshold, max_depth, max_range, log, al
             'center': [cx, cy],
             'size': size,
             'resolution': GRID_N,
-            'heightmap': tile['heightmap'],
+            'heightmap': tile.get('heightmap'),
             'source': tile['source'],
             'geometric_error': tile['geometric_error'],
+            'updated_at': tile.get('updated_at'),
+            'has_heightmap': tile.get('has_heightmap', tile.get('heightmap') is not None),
         })
 
     # Queue background refetch for tiles with outdated DEM resolution.
@@ -384,7 +445,8 @@ def _query_tiles_impl(db, qx, qy, error_threshold, max_depth, max_range, log, al
         log(f"  [DEM UPGRADE] {upgrade_count} tiles queued for 10m refetch")
 
     results = sorted(results, key=lambda t: -t['depth'])
-    _stitch_lod_edges(results)
+    if include_heightmaps:
+        _stitch_lod_edges(results)
 
     # --- Clear logging: what came from where ---
     db_depths = Counter(t['depth'] for t in results)

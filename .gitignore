@@ -27,6 +27,8 @@ webserver/dist-ssr
 # Secrets
 .env
 .env.*
+!.env.example
+!**/.env.example
 *.pem
 *.key
 *.p12
@@ -44,6 +46,7 @@ debug-storybook.log
 venv/
 __pycache__/
 pipeline/database/data/
+flaskserver/data/
 flaskserver/greenland.db
 flaskserver/terrain.db
 flaskserver/terrain.db-wal
@@ -51,6 +54,9 @@ flaskserver/terrain.db-shm
 assetserver/assets.db
 assetserver/assets.db-wal
 assetserver/assets.db-shm
+webserver/public/models/v22_osprey.glb
+webserver/public/models/v22_osprey_rotors.glb
+webserver/public/models/v22_textures/
 water_samples/
 sample/
 

@@ -10,11 +10,14 @@ export function buildTerrainTilesRequest({
   frameOffsetReady,
   originX,
   originY,
+  useManifest = false,
+  tileBudget = 384,
   cameraSnapshot = {},
 }) {
   const preview = pass === 1;
   let url = `/api/tiles?lat=${lat}&lon=${lon}&alt=${altitude}&heading=${heading}&range=${range}`;
   if (preview) url += `&maxDepth=${previewMaxDepth}`;
+  if (useManifest) url += `&manifest=1&budget=${tileBudget}`;
   if (!isFirstLoad || frameOffsetReady) url += `&ox=${originX}&oy=${originY}`;
   return {
     url,
@@ -27,9 +30,49 @@ export function buildTerrainTilesRequest({
       requestAltM: altitude,
       headingRad: heading,
       maxDepth: preview ? previewMaxDepth : null,
+      ...(useManifest ? { manifest: true, tileBudget } : {}),
       ...cameraSnapshot,
     },
   };
+}
+
+export async function hydrateTerrainHeightmaps(tiles, {
+  cache,
+  fetchImpl = (...args) => fetch(...args),
+  signal,
+  concurrency = 12,
+} = {}) {
+  const pending = [];
+  for (const tile of tiles || []) {
+    if (tile.heightmap instanceof Float32Array) continue;
+    const cached = cache?.get(tile.id);
+    if (cached && cached.version === tile.heightVersion) {
+      tile.heightmap = cached.heightmap;
+      continue;
+    }
+    if (tile.heightmapUrl) pending.push(tile);
+  }
+  let cursor = 0;
+  const workers = Array.from(
+    { length: Math.min(concurrency, pending.length) },
+    async () => {
+      while (cursor < pending.length) {
+        const tile = pending[cursor++];
+        const response = await fetchImpl(tile.heightmapUrl, { signal });
+        if (!response.ok) throw new Error(`height ${tile.id}: HTTP ${response.status}`);
+        const buffer = await response.arrayBuffer();
+        const expectedBytes = tile.resolution * tile.resolution * Float32Array.BYTES_PER_ELEMENT;
+        if (buffer.byteLength !== expectedBytes) {
+          throw new Error(`height ${tile.id}: ${buffer.byteLength} bytes, expected ${expectedBytes}`);
+        }
+        const heightmap = new Float32Array(buffer);
+        tile.heightmap = heightmap;
+        cache?.set(tile.id, { version: tile.heightVersion, heightmap });
+      }
+    },
+  );
+  await Promise.all(workers);
+  return { requested: pending.length, resident: (tiles || []).length - pending.length };
 }
 
 export function diffTerrainTileIds(tiles, currentTileIds) {
