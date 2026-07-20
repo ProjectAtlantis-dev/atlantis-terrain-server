@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs';
 import test from 'node:test';
 
 import {
-  headingAlignedPriorityDistance,
+  radialPriorityDistance,
   headingFromForward2D,
   headingForward2D,
   priorityHeading,
@@ -708,6 +708,7 @@ test('reconciliation rebuilds a resident tile when repaired seam geometry change
     remove(mesh) { this.children = this.children.filter(item => item !== mesh); },
   };
   const evicted = [];
+  const sceneSizesAtEviction = [];
   const built = [];
   const nextTile = {
     id: '12-20-40', bbox: [0, 0, 4, 4], heightmap: 'new-repair', priority: 1,
@@ -719,7 +720,11 @@ test('reconciliation rebuilds a resident tile when repaired seam geometry change
     deferredTiles: new Map(),
     terrainRoot,
     lifecycle: {
-      evict(mesh) { evicted.push(mesh.userData.tileId); terrainRoot.remove(mesh); },
+      evict(mesh) {
+        evicted.push(mesh.userData.tileId);
+        sceneSizesAtEviction.push(terrainRoot.children.length);
+        terrainRoot.remove(mesh);
+      },
       sweepStaleParents: () => 0,
     },
     priorityForTile: () => 0,
@@ -739,11 +744,57 @@ test('reconciliation rebuilds a resident tile when repaired seam geometry change
   });
 
   assert.deepEqual(evicted, [nextTile.id]);
+  assert.deepEqual(sceneSizesAtEviction, [2]);
   assert.deepEqual(built, [nextTile.id]);
   assert.equal(terrainRoot.children.length, 1);
   assert.equal(terrainRoot.children[0].userData.heightmapPayload, 'new-repair');
   assert.deepEqual(result.added, [nextTile.id]);
   assert.deepEqual(result.removed, []);
+});
+
+test('seam refresh keeps old geometry when the replacement is build-budget deferred', () => {
+  const oldMesh = {
+    isMesh: true,
+    userData: {
+      tileId: '12-20-40', bbox: [0, 0, 4, 4], heightmapPayload: 'old-repair',
+    },
+    material: { map: null },
+  };
+  const terrainRoot = {
+    children: [oldMesh],
+    add(mesh) { this.children.push(mesh); },
+    remove(mesh) { this.children = this.children.filter(item => item !== mesh); },
+  };
+  const deferredTiles = new Map();
+  let evictions = 0;
+  let builds = 0;
+  const nextTile = {
+    id: oldMesh.userData.tileId,
+    bbox: oldMesh.userData.bbox,
+    heightmap: 'new-repair',
+  };
+
+  reconcileTerrainTiles({
+    tiles: [nextTile],
+    currentTileIds: new Set([nextTile.id]),
+    deferredTiles,
+    terrainRoot,
+    lifecycle: {
+      evict() { evictions += 1; },
+      sweepStaleParents: () => 0,
+    },
+    priorityForTile: () => 0,
+    textureCache: new Map(),
+    materialize() {},
+    buildMesh() { builds += 1; },
+    buildBudget: 0,
+    log() {},
+  });
+
+  assert.equal(evictions, 0);
+  assert.equal(builds, 0);
+  assert.deepEqual(terrainRoot.children, [oldMesh]);
+  assert.equal(deferredTiles.get(nextTile.id), nextTile);
 });
 
 test('reconciliation releases old heatmap tiles but retains a complete fallback parent', () => {
@@ -790,6 +841,57 @@ test('reconciliation releases old heatmap tiles but retains a complete fallback 
   assert.deepEqual(releasedTextures, ['8-10-10']);
   assert.deepEqual(terrainRoot.children, [parent]);
   assert.equal(result.released, 1);
+});
+
+test('circular-boundary parent remains for partial demanded descendants', () => {
+  const parent = {
+    isMesh: true,
+    userData: { tileId: '10-351-206', bbox: [0, 0, 8, 8] },
+    material: { map: {}, dispose() {} },
+    geometry: { dispose() {} },
+    children: [],
+  };
+  const terrainRoot = {
+    children: [parent],
+    add(mesh) { this.children.push(mesh); },
+    remove(mesh) { this.children = this.children.filter(item => item !== mesh); },
+  };
+  const lifecycle = createTileLifecycle({
+    terrainRoot, disposeScatter: () => {}, log: () => {},
+  });
+  const demanded = [
+    { id: '11-702-412', bbox: [0, 0, 4, 4], heightmap: 'hm' },
+    { id: '11-703-412', bbox: [4, 0, 8, 4], heightmap: 'hm' },
+  ];
+
+  const result = reconcileTerrainTiles({
+    tiles: demanded,
+    currentTileIds: new Set([parent.userData.tileId]),
+    deferredTiles: new Map(),
+    terrainRoot,
+    lifecycle,
+    priorityForTile: () => 0,
+    textureCache: new Map(),
+    materialize() {},
+    buildMesh: () => null,
+    log() {},
+  });
+
+  assert.equal(result.released, 0);
+  assert.deepEqual(terrainRoot.children, [parent]);
+  assert.equal(lifecycle.sweepStaleParents(demanded, new Set(demanded.map(tile => tile.id))), 0);
+
+  for (const tile of demanded) {
+    terrainRoot.add({
+      isMesh: true,
+      userData: { tileId: tile.id, bbox: tile.bbox },
+      material: { map: {}, dispose() {} },
+      geometry: { dispose() {} },
+      children: [],
+    });
+  }
+  assert.equal(lifecycle.sweepStaleParents(demanded, new Set(demanded.map(tile => tile.id))), 1);
+  assert.equal(terrainRoot.children.includes(parent), false);
 });
 
 test('textured parent remains while demanded children are untextured', () => {
@@ -1485,12 +1587,12 @@ test('tile ahead of vehicle is hotter than tile behind it', () => {
   assert.ok(ahead < behind);
 });
 
-test('terrain priority distance has a two-times-forward oval', () => {
-  assert.equal(headingAlignedPriorityDistance(0, 40000, 0), 20000);
-  assert.equal(headingAlignedPriorityDistance(0, -20000, 0), 20000);
-  assert.equal(headingAlignedPriorityDistance(20000, 0, 0), 20000);
+test('terrain priority distance is circular in every heading', () => {
+  assert.equal(radialPriorityDistance(0, 40000), 40000);
+  assert.equal(radialPriorityDistance(0, -20000), 20000);
+  assert.equal(radialPriorityDistance(20000, 0), 20000);
   assert.ok(Math.abs(
-    headingAlignedPriorityDistance(-40000, 0, Math.PI / 2) - 20000,
+    radialPriorityDistance(-40000, 0) - 40000,
   ) < 1e-9);
 });
 
@@ -1738,6 +1840,77 @@ test('shared texture pump caches successful exact texture', async () => {
   assert.equal(completed.texture.anisotropy, 8);
 });
 
+test('shared texture pump immediately refills freed concurrency slots', async () => {
+  const requests = [];
+  const resolvers = [];
+  const streamer = createTextureStreamer({
+    log: () => {},
+    maxInflight: 2,
+    fetchImpl: url => new Promise(resolve => {
+      requests.push(url);
+      resolvers.push(resolve);
+    }),
+    decodeImage: async () => ({ width: 256, height: 256 }),
+  });
+  const response = {
+    status: 200,
+    ok: true,
+    headers: { get: () => null },
+    blob: async () => ({}),
+  };
+  const scored = [1, 2, 3].map(index => ({
+    tile: { id: `12-1-${index}`, bbox: [0, 0, 1, 1] },
+  }));
+
+  streamer.pump(scored, {
+    isCovered: () => false,
+    onPlaceholder: () => assert.fail('unexpected placeholder'),
+    onTexture: () => {},
+  });
+  assert.equal(requests.length, 2);
+
+  resolvers[0](response);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(requests.length, 3);
+
+  resolvers[1](response);
+  resolvers[2](response);
+  await new Promise(resolve => setImmediate(resolve));
+});
+
+test('aborted texture demand does not refill cancelled work', async () => {
+  const requests = [];
+  let resolveRequest;
+  const streamer = createTextureStreamer({
+    log: () => {},
+    maxInflight: 1,
+    fetchImpl: url => new Promise(resolve => {
+      requests.push(url);
+      resolveRequest = resolve;
+    }),
+    decodeImage: async () => ({ width: 256, height: 256 }),
+  });
+  const scored = [1, 2].map(index => ({
+    tile: { id: `12-2-${index}`, bbox: [0, 0, 1, 1] },
+  }));
+  streamer.pump(scored, {
+    isCovered: () => false,
+    onPlaceholder: () => assert.fail('unexpected placeholder'),
+    onTexture: () => {},
+  });
+  assert.equal(requests.length, 1);
+
+  streamer.abortAll();
+  resolveRequest({
+    status: 200,
+    ok: true,
+    headers: { get: () => null },
+    blob: async () => ({}),
+  });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(requests.length, 1);
+});
+
 test('texture anisotropy supports both renderer APIs and fails safely', () => {
   assert.equal(rendererTextureAnisotropy({ getMaxAnisotropy: () => 16 }), 16);
   assert.equal(rendererTextureAnisotropy({
@@ -1746,7 +1919,7 @@ test('texture anisotropy supports both renderer APIs and fails safely', () => {
   assert.equal(rendererTextureAnisotropy({ getMaxAnisotropy: () => { throw new Error('not ready'); } }), 1);
 });
 
-test('shared lifecycle keeps parent until all four quadrants are textured', () => {
+test('shared lifecycle retires parent when all demanded descendants are textured', () => {
   const parent = {
     isMesh: true,
     userData: { tileId: '10-1-1', bbox: [0, 0, 10, 10] },
@@ -1765,8 +1938,9 @@ test('shared lifecycle keeps parent until all four quadrants are textured', () =
   const lifecycle = createTileLifecycle({
     terrainRoot: root, disposeScatter: () => {}, log: () => {},
   });
-  assert.equal(lifecycle.sweepStaleParents([], new Set(['11-2-2'])), 0);
+  const demandedIds = new Set(children.map(c => c.userData.tileId));
+  assert.equal(lifecycle.sweepStaleParents([], demandedIds), 0);
   root.children.push(...children.slice(1));
-  assert.equal(lifecycle.sweepStaleParents([], new Set(children.map(c => c.userData.tileId))), 1);
+  assert.equal(lifecycle.sweepStaleParents([], demandedIds), 1);
   assert.deepEqual(root.children, children);
 });

@@ -1,4 +1,4 @@
-import { headingAlignedPriorityDistance } from './terrain-priority.js';
+import { radialPriorityDistance } from './terrain-priority.js';
 
 function priorityColor(value) {
   if (value < 0.33) {
@@ -31,7 +31,7 @@ export function updateHeatmapViewPriorities(tiles, view) {
       continue;
     }
     const dot = (dx * forwardX + dy * forwardY) / distance;
-    const priorityDistance = headingAlignedPriorityDistance(dx, dy, heading);
+    const priorityDistance = radialPriorityDistance(dx, dy);
     tile.priority = Math.log(Math.max(
       priorityDistance / Math.max(dot, 0.01), 1,
     ));

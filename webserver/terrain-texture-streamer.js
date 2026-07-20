@@ -25,6 +25,7 @@ export function createTextureStreamer({
   decodeImage = (...args) => createImageBitmap(...args),
   getTextureAnisotropy = () => 1,
   now = () => performance.now(),
+  queueMicrotaskImpl = callback => queueMicrotask(callback),
 }) {
   const texCache = new Map();
   const texSource = new Map();
@@ -37,6 +38,9 @@ export function createTextureStreamer({
   const demandClient = globalThis.crypto?.randomUUID?.() ?? `terrain-${Date.now()}-${Math.random()}`;
   let version = Date.now();
   let roadDebug = false;
+  let activeDemand = null;
+  let demandGeneration = 0;
+  let refillPending = false;
 
   function advanceVersion() {
     version = Math.max(version + 1, Date.now());
@@ -56,7 +60,19 @@ export function createTextureStreamer({
       : 1;
   }
 
-  function pump(scored, { isCovered, onPlaceholder, onTexture }) {
+  function scheduleRefill(generation) {
+    if (generation !== demandGeneration || refillPending || activeDemand == null) return;
+    refillPending = true;
+    queueMicrotaskImpl(() => {
+      refillPending = false;
+      if (generation === demandGeneration && activeDemand != null) fillAvailableSlots();
+    });
+  }
+
+  function fillAvailableSlots() {
+    const demand = activeDemand;
+    if (demand == null) return;
+    const { scored, isCovered, onPlaceholder, onTexture } = demand;
     const currentTime = now();
     let repolls = repollBatch;
     for (const { tile } of scored) {
@@ -74,6 +90,7 @@ export function createTextureStreamer({
 
       const controller = new AbortController();
       texInflight.set(tileId, controller);
+      const requestGeneration = demandGeneration;
       const debugQuery = roadDebug ? '&roadDebug=1' : '';
       fetchImpl(`/api/texture/${tileId}.jpg?v=${version}&demand=${version}&demandClient=${encodeURIComponent(demandClient)}${debugQuery}`, { signal: controller.signal })
         .then(response => {
@@ -132,8 +149,14 @@ export function createTextureStreamer({
             log(tileId, `fetch error: ${error.message} (retry in ${retryErrorMs}ms)`);
             console.warn(`[TEX] ${tileId}:`, error.message);
           }
-        });
+        })
+        .finally(() => scheduleRefill(requestGeneration));
     }
+  }
+
+  function pump(scored, handlers) {
+    activeDemand = { scored, ...handlers };
+    fillAvailableSlots();
   }
 
   function invalidate(tileId) {
@@ -175,6 +198,8 @@ export function createTextureStreamer({
   }
 
   function abortAll() {
+    demandGeneration += 1;
+    activeDemand = null;
     for (const controller of texInflight.values()) controller.abort();
     texInflight.clear();
     texFetching.clear();

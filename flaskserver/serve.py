@@ -214,7 +214,7 @@ def _ensure_children(db, depth, col, row):
 
 
 def _traverse(db, depth, col, row, qx, qy, max_depth, error_threshold,
-              results, missing, max_range=0.0, altitude=0.0, heading=None,
+              results, missing, max_range=0.0, altitude=0.0,
               previous_subdivided=None):
     """Recursive quadtree traversal with error-based LOD.
 
@@ -253,7 +253,7 @@ def _traverse(db, depth, col, row, qx, qy, max_depth, error_threshold,
         log_trav.debug(f"{tid}: source={meta['source']} real={has_real_data} geo_err={geo_err:.1f} (orig={meta['geometric_error']:.1f})")
 
     # Coverage cutoff — terrain outside the local demand circle is not part of
-    # this response. Boundary-intersecting tiles are retained by the oval
+    # this response. Boundary-intersecting tiles are retained by the circle
     # test itself, so the requested region still has coarse edge coverage.
     dist_to_tile = _distance_to_bbox(qx, qy, meta['bbox'])
     in_coverage = bbox_in_view_circle(qx, qy, meta['bbox'], max_range)
@@ -364,7 +364,7 @@ def _traverse(db, depth, col, row, qx, qy, max_depth, error_threshold,
                 _traverse(
                     db, depth+1, cc, cr, qx, qy, max_depth,
                     error_threshold, results, missing, max_range, altitude,
-                    heading, previous_subdivided,
+                    previous_subdivided,
                 )
     else:
         if _debug:
@@ -377,20 +377,15 @@ def _traverse(db, depth, col, row, qx, qy, max_depth, error_threshold,
 
 def query_tiles_stereo(db, qx, qy, error_threshold=0.001, max_depth=None,
                        max_range=0.0, log=print, altitude=0.0,
-                       heading=None, preview=False, lod_history=None):
+                       lod_history=None):
     """Query tiles using error-based LOD with stereo coords directly.
 
     Same as query_tiles() but takes EPSG:3413 coords instead of lat/lon.
         max_range: circular coverage radius in meters.
     altitude: camera altitude in meters — increases effective distance to tiles below.
-    heading: camera heading in radians (JS convention: 0 = north, positive
-    turns west). When given, the missing-tile fetch batch is ordered by view
-    priority instead of plain distance.
-    preview: initial quick-paint pass — keeps the closest-first flood.
     """
     return _query_tiles_impl(db, qx, qy, error_threshold, max_depth, max_range,
-                             log, altitude, heading=heading, preview=preview,
-                             lod_history=lod_history)
+                             log, altitude, lod_history=lod_history)
 
 
 def query_tiles(db, lat, lon, error_threshold=0.001, max_depth=None,
@@ -419,26 +414,8 @@ def query_tiles(db, lat, lon, error_threshold=0.001, max_depth=None,
     return _query_tiles_impl(db, qx, qy, error_threshold, max_depth, max_range, log, altitude)
 
 
-def bbox_view_priority(qx, qy, fwd_x, fwd_y, bbox, forward_scale=2.0):
-    """Heading-weighted fetch priority (lower = sooner), matching the texture
-    priority in serve_flask: distance divided by how far ahead the tile is."""
-    cx = (bbox[0] + bbox[2]) / 2
-    cy = (bbox[1] + bbox[3]) / 2
-    dx, dy = cx - qx, cy - qy
-    dist = math.hypot(dx, dy)
-    if dist <= 0:
-        return 0.0
-    along = dx * fwd_x + dy * fwd_y
-    across = dx * fwd_y - dy * fwd_x
-    scaled_along = along / max(1.0, forward_scale) if along > 0 else along
-    priority_dist = math.hypot(across, scaled_along)
-    dot = along / dist
-    return priority_dist / max(dot, 0.01)
-
-
 def _query_tiles_impl(db, qx, qy, error_threshold, max_depth, max_range, log,
-                      altitude=0.0, heading=None, preview=False,
-                      lod_history=None):
+                      altitude=0.0, lod_history=None):
     from database import get_metadata
     from collections import Counter
 
@@ -457,7 +434,7 @@ def _query_tiles_impl(db, qx, qy, error_threshold, max_depth, max_range, log,
     previous_subdivided = _lod_complete_ancestors(lod_history)
     _traverse(
         db, 0, 0, 0, qx, qy, max_depth, error_threshold,
-        leaf_ids, missing_raw, max_range, altitude, heading,
+        leaf_ids, missing_raw, max_range, altitude,
         previous_subdivided,
     )
 
@@ -514,16 +491,9 @@ def _query_tiles_impl(db, qx, qy, error_threshold, max_depth, max_range, log,
         tid: (tid, bbox) for tid, bbox in (*missing_raw, *upgrade_candidates)
     }
     missing_candidates = list(candidates_by_id.values())
-    if preview or heading is None:
-        missing_candidates.sort(
-            key=lambda tb: _distance_to_bbox(qx, qy, tb[1])
-        )
-    else:
-        fwd_x = -math.sin(heading)
-        fwd_y = math.cos(heading)
-        missing_candidates.sort(
-            key=lambda tb: bbox_view_priority(qx, qy, fwd_x, fwd_y, tb[1])
-        )
+    missing_candidates.sort(
+        key=lambda tb: _distance_to_bbox(qx, qy, tb[1])
+    )
     # Small batches on purpose: the background fetcher holds its lock for a
     # whole batch, then the next request reprioritizes from the live camera.
     MAX_FETCH_BATCH = 100

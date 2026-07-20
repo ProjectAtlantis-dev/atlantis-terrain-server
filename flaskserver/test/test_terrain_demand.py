@@ -1,51 +1,17 @@
-"""View-priority ordering for the missing-heightmap fetch batch."""
+"""Terrain demand coverage and LOD-history behavior."""
 
-import math
 import unittest
 from unittest.mock import patch
 
 from serve import (
     _lod_complete_ancestors, _lod_leaf_descendants_cover, _traverse,
     bbox_in_view_circle,
-    bbox_view_priority,
 )
 
 
 def _bbox_at(cx, cy, size=100.0):
     half = size / 2
     return [cx - half, cy - half, cx + half, cy + half]
-
-
-class TestBboxViewPriority(unittest.TestCase):
-    def test_ahead_beats_behind_at_equal_distance(self):
-        # Heading 0 = north = +y (fwd taken from -sin/cos convention).
-        fwd_x, fwd_y = -math.sin(0.0), math.cos(0.0)
-        ahead = bbox_view_priority(0, 0, fwd_x, fwd_y, _bbox_at(0, 1000))
-        behind = bbox_view_priority(0, 0, fwd_x, fwd_y, _bbox_at(0, -1000))
-        self.assertLess(ahead, behind)
-        # Behind is penalized by the 0.01 dot floor: 100x distance.
-        self.assertGreater(behind, ahead * 50)
-
-    def test_near_ahead_beats_far_ahead(self):
-        fwd_x, fwd_y = 0.0, 1.0
-        near = bbox_view_priority(0, 0, fwd_x, fwd_y, _bbox_at(0, 500))
-        far = bbox_view_priority(0, 0, fwd_x, fwd_y, _bbox_at(0, 5000))
-        self.assertLess(near, far)
-
-    def test_forward_priority_uses_elongated_distance(self):
-        fwd_x, fwd_y = 0.0, 1.0
-        forward = bbox_view_priority(0, 0, fwd_x, fwd_y, _bbox_at(0, 4000))
-        self.assertAlmostEqual(forward, 2000, places=6)
-
-    def test_camera_inside_tile_is_top_priority(self):
-        self.assertEqual(bbox_view_priority(0, 0, 0.0, 1.0, _bbox_at(0, 0)), 0.0)
-
-    def test_matches_texture_priority_shape(self):
-        # Forward distance is compressed by 2 while lateral distance is kept.
-        fwd_x, fwd_y = 0.0, 1.0
-        diagonal = bbox_view_priority(0, 0, fwd_x, fwd_y, _bbox_at(1000, 1000))
-        expected = math.hypot(1000, 500) / (1000 / math.hypot(1000, 1000))
-        self.assertAlmostEqual(diagonal, expected, places=6)
 
 
 class TestViewCoverageCircle(unittest.TestCase):
@@ -103,7 +69,7 @@ class TestViewCoverageCircle(unittest.TestCase):
         with patch("serve.read_tile_metadata", return_value=metadata):
             _traverse(
                 None, 1, 0, 0, 0, 0, 10, 0.001,
-                results, missing, max_range=1000, heading=0.0,
+                results, missing, max_range=1000,
             )
         self.assertEqual(results, [])
         self.assertEqual(missing, [])
