@@ -5,6 +5,7 @@ const DEFAULT_PARTS = Object.freeze({
   body: Object.freeze(['Object_4', 'Object_5', 'Object_6']),
   shield: Object.freeze(['Object_7']),
 });
+const DEFAULT_WHEEL_CLUSTER_SPLIT_THRESHOLD = 3500;
 
 function cleanName(value) {
   if (value === null) return null;
@@ -35,7 +36,14 @@ export function normalizeVehiclePartDefinition(definition = {}) {
     const name = cleanName(value);
     return name === undefined ? fallback : name;
   };
-  const splitThreshold = Number(definition?.wheelClusterSplitThreshold);
+  // Match the accepted vehicle_splitting implementation: a missing/non-number
+  // threshold falls back to 3500. Returning null here grouped paired wheel
+  // meshes into five clusters instead of the Patria's eight wheels, so each
+  // merged pair rotated around the wrong shared centre.
+  const configuredSplitThreshold = definition?.wheelClusterSplitThreshold;
+  const splitThreshold = Number.isFinite(configuredSplitThreshold)
+    ? configuredSplitThreshold
+    : DEFAULT_WHEEL_CLUSTER_SPLIT_THRESHOLD;
   return {
     wheels: cleanNames(parts.wheels, DEFAULT_PARTS.wheels),
     turret: optionalPart(parts.turret, DEFAULT_PARTS.turret),
@@ -45,9 +53,7 @@ export function normalizeVehiclePartDefinition(definition = {}) {
     turretPivot: cleanVector3(parts.turretPivot),
     gunPivot: cleanVector3(parts.gunPivot),
     muzzle: cleanVector3(parts.muzzle),
-    wheelClusterSplitThreshold: Number.isFinite(splitThreshold) && splitThreshold > 0
-      ? splitThreshold
-      : null,
+    wheelClusterSplitThreshold: splitThreshold,
   };
 }
 

@@ -661,3 +661,17 @@ healthy.
 - During active traversal, near-cascade camera drift now gets an eight-texel window and
   vehicle-only invalidation is capped at 10 Hz. Stationary camera/sun/stream/recenter policy
   remains unchanged; TAA and contact shadows cover the small moving-shadow latency.
+
+### 2026-07-20 — Patria wheel-cluster correction after failed visual acceptance
+
+- The 02:13:01 recording disproved the earlier broad vehicle acceptance: Patria's wheels
+  visibly deformed/spun around incorrect centres, and the overall vehicle still requires
+  user acceptance for handling, suspension, terrain contact, and camera feel.
+- The correlated client log showed the extracted WebGPU runtime normalized a missing
+  `wheelClusterSplitThreshold` to `null`, yielding only five wheel clusters (2/2/1).
+- Read-only comparison with the `atlantis-terrain-server` `vehicle_splitting` source showed
+  the missing configuration must default to `3500`, yielding all eight physical wheels
+  (3/3/2). The cluster algorithm and accumulated YZ rotation already match that source.
+- The local runtime now restores the exact finite-value-or-`3500` default. Subsequent live
+  logs show threshold 3500, eight clusters, and zero crossing triangles. Focused regression
+  tests pass. This corrects the wheel rig only; it does not close vehicle acceptance.

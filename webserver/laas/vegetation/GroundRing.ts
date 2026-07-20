@@ -96,6 +96,21 @@ const G_NEAR = 30;
 const G_MID = 70;
 /** crossfade half-width — cull overlap and material fade MUST share it */
 const G_BAND = 12;
+// Vehicle suspension/camera smoothing can move the view by tiny sub-frame
+// amounts even when traversal speed is zero. Re-running the append-buffer cull
+// for that noise both burns the GPU and can reshuffle borderline instances.
+const CULL_MATRIX_EPSILON = 0.01;
+
+function matrixApproximatelyEquals(a: Matrix4, b: Matrix4): boolean {
+  const ae = a.elements;
+  const be = b.elements;
+  for (let index = 0; index < 16; index++) {
+    if (Math.abs((ae[index] ?? 0) - (be[index] ?? 0)) > CULL_MATRIX_EPSILON) {
+      return false;
+    }
+  }
+  return true;
+}
 // The LAAS heightfield is a resampled representation of the rendered DEM.
 // Keep blade roots just above the triangle surface so tiny interpolation
 // differences cannot bury most of a short tundra blade at grazing angles.
@@ -305,6 +320,10 @@ export class GroundRing {
   private planesU = uniformArray(Array.from({ length: 6 }, () => new Vector4()));
   private frustum = new Frustum();
   private projView = new Matrix4();
+  private lastCullProjView = new Matrix4();
+  private cullValid = false;
+  private cullSubmits = 0;
+  private cullSkips = 0;
   private hud: Record<string, number> = {};
   private reading = false;
   private frame = 0;
@@ -1084,6 +1103,10 @@ export class GroundRing {
   update(renderer: Renderer, camera: PerspectiveCamera): void {
     this.camU.value.copy(camera.position);
     this.projView.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
+    if (this.cullValid && matrixApproximatelyEquals(this.lastCullProjView, this.projView)) {
+      this.cullSkips++;
+      return;
+    }
     this.frustum.setFromProjectionMatrix(this.projView);
     const arr = this.planesU.array as Vector4[];
     for (let p = 0; p < 6; p++) {
@@ -1094,6 +1117,9 @@ export class GroundRing {
     for (const k of this.kernels) {
       renderer.compute(k as Parameters<Renderer['compute']>[0]);
     }
+    this.lastCullProjView.copy(this.projView);
+    this.cullValid = true;
+    this.cullSubmits++;
     this.frame++;
     if (this.frame % 90 === 30 && !this.reading) {
       this.reading = true;
@@ -1102,7 +1128,15 @@ export class GroundRing {
   }
 
   counterSnapshot(): Record<string, number> {
-    return this.hud;
+    return {
+      ...this.hud,
+      'veg.groundCullSubmits': this.cullSubmits,
+      'veg.groundCullSkips': this.cullSkips,
+    };
+  }
+
+  invalidateVisibility(): void {
+    this.cullValid = false;
   }
 
   private async readStats(renderer: Renderer): Promise<void> {

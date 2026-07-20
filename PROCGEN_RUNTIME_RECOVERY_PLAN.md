@@ -78,7 +78,7 @@ Source: `/Users/projectatlantis/Desktop/Screen Recording 2026-07-20 at
 
 ### P0 — stop recenter ping-pong
 
-Status: **verified broken**.
+Status: **stabilization implemented; live traversal acceptance pending**.
 
 - Add target hysteresis so predictive lookahead cannot snap the window across a
   boundary and immediately pull it back.
@@ -91,7 +91,7 @@ Status: **verified broken**.
 
 ### P0 — stop stationary placement-grid rescans
 
-Status: **verified broken**.
+Status: **dirty-driven cull implemented; live stationary acceptance pending**.
 
 - `GroundRing.update()` currently submits five compute kernels every rendered
   frame, scanning roughly 3.2 million candidate cells even when the camera and
@@ -118,7 +118,7 @@ Status: **partially fixed; still visibly broken**.
 
 ### P1 — retained world-chunk cache
 
-Status: **designed, not implemented**.
+Status: **CPU area cache implemented; retained GPU chunks not implemented**.
 
 - Key chunks by canonical EPSG cell, source identities, `worldSeed`, and
   `procgenVersion`.
@@ -157,7 +157,7 @@ Status: **measured, not resolved**.
 
 ### P1 — vehicle/CSM traversal state
 
-Status: **still broken; failed user acceptance**.
+Status: **wheel cluster regression repaired; overall vehicle acceptance open**.
 
 - Preserve the current restored-vehicle visibility fix, persistence-safe live
   verifier, and motion-aware CSM refresh limits in the baseline commit.
@@ -195,3 +195,79 @@ Status: **operator configuration implemented; product workflow not built**.
 - Vehicle acceptance remains open and must cover drive response, suspension,
   terrain contact, camera behavior, and traversal smoothness after the procgen
   double-recenter hitch is isolated.
+
+### 2026-07-20 — local recovery checkpoint
+
+- Created local checkpoint `87bda52` (`Checkpoint terrain procgen and vehicle
+  recovery state`) before the architecture trial.
+- The checkpoint includes the classifier, terrain-material, ComfyUI operator
+  configuration, current vehicle/CSM work, and this ledger. Generated
+  `flaskserver/data/terrain.db` remains untracked and was not committed.
+
+### 2026-07-20 — Patria wheel recording and source comparison
+
+Source: `/Users/projectatlantis/Desktop/Screen Recording 2026-07-20 at
+02.13.01.mov`, 15.65 seconds, 1958x1138. Correlated log interval begins at
+2026-07-20 02:13:01 local time.
+
+- The recording confirms visually incorrect wheel deformation/spin while the
+  Patria travels at about 23 km/h. This is separate from the still-open
+  handling, suspension, and camera-feel problems.
+- At recording time, `vehicle.parts.discovered` reported
+  `wheelClusterSplitThreshold: null`; `vehicle.wheels.rigged` consequently
+  built only five clusters from the three source meshes (2/2/1).
+- Read-only comparison against
+  `/Users/projectatlantis/work/atlantis-terrain-server` on branch
+  `vehicle_splitting` showed that its accepted construction defaults a missing
+  threshold to `3500` and produces eight clusters (3/3/2). Its Y-gap grouping,
+  large-cluster midpoint split, YZ centres, saved base vertices, and accumulated
+  wheel-angle rotation all otherwise match the extracted runtime module.
+- The source-of-truth repository was inspected only. No file there was changed.
+- The local normalizer now exactly restores the finite-value-or-`3500`
+  behavior. Later live logs report threshold `3500`, eight clusters, and zero
+  crossing triangles. Focused tests cover the default and the existing vertex
+  rotation. Visual vehicle acceptance is still required; this finding does not
+  declare the overall vehicle fixed.
+
+### 2026-07-20 — monolithic-window stabilization trial
+
+- Replaced predictive single-slot adoption with actual-camera window selection
+  plus a 16 m hysteresis deadband. The measured stop-time lookahead collapse can
+  no longer force `A -> B -> A` rebuilds around the ordinary 192 m snap line.
+- Added a 25-entry LRU cache of baked 768 m CPU windows. Cache keys include the
+  canonical centre, overlapping height-source identities, classifier-page
+  identities, `worldSeed`, and `procgenVersion`. A depth-12 fallback therefore
+  cannot permanently mask newly available depth-13 inputs.
+- This cache avoids repeat CPU resampling for an exact source match, but the
+  current single compiled slot still rewrites heightfield and scatter GPU
+  buffers after a centre change. Retained 192 m GPU chunk slots remain the next
+  architectural stage.
+- Ground and forest visibility compute now retain their last view/cascade
+  matrices and skip all placement-list clear/cull/indirect passes when those
+  inputs have not materially changed. A small matrix tolerance rejects
+  suspension/camera smoothing noise; wind remains shader animation and does not
+  invalidate placement.
+- `patch.diag` now records window cache hits/misses/entries and ground/forest
+  cull submits/skips. The first live instrumentation pass proved the counters
+  work, but also showed exact matrix equality was too strict: while traversal
+  speed was zero, submits rose by 180 per 180-frame interval. The tolerance was
+  added from that log evidence; acceptance of the tolerance revision is pending
+  the next settled live interval.
+- Focused tests pass for snap hysteresis (3 cases) and Patria wheel behavior
+  (2 selected cases). One production Vite build passed in 2.67 seconds. No new
+  WebGPU validation/shader/pipeline error appears in the sampled post-change
+  client log.
+
+### Classifier/material ownership clarification
+
+- The classifier still decides biome fields and therefore where grass, plants,
+  rocks, water exclusion, moisture response, and snow response belong.
+- A streamed mesh that already has satellite texture must retain that texture;
+  moving classifier color/normal embossing on top of it was the source of the
+  camera-following repaint artifact. Classification should influence a
+  separately baked world-anchored material only where usable satellite albedo
+  is absent.
+- The remaining dark/pale near-terrain artifact is therefore not evidence that
+  placement classification was removed. It is the unresolved handoff where a
+  fine mesh lacks its own texture and falls back to a generic procedural
+  material over or beside textured stale coverage.

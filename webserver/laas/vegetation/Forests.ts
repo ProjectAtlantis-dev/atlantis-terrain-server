@@ -130,6 +130,20 @@ const CASC_LOCALS = 142;
 // Atlantis configures three CSM cascades. Building/culling a fourth set of
 // caster groups wastes compute and draw traversal without a camera consuming it.
 const CASCADES = 3;
+// Ignore camera/CSM matrix noise below a visible culling threshold. This keeps
+// stationary wind in the vertex shader without rebuilding instance lists.
+const CULL_MATRIX_EPSILON = 0.01;
+
+function matrixApproximatelyEquals(a: Matrix4, b: Matrix4): boolean {
+  const ae = a.elements;
+  const be = b.elements;
+  for (let index = 0; index < 16; index++) {
+    if (Math.abs((ae[index] ?? 0) - (be[index] ?? 0)) > CULL_MATRIX_EPSILON) {
+      return false;
+    }
+  }
+  return true;
+}
 const GROUPS = MAIN_GROUPS + CASCADES * CASC_LOCALS;
 /** crown-proxy shadows fade out across this band (m from camera) */
 const IMP_CAST_FADE0 = 620;
@@ -290,7 +304,10 @@ export class Forests {
   private csm: object | null = null;
   private frustum = new Frustum();
   private projView = new Matrix4();
+  private lastCullProjView = new Matrix4();
   private cascM = new Matrix4();
+  private lastCullCascades = Array.from({ length: CASCADES }, () => new Matrix4());
+  private lastCullCascadeValid = new Array<boolean>(CASCADES).fill(false);
   private cascFrustum = new Frustum();
   private indirectAttr!: IndirectStorageBufferAttribute;
   private groupTris = new Float32Array(GROUPS);
@@ -298,6 +315,9 @@ export class Forests {
   private reading = false;
   private frame = 0;
   private hud: Record<string, number> = {};
+  private cullValid = false;
+  private cullSubmits = 0;
+  private cullSkips = 0;
 
   constructor(
     private hf: Heightfield,
@@ -966,12 +986,16 @@ export class Forests {
     this.camU.value.copy(camera.position);
     updateVegViewPos(camera);
     this.projView.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
-    this.frustum.setFromProjectionMatrix(this.projView);
+    let visibilityChanged = !this.cullValid
+      || !matrixApproximatelyEquals(this.lastCullProjView, this.projView);
+    if (visibilityChanged) this.frustum.setFromProjectionMatrix(this.projView);
     const arr = this.planesU.array as Vector4[];
-    for (let p = 0; p < 6; p++) {
-      const pl = this.frustum.planes[p];
-      if (!pl) continue;
-      (arr[p] as Vector4).set(pl.normal.x, pl.normal.y, pl.normal.z, pl.constant);
+    if (visibilityChanged) {
+      for (let p = 0; p < 6; p++) {
+        const pl = this.frustum.planes[p];
+        if (!pl) continue;
+        (arr[p] as Vector4).set(pl.normal.x, pl.normal.y, pl.normal.z, pl.constant);
+      }
     }
     // cascade ortho frusta → caster-cull planes (read one frame stale —
     // CSMShadowNode positions its lwLights during the upcoming render; the
@@ -986,13 +1010,19 @@ export class Forests {
     const lights = (
       this.csm as { lights?: { shadow?: { camera?: CascCam } }[] } | null
     )?.lights;
+    const nextCascadeValid = new Array<boolean>(CASCADES).fill(false);
     if (lights) {
       const carr = this.planesCsmU.array as Vector4[];
       for (let c = 0; c < CASCADES; c++) {
         const cam = lights[c]?.shadow?.camera;
         if (!cam || !Number.isFinite(cam.left ?? NaN)) continue;
+        nextCascadeValid[c] = true;
         cam.layers.enable(2 + c);
         this.cascM.multiplyMatrices(cam.projectionMatrix, cam.matrixWorldInverse);
+        if (!this.lastCullCascadeValid[c]
+            || !matrixApproximatelyEquals(this.lastCullCascades[c] as Matrix4, this.cascM)) {
+          visibilityChanged = true;
+        }
         this.cascFrustum.setFromProjectionMatrix(this.cascM);
         for (let p = 0; p < 6; p++) {
           const pl = this.cascFrustum.planes[p];
@@ -1004,7 +1034,16 @@ export class Forests {
             pl.constant,
           );
         }
+        this.lastCullCascades[c]?.copy(this.cascM);
       }
+    }
+    if (this.lastCullCascadeValid.some((valid, index) => valid !== nextCascadeValid[index])) {
+      visibilityChanged = true;
+    }
+    this.lastCullCascadeValid = nextCascadeValid;
+    if (!visibilityChanged) {
+      this.cullSkips++;
+      return;
     }
     renderer.compute(this.kernels[0] as Parameters<Renderer['compute']>[0]);
     for (const { kernel, layer } of this.cullKernels) {
@@ -1017,6 +1056,9 @@ export class Forests {
       );
     }
     renderer.compute(this.kernels[1] as Parameters<Renderer['compute']>[0]);
+    this.lastCullProjView.copy(this.projView);
+    this.cullValid = true;
+    this.cullSubmits++;
     this.frame++;
     if (this.frame % 90 === 0 && !this.reading) {
       this.reading = true;
@@ -1026,7 +1068,15 @@ export class Forests {
 
   /** HUD stats (throttled async readback of the group counters) */
   counterSnapshot(): Record<string, number> {
-    return this.hud;
+    return {
+      ...this.hud,
+      'veg.forestCullSubmits': this.cullSubmits,
+      'veg.forestCullSkips': this.cullSkips,
+    };
+  }
+
+  invalidateVisibility(): void {
+    this.cullValid = false;
   }
 
   private async readStats(renderer: Renderer): Promise<void> {

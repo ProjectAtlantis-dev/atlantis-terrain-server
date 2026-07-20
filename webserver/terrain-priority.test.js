@@ -18,7 +18,11 @@ import {
   updateAircraftVisuals,
 } from './terrain-aircraft-runtime.js';
 import { createVehicleFireRuntime } from './terrain-vehicle-fire.js';
-import { createVehicleWheelRig, spinVehicleWheelRig } from './terrain-vehicle-parts.js';
+import {
+  createVehicleWheelRig,
+  normalizeVehiclePartDefinition,
+  spinVehicleWheelRig,
+} from './terrain-vehicle-parts.js';
 import { meshUsesTextureClassification, scoreTextureTiles, textureRetryDelay, tileDepthFromId } from './terrain-tile-runtime.js';
 import { createTextureStreamer, rendererTextureAnisotropy } from './terrain-texture-streamer.js';
 import { createTileLifecycle } from './terrain-tile-lifecycle.js';
@@ -1118,6 +1122,20 @@ test('Patria wheel rig preserves original meshes and rotates accepted vertex clu
   assert.equal(spinVehicleWheelRig(rig, Math.PI / 2, 1), true);
   assert.ok(Math.abs(geometry.getAttribute('position').getY(0) - -1) < 1e-6);
   assert.ok(geometry.getAttribute('position').version > 0);
+});
+
+test('Patria wheel discovery keeps the vehicle_splitting 3500 vertex default', () => {
+  assert.equal(normalizeVehiclePartDefinition({}).wheelClusterSplitThreshold, 3500);
+  assert.equal(
+    normalizeVehiclePartDefinition({ wheelClusterSplitThreshold: null })
+      .wheelClusterSplitThreshold,
+    3500,
+  );
+  assert.equal(
+    normalizeVehiclePartDefinition({ wheelClusterSplitThreshold: 4200 })
+      .wheelClusterSplitThreshold,
+    4200,
+  );
 });
 
 test('aircraft uses the accepted engine and direct game-flight controls', () => {

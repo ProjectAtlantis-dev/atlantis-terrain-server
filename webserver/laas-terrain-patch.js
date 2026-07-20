@@ -23,6 +23,7 @@ import {
   classifierSourceCandidates,
   classifierSourcesCoverBounds,
 } from './procgen/classifier-source.js';
+import { selectProcgenWindowCenter } from './procgen/window-policy.js';
 import { sampleTriangulatedHeight } from './terrain-height-sampling.js';
 
 const PATCH_WORLD_SIZE = 768; // 384 m half-width: 265 m lush ring + guard band
@@ -31,6 +32,11 @@ const PATCH_RES = 256;        // 3 m field/normal samples
 // 265 m far radius at the worst camera offset. The former 96 m snap rebuilt
 // the complete scatter/forest allocation twice as often without adding view.
 const RECENTER_STEP = 192;
+// Do not let a few metres of lookahead/camera noise bounce a compiled window
+// across the 96 m rounding boundary. 16 m on both sides gives a 32 m deadband
+// while remaining inside the 119 m complete-coverage guard.
+const RECENTER_HYSTERESIS = 16;
+const WINDOW_CACHE_LIMIT = 25;
 // Above this altitude the individual grass/plants are at or below useful
 // screen size, while their ~3.2 M candidate cull and moving-window rebuilds
 // remain fully priced. The streamed terrain/material LOD remains visible.
@@ -48,10 +54,6 @@ const DETAIL_PREWARM_SPEED_MAX = DETAIL_SPEED_DISABLE_MPS;
 // PATCH_WORLD_SIZE/2 - GroundRing's 265 m outer radius. Within this guard the
 // active patch still supplies a complete detail ring during an async handoff.
 const DETAIL_CAMERA_GUARD = PATCH_WORLD_SIZE * 0.5 - 265;
-// The detailed ring has 119 m of guaranteed coverage beyond the largest
-// camera-to-snap-center offset. Keep speculative lead inside that margin until
-// retained leading-edge cells replace the two-slot window handoff.
-const FLIGHT_LOOKAHEAD_MAX = 20;
 const RETRY_MS = 500;
 
 function log(level, ev, details) {
@@ -136,9 +138,17 @@ function sampleField(tile, channel, x, y) {
   return v / 255;
 }
 
-function cameraWindowAt(x, y) {
-  const centerX = Math.round(x / RECENTER_STEP) * RECENTER_STEP;
-  const centerY = Math.round(y / RECENTER_STEP) * RECENTER_STEP;
+function cameraWindowAt(x, y, activeDescriptor = null) {
+  const selected = selectProcgenWindowCenter({
+    x,
+    y,
+    currentX: activeDescriptor?.centerX,
+    currentY: activeDescriptor?.centerY,
+    step: RECENTER_STEP,
+    hysteresis: RECENTER_HYSTERESIS,
+  });
+  if (!selected) return null;
+  const { centerX, centerY } = selected;
   const half = PATCH_WORLD_SIZE * 0.5;
   return {
     id: `${centerX}:${centerY}`,
@@ -338,6 +348,9 @@ export class GreenlandPatch {
     this.activeSlot = null;
     this.inactiveSlot = null;
     this.classifierSources = [];
+    this.windowCache = new Map();
+    this.windowCacheHits = 0;
+    this.windowCacheMisses = 0;
     this.motionDetailActive = true;
     this._diag = 0;
   }
@@ -562,6 +575,64 @@ export class GreenlandPatch {
     return this._camTR;
   }
 
+  _windowCacheKey(descriptor, sourceTiles, fieldSources) {
+    const intersects = source => (
+      source.xMax >= descriptor.xMin && source.xMin <= descriptor.xMax
+      && source.yMax >= descriptor.yMin && source.yMin <= descriptor.yMax
+    );
+    const heightIds = [...new Set(
+      sourceTiles.filter(intersects).map(source => source.id),
+    )].sort();
+    const fieldIds = [...new Set(
+      fieldSources.filter(intersects).map(source => source.id),
+    )].sort();
+    return [
+      descriptor.id,
+      `seed=${this.seedN}`,
+      `version=${this.procgenVersion}`,
+      `height=${heightIds.join(',')}`,
+      `fields=${fieldIds.join(',')}`,
+    ].join('|');
+  }
+
+  _cachedWindow(cacheKey) {
+    const cached = this.windowCache.get(cacheKey);
+    if (!cached) {
+      this.windowCacheMisses += 1;
+      return null;
+    }
+    // LRU refresh. Window arrays are self-contained, deterministic area data;
+    // they remain valid even after their source render meshes leave residency.
+    this.windowCache.delete(cacheKey);
+    this.windowCache.set(cacheKey, cached);
+    this.windowCacheHits += 1;
+    return cached;
+  }
+
+  _rememberWindow(cacheKey, window, classifierPages) {
+    this.windowCache.set(cacheKey, { window, classifierPages });
+    while (this.windowCache.size > WINDOW_CACHE_LIMIT) {
+      const oldest = this.windowCache.keys().next().value;
+      this.windowCache.delete(oldest);
+    }
+  }
+
+  async _resolveWindow(sourceTiles, descriptor) {
+    const fieldSources = await this._loadClassifier(sourceTiles, descriptor);
+    if (!fieldSources) return null;
+    // Cache the bake against its real inputs. An area first encountered with
+    // a depth-12 fallback must be rebuilt when depth-13 imagery/DEM becomes
+    // available instead of freezing the first coarse result forever.
+    const cacheKey = this._windowCacheKey(descriptor, sourceTiles, fieldSources);
+    const cached = this._cachedWindow(cacheKey);
+    if (cached) return { ...cached, cacheHit: true };
+    const window = buildWindow(descriptor, sourceTiles, fieldSources);
+    if (!window) return null;
+    const classifierPages = fieldSources.map(source => source.id);
+    this._rememberWindow(cacheKey, window, classifierPages);
+    return { window, classifierPages, cacheHit: false };
+  }
+
   terrainMaterialContext() {
     if (!this.ready || !this.hf || !this.window) return null;
     const d = this.window.descriptor;
@@ -599,20 +670,17 @@ export class GreenlandPatch {
       const sourceTiles = collectTiles(this.terrainRoot);
       const camTR = this._camTerrainLocal(camera);
       const descriptor = cameraWindowAt(camTR.x, camTR.y);
+      if (!descriptor) return;
       if (!finestSourceAt(sourceTiles, descriptor.centerX, descriptor.centerY)) {
         this.nextBuildAttempt = now + RETRY_MS;
         return;
       }
-      const fieldSources = await this._loadClassifier(sourceTiles, descriptor);
-      if (!fieldSources) {
+      const resolved = await this._resolveWindow(sourceTiles, descriptor);
+      if (!resolved) {
         this.nextBuildAttempt = now + RETRY_MS;
         return;
       }
-      const window = buildWindow(descriptor, sourceTiles, fieldSources);
-      if (!window) {
-        this.nextBuildAttempt = now + RETRY_MS;
-        return;
-      }
+      const { window, classifierPages, cacheHit } = resolved;
 
       const seed = new WorldSeed(this.seedN);
       const slot = await this._prepareSlot(renderer, null, seed, window, descriptor);
@@ -630,7 +698,8 @@ export class GreenlandPatch {
         worldSeed: this.seedN,
         procgenVersion: this.procgenVersion,
         sourceTiles: sourceTiles.length,
-        classifierPages: fieldSources.map(source => source.id),
+        classifierPages,
+        windowCacheHit: cacheHit,
         spanMetres: PATCH_WORLD_SIZE,
         res: PATCH_RES,
         libraryPools: this.vegLibrary.pools.length,
@@ -656,11 +725,10 @@ export class GreenlandPatch {
     const startedAt = performance.now();
     let fieldsReadyAt = startedAt;
     try {
-      const fieldSources = await this._loadClassifier(sourceTiles, descriptor);
-      if (!fieldSources) return;
+      const resolved = await this._resolveWindow(sourceTiles, descriptor);
+      if (!resolved) return;
       fieldsReadyAt = performance.now();
-      const window = buildWindow(descriptor, sourceTiles, fieldSources);
-      if (!window) return;
+      const { window, classifierPages, cacheHit } = resolved;
       // A second Forests/GroundRing graph caused a measured 12.5 s lazy
       // pipeline-compilation frame when first adopted. Keep one compiled render
       // graph and rewrite its persistent data buffers in place; the root stays
@@ -675,6 +743,8 @@ export class GreenlandPatch {
         window,
         descriptor,
       );
+      nextSlot.ground.invalidateVisibility();
+      nextSlot.forests.invalidateVisibility();
       const preparedAt = performance.now();
       // Preserve the compiled object/material graph and publish the new window
       // metadata only after its persistent buffers have been rewritten.
@@ -692,7 +762,8 @@ export class GreenlandPatch {
         center: descriptor.id,
         spanMetres: PATCH_WORLD_SIZE,
         sourceTiles: sourceTiles.length,
-        classifierPages: fieldSources.map(source => source.id),
+        classifierPages,
+        windowCacheHit: cacheHit,
         fields: window.stats,
         timing: this.lastRecenterTiming,
         handoff: 'single-compiled-root-visible-during-rewrite',
@@ -708,7 +779,6 @@ export class GreenlandPatch {
     if (!this.ready) return;
 
     const speed = Number.isFinite(traversal.speedMps) ? Math.abs(traversal.speedMps) : 0;
-    const heading = Number.isFinite(traversal.heading) ? traversal.heading : 0;
     if (this.motionDetailActive && speed >= DETAIL_SPEED_DISABLE_MPS) {
       this.motionDetailActive = false;
       log('info', 'patch.detail-lod', {
@@ -746,19 +816,14 @@ export class GreenlandPatch {
     if (canPrewarm && !this.reseeding && !this.building
         && (!this.classifierSelectionReady || this.classifierSelectionReady())) {
       const sourceTiles = collectTiles(this.terrainRoot);
-      const lookahead = Math.min(FLIGHT_LOOKAHEAD_MAX, speed * 1.5);
-      const descriptor = cameraWindowAt(
-        camTR.x - Math.sin(heading) * lookahead,
-        camTR.y + Math.cos(heading) * lookahead,
-      );
-      const centerDepth = finestSourceAt(
-        sourceTiles,
-        descriptor.centerX,
-        descriptor.centerY,
-      )?.depth ?? -1;
-      const sourceRefined = descriptor.id === this.centerId
-        && centerDepth > (this.window?.centerSourceDepth ?? -1);
-      if (descriptor.id !== this.centerId || sourceRefined) {
+      // A single compiled slot cannot safely adopt a predictive center: when
+      // speed falls near a snap boundary, lookahead vanishes and immediately
+      // pulls the slot back (the measured 384:0 -> 192:0 double rebuild).
+      // Center on the real camera with hysteresis. Predictive preparation
+      // returns when retained chunk slots exist and can be warmed without
+      // replacing the active population.
+      const descriptor = cameraWindowAt(camTR.x, camTR.y, activeCenter);
+      if (descriptor && descriptor.id !== this.centerId) {
         void this._recenter(renderer, descriptor, sourceTiles);
       }
     }
@@ -798,6 +863,13 @@ export class GreenlandPatch {
         worldSeed: this.seedN,
         procgenVersion: this.procgenVersion,
         spanMetres: PATCH_WORLD_SIZE,
+        windowCacheHits: this.windowCacheHits,
+        windowCacheMisses: this.windowCacheMisses,
+        windowCacheEntries: this.windowCache.size,
+        groundCullSubmits: hud['veg.groundCullSubmits'] ?? -1,
+        groundCullSkips: hud['veg.groundCullSkips'] ?? -1,
+        forestCullSubmits: forestHud['veg.forestCullSubmits'] ?? -1,
+        forestCullSkips: forestHud['veg.forestCullSkips'] ?? -1,
       });
     }
   }
