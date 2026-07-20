@@ -30,25 +30,63 @@ function disposeMaterial(material) {
 export function createTerrainHoverOutlineController({ terrainRoot, onChanged = () => {} }) {
   let outline = null;
   let tileId = null;
+  let presentation = null;
+  let ownsGeometry = false;
 
   function clear() {
     if (outline == null) return false;
     terrainRoot.remove(outline);
-    outline.geometry?.dispose?.();
+    if (ownsGeometry) outline.geometry?.dispose?.();
     disposeMaterial(outline.material);
     outline = null;
     tileId = null;
+    presentation = null;
+    ownsGeometry = false;
     return true;
   }
 
-  function show(mesh) {
+  function show(mesh, nextPresentation = 'outline') {
     const nextTileId = mesh?.userData?.tileId ?? null;
-    if (nextTileId != null && nextTileId === tileId && outline != null) return false;
+    if (
+      nextTileId != null
+      && nextTileId === tileId
+      && nextPresentation === presentation
+      && outline != null
+    ) return false;
 
     let changed = clear();
     if (mesh == null) {
       if (changed) onChanged();
       return changed;
+    }
+
+    if (nextPresentation === 'classifier') {
+      outline = new THREE.Mesh(
+        mesh.geometry,
+        new THREE.MeshBasicMaterial({
+          color: 0xffb000,
+          transparent: true,
+          opacity: 0.38,
+          depthTest: true,
+          depthWrite: false,
+          side: THREE.DoubleSide,
+          polygonOffset: true,
+          polygonOffsetFactor: -4,
+          polygonOffsetUnits: -4,
+        }),
+      );
+      outline.position.copy(mesh.position);
+      outline.quaternion.copy(mesh.quaternion);
+      outline.scale.copy(mesh.scale);
+      outline.renderOrder = 998;
+      // The highlight is presentation-only and must never become a pick target.
+      outline.raycast = () => {};
+      terrainRoot.add(outline);
+      tileId = nextTileId;
+      presentation = nextPresentation;
+      ownsGeometry = false;
+      onChanged();
+      return true;
     }
 
     const bbox = mesh.userData?.bbox;
@@ -77,12 +115,20 @@ export function createTerrainHoverOutlineController({ terrainRoot, onChanged = (
     outline.renderOrder = 999;
     terrainRoot.add(outline);
     tileId = nextTileId;
+    presentation = nextPresentation;
+    ownsGeometry = true;
     changed = true;
     onChanged();
     return changed;
   }
 
-  return { show, clear, get outline() { return outline; }, get tileId() { return tileId; } };
+  return {
+    show,
+    clear,
+    get outline() { return outline; },
+    get tileId() { return tileId; },
+    get presentation() { return presentation; },
+  };
 }
 
 const SEAM_COLORS = Object.freeze({

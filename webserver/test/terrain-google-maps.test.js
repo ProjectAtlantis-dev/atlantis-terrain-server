@@ -25,7 +25,7 @@ test('Google Maps URL uses camera coordinates and height above ground', () => {
   }), 'https://www.google.com/maps/@64.1800000,-51.7200000,240.0a,60.0y,90.00h,90.00t/data=!3m1!1e3');
 });
 
-test('G key opens Google Maps once and ignores key repeat', () => {
+test('G key opens Google Maps once and C remains unassigned', () => {
   const previousWindow = globalThis.window;
   const listeners = new Map();
   globalThis.window = {
@@ -53,14 +53,14 @@ test('G key opens Google Maps once and ignores key repeat', () => {
     listeners.get('keydown')({ code: 'KeyC', repeat: false });
     listeners.get('keydown')({ code: 'KeyC', repeat: true });
     assert.equal(opens, 1);
-    assert.equal(classifierToggles, 1);
+    assert.equal(classifierToggles, 0);
   } finally {
     dispose();
     globalThis.window = previousWindow;
   }
 });
 
-test('R toggles road debug and does not reset the view', () => {
+test('H and R remain unassigned to heatmap and road debug', () => {
   const previousWindow = globalThis.window;
   const listeners = new Map();
   globalThis.window = {
@@ -68,7 +68,7 @@ test('R toggles road debug and does not reset the view', () => {
     removeEventListener(type) { listeners.delete(type); },
   };
   let roadToggles = 0;
-  let resets = 0;
+  let heatmapToggles = 0;
   const noop = () => {};
   const dispose = installTerrainKeyboardControls({
     controls: { keys: {} },
@@ -77,15 +77,17 @@ test('R toggles road debug and does not reset the view', () => {
     onEscapeVehicle: noop,
     onToggleMap: noop,
     onToggleRoadDebug: () => { roadToggles += 1; },
-    onReset: () => { resets += 1; },
+    onToggleHeatmap: () => { heatmapToggles += 1; },
     onHouseAction: noop,
     onToggleHeadlights: noop,
   });
   try {
     listeners.get('keydown')({ code: 'KeyR', repeat: false });
     listeners.get('keydown')({ code: 'KeyR', repeat: true });
-    assert.equal(roadToggles, 1);
-    assert.equal(resets, 0);
+    listeners.get('keydown')({ code: 'KeyH', repeat: false });
+    listeners.get('keydown')({ code: 'KeyH', repeat: true });
+    assert.equal(roadToggles, 0);
+    assert.equal(heatmapToggles, 0);
   } finally {
     dispose();
     globalThis.window = previousWindow;

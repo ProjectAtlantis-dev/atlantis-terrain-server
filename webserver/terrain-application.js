@@ -288,6 +288,7 @@ const { hud, alt, gameClock: gameClockEl } = createTerrainHud({
   onToggleMapMode: () => toggleMapMode(),
   onToggleSeamMode: () => toggleSeamMode(),
   onToggleHeatmap: () => toggleHeatmap(),
+  onToggleClassifier: () => toggleClassifierMode(),
   onToggleRenderBackend: () => {
     // beforeunload normally saves this too, but make the renderer transition
     // self-contained so a fast reload cannot race the camera/frame snapshot.
@@ -346,7 +347,7 @@ tileInfoEl.style.cssText = [
   'border-radius:6px',
   'pointer-events:none',
   'display:none',
-  'z-index:6'
+  'z-index:30'
 ].join(';');
 document.body.appendChild(tileInfoEl);
 
@@ -1790,8 +1791,8 @@ function updateHud() {
     ? '<span style="color:#ff3b30">VEHICLE</span>'
     : modeLabel;
   const classifierLine = classifierRuntime.active
-    ? `classifier: <span style="color:#8f8">ON</span>  ${classifierRuntime.textures.size} painted  ${classifierRuntime.missing.size} grayscale`
-    : 'classifier: off (C)';
+    ? `classifier: <span id="classifierModeLink" style="color:#8f8;text-decoration:underline;cursor:pointer;pointer-events:auto">ON</span>  ${classifierRuntime.textures.size} painted  ${classifierRuntime.missing.size} grayscale`
+    : 'classifier: <span id="classifierModeLink" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">off</span>';
   const renderBackendLabel = backend === 'webgpu' ? 'WebGPU' : 'WebGL';
   const nextRenderBackendLabel = backend === 'webgpu' ? 'WebGL' : 'WebGPU';
   const roadDebugColor = textureStreamer.roadDebug ? '#ff3b30' : '#0af';
@@ -1829,9 +1830,9 @@ function updateHud() {
     'map: left-drag rotate, right-drag pan, wheel zoom',
     `<span id="mapModeLink" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">${controls.mapMode && !controls.seamMode && !heatmapRuntime?.active ? '3D view' : 'map mode'}</span> (M)` +
       ` · <span id="seamModeLink" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">${controls.seamMode ? '3D view' : 'seam view'}</span>` +
-      ` · <span id="heatmapModeLink" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">${heatmapRuntime?.active ? '3D view' : 'heatmap'}</span> (H)` +
+      ` · <span id="heatmapModeLink" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">${heatmapRuntime?.active ? '3D view' : 'heatmap'}</span>` +
       ' · Google 3D (G)' +
-      ` · <span id="roadDebugLink" style="color:${roadDebugColor};text-decoration:underline;cursor:pointer;pointer-events:auto">${roadDebugLabel}</span> (R)` +
+      ` · <span id="roadDebugLink" style="color:${roadDebugColor};text-decoration:underline;cursor:pointer;pointer-events:auto">${roadDebugLabel}</span>` +
       ' · <span id="resetViewLink" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">reset</span>' +
       ' · <span id="debugLogLink" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">debug log</span>'
   ].join('<br>');
@@ -2023,7 +2024,8 @@ function toggleSeamMode() {
 
 function toggleClassifierMode() {
   if (controls.mapMode) return;
-  classifierRuntime.toggle(terrainPipelineState.lastTiles ?? []);
+  const active = classifierRuntime.toggle(terrainPipelineState.lastTiles ?? []);
+  if (!active) hideTileInfo();
 }
 
 installTerrainKeyboardControls({
@@ -2039,13 +2041,7 @@ installTerrainKeyboardControls({
   },
   onToggleMap: toggleMapMode,
   onOpenGoogleMaps: openGoogleMapsView,
-  onToggleHeatmap: toggleHeatmap,
-  onToggleClassifier: toggleClassifierMode,
-  onToggleRoadDebug: toggleRoadDebug,
   onFlyToTile: promptFlyToTile,
-  onHouseAction: load => load
-    ? houseRuntime.loadHouseModel('keyboard')
-    : houseRuntime.setHousesRuntimeVisible(!houseRuntime.housesRuntimeVisible, 'keyboard'),
   onToggleHeadlights: () => {
     for (const light of vehicleRuntime.vehicleHeadlightSpots) light.visible = !light.visible;
   },
@@ -2079,11 +2075,15 @@ renderer.domElement.addEventListener('pointerdown', event => {
 });
 
 renderer.domElement.addEventListener('click', event => {
+  const classifierTileId = classifierRuntime.active && !controls.mapMode
+    ? hoverOutlineController.tileId
+    : null;
   console.warn('[CLICK TEST] click', {
     x: event.clientX,
     y: event.clientY,
     mapMode: controls.mapMode,
     housesVisible: houseRuntime.housesRuntimeVisible,
+    tileId: classifierTileId,
   });
   enqueueClientLog('info', 'click.test', {
     x: event.clientX,
@@ -2091,6 +2091,7 @@ renderer.domElement.addEventListener('click', event => {
     mapMode: controls.mapMode,
     shadowMode: houseRuntime.HOUSE_SHADOW_MODE,
     housesVisible: houseRuntime.housesRuntimeVisible,
+    tileId: classifierTileId,
   });
   flushClientLogQueue();
   try {
@@ -2144,7 +2145,8 @@ renderer.domElement.addEventListener('click', event => {
 });
 
 renderer.domElement.addEventListener('mousemove', event => {
-  if (!controls.mapMode || controls.dragging) {
+  const classifier3dHover = classifierRuntime.active && !controls.mapMode;
+  if ((!controls.mapMode && !classifier3dHover) || controls.dragging) {
     hideTileInfo();
     return;
   }
@@ -2155,7 +2157,7 @@ renderer.domElement.addEventListener('mousemove', event => {
   }
   mouseNDC.x = (event.clientX / window.innerWidth) * 2 - 1;
   mouseNDC.y = -(event.clientY / window.innerHeight) * 2 + 1;
-  raycaster.setFromCamera(mouseNDC, mapCam);
+  raycaster.setFromCamera(mouseNDC, controls.mapMode ? mapCam : camera);
   const hits = raycaster.intersectObjects(targets);
   if (hits.length === 0) {
     hideTileInfo();
@@ -2163,7 +2165,18 @@ renderer.domElement.addEventListener('mousemove', event => {
   }
 
   const mesh = hits[0].object;
-  hoverOutlineController.show(mesh);
+  hoverOutlineController.show(mesh, classifier3dHover ? 'classifier' : 'outline');
+  if (classifier3dHover) {
+    tileInfoEl.textContent = `tile: ${mesh.userData.tileId}`;
+    tileInfoEl.style.left = `${Math.max(8, Math.min(event.clientX + 14, window.innerWidth - 180))}px`;
+    tileInfoEl.style.top = `${Math.max(8, Math.min(event.clientY + 14, window.innerHeight - 42))}px`;
+    tileInfoEl.style.right = 'auto';
+    tileInfoEl.style.display = 'block';
+    return;
+  }
+  tileInfoEl.style.left = 'auto';
+  tileInfoEl.style.top = '12px';
+  tileInfoEl.style.right = '12px';
   const info = summarizeTerrainMesh(mesh);
   const overlappingMeshes = [...new Map(hits
     .filter(hit => hit.object.userData?.tileId && hit.object.userData.tileId !== info.tileId)
@@ -2196,6 +2209,8 @@ renderer.domElement.addEventListener('mousemove', event => {
   ].filter(Boolean).join('<br>');
   tileInfoEl.style.display = 'block';
 });
+
+renderer.domElement.addEventListener('mouseleave', hideTileInfo);
 
 renderer.domElement.addEventListener('contextmenu', event => {
   event.preventDefault();

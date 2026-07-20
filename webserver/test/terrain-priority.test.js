@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import test from 'node:test';
+import * as THREE from 'three';
 
 import {
   radialPriorityDistance,
@@ -1425,6 +1426,33 @@ test('shared terrain hover outline owns replacement and cleanup', () => {
   assert.equal(hover.show(null), true);
   assert.equal(root.children.length, 0);
   assert.equal(changes, 2);
+});
+
+test('classifier terrain hover uses a distinct surface highlight without owning tile geometry', () => {
+  const root = {
+    children: [],
+    add(child) { this.children.push(child); },
+    remove(child) { this.children = this.children.filter(item => item !== child); },
+  };
+  const hover = createTerrainHoverOutlineController({ terrainRoot: root });
+  const geometry = new THREE.BufferGeometry();
+  const mesh = new THREE.Mesh(geometry, new THREE.MeshBasicMaterial());
+  mesh.userData.tileId = '12-1-2';
+
+  assert.equal(hover.show(mesh, 'classifier'), true);
+  assert.equal(hover.presentation, 'classifier');
+  assert.equal(hover.outline.isMesh, true);
+  assert.equal(hover.outline.geometry, geometry);
+  assert.equal(hover.outline.material.color.getHex(), 0xffb000);
+  assert.equal(hover.outline.material.depthWrite, false);
+  assert.equal(hover.show(mesh, 'classifier'), false);
+
+  let geometryDisposed = false;
+  geometry.addEventListener('dispose', () => { geometryDisposed = true; });
+  assert.equal(hover.clear(), true);
+  assert.equal(geometryDisposed, false);
+  mesh.material.dispose();
+  geometry.dispose();
 });
 
 test('seam grid colors shared edges by measured failure and reports both tiles', () => {
