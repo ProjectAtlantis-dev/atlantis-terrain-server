@@ -67,11 +67,11 @@ export function createWaterRuntime({
   log = null,
   params = { ...DEFAULT_WATER_PARAMS },
 }) {
-  const water = backend.createWater?.({ geometry: buildRadialGridGeometry() }) ?? null;
+  const water = backend.createWater?.({ geometry: buildRadialGridGeometry(), log }) ?? null;
   if (!water?.mesh) {
     return {
       enabled: false, params,
-      applyWind() {}, update() {}, dispose() {},
+      applyWind() {}, update() {}, dispose() {}, setDebugMode() {},
     };
   }
   terrainRoot.add(water.mesh);
@@ -168,6 +168,7 @@ export function createWaterRuntime({
     params,
     applyWind,
     update,
+    setDebugMode(mode) { water.setDebugMode?.(mode); },
     dispose() {
       terrainRoot.remove(water.mesh);
       water.dispose();

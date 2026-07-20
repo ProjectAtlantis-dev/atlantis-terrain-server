@@ -2,6 +2,7 @@ import * as THREE from 'three';
 import { WebGPURenderer } from 'three/webgpu';
 import { color, densityFogFactor, fog, uniform } from 'three/tsl';
 import { createWebGPUAtmosphereController } from './webgpu-atmosphere.js';
+import { createWebGPUWater } from './webgpu-water.js';
 
 /**
  * Create the WebGPU renderer adapter used by the shared terrain application.
@@ -65,6 +66,7 @@ export function createTerrainBackend({
     },
     setFogDensity(value) { fogDensity.value = value; },
     setMapMode(active) { fogDensity.value = active ? 0 : fogDensity.value; },
+    createWater(options) { return createWebGPUWater({ renderer, ...options }); },
     prepareUntexturedTerrain(mesh) {
       if (!mesh?.material || mesh.material.map) return;
       let needsUpdate = false;

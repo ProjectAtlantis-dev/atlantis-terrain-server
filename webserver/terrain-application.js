@@ -1204,7 +1204,12 @@ function needsContinuousRender() {
     hasActiveKeyInput() ||
     Math.abs(controls.speed) > 1e-3 ||
     Math.abs(controls.strafeSpeed) > 1e-3 ||
-    vehicleRuntime.vehicleControlActive
+    vehicleRuntime.vehicleControlActive ||
+    // Animated water must hold the loop open on backends that actually idle
+    // (WebGPU; the WebGL backend never stops once started). Mirrors the
+    // waterRuntime.update visibility gate.
+    (waterRuntime.enabled && waterParams.enabled &&
+      !controls.mapMode && !classifierRuntime.active)
   );
 }
 
@@ -1436,6 +1441,8 @@ window.takramDebug = {
   bootEvents,
   getBootEvents: () => bootEvents.slice(),
   getCloudShadowDebugSummary: () => webgpuAtmosphere?.debugSummary() ?? null,
+  // Water port bisect: 0 normal | 1 fetch open | 2 +de-tile bypass | 3 data paint
+  setWaterDebugMode: mode => waterRuntime.setDebugMode?.(mode),
   flushClientLogQueue: () => flushClientLogQueue(),
   fetchTiles: terrainFetchRuntime.request,
   loadHouseModel: houseRuntime.loadHouseModel,
