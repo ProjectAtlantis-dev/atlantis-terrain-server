@@ -13,7 +13,7 @@ import {
 } from '../terrain-priority.js';
 import { compassHeading } from '../terrain-hud.js';
 import { applyMapDrag } from '../terrain-controls.js';
-import { createVehiclePersistenceRuntime, normalizeSavedVehicleState, stepSuspension, stepVehicleDrive, vehicleLocalToLatLon, vehicleStateSnapshot } from '../terrain-vehicle.js';
+import { createVehiclePersistenceRuntime, normalizeSavedVehicleState, stepSuspension, stepVehicleDrive, terrainBboxIntersectsCircle, vehicleLocalToLatLon, vehicleStateSnapshot } from '../terrain-vehicle.js';
 import { scoreTextureTiles, textureRetryDelay, tileDepthFromId } from '../terrain-tile-runtime.js';
 import { createTextureStreamer, rendererTextureAnisotropy } from '../terrain-texture-streamer.js';
 import {
@@ -72,6 +72,14 @@ test('classifier grid border is baked into all four texture edges', () => {
     [510, 2, 2, 252],
   ]);
   assert.equal(context.fillStyle, 'rgba(20, 230, 255, 0.9)');
+});
+
+test('vehicle shadow receiver footprint keeps intersecting terrain tiles only', () => {
+  assert.equal(terrainBboxIntersectsCircle([0, 0, 100, 100], 50, 50, 10), true);
+  assert.equal(terrainBboxIntersectsCircle([0, 0, 100, 100], 110, 50, 10), true);
+  assert.equal(terrainBboxIntersectsCircle([0, 0, 100, 100], 111, 50, 10), false);
+  assert.equal(terrainBboxIntersectsCircle([100, 100, 0, 0], 50, 50, 0), true);
+  assert.equal(terrainBboxIntersectsCircle(null, 50, 50, 10), false);
 });
 
 test('terrain camera persistence round-trips pose and frame state', () => {

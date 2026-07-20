@@ -6,6 +6,7 @@ import {
   createVehiclePersistenceRuntime,
   normalizeSavedVehicleState,
   stepSuspension,
+  terrainBboxIntersectsCircle,
   vehicleLocalToLatLon as terrainVehicleLocalToLatLon,
   vehicleStateSnapshot,
 } from './terrain-vehicle.js';
@@ -138,6 +139,7 @@ export function createTerrainVehicleRuntime({
   const VEHICLE_SHADOW_LIGHT_DISTANCE = 250;
   const VEHICLE_SHADOW_MIN_RADIUS = 60;
   const VEHICLE_SHADOW_MAX_RADIUS = 180;
+  const VEHICLE_SHADOW_MIN_SUN_PROJECTION = 0.2;
   const VEHICLE_SHADOW_TEXEL_SNAP = true;
   const VEHICLE_SHADOW_GROUND_ANCHOR = THREE.MathUtils.clamp(
     paramNumber('vehicleShadowGroundAnchor', 1.0),
@@ -689,7 +691,7 @@ export function createTerrainVehicleRuntime({
     receiver.scale.copy(terrainMesh.scale);
     receiver.receiveShadow = true;
     receiver.castShadow = false;
-    receiver.frustumCulled = false;
+    receiver.frustumCulled = true;
     receiver.renderOrder = 25;
     receiver.userData.vehicleShadowTileId = terrainMesh.userData.tileId;
     receiver.userData.sourceGeometry = terrainMesh.geometry;
@@ -704,15 +706,27 @@ export function createTerrainVehicleRuntime({
   }
   
   function syncVehicleShadowReceivers() {
-    if (!vehicleLoaded) {
+    if (!vehicleLoaded || !vehicleGroup.visible || controls.mapMode) {
       clearVehicleShadowReceivers();
       return;
     }
+    // The light's orthographic square is rotated into the sun frame. Project
+    // a conservative circumscribed circle onto the ground so low sun keeps
+    // enough receiving terrain without cloning the entire resident heatmap.
+    const sunUp = Math.abs(getSunDirection().dot(up));
+    const receiverRadius = vehicleShadowRadius * Math.SQRT2
+      / Math.max(VEHICLE_SHADOW_MIN_SUN_PROJECTION, sunUp);
     const activeTileIds = new Set();
     const terrainMeshes = houseTerrainMeshes();
     for (const terrainMesh of terrainMeshes) {
       const tileId = terrainMesh.userData?.tileId;
       if (!tileId) continue;
+      if (!terrainBboxIntersectsCircle(
+        terrainMesh.userData?.bbox,
+        vehicleGroup.position.x,
+        vehicleGroup.position.y,
+        receiverRadius,
+      )) continue;
       activeTileIds.add(tileId);
       const existing = vehicleShadowReceivers.get(tileId);
       if (existing) {
