@@ -50,6 +50,8 @@ import { googleMaps3dUrl } from './terrain-google-maps.js';
 import { createTerrainFlyToTileRuntime } from './terrain-fly-to-tile.js';
 import { epsg3413DirectionBearing, epsg3413ToWgs84 } from './terrain-polar-stereo.js';
 import { createWaterRuntime, DEFAULT_WATER_PARAMS } from './water/water-runtime.js';
+import { FAST_TIME_SCALE, getFastTimeRange } from './terrain-game-clock.js';
+import { advanceRealtimeMovement, MAX_REALTIME_STEP_SECONDS } from './terrain-realtime-step.js';
 
 export async function startTerrainApplication({
   backend = 'webgl',
@@ -134,6 +136,8 @@ const gameClockState = {
   anchorBrowserTimeMs: Date.now(),
   lastSavedAtMs: 0,
   running: true,
+  timeScale: GAME_TIME_SCALE,
+  stopGameTimeMs: null,
   renderedDate: null,
   lastSunSyncTimeMs: NaN,
 };
@@ -309,6 +313,8 @@ const { hud, alt, gameClock: gameClockEl } = createTerrainHud({
 function rewindGameClock() {
   if (gameClockState.running) currentDate.setTime(getGameDateFromBrowserTime().getTime());
   gameClockState.running = false;
+  gameClockState.timeScale = GAME_TIME_SCALE;
+  gameClockState.stopGameTimeMs = null;
   currentDate.setTime(currentDate.getTime() - 15 * 60 * 1000);
   applyDate(currentDate);
   maybeLogWebGPUSun(currentDate, 'clock-rewind', true);
@@ -316,6 +322,8 @@ function rewindGameClock() {
 function stopGameClock() {
   if (gameClockState.running) currentDate.setTime(getGameDateFromBrowserTime().getTime());
   gameClockState.running = false;
+  gameClockState.timeScale = GAME_TIME_SCALE;
+  gameClockState.stopGameTimeMs = null;
   maybeLogWebGPUSun(currentDate, 'clock-stop', true);
 }
 function playGameClock() {
@@ -323,15 +331,33 @@ function playGameClock() {
     gameClockState.anchorGameTimeMs = currentDate.getTime();
     gameClockState.anchorBrowserTimeMs = Date.now();
     gameClockState.running = true;
+    gameClockState.timeScale = GAME_TIME_SCALE;
+    gameClockState.stopGameTimeMs = null;
   }
   maybeLogWebGPUSun(currentDate, 'clock-play', true);
 }
 function fastForwardGameClock() {
   if (gameClockState.running) currentDate.setTime(getGameDateFromBrowserTime().getTime());
   gameClockState.running = false;
+  gameClockState.timeScale = GAME_TIME_SCALE;
+  gameClockState.stopGameTimeMs = null;
   currentDate.setTime(currentDate.getTime() + 15 * 60 * 1000);
   applyDate(currentDate);
   maybeLogWebGPUSun(currentDate, 'clock-forward', true);
+}
+
+function startFastTime() {
+  if (controls.mapMode) return;
+  const { startMs, endMs } = getFastTimeRange(currentDate);
+  currentDate.setTime(startMs);
+  gameClockState.anchorGameTimeMs = startMs;
+  gameClockState.anchorBrowserTimeMs = Date.now();
+  gameClockState.timeScale = FAST_TIME_SCALE;
+  gameClockState.stopGameTimeMs = endMs;
+  gameClockState.running = true;
+  applyDate(currentDate);
+  maybeLogWebGPUSun(currentDate, 'clock-fast-time', true);
+  requestRender();
 }
 
 const tileInfoEl = document.createElement('div');
@@ -994,7 +1020,15 @@ function applyDate(date, { force = true } = {}) {
 }
 function getGameDateFromBrowserTime(nowMs = Date.now()) {
   const elapsedMs = nowMs - gameClockState.anchorBrowserTimeMs;
-  return new Date(gameClockState.anchorGameTimeMs + elapsedMs * GAME_TIME_SCALE);
+  const gameTimeMs = gameClockState.anchorGameTimeMs + elapsedMs * gameClockState.timeScale;
+  if (gameClockState.stopGameTimeMs != null && gameTimeMs >= gameClockState.stopGameTimeMs) {
+    const stopGameTimeMs = gameClockState.stopGameTimeMs;
+    gameClockState.running = false;
+    gameClockState.timeScale = GAME_TIME_SCALE;
+    gameClockState.stopGameTimeMs = null;
+    return new Date(stopGameTimeMs);
+  }
+  return new Date(gameTimeMs);
 }
 buildTuningControls(aerialPerspective, cloudsEffect);
 // Only apply the default referenceDate if no saved tuning overrides month/hour.
@@ -1275,6 +1309,7 @@ function needsContinuousRender() {
     Math.abs(controls.speed) > 1e-3 ||
     Math.abs(controls.strafeSpeed) > 1e-3 ||
     vehicleRuntime.vehicleControlActive ||
+    gameClockState.stopGameTimeMs != null ||
     // Animated water must hold the loop open on backends that actually idle
     // (WebGPU; the WebGL backend never stops once started). Mirrors the
     // waterRuntime.update visibility gate.
@@ -1335,8 +1370,10 @@ const terrainFetchEvents = {
     console.error('Fetch error:', error);
   },
   onSettled() {
-    // Drain accumulated dt so the next render frame doesn't lurch the camera.
-    clock.getDelta();
+    // Do not read the movement clock here. Fetch callbacks can settle between
+    // animation frames, and draining it would silently discard travel time.
+    // Demand-render startup already resets the clock after a genuinely idle
+    // period via configureDemandRendering.onStart.
     requestRender();
   },
 };
@@ -1815,7 +1852,7 @@ function updateHud() {
     gameClockState.lastSavedAtMs = now;
     localStorage.setItem(GAME_CLOCK_STORAGE_KEY, String(gameDate.getTime()));
   }
-  renderGameClock(gameClockEl, gameDate, gameClockState.running);
+  renderGameClock(gameClockEl, gameDate, gameClockState.running, gameClockState.timeScale);
 
   const hudHtml = [
     '<b>Clouds Terrain Managed Flask UX WIP</b>',
@@ -1842,6 +1879,7 @@ function updateHud() {
       ` · <span id="seamModeLink" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">${controls.seamMode ? '3D view' : 'seam view'}</span>` +
       ` · <span id="heatmapModeLink" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">${heatmapRuntime?.active ? '3D view' : 'heatmap'}</span>` +
       ' · Google 3D (G)' +
+      ' · fast time 03:00–03:00 (P)' +
       ` · <span id="roadDebugLink" style="color:${roadDebugColor};text-decoration:underline;cursor:pointer;pointer-events:auto">${roadDebugLabel}</span>` +
       ' · <span id="resetViewLink" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">reset</span>' +
       ' · <span id="debugLogLink" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">debug log</span>'
@@ -2050,6 +2088,7 @@ installTerrainKeyboardControls({
   onToggleMap: toggleMapMode,
   onOpenGoogleMaps: openGoogleMapsView,
   onFlyToTile: promptFlyToTile,
+  onStartFastTime: startFastTime,
   onToggleHeadlights: () => {
     for (const light of vehicleRuntime.vehicleHeadlightSpots) light.visible = !light.visible;
   },
@@ -2244,14 +2283,20 @@ updateMapCamera();
 updateHud();
 
 function render() {
-  const dt = Math.min(0.05, clock.getDelta());
+  const elapsedDt = clock.getDelta();
+  // Movement consumes the entire wall-clock interval. If rendering stalls,
+  // intermediate simulation states are advanced without rendering and this
+  // frame presents only the current camera/vehicle position.
+  advanceRealtimeMovement(elapsedDt, updateMovement);
+  // Purely visual simulations may drop stale time to avoid a large unstable
+  // water or suspension step after a delayed frame.
+  const dt = Math.min(MAX_REALTIME_STEP_SECONDS, elapsedDt);
   const nowMs = performance.now();
   fpsCounter.frame(nowMs);
   if (gameClockState.running) {
     currentDate.setTime(getGameDateFromBrowserTime().getTime());
   }
   applyDate(currentDate, { force: false });
-  updateMovement(dt);
   applyCameraOrientation();
   rebuildTerrainDemandForViewDirection();
   updateHud();

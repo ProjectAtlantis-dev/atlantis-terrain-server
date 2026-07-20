@@ -20,4 +20,7 @@ test('renderGameClock only rewrites the DOM when the display changes', () => {
   element.innerHTML = 'sentinel';
   renderGameClock(element, new Date(date.getTime() + 60_000), false);
   assert.notEqual(element.innerHTML, 'sentinel'); // minute change rewrites
+
+  renderGameClock(element, date, true, 600);
+  assert.ok(element.innerHTML.includes('×600'));
 });

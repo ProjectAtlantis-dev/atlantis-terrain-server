@@ -110,6 +110,8 @@ WebGPU TSL ports of the same FFT sim). (WIP — still working out some bugs.)
 
 Press **G** to open Google Maps' satellite 3D view at the current camera position, heading, tilt, height above ground, and field of view. This is a debugging reference and opens in a new tab.
 
+Press **P** in the 3D view to run one Nuuk-local day from 03:00 to the following 03:00 in fast time. One real second advances the game clock by 10 minutes, so a normal 24-hour cycle takes 2 minutes 24 seconds.
+
 ## Setup
 
 ### Prerequisites

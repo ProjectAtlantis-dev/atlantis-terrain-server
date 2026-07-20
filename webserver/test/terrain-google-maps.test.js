@@ -91,3 +91,31 @@ test('H and R remain unassigned to heatmap and road debug', () => {
     globalThis.window = previousWindow;
   }
 });
+
+test('P starts fast time once per key press', () => {
+  const previousWindow = globalThis.window;
+  const listeners = new Map();
+  globalThis.window = {
+    addEventListener(type, callback) { listeners.set(type, callback); },
+    removeEventListener(type) { listeners.delete(type); },
+  };
+  let starts = 0;
+  const noop = () => {};
+  const dispose = installTerrainKeyboardControls({
+    controls: { keys: {} },
+    isVehicleActive: () => false,
+    onForwardDoubleTap: noop,
+    onEscapeVehicle: noop,
+    onToggleMap: noop,
+    onStartFastTime: () => { starts += 1; },
+    onToggleHeadlights: noop,
+  });
+  try {
+    listeners.get('keydown')({ code: 'KeyP', repeat: false });
+    listeners.get('keydown')({ code: 'KeyP', repeat: true });
+    assert.equal(starts, 1);
+  } finally {
+    dispose();
+    globalThis.window = previousWindow;
+  }
+});
