@@ -717,6 +717,40 @@ export function createWebGPUWater({
     // the open sea.
     spec = spec.mul(float(0.06).div(slopeVarFull.add(0.06)));
 
+    // Crest sparkle, not foam. Reuse the three physical signals that made
+    // plausible whitecap *locations*—high swell phase, a steep advancing
+    // face, and horizontal compression—but emit only reflected sun. There
+    // is no persistence buffer, breakup texture, white albedo, or residue.
+    // The narrow N.H term breaks crest rows into momentary facet flashes.
+    const J = D0.z.sub(1.0)
+      .add(D1.z.sub(1.0).mul(mix(f1, float(1.0), 0.6)))
+      .add(D2.z.sub(1.0).mul(f2).mul(0.5))
+      .mul(fetchAmp).add(1.0);
+    const crestSlope = D0.xy.add(D1.xy.mul(0.6)).mul(fetchAmp);
+    const faceSteep = crestSlope.dot(uWindDir).negate().max(0.0);
+    const crestTop = smoothstep(0.05, 0.55, hN);
+    const advancingFace = smoothstep(0.025, 0.11, faceSteep);
+    const compression = smoothstep(0.58, 0.92, J).oneMinus();
+    const crestSite = crestTop.mul(advancingFace)
+      .mul(mix(float(0.30), float(1.0), compression));
+    // Normalized narrow microfacet distribution. The previous unnormalized
+    // pow(N.H, 48) * 4 never reached HDR after water's ~2.2% Fresnel term;
+    // this carries the same Cook-Torrance normalization as the main glint.
+    const crestExponent = 96.0;
+    const crestD = N.dot(H).max(0.0).pow(crestExponent)
+      .mul((crestExponent + 2.0) / (2.0 * Math.PI));
+    const resolvedCrestGlint = uSunColor.mul(crestD).mul(fresL)
+      .mul(smoothstep(0.0, 0.06, L.z)).mul(crestSite)
+      .div(NdotV.max(0.1).mul(N.dot(L).max(0.1)).mul(4.0));
+    // Past the point where mip filtering can resolve individual N.H peaks,
+    // use the variance-filtered sun lobe already computed above and gate it
+    // by the same crest physics. Otherwise sparkle exists only near camera.
+    const filteredCrestGlint = spec.mul(crestSite).mul(3.0);
+    const crestFilterBlend = smoothstep(450.0, 2200.0, d);
+    spec = spec.add(
+      mix(resolvedCrestGlint, filteredCrestGlint, crestFilterBlend),
+    );
+
     const backlight = L.dot(V.negate()).mul(0.5).add(0.5).clamp(0.0, 1.0).pow(3.0);
     const ambient = mix(uHorizonCool, uZenithColor, 0.4).mul(0.65);
     const bodyCol = uDeepColor.mul(ambient).mul(4.0);

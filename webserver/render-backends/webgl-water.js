@@ -579,6 +579,36 @@ const WATER_FRAGMENT = /* glsl */ `
     // away from the sun path — no hard fetch gate needed.
     spec *= 0.06 / (0.06 + slopeVarFull);
 
+    // Crest sparkle, not foam. Reuse the three physical signals that made
+    // plausible whitecap *locations*—high swell phase, a steep advancing
+    // face, and horizontal compression—but emit only reflected sun. There
+    // is no persistence buffer, breakup texture, white albedo, or residue.
+    // The narrow N.H term breaks crest rows into momentary facet flashes.
+    float J = 1.0 + ((D0.z - 1.0)
+            + (D1.z - 1.0) * mix(f1, 1.0, 0.6)
+            + (D2.z - 1.0) * f2 * 0.5) * fetchAmp;
+    vec2 crestSlope = (D0.xy + D1.xy * 0.6) * fetchAmp;
+    float faceSteep = max(-dot(crestSlope, uWindDir), 0.0);
+    float crestTop = smoothstep(0.05, 0.55, hN);
+    float advancingFace = smoothstep(0.025, 0.11, faceSteep);
+    float compression = 1.0 - smoothstep(0.58, 0.92, J);
+    float crestSite = crestTop * advancingFace * mix(0.30, 1.0, compression);
+    // Normalized narrow microfacet distribution. The previous unnormalized
+    // pow(N.H, 48) * 4 never reached HDR after water's ~2.2% Fresnel term;
+    // this carries the same Cook-Torrance normalization as the main glint.
+    const float crestExponent = 96.0;
+    float crestD = (crestExponent + 2.0) / (2.0 * 3.14159265)
+                 * pow(max(dot(N, H), 0.0), crestExponent);
+    vec3 resolvedCrestGlint = uSunColor * crestD * fresL
+      * smoothstep(0.0, 0.06, L.z) * crestSite
+      / (4.0 * max(NdotV, 0.1) * max(dot(N, L), 0.1));
+    // Past the point where mip filtering can resolve individual N.H peaks,
+    // use the variance-filtered sun lobe already computed above and gate it
+    // by the same crest physics. Otherwise sparkle exists only near camera.
+    vec3 filteredCrestGlint = spec * crestSite * 3.0;
+    float crestFilterBlend = smoothstep(450.0, 2200.0, d);
+    spec += mix(resolvedCrestGlint, filteredCrestGlint, crestFilterBlend);
+
     float backlight = pow(clamp(dot(L, -V) * 0.5 + 0.5, 0.0, 1.0), 3.0);
     vec3 ambient = mix(uHorizonCool, uZenithColor, 0.4) * 0.65;
     vec3 bodyCol = uDeepColor * ambient * 4.0;

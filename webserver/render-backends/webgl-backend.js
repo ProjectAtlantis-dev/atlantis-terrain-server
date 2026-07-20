@@ -10,12 +10,14 @@ import {
 import { DitheringEffect } from '../three-geospatial/packages/effects/src/index.ts';
 import { createWebGLWater } from './webgl-water.js';
 import { TerrainSunFlareEffect } from '../terrain-sun-flare-effect.js';
+import { createWebGLGpuProfiler } from '../webgl-gpu-profiler.js';
 
 export function createTerrainBackend({
   width,
   height,
   pixelRatio,
   toneMappingExposure = 10,
+  gpuProfilerEnabled = false,
   scene,
   bootLog = () => {},
 } = {}) {
@@ -31,6 +33,7 @@ export function createTerrainBackend({
   renderer.shadowMap.autoUpdate = true;
   renderer.toneMapping = THREE.NoToneMapping;
   renderer.toneMappingExposure = toneMappingExposure;
+  const gpuProfiler = createWebGLGpuProfiler(renderer, { enabled: gpuProfilerEnabled });
   let composer = null;
   let atmospherePass = null;
   let cloudsEffectRef = null;
@@ -56,6 +59,7 @@ export function createTerrainBackend({
     kind: 'webgl',
     defaultFogStrength: 4.5,
     renderer,
+    gpuProfiler,
     lensFlare,
     get takramCloudsEnabled() { return takramCloudsEnabled; },
     get sceneMutationVersion() { return sceneMutationVersion; },
@@ -112,10 +116,13 @@ export function createTerrainBackend({
         frameBufferType: THREE.HalfFloatType,
         multisampling: Math.min(4, renderer.capabilities.maxSamples),
       });
-      const scenePass = new RenderPass(scene, camera);
-      atmospherePass = new EffectPass(camera, cloudsEffect, aerialPerspective);
+      const scenePass = gpuProfiler.wrapPass(new RenderPass(scene, camera), 'scene+shadows');
+      atmospherePass = gpuProfiler.wrapPass(
+        new EffectPass(camera, cloudsEffect, aerialPerspective),
+        'clouds+aerial-perspective',
+      );
       composer.addPass(scenePass);
-      composer.addPass(normalPass);
+      composer.addPass(gpuProfiler.wrapPass(normalPass, 'normal-buffer'));
       composer.addPass(atmospherePass);
       if (!takramCloudsEnabled) {
         aerialPerspective.overlay = null;
@@ -127,12 +134,12 @@ export function createTerrainBackend({
       // Lens flare runs on the HDR frame AFTER sky/clouds (so the sun disk
       // exists in the buffer) and BEFORE tone mapping. It thresholds bright
       // pixels, so it flares the sun itself and any HDR water glint alike.
-      const finalPass = new EffectPass(
+      const finalPass = gpuProfiler.wrapPass(new EffectPass(
         camera,
         lensFlare,
         new ToneMappingEffect({ mode: ToneMappingMode.AGX }),
         new DitheringEffect(),
-      );
+      ), 'lens-flare+tone-map+dither');
       composer.addPass(finalPass);
       bootLog('composer.ready', { passCount: composer.passes.length });
     },
@@ -150,7 +157,12 @@ export function createTerrainBackend({
       }
     },
     renderScene() {
-      composer?.render();
+      gpuProfiler.beginFrame();
+      try {
+        composer?.render();
+      } finally {
+        gpuProfiler.endFrame();
+      }
     },
     configureDemandRendering(configuration) { demandRendering = configuration; },
     startRenderLoop() {
@@ -166,6 +178,7 @@ export function createTerrainBackend({
       renderer.setAnimationLoop(null);
       animationLoopActive = false;
       composer?.dispose?.();
+      gpuProfiler.dispose();
       renderer.dispose();
     },
   };

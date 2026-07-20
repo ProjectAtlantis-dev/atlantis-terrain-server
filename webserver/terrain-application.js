@@ -265,6 +265,8 @@ const renderBackend = backendModule.createTerrainBackend({
     : WEBGL_TONE_MAPPING_EXPOSURE,
   scene,
   bootLog,
+  gpuProfilerEnabled: !USE_WEBGPU_RENDER_BACKEND
+    && localStorage.getItem('terrain-gpu-profiler') === '1',
 });
 const webgpuAtmosphere = USE_WEBGPU_RENDER_BACKEND
   ? renderBackend.createAtmosphere({
@@ -1523,6 +1525,15 @@ window.takramDebug = {
   loadVehicleState: vehicleRuntime.loadVehicleState,
   setVehicleControlActive: active => vehicleRuntime.setVehicleControlActive(Boolean(active), 'debug-api'),
   getVehicleControlActive: () => vehicleRuntime.vehicleControlActive,
+  gpuProfiler: renderBackend.gpuProfiler ?? null,
+  setGpuProfilerEnabled: enabled => renderBackend.gpuProfiler?.setEnabled(Boolean(enabled)) ?? false,
+  setGpuProfilerSampleInterval: frames => renderBackend.gpuProfiler?.setSampleInterval(frames) ?? null,
+  clearGpuProfile: () => renderBackend.gpuProfiler?.clear(),
+  getGpuProfile: () => renderBackend.gpuProfiler?.getSummary() ?? {
+    supported: false,
+    enabled: false,
+    reason: 'GPU pass timing is currently available only on the WebGL backend',
+  },
   terrainRoot,
   texCache,
   deferredTiles: terrainTileSet.deferredTiles,
@@ -1530,6 +1541,15 @@ window.takramDebug = {
   get currentTileIds() { return terrainTileSet.currentTileIds; },
   getSunDirection: () => sunDirection.clone()
 };
+
+// A DOM event bridge makes the latest result readable from automation worlds
+// that intentionally cannot see page-script globals. It does no work unless a
+// diagnostic explicitly requests a snapshot.
+document.addEventListener('terrain-gpu-profile-request', () => {
+  document.documentElement.dataset.terrainGpuProfile = JSON.stringify(
+    window.takramDebug.getGpuProfile(),
+  );
+});
 
 function applyCameraOrientation() {
   const cp = Math.cos(controls.pitch);
