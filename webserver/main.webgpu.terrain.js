@@ -169,8 +169,19 @@ const WEBGPU_ATMOSPHERE_DEFAULTS = Object.freeze({
   mieScale: 1.4,
   groundAlbedo: 0.3,
   // Epipolar god rays (volumetric shadow length fed into the inscatter).
+  // Slice count controls angular sampling density of the Intel OLS epipolar
+  // technique. Undersampling shows as horizontal streaking/banding radiating
+  // from the sun's screen-space position (or its off-screen projection) —
+  // worst at low sun elevation looking away from the sun, exactly the
+  // 2026-07-20 dawn banding report (heading 93°E vs sun azimuth ~38°,
+  // elevation ~3° — sun ~55° off-axis, just outside the 60° FOV frustum).
+  // Verified 2026-07-18 (PERF_REWORK.md, headless 2560x1440): 512x256 vs
+  // 2048x1024 (16x grid) measured 0 fps difference — slice count is not the
+  // frame-cost bottleneck, so there's no budget reason to keep it low.
+  // Raised to reduce banding; this is an angular-resolution mitigation, not
+  // a full fix for the underlying near-off-screen-light degenerate case.
   godRays: true,
-  godRaySlices: 512
+  godRaySlices: 2048
 });
 const WEBGPU_CLOUD_SHADOW_DEFAULTS = Object.freeze({
   // WebGPU clouds are intentionally unavailable for now. Takram CloudsEffect
@@ -1095,7 +1106,7 @@ function buildTuningControls(ap, ce) {
       }
     });
     tuningSlider('god ray quality', {
-      min: 128, max: 1024, step: 64,
+      min: 128, max: 2048, step: 64,
       value: WEBGPU_ATMOSPHERE_DEFAULTS.godRaySlices,
       decimals: 0,
       onChange: v => {
@@ -4416,7 +4427,16 @@ function createWebGPUAtmospherePostProcessing(renderer) {
   bootLog('renderer.webgpu.atmosphere.ready', {
     godRays: true,
     csmCascades: csmShadowNode.cascades,
-    csmMaxFar: csmShadowNode.maxFar
+    csmMaxFar: csmShadowNode.maxFar,
+    // Which cascade-refresh policy is live this session — check this first
+    // before assuming shadow behavior; 'budgeted' is production, 'sync' is
+    // the ?csmSyncRefresh=1 diagnostic (forces all cascades every frame).
+    csmRefreshMode: CSM_SYNC_REFRESH_DIAGNOSTIC ? 'sync' : 'budgeted',
+    csmLegacyStagger: CSM_LEGACY_STAGGER_DIAGNOSTIC,
+    godRaySlices: shadowLengthNode.epipolarSliceCount.value,
+    godRayMaxSamples: shadowLengthNode.maxSliceSampleCount.value,
+    cloudGodRaysEnabled: cloudGodRays != null,
+    cloudGodRaysFullRes: BOOT_QUERY.get('cloudGodRaysFull') === '1'
   });
   return postProcessing;
 }
@@ -4925,7 +4945,17 @@ function traversalMotion() {
     : controlled?.vehicleType === 'ground'
       ? Math.abs(controlled.speed ?? 0)
       : Math.hypot(controls.speed, controls.strafeSpeed);
-  return { heading, speedMps };
+  const controlledPosition = controlled?.group?.position;
+  return {
+    heading,
+    speedMps,
+    // Procgen residency follows the controlled vehicle, not an orbiting chase
+    // camera. Mouse-look around a stationary vehicle must never move or
+    // rebuild the baked asset population.
+    focusTerrainX: Number.isFinite(controlledPosition?.x) ? controlledPosition.x : null,
+    focusTerrainY: Number.isFinite(controlledPosition?.y) ? controlledPosition.y : null,
+    focusTerrainZ: Number.isFinite(controlledPosition?.z) ? controlledPosition.z : null,
+  };
 }
 
 function terrainStreamingFocus(cameraLL = getCameraLatLon()) {
@@ -6525,6 +6555,15 @@ const SHADOW_RADIAL_CULL_DIAGNOSTIC = BOOT_QUERY.get('shadowRadialCull') === '1'
 // (near cascade every frame, cascade i every 2^i frames) instead of the
 // invalidation policy. For measurement-protocol comparisons.
 const CSM_LEGACY_STAGGER_DIAGNOSTIC = BOOT_QUERY.get('csmRefreshLegacy') === '1';
+// Diagnostic: force all cascades to re-render every frame. NOT the default —
+// r182 freezes a cascade's depth map and sampling matrix together while
+// needsUpdate=false, so cached cascades lag coverage but never project stale
+// depth through a fresh matrix (verified 2026-07-16, PERF_REWORK.md). The
+// every-frame path was trialed 2026-07-20 against the dawn banding and did
+// not remove it (the bands are epipolar god-ray artifacts, not stale CSM);
+// it only added per-frame cascade re-fits (visible full-ground shimmer) and
+// re-rendered 3×2048² maps every frame.
+const CSM_SYNC_REFRESH_DIAGNOSTIC = BOOT_QUERY.get('csmSyncRefresh') === '1';
 const SHADOW_CASTER_RADIUS_M = 20000;
 const SHADOW_CULL_INTERVAL_FRAMES = 15;
 let shadowBudgetFrame = 0;
@@ -6580,6 +6619,16 @@ function updateTerrainShadowBudget() {
   const csm = webgpuCsmShadowNode;
   const cascadeLights = csm?.lights;
   if (csm != null && cascadeLights != null && cascadeLights.length > 0) {
+    if (CSM_SYNC_REFRESH_DIAGNOSTIC) {
+      for (const lwLight of cascadeLights) {
+        const shadow = lwLight.shadow;
+        if (shadow == null) continue;
+        shadow.autoUpdate = true;
+        shadow.needsUpdate = true;
+      }
+      runShadowRadialCullDiagnostic();
+      return;
+    }
     if (CSM_LEGACY_STAGGER_DIAGNOSTIC) {
       for (let i = 0; i < cascadeLights.length; i++) {
         const shadow = cascadeLights[i].shadow;

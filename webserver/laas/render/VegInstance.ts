@@ -52,7 +52,14 @@ export const vegViewPos = runiform(new Vector3());
 
 /** per-frame update (Forests.update) — feeds every ring-fade distance */
 export function updateVegViewPos(camera: PerspectiveCamera): void {
-  (vegViewPos as unknown as { value: Vector3 }).value.copy(camera.position);
+  updateVegViewPosition(camera.position);
+}
+
+/** Pin LOD/material decisions to a world residency focus when camera orbit is
+ * only a view change. This keeps a stationary population visually identical
+ * from every mouse-look angle. */
+export function updateVegViewPosition(position: Vector3): void {
+  (vegViewPos as unknown as { value: Vector3 }).value.copy(position);
 }
 
 export interface RingFade {

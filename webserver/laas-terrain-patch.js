@@ -339,6 +339,9 @@ export class GreenlandPatch {
     this._invTR = new THREE.Matrix4();
     this._camWorld = new THREE.Vector3();
     this._camTR = new THREE.Vector3();
+    this._focusTR = new THREE.Vector3();
+    this._focusWorld = new THREE.Vector3();
+    this._focusVeg = new THREE.Vector3();
     this.window = null;
     this.centerId = null;
     this.ready = false;
@@ -575,6 +578,15 @@ export class GreenlandPatch {
     return this._camTR;
   }
 
+  _residencyTerrainLocal(camera, traversal = {}) {
+    const cameraLocal = this._camTerrainLocal(camera);
+    const x = traversal.focusTerrainX;
+    const y = traversal.focusTerrainY;
+    const z = traversal.focusTerrainZ;
+    if ([x, y, z].every(Number.isFinite)) return this._focusTR.set(x, y, z);
+    return this._focusTR.copy(cameraLocal);
+  }
+
   _windowCacheKey(descriptor, sourceTiles, fieldSources) {
     const intersects = source => (
       source.xMax >= descriptor.xMin && source.xMin <= descriptor.xMax
@@ -668,8 +680,8 @@ export class GreenlandPatch {
     const startedAt = performance.now();
     try {
       const sourceTiles = collectTiles(this.terrainRoot);
-      const camTR = this._camTerrainLocal(camera);
-      const descriptor = cameraWindowAt(camTR.x, camTR.y);
+      const focusTR = this._residencyTerrainLocal(camera, traversal);
+      const descriptor = cameraWindowAt(focusTR.x, focusTR.y);
       if (!descriptor) return;
       if (!finestSourceAt(sourceTiles, descriptor.centerX, descriptor.centerY)) {
         this.nextBuildAttempt = now + RETRY_MS;
@@ -795,7 +807,7 @@ export class GreenlandPatch {
       });
     }
 
-    const camTR = this._camTerrainLocal(camera);
+    const focusTR = this._residencyTerrainLocal(camera, traversal);
     const finiteAGL = Number.isFinite(cameraAGL);
     const wantsDetail = finiteAGL
       && cameraAGL <= DETAIL_AGL_MAX
@@ -805,8 +817,8 @@ export class GreenlandPatch {
       && speed <= DETAIL_PREWARM_SPEED_MAX;
     const activeCenter = this.window?.descriptor;
     const hasCompleteCoverage = activeCenter != null
-      && Math.abs(camTR.x - activeCenter.centerX) <= DETAIL_CAMERA_GUARD
-      && Math.abs(camTR.y - activeCenter.centerY) <= DETAIL_CAMERA_GUARD;
+      && Math.abs(focusTR.x - activeCenter.centerX) <= DETAIL_CAMERA_GUARD
+      && Math.abs(focusTR.y - activeCenter.centerY) <= DETAIL_CAMERA_GUARD;
 
     // The streamed satellite/DEM meshes are not children of vegRoot and remain
     // visible in every tier. Only show micro-detail when the active local data
@@ -822,7 +834,7 @@ export class GreenlandPatch {
       // Center on the real camera with hysteresis. Predictive preparation
       // returns when retained chunk slots exist and can be warmed without
       // replacing the active population.
-      const descriptor = cameraWindowAt(camTR.x, camTR.y, activeCenter);
+      const descriptor = cameraWindowAt(focusTR.x, focusTR.y, activeCenter);
       if (descriptor && descriptor.id !== this.centerId) {
         void this._recenter(renderer, descriptor, sourceTiles);
       }
@@ -839,11 +851,14 @@ export class GreenlandPatch {
     this._invVeg.copy(this.vegRoot.matrixWorld).invert();
     camera.getWorldPosition(this._camWorld);
     this.proxy.position.copy(this._camWorld).applyMatrix4(this._invVeg);
-    this.ground.update(renderer, this.proxy);
+    this._focusWorld.copy(focusTR);
+    this.terrainRoot.localToWorld(this._focusWorld);
+    this._focusVeg.copy(this._focusWorld).applyMatrix4(this._invVeg);
+    this.ground.update(renderer, this.proxy, this._focusVeg);
     const sun = this.getSunLight?.();
     if (sun) updateSunUniforms(sun);
     this.forests?.setCSM(this.getCSM?.() ?? null);
-    this.forests?.update(renderer, this.proxy);
+    this.forests?.update(renderer, this.proxy, this._focusVeg);
 
     if ((this._diag = (this._diag + 1) % 180) === 0) {
       const hud = this.ground.counterSnapshot?.() ?? {};

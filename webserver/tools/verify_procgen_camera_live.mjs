@@ -88,6 +88,8 @@ const snapshotExpression = `(() => {
     grass: ground['veg.grass'] ?? -1,
     plantsDrawn: forest['veg.underDrawn'] ?? -1,
     rocksDrawn: forest['veg.extraDrawn'] ?? -1,
+    groundCullSubmits: ground['veg.groundCullSubmits'] ?? -1,
+    forestCullSubmits: forest['veg.forestCullSubmits'] ?? -1,
     plantCandidates: patch?.scatter?.understory?.count ?? -1,
     rockCandidates: (patch?.scatter?.extras?.count ?? 0) + (patch?.scatter?.stones?.count ?? 0),
     procgenMaterials,
@@ -122,6 +124,14 @@ async function sampleGpuCounters() {
   await sleep(500);
 }
 
+async function capture(path) {
+  const screenshot = await send('Page.captureScreenshot', {
+    format: 'png',
+    captureBeyondViewport: false,
+  });
+  await writeFile(path, Buffer.from(screenshot.data, 'base64'));
+}
+
 await send('Runtime.enable');
 await send('Page.enable');
 await waitFor(`window.__atlantisWebGPU?.greenlandPatch?.ready === true`);
@@ -134,19 +144,24 @@ for (let attempt = 0; attempt < 5; attempt++) {
   })()`);
   if (countersReady) break;
 }
+await waitFor(`(() => {
+  const patch = window.__atlantisWebGPU?.greenlandPatch;
+  const ground = patch?.ground?.counterSnapshot?.() ?? {};
+  const forest = patch?.forests?.counterSnapshot?.() ?? {};
+  return (ground['veg.grass'] ?? -1) >= 0
+    && (forest['veg.underDrawn'] ?? -1) >= 0
+    && (forest['veg.extraDrawn'] ?? -1) >= 0;
+})()`, 180_000);
 
 const before = await evaluate(snapshotExpression);
+await capture('/tmp/atlantis-procgen-before.png');
 await dragYaw(1000);
 const away = await evaluate(snapshotExpression);
+await capture('/tmp/atlantis-procgen-away.png');
 await dragYaw(-1000);
 await sampleGpuCounters();
 const restored = await evaluate(snapshotExpression);
-
-const screenshot = await send('Page.captureScreenshot', {
-  format: 'png',
-  captureBeyondViewport: false,
-});
-await writeFile('/tmp/atlantis-procgen-camera.png', Buffer.from(screenshot.data, 'base64'));
+await capture('/tmp/atlantis-procgen-restored.png');
 
 const stable = before.visible
   && restored.visible
@@ -155,8 +170,15 @@ const stable = before.visible
   && before.plantsDrawn >= 0
   && before.rocksDrawn >= 0
   && before.grass === restored.grass
+  && before.grass === away.grass
   && before.plantsDrawn === restored.plantsDrawn
-  && before.rocksDrawn === restored.rocksDrawn;
+  && before.plantsDrawn === away.plantsDrawn
+  && before.rocksDrawn === restored.rocksDrawn
+  && before.rocksDrawn === away.rocksDrawn
+  && before.groundCullSubmits === away.groundCullSubmits
+  && before.groundCullSubmits === restored.groundCullSubmits
+  && before.forestCullSubmits === away.forestCullSubmits
+  && before.forestCullSubmits === restored.forestCullSubmits;
 
 console.log(JSON.stringify({ stable, before, away, restored, browserErrors }, null, 2));
 await send('Page.close');

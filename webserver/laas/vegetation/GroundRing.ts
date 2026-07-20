@@ -20,12 +20,9 @@ import {
   BufferAttribute,
   BufferGeometry,
   DoubleSide,
-  Frustum,
   Group,
-  Matrix4,
   Mesh,
   Vector3,
-  Vector4,
 } from 'three';
 import type { DataTexture, PerspectiveCamera } from 'three';
 import {
@@ -59,7 +56,6 @@ import {
   transformNormalToView,
   uint,
   uniform,
-  uniformArray,
   uv,
   varying,
   vec2,
@@ -99,18 +95,7 @@ const G_BAND = 12;
 // Vehicle suspension/camera smoothing can move the view by tiny sub-frame
 // amounts even when traversal speed is zero. Re-running the append-buffer cull
 // for that noise both burns the GPU and can reshuffle borderline instances.
-const CULL_MATRIX_EPSILON = 0.01;
-
-function matrixApproximatelyEquals(a: Matrix4, b: Matrix4): boolean {
-  const ae = a.elements;
-  const be = b.elements;
-  for (let index = 0; index < 16; index++) {
-    if (Math.abs((ae[index] ?? 0) - (be[index] ?? 0)) > CULL_MATRIX_EPSILON) {
-      return false;
-    }
-  }
-  return true;
-}
+const CULL_FOCUS_EPSILON_SQ = 0.25;
 // The LAAS heightfield is a resampled representation of the rendered DEM.
 // Keep blade roots just above the triangle surface so tiny interpolation
 // differences cannot bury most of a short tundra blade at grazing angles.
@@ -317,10 +302,7 @@ export class GroundRing {
   private prepassGroup = new Group();
   private kernels: object[] = [];
   private camU = uniform(new Vector3());
-  private planesU = uniformArray(Array.from({ length: 6 }, () => new Vector4()));
-  private frustum = new Frustum();
-  private projView = new Matrix4();
-  private lastCullProjView = new Matrix4();
+  private lastCullFocus = new Vector3();
   private cullValid = false;
   private cullSubmits = 0;
   private cullSkips = 0;
@@ -368,7 +350,6 @@ export class GroundRing {
     const hf = this.hf;
     const salt = this.seed.sub('groundring') & 0x7fffffff;
     const camU = this.camU;
-    const planesU = this.planesU;
     const canopyTex = this.canopyTex;
 
     const offsets: number[] = [];
@@ -415,17 +396,6 @@ export class GroundRing {
         e = b.equal(float(i).toInt()).select(float(vals[i] ?? 0), e) as NF;
       }
       return e;
-    };
-
-    const inFrustum = (center: NV3, slack: number): NF => {
-      let inside: NF = float(1);
-      for (let p = 0; p < 6; p++) {
-        const pl = planesU.element(float(p).toInt()) as unknown as NV4;
-        inside = inside.mul(
-          pl.xyz.dot(center).add(pl.w).greaterThan(-slack).select(float(1), float(0)),
-        );
-      }
-      return inside;
     };
 
     const appendRing = (g: NI, wc: NV2, y: NF): void => {
@@ -540,9 +510,6 @@ export class GroundRing {
       If(cellHash(wc, salt ^ 0x77a1).greaterThanEqual(dens.mul(edge).mul(thin)), () => {
         Return();
       });
-      If(inFrustum(vec3(wpos.x, h.add(0.5), wpos.y), 1.4).lessThan(0.5), () => {
-        Return();
-      });
       // Boundary-band cells append to BOTH adjacent layers — the
       // complementary dither in grassMaterial then draws each pixel from
       // exactly one layer, holding blade density constant through the band.
@@ -635,9 +602,6 @@ export class GroundRing {
       If(cellHash(wc, salt ^ 0x132f).greaterThanEqual(dens.mul(edge)), () => {
         Return();
       });
-      If(inFrustum(vec3(wpos.x, h.add(0.3), wpos.y), 0.8).lessThan(0.5), () => {
-        Return();
-      });
       const r = cellHash(wc, salt ^ 0x4c11).mul(wSum);
       const ty = float(0).toVar();
       const acc = wCobble.toVar();
@@ -717,9 +681,6 @@ export class GroundRing {
           Return();
         },
       );
-      If(inFrustum(vec3(wpos.x, h.add(0.6), wpos.y), 1.6).lessThan(0.5), () => {
-        Return();
-      });
       appendRing(int(8), wc, h);
     })().compute(FAR_GRID * FAR_GRID);
     farK.setName('farTuftCull');
@@ -1100,27 +1061,28 @@ export class GroundRing {
     bandFade(mat, dist, null, DEB_R - 6, 5, h2.x);
   }
 
-  update(renderer: Renderer, camera: PerspectiveCamera): void {
-    this.camU.value.copy(camera.position);
-    this.projView.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
-    if (this.cullValid && matrixApproximatelyEquals(this.lastCullProjView, this.projView)) {
+  update(
+    renderer: Renderer,
+    camera: PerspectiveCamera,
+    residencyFocus: Vector3 = camera.position,
+  ): void {
+    this.camU.value.copy(residencyFocus);
+    this.frame++;
+    if (this.cullValid
+        && this.lastCullFocus.distanceToSquared(residencyFocus) <= CULL_FOCUS_EPSILON_SQ) {
       this.cullSkips++;
+      if (this.frame % 90 === 30 && !this.reading) {
+        this.reading = true;
+        void this.readStats(renderer);
+      }
       return;
-    }
-    this.frustum.setFromProjectionMatrix(this.projView);
-    const arr = this.planesU.array as Vector4[];
-    for (let p = 0; p < 6; p++) {
-      const pl = this.frustum.planes[p];
-      if (!pl) continue;
-      (arr[p] as Vector4).set(pl.normal.x, pl.normal.y, pl.normal.z, pl.constant);
     }
     for (const k of this.kernels) {
       renderer.compute(k as Parameters<Renderer['compute']>[0]);
     }
-    this.lastCullProjView.copy(this.projView);
+    this.lastCullFocus.copy(residencyFocus);
     this.cullValid = true;
     this.cullSubmits++;
-    this.frame++;
     if (this.frame % 90 === 30 && !this.reading) {
       this.reading = true;
       void this.readStats(renderer);

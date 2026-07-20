@@ -83,7 +83,7 @@ import { hash12 } from '../gpu/noise/NoiseTSL';
 import type { ProbeGI } from '../gpu/passes/ProbeGI';
 import { canopyAt, type ScatterLayer, type ScatterResult } from '../gpu/passes/Scatter';
 import { impostorQuad, impostorRuntimeMaterial } from '../render/ImpostorRuntime';
-import { instanceVeg, updateVegViewPos, type RingFade } from '../render/VegInstance';
+import { instanceVeg, updateVegViewPosition, type RingFade } from '../render/VegInstance';
 import { depthPrepassTwin } from '../render/VegPrepass';
 import type { NF, NI, NU, NV3, NV4 } from '../gpu/TSLTypes';
 import type { VegLib } from './VegLibrary';
@@ -133,6 +133,7 @@ const CASCADES = 3;
 // Ignore camera/CSM matrix noise below a visible culling threshold. This keeps
 // stationary wind in the vertex shader without rebuilding instance lists.
 const CULL_MATRIX_EPSILON = 0.01;
+const CULL_FOCUS_EPSILON_SQ = 0.25;
 
 function matrixApproximatelyEquals(a: Matrix4, b: Matrix4): boolean {
   const ae = a.elements;
@@ -294,17 +295,12 @@ export class Forests {
   private kernels: object[] = [];
   private cullKernels: { kernel: object; layer: ScatterLayer }[] = [];
   private camU = uniform(new Vector3());
-  private planesU = uniformArray(
-    Array.from({ length: 6 }, () => new Vector4()),
-  );
   /** 6 planes × 4 cascade ortho frusta; w=-1e9 ⇒ reject-all until CSM exists */
   private planesCsmU = uniformArray(
     Array.from({ length: 6 * CASCADES }, () => new Vector4(0, 0, 0, -1e9)),
   );
   private csm: object | null = null;
-  private frustum = new Frustum();
-  private projView = new Matrix4();
-  private lastCullProjView = new Matrix4();
+  private lastCullFocus = new Vector3();
   private cascM = new Matrix4();
   private lastCullCascades = Array.from({ length: CASCADES }, () => new Matrix4());
   private lastCullCascadeValid = new Array<boolean>(CASCADES).fill(false);
@@ -754,7 +750,6 @@ export class Forests {
     const counters = this.counters;
     const compact = this.compact;
     const camU = this.camU;
-    const planesU = this.planesU;
     const hf = this.hf;
 
     const clearK = Fn(() => {
@@ -765,17 +760,6 @@ export class Forests {
       atomicStore(counters.element(i), uint(0));
     })().compute(GROUPS);
     clearK.setName('vegClear');
-
-    const inFrustum = (center: NV3, rad: NF): NF => {
-      // product of per-plane step(−r ≤ dist) — 1 inside, 0 outside
-      let inside: NF = float(1);
-      for (let p = 0; p < 6; p++) {
-        const pl = planesU.element(int(p)) as unknown as NV4;
-        const d = pl.xyz.dot(center).add(pl.w);
-        inside = inside.mul(d.greaterThan(rad.negate()).select(float(1), float(0)));
-      }
-      return inside;
-    };
 
     const planesCsmU = this.planesCsmU;
     // +30 m slack: the planes are one frame stale (CSM fits its boxes during
@@ -836,10 +820,8 @@ export class Forests {
         }
 
         if (kind === 'under') {
-          // understory never casts — keep the cheap early-out path
-          If(inFrustum(center, rad).lessThan(0.5), () => {
-            Return();
-          });
+          // Understory is a resident radial population. Camera rotation only
+          // changes raster visibility; it must not rebuild or replace assets.
           const ordinal = cls
             .lessThan(16)
             .select(cls.sub(8), cls.sub(16));
@@ -848,10 +830,10 @@ export class Forests {
           return;
         }
 
-        // main-view visibility: frustum + terrain-occlusion march (camera
-        // sight line) — casters intentionally skip BOTH (an off-screen or
-        // ridge-hidden tree still casts into the visible scene)
-        const visMain = inFrustum(center, rad).toVar();
+        // Main-view populations are camera-orientation independent. Distance
+        // LOD remains centered on the residency focus, while ordinary raster
+        // clipping decides what the current view can see.
+        const visMain = float(1).toVar();
         // The seven-tap ridge test is useful for tall trees, but applying its
         // hard 4 m decision to ground rocks made them pop as a small camera
         // translation changed the nearest-height samples. Rocks are bounded
@@ -981,22 +963,17 @@ export class Forests {
     this.csm = csm;
   }
 
-  /** per-frame: update frustum/camera uniforms, run cull+indirect computes */
-  update(renderer: Renderer, camera: PerspectiveCamera): void {
-    this.camU.value.copy(camera.position);
-    updateVegViewPos(camera);
-    this.projView.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
+  /** update resident radial LOD plus independent cascade-caster visibility */
+  update(
+    renderer: Renderer,
+    camera: PerspectiveCamera,
+    residencyFocus: Vector3 = camera.position,
+  ): void {
+    this.camU.value.copy(residencyFocus);
+    updateVegViewPosition(residencyFocus);
+    this.frame++;
     let visibilityChanged = !this.cullValid
-      || !matrixApproximatelyEquals(this.lastCullProjView, this.projView);
-    if (visibilityChanged) this.frustum.setFromProjectionMatrix(this.projView);
-    const arr = this.planesU.array as Vector4[];
-    if (visibilityChanged) {
-      for (let p = 0; p < 6; p++) {
-        const pl = this.frustum.planes[p];
-        if (!pl) continue;
-        (arr[p] as Vector4).set(pl.normal.x, pl.normal.y, pl.normal.z, pl.constant);
-      }
-    }
+      || this.lastCullFocus.distanceToSquared(residencyFocus) > CULL_FOCUS_EPSILON_SQ;
     // cascade ortho frusta → caster-cull planes (read one frame stale —
     // CSMShadowNode positions its lwLights during the upcoming render; the
     // lightMargin slack swallows the lag). Also pins each cascade camera to
@@ -1010,6 +987,7 @@ export class Forests {
     const lights = (
       this.csm as { lights?: { shadow?: { camera?: CascCam } }[] } | null
     )?.lights;
+    const hasTreeCasters = this.scatter.trees.count > 0;
     const nextCascadeValid = new Array<boolean>(CASCADES).fill(false);
     if (lights) {
       const carr = this.planesCsmU.array as Vector4[];
@@ -1019,8 +997,8 @@ export class Forests {
         nextCascadeValid[c] = true;
         cam.layers.enable(2 + c);
         this.cascM.multiplyMatrices(cam.projectionMatrix, cam.matrixWorldInverse);
-        if (!this.lastCullCascadeValid[c]
-            || !matrixApproximatelyEquals(this.lastCullCascades[c] as Matrix4, this.cascM)) {
+        if (hasTreeCasters && (!this.lastCullCascadeValid[c]
+            || !matrixApproximatelyEquals(this.lastCullCascades[c] as Matrix4, this.cascM))) {
           visibilityChanged = true;
         }
         this.cascFrustum.setFromProjectionMatrix(this.cascM);
@@ -1037,12 +1015,17 @@ export class Forests {
         this.lastCullCascades[c]?.copy(this.cascM);
       }
     }
-    if (this.lastCullCascadeValid.some((valid, index) => valid !== nextCascadeValid[index])) {
+    if (hasTreeCasters
+        && this.lastCullCascadeValid.some((valid, index) => valid !== nextCascadeValid[index])) {
       visibilityChanged = true;
     }
     this.lastCullCascadeValid = nextCascadeValid;
     if (!visibilityChanged) {
       this.cullSkips++;
+      if (this.frame % 90 === 0 && !this.reading) {
+        this.reading = true;
+        void this.readStats(renderer);
+      }
       return;
     }
     renderer.compute(this.kernels[0] as Parameters<Renderer['compute']>[0]);
@@ -1056,10 +1039,9 @@ export class Forests {
       );
     }
     renderer.compute(this.kernels[1] as Parameters<Renderer['compute']>[0]);
-    this.lastCullProjView.copy(this.projView);
+    this.lastCullFocus.copy(residencyFocus);
     this.cullValid = true;
     this.cullSubmits++;
-    this.frame++;
     if (this.frame % 90 === 0 && !this.reading) {
       this.reading = true;
       void this.readStats(renderer);
