@@ -34,8 +34,8 @@ OFFICIAL_COASTLINE_SOURCE = "govmin_gl_aabent_land"
 # Masked water is dropped below sea level at read time so a sea-level water
 # surface has volume above the seabed. Bump WATER_FLOOR_VERSION whenever the
 # derived geometry changes: open_db() flushes every cached seam on mismatch.
-WATER_FLOOR_DROP_M = 10.0
-WATER_FLOOR_VERSION = 2
+WATER_FLOOR_DROP_M = 3.0
+WATER_FLOOR_VERSION = 3
 _WMS_URL = "https://gis.govmin.gl/geoserver/wms"
 _WMS_LAYER = "Greenland:gl_aabent_land"
 _OVERSAMPLE = 8

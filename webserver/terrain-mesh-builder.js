@@ -43,7 +43,6 @@ export function createTerrainMeshBuilder({ exaggeration, attachScatter }) {
     const vertexCount = surfaceVertexCount + skirtVertexCount;
     const positions = new Float32Array(vertexCount * 3);
     const colors = new Float32Array(vertexCount * 3);
-    const classifierFallbackColors = new Float32Array(vertexCount * 3);
     const uvs = new Float32Array(vertexCount * 2);
 
     for (let row = 0; row < resolution; row++) for (let column = 0; column < resolution; column++) {
@@ -56,8 +55,6 @@ export function createTerrainMeshBuilder({ exaggeration, attachScatter }) {
       uvs[index * 2 + 1] = row / (resolution - 1);
       const color = elevationColor(elevation);
       colors.set([color.r, color.g, color.b], index * 3);
-      const gray = Math.max(0.03, Math.min(1, (elevation + 50) / 3050));
-      classifierFallbackColors.set([gray, gray, gray], index * 3);
     }
 
     const indices = [];
@@ -82,10 +79,6 @@ export function createTerrainMeshBuilder({ exaggeration, attachScatter }) {
           positions[bottom * 3 + component] = value;
           colors[top * 3 + component] = colors[surfaceIndex * 3 + component];
           colors[bottom * 3 + component] = colors[surfaceIndex * 3 + component];
-          classifierFallbackColors[top * 3 + component]
-            = classifierFallbackColors[surfaceIndex * 3 + component];
-          classifierFallbackColors[bottom * 3 + component]
-            = classifierFallbackColors[surfaceIndex * 3 + component];
         }
         positions[bottom * 3 + 2] -= skirtDepth;
         uvs[top * 2] = uvs[surfaceIndex * 2];
@@ -124,7 +117,6 @@ export function createTerrainMeshBuilder({ exaggeration, attachScatter }) {
     const geometry = new THREE.BufferGeometry();
     geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
     const terrainColorAttribute = new THREE.BufferAttribute(colors, 3);
-    const classifierColorAttribute = new THREE.BufferAttribute(classifierFallbackColors, 3);
     geometry.setAttribute('color', terrainColorAttribute);
     geometry.setAttribute('uv', new THREE.BufferAttribute(uvs, 2));
     geometry.setIndex(indices);
@@ -144,7 +136,6 @@ export function createTerrainMeshBuilder({ exaggeration, attachScatter }) {
       // replace stale geometry without requiring a page refresh.
       heightmapPayload: tile.heightmap,
       terrainColorAttribute,
-      classifierColorAttribute,
     });
     attachScatter(mesh, tile, heightmap);
     return mesh;

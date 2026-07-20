@@ -114,13 +114,13 @@ const BATHY_GLSL = /* glsl */ `
   uniform float uFetchRamp;    // metres of open water upwind for a full sea
                                // state; 0 disables the lee-shore calm zone
 
-  // local terrain height under the water plane; -10 m (the synthetic fjord
+  // local terrain height under the water plane; -3 m (the synthetic fjord
   // floor) wherever the capture has no coverage
   vec4 bathyAt(vec2 p) {
     vec2 uv = (p - uBathyCenter) / uBathyExtent + 0.5;
     float inB = step(abs(uv.x - 0.5), 0.5) * step(abs(uv.y - 0.5), 0.5);
     vec4 b = texture2D(uBathy, uv);
-    return mix(vec4(-10.0, 0.0, 0.0, 0.0), b, b.a * inB);
+    return mix(vec4(-3.0, 0.0, 0.0, 0.0), b, b.a * inB);
   }
 
   // Lee-shore fetch: waves need open water upwind to build, so a shore the
@@ -329,7 +329,7 @@ const WATER_FRAGMENT = /* glsl */ `
   // Replace analytic sky reflections near north-facing coastal cliffs. Local +y is
   // north, so a north-facing slope rises toward -y (south). Search only on
   // that axis: east/west/south-facing shores are deliberately unaffected.
-  // The broad derivative also rejects the artificial 10 m sea-floor drop at
+  // The broad derivative also rejects the artificial 3 m sea-floor drop at
   // an otherwise flat shoreline. Exact shoreline distance is unnecessary;
   // this is intentionally a coarse, low-frequency visual setback.
   float northCliffReflectionKeep(vec2 p, vec4 centerBathy) {
@@ -415,9 +415,9 @@ const WATER_FRAGMENT = /* glsl */ `
     // only calls a pixel black when all three are nearly absent.
     float bottomReflection = reflectionGateAt(pxy);
 
-    // Wall detection: the open fjord floor is a flat synthetic -10 m plane —
+    // Wall detection: the open fjord floor is a flat synthetic -3 m plane —
     // the only steep thing under the surface is the artificial mask-drop wall
-    // at the shoreline (10 m over a texel or two). The veil below must hide
+    // at the shoreline (3 m over a texel or two). The veil below must hide
     // exactly that band and nothing else, so measure seabed slope in world
     // metres (central differences one texel apart, resolution-independent).
     float h = uBathyTexel;
@@ -460,7 +460,11 @@ const WATER_FRAGMENT = /* glsl */ `
     // but smooth sheen from altitude.
     float microFade = 1.0 / (1.0 + d * 0.004);
     float fetchAmp = vFetch;
-    float microGate = smoothstep(0.02, 0.25, vFetch);
+    // Calm is not flat: even directly behind a lee shore, retain a small
+    // wind-ripple field.  The fetch mask owns the swell amplitude; using it
+    // as an on/off switch for capillary detail made the calm band lose its
+    // moving normals and therefore read as matte water.
+    float microGate = mix(0.22, 1.0, smoothstep(0.02, 0.25, vFetch));
     float slopeVarFull = slopeVar
       + 0.5 * (0.35 * uWindFactor) * (0.35 * uWindFactor) * (1.0 - microFade);
     slope *= fetchAmp;
@@ -575,6 +579,36 @@ const WATER_FRAGMENT = /* glsl */ `
     // away from the sun path — no hard fetch gate needed.
     spec *= 0.06 / (0.06 + slopeVarFull);
 
+    // Crest sparkle, not foam. Reuse the three physical signals that made
+    // plausible whitecap *locations*—high swell phase, a steep advancing
+    // face, and horizontal compression—but emit only reflected sun. There
+    // is no persistence buffer, breakup texture, white albedo, or residue.
+    // The narrow N.H term breaks crest rows into momentary facet flashes.
+    float J = 1.0 + ((D0.z - 1.0)
+            + (D1.z - 1.0) * mix(f1, 1.0, 0.6)
+            + (D2.z - 1.0) * f2 * 0.5) * fetchAmp;
+    vec2 crestSlope = (D0.xy + D1.xy * 0.6) * fetchAmp;
+    float faceSteep = max(-dot(crestSlope, uWindDir), 0.0);
+    float crestTop = smoothstep(0.05, 0.55, hN);
+    float advancingFace = smoothstep(0.025, 0.11, faceSteep);
+    float compression = 1.0 - smoothstep(0.58, 0.92, J);
+    float crestSite = crestTop * advancingFace * mix(0.30, 1.0, compression);
+    // Normalized narrow microfacet distribution. The previous unnormalized
+    // pow(N.H, 48) * 4 never reached HDR after water's ~2.2% Fresnel term;
+    // this carries the same Cook-Torrance normalization as the main glint.
+    const float crestExponent = 96.0;
+    float crestD = (crestExponent + 2.0) / (2.0 * 3.14159265)
+                 * pow(max(dot(N, H), 0.0), crestExponent);
+    vec3 resolvedCrestGlint = uSunColor * crestD * fresL
+      * smoothstep(0.0, 0.06, L.z) * crestSite
+      / (4.0 * max(NdotV, 0.1) * max(dot(N, L), 0.1));
+    // Past the point where mip filtering can resolve individual N.H peaks,
+    // use the variance-filtered sun lobe already computed above and gate it
+    // by the same crest physics. Otherwise sparkle exists only near camera.
+    vec3 filteredCrestGlint = spec * crestSite * 3.0;
+    float crestFilterBlend = smoothstep(450.0, 2200.0, d);
+    spec += mix(resolvedCrestGlint, filteredCrestGlint, crestFilterBlend);
+
     float backlight = pow(clamp(dot(L, -V) * 0.5 + 0.5, 0.0, 1.0), 3.0);
     vec3 ambient = mix(uHorizonCool, uZenithColor, 0.4) * 0.65;
     vec3 bodyCol = uDeepColor * ambient * 4.0;
@@ -611,21 +645,15 @@ const WATER_FRAGMENT = /* glsl */ `
     // transparent surface. This is extinction only: feeding its weight into
     // the sky-lit body colour creates an opaque cyan ribbon along the shore.
     // Cap it so even a full-depth mask wall only darkens rather than becoming
-    // a replacement surface. The gate matters: ungated, the uniform -10 m
+    // a replacement surface. The gate matters: ungated, the uniform -3 m
     // floor made the veil a de facto 40% opacity over EVERY open-water
     // pixel, replacing the satellite colour with the shader's own sky-lit
     // teal — exactly the veil light the design forbids.
     float veil = wall * (1.0 - exp(-uAbsorb * colDepth)) * 0.35;
-    // Smooth water is DARKER from altitude, not lighter: a lee-shore slick
-    // mirrors the mostly-dark sky away from the sun, while rough water
-    // spreads sun glitter into broad bright sheen. Carry the calm band as
-    // extra radiance-free alpha (the same premultiplied trick as the wall
-    // veil): it darkens the imagery underneath instead of painting the
-    // surface with light of its own. The narrow direct-sun mirror line
-    // survives via the glint term, whose lobe tightens as slopeVar
-    // collapses with the fetch.
-    float slick = (1.0 - smoothstep(0.05, 0.6, vFetch)) * 0.18;
-    float bodyW = uOpacity + (veil + slick * (1.0 - veil)) * (1.0 - uOpacity);
+    // Fetch must not change base opacity: doing so paints the lee mask as a
+    // dark shadow over the satellite water. Calmness is represented solely
+    // by the smaller swell and residual micro-ripple normals above.
+    float bodyW = uOpacity + veil * (1.0 - uOpacity);
 
     // Reflection gain < 1 stands in for the sky occlusion the analytic dome
     // cannot know about. The terrain imagery contains the cliff shadows the
@@ -637,11 +665,9 @@ const WATER_FRAGMENT = /* glsl */ `
     const float reflectionGain = 0.333333;
     float refl = fresnel * uReflect * bottomReflection * ambientReflection
                * bakedCliffVisibility * reflectionGain;
-    // The grazing-angle sky sheen uses the distance-relaxed normal (~up far
-    // from the camera), so it is blind to the flattened wave field — left
-    // ungated it bleaches the calm band white at oblique view angles. A
-    // small floor keeps the slick from going pitch black at grazing.
-    refl *= mix(0.1, 1.0, smoothstep(0.0, 0.5, vFetch));
+    // Fetch changes surface roughness, not how reflective water is.  The
+    // retained micro-ripple normals keep the lee band from becoming a flat
+    // oblique mirror, while Fresnel still makes calm water properly shiny.
     float a = bodyW + refl * (1.0 - bodyW);
     // Only the explicit surface opacity emits body colour. The extra wall
     // alpha carries no radiance, so premultiplied blending uses it to darken

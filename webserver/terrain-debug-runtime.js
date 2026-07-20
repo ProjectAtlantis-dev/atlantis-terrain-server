@@ -30,20 +30,29 @@ function disposeMaterial(material) {
 export function createTerrainHoverOutlineController({ terrainRoot, onChanged = () => {} }) {
   let outline = null;
   let tileId = null;
+  let presentation = null;
+  let ownsGeometry = false;
 
   function clear() {
     if (outline == null) return false;
     terrainRoot.remove(outline);
-    outline.geometry?.dispose?.();
+    if (ownsGeometry) outline.geometry?.dispose?.();
     disposeMaterial(outline.material);
     outline = null;
     tileId = null;
+    presentation = null;
+    ownsGeometry = false;
     return true;
   }
 
-  function show(mesh) {
+  function show(mesh, nextPresentation = 'outline') {
     const nextTileId = mesh?.userData?.tileId ?? null;
-    if (nextTileId != null && nextTileId === tileId && outline != null) return false;
+    if (
+      nextTileId != null
+      && nextTileId === tileId
+      && nextPresentation === presentation
+      && outline != null
+    ) return false;
 
     let changed = clear();
     if (mesh == null) {
@@ -77,12 +86,20 @@ export function createTerrainHoverOutlineController({ terrainRoot, onChanged = (
     outline.renderOrder = 999;
     terrainRoot.add(outline);
     tileId = nextTileId;
+    presentation = nextPresentation;
+    ownsGeometry = true;
     changed = true;
     onChanged();
     return changed;
   }
 
-  return { show, clear, get outline() { return outline; }, get tileId() { return tileId; } };
+  return {
+    show,
+    clear,
+    get outline() { return outline; },
+    get tileId() { return tileId; },
+    get presentation() { return presentation; },
+  };
 }
 
 const SEAM_COLORS = Object.freeze({

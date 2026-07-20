@@ -6,6 +6,8 @@ import {
   createVehiclePersistenceRuntime,
   normalizeSavedVehicleState,
   stepSuspension,
+  terrainBboxIntersectsCircle,
+  vehicleLatLonToLocal,
   vehicleLocalToLatLon as terrainVehicleLocalToLatLon,
   vehicleStateSnapshot,
 } from './terrain-vehicle.js';
@@ -15,20 +17,13 @@ export function createTerrainVehicleRuntime({
   vehicleHeadlights: VEHICLE_HEADLIGHTS,
   assetVehicleInstances: ASSET_VEHICLE_INSTANCES,
   startupAssetsResponse,
-  houseSites,
   vehicleStateEndpoint: VEHICLE_STATE_ENDPOINT,
   vehicleSaveTimeoutMs: VEHICLE_SAVE_FETCH_TIMEOUT_MS,
   vehicleSaveFailureCooldownMs: VEHICLE_SAVE_FAILURE_COOLDOWN_MS,
-  houseMarkerBaseLift: HOUSE_MARKER_BASE_LIFT,
-  houseMarkerHeight: HOUSE_MARKER_HEIGHT,
-  houseMarkerHaloGeo,
-  houseMarkerDotGeo,
-  createHouseLabelSprite,
   mouseSensitivity: MOUSE_SENS,
   scene, camera, renderer, terrainRoot, controls, mouseNDC, raycaster,
   up, east, north, anchorLat, anchorLon,
   paramNumber, bootLog, enqueueClientLog,
-  houseTerrainMeshes, houseLocalFromLatLon,
   getSunDirection,
   windowImpl = globalThis.window,
 } = {}) {
@@ -57,7 +52,6 @@ export function createTerrainVehicleRuntime({
     seeded: startupAssetsResponse.seeded,
     headlightsOn: _vehicleSeedInstance.headlightsOn === true,
     headlightsParams: VEHICLE_HEADLIGHTS != null,
-    structureCount: houseSites.length,
     vehicleCount: ASSET_VEHICLE_INSTANCES.length,
   });
   const VEHICLE_TIRE_RADIUS_M = Math.max(
@@ -79,13 +73,53 @@ export function createTerrainVehicleRuntime({
     2
   );
   const vehicleMarkerColor = 0xff2d55;
+  const VEHICLE_MARKER_BASE_LIFT = 5;
+  const VEHICLE_MARKER_HEIGHT = 5000;
+  const vehicleMarkerHaloGeo = new THREE.RingGeometry(330, 470, 24);
+  const vehicleMarkerDotGeo = new THREE.SphereGeometry(240, 14, 12);
+
+  function createVehicleLabelSprite(labelText, colorHex) {
+    const canvas = document.createElement('canvas');
+    canvas.width = 256;
+    canvas.height = 128;
+    const context = canvas.getContext('2d');
+    if (context == null) {
+      return new THREE.Sprite(new THREE.SpriteMaterial({
+        color: colorHex, depthTest: false, depthWrite: false,
+      }));
+    }
+    context.fillStyle = 'rgba(0,0,0,0.55)';
+    context.fillRect(12, 20, canvas.width - 24, 88);
+    context.strokeStyle = '#ffffff';
+    context.lineWidth = 3;
+    context.strokeRect(12, 20, canvas.width - 24, 88);
+    context.fillStyle = '#ffffff';
+    context.font = 'bold 54px ui-monospace, Menlo, monospace';
+    context.textAlign = 'center';
+    context.textBaseline = 'middle';
+    context.fillText(labelText, canvas.width / 2, 64);
+    const texture = new THREE.CanvasTexture(canvas);
+    texture.needsUpdate = true;
+    const sprite = new THREE.Sprite(new THREE.SpriteMaterial({
+      map: texture, transparent: true, depthTest: false, depthWrite: false,
+      color: colorHex,
+    }));
+    sprite.scale.set(1500, 750, 1);
+    return sprite;
+  }
+
+  function collectTerrainMeshes() {
+    return terrainRoot.children.filter(
+      child => child.isMesh && Boolean(child.userData?.tileId),
+    );
+  }
   const vehicleMarker = (function createVehicleMarker() {
     const marker = new THREE.Group();
     marker.name = 'vehicle-marker-amv';
     const line = new THREE.Line(
       new THREE.BufferGeometry().setFromPoints([
         new THREE.Vector3(0, 0, 0),
-        new THREE.Vector3(0, 0, HOUSE_MARKER_HEIGHT),
+        new THREE.Vector3(0, 0, VEHICLE_MARKER_HEIGHT),
       ]),
       new THREE.LineBasicMaterial({
         color: vehicleMarkerColor,
@@ -97,7 +131,7 @@ export function createTerrainVehicleRuntime({
     );
     line.renderOrder = 1002;
     const halo = new THREE.Mesh(
-      houseMarkerHaloGeo,
+      vehicleMarkerHaloGeo,
       new THREE.MeshBasicMaterial({
         color: vehicleMarkerColor,
         depthTest: false,
@@ -107,20 +141,20 @@ export function createTerrainVehicleRuntime({
         side: THREE.DoubleSide,
       })
     );
-    halo.position.z = HOUSE_MARKER_HEIGHT;
+    halo.position.z = VEHICLE_MARKER_HEIGHT;
     halo.renderOrder = 1003;
     const dot = new THREE.Mesh(
-      houseMarkerDotGeo,
+      vehicleMarkerDotGeo,
       new THREE.MeshBasicMaterial({
         color: vehicleMarkerColor,
         depthTest: false,
         depthWrite: false,
       })
     );
-    dot.position.z = HOUSE_MARKER_HEIGHT;
+    dot.position.z = VEHICLE_MARKER_HEIGHT;
     dot.renderOrder = 1004;
-    const label = createHouseLabelSprite('AMV', vehicleMarkerColor);
-    label.position.set(0, 0, HOUSE_MARKER_HEIGHT + 900);
+    const label = createVehicleLabelSprite('AMV', vehicleMarkerColor);
+    label.position.set(0, 0, VEHICLE_MARKER_HEIGHT + 900);
     label.renderOrder = 1005;
     marker.add(line, halo, dot, label);
     return marker;
@@ -138,6 +172,7 @@ export function createTerrainVehicleRuntime({
   const VEHICLE_SHADOW_LIGHT_DISTANCE = 250;
   const VEHICLE_SHADOW_MIN_RADIUS = 60;
   const VEHICLE_SHADOW_MAX_RADIUS = 180;
+  const VEHICLE_SHADOW_MIN_SUN_PROJECTION = 0.2;
   const VEHICLE_SHADOW_TEXEL_SNAP = true;
   const VEHICLE_SHADOW_GROUND_ANCHOR = THREE.MathUtils.clamp(
     paramNumber('vehicleShadowGroundAnchor', 1.0),
@@ -320,7 +355,7 @@ export function createTerrainVehicleRuntime({
     if (!vehicleLoaded) {
       return { hit: null, depth: -1, tileId: null };
     }
-    const targets = terrainMeshes ?? houseTerrainMeshes();
+    const targets = terrainMeshes ?? collectTerrainMeshes();
     if (targets.length === 0) {
       return { hit: null, depth: -1, tileId: null };
     }
@@ -476,7 +511,7 @@ export function createTerrainVehicleRuntime({
     if (immediate) {
       vehicleGroup.position.z = nextZ;
     }
-    vehicleMarker.position.z = vehicleGroup.position.z + HOUSE_MARKER_BASE_LIFT;
+    vehicleMarker.position.z = vehicleGroup.position.z + VEHICLE_MARKER_BASE_LIFT;
   }
   
   function updateVehicleSuspension(dt) {
@@ -492,7 +527,7 @@ export function createTerrainVehicleRuntime({
     updateVehicleOrientationTargetFromGround();
     const orientationAlpha = 1 - Math.exp(-VEHICLE_ORIENTATION_RESPONSE * suspension.stepDt);
     vehicleGroup.quaternion.slerp(vehicleOrientationTargetQuat, orientationAlpha);
-    vehicleMarker.position.z = vehicleGroup.position.z + HOUSE_MARKER_BASE_LIFT;
+    vehicleMarker.position.z = vehicleGroup.position.z + VEHICLE_MARKER_BASE_LIFT;
   }
   
   function createVehicleSaveSnapshot(options = {}) {
@@ -620,7 +655,7 @@ export function createTerrainVehicleRuntime({
           ? savedState.headingDeg
           : VEHICLE_MODEL.headingDeg;
         const startZ = Number.isFinite(savedState?.z) ? savedState.z : (VEHICLE_MODEL.z ?? 0);
-        const local = houseLocalFromLatLon(startLat, startLon);
+        const local = vehicleLatLonToLocal(startLat, startLon, anchorLat, anchorLon);
         vehicleHeadingRad = THREE.MathUtils.degToRad(startHeadingDeg);
         vehicleGroundNormal.copy(up);
         updateVehicleOrientationTargetFromGround();
@@ -639,7 +674,7 @@ export function createTerrainVehicleRuntime({
         vehicleLastContactDepth = -1;
         vehicleLastContactTileId = null;
         vehicleGroup.visible = false;
-        vehicleMarker.position.set(local.x, local.y, HOUSE_MARKER_BASE_LIFT);
+        vehicleMarker.position.set(local.x, local.y, VEHICLE_MARKER_BASE_LIFT);
         bootLog('vehicle.load.success', {
           url: VEHICLE_MODEL.url,
           modelLength: modelLength.toFixed(2),
@@ -689,7 +724,7 @@ export function createTerrainVehicleRuntime({
     receiver.scale.copy(terrainMesh.scale);
     receiver.receiveShadow = true;
     receiver.castShadow = false;
-    receiver.frustumCulled = false;
+    receiver.frustumCulled = true;
     receiver.renderOrder = 25;
     receiver.userData.vehicleShadowTileId = terrainMesh.userData.tileId;
     receiver.userData.sourceGeometry = terrainMesh.geometry;
@@ -704,15 +739,27 @@ export function createTerrainVehicleRuntime({
   }
   
   function syncVehicleShadowReceivers() {
-    if (!vehicleLoaded) {
+    if (!vehicleLoaded || !vehicleGroup.visible || controls.mapMode) {
       clearVehicleShadowReceivers();
       return;
     }
+    // The light's orthographic square is rotated into the sun frame. Project
+    // a conservative circumscribed circle onto the ground so low sun keeps
+    // enough receiving terrain without cloning the entire resident heatmap.
+    const sunUp = Math.abs(getSunDirection().dot(up));
+    const receiverRadius = vehicleShadowRadius * Math.SQRT2
+      / Math.max(VEHICLE_SHADOW_MIN_SUN_PROJECTION, sunUp);
     const activeTileIds = new Set();
-    const terrainMeshes = houseTerrainMeshes();
+    const terrainMeshes = collectTerrainMeshes();
     for (const terrainMesh of terrainMeshes) {
       const tileId = terrainMesh.userData?.tileId;
       if (!tileId) continue;
+      if (!terrainBboxIntersectsCircle(
+        terrainMesh.userData?.bbox,
+        vehicleGroup.position.x,
+        vehicleGroup.position.y,
+        receiverRadius,
+      )) continue;
       activeTileIds.add(tileId);
       const existing = vehicleShadowReceivers.get(tileId);
       if (existing) {
@@ -824,7 +871,7 @@ export function createTerrainVehicleRuntime({
     const minInterval = vehicleSnapPending ? VEHICLE_SNAP_PENDING_MS : VEHICLE_SNAP_IDLE_MS;
     if (!bypassThrottle && now - lastVehicleSnapAttemptAt < minInterval) return;
     lastVehicleSnapAttemptAt = now;
-    const terrainMeshes = houseTerrainMeshes();
+    const terrainMeshes = collectTerrainMeshes();
     if (terrainMeshes.length === 0 || vehicleMeshes.length === 0) return;
     const terrainSample = sampleBestVehicleTerrainHit(
       vehicleGroup.position.x,

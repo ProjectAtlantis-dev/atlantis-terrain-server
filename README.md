@@ -71,7 +71,7 @@ Retired approaches, kept in git history only: bathymetry flattening and learned 
 
 The eyeball harness is the **tile inspector** (`pipeline.html?tile=<id>`): a tile's progress through heightmap → southness → texture → procgen, with per-stage status and keyboard navigation across tiles and depths.
 
-Classifier output lives in `terrain.db`'s `classifier_tiles` table as a zlib-compressed, image-oriented `uint8` label raster plus a class-schema name, dimensions, optional confidence raster, source/model identifier, and timestamp. A fresh database contains no classifier rows. In the 3D view, press **C** to toggle classifier presentation: missing tiles keep their satellite imagery but desaturate it, while available `coarse_v1` tiles are painted as grey / green / dark / white / water classes. Both presentations paint cyan tile borders directly into their terrain textures, producing a terrain-conforming grid with normal hidden-surface removal. Grayscale elevation is used only while a satellite texture is still loading. Deeper terrain tiles inherit a nearest-neighbor crop from the closest classified ancestor.
+Classifier output lives in `terrain.db`'s `classifier_tiles` table as a zlib-compressed, image-oriented `uint8` label raster plus a class-schema name, dimensions, optional confidence raster, source/model identifier, and timestamp. A fresh database contains no classifier rows. In the 3D view, the **gridlines** HUD link toggles cyan terrain-conforming tile boundaries. Gridlines are a single batched line overlay; they do not fetch classifier output, alter imagery, replace textures, or change water rendering.
 
 ## Buildings & Roads
 
@@ -91,7 +91,7 @@ Geometry is reprojected to EPSG:3413. Building ground is sampled from cached hei
 
 ## Default Camera
 
-The camera starts facing north at Nuuk (64.18°N, 51.72°W). Press **R** to toggle the red road-texture diagnostic; use the clickable **reset** link in the HUD to restore the default view.
+The camera starts facing north at Nuuk (64.18°N, 51.72°W). Use the clickable **roads** link in the HUD to toggle the red road-texture diagnostic, or **reset** to restore the default view.
 
 ## Fly to Tile
 
@@ -101,7 +101,7 @@ Press **T** and enter a tile id (`depth-col-row`, e.g. `12-1461-786`) to telepor
 
 Press **M** to toggle a 2D map view (no clouds/atmosphere) for navigation and tile debugging. Right-click on a tile to inspect its metadata or open it in the tile inspector.
 
-Press **H** from the 3D view to toggle the live tile-priority heatmap. Press **H** again to return directly to 3D. Map and heatmap are separate views: return to 3D before switching between them. Both retain the same heading, pan, and zoom. Regular map mode outlines the terrain meshes currently being rendered as a thin grey grid, with the tile under the pointer outlined in red.
+Use the clickable **heatmap** link in the HUD to toggle the live tile-priority heatmap and return directly to 3D. Map and heatmap are separate views: return to 3D before switching between them. Both retain the same heading, pan, and zoom. Regular map mode outlines the terrain meshes currently being rendered as a thin grey grid, with the tile under the pointer outlined in red.
 
 In 3D mode, expand **Scene settings** in the top-right to adjust atmosphere,
 cloud, and lighting parameters. The **Water** section's **dynamic water**

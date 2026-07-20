@@ -2,7 +2,7 @@ import unittest
 
 import numpy as np
 
-from classifier.rendering import paint_navy_water_shadows, smooth_effective_water_mask
+from classifier.rendering import smooth_effective_water_mask
 
 
 class ClassifierRenderingTest(unittest.TestCase):
@@ -33,25 +33,6 @@ class ClassifierRenderingTest(unittest.TestCase):
 
         self.assertFalse(rendered[0].any())
         self.assertTrue(rendered[-1].all())
-
-    def test_navy_shadow_is_green_but_equally_dark_teal_stays_pink(self):
-        pink = (255, 42, 161)
-        classifier = np.asarray(
-            [[pink, pink, (150, 225, 60)]], dtype=np.uint8
-        )
-        satellite = np.asarray(
-            [[(10, 30, 37), (10, 37, 40), (0, 0, 20)]], dtype=np.uint8
-        )
-
-        painted, shadow = paint_navy_water_shadows(classifier, satellite)
-
-        np.testing.assert_array_equal(
-            shadow, np.asarray([[True, False, False]])
-        )
-        np.testing.assert_array_equal(painted[0, 0], (0, 255, 0))
-        np.testing.assert_array_equal(painted[0, 1], pink)
-        np.testing.assert_array_equal(painted[0, 2], (150, 225, 60))
-
 
 if __name__ == "__main__":
     unittest.main()

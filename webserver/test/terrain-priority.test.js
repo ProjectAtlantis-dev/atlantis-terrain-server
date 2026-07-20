@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import test from 'node:test';
+import * as THREE from 'three';
 
 import {
   radialPriorityDistance,
@@ -12,7 +13,7 @@ import {
 } from '../terrain-priority.js';
 import { compassHeading } from '../terrain-hud.js';
 import { applyMapDrag } from '../terrain-controls.js';
-import { createVehiclePersistenceRuntime, normalizeSavedVehicleState, stepSuspension, stepVehicleDrive, vehicleLocalToLatLon, vehicleStateSnapshot } from '../terrain-vehicle.js';
+import { createVehiclePersistenceRuntime, normalizeSavedVehicleState, stepSuspension, stepVehicleDrive, terrainBboxIntersectsCircle, vehicleLatLonToLocal, vehicleLocalToLatLon, vehicleStateSnapshot } from '../terrain-vehicle.js';
 import { scoreTextureTiles, textureRetryDelay, tileDepthFromId } from '../terrain-tile-runtime.js';
 import { createTextureStreamer, rendererTextureAnisotropy } from '../terrain-texture-streamer.js';
 import {
@@ -29,10 +30,12 @@ import { createTerrainFetchRuntime } from '../terrain-fetch-runtime.js';
 import { restoreTerrainCameraState, terrainCameraState } from '../terrain-camera-state.js';
 import { createTerrainClientLogger } from '../terrain-client-logging.js';
 import { createTerrainFpsCounter } from '../terrain-fps-counter.js';
+import { projectSunDirectionToUv } from '../terrain-sun-flare-effect.js';
 import { loadTerrainStartupAssets, normalizeTerrainStartupAssets } from '../terrain-startup-assets.js';
 import { createTerrainAtmosphereTextureRuntime } from '../terrain-atmosphere-textures.js';
-import { paintClassifierGridBorder } from '../terrain-classifier-texture.js';
+import { createTerrainGridlinesController } from '../terrain-gridlines.js';
 import { createTerrainTuningControls } from '../terrain-tuning-controls.js';
+import { waterCascadeUpdateDue, waterCascadeUpdateRate } from '../water/water-spectrum.js';
 import {
   bindTerrainCloudComposition,
   configureTerrainClouds,
@@ -40,7 +43,6 @@ import {
   installTerrainCloudHistoryReset,
   registerTerrainCloudTuning,
 } from '../terrain-cloud-runtime.js';
-import { createTerrainHouseConfiguration, createTerrainHouseMarkerRuntime, createTerrainHouseModelController, disposeTerrainHouseTree, markTerrainHousesNeedSnap, terrainHouseLocalPosition, terrainHouseShadowCoverage, terrainHouseZSummary } from '../terrain-house-runtime.js';
 import {
   buildTerrainTilesRequest,
   adoptTerrainOrigin,
@@ -57,20 +59,58 @@ import {
   terrainPipelineStatus,
 } from '../terrain-tile-fetch.js';
 
-test('classifier grid border is baked into all four texture edges', () => {
-  const fills = [];
-  const context = {
-    fillStyle: null,
-    fillRect(...args) { fills.push(args); },
-  };
-  assert.equal(paintClassifierGridBorder(context, 512, 256), 2);
-  assert.deepEqual(fills, [
-    [0, 0, 512, 2],
-    [0, 254, 512, 2],
-    [0, 2, 2, 252],
-    [510, 2, 2, 252],
-  ]);
-  assert.equal(context.fillStyle, 'rgba(20, 230, 255, 0.9)');
+test('gridlines batch terrain-conforming tile edges without replacing textures', () => {
+  const terrainRoot = new THREE.Group();
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute('position', new THREE.Float32BufferAttribute([
+    0, 0, 10, 1, 0, 20, 0, 1, 30, 1, 1, 40,
+  ], 3));
+  const mesh = new THREE.Mesh(geometry, new THREE.MeshBasicMaterial({ map: {} }));
+  mesh.userData = { tileId: '1-0-0', resolution: 2 };
+  terrainRoot.add(mesh);
+  const originalTexture = mesh.material.map;
+  const grid = createTerrainGridlinesController({ terrainRoot });
+  grid.setVisible(true);
+  assert.equal(grid.lines.geometry.getAttribute('position').count, 24);
+  assert.equal(grid.lines.isMesh, true);
+  assert.equal(grid.lines.material.side, THREE.DoubleSide);
+  assert.equal(grid.lines.visible, true);
+  assert.equal(mesh.material.map, originalTexture);
+  grid.setVisible(false);
+  assert.equal(grid.lines.visible, false);
+});
+
+test('water cascade pacing slows long and aerial waves without starving updates', () => {
+  assert.deepEqual([0, 1, 2].map(index => waterCascadeUpdateRate(index, 0)), [15, 30, 60]);
+  assert.deepEqual([0, 1, 2].map(index => waterCascadeUpdateRate(index, 3000)), [8, 15, 20]);
+  assert.ok(waterCascadeUpdateRate(2, 1500) < 60);
+  assert.ok(waterCascadeUpdateRate(2, 1500) > 20);
+
+  const schedule = {};
+  assert.equal(waterCascadeUpdateDue(schedule, 0, 0, 0), true);
+  assert.equal(waterCascadeUpdateDue(schedule, 0.03, 0, 0), false);
+  assert.equal(waterCascadeUpdateDue(schedule, 1 / 15, 0, 0), true);
+  assert.equal(waterCascadeUpdateDue(schedule, 0.01, 0, 0), true);
+});
+
+test('vehicle shadow receiver footprint keeps intersecting terrain tiles only', () => {
+  assert.equal(terrainBboxIntersectsCircle([0, 0, 100, 100], 50, 50, 10), true);
+  assert.equal(terrainBboxIntersectsCircle([0, 0, 100, 100], 110, 50, 10), true);
+  assert.equal(terrainBboxIntersectsCircle([0, 0, 100, 100], 111, 50, 10), false);
+  assert.equal(terrainBboxIntersectsCircle([100, 100, 0, 0], 50, 50, 0), true);
+  assert.equal(terrainBboxIntersectsCircle(null, 50, 50, 10), false);
+});
+
+test('analytic sun flare projects a moving world direction into screen space', () => {
+  const camera = new THREE.PerspectiveCamera(60, 2, 0.1, 1000);
+  camera.position.set(10, 20, 30);
+  camera.lookAt(10, 20, 29);
+  camera.updateMatrixWorld(true);
+  const uv = new THREE.Vector2();
+  assert.equal(projectSunDirectionToUv(camera, new THREE.Vector3(0, 0, -1), uv), true);
+  assert.ok(Math.abs(uv.x - 0.5) < 1e-12);
+  assert.ok(Math.abs(uv.y - 0.5) < 1e-12);
+  assert.equal(projectSunDirectionToUv(camera, new THREE.Vector3(0, 0, 1), uv), false);
 });
 
 test('terrain camera persistence round-trips pose and frame state', () => {
@@ -173,15 +213,11 @@ test('startup asset normalization clones valid records and rejects junk', () => 
   const vehicle = { id: 'v1' };
   const normalized = normalizeTerrainStartupAssets({
     vehicle_definition: { model: 'truck' },
-    structure_definition: null,
     vehicle_instances: [vehicle, null, 'bad'],
-    structure_instances: [{ id: 's1' }, 4],
   });
   assert.deepEqual(normalized, {
     vehicle_definition: { model: 'truck' },
-    structure_definition: {},
     vehicle_instances: [{ id: 'v1' }],
-    structure_instances: [{ id: 's1' }],
   });
   assert.notEqual(normalized.vehicle_instances[0], vehicle);
 });
@@ -200,7 +236,7 @@ test('shared startup asset loader preserves metadata and clears timeout', async 
       status: 200,
       json: async () => ({
         source: 'database', schemaVersion: 9, seeded: true,
-        vehicle_instances: [{ id: 'v1' }], structure_instances: [{ id: 's1' }],
+        vehicle_instances: [{ id: 'v1' }],
       }),
     }),
   });
@@ -209,7 +245,6 @@ test('shared startup asset loader preserves metadata and clears timeout', async 
   assert.deepEqual(cleared, [7]);
   assert.equal(logs[0][0], 'assets.fetch.ok');
   assert.equal(logs[0][1].vehicleCount, 1);
-  assert.equal(logs[0][1].structureCount, 1);
 });
 
 test('shared startup asset loader returns complete defaults on failure', async () => {
@@ -223,8 +258,7 @@ test('shared startup asset loader returns complete defaults on failure', async (
     });
     assert.deepEqual(result, {
       source: 'defaults', schemaVersion: 4, seeded: null,
-      vehicle_definition: {}, structure_definition: {},
-      vehicle_instances: [], structure_instances: [],
+      vehicle_definition: {}, vehicle_instances: [],
     });
   } finally {
     console.warn = previousWarn;
@@ -449,104 +483,32 @@ test('shared cloud tuning registers controls and applies altitude, cirrus, and d
   assert.equal(typeof tuning.syncDrift, 'function');
 });
 
-test('shared house configuration and placement preserve terrain conventions', () => {
-  const logs = [];
-  const configured = createTerrainHouseConfiguration({
-    definition: { url: ' house.glb ', enabled: true, altOffsetM: 2, hotReloadMs: 100 },
-    instances: [{ id: 'h1' }], source: 'database', bootLog: (...args) => logs.push(args),
-  });
-  assert.deepEqual(configured.model, {
-    url: 'house.glb', altOffsetM: 2, hotReloadMs: 500, enabled: true,
-  });
-  assert.deepEqual(configured.sites, [{ id: 'h1' }]);
-  assert.equal(logs.length, 0);
-  const local = terrainHouseLocalPosition(64.1, -51.2, 64, -51);
-  assert.ok(Math.abs(local.y - 11132) < 1e-9);
-});
-
-test('shared house shadow coverage bounds loaded instances', () => {
-  const houses = [
-    { group: { position: { x: 0, y: 10, z: 2 } } },
-    { group: { position: { x: 100, y: 30, z: 4 } } },
-  ];
-  assert.deepEqual(terrainHouseShadowCoverage(houses, {
-    baseRadius: 50, radiusPadding: 10, maxRadius: 500,
-  }), {
-    centerX: 50, centerY: 20, centerZ: 3,
-    minX: 0, minY: 10, maxX: 100, maxY: 30, shadowRadius: 120,
-  });
-});
-
-test('shared house marker runtime creates and updates instance records', () => {
-  const children = [];
-  const markerChildren = [];
-  const runtime = createTerrainHouseMarkerRuntime({
-    documentRef: { createElement: () => ({ width: 0, height: 0, getContext: () => null }) },
-    markerHeight: 100,
-    baseLift: 5,
-    colors: [0xff0000],
-  });
-  const { instances, byId } = runtime.createHouseInstances({
-    sites: [{ id: 'nuuk-h1', tileId: '12-1-2' }],
-    houseLayer: { add: value => children.push(value) },
-    markerLayer: { add: value => markerChildren.push(value) },
-  });
-  assert.equal(instances.length, 1);
-  assert.equal(byId.get('nuuk-h1'), instances[0]);
-  assert.equal(children[0].name, 'house-nuuk-h1');
-  assert.equal(markerChildren[0].name, 'house-marker-nuuk-h1');
-  instances[0].group.position.set(10, 20, 30);
-  runtime.updateHouseMarkerPosition(instances[0]);
-  assert.deepEqual(instances[0].marker.position.toArray(), [10, 20, 35]);
-});
-
-test('shared house model controller rejects stale loads and reloads changed assets', async () => {
-  const loads = [];
-  const templates = [];
-  let signature = 'a';
-  const controller = createTerrainHouseModelController({
-    model: { enabled: true, url: '/house.glb', hotReloadMs: 10 },
-    loader: { load: (url, success) => loads.push({ url, success }) },
-    instanceCount: 2,
-    now: () => 123,
-    onTemplate: template => templates.push(template),
-    fetchImpl: async () => ({
-      ok: true,
-      headers: { get: name => name === 'etag' ? signature : '' },
-    }),
-  });
-  controller.load('first');
-  controller.load('second');
-  loads[0].success({ scene: 'stale' });
-  loads[1].success({ scene: 'current' });
-  assert.deepEqual(templates, ['current']);
-  await controller.updateHotReload(10);
-  signature = 'b';
-  await controller.updateHotReload(20);
-  assert.equal(loads.length, 3);
-  assert.equal(loads[2].url, '/house.glb?cb=123');
-});
-
-test('shared house disposal and snap summaries preserve lifecycle state', () => {
-  let geometryDisposals = 0;
-  let materialDisposals = 0;
-  const material = { dispose: () => { materialDisposals += 1; } };
-  const geometry = { dispose: () => { geometryDisposals += 1; } };
-  disposeTerrainHouseTree({
-    traverse(callback) {
-      callback({ isMesh: true, geometry, material });
-      callback({ isMesh: true, geometry, material });
+test('shared cloud tuning puts the Takram rendering checkbox first in the Clouds section', () => {
+  const order = [];
+  const renderingStates = [];
+  const controls = {};
+  registerTerrainCloudTuning({
+    effect: {
+      coverage: 0.28,
+      cloudLayers: [1550, 1800, 8300, 9100].map(altitude => ({
+        altitude, densityScale: 0, weatherExponent: 1, shapeAmount: 0.3,
+      })),
+      localWeatherVelocity: { set() {} },
     },
-  }, new Set(), new Set());
-  assert.equal(geometryDisposals, 1);
-  assert.equal(materialDisposals, 1);
-  const houses = [{
-    site: { id: 'h1', lat: 1, lon: 2, tileId: '3-4-5' },
-    group: { position: { z: 7.125 } }, snapPending: false,
-  }];
-  assert.equal(terrainHouseZSummary(houses)[0].z, 7.125);
-  markTerrainHousesNeedSnap(houses);
-  assert.equal(houses[0].snapPending, true);
+    controls,
+    section: label => order.push(`section:${label}`),
+    slider: label => { order.push(`slider:${label}`); return { label }; },
+    toggle: (label, options) => {
+      order.push(`toggle:${label}`);
+      if (label === 'Takram clouds') options.onChange(false);
+      return { label };
+    },
+    renderingEnabled: true,
+    onRenderingEnabledChange: enabled => renderingStates.push(enabled),
+  });
+  assert.deepEqual(order.slice(0, 2), ['section:Clouds', 'toggle:Takram clouds']);
+  assert.equal(controls._takramCloudsCheckbox.label, 'Takram clouds');
+  assert.deepEqual(renderingStates, [false]);
 });
 
 test('terrain preview request preserves boot frame semantics', () => {
@@ -890,8 +852,8 @@ test('circular-boundary parent remains for partial demanded descendants', () => 
       children: [],
     });
   }
-  assert.equal(lifecycle.sweepStaleParents(demanded, new Set(demanded.map(tile => tile.id))), 1);
-  assert.equal(terrainRoot.children.includes(parent), false);
+  assert.equal(lifecycle.sweepStaleParents(demanded, new Set(demanded.map(tile => tile.id))), 0);
+  assert.equal(terrainRoot.children.includes(parent), true);
 });
 
 test('textured parent remains while demanded children are untextured', () => {
@@ -976,7 +938,6 @@ test('terrain tile set owns reconciliation, scene residency, and texture demand'
       }),
       priorityForTile: () => 0,
       getVisibilityDistance: () => 1000,
-      createDesaturatedTexture: source => ({ source, desaturated: true, dispose() {} }),
     },
   });
   const tile = { id: '1-0-0', bbox: [0, 0, 1, 1], heightmap: 'hm' };
@@ -993,16 +954,6 @@ test('terrain tile set owns reconciliation, scene residency, and texture demand'
 
   terrainRoot.children[0].material.map = baseTexture;
   terrainRoot.children[0].userData.terrainBaseTexture = baseTexture;
-  assert.equal(terrainRoot.children[0].material.map, baseTexture);
-  assert.equal(tileSet.setClassifierMode(true), true);
-  assert.equal(terrainRoot.children[0].material.map.desaturated, true);
-  assert.equal(terrainRoot.children[0].material.map.source, baseTexture);
-  const classifierTexture = { classifier: true };
-  tileSet.setClassifierTexture(tile.id, classifierTexture);
-  assert.equal(terrainRoot.children[0].material.map, classifierTexture);
-  tileSet.setClassifierTexture(tile.id, null);
-  assert.equal(terrainRoot.children[0].material.map.desaturated, true);
-  assert.equal(tileSet.setClassifierMode(false), false);
   assert.equal(terrainRoot.children[0].material.map, baseTexture);
 });
 
@@ -1336,11 +1287,12 @@ test('ancestor crops materialize deferred child slots and yield to exact texture
   callbacks.onPlaceholder({ tileId: tile.id, tile, texture: placeholder });
   assert.equal(deferredTiles.has(tile.id), false);
   assert.equal(terrainRoot.children[0].material.map, placeholder);
-  assert.equal(ancestorEvictions, 1);
+  assert.equal(ancestorEvictions, 0);
 
   textureCache.set(tile.id, exact);
   callbacks.onTexture({ tileId: tile.id, tile, texture: exact });
   frames.shift()();
+  assert.equal(ancestorEvictions, 1);
   assert.equal(terrainRoot.children[0].material.map, exact);
   assert.equal(placeholder.disposed, true);
   assert.equal(terrainRoot.children[0].userData.terrainPlaceholderTexture, undefined);
@@ -1636,6 +1588,9 @@ test('shared vehicle persistence helpers preserve coordinates and normalize save
   const local = vehicleLocalToLatLon(111320 * Math.cos(anchorLat * Math.PI / 180), 111320, anchorLat, anchorLon);
   assert.ok(Math.abs(local.lat - 65) < 1e-12);
   assert.ok(Math.abs(local.lon - -50) < 1e-12);
+  const roundTrip = vehicleLatLonToLocal(local.lat, local.lon, anchorLat, anchorLon);
+  assert.ok(Math.abs(roundTrip.x - 111320 * Math.cos(anchorLat * Math.PI / 180)) < 1e-6);
+  assert.ok(Math.abs(roundTrip.y - 111320) < 1e-6);
 
   assert.equal(vehicleStateSnapshot({
     loaded: false, position: { x: 0, y: 0, z: 0 }, headingRad: 0, anchorLat, anchorLon,
@@ -1941,6 +1896,37 @@ test('shared lifecycle retires parent when all demanded descendants are textured
   const demandedIds = new Set(children.map(c => c.userData.tileId));
   assert.equal(lifecycle.sweepStaleParents([], demandedIds), 0);
   root.children.push(...children.slice(1));
-  assert.equal(lifecycle.sweepStaleParents([], demandedIds), 1);
+  lifecycle.evictCoveredAncestors(children.at(-1).userData.tileId, demandedIds);
   assert.deepEqual(root.children, children);
+});
+
+test('shared lifecycle excludes ancestor-crop placeholders from final coverage', () => {
+  const parent = {
+    isMesh: true,
+    userData: { tileId: '11-719-386' },
+    material: { map: {}, dispose() {} },
+    geometry: { dispose() {} },
+  };
+  const children = ['12-1438-772', '12-1438-773', '12-1439-772', '12-1439-773']
+    .map(tileId => ({
+      isMesh: true,
+      userData: { tileId },
+      material: { map: {}, dispose() {} },
+      geometry: { dispose() {} },
+    }));
+  children[3].userData.terrainPlaceholderTexture = children[3].material.map;
+  const root = {
+    children: [parent, ...children],
+    remove(mesh) { this.children = this.children.filter(item => item !== mesh); },
+  };
+  const lifecycle = createTileLifecycle({
+    terrainRoot: root, disposeScatter: () => {}, log: () => {},
+  });
+
+  lifecycle.evictCoveredAncestors(children[3].userData.tileId);
+  assert.equal(root.children.includes(parent), true);
+
+  delete children[3].userData.terrainPlaceholderTexture;
+  lifecycle.evictCoveredAncestors(children[3].userData.tileId);
+  assert.equal(root.children.includes(parent), false);
 });

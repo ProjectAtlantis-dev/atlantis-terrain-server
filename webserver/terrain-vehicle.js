@@ -1,9 +1,38 @@
 import { headingForward2D } from './terrain-priority.js';
 
+export function terrainBboxIntersectsCircle(bbox, centerX, centerY, radius) {
+  if (
+    !Array.isArray(bbox)
+    || bbox.length < 4
+    || !Number.isFinite(centerX)
+    || !Number.isFinite(centerY)
+    || !Number.isFinite(radius)
+    || radius < 0
+  ) return false;
+  const [x0, y0, x1, y1] = bbox.map(Number);
+  if (![x0, y0, x1, y1].every(Number.isFinite)) return false;
+  const minX = Math.min(x0, x1);
+  const maxX = Math.max(x0, x1);
+  const minY = Math.min(y0, y1);
+  const maxY = Math.max(y0, y1);
+  const nearestX = Math.max(minX, Math.min(maxX, centerX));
+  const nearestY = Math.max(minY, Math.min(maxY, centerY));
+  const dx = centerX - nearestX;
+  const dy = centerY - nearestY;
+  return dx * dx + dy * dy <= radius * radius;
+}
+
 export function vehicleLocalToLatLon(x, y, anchorLat, anchorLon) {
   return {
     lat: anchorLat + y / 111320,
     lon: anchorLon + x / (111320 * Math.cos(anchorLat * Math.PI / 180)),
+  };
+}
+
+export function vehicleLatLonToLocal(lat, lon, anchorLat, anchorLon) {
+  return {
+    x: (lon - anchorLon) * 111320 * Math.cos(anchorLat * Math.PI / 180),
+    y: (lat - anchorLat) * 111320,
   };
 }
 
