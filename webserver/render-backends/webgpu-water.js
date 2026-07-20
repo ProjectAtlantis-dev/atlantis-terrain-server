@@ -588,7 +588,11 @@ export function createWebGPUWater({
     // but smooth sheen from altitude.
     const microFade = float(1.0).div(d.mul(0.004).add(1.0));
     const fetchAmp = float(vFetch);
-    const microGate = smoothstep(0.02, 0.25, vFetch);
+    // Calm is not flat: even directly behind a lee shore, retain a small
+    // wind-ripple field. The fetch mask owns the swell amplitude; using it
+    // as an on/off switch for capillary detail made the calm band lose its
+    // moving normals and therefore read as matte water.
+    const microGate = mix(float(0.22), float(1.0), smoothstep(0.02, 0.25, vFetch));
     const windMicro = float(0.35).mul(uWindFactor);
     const slopeVarFull = slopeVarRaw
       .add(windMicro.mul(windMicro).mul(0.5).mul(microFade.oneMinus()));
@@ -752,31 +756,21 @@ export function createWebGPUWater({
     // transparent surface. This is extinction only: feeding its weight into
     // the sky-lit body colour creates an opaque cyan ribbon along the shore.
     const veil = wall.mul(uAbsorb.negate().mul(colDepth).exp().oneMinus()).mul(0.35);
-    // Smooth water is DARKER from altitude, not lighter: a lee-shore slick
-    // mirrors the mostly-dark sky away from the sun, while rough water
-    // spreads sun glitter into broad bright sheen. Carry the calm band as
-    // extra radiance-free alpha (the same premultiplied trick as the wall
-    // veil): it darkens the imagery underneath instead of painting the
-    // surface with light of its own. The narrow direct-sun mirror line
-    // survives via the glint term, whose lobe tightens as slopeVar
-    // collapses with the fetch.
-    const slick = smoothstep(0.05, 0.6, vFetch).oneMinus().mul(0.18);
-    const bodyW = uOpacity.add(
-      veil.add(slick.mul(veil.oneMinus())).mul(uOpacity.oneMinus()),
-    );
+    // Fetch must not change base opacity: doing so paints the lee mask as a
+    // dark shadow over the satellite water. Calmness is represented solely
+    // by the smaller swell and residual micro-ripple normals above.
+    const bodyW = uOpacity.add(veil.mul(uOpacity.oneMinus()));
 
     // Reflection gain < 1 stands in for the sky occlusion the analytic dome
     // cannot know about. The terrain imagery contains the cliff shadows the
     // reflection model lacks, so dark water suppresses the entire analytic
     // reflection—not only the narrow direct-sun glint.
     const reflectionGain = 0.333333;
-    let refl = fresnel.mul(uReflect).mul(bottomReflection).mul(ambientReflection)
+    const refl = fresnel.mul(uReflect).mul(bottomReflection).mul(ambientReflection)
       .mul(bakedCliffVisibility).mul(reflectionGain);
-    // The grazing-angle sky sheen uses the distance-relaxed normal (~up far
-    // from the camera), so it is blind to the flattened wave field — left
-    // ungated it bleaches the calm band white at oblique view angles. A
-    // small floor keeps the slick from going pitch black at grazing.
-    refl = refl.mul(mix(float(0.1), float(1.0), smoothstep(0.0, 0.5, vFetch)));
+    // Fetch changes surface roughness, not how reflective water is. The
+    // retained micro-ripple normals keep the lee band from becoming a flat
+    // oblique mirror, while Fresnel still makes calm water properly shiny.
     const alpha = bodyW.add(refl.mul(bodyW.oneMinus()));
     // Only the explicit surface opacity emits body colour. The extra wall
     // alpha carries no radiance, so premultiplied blending uses it to darken
