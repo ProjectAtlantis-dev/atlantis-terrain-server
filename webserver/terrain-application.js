@@ -82,20 +82,24 @@ const WEBGPU_ATMOSPHERE_DEFAULTS = Object.freeze({
   groundAlbedo: 0.3
 });
 const WEBGPU_CLOUD_SHADOW_DEFAULTS = Object.freeze({
-  // WebGPU clouds are intentionally unavailable for now. Takram CloudsEffect
-  // is WebGL-only; keep this provisional shadow path hard-disabled until a
-  // complete WebGPU cloud renderer exists.
+  // The dual-depth path is implemented as an opt-in diagnostic until its
+  // sun-depth convention and shaft energy are calibrated visually.
   enabled: false,
   debugSurface: false,
   coverage: 0.52,
   density: 1.15,
-  strength: 1
+  strength: 1,
+  shaftsEnabled: false,
+  shaftStrength: 0.82,
+  indirectFloor: 0.28
 });
 const webgpuAtmosphereSettings = { ...WEBGPU_ATMOSPHERE_DEFAULTS };
 const webgpuCloudShadowSettings = {
   ...WEBGPU_CLOUD_SHADOW_DEFAULTS,
-  // Shareable validation view; the UI toggle remains the normal control.
-  enabled: window.location.hash !== '#no-cloud-shadows',
+  // Shareable opt-in validation views; the UI toggles remain normal controls.
+  enabled: window.location.hash === '#cloud-shadows'
+    || window.location.hash === '#shadow-mask',
+  shaftsEnabled: window.location.hash === '#god-rays',
   debugSurface: window.location.hash === '#shadow-mask'
 };
 
@@ -409,7 +413,7 @@ tuningHeader.onclick = () => {
 // --- Tuning panel persistence ---
 const TUNING_STORAGE_KEY = 'clouds-tuning';
 const tuningState = JSON.parse(localStorage.getItem(TUNING_STORAGE_KEY) || '{}');
-const WEBGPU_CALIBRATION_VERSION = 5;
+const WEBGPU_CALIBRATION_VERSION = 6;
 if (tuningState.webgpuCalibrationVersion !== WEBGPU_CALIBRATION_VERSION) {
   if (
     tuningState['webgpu exposure'] == null
@@ -431,6 +435,10 @@ if (tuningState.webgpuCalibrationVersion !== WEBGPU_CALIBRATION_VERSION) {
   if (tuningState.haze == null || tuningState.haze === 4.5) {
     tuningState.haze = WEBGPU_DEFAULT_HAZE;
   }
+  // Version 6 introduced experimental dual-depth volumetrics. Never carry an
+  // opt-in from an earlier development session into the normal renderer.
+  tuningState['cloud shadows'] = false;
+  tuningState['god rays'] = false;
   tuningState.webgpuCalibrationVersion = WEBGPU_CALIBRATION_VERSION;
 }
 if (tuningState.brightness == null && tuningState['webgpu exposure'] != null) {
@@ -619,6 +627,73 @@ function buildTuningControls(ap, ce) {
       onChange: applyWebGPUHaze
     });
     applyWebGPUHaze(Number(tuningState.haze ?? WEBGPU_DEFAULT_HAZE));
+    tuningSectionLabel('Experimental Volumetrics');
+    tuningToggle('cloud shadows', {
+      value: webgpuCloudShadowSettings.enabled,
+      onChange: v => {
+        webgpuCloudShadowSettings.enabled = v;
+        webgpuAtmosphere?.applyCloudShadowSettings();
+      }
+    });
+    tuningSlider('cloud coverage', {
+      min: 0, max: 1, step: 0.01,
+      value: webgpuCloudShadowSettings.coverage,
+      decimals: 2,
+      onChange: v => {
+        webgpuCloudShadowSettings.coverage = v;
+        webgpuAtmosphere?.applyCloudShadowSettings();
+      }
+    });
+    tuningSlider('cloud density', {
+      min: 0, max: 2.5, step: 0.01,
+      value: webgpuCloudShadowSettings.density,
+      decimals: 2,
+      onChange: v => {
+        webgpuCloudShadowSettings.density = v;
+        webgpuAtmosphere?.applyCloudShadowSettings();
+      }
+    });
+    tuningSlider('shadow strength', {
+      min: 0, max: 2, step: 0.01,
+      value: webgpuCloudShadowSettings.strength,
+      decimals: 2,
+      onChange: v => {
+        webgpuCloudShadowSettings.strength = v;
+        webgpuAtmosphere?.applyCloudShadowSettings();
+      }
+    });
+    tuningToggle('god rays', {
+      value: webgpuCloudShadowSettings.shaftsEnabled,
+      onChange: v => {
+        webgpuCloudShadowSettings.shaftsEnabled = v;
+        webgpuAtmosphere?.applyCloudShadowSettings();
+      }
+    });
+    tuningSlider('indirect floor', {
+      min: 0, max: 1, step: 0.01,
+      value: webgpuCloudShadowSettings.indirectFloor,
+      decimals: 2,
+      onChange: v => {
+        webgpuCloudShadowSettings.indirectFloor = v;
+        webgpuAtmosphere?.applyCloudShadowSettings();
+      }
+    });
+    tuningSlider('god ray strength', {
+      min: 0, max: 1, step: 0.01,
+      value: webgpuCloudShadowSettings.shaftStrength,
+      decimals: 2,
+      onChange: v => {
+        webgpuCloudShadowSettings.shaftStrength = v;
+        webgpuAtmosphere?.applyCloudShadowSettings();
+      }
+    });
+    tuningToggle('shadow mask', {
+      value: webgpuCloudShadowSettings.debugSurface,
+      onChange: v => {
+        webgpuCloudShadowSettings.debugSurface = v;
+        webgpuAtmosphere?.applyCloudShadowSettings();
+      }
+    });
   } else {
   tuningSlider('fog strength', {
     min: 1, max: 10, step: 0.5, value: 4.5,
@@ -980,7 +1055,7 @@ function markMissing(missing, downloading) {
 // --- Deferred tile system ---
 const { history: tileHistory, log: tileLog } = createTileHistory({
   getPass: () => terrainPipelineState.loadPass,
-  emit: details => enqueueClientLog('debug', 'tile', details),
+  emit: (details, level) => enqueueClientLog(level, 'tile', details),
 });
 
 // --- Texture streaming ---

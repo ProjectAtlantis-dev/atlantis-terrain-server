@@ -103,8 +103,10 @@ export function createTileLifecycle({
   log,
   onSceneMutated = () => {},
 }) {
-  function evict(mesh) {
+  function evict(mesh, reason = 'unspecified lifecycle eviction') {
     if (!mesh) return;
+    const tileId = mesh.userData?.tileId || '?';
+    log(tileId, `evicted — ${reason}`);
     terrainRoot.remove(mesh);
     disposeScatter(mesh);
     mesh.userData?.terrainPlaceholderTexture?.dispose?.();
@@ -116,6 +118,7 @@ export function createTileLifecycle({
       mesh.material?.dispose?.();
     }
     onSceneMutated();
+    return true;
   }
 
   function evictCoveredAncestors(childTileId) {
@@ -129,8 +132,7 @@ export function createTileLifecycle({
         child => child.isMesh && child.userData.tileId === ancestorId,
       );
       if (!mesh) continue;
-      log(ancestorId, `evicted — eager complete descendant coverage (triggered by ${childTileId})`);
-      evict(mesh);
+      evict(mesh, `eager complete descendant coverage (triggered by ${childTileId})`);
     }
   }
 
@@ -151,8 +153,7 @@ export function createTileLifecycle({
         }
       }
       if (!reason) continue;
-      log(existingId || '?', `evicted — ${reason}`);
-      evict(existing);
+      evict(existing, reason);
     }
     terrainRoot.add(mesh);
     onSceneMutated();
@@ -198,10 +199,9 @@ export function createTileLifecycle({
       const parent = meshById.get(parentId);
       if (!parent) continue;
       const reason = parent.material?.map
-        ? 'evicted — stale parent (children now textured)'
-        : 'evicted — stale noTex parent (children now textured)';
-      log(parentId, reason);
-      evict(parent);
+        ? 'stale parent (children now textured)'
+        : 'stale noTex parent (children now textured)';
+      evict(parent, reason);
     }
     return staleIds.size;
   }
@@ -456,8 +456,7 @@ export function reconcileTerrainTiles({
       || typeof previousPayload !== 'string'
       || previousPayload === nextTile.heightmap
     ) continue;
-    log(tileId, 'evicted — repaired heightmap changed');
-    lifecycle.evict(mesh);
+    lifecycle.evict(mesh, 'repaired heightmap changed');
     refreshedIds.add(tileId);
   }
 
@@ -498,8 +497,7 @@ export function reconcileTerrainTiles({
     const tileId = mesh.userData?.tileId;
     if (!mesh.isMesh || !removedIds.has(tileId)) continue;
     if (retainedFallbackIds.has(tileId)) continue;
-    log(tileId, 'evicted — outside current terrain demand');
-    lifecycle.evict(mesh);
+    lifecycle.evict(mesh, 'outside current terrain demand');
     released += 1;
   }
 

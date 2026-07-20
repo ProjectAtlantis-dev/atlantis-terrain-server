@@ -70,7 +70,7 @@ export class CloudShadowAerialPerspectiveNode extends AerialPerspectiveNode {
     const { colorNode, depthNode, normalNode } = this;
     const depth = depthNode.r.toVar();
 
-    const getSurfacePositionECEF = () => {
+    const getSurfacePositionWorld = () => {
       const viewZ = depthToViewZ(depth, cameraNear(camera), cameraFar(camera), {
         perspective: camera.isPerspectiveCamera,
         logarithmic: builder.renderer.logarithmicDepthBuffer
@@ -82,11 +82,13 @@ export class CloudShadowAerialPerspectiveNode extends AerialPerspectiveNode {
         projectionMatrix(camera),
         inverseProjectionMatrix(camera)
       );
-      const positionWorld = inverseViewMatrix(camera).mul(
+      return inverseViewMatrix(camera).mul(
         vec4(positionView, 1)
       ).xyz;
-      return matrixWorldToECEF.mul(vec4(positionWorld, 1)).xyz;
     };
+
+    const getSurfacePositionECEF = positionWorld => matrixWorldToECEF
+      .mul(vec4(positionWorld, 1)).xyz;
 
     const getRayDirectionECEF = () => {
       const positionView = inverseProjectionMatrix(camera).mul(
@@ -102,13 +104,15 @@ export class CloudShadowAerialPerspectiveNode extends AerialPerspectiveNode {
     };
 
     const surfaceLuminance = Fn(() => {
-      const positionECEF = getSurfacePositionECEF().toVar();
+      const positionWorld = getSurfacePositionWorld().toVar();
+      const positionECEF = getSurfacePositionECEF(positionWorld).toVar();
       const positionUnit = positionECEF.mul(worldToUnit).toVar();
       const shadowPositionECEF = this.atmosphereContext.correctAltitude
         ? positionECEF.add(altitudeCorrectionECEF)
         : positionECEF;
-      const cloudTransmittance = this.cloudShadow.getTransmittanceNode(
-        shadowPositionECEF
+      const sunVisibility = this.cloudShadow.getSurfaceSunVisibilityNode(
+        shadowPositionECEF,
+        positionWorld,
       );
 
       const geometryCorrectionAmount = remapClamp(
@@ -164,7 +168,7 @@ export class CloudShadowAerialPerspectiveNode extends AerialPerspectiveNode {
         let sunIlluminance = sunSkyIlluminance.get('sunIlluminance');
         const skyIlluminance = sunSkyIlluminance.get('skyIlluminance');
 
-        sunIlluminance = sunIlluminance.mul(cloudTransmittance);
+        sunIlluminance = sunIlluminance.mul(sunVisibility);
         return sunIlluminance.add(skyIlluminance);
       })();
 
@@ -180,17 +184,21 @@ export class CloudShadowAerialPerspectiveNode extends AerialPerspectiveNode {
       ).toVar();
       const inscatter = luminanceTransfer.get('luminance');
       const transmittance = luminanceTransfer.get('transmittance');
+      const atmosphereVisibility = this.cloudShadow.getAtmosphereVisibilityNode(
+        this.atmosphereContext.cameraPositionECEF.add(altitudeCorrectionECEF),
+        shadowPositionECEF,
+      );
 
       let output = diffuse;
       if (this.transmittance) {
         output = output.mul(transmittance);
       }
       if (this.inscatter) {
-        output = output.add(inscatter);
+        output = output.add(inscatter.mul(atmosphereVisibility));
       }
       return select(
         this.cloudShadow.debugSurface,
-        vec3(cloudTransmittance),
+        vec3(sunVisibility),
         output
       );
     })().context(builder.getContext());

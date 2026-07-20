@@ -187,11 +187,13 @@ export function registerTerrainCloudTuning({
   // One wind: cloud drift heading is slaved to the water wind direction
   // (compass "blows toward" degrees, 0 = north / 90 = east) instead of an
   // independent slider, so waves, whitecap streaks and weather all move
-  // together. Compass converts to the weather-uv math frame (+x east, ccw).
+  // together. Takram's globe weather UV is rotated 90 degrees from the
+  // terrain's east/north frame, so compensate here: without this correction
+  // an eastbound wind makes the cloud pattern move north.
   let driftSpeed = 0.00004;
   const updateDrift = () => {
     const compass = getWindDirection?.() ?? 90;
-    const radians = (90 - compass) * Math.PI / 180;
+    const radians = -compass * Math.PI / 180;
     effect.localWeatherVelocity.set(
       Math.cos(radians) * driftSpeed,
       Math.sin(radians) * driftSpeed,
