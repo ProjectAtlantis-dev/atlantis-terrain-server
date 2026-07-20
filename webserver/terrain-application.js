@@ -463,6 +463,7 @@ gameClockState.running = !(hasSavedMonth || hasSavedHour);
 const {
   reset: resetTuningUI,
   section: tuningSectionLabel,
+  select: tuningSelect,
   slider: tuningSlider,
   toggle: tuningToggle,
 } = createTerrainTuningControls({
@@ -522,6 +523,17 @@ function buildTuningControls(ap, ce) {
       onChange: v => { renderBackend.lensFlare.thresholdLevel = v; }
     });
   }
+  if (renderBackend.colorGradingPresets) {
+    tuningSectionLabel('Color Grade');
+    tuningSelect('color LUT', {
+      value: renderBackend.colorGradingPreset,
+      options: Object.fromEntries(
+        Object.entries(renderBackend.colorGradingPresets)
+          .map(([name, preset]) => [name, preset.label]),
+      ),
+      onChange: value => { renderBackend.setColorGradingPreset(value); },
+    });
+  }
   cloudTuning = registerTerrainCloudTuning({
     effect: ce, controls,
     section: tuningSectionLabel,
@@ -529,10 +541,10 @@ function buildTuningControls(ap, ce) {
     toggle: tuningToggle,
     // one wind: cloud drift heading follows the water wind direction
     getWindDirection: () => waterParams.windDirection,
-  });
-  tuningToggle('Takram clouds', {
-    value: renderBackend.takramCloudsEnabled,
-    onChange: enabled => { renderBackend.setTakramCloudsEnabled(enabled); },
+    renderingEnabled: renderBackend.takramCloudsEnabled,
+    onRenderingEnabledChange: enabled => {
+      renderBackend.setTakramCloudsEnabled(enabled);
+    },
   });
   }
   if (waterRuntime.enabled) {

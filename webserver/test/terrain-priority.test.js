@@ -35,6 +35,8 @@ import { loadTerrainStartupAssets, normalizeTerrainStartupAssets } from '../terr
 import { createTerrainAtmosphereTextureRuntime } from '../terrain-atmosphere-textures.js';
 import { paintClassifierGridBorder } from '../terrain-classifier-texture.js';
 import { createTerrainTuningControls } from '../terrain-tuning-controls.js';
+import { haldImageDataTo3D } from '../terrain-color-grading.js';
+import { waterCascadeUpdateDue, waterCascadeUpdateRate } from '../water/water-spectrum.js';
 import {
   bindTerrainCloudComposition,
   configureTerrainClouds,
@@ -73,6 +75,32 @@ test('classifier grid border is baked into all four texture edges', () => {
     [510, 2, 2, 252],
   ]);
   assert.equal(context.fillStyle, 'rgba(20, 230, 255, 0.9)');
+});
+
+test('water cascade pacing slows long and aerial waves without starving updates', () => {
+  assert.deepEqual([0, 1, 2].map(index => waterCascadeUpdateRate(index, 0)), [15, 30, 60]);
+  assert.deepEqual([0, 1, 2].map(index => waterCascadeUpdateRate(index, 3000)), [8, 15, 20]);
+  assert.ok(waterCascadeUpdateRate(2, 1500) < 60);
+  assert.ok(waterCascadeUpdateRate(2, 1500) > 20);
+
+  const schedule = {};
+  assert.equal(waterCascadeUpdateDue(schedule, 0, 0, 0), true);
+  assert.equal(waterCascadeUpdateDue(schedule, 0.03, 0, 0), false);
+  assert.equal(waterCascadeUpdateDue(schedule, 1 / 15, 0, 0), true);
+  assert.equal(waterCascadeUpdateDue(schedule, 0.01, 0, 0), true);
+});
+
+test('Hald color grading images convert to compact 3D textures in RGB order', () => {
+  const data = new Uint8ClampedArray(8 * 8 * 4);
+  for (let index = 0; index < 64; index += 1) {
+    data[index * 4] = index;
+    data[index * 4 + 1] = 100 + index;
+    data[index * 4 + 2] = 200 + index;
+    data[index * 4 + 3] = 17;
+  }
+  const result = haldImageDataTo3D({ width: 8, height: 8, data }, 4);
+  assert.equal(result.length, 4 ** 3 * 4);
+  assert.deepEqual(Array.from(result.slice(20, 24)), [5, 105, 205, 255]);
 });
 
 test('vehicle shadow receiver footprint keeps intersecting terrain tiles only', () => {
@@ -316,7 +344,7 @@ test('shared tuning controls initialize, persist, update, and reset widgets', ()
     return element;
   } };
   const body = documentImpl.createElement('section');
-  const state = { exposure: 2, clouds: false };
+  const state = { exposure: 2, clouds: false, look: 'natural' };
   const changes = [];
   let saves = 0;
   const tuning = createTerrainTuningControls({
@@ -331,21 +359,28 @@ test('shared tuning controls initialize, persist, update, and reset widgets', ()
   const toggle = tuning.toggle('clouds', {
     value: true, onChange: value => changes.push(['clouds', value]),
   });
-  assert.deepEqual(changes, [['exposure', 2], ['clouds', false]]);
+  const select = tuning.select('look', {
+    value: 'off', options: { off: 'Off', natural: 'Natural' },
+    onChange: value => changes.push(['look', value]),
+  });
+  assert.deepEqual(changes, [['exposure', 2], ['clouds', false], ['look', 'natural']]);
 
   slider.value = '3.5';
   slider.oninput();
   toggle.checked = true;
   toggle.onchange();
-  assert.deepEqual(state, { exposure: 3.5, clouds: true });
-  assert.equal(saves, 2);
+  select.value = 'off';
+  select.onchange();
+  assert.deepEqual(state, { exposure: 3.5, clouds: true, look: 'off' });
+  assert.equal(saves, 3);
 
   tuning.setSliderValue('exposure', 2.25);
   assert.equal(slider.value, 2.25);
   tuning.reset();
   assert.equal(slider.value, 1);
   assert.equal(toggle.checked, true);
-  assert.deepEqual(changes.slice(-2), [['exposure', 1], ['clouds', true]]);
+  assert.equal(select.value, 'off');
+  assert.deepEqual(changes.slice(-3), [['exposure', 1], ['clouds', true], ['look', 'off']]);
 });
 
 test('shared cloud runtime configures layers and synchronizes atmosphere composition', () => {
@@ -469,6 +504,34 @@ test('shared cloud tuning registers controls and applies altitude, cirrus, and d
   assert.ok(Math.abs(effect.localWeatherVelocity.values[0]) < 1e-12);
   assert.ok(Math.abs(effect.localWeatherVelocity.values[1] - 0.001) < 1e-12);
   assert.equal(typeof tuning.syncDrift, 'function');
+});
+
+test('shared cloud tuning puts the Takram rendering checkbox first in the Clouds section', () => {
+  const order = [];
+  const renderingStates = [];
+  const controls = {};
+  registerTerrainCloudTuning({
+    effect: {
+      coverage: 0.28,
+      cloudLayers: [1550, 1800, 8300, 9100].map(altitude => ({
+        altitude, densityScale: 0, weatherExponent: 1, shapeAmount: 0.3,
+      })),
+      localWeatherVelocity: { set() {} },
+    },
+    controls,
+    section: label => order.push(`section:${label}`),
+    slider: label => { order.push(`slider:${label}`); return { label }; },
+    toggle: (label, options) => {
+      order.push(`toggle:${label}`);
+      if (label === 'Takram clouds') options.onChange(false);
+      return { label };
+    },
+    renderingEnabled: true,
+    onRenderingEnabledChange: enabled => renderingStates.push(enabled),
+  });
+  assert.deepEqual(order.slice(0, 2), ['section:Clouds', 'toggle:Takram clouds']);
+  assert.equal(controls._takramCloudsCheckbox.label, 'Takram clouds');
+  assert.deepEqual(renderingStates, [false]);
 });
 
 test('shared house configuration and placement preserve terrain conventions', () => {

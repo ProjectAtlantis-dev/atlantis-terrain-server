@@ -12,6 +12,39 @@ export const DEFAULT_CASCADES = [
   { size: 22, minWave: 0.4, maxWave: 7.5 },
 ];
 
+const GROUND_CASCADE_HZ = [15, 30, 60];
+const AERIAL_CASCADE_HZ = [8, 15, 20];
+
+export function waterCascadeUpdateRate(cascadeIndex, cameraAltitudeM = 0) {
+  const index = Math.max(0, Math.min(GROUND_CASCADE_HZ.length - 1, cascadeIndex | 0));
+  const altitude = Math.max(0, Number(cameraAltitudeM) || 0);
+  const x = Math.min(1, Math.max(0, (altitude - 500) / 2000));
+  const aerialBlend = x * x * (3 - 2 * x);
+  return GROUND_CASCADE_HZ[index]
+    + (AERIAL_CASCADE_HZ[index] - GROUND_CASCADE_HZ[index]) * aerialBlend;
+}
+
+export function waterCascadeUpdateDue(state, time, cascadeIndex, cameraAltitudeM = 0) {
+  const rate = waterCascadeUpdateRate(cascadeIndex, cameraAltitudeM);
+  const interval = 1 / rate;
+  if (!state.waterScheduleInitialized || time < state.waterScheduleLastTime) {
+    state.waterScheduleInitialized = true;
+    state.waterScheduleLastTime = time;
+    state.waterScheduleRate = rate;
+    state.waterScheduleNextTime = time + interval;
+    return true;
+  }
+  if (state.waterScheduleRate !== rate) {
+    state.waterScheduleRate = rate;
+    state.waterScheduleNextTime = Math.min(state.waterScheduleNextTime, time + interval);
+  }
+  state.waterScheduleLastTime = time;
+  if (time + 1e-6 < state.waterScheduleNextTime) return false;
+  do state.waterScheduleNextTime += interval;
+  while (state.waterScheduleNextTime <= time);
+  return true;
+}
+
 function bitReverse(i, bits) {
   let r = 0;
   for (let b = 0; b < bits; b++) { r = (r << 1) | ((i >> b) & 1); }

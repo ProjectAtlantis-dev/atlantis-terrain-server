@@ -1424,6 +1424,11 @@ def api_terrain_channel(tile_id: str, chan: str):
   )
 
 
+# Presentation-only switch. Water labels and coastline masks remain stored and
+# queryable; flip this back on when the pink diagnostic overlay is useful.
+CLASSIFIER_PINK_WATER_ENABLED = False
+
+
 @app.get("/api/classifier/<tile_id>.png")
 def api_classifier_tile(tile_id: str):
   """Colorized semantic labels for a terrain tile.
@@ -1499,7 +1504,10 @@ def api_classifier_tile(tile_id: str):
       label_image = label_image.resize(
         (resolution, resolution), _Image.Resampling.NEAREST,
       )
-      rgb = colorize_class_map(_np.asarray(label_image), class_schema)
+      rgb = colorize_class_map(
+        _np.asarray(label_image), class_schema,
+        highlight_water=CLASSIFIER_PINK_WATER_ENABLED,
+      )
     if effective_water is not None:
       # Reconstruct the terrain-grid boundary at the output resolution before
       # painting it. The midpoint threshold preserves a binary authoritative
@@ -1507,7 +1515,11 @@ def api_classifier_tile(tile_id: str):
       render_water = smooth_effective_water_mask(
         effective_water, resolution, resolution,
       )
-      rgb[render_water] = (255, 42, 161)
+      # Keep the authoritative water mask and the original pink highlight
+      # available, but present water neutrally while the highlight is disabled.
+      rgb[render_water] = (
+        (255, 42, 161) if CLASSIFIER_PINK_WATER_ENABLED else (42, 42, 42)
+      )
   except (TypeError, ValueError, zlib.error):
     return Response(
       b"", status=500,
@@ -1520,6 +1532,9 @@ def api_classifier_tile(tile_id: str):
     "X-Classifier-Status": "ready",
     "X-Classifier-Schema": str(class_schema),
     "X-Classifier-Source": str(source),
+    "X-Classifier-Pink-Water": (
+      "enabled" if CLASSIFIER_PINK_WATER_ENABLED else "disabled"
+    ),
   }
   if effective_water is not None and water_source_row is not None:
     headers["X-Water-Mask-Source"] = str(water_source_row[0])

@@ -118,6 +118,7 @@ export function createWaterRuntime({
     const scaledDt = dt * params.timeScale;
     simTime += scaledDt;
     simParams.choppiness = params.choppiness;
+    simParams.cameraAltitude = Math.max(0, cameraLocal.z);
 
     water.update({
       simTime, dt: scaledDt, meshOffset, cameraLocal, sunLocal,

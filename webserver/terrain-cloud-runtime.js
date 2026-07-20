@@ -145,8 +145,16 @@ export function registerTerrainCloudTuning({
   slider,
   toggle,
   getWindDirection,
+  renderingEnabled,
+  onRenderingEnabledChange,
 } = {}) {
   section('Clouds');
+  if (typeof onRenderingEnabledChange === 'function') {
+    controls._takramCloudsCheckbox = toggle('Takram clouds', {
+      value: renderingEnabled ?? true,
+      onChange: onRenderingEnabledChange,
+    });
+  }
   const defaultAltitudes = effect.cloudLayers.map(layer => layer.altitude);
   slider('cloud altitude', {
     min: -2000, max: 5000, step: 50, value: 0, decimals: 0,

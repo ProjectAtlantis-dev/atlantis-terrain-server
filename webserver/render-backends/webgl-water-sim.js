@@ -4,6 +4,7 @@ import {
   DEFAULT_CASCADES,
   buildButterflyData,
   buildInitialSpectra,
+  waterCascadeUpdateDue,
 } from '../water/water-spectrum.js';
 
 // ---------------------------------------------------------------------------
@@ -233,6 +234,7 @@ export class WebGLWaterSimulation {
       c.h0 = new THREE.DataTexture(spectra[i], this.N, this.N, THREE.RGBAFormat, THREE.FloatType);
       c.h0.magFilter = c.h0.minFilter = THREE.NearestFilter;
       c.h0.needsUpdate = true;
+      c.waterScheduleInitialized = false;
     });
   }
 
@@ -263,11 +265,13 @@ export class WebGLWaterSimulation {
     return input;
   }
 
-  update(time, dt, { choppiness = 1.1 } = {}) {
+  update(time, dt, { choppiness = 1.1, cameraAltitude = 0 } = {}) {
     const prevRT = this.renderer.getRenderTarget();
 
-    for (const c of this.cascades) {
+    for (let cascadeIndex = 0; cascadeIndex < this.cascades.length; cascadeIndex += 1) {
+      const c = this.cascades[cascadeIndex];
       if (!c.h0) continue;
+      if (!waterCascadeUpdateDue(c, time, cascadeIndex, cameraAltitude)) continue;
 
       // 1. spectrum evolution (two packings)
       const me = this.matEvolve.uniforms;

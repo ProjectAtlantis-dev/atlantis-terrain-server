@@ -131,7 +131,13 @@ def write_classifier_tile(
     db.commit()
 
 
-def colorize_class_map(classes, class_schema):
+def colorize_class_map(
+    classes,
+    class_schema,
+    *,
+    highlight_water=True,
+    neutral_water_color=(42, 42, 42),
+):
     schema = CLASS_SCHEMAS.get(class_schema)
     if schema is None:
         raise ValueError(f"unknown classifier schema: {class_schema}")
@@ -139,4 +145,9 @@ def colorize_class_map(classes, class_schema):
     palette = schema["palette"]
     if array.size and int(array.max()) >= len(palette):
         raise ValueError(f"class map contains labels outside {class_schema}")
-    return palette[array]
+    rgb = palette[array]
+    if not highlight_water and "water" in schema["names"]:
+        water_label = schema["names"].index("water")
+        rgb = rgb.copy()
+        rgb[array == water_label] = np.asarray(neutral_water_color, dtype=np.uint8)
+    return rgb

@@ -92,6 +92,18 @@ class ClassifierStorageTest(unittest.TestCase):
             np.asarray([255, 42, 161], dtype=np.uint8),
         )
 
+    def test_water_highlight_can_be_disabled_without_removing_water_label(self):
+        labels = np.asarray([[4, 1]], dtype=np.uint8)
+        colors = colorize_class_map(
+            labels, COARSE_SCHEMA, highlight_water=False,
+        )
+        np.testing.assert_array_equal(
+            colors[0, 0], np.asarray([42, 42, 42], dtype=np.uint8),
+        )
+        np.testing.assert_array_equal(
+            colors[0, 1], np.asarray([150, 225, 60], dtype=np.uint8),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
