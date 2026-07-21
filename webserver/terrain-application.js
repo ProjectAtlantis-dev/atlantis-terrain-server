@@ -2174,7 +2174,11 @@ renderer.domElement.addEventListener('click', event => {
   // Show context menu for the top-most hit
   const topInfo = summarizeTerrainMesh(hits[0].object);
   const topSrc = texSource.get(topInfo.tileId) || '';
-  showTileMenu(event.clientX, event.clientY, topInfo.tileId, topSrc);
+  showTileMenu(
+    event.clientX, event.clientY, topInfo.tileId, topSrc,
+    hits[0].object.userData.heightmapPayload,
+    hits[0].object.userData.resolution,
+  );
 
   hits.forEach((hit, index) => {
     const info = summarizeTerrainMesh(hit.object);
@@ -2199,6 +2203,10 @@ renderer.domElement.addEventListener('click', event => {
 });
 
 renderer.domElement.addEventListener('mousemove', event => {
+  if (tileMenuRuntime.active) {
+    hideTileInfo();
+    return;
+  }
   const gridlines3dHover = gridlinesRuntime.active && !controls.mapMode;
   if ((!controls.mapMode && !gridlines3dHover) || controls.dragging) {
     hideTileInfo();
@@ -2269,7 +2277,8 @@ renderer.domElement.addEventListener('mouseleave', hideTileInfo);
 
 renderer.domElement.addEventListener('contextmenu', event => {
   event.preventDefault();
-  if (!controls.mapMode) {
+  const gridlines3dContextMenu = gridlinesRuntime.active && !controls.mapMode;
+  if (!controls.mapMode && !gridlines3dContextMenu) {
     vehicleRuntime.tryEnterVehicleControlFromPointer(event);
     return;
   }
@@ -2277,12 +2286,17 @@ renderer.domElement.addEventListener('contextmenu', event => {
   if (targets.length === 0) return;
   mouseNDC.x = (event.clientX / window.innerWidth) * 2 - 1;
   mouseNDC.y = -(event.clientY / window.innerHeight) * 2 + 1;
-  raycaster.setFromCamera(mouseNDC, mapCam);
+  raycaster.setFromCamera(mouseNDC, controls.mapMode ? mapCam : camera);
   const hits = raycaster.intersectObjects(targets);
   if (hits.length === 0) return;
-  const info = summarizeTerrainMesh(hits[0].object);
+  const mesh = hits[0].object;
+  const info = summarizeTerrainMesh(mesh);
   const src = texSource.get(info.tileId) || '';
-  showTileMenu(event.clientX, event.clientY, info.tileId, src);
+  showTileMenu(
+    event.clientX, event.clientY, info.tileId, src,
+    mesh.userData.heightmapPayload,
+    mesh.userData.resolution,
+  );
 });
 
 renderer.domElement.addEventListener(

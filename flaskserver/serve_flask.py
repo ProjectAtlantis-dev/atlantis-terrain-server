@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import binascii
 import io
 import json
 import logging
@@ -12,6 +13,7 @@ import sqlite3
 import threading
 import time
 import zlib
+import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from logging import FileHandler
 from pathlib import Path
@@ -1393,6 +1395,169 @@ def api_texture(tile_id: str):
       "X-Tex-Status": "ancestor_fallback",
       "X-Tex-Quality": "ancestor_crop",
       "X-Tex-Temporary": "1",
+    },
+  )
+
+
+def _tile_package_png(values, *, boolean: bool = False) -> bytes:
+  """Encode a south-first terrain raster as a north-first PNG."""
+  array = _np.asarray(values)
+  if boolean:
+    array = array.astype(_np.uint8) * 255
+  else:
+    array = array.astype(_np.uint8)
+  output = io.BytesIO()
+  _Image.fromarray(_np.ascontiguousarray(array[::-1]), mode="L").save(
+    output, format="PNG"
+  )
+  return output.getvalue()
+
+
+@app.post("/api/tile-package/<tile_id>.zip")
+def api_tile_package(tile_id: str):
+  """Download all cached inputs plus the exact seam-repaired render DEM."""
+  unavailable = _terrain_unavailable_response()
+  if unavailable is not None:
+    return unavailable
+  parsed = _parse_tile_id(tile_id)
+  if parsed is None:
+    return jsonify({"error": "invalid tile id"}), 400
+
+  payload = request.get_json(silent=True) or {}
+  try:
+    resolution = int(payload.get("resolution", 0))
+    encoded_heightmap = str(payload.get("heightmap", ""))
+    heightmap_bytes = base64.b64decode(encoded_heightmap, validate=True)
+    final_heightmap = _np.frombuffer(heightmap_bytes, dtype=_np.float32).copy()
+  except (TypeError, ValueError, binascii.Error):
+    return jsonify({"error": "invalid rendered heightmap"}), 400
+  if resolution < 2 or resolution > 2048 or final_heightmap.size != resolution ** 2:
+    return jsonify({"error": "rendered heightmap shape mismatch"}), 400
+  final_heightmap = final_heightmap.reshape((resolution, resolution))
+
+  db = _get_db()
+  row = db.execute(
+    "SELECT depth, col, row, x_min, y_min, x_max, y_max, source, "
+    "updated_at, confidence_map FROM tiles WHERE tile_id = ?",
+    (tile_id,),
+  ).fetchone()
+  if row is None:
+    return jsonify({"error": "tile not found"}), 404
+  depth, column, tile_row = int(row[0]), int(row[1]), int(row[2])
+  bbox = tuple(float(value) for value in row[3:7])
+
+  texture_row = db.execute(
+    "SELECT texture, source, updated_at FROM textures WHERE tile_id = ?",
+    (tile_id,),
+  ).fetchone()
+  canonical_texture = texture_row[0] if texture_row else None
+  rendered_texture = canonical_texture
+  roads = []
+  if ASSETS_DB_PATH.exists():
+    from asset_catalog import connect as connect_assets, paint_roads, query_roads
+    assets_db = connect_assets(ASSETS_DB_PATH)
+    try:
+      roads = query_roads(assets_db, bbox)
+    finally:
+      assets_db.close()
+    if canonical_texture:
+      rendered_texture, _ = paint_roads(canonical_texture, bbox, ASSETS_DB_PATH)
+
+  from classifier.storage import decode_class_map
+  from coastline import read_hydrography_mask, read_water_mask
+
+  def exact_mask(table):
+    mask_row = db.execute(
+      f"SELECT width, height, mask, source, version, updated_at "
+      f"FROM {table} WHERE tile_id = ?", (tile_id,),
+    ).fetchone()
+    if mask_row is None:
+      return None, None
+    width, height = int(mask_row[0]), int(mask_row[1])
+    values = _np.frombuffer(zlib.decompress(mask_row[2]), dtype=_np.uint8)
+    if values.size != width * height:
+      return None, None
+    return values.reshape((height, width)).astype(bool), {
+      "source": mask_row[3], "version": mask_row[4], "updated_at": mask_row[5],
+    }
+
+  coastline_mask, coastline_meta = exact_mask("coastline_masks")
+  hydrography_mask = read_hydrography_mask(db, tile_id)
+  effective_water_mask = read_water_mask(db, tile_id)
+  classifier_row = db.execute(
+    "SELECT class_schema, width, height, class_map, source, updated_at "
+    "FROM classifier_tiles WHERE tile_id = ?", (tile_id,),
+  ).fetchone()
+
+  seam_rows = db.execute(
+    "SELECT tile_a, direction, tile_b, edge, updated_at "
+    "FROM terrain_seam_cache WHERE tile_a = ? OR tile_b = ? "
+    "ORDER BY updated_at", (tile_id, tile_id),
+  ).fetchall()
+  seam_metadata = [{
+    "tileA": seam[0], "direction": seam[1], "tileB": seam[2],
+    "edge": _np.frombuffer(seam[3], dtype=_np.float32).tolist(),
+    "updatedAt": seam[4],
+  } for seam in seam_rows]
+
+  manifest = {
+    "format": "atlantis-terrain-tile-package-v1",
+    "tileId": tile_id,
+    "address": {"depth": depth, "column": column, "row": tile_row},
+    "bbox": {"crs": "EPSG:3413", "values": list(bbox)},
+    "heightmap": {
+      "file": "heightmap-final.npy", "dtype": "float32",
+      "shape": [resolution, resolution], "rowOrder": "south-to-north",
+      "seamCacheApplied": True, "source": row[7], "updatedAt": row[8],
+    },
+    "texture": ({
+      "sourceFile": "texture-source.jpg", "renderedFile": "texture-final.jpg",
+      "source": texture_row[1], "updatedAt": texture_row[2],
+    } if texture_row else None),
+    "masks": {
+      "coastline": coastline_meta,
+      "hydrography": hydrography_mask is not None,
+      "effectiveWater": effective_water_mask is not None,
+      "classifier": classifier_row[0] if classifier_row else None,
+    },
+    "roads": {"file": "roads.json", "count": len(roads), "crs": "EPSG:3413"},
+    "seamCache": {"file": "seam-cache.json", "entries": len(seam_metadata)},
+  }
+
+  archive_buffer = io.BytesIO()
+  with zipfile.ZipFile(archive_buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+    archive.writestr("manifest.json", json.dumps(manifest, indent=2, default=str))
+    heightmap_buffer = io.BytesIO()
+    _np.save(heightmap_buffer, final_heightmap, allow_pickle=False)
+    archive.writestr("heightmap-final.npy", heightmap_buffer.getvalue())
+    archive.writestr("heightmap-final.f32", final_heightmap.tobytes())
+    if row[9] is not None:
+      confidence = _np.frombuffer(zlib.decompress(row[9]), dtype=_np.uint8)
+      if confidence.size == resolution ** 2:
+        archive.writestr(
+          "confidence-map.png",
+          _tile_package_png(confidence.reshape((resolution, resolution))),
+        )
+    if canonical_texture:
+      archive.writestr("texture-source.jpg", canonical_texture)
+      archive.writestr("texture-final.jpg", rendered_texture)
+    if coastline_mask is not None:
+      archive.writestr("coastline-mask.png", _tile_package_png(coastline_mask, boolean=True))
+    if hydrography_mask is not None:
+      archive.writestr("hydrography-mask.png", _tile_package_png(hydrography_mask, boolean=True))
+    if effective_water_mask is not None:
+      archive.writestr("effective-water-mask.png", _tile_package_png(effective_water_mask, boolean=True))
+    if classifier_row is not None:
+      labels = decode_class_map(classifier_row[3], classifier_row[1], classifier_row[2])
+      archive.writestr("classifier-map.png", _tile_package_png(_np.flipud(labels)))
+    archive.writestr("roads.json", json.dumps(roads, indent=2, default=str))
+    archive.writestr("seam-cache.json", json.dumps(seam_metadata, indent=2))
+
+  return Response(
+    archive_buffer.getvalue(), mimetype="application/zip",
+    headers={
+      "Content-Disposition": f'attachment; filename="{tile_id}-package.zip"',
+      "Cache-Control": "no-store",
     },
   )
 
