@@ -42,10 +42,10 @@ export function updateHeatmapViewPriorities(tiles, view) {
 
 export function createTerrainHeatmapRuntime({
   getView,
+  getTiles,
   onWheel,
   onDrag,
   onTileClick,
-  fetchImpl = (...args) => fetch(...args),
   documentImpl = document,
   windowImpl = window,
 } = {}) {
@@ -69,7 +69,7 @@ export function createTerrainHeatmapRuntime({
     'font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace',
     'pointer-events:none', 'white-space:nowrap',
   ].join(';');
-  meta.textContent = 'waiting for heatmap…';
+  meta.textContent = 'waiting for browser terrain demand…';
   layer.appendChild(meta);
 
   const tip = documentImpl.createElement('div');
@@ -86,16 +86,34 @@ export function createTerrainHeatmapRuntime({
   let heatmap = null;
   let width = 0;
   let height = 0;
-  let pollTimer = null;
   let animationFrame = null;
-  let activePollController = null;
-  let pollGeneration = 0;
   let dragging = false;
   let dragButton = 0;
   let dragged = false;
   let lastView = null;
   let lastPriorityView = null;
-  let lastRequestedHeading = null;
+  let lastSourceTiles = null;
+
+  function syncBrowserTiles() {
+    const sourceTiles = getTiles?.();
+    if (sourceTiles === lastSourceTiles) return;
+    lastSourceTiles = sourceTiles;
+    heatmap = {
+      // Priority sorting is presentation state. Keep it off the renderer's
+      // authoritative demand array so the heatmap cannot influence residency
+      // or eviction order.
+      tiles: Array.isArray(sourceTiles) ? sourceTiles.map(tile => ({
+        id: tile.id,
+        bbox: Array.isArray(tile.bbox) ? [...tile.bbox] : tile.bbox,
+        depth: tile.depth,
+        hasTexture: Boolean(tile.hasTexture),
+        hasHeightmap: Boolean(tile.heightmap),
+        texStatus: tile.texStatus,
+      })) : [],
+    };
+    lastPriorityView = null;
+    updateMeta();
+  }
 
   function resize() {
     width = windowImpl.innerWidth;
@@ -145,14 +163,13 @@ export function createTerrainHeatmapRuntime({
       return;
     }
 
+    syncBrowserTiles();
     const tiles = heatmap?.tiles || [];
     const priorityView = `${view.cameraX}:${view.cameraY}:${view.yaw}`;
     if (priorityView !== lastPriorityView) {
       updateHeatmapViewPriorities(tiles, view);
       lastPriorityView = priorityView;
     }
-    const requestedHeading = String(view.yaw);
-    if (requestedHeading !== lastRequestedHeading) rebuildForHeading(view);
     const priorities = tiles.map(tile => tile.priority);
     const minPriority = priorities.length ? Math.min(...priorities) : 0;
     const maxPriority = priorities.length ? Math.max(...priorities) : 0;
@@ -244,56 +261,7 @@ export function createTerrainHeatmapRuntime({
       ? `<b style="color:#dbe5f1">${count}</b> quadtree tiles · priority ` +
         '<span style="display:inline-block;width:90px;height:10px;border:1px solid #000;' +
         'background:linear-gradient(to right,#ff2020,#ffff00,#00e050,#0066ff)"></span> hot→cold · numbers = fetch order'
-      : 'waiting for /api/heatmap…';
-  }
-
-  async function poll(viewOverride = null) {
-    if (presentation === 'hidden') return;
-    const requestGeneration = ++pollGeneration;
-    activePollController?.abort();
-    const controller = new AbortController();
-    activePollController = controller;
-    let delay = 2000;
-    try {
-      const view = viewOverride ?? getView?.();
-      const params = new URLSearchParams();
-      if (view) {
-        params.set('qx', String(view.cameraX));
-        params.set('qy', String(view.cameraY));
-        params.set('alt', String(view.alt));
-        params.set('heading', String(view.yaw));
-        if (Number.isFinite(view.range)) params.set('range', String(view.range));
-        lastRequestedHeading = String(view.yaw);
-      }
-      const response = await fetchImpl(`/api/heatmap?${params}`, {
-        signal: controller.signal,
-      });
-      if (!response.ok) throw new Error(String(response.status));
-      const data = await response.json();
-      if (requestGeneration !== pollGeneration) return;
-      if (data) {
-        heatmap = data;
-        lastPriorityView = null;
-      }
-      updateMeta();
-    } catch (error) {
-      if (requestGeneration !== pollGeneration || error?.name === 'AbortError') return;
-      delay = 5000;
-      meta.textContent = 'heatmap unavailable — retrying…';
-    }
-    if (requestGeneration !== pollGeneration || presentation === 'hidden') return;
-    activePollController = null;
-    pollTimer = windowImpl.setTimeout(() => {
-      pollTimer = null;
-      poll();
-    }, delay);
-  }
-
-  function rebuildForHeading(view) {
-    lastRequestedHeading = String(view.yaw);
-    if (pollTimer != null) windowImpl.clearTimeout(pollTimer);
-    pollTimer = null;
-    poll(view);
+      : 'waiting for browser terrain demand…';
   }
 
   function setPresentation(next) {
@@ -310,17 +278,11 @@ export function createTerrainHeatmapRuntime({
     tip.style.display = 'none';
     if (visible && !wasVisible) {
       resize();
-      poll();
+      syncBrowserTiles();
       animationFrame = windowImpl.requestAnimationFrame(draw);
     } else if (!visible && wasVisible) {
-      pollGeneration += 1;
-      activePollController?.abort();
-      activePollController = null;
-      if (pollTimer != null) windowImpl.clearTimeout(pollTimer);
       if (animationFrame != null) windowImpl.cancelAnimationFrame(animationFrame);
-      pollTimer = null;
       animationFrame = null;
-      lastRequestedHeading = null;
     }
   }
 

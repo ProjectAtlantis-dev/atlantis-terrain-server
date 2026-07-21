@@ -854,7 +854,7 @@ test('seam refresh keeps old geometry when the replacement is build-budget defer
   assert.equal(deferredTiles.get(nextTile.id), nextTile);
 });
 
-test('reconciliation releases old heatmap tiles but retains a complete fallback parent', () => {
+test('reconciliation releases old browser-demand tiles but retains a complete fallback parent', () => {
   const evicted = [];
   const releasedTextures = [];
   const outside = {
@@ -1312,7 +1312,7 @@ test('shared texture controller budgets scene applications per frame', () => {
   assert.deepEqual(materialized, ['a', 'b']);
 });
 
-test('shared texture controller discards late arrivals outside current heatmap demand', () => {
+test('shared texture controller discards late arrivals outside current browser demand', () => {
   let callbacks = null;
   let disposed = 0;
   const lateTexture = { dispose: () => { disposed += 1; } };

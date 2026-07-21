@@ -190,7 +190,7 @@ export function createTextureStreamer({
   }
 
   function releaseTileDemand(tileId) {
-    // Ordinary heatmap motion removes scene residency, not cached paint.
+    // Ordinary browser-demand motion removes scene residency, not cached paint.
     // Retaining the decoded texture makes a heading reversal an immediate
     // materialization instead of a grey fetch/decode/repaint cycle.
     texInflight.get(tileId)?.abort();

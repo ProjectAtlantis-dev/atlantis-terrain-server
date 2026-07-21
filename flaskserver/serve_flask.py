@@ -996,7 +996,6 @@ def _queue_texture_fetch(
 
 _api_tiles_state: dict[str, str | None] = {"last_result": None}
 _terrain_lod_history: set[str] = set()
-_last_camera: dict[str, float] | None = None  # last /api/tiles pose, feeds /api/heatmap
 _BUILDING_QUERY_RANGE_M = 25000.0
 
 
@@ -1035,10 +1034,6 @@ def api_tiles():
   oy = _arg_float("oy", qy)
   alt = _arg_float("alt", 0.0)
   heading = _arg_float("heading", 0.0)
-  global _last_camera
-  _last_camera = {"qx": qx, "qy": qy, "alt": alt, "heading": heading,
-                  "maxDepth": max_depth, "range": max_range}
-
   try:
     tiles, missing = _query_tiles_stereo(
       _get_db(),
@@ -1405,7 +1400,7 @@ def api_texture(tile_id: str):
 def _heightmap_ancestor_crop(db, d: int, c: int, r: int, max_up: int = 4):
   """Tile heightmap, cropped out of the nearest ancestor's when the tile
   itself was never seeded/flown (pipeline.html can ask for any tile id; tile
-  rows only exist where the frontend heatmap demanded them). Same philosophy
+  rows only exist where browser terrain demand requested them). Same philosophy
   as ancestor-crop textures. Returns (hm, source, depth_found) or
   (None, None, None); hm is (GRID_N, GRID_N), row 0 = south.
   """
@@ -1599,100 +1594,6 @@ def api_classifier_tile(tile_id: str):
   if found is not None and depth != child_depth:
     headers["X-Classifier-Ancestor"] = f"{depth}-{col}-{row}"
   return Response(buf.getvalue(), mimetype="image/png", headers=headers)
-
-
-@app.get("/api/heatmap")
-def api_heatmap():
-  """Quadtree grid and cached terrain diagnostics for the last /api/tiles
-  camera. hasTexture marks tiles whose own texture is already cached (safe to
-  pull /api/texture without triggering an upstream fetch)."""
-  import numpy as np
-  from database import CONFIDENCE, GRID_N, _decompress_uint8
-  from tiles import build_lod_tree, get_leaves
-  from serve import bbox_in_view_circle
-
-  cam = _last_camera
-  if cam is None:
-    return jsonify(None)
-
-  qx = _arg_float("qx", cam["qx"])
-  qy = _arg_float("qy", cam["qy"])
-  alt = _arg_float("alt", cam["alt"])
-  heading = _arg_float("heading", cam["heading"])
-  max_range = _arg_float("range", cam.get("range", 20000.0))
-  # This is a diagnostic view of the terrain traversal, not a speculative
-  # quadtree. Never advertise leaves deeper than the renderer can request.
-  max_depth = min(
-    _arg_int("maxDepth", int(cam["maxDepth"])),
-    MAX_TILE_DEPTH,
-  )
-  lod_factor = _arg_float("lod", 2.0)
-
-  root = build_lod_tree(qx, qy, max_depth=max_depth, lod_factor=lod_factor)
-  # The heatmap visualizes the same local demand region as /api/tiles. Do not
-  # expose the coarse leaves covering the rest of Greenland's root quadtree.
-  leaves = [
-    leaf for leaf in get_leaves(root)
-    if bbox_in_view_circle(
-      qx, qy,
-      [leaf.center[0], leaf.center[1], leaf.center[0], leaf.center[1]],
-      max_range,
-    )
-  ]
-
-  # Only count permanently cached textures — temporary placeholder sources
-  # would make /api/texture queue an upstream re-fetch when the map page
-  # pulls them (mirror of api_texture's _TEX_TEMPORARY).
-  leaf_ids = [leaf.id for leaf in leaves]
-  placeholders = ",".join("?" for _ in leaf_ids)
-  texture_ids = {r[0] for r in _get_db().execute(
-    f"SELECT tile_id FROM textures WHERE tile_id IN ({placeholders}) "
-    "AND source NOT IN ('sentinel2_crop', 'ancestor_crop', 'ancestor_crop_ratelimit')",
-    leaf_ids).fetchall()} if leaf_ids else set()
-  terrain_rows = {r[0]: r[1:] for r in _get_db().execute(
-    f"SELECT tile_id, source, geometric_error, heightmap IS NOT NULL, confidence_map "
-    f"FROM tiles WHERE tile_id IN ({placeholders})",
-    leaf_ids).fetchall()} if leaf_ids else {}
-  confidence_names = {value: name for name, value in reversed(CONFIDENCE.items())}
-  tiles = []
-  for leaf in leaves:
-    bbox = list(leaf.bbox)
-    tile = {
-      "id": leaf.id,
-      "bbox": bbox,
-      "depth": leaf.depth,
-      "hasTexture": leaf.id in texture_ids,
-    }
-    terrain_row = terrain_rows.get(leaf.id)
-    if terrain_row is not None:
-      source, geometric_error, has_heightmap, confidence_blob = terrain_row
-      tile.update({
-        "source": source,
-        "geometricError": geometric_error,
-        "hasHeightmap": bool(has_heightmap),
-      })
-      if confidence_blob:
-        confidence_map = _decompress_uint8(confidence_blob, (GRID_N, GRID_N))
-        values, counts = np.unique(confidence_map, return_counts=True)
-        tile["confidence"] = {
-          "min": int(values[0]),
-          "max": int(values[-1]),
-          "mean": round(float(confidence_map.mean()), 2),
-          "levels": {
-            confidence_names.get(int(value), str(int(value))): int(count)
-            for value, count in zip(values, counts)
-          },
-        }
-    tiles.append(tile)
-
-  return jsonify({
-    "timestamp": time.time(),
-    "camera": {
-      "qx": qx, "qy": qy, "alt": alt, "heading": heading,
-      "range": max_range,
-    },
-    "tiles": tiles,
-  })
 
 
 @app.get("/api/pipeline/at.json")

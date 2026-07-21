@@ -59,6 +59,13 @@ class TestViewCoverageCircle(unittest.TestCase):
                 0, 0, _bbox_at(x, y, 10), 1000
             ))
 
+    def test_large_rim_tile_is_kept_when_its_bbox_reaches_the_circle(self):
+        tile_bbox = [900, -500, 1900, 500]
+        tile_center = [1400, 0, 1400, 0]
+
+        self.assertTrue(bbox_in_view_circle(0, 0, tile_bbox, 1000))
+        self.assertFalse(bbox_in_view_circle(0, 0, tile_center, 1000))
+
     def test_traversal_does_not_return_greenland_wide_outside_parent(self):
         metadata = {
             "source": "arcticdem",

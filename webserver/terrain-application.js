@@ -936,6 +936,7 @@ const terrainPipelineState = {
 }; // end terrain pipeline state
 
 heatmapRuntime = createTerrainHeatmapRuntime({
+  getTiles: () => terrainPipelineState.lastTiles,
   getView: () => {
     if (terrainPipelineState.firstLoad) return null;
     const cosine = Math.cos(controls.yaw);
