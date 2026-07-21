@@ -32,7 +32,7 @@ function appendEdge(positions, attribute, resolution, indexAt, matrix, halfWidth
 export function createTerrainGridlinesController({
   terrainRoot,
   renderOrder = 997,
-  width = 4,
+  width = 12,
 } = {}) {
   const material = new THREE.MeshBasicMaterial({
     color: GRIDLINES_COLOR,

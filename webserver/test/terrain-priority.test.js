@@ -383,7 +383,7 @@ test('shared cloud runtime configures layers and synchronizes atmosphere composi
   const effect = {
     cloudLayers: Array.from({ length: 4 }, () => ({})),
     localWeatherVelocity: vector(), shapeVelocity: vector(), shapeDetailVelocity: vector(),
-    shadow: {}, scatteringCoefficient: 2, absorptionCoefficient: 3,
+    clouds: {}, shadow: {}, scatteringCoefficient: 2, absorptionCoefficient: 3,
     atmosphereOverlay: 'overlay', atmosphereShadow: 'shadow', atmosphereShadowLength: 42,
     events: {
       addEventListener(type, listener) { listeners.set(type, listener); },
@@ -400,6 +400,12 @@ test('shared cloud runtime configures layers and synchronizes atmosphere composi
     effect, LocalWeather, CloudShape, CloudShapeDetail, Turbulence,
   }), { scattering: 2, absorption: 3 });
   assert.deepEqual(effect.cloudLayers.map(layer => layer.altitude), [1550, 1800, 8300, 9100]);
+  assert.deepEqual(effect.clouds, {
+    minStepSize: 20,
+    maxStepSize: 400,
+    perspectiveStepScale: 1.005,
+    maxIterationCount: 750,
+  });
   assert.equal(effect.cloudLayers[3].densityScale, 0);
   assert.deepEqual(effect.localWeatherVelocity.values, [0.00004, 0]);
   assert.ok(effect.localWeatherTexture instanceof LocalWeather);

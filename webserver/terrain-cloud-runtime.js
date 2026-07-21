@@ -12,6 +12,13 @@ export function configureTerrainClouds({
     );
   }
   effect.qualityPreset = 'high';
+  // Reduce adaptive ray-march banding by sampling the volume more densely.
+  Object.assign(effect.clouds, {
+    minStepSize: 20,
+    maxStepSize: 400,
+    perspectiveStepScale: 1.005,
+    maxIterationCount: 750,
+  });
   effect.coverage = 0.28;
   const altitudes = [1550, 1800, 8300, 9100];
   for (let index = 0; index < altitudes.length; index += 1) {
