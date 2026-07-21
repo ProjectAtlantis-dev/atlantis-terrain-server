@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+if [ "$#" -ne 1 ]; then
+  echo "Usage: ./select TABLE_NAME" >&2
+  exit 2
+fi
+
+script_dir="$(cd "$(dirname "$0")" && pwd)"
+db="$script_dir/flaskserver/terrain.db"
+table=${1//\"/\"\"}
+
+sqlite3 -header -column "$db" "SELECT * FROM \"$table\" LIMIT 100;"

@@ -116,6 +116,75 @@ export function bindTerrainCloudComposition(cloudsEffect, aerialPerspective) {
 
 const pendingHistoryRestores = new WeakMap();
 
+// CPU twin of Takram clouds.glsl getCubeSphereUv(). Cloud weather is sampled
+// in this projection, whose local axes rotate and skew across each cube face.
+function cubeSphereUv({ x, y, z }) {
+  const length = Math.hypot(x, y, z);
+  const nx = x / length;
+  const ny = y / length;
+  const nz = z / length;
+  const ax = Math.abs(nx);
+  const ay = Math.abs(ny);
+  const az = Math.abs(nz);
+  let mx;
+  let my;
+  if (ay > ax && ay > az) {
+    [mx, my] = ny > 0 ? [-nx, nz] : [nx, nz];
+  } else if (ax > ay && ax > az) {
+    [mx, my] = nx > 0 ? [ny, nz] : [-ny, nz];
+  } else {
+    [mx, my] = nz > 0 ? [nx, ny] : [nx, -ny];
+  }
+  const mx2 = mx * mx;
+  const my2 = my * my;
+  const q = -2 * mx2 + 2 * my2 - 3;
+  const ux = Math.sqrt(Math.max(
+    0,
+    1.5 + mx2 - my2 - 0.5 * Math.sqrt(Math.max(0, -24 * mx2 + q * q)),
+  )) * (mx > 0 ? 1 : -1);
+  const uy = Math.sqrt(6 / (3 - ux * ux)) * my;
+  return { x: ux * 0.5 + 0.5, y: uy * 0.5 + 0.5 };
+}
+
+export function cloudWeatherUvVelocity({
+  compassDegrees,
+  speed,
+  weatherUvBasis,
+}) {
+  const radians = compassDegrees * Math.PI / 180;
+  const eastAmount = Math.sin(radians);
+  const northAmount = Math.cos(radians);
+  const { position, east, north } = weatherUvBasis ?? {};
+  if (position && east && north) {
+    const positionLength = Math.hypot(position.x, position.y, position.z);
+    const origin = {
+      x: position.x / positionLength,
+      y: position.y / positionLength,
+      z: position.z / positionLength,
+    };
+    const direction = {
+      x: east.x * eastAmount + north.x * northAmount,
+      y: east.y * eastAmount + north.y * northAmount,
+      z: east.z * eastAmount + north.z * northAmount,
+    };
+    const step = 1e-5;
+    const uv0 = cubeSphereUv(origin);
+    const uv1 = cubeSphereUv({
+      x: origin.x + direction.x * step,
+      y: origin.y + direction.y * step,
+      z: origin.z + direction.z * step,
+    });
+    const du = uv1.x - uv0.x;
+    const dv = uv1.y - uv0.y;
+    const uvLength = Math.hypot(du, dv);
+    if (uvLength > 1e-12) {
+      // Offset moves the sampled texture, so visible weather moves opposite.
+      return { x: -du / uvLength * speed, y: -dv / uvLength * speed };
+    }
+  }
+  return { x: -eastAmount * speed, y: -northAmount * speed };
+}
+
 export function invalidateTerrainCloudHistory(effect) {
   let restore = pendingHistoryRestores.get(effect);
   if (restore != null) return restore;
@@ -152,6 +221,7 @@ export function registerTerrainCloudTuning({
   slider,
   toggle,
   getWindDirection,
+  weatherUvBasis,
   renderingEnabled,
   onRenderingEnabledChange,
 } = {}) {
@@ -202,17 +272,19 @@ export function registerTerrainCloudTuning({
   // One wind: cloud drift heading is slaved to the water wind direction
   // (compass "blows toward" degrees, 0 = north / 90 = east) instead of an
   // independent slider, so waves, whitecap streaks and weather all move
-  // together. Takram's globe weather UV is rotated 90 degrees from the
-  // terrain's east/north frame, so compensate here: without this correction
-  // an eastbound wind makes the cloud pattern move north.
+  // together. Takram samples weather through a cube-sphere projection, so map
+  // the geographic heading into the projection's local basis at the scene
+  // anchor, then invert it because advancing the sample offset moves the
+  // visible texture in the opposite direction.
   let driftSpeed = 0.00004;
   const updateDrift = () => {
     const compass = getWindDirection?.() ?? 90;
-    const radians = -compass * Math.PI / 180;
-    effect.localWeatherVelocity.set(
-      Math.cos(radians) * driftSpeed,
-      Math.sin(radians) * driftSpeed,
-    );
+    const velocity = cloudWeatherUvVelocity({
+      compassDegrees: compass,
+      speed: driftSpeed,
+      weatherUvBasis,
+    });
+    effect.localWeatherVelocity.set(velocity.x, velocity.y);
   };
   slider('drift speed', {
     min: 0, max: 0.002, step: 0.00005, value: driftSpeed, decimals: 6,

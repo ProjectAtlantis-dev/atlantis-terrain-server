@@ -6,7 +6,6 @@ from PIL import Image
 
 from coastline import (
     cache_official_water_mask,
-    fetch_official_water_mask,
     read_water_mask,
 )
 from database import GRID_N
@@ -29,7 +28,9 @@ def classifier_water_mask(bbox, width: int, height: int) -> np.ndarray | None:
     does not justify a denser shoreline, and reusing this grid keeps classifier
     water aligned with the derived render geometry.
     """
-    south_first = fetch_official_water_mask(bbox, GRID_N)
+    from gtk50_vector import vector_water_mask
+
+    south_first = vector_water_mask(bbox, GRID_N)
     return _resize_for_classifier(south_first, width, height)
 
 

@@ -113,7 +113,7 @@ class RetiredTerrainMigrationTest(unittest.TestCase):
                 db.execute(
                     "SELECT value FROM metadata WHERE key = 'schema_version'"
                 ).fetchone(),
-                ("3",),
+                ("4",),
             )
             columns = {row[1] for row in db.execute("PRAGMA table_info(tiles)")}
             self.assertNotIn("has_sealevel_water", columns)

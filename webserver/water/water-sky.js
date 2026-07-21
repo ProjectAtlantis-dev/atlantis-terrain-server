@@ -10,15 +10,18 @@ import * as THREE from 'three';
 // anti-sun horizon cools and dims. Open water mostly reflects the cool side —
 // one shared horizon color turns the whole ocean red at sunset.
 
-const DUSK_SUN = new THREE.Color(1.0, 0.42, 0.18);
+// Keep dusk radiance chromatic before AGX compresses it.  The old red-heavy,
+// low-saturation values landed in the tone mapper's copper/brown range once
+// mixed with the dark satellite water.
+const DUSK_SUN = new THREE.Color(1.0, 0.30, 0.045);
 const DAY_SUN = new THREE.Color(1.0, 0.96, 0.90);
 const DUSK_ZENITH = new THREE.Color(0.12, 0.09, 0.25);
 const DAY_ZENITH = new THREE.Color(0.115, 0.30, 0.62);
 // Orange is confined to the sunward path; the surrounding dusk water reflects
 // the violet sky on either side.
-const DUSK_HORIZON = new THREE.Color(0.85, 0.42, 0.24);
+const DUSK_HORIZON = new THREE.Color(1.0, 0.27, 0.025);
 const DAY_HORIZON = new THREE.Color(0.55, 0.70, 0.84);
-const DUSK_HORIZON_COOL = new THREE.Color(0.24, 0.12, 0.32);
+const DUSK_HORIZON_COOL = new THREE.Color(0.20, 0.035, 0.44);
 const CLEAR_DEEP = new THREE.Color(0.032, 0.046, 0.048);
 const OVERCAST_DEEP = new THREE.Color(0.024, 0.035, 0.037);
 const CLEAR_SCATTER = new THREE.Color(0.020, 0.16, 0.18);

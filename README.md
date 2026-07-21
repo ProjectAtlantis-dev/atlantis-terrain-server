@@ -48,12 +48,14 @@ Real imagery down to depth 12, invented detail below it.
 4. Dataforsyningen runs out of detail around depth 13 (SPOT is 1.6 m/px). Below that, accuracy vs reality stops mattering: **depth 12 already tells us what goes where**. A coarse class map at d12 scale (water / grey / dark slopes & shadows / green / white — see `flaskserver/classifier/storage.py`) is the entire semantic contract.
 
 Coastal terrain uses the `Åbent Land` GTK50 map as its authoritative land/sea
-boundary, preferring the **1:50k vector edition** (Dataforsyningen Databoks,
+boundary using the **1:50k vector edition** (Dataforsyningen Databoks,
 `tidalwater_s` minus `island_s`, sea only — lakes keep their elevation) for any
 area whose 100 km blocks have been downloaded into `flaskserver/gtk50_blocks/`
-via `ingest_coastline.py <block>|--lat/--lon`; elsewhere it falls back to
-decoding the rendered `gl_aabent_land` WMS from `gis.govmin.gl` (set
-`COASTLINE_VECTOR=0` to force the fallback everywhere). The raw DEM remains
+via `ingest_coastline.py <block>|--lat/--lon`. The rendered `gl_aabent_land`
+WMS is decoded and retained separately as general hydrography because it also
+contains lakes and watercourses. Only four-connected WMS components reachable
+from trusted GTK50 tidal masks across exact tile edges join the effective sea;
+isolated lakes and dashed creek segments remain diagnostic-only. The raw DEM remains
 unchanged in the canonical `tiles.heightmap` payload. An independent mask in
 `coastline_masks` is applied to a copy when terrain is read or rendered, and
 the classifier uses the same mask to force mapped sea into its water class. This prevents

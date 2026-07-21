@@ -14,6 +14,8 @@ export function createTerrainHud({
   onToggleSeamMode,
   onToggleHeatmap,
   onToggleGridlines,
+  onToggleWaterOverlay,
+  onToggleHydrographyOverlay,
   onToggleRenderBackend,
   onToggleRoadDebug,
   onReset,
@@ -33,6 +35,8 @@ export function createTerrainHud({
       event.target.id === 'seamModeLink' ||
       event.target.id === 'heatmapModeLink' ||
       event.target.id === 'gridlinesModeLink' ||
+      event.target.id === 'waterOverlayLink' ||
+      event.target.id === 'hydrographyOverlayLink' ||
       event.target.id === 'renderBackendLink' ||
       event.target.id === 'roadDebugLink' ||
       event.target.id === 'resetViewLink' ||
@@ -61,6 +65,18 @@ export function createTerrainHud({
       event.stopPropagation();
       event.preventDefault();
       onToggleGridlines();
+      return;
+    }
+    if (event.target.id === 'waterOverlayLink') {
+      event.stopPropagation();
+      event.preventDefault();
+      onToggleWaterOverlay();
+      return;
+    }
+    if (event.target.id === 'hydrographyOverlayLink') {
+      event.stopPropagation();
+      event.preventDefault();
+      onToggleHydrographyOverlay();
       return;
     }
     if (event.target.id === 'renderBackendLink') {
@@ -103,6 +119,8 @@ export function createTerrainHud({
       event.target.id === 'mapModeLink' || event.target.id === 'seamModeLink' ||
       event.target.id === 'heatmapModeLink' ||
       event.target.id === 'gridlinesModeLink' ||
+      event.target.id === 'waterOverlayLink' ||
+      event.target.id === 'hydrographyOverlayLink' ||
       event.target.id === 'renderBackendLink' ||
       event.target.id === 'roadDebugLink' || event.target.id === 'resetViewLink' ||
       TERRAIN_HUD_LINKS[event.target.id]

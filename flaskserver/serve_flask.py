@@ -1190,15 +1190,44 @@ def _painted_texture_response(
   jpeg: bytes,
   bbox: tuple[float, float, float, float],
   *,
+  tile_id: str,
   headers: dict[str, str],
   road_debug: bool = False,
+  water_debug: bool = False,
+  hydro_debug: bool = False,
 ) -> Response:
   """Apply terrain-coupled catalog overlays to a clean cached texture copy."""
   from asset_catalog import paint_roads
   painted, road_count = paint_roads(jpeg, bbox, ASSETS_DB_PATH, debug=road_debug)
+  if hydro_debug or water_debug:
+    from classifier.rendering import smooth_effective_water_mask
+    from coastline import read_hydrography_mask, read_water_mask
+    db = _get_db()
+    hydro = read_hydrography_mask(db, tile_id) if hydro_debug else None
+    water = read_water_mask(db, tile_id) if water_debug else None
+    if hydro is not None or water is not None:
+      image = _Image.open(io.BytesIO(painted)).convert("RGB")
+      pixels = _np.asarray(image).copy()
+      if hydro is not None:
+        render_hydro = smooth_effective_water_mask(
+          hydro, image.width, image.height,
+        )
+        pixels[render_hydro] = (0, 140, 255)
+      # Paint authoritative tidal sea last so simultaneous diagnostics read as
+      # pink sea plus blue WMS-only inland hydrography.
+      if water is not None:
+        render_water = smooth_effective_water_mask(
+          water, image.width, image.height,
+        )
+        pixels[render_water] = (255, 42, 161)
+      output = io.BytesIO()
+      _Image.fromarray(pixels, mode="RGB").save(output, format="JPEG", quality=92)
+      painted = output.getvalue()
   response_headers = dict(headers)
   response_headers["X-Road-Overlay-Count"] = str(road_count)
   response_headers["X-Road-Debug"] = "1" if road_debug else "0"
+  response_headers["X-Water-Debug"] = "1" if water_debug else "0"
+  response_headers["X-Hydrography-Debug"] = "1" if hydro_debug else "0"
   if road_count:
     # Asset edits must be visible on the next texture request; the canonical
     # imagery remains cached in terrain.db and is never painted in place.
@@ -1224,6 +1253,8 @@ def api_texture(tile_id: str):
   d, c, r = parsed
   texture_bbox = _tile_bbox(d, c, r)
   road_debug = request.args.get("roadDebug") == "1"
+  water_debug = request.args.get("waterDebug") == "1"
+  hydro_debug = request.args.get("hydroDebug") == "1"
 
   db = _get_db()
   row = db.execute(
@@ -1250,7 +1281,10 @@ def api_texture(tile_id: str):
       return _painted_texture_response(
         cached,
         texture_bbox,
+        tile_id=tile_id,
         road_debug=road_debug,
+        water_debug=water_debug,
+        hydro_debug=hydro_debug,
         headers={
           "Cache-Control": "public, max-age=86400" if not is_crop else "public, max-age=3600",
           "X-Tex-Source": source,
@@ -1274,7 +1308,10 @@ def api_texture(tile_id: str):
     return _painted_texture_response(
       _repair_white_ocean_jpeg(db, tile_id, cached_crop),
       texture_bbox,
+      tile_id=tile_id,
       road_debug=road_debug,
+      water_debug=water_debug,
+      hydro_debug=hydro_debug,
       headers={
         "Cache-Control": "no-store",
         "X-Tex-Ancestor": "precomputed_crop",
@@ -1333,7 +1370,10 @@ def api_texture(tile_id: str):
   return _painted_texture_response(
     _repair_white_ocean_jpeg(db, tile_id, buf.getvalue()),
     texture_bbox,
+    tile_id=tile_id,
     road_debug=road_debug,
+    water_debug=water_debug,
+    hydro_debug=hydro_debug,
     headers={
       "Cache-Control": "no-store",
       "X-Tex-Ancestor": ancestor_id,

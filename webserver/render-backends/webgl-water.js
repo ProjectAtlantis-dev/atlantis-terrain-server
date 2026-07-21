@@ -19,7 +19,7 @@ import {
 //     the dropped seabed carries the satellite imagery OF the water, so the
 //     surface lets it show through — colour inheritance is per-pixel and
 //     free, with veil/reflection/glint composited on top. Depth read by
-//     the post passes is the seabed, 10 m below the surface — negligible.
+//     the post passes is the seabed, 3 m below the surface — negligible.
 
 const SKY_GLSL = /* glsl */ `
   vec3 skyColor(vec3 dir, vec3 sunDir, vec3 horizonWarm, vec3 horizonCool, vec3 zenithCol, vec3 sunCol, float cloud) {

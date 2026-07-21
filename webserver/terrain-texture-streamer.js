@@ -38,6 +38,8 @@ export function createTextureStreamer({
   const demandClient = globalThis.crypto?.randomUUID?.() ?? `terrain-${Date.now()}-${Math.random()}`;
   let version = Date.now();
   let roadDebug = false;
+  let waterDebug = false;
+  let hydroDebug = false;
   let activeDemand = null;
   let demandGeneration = 0;
   let refillPending = false;
@@ -91,7 +93,9 @@ export function createTextureStreamer({
       const controller = new AbortController();
       texInflight.set(tileId, controller);
       const requestGeneration = demandGeneration;
-      const debugQuery = roadDebug ? '&roadDebug=1' : '';
+      const debugQuery = `${roadDebug ? '&roadDebug=1' : ''}`
+        + `${waterDebug ? '&waterDebug=1' : ''}`
+        + `${hydroDebug ? '&hydroDebug=1' : ''}`;
       fetchImpl(`/api/texture/${tileId}.jpg?v=${version}&demand=${version}&demandClient=${encodeURIComponent(demandClient)}${debugQuery}`, { signal: controller.signal })
         .then(response => {
           texInflight.delete(tileId);
@@ -220,6 +224,28 @@ export function createTextureStreamer({
     return roadDebug;
   }
 
+  function setWaterDebug(enabled) {
+    const next = Boolean(enabled);
+    if (waterDebug === next) return waterDebug;
+    waterDebug = next;
+    abortAll();
+    for (const texture of texCache.values()) staleTextures.add(texture);
+    texCache.clear();
+    texSource.clear();
+    return waterDebug;
+  }
+
+  function setHydroDebug(enabled) {
+    const next = Boolean(enabled);
+    if (hydroDebug === next) return hydroDebug;
+    hydroDebug = next;
+    abortAll();
+    for (const texture of texCache.values()) staleTextures.add(texture);
+    texCache.clear();
+    texSource.clear();
+    return hydroDebug;
+  }
+
   function releaseStaleTexture(texture) {
     if (!texture || !staleTextures.delete(texture)) return false;
     texture.dispose?.();
@@ -229,9 +255,11 @@ export function createTextureStreamer({
   return {
     texCache, texSource, texInflight, texFetching, texRetryAtMs, texRetryCount,
     ancestorLogged, pump, invalidate, releaseTile, releaseTileDemand,
-    abortAll, setRoadDebug,
+    abortAll, setRoadDebug, setWaterDebug, setHydroDebug,
     releaseStaleTexture,
     get roadDebug() { return roadDebug; },
+    get waterDebug() { return waterDebug; },
+    get hydroDebug() { return hydroDebug; },
     get version() { return version; },
     bumpVersion: advanceVersion,
   };

@@ -17,6 +17,10 @@ export function createTerrainTuningControls({
   function slider(label, options) {
     const saved = state[label];
     const initial = saved != null ? saved : options.value;
+    // Keep state as a complete snapshot of the registered controls, rather
+    // than a sparse collection whose shape depends on which widgets happened
+    // to receive input. The caller persists once after registration finishes.
+    if (saved == null) state[label] = Number(initial);
     const row = documentImpl.createElement('div');
     row.style.cssText = 'display:flex;align-items:center;gap:6px;margin:5px 0';
     const labelElement = documentImpl.createElement('span');
@@ -53,6 +57,7 @@ export function createTerrainTuningControls({
   function toggle(label, options) {
     const saved = state[label];
     const initial = saved != null ? saved : options.value;
+    if (saved == null) state[label] = Boolean(initial);
     const row = documentImpl.createElement('div');
     row.style.cssText = 'display:flex;align-items:center;gap:6px;margin:5px 0';
     const labelElement = documentImpl.createElement('span');

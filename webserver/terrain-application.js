@@ -182,6 +182,14 @@ const east = new THREE.Vector3();
 const north = new THREE.Vector3();
 const up = new THREE.Vector3();
 Ellipsoid.WGS84.getEastNorthUpVectors(anchorPosition, east, north, up);
+const CLOUD_WIND_RECALIBRATION_DISTANCE_M = 25_000;
+// Keep the water's fixed terrain-local east/north axes, but evaluate how those
+// directions map into Takram's cube-sphere UVs near the current camera.
+const cloudWeatherUvBasis = {
+  position: anchorPosition.clone(),
+  east,
+  north,
+};
 
 // --- View distance constants ---
 const MAX_VIEW_DIST = 50000;       // 50km — camera far, fog, map extents
@@ -291,6 +299,8 @@ const { hud, alt, gameClock: gameClockEl } = createTerrainHud({
   onToggleSeamMode: () => toggleSeamMode(),
   onToggleHeatmap: () => toggleHeatmap(),
   onToggleGridlines: () => toggleGridlines(),
+  onToggleWaterOverlay: () => toggleWaterOverlay(),
+  onToggleHydrographyOverlay: () => toggleHydrographyOverlay(),
   onToggleRenderBackend: () => {
     // beforeunload normally saves this too, but make the renderer transition
     // self-contained so a fast reload cannot race the camera/frame snapshot.
@@ -496,8 +506,8 @@ const {
 });
 
 // We'll call this after aerialPerspective + cloudsEffect are created.
+let cloudTuning = null;
 function buildTuningControls(ap, ce) {
-  let cloudTuning = null;
   tuningSectionLabel('Date / Time');
   const monthNames = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
   tuningSlider('month', {
@@ -553,6 +563,7 @@ function buildTuningControls(ap, ce) {
     toggle: tuningToggle,
     // one wind: cloud drift heading follows the water wind direction
     getWindDirection: () => waterParams.windDirection,
+    weatherUvBasis: cloudWeatherUvBasis,
     renderingEnabled: renderBackend.takramCloudsEnabled,
     onRenderingEnabledChange: enabled => {
       renderBackend.setTakramCloudsEnabled(enabled);
@@ -765,6 +776,19 @@ function buildTuningControls(ap, ce) {
   //   decimals: 1,
   //   onChange: v => { ce.shadow.opticalDepthTailScale = v; }
   // });
+}
+
+function recalibrateCloudWindForCamera() {
+  if (
+    cloudTuning == null
+    || camera.position.distanceToSquared(cloudWeatherUvBasis.position)
+      < CLOUD_WIND_RECALIBRATION_DISTANCE_M ** 2
+  ) {
+    return false;
+  }
+  cloudWeatherUvBasis.position.copy(camera.position);
+  cloudTuning.syncDrift();
+  return true;
 }
 
 const terrainRoot = new THREE.Group();
@@ -1030,6 +1054,10 @@ function getGameDateFromBrowserTime(nowMs = Date.now()) {
   return new Date(gameTimeMs);
 }
 buildTuningControls(aerialPerspective, cloudsEffect);
+// Control registration fills in defaults as well as restoring overrides, so
+// this is a complete bundle of the registered tuning controls instead of a
+// sparse record of only the sliders that have emitted an input event.
+saveTuning();
 // Only apply the default referenceDate if no saved tuning overrides month/hour.
 // buildTuningControls already calls applyDate() when restoring saved values.
 if (gameClockState.running) {
@@ -1297,7 +1325,8 @@ function needsContinuousRender() {
     // Animated water must hold the loop open on backends that actually idle
     // (WebGPU; the WebGL backend never stops once started). Mirrors the
     // waterRuntime.update visibility gate.
-    (waterRuntime.enabled && waterParams.enabled && !controls.mapMode)
+    (waterRuntime.enabled && waterParams.enabled && !controls.mapMode
+      && !textureStreamer.waterDebug && !textureStreamer.hydroDebug)
   );
 }
 
@@ -1823,6 +1852,12 @@ function updateHud() {
   const gridlinesLine = gridlinesRuntime.active
     ? 'gridlines: <span id="gridlinesModeLink" style="color:#8f8;text-decoration:underline;cursor:pointer;pointer-events:auto">ON</span>'
     : 'gridlines: <span id="gridlinesModeLink" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">off</span>';
+  const waterOverlayLine = textureStreamer.waterDebug
+    ? 'pink water: <span id="waterOverlayLink" style="color:#ff2aa1;text-decoration:underline;cursor:pointer;pointer-events:auto">ON</span>'
+    : 'pink water: <span id="waterOverlayLink" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">off</span>';
+  const hydrographyOverlayLine = textureStreamer.hydroDebug
+    ? 'Åbent Land: <span id="hydrographyOverlayLink" style="color:#008cff;text-decoration:underline;cursor:pointer;pointer-events:auto">BLUE</span>'
+    : 'Åbent Land: <span id="hydrographyOverlayLink" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">off</span>';
   const renderBackendLabel = backend === 'webgpu' ? 'WebGPU' : 'WebGL';
   const nextRenderBackendLabel = backend === 'webgpu' ? 'WebGL' : 'WebGPU';
   const roadDebugColor = textureStreamer.roadDebug ? '#ff3b30' : '#0af';
@@ -1854,6 +1889,8 @@ function updateHud() {
     hmLine,
     texLine,
     gridlinesLine,
+    waterOverlayLine,
+    hydrographyOverlayLine,
     vehicleRuntime.vehicleControlActive
       ? 'W/S drive, A/D steer, mouse orbit camera, Esc exits vehicle control'
       : 'WASD or Arrows move, Q/Z altitude, drag look',
@@ -2055,6 +2092,28 @@ function toggleSeamMode() {
 function toggleGridlines() {
   if (controls.mapMode) return;
   gridlinesRuntime.toggle();
+}
+
+function toggleWaterOverlay() {
+  if (controls.mapMode) return false;
+  const active = textureStreamer.setWaterDebug(!textureStreamer.waterDebug);
+  terrainTileSet.resetTextureApplications();
+  terrainTileSet.refreshTextures();
+  enqueueClientLog('info', 'water.debug.toggle', { active });
+  updateHud();
+  requestRender();
+  return active;
+}
+
+function toggleHydrographyOverlay() {
+  if (controls.mapMode) return false;
+  const active = textureStreamer.setHydroDebug(!textureStreamer.hydroDebug);
+  terrainTileSet.resetTextureApplications();
+  terrainTileSet.refreshTextures();
+  enqueueClientLog('info', 'hydrography.debug.toggle', { active });
+  updateHud();
+  requestRender();
+  return active;
 }
 
 installTerrainKeyboardControls({
@@ -2281,6 +2340,7 @@ function render() {
   }
   applyDate(currentDate, { force: false });
   applyCameraOrientation();
+  recalibrateCloudWindForCamera();
   rebuildTerrainDemandForViewDirection();
   updateHud();
   syncMapModePresentation();
@@ -2292,7 +2352,8 @@ function render() {
 
   waterRuntime.update({
     dt, camera,
-    visible: waterParams.enabled && !controls.mapMode,
+    visible: waterParams.enabled && !controls.mapMode
+      && !textureStreamer.waterDebug && !textureStreamer.hydroDebug,
   });
 
   // Terrain streaming: check if camera moved far enough to re-fetch

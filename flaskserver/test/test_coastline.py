@@ -13,9 +13,12 @@ from coastline import (
     _OVERSAMPLE,
     WATER_FLOOR_DROP_M,
     apply_water_mask,
+    cache_official_water_mask,
     fetch_official_water_mask,
+    read_hydrography_mask,
     read_water_mask,
     write_water_mask,
+    write_hydrography_mask,
 )
 os.environ.setdefault("DATAFORSYNINGEN_TOKEN", "test-token")
 from database import GRID_N, open_db, read_tile, seed_tiles, write_tile
@@ -103,6 +106,134 @@ class OfficialCoastlineTest(unittest.TestCase):
     def test_network_failure_does_not_create_a_mask(self):
         with patch("coastline._fetch_url", side_effect=OSError("offline")):
             self.assertIsNone(fetch_official_water_mask((0, 0, 1, 1), 2))
+
+    def test_hydrography_is_stored_separately_from_tidal_sea(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db = open_db(str(Path(directory) / "terrain.db"))
+            seed_tiles(db, max_depth=0)
+            hydro = np.array([[True, False], [True, True]], dtype=bool)
+            write_hydrography_mask(db, "0-0-0", hydro)
+
+            self.assertIsNone(read_water_mask(db, "0-0-0"))
+            np.testing.assert_array_equal(
+                read_hydrography_mask(db, "0-0-0"), hydro,
+            )
+            db.close()
+
+    def test_wms_fallback_is_retained_but_not_returned_as_sea(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db = open_db(str(Path(directory) / "terrain.db"))
+            seed_tiles(db, max_depth=0)
+            hydro = np.array([[True, False], [True, True]], dtype=bool)
+            with (
+                patch("gtk50_vector.vector_water_mask", return_value=None),
+                patch("coastline.fetch_official_water_mask", return_value=hydro),
+            ):
+                result = cache_official_water_mask(
+                    db, "0-0-0", bbox=(0, 0, 1, 1), resolution=2,
+                )
+
+            self.assertIsNone(result)
+            self.assertIsNone(read_water_mask(db, "0-0-0"))
+            np.testing.assert_array_equal(
+                read_hydrography_mask(db, "0-0-0"), hydro,
+            )
+            db.close()
+
+    def test_schema_v4_moves_existing_wms_masks_out_of_sea_authority(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "terrain.db")
+            db = open_db(path)
+            seed_tiles(db, max_depth=0)
+            hydro = np.array([[True, True], [False, True]], dtype=np.uint8)
+            db.execute(
+                "INSERT INTO coastline_masks "
+                "(tile_id, width, height, mask, source, version, updated_at) "
+                "VALUES ('0-0-0', 2, 2, ?, 'govmin_gl_aabent_land', 1, 'now')",
+                (zlib.compress(hydro.tobytes()),),
+            )
+            db.execute(
+                "UPDATE metadata SET value = '3' WHERE key = 'schema_version'"
+            )
+            db.commit()
+            db.close()
+
+            db = open_db(path)
+            self.assertIsNone(read_water_mask(db, "0-0-0"))
+            np.testing.assert_array_equal(
+                read_hydrography_mask(db, "0-0-0"), hydro.astype(bool),
+            )
+            self.assertEqual(
+                db.execute(
+                    "SELECT value FROM metadata WHERE key = 'schema_version'"
+                ).fetchone()[0],
+                "4",
+            )
+            db.close()
+
+    def test_only_hydrography_connected_to_tidal_mask_becomes_effective_sea(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db = open_db(str(Path(directory) / "terrain.db"))
+            seed_tiles(db, max_depth=1)
+            coast = np.zeros((5, 5), dtype=bool)
+            coast[:, -1] = True
+            hydro = np.zeros((5, 5), dtype=bool)
+            hydro[2, :3] = True  # touches the trusted sea across the tile edge
+            hydro[4, 4] = True   # isolated lake/creek dash
+            write_water_mask(db, "1-0-0", coast)
+            write_hydrography_mask(db, "1-1-0", hydro)
+
+            expected = np.zeros_like(hydro)
+            expected[2, :3] = True
+            np.testing.assert_array_equal(
+                read_water_mask(db, "1-1-0"), expected,
+            )
+            np.testing.assert_array_equal(
+                read_hydrography_mask(db, "1-1-0"), hydro,
+            )
+            db.close()
+
+    def test_sea_level_tile_seeds_its_hydrography_flood_component(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db = open_db(str(Path(directory) / "terrain.db"))
+            seed_tiles(db, max_depth=0)
+            raw = np.full((GRID_N, GRID_N), -0.25, dtype=np.float32)
+            confidence = np.full(raw.shape, 6, dtype=np.uint8)
+            hydro = np.ones(raw.shape, dtype=bool)
+            hydro[20:25, 20:25] = False
+            write_tile(db, "0-0-0", raw, confidence, "arcticdem_10m")
+            write_hydrography_mask(db, "0-0-0", hydro)
+
+            np.testing.assert_array_equal(
+                read_water_mask(db, "0-0-0"), hydro,
+            )
+            effective = read_tile(db, "0-0-0")["heightmap"]
+            np.testing.assert_array_equal(
+                effective[hydro], -WATER_FLOOR_DROP_M,
+            )
+            np.testing.assert_array_equal(effective[~hydro], raw[~hydro])
+            db.close()
+
+    def test_coarse_hydrography_overlay_is_assembled_from_stored_children(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db = open_db(str(Path(directory) / "terrain.db"))
+            seed_tiles(db, max_depth=1)
+            southwest = np.zeros((5, 5), dtype=bool)
+            southwest[0, 0] = True
+            southeast = np.zeros((5, 5), dtype=bool)
+            southeast[0, 0] = True
+            southeast[-1, -1] = True
+            write_hydrography_mask(db, "1-0-0", southwest)
+            write_hydrography_mask(db, "1-1-0", southeast)
+
+            parent = read_hydrography_mask(db, "0-0-0")
+
+            self.assertIsNotNone(parent)
+            self.assertTrue(parent[0, 0])
+            self.assertTrue(parent[0, 2])
+            self.assertTrue(parent[2, 4])
+            self.assertEqual(int(parent.sum()), 3)
+            db.close()
 
     def test_marking_official_ocean_preserves_stored_elevation_payload(self):
         with tempfile.TemporaryDirectory() as directory:
