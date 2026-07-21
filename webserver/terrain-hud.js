@@ -14,6 +14,8 @@ export function createTerrainHud({
   onToggleSeamMode,
   onToggleHeatmap,
   onToggleGridlines,
+  onToggleWaterOverlay,
+  onToggleHydrographyOverlay,
   onToggleRenderBackend,
   onToggleRoadDebug,
   onReset,
@@ -33,6 +35,8 @@ export function createTerrainHud({
       event.target.id === 'seamModeLink' ||
       event.target.id === 'heatmapModeLink' ||
       event.target.id === 'gridlinesModeLink' ||
+      event.target.id === 'waterOverlayLink' ||
+      event.target.id === 'hydrographyOverlayLink' ||
       event.target.id === 'renderBackendLink' ||
       event.target.id === 'roadDebugLink' ||
       event.target.id === 'resetViewLink' ||
@@ -61,6 +65,18 @@ export function createTerrainHud({
       event.stopPropagation();
       event.preventDefault();
       onToggleGridlines();
+      return;
+    }
+    if (event.target.id === 'waterOverlayLink') {
+      event.stopPropagation();
+      event.preventDefault();
+      onToggleWaterOverlay();
+      return;
+    }
+    if (event.target.id === 'hydrographyOverlayLink') {
+      event.stopPropagation();
+      event.preventDefault();
+      onToggleHydrographyOverlay();
       return;
     }
     if (event.target.id === 'renderBackendLink') {
@@ -103,6 +119,8 @@ export function createTerrainHud({
       event.target.id === 'mapModeLink' || event.target.id === 'seamModeLink' ||
       event.target.id === 'heatmapModeLink' ||
       event.target.id === 'gridlinesModeLink' ||
+      event.target.id === 'waterOverlayLink' ||
+      event.target.id === 'hydrographyOverlayLink' ||
       event.target.id === 'renderBackendLink' ||
       event.target.id === 'roadDebugLink' || event.target.id === 'resetViewLink' ||
       TERRAIN_HUD_LINKS[event.target.id]
@@ -142,20 +160,21 @@ export function compassHeading(headingRad) {
   return { degrees, compass: directions[Math.round(degrees / 45) % 8] };
 }
 
-export function renderGameClock(element, date, isPlaying) {
+export function renderGameClock(element, date, isPlaying, timeScale = 1) {
   const nuukTime = date.toLocaleString('en-GB', {
     timeZone: 'America/Nuuk', hour: '2-digit', minute: '2-digit', hour12: false,
   });
   const [hours, minutes] = nuukTime.split(':');
   // Rewriting per frame destroys the buttons mid-click and forces relayout;
   // only touch the DOM when the rendered minute or play state changes.
-  const renderKey = `${hours}:${minutes}|${isPlaying}`;
+  const renderKey = `${hours}:${minutes}|${isPlaying}|${timeScale}`;
   if (element.dataset?.gcRendered === renderKey) return;
   if (element.dataset) element.dataset.gcRendered = renderKey;
   const style = 'cursor:pointer;padding:0 4px;border:none;background:none;font-size:12px;line-height:1;vertical-align:middle;';
   const color = '#5af';
   element.innerHTML = `<button data-gc="rw" style="${style}color:${color}" title="−15 min"><i class="fa-solid fa-backward"></i></button>`
     + ` <b>${hours}:${minutes}</b>`
+    + (timeScale > 1 ? ` <span title="Fast time">×${timeScale}</span>` : '')
     + (isPlaying
       ? `<button data-gc="stop" style="${style}color:${color}" title="Pause"><i class="fa-solid fa-pause"></i></button>`
       : `<button data-gc="play" style="${style}color:${color}" title="Play"><i class="fa-solid fa-play"></i></button>`)

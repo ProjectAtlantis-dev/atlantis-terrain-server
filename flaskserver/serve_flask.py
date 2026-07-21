@@ -287,12 +287,149 @@ def _tex_retry_worker() -> None:
         db.close()
 
 
-_cog_fetch_lock = threading.Lock()
+_cog_scheduler_lock = threading.RLock()
 _cog_fetching_tiles: set[str] = set()
+_cog_pending_tiles: dict[str, tuple[float, float, float, float]] = {}
+_cog_demand_ids: set[str] = set()
 _cog_fetched_total = 0      # lifetime count of COG tiles fetched from S3
 _cog_skipped_total = 0      # lifetime count of tiles skipped (already had data)
 _cog_already_fetched: set[str] = set()  # tile IDs we've already fetched this session
 _COG_TILE_WORKERS = max(1, _env_int("COG_TILE_WORKERS", 6))
+_cog_pool = ThreadPoolExecutor(max_workers=_COG_TILE_WORKERS)
+
+
+def _tile_ancestor_ids(tile_id: str):
+  parsed = _parse_tile_id(tile_id)
+  if parsed is None:
+    return
+  depth, column, row = parsed
+  while depth > 0:
+    depth -= 1
+    column //= 2
+    row //= 2
+    yield f"{depth}-{column}-{row}"
+
+
+def _fetch_one_cog_tile(tile_id, bbox):
+  """Fetch and persist one tile; completion never waits for sibling tiles."""
+  from ingest import _read_cog_heightmap, _resample_from_parent
+  from database import CONFIDENCE, TileClobberError, write_tile
+  from serve import (
+    mark_no_data, _UPGRADEABLE_SOURCES, _cache_coastline,
+    _mark_official_ocean,
+  )
+
+  db = sqlite3.connect(str(DB_PATH), check_same_thread=False)
+  db.execute("PRAGMA journal_mode=WAL")
+  try:
+    row = db.execute(
+      "SELECT source FROM tiles WHERE tile_id = ?", (tile_id,)
+    ).fetchone()
+    upgrade = bool(row and row[0] in _UPGRADEABLE_SOURCES)
+    log_cog.debug(
+      f"[cog-worker] {tile_id}: reading "
+      f"bbox=[{bbox[0]:.0f},{bbox[1]:.0f},{bbox[2]:.0f},{bbox[3]:.0f}]"
+    )
+    data, src_name = _read_cog_heightmap(bbox, _GRID_N)
+
+    if data is None:
+      water = _cache_coastline(db, tile_id, bbox)
+      if water is not None and _np.all(water):
+        _mark_official_ocean(db, tile_id)
+        return "fetched"
+
+      # A child whose source COG is empty may depend on a parent currently in
+      # flight. Put it back into the live queue instead of blocking a worker or
+      # prematurely caching it as no-data.
+      with _cog_scheduler_lock:
+        ancestor_work = any(
+          ancestor in _cog_fetching_tiles or ancestor in _cog_pending_tiles
+          for ancestor in _tile_ancestor_ids(tile_id)
+        )
+      if ancestor_work:
+        return "defer"
+
+      data, src_name = _resample_from_parent(
+        db, tile_id, bbox=None, resolution=_GRID_N
+      )
+      if data is None:
+        mark_no_data(db, tile_id)
+        return "no_data"
+
+    source_name = src_name if isinstance(src_name, str) else "parent_resampled"
+    conf = CONFIDENCE.get(source_name, CONFIDENCE["arcticdem"])
+    cm = _np.where(_np.isnan(data), _np.uint8(0), _np.uint8(conf))
+    hm = _np.where(_np.isnan(data), 0.0, data).astype(_np.float32)
+    try:
+      write_tile(
+        db, tile_id, hm, cm, source_name, reconcile=False,
+        allow_overwrite=upgrade,
+      )
+      _cache_coastline(db, tile_id, bbox)
+      if source_name == "parent_resampled":
+        log_cog.info(f"[PARENT RESAMPLE] {tile_id}: filled from parent")
+      return "fetched"
+    except TileClobberError:
+      return "skipped"
+  except Exception as exc:
+    log_cog.warning(
+      f"[COG FETCH] {tile_id}: {type(exc).__name__}: {exc}"
+    )
+    try:
+      mark_no_data(db, tile_id)
+    except Exception:
+      pass
+    return "no_data"
+  finally:
+    db.close()
+
+
+def _fill_cog_workers_locked():
+  while _cog_pending_tiles and len(_cog_fetching_tiles) < _COG_TILE_WORKERS:
+    tile_id = next(iter(_cog_pending_tiles))
+    bbox = _cog_pending_tiles.pop(tile_id)
+    _cog_fetching_tiles.add(tile_id)
+    _cog_already_fetched.add(tile_id)
+    future = _cog_pool.submit(_fetch_one_cog_tile, tile_id, bbox)
+    future.add_done_callback(
+      lambda completed, tid=tile_id, tile_bbox=bbox:
+        _finish_cog_tile(tid, tile_bbox, completed)
+    )
+
+
+def _finish_cog_tile(tile_id, bbox, future):
+  global _cog_fetched_total, _cog_skipped_total
+  try:
+    outcome = future.result()
+  except Exception as exc:  # pragma: no cover - defensive executor boundary
+    log_cog.error(f"[COG worker] {tile_id}: {type(exc).__name__}: {exc}")
+    outcome = "no_data"
+
+  with _cog_scheduler_lock:
+    _cog_fetching_tiles.discard(tile_id)
+    if outcome == "defer":
+      _cog_already_fetched.discard(tile_id)
+      if tile_id in _cog_demand_ids:
+        _cog_pending_tiles[tile_id] = bbox
+    elif outcome == "fetched":
+      _cog_fetched_total += 1
+    elif outcome == "skipped":
+      _cog_skipped_total += 1
+    _fill_cog_workers_locked()
+
+
+def _schedule_cog_demand(missing):
+  """Replace unstarted work with the latest camera-priority ordering."""
+  global _cog_pending_tiles, _cog_demand_ids
+  with _cog_scheduler_lock:
+    _cog_demand_ids = {tile_id for tile_id, _ in missing}
+    _cog_pending_tiles = {
+      tile_id: bbox for tile_id, bbox in missing
+      if tile_id not in _cog_already_fetched
+      and tile_id not in _cog_fetching_tiles
+    }
+    _fill_cog_workers_locked()
+    return len(_cog_fetching_tiles), len(_cog_pending_tiles)
 
 def _bootstrap_backend() -> None:
   global _backend_ready, _backend_error
@@ -984,134 +1121,15 @@ def api_tiles():
       }
     )
 
-  # Background COG fetch for missing heightmap tiles
-  if missing and _cog_fetch_lock.acquire(blocking=False):
-    # Dedup: skip tiles we've already fetched or attempted this session
-    deduped = [(tid, bbox) for tid, bbox in missing if tid not in _cog_already_fetched]
-    skipped = len(missing) - len(deduped)
-    if skipped:
-      log_cog.info(f"[COG dedup] {skipped} already fetched this session, {len(deduped)} new")
-    if not deduped:
-      _cog_fetch_lock.release()
-    else:
-      # Mark all as attempted before spawning thread
-      for tid, _ in deduped:
-        _cog_already_fetched.add(tid)
-
-      def _bg_cog_fetch(missing_list):
-        global _cog_fetched_total, _cog_skipped_total
-        db = None
-        try:
-          from concurrent.futures import ThreadPoolExecutor, as_completed
-          from ingest import _read_cog_heightmap, _resample_from_parent
-          from database import CONFIDENCE, write_tile
-          from serve import (
-            mark_no_data, _UPGRADEABLE_SOURCES, _cache_coastline,
-            _mark_official_ocean,
-          )
-
-          db = sqlite3.connect(str(DB_PATH), check_same_thread=False)
-          db.execute("PRAGMA journal_mode=WAL")
-          log_cog.info(f"Starting {len(missing_list)} tiles from S3... (session: {_cog_fetched_total} fetched, {_cog_skipped_total} skipped)")
-
-          upgrade_ids = set()
-          bbox_by_id = {tid: bbox for tid, bbox in missing_list}
-          for tid, _ in missing_list:
-            row = db.execute(
-              "SELECT source FROM tiles WHERE tile_id = ?", (tid,)
-            ).fetchone()
-            if row and row[0] in _UPGRADEABLE_SOURCES:
-              upgrade_ids.add(tid)
-
-          def _worker(tile_id, bbox):
-            log_cog.debug(f"[cog-worker] {tile_id}: reading bbox=[{bbox[0]:.0f},{bbox[1]:.0f},{bbox[2]:.0f},{bbox[3]:.0f}]")
-            return tile_id, _read_cog_heightmap(bbox, _GRID_N)
-
-          fetched, no_data_count, parent_resampled_count = 0, 0, 0
-          # Collect tiles that COG couldn't resolve for a second-pass parent resample
-          cog_failed = []
-          with ThreadPoolExecutor(max_workers=_COG_TILE_WORKERS) as pool:
-            futs = {pool.submit(_worker, tid, bbox): tid for tid, bbox in missing_list}
-            for fut in as_completed(futs):
-              tid = futs[fut]
-              try:
-                tile_id, (data, src_name) = fut.result()
-                if data is None:
-                  water = _cache_coastline(db, tile_id, bbox_by_id[tile_id])
-                  if water is not None and _np.all(water):
-                    _mark_official_ocean(db, tile_id)
-                    fetched += 1
-                    _cog_fetched_total += 1
-                    continue
-                  cog_failed.append(tile_id)
-                  continue
-                conf = CONFIDENCE.get(src_name, CONFIDENCE['arcticdem'])
-                cm = _np.where(_np.isnan(data), _np.uint8(0), _np.uint8(conf))
-                hm = _np.where(_np.isnan(data), 0.0, data).astype(_np.float32)
-                write_tile(
-                  db, tile_id, hm, cm, src_name, reconcile=False,
-                  allow_overwrite=tile_id in upgrade_ids,
-                )
-                _cache_coastline(db, tile_id, bbox_by_id[tile_id])
-                fetched += 1
-                _cog_fetched_total += 1
-              except Exception as exc:
-                log_cog.warning(
-                  f"  [COG FETCH] {tid}: failed after source read: "
-                  f"{type(exc).__name__}: {exc}"
-                )
-                cog_failed.append(tid)
-              finally:
-                _cog_fetching_tiles.discard(tid)
-
-          # Second pass: try parent resampling for tiles that had no COG data.
-          # Sort by depth (shallowest first) so parent tiles get written before
-          # their children try to resample from them — enables chaining
-          # (depth-10 → depth-11 → depth-12 in one pass).
-          cog_failed.sort(key=lambda tid: int(tid.split('-')[0]))
-          for tile_id in cog_failed:
-            try:
-              data, src_name = _resample_from_parent(db, tile_id, bbox=None, resolution=_GRID_N)
-              if data is not None:
-                source_name = src_name if isinstance(src_name, str) else "parent_resampled"
-                conf = CONFIDENCE.get(source_name, CONFIDENCE['arcticdem'])
-                cm = _np.where(_np.isnan(data), _np.uint8(0), _np.uint8(conf))
-                hm = _np.where(_np.isnan(data), 0.0, data).astype(_np.float32)
-                from database import TileClobberError
-                try:
-                  write_tile(
-                    db, tile_id, hm, cm, source_name, reconcile=False,
-                    allow_overwrite=tile_id in upgrade_ids,
-                  )
-                  _cache_coastline(db, tile_id, bbox_by_id[tile_id])
-                  parent_resampled_count += 1
-                  _cog_fetched_total += 1
-                  log_cog.info(f"  [PARENT RESAMPLE] {tile_id}: filled from parent")
-                except TileClobberError:
-                  # Already has data (e.g. from a previous request) — that's fine
-                  parent_resampled_count += 1
-                  _cog_skipped_total += 1
-              else:
-                mark_no_data(db, tile_id)
-                no_data_count += 1
-            except Exception as exc:
-              log_cog.warning(f"  [PARENT RESAMPLE] {tile_id}: failed: {exc}")
-              mark_no_data(db, tile_id)
-              no_data_count += 1
-
-          log_cog.info(f"Done: {fetched} fetched, {parent_resampled_count} parent-resampled, {no_data_count} no data (session totals: {_cog_fetched_total} fetched, {_cog_skipped_total} skipped)")
-        finally:
-          if db is not None:
-            db.close()
-          _cog_fetching_tiles.clear()
-          _cog_fetch_lock.release()
-
-      _cog_fetching_tiles.clear()
-      for tid, _ in deduped:
-        _cog_fetching_tiles.add(tid)
-      threading.Thread(target=_bg_cog_fetch, args=(deduped,), daemon=True).start()
-
-  downloading = list(_cog_fetching_tiles)
+  # Continuously feed free workers. Unstarted work is replaced by every new
+  # camera-priority list, so there is neither a wave barrier nor a stale queue.
+  active_cog, pending_cog = _schedule_cog_demand(missing)
+  if missing:
+    log_cog.debug(
+      f"[COG scheduler] {active_cog} active, {pending_cog} priority-queued"
+    )
+  with _cog_scheduler_lock:
+    downloading = list(_cog_fetching_tiles)
 
   try:
     buildings = _buildings_for_tile_query(qx, qy, ox, oy)
@@ -1190,15 +1208,44 @@ def _painted_texture_response(
   jpeg: bytes,
   bbox: tuple[float, float, float, float],
   *,
+  tile_id: str,
   headers: dict[str, str],
   road_debug: bool = False,
+  water_debug: bool = False,
+  hydro_debug: bool = False,
 ) -> Response:
   """Apply terrain-coupled catalog overlays to a clean cached texture copy."""
   from asset_catalog import paint_roads
   painted, road_count = paint_roads(jpeg, bbox, ASSETS_DB_PATH, debug=road_debug)
+  if hydro_debug or water_debug:
+    from classifier.rendering import smooth_effective_water_mask
+    from coastline import read_hydrography_mask, read_water_mask
+    db = _get_db()
+    hydro = read_hydrography_mask(db, tile_id) if hydro_debug else None
+    water = read_water_mask(db, tile_id) if water_debug else None
+    if hydro is not None or water is not None:
+      image = _Image.open(io.BytesIO(painted)).convert("RGB")
+      pixels = _np.asarray(image).copy()
+      if hydro is not None:
+        render_hydro = smooth_effective_water_mask(
+          hydro, image.width, image.height,
+        )
+        pixels[render_hydro] = (0, 140, 255)
+      # Paint authoritative tidal sea last so simultaneous diagnostics read as
+      # pink sea plus blue WMS-only inland hydrography.
+      if water is not None:
+        render_water = smooth_effective_water_mask(
+          water, image.width, image.height,
+        )
+        pixels[render_water] = (255, 42, 161)
+      output = io.BytesIO()
+      _Image.fromarray(pixels, mode="RGB").save(output, format="JPEG", quality=92)
+      painted = output.getvalue()
   response_headers = dict(headers)
   response_headers["X-Road-Overlay-Count"] = str(road_count)
   response_headers["X-Road-Debug"] = "1" if road_debug else "0"
+  response_headers["X-Water-Debug"] = "1" if water_debug else "0"
+  response_headers["X-Hydrography-Debug"] = "1" if hydro_debug else "0"
   if road_count:
     # Asset edits must be visible on the next texture request; the canonical
     # imagery remains cached in terrain.db and is never painted in place.
@@ -1224,6 +1271,8 @@ def api_texture(tile_id: str):
   d, c, r = parsed
   texture_bbox = _tile_bbox(d, c, r)
   road_debug = request.args.get("roadDebug") == "1"
+  water_debug = request.args.get("waterDebug") == "1"
+  hydro_debug = request.args.get("hydroDebug") == "1"
 
   db = _get_db()
   row = db.execute(
@@ -1250,7 +1299,10 @@ def api_texture(tile_id: str):
       return _painted_texture_response(
         cached,
         texture_bbox,
+        tile_id=tile_id,
         road_debug=road_debug,
+        water_debug=water_debug,
+        hydro_debug=hydro_debug,
         headers={
           "Cache-Control": "public, max-age=86400" if not is_crop else "public, max-age=3600",
           "X-Tex-Source": source,
@@ -1274,7 +1326,10 @@ def api_texture(tile_id: str):
     return _painted_texture_response(
       _repair_white_ocean_jpeg(db, tile_id, cached_crop),
       texture_bbox,
+      tile_id=tile_id,
       road_debug=road_debug,
+      water_debug=water_debug,
+      hydro_debug=hydro_debug,
       headers={
         "Cache-Control": "no-store",
         "X-Tex-Ancestor": "precomputed_crop",
@@ -1333,7 +1388,10 @@ def api_texture(tile_id: str):
   return _painted_texture_response(
     _repair_white_ocean_jpeg(db, tile_id, buf.getvalue()),
     texture_bbox,
+    tile_id=tile_id,
     road_debug=road_debug,
+    water_debug=water_debug,
+    hydro_debug=hydro_debug,
     headers={
       "Cache-Control": "no-store",
       "X-Tex-Ancestor": ancestor_id,

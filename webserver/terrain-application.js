@@ -25,7 +25,6 @@ import { createTerrainVehicleRuntime } from './terrain-vehicle-runtime.js';
 import { createTileHistory, terrainFogDistance, tileDepthFromId } from './terrain-tile-runtime.js';
 import { createTextureStreamer, rendererTextureAnisotropy } from './terrain-texture-streamer.js';
 import { evaluateTerrainRefetch, summarizeTerrainCamera, terrainCameraCoordinates, terrainCameraGridPosition, terrainCameraStereoPosition } from './terrain-tile-fetch.js';
-import { applyTerrainAvailabilityStatus } from './terrain-status-controller.js';
 import { collectTerrainDebugMeshes, createTerrainHoverOutlineController, createTerrainMapGridController, formatTerrainSeamDiagnostic, summarizeTerrainMesh } from './terrain-debug-runtime.js';
 import { createTerrainFetchRuntime } from './terrain-fetch-runtime.js';
 import { createTerrainTileSet } from './terrain-tile-set.js';
@@ -50,6 +49,8 @@ import { googleMaps3dUrl } from './terrain-google-maps.js';
 import { createTerrainFlyToTileRuntime } from './terrain-fly-to-tile.js';
 import { epsg3413DirectionBearing, epsg3413ToWgs84 } from './terrain-polar-stereo.js';
 import { createWaterRuntime, DEFAULT_WATER_PARAMS } from './water/water-runtime.js';
+import { FAST_TIME_SCALE, getFastTimeRange } from './terrain-game-clock.js';
+import { advanceRealtimeMovement, MAX_REALTIME_STEP_SECONDS } from './terrain-realtime-step.js';
 
 export async function startTerrainApplication({
   backend = 'webgl',
@@ -134,6 +135,8 @@ const gameClockState = {
   anchorBrowserTimeMs: Date.now(),
   lastSavedAtMs: 0,
   running: true,
+  timeScale: GAME_TIME_SCALE,
+  stopGameTimeMs: null,
   renderedDate: null,
   lastSunSyncTimeMs: NaN,
 };
@@ -179,6 +182,14 @@ const east = new THREE.Vector3();
 const north = new THREE.Vector3();
 const up = new THREE.Vector3();
 Ellipsoid.WGS84.getEastNorthUpVectors(anchorPosition, east, north, up);
+const CLOUD_WIND_RECALIBRATION_DISTANCE_M = 25_000;
+// Keep the water's fixed terrain-local east/north axes, but evaluate how those
+// directions map into Takram's cube-sphere UVs near the current camera.
+const cloudWeatherUvBasis = {
+  position: anchorPosition.clone(),
+  east,
+  north,
+};
 
 // --- View distance constants ---
 const MAX_VIEW_DIST = 50000;       // 50km — camera far, fog, map extents
@@ -288,6 +299,8 @@ const { hud, alt, gameClock: gameClockEl } = createTerrainHud({
   onToggleSeamMode: () => toggleSeamMode(),
   onToggleHeatmap: () => toggleHeatmap(),
   onToggleGridlines: () => toggleGridlines(),
+  onToggleWaterOverlay: () => toggleWaterOverlay(),
+  onToggleHydrographyOverlay: () => toggleHydrographyOverlay(),
   onToggleRenderBackend: () => {
     // beforeunload normally saves this too, but make the renderer transition
     // self-contained so a fast reload cannot race the camera/frame snapshot.
@@ -309,6 +322,8 @@ const { hud, alt, gameClock: gameClockEl } = createTerrainHud({
 function rewindGameClock() {
   if (gameClockState.running) currentDate.setTime(getGameDateFromBrowserTime().getTime());
   gameClockState.running = false;
+  gameClockState.timeScale = GAME_TIME_SCALE;
+  gameClockState.stopGameTimeMs = null;
   currentDate.setTime(currentDate.getTime() - 15 * 60 * 1000);
   applyDate(currentDate);
   maybeLogWebGPUSun(currentDate, 'clock-rewind', true);
@@ -316,6 +331,8 @@ function rewindGameClock() {
 function stopGameClock() {
   if (gameClockState.running) currentDate.setTime(getGameDateFromBrowserTime().getTime());
   gameClockState.running = false;
+  gameClockState.timeScale = GAME_TIME_SCALE;
+  gameClockState.stopGameTimeMs = null;
   maybeLogWebGPUSun(currentDate, 'clock-stop', true);
 }
 function playGameClock() {
@@ -323,15 +340,33 @@ function playGameClock() {
     gameClockState.anchorGameTimeMs = currentDate.getTime();
     gameClockState.anchorBrowserTimeMs = Date.now();
     gameClockState.running = true;
+    gameClockState.timeScale = GAME_TIME_SCALE;
+    gameClockState.stopGameTimeMs = null;
   }
   maybeLogWebGPUSun(currentDate, 'clock-play', true);
 }
 function fastForwardGameClock() {
   if (gameClockState.running) currentDate.setTime(getGameDateFromBrowserTime().getTime());
   gameClockState.running = false;
+  gameClockState.timeScale = GAME_TIME_SCALE;
+  gameClockState.stopGameTimeMs = null;
   currentDate.setTime(currentDate.getTime() + 15 * 60 * 1000);
   applyDate(currentDate);
   maybeLogWebGPUSun(currentDate, 'clock-forward', true);
+}
+
+function startFastTime() {
+  if (controls.mapMode) return;
+  const { startMs, endMs } = getFastTimeRange(currentDate);
+  currentDate.setTime(startMs);
+  gameClockState.anchorGameTimeMs = startMs;
+  gameClockState.anchorBrowserTimeMs = Date.now();
+  gameClockState.timeScale = FAST_TIME_SCALE;
+  gameClockState.stopGameTimeMs = endMs;
+  gameClockState.running = true;
+  applyDate(currentDate);
+  maybeLogWebGPUSun(currentDate, 'clock-fast-time', true);
+  requestRender();
 }
 
 const tileInfoEl = document.createElement('div');
@@ -471,8 +506,8 @@ const {
 });
 
 // We'll call this after aerialPerspective + cloudsEffect are created.
+let cloudTuning = null;
 function buildTuningControls(ap, ce) {
-  let cloudTuning = null;
   tuningSectionLabel('Date / Time');
   const monthNames = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
   tuningSlider('month', {
@@ -528,6 +563,7 @@ function buildTuningControls(ap, ce) {
     toggle: tuningToggle,
     // one wind: cloud drift heading follows the water wind direction
     getWindDirection: () => waterParams.windDirection,
+    weatherUvBasis: cloudWeatherUvBasis,
     renderingEnabled: renderBackend.takramCloudsEnabled,
     onRenderingEnabledChange: enabled => {
       renderBackend.setTakramCloudsEnabled(enabled);
@@ -740,6 +776,19 @@ function buildTuningControls(ap, ce) {
   //   decimals: 1,
   //   onChange: v => { ce.shadow.opticalDepthTailScale = v; }
   // });
+}
+
+function recalibrateCloudWindForCamera() {
+  if (
+    cloudTuning == null
+    || camera.position.distanceToSquared(cloudWeatherUvBasis.position)
+      < CLOUD_WIND_RECALIBRATION_DISTANCE_M ** 2
+  ) {
+    return false;
+  }
+  cloudWeatherUvBasis.position.copy(camera.position);
+  cloudTuning.syncDrift();
+  return true;
 }
 
 const terrainRoot = new THREE.Group();
@@ -994,9 +1043,21 @@ function applyDate(date, { force = true } = {}) {
 }
 function getGameDateFromBrowserTime(nowMs = Date.now()) {
   const elapsedMs = nowMs - gameClockState.anchorBrowserTimeMs;
-  return new Date(gameClockState.anchorGameTimeMs + elapsedMs * GAME_TIME_SCALE);
+  const gameTimeMs = gameClockState.anchorGameTimeMs + elapsedMs * gameClockState.timeScale;
+  if (gameClockState.stopGameTimeMs != null && gameTimeMs >= gameClockState.stopGameTimeMs) {
+    const stopGameTimeMs = gameClockState.stopGameTimeMs;
+    gameClockState.running = false;
+    gameClockState.timeScale = GAME_TIME_SCALE;
+    gameClockState.stopGameTimeMs = null;
+    return new Date(stopGameTimeMs);
+  }
+  return new Date(gameTimeMs);
 }
 buildTuningControls(aerialPerspective, cloudsEffect);
+// Control registration fills in defaults as well as restoring overrides, so
+// this is a complete bundle of the registered tuning controls instead of a
+// sparse record of only the sliders that have emitted an input event.
+saveTuning();
 // Only apply the default referenceDate if no saved tuning overrides month/hour.
 // buildTuningControls already calls applyDate() when restoring saved values.
 if (gameClockState.running) {
@@ -1016,13 +1077,13 @@ createTerrainAtmosphereTextureRuntime({
 
 renderBackend.configureScenePipeline({
   scene, camera, normalPass, cloudsEffect, aerialPerspective,
-  sunDirection,
+  sunDirection, up,
   date: gameClockState.renderedDate,
 });
 
 // --- Heightmap decode + mesh building (adapted for ENU frame) ---
 
-// --- Status colors for untextured tiles ---
+// --- Tile priority colors ---
 
 function priorityColor(priority, minP, maxP) {
   if (maxP <= minP) return new THREE.Color(1, 0, 0);
@@ -1030,21 +1091,6 @@ function priorityColor(priority, minP, maxP) {
   if (t < 0.33) return new THREE.Color(1, t / 0.33, 0);
   if (t < 0.66) return new THREE.Color(1 - (t - 0.33) / 0.33, 1, 0);
   return new THREE.Color(0, 1 - (t - 0.66) / 0.34, (t - 0.66) / 0.34);
-}
-
-const COLOR_DOWNLOADING = new THREE.Color(0xff2200);
-const COLOR_MISSING = new THREE.Color(0x666666);
-
-function markMissing(missing, downloading) {
-  applyTerrainAvailabilityStatus({
-    terrainRoot, missing, downloading,
-    applyStatus: (mesh, status) => {
-      mesh.material.color.copy(status === 'downloading' ? COLOR_DOWNLOADING : COLOR_MISSING);
-      mesh.material.vertexColors = false;
-      mesh.material.needsUpdate = true;
-      markSceneMutated();
-    },
-  });
 }
 
 // --- Deferred tile system ---
@@ -1275,10 +1321,12 @@ function needsContinuousRender() {
     Math.abs(controls.speed) > 1e-3 ||
     Math.abs(controls.strafeSpeed) > 1e-3 ||
     vehicleRuntime.vehicleControlActive ||
+    gameClockState.stopGameTimeMs != null ||
     // Animated water must hold the loop open on backends that actually idle
     // (WebGPU; the WebGL backend never stops once started). Mirrors the
     // waterRuntime.update visibility gate.
-    (waterRuntime.enabled && waterParams.enabled && !controls.mapMode)
+    (waterRuntime.enabled && waterParams.enabled && !controls.mapMode
+      && !textureStreamer.waterDebug && !textureStreamer.hydroDebug)
   );
 }
 
@@ -1316,7 +1364,6 @@ function runStreamingMaintenance() {
 const terrainFetchEvents = {
   onResponseApplied: requestRender,
   onBuildings: buildings => buildingsRuntime?.reconcile(buildings),
-  onAvailability: markMissing,
   onSkip: () => enqueueClientLog('debug', 'fetchTiles.skip', {
     reason: 'already fetching', ...getCameraLogSnapshot(),
   }),
@@ -1335,8 +1382,10 @@ const terrainFetchEvents = {
     console.error('Fetch error:', error);
   },
   onSettled() {
-    // Drain accumulated dt so the next render frame doesn't lurch the camera.
-    clock.getDelta();
+    // Do not read the movement clock here. Fetch callbacks can settle between
+    // animation frames, and draining it would silently discard travel time.
+    // Demand-render startup already resets the clock after a genuinely idle
+    // period via configureDemandRendering.onStart.
     requestRender();
   },
 };
@@ -1803,6 +1852,12 @@ function updateHud() {
   const gridlinesLine = gridlinesRuntime.active
     ? 'gridlines: <span id="gridlinesModeLink" style="color:#8f8;text-decoration:underline;cursor:pointer;pointer-events:auto">ON</span>'
     : 'gridlines: <span id="gridlinesModeLink" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">off</span>';
+  const waterOverlayLine = textureStreamer.waterDebug
+    ? 'pink water: <span id="waterOverlayLink" style="color:#ff2aa1;text-decoration:underline;cursor:pointer;pointer-events:auto">ON</span>'
+    : 'pink water: <span id="waterOverlayLink" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">off</span>';
+  const hydrographyOverlayLine = textureStreamer.hydroDebug
+    ? 'Åbent Land: <span id="hydrographyOverlayLink" style="color:#008cff;text-decoration:underline;cursor:pointer;pointer-events:auto">BLUE</span>'
+    : 'Åbent Land: <span id="hydrographyOverlayLink" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">off</span>';
   const renderBackendLabel = backend === 'webgpu' ? 'WebGPU' : 'WebGL';
   const nextRenderBackendLabel = backend === 'webgpu' ? 'WebGL' : 'WebGPU';
   const roadDebugColor = textureStreamer.roadDebug ? '#ff3b30' : '#0af';
@@ -1815,7 +1870,7 @@ function updateHud() {
     gameClockState.lastSavedAtMs = now;
     localStorage.setItem(GAME_CLOCK_STORAGE_KEY, String(gameDate.getTime()));
   }
-  renderGameClock(gameClockEl, gameDate, gameClockState.running);
+  renderGameClock(gameClockEl, gameDate, gameClockState.running, gameClockState.timeScale);
 
   const hudHtml = [
     '<b>Clouds Terrain Managed Flask UX WIP</b>',
@@ -1834,6 +1889,8 @@ function updateHud() {
     hmLine,
     texLine,
     gridlinesLine,
+    waterOverlayLine,
+    hydrographyOverlayLine,
     vehicleRuntime.vehicleControlActive
       ? 'W/S drive, A/D steer, mouse orbit camera, Esc exits vehicle control'
       : 'WASD or Arrows move, Q/Z altitude, drag look',
@@ -1842,6 +1899,7 @@ function updateHud() {
       ` · <span id="seamModeLink" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">${controls.seamMode ? '3D view' : 'seam view'}</span>` +
       ` · <span id="heatmapModeLink" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">${heatmapRuntime?.active ? '3D view' : 'heatmap'}</span>` +
       ' · Google 3D (G)' +
+      ' · fast time 03:00–03:00 (P)' +
       ` · <span id="roadDebugLink" style="color:${roadDebugColor};text-decoration:underline;cursor:pointer;pointer-events:auto">${roadDebugLabel}</span>` +
       ' · <span id="resetViewLink" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">reset</span>' +
       ' · <span id="debugLogLink" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">debug log</span>'
@@ -2036,6 +2094,28 @@ function toggleGridlines() {
   gridlinesRuntime.toggle();
 }
 
+function toggleWaterOverlay() {
+  if (controls.mapMode) return false;
+  const active = textureStreamer.setWaterDebug(!textureStreamer.waterDebug);
+  terrainTileSet.resetTextureApplications();
+  terrainTileSet.refreshTextures();
+  enqueueClientLog('info', 'water.debug.toggle', { active });
+  updateHud();
+  requestRender();
+  return active;
+}
+
+function toggleHydrographyOverlay() {
+  if (controls.mapMode) return false;
+  const active = textureStreamer.setHydroDebug(!textureStreamer.hydroDebug);
+  terrainTileSet.resetTextureApplications();
+  terrainTileSet.refreshTextures();
+  enqueueClientLog('info', 'hydrography.debug.toggle', { active });
+  updateHud();
+  requestRender();
+  return active;
+}
+
 installTerrainKeyboardControls({
   controls,
   isVehicleActive: () => vehicleRuntime.vehicleControlActive,
@@ -2050,6 +2130,7 @@ installTerrainKeyboardControls({
   onToggleMap: toggleMapMode,
   onOpenGoogleMaps: openGoogleMapsView,
   onFlyToTile: promptFlyToTile,
+  onStartFastTime: startFastTime,
   onToggleHeadlights: () => {
     for (const light of vehicleRuntime.vehicleHeadlightSpots) light.visible = !light.visible;
   },
@@ -2244,15 +2325,22 @@ updateMapCamera();
 updateHud();
 
 function render() {
-  const dt = Math.min(0.05, clock.getDelta());
+  const elapsedDt = clock.getDelta();
+  // Movement consumes the entire wall-clock interval. If rendering stalls,
+  // intermediate simulation states are advanced without rendering and this
+  // frame presents only the current camera/vehicle position.
+  advanceRealtimeMovement(elapsedDt, updateMovement);
+  // Purely visual simulations may drop stale time to avoid a large unstable
+  // water or suspension step after a delayed frame.
+  const dt = Math.min(MAX_REALTIME_STEP_SECONDS, elapsedDt);
   const nowMs = performance.now();
   fpsCounter.frame(nowMs);
   if (gameClockState.running) {
     currentDate.setTime(getGameDateFromBrowserTime().getTime());
   }
   applyDate(currentDate, { force: false });
-  updateMovement(dt);
   applyCameraOrientation();
+  recalibrateCloudWindForCamera();
   rebuildTerrainDemandForViewDirection();
   updateHud();
   syncMapModePresentation();
@@ -2264,7 +2352,8 @@ function render() {
 
   waterRuntime.update({
     dt, camera,
-    visible: waterParams.enabled && !controls.mapMode,
+    visible: waterParams.enabled && !controls.mapMode
+      && !textureStreamer.waterDebug && !textureStreamer.hydroDebug,
   });
 
   // Terrain streaming: check if camera moved far enough to re-fetch

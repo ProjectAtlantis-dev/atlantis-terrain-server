@@ -1,11 +1,13 @@
-"""Official Greenland coastline mask from the public Open Land map service.
+"""Greenland tidal coastline and separately retained Open Land hydrography.
 
 The ASIAQ technical basemap contains an excellent ``KYSTLINJE`` layer, but its
 free downloads cover towns and settlements only (the Nuuk file is roughly
-8 x 9 km).  The Greenland Government's public ``gl_aabent_land`` service is
-the fjord-wide GTK50 map and is therefore the coastline authority used here.
+8 x 9 km). Dataforsyningen's GTK50 ``tidalwater_s`` vectors are the sea
+authority used for terrain. The Government of Greenland's rendered
+``gl_aabent_land`` WMS contains useful lakes and watercourses too, so its blue
+water pixels are retained as hydrography but never treated as tidal sea.
 
-The service is a rendered WMS rather than a feature service.  We request an
+The WMS is rendered rather than a feature service. We request an
 oversampled map and classify its distinctive blue water fill, then aggregate
 each block down to one terrain vertex.  Oversampling makes labels, grid lines,
 and contours minority pixels instead of holes in the water mask.
@@ -19,6 +21,7 @@ import threading
 import urllib.parse
 import urllib.request
 import zlib
+from typing import cast
 
 import numpy as np
 from PIL import Image
@@ -29,13 +32,15 @@ from colored_log import get_logger
 log_coast = get_logger("terrain.coastline")
 
 OFFICIAL_COASTLINE_VERSION = 1
-OFFICIAL_COASTLINE_SOURCE = "govmin_gl_aabent_land"
+HYDROGRAPHY_SOURCE = "govmin_gl_aabent_land"
+OFFICIAL_COASTLINE_SOURCE = HYDROGRAPHY_SOURCE  # compatibility alias
 
 # Masked water is dropped below sea level at read time so a sea-level water
 # surface has volume above the seabed. Bump WATER_FLOOR_VERSION whenever the
 # derived geometry changes: open_db() flushes every cached seam on mismatch.
 WATER_FLOOR_DROP_M = 3.0
-WATER_FLOOR_VERSION = 3
+WATER_FLOOR_VERSION = 5
+SEA_SEED_MAX_ELEV_M = 0.5
 _WMS_URL = "https://gis.govmin.gl/geoserver/wms"
 _WMS_LAYER = "Greenland:gl_aabent_land"
 _OVERSAMPLE = 8
@@ -45,6 +50,8 @@ _OVERSAMPLE = 8
 # /api/tiles request.
 _logged_effective_tiles: set[str] = set()
 _logged_effective_tiles_lock = threading.Lock()
+_connected_hydro_cache: dict[tuple[str, int], tuple[tuple, dict[str, np.ndarray]]] = {}
+_connected_hydro_cache_lock = threading.Lock()
 
 
 def _fetch_url(url: str, timeout: int = 30) -> bytes:
@@ -71,8 +78,8 @@ def _water_pixels(rgb: np.ndarray) -> np.ndarray:
 def fetch_official_water_mask(bbox, resolution: int) -> np.ndarray | None:
     """Return a south-first boolean sea mask for an EPSG:3413 bbox.
 
-    ``None`` means the remote authority was unavailable or returned an invalid
-    response.  Callers must retain the unmodified DEM in that case.
+    ``None`` means the remote hydrography service was unavailable or returned
+    an invalid response. Callers must retain the unmodified DEM in that case.
     """
     sample_resolution = resolution * _OVERSAMPLE
     params = {
@@ -130,18 +137,19 @@ def apply_water_mask(heightmap, water):
     return result
 
 
-def write_water_mask(
+def _write_mask(
     db,
+    table: str,
     tile_id: str,
     water,
-    source: str = OFFICIAL_COASTLINE_SOURCE,
-    version: int = OFFICIAL_COASTLINE_VERSION,
+    source: str,
+    version: int,
 ) -> None:
     mask = np.asarray(water, dtype=np.uint8)
     if mask.ndim != 2:
         raise ValueError("water mask must be a 2D array")
     db.execute(
-        "INSERT INTO coastline_masks "
+        f"INSERT INTO {table} "
         "(tile_id, width, height, mask, source, version, updated_at) "
         "VALUES (?, ?, ?, ?, ?, ?, ?) "
         "ON CONFLICT(tile_id) DO UPDATE SET width=excluded.width, "
@@ -157,17 +165,126 @@ def write_water_mask(
             datetime.datetime.now(datetime.timezone.utc).isoformat(),
         ),
     )
+    db.commit()
+    with _connected_hydro_cache_lock:
+        _connected_hydro_cache.clear()
+
+
+def write_water_mask(db, tile_id: str, water, source="gtk50_vector", version=2) -> None:
+    """Store an authoritative tidal-sea mask used by terrain rendering."""
+    _write_mask(db, "coastline_masks", tile_id, water, source, version)
     # The canonical DEM did not change, but its derived render edge may have.
-    # Cached seams must therefore be rebuilt against the new mask.
     from terrain_seams import invalidate_tile_seams
 
     invalidate_tile_seams(db, tile_id)
     db.commit()
 
 
+def write_hydrography_mask(
+    db, tile_id: str, water,
+    source: str = HYDROGRAPHY_SOURCE,
+    version: int = OFFICIAL_COASTLINE_VERSION,
+) -> None:
+    """Store general WMS hydrography without granting it sea authority."""
+    _write_mask(db, "hydrography_masks", tile_id, water, source, version)
+
+
 def read_water_mask(db, tile_id: str) -> np.ndarray | None:
+    """Authoritative tidal sea plus Åbent Land water connected to that sea."""
+    authoritative = _read_mask(db, "coastline_masks", tile_id)
+    hydro = _read_mask(db, "hydrography_masks", tile_id)
+    if hydro is None:
+        return authoritative
+    connected = _connected_hydrography_for_tile(db, tile_id)
+    if connected is None or not np.any(connected):
+        return authoritative
+    if authoritative is None:
+        return connected
+    if authoritative.shape != connected.shape:
+        raise ValueError(
+            f"coastline/hydrography mask shape mismatch for {tile_id}: "
+            f"{authoritative.shape} vs {connected.shape}"
+        )
+    return authoritative | connected
+
+
+def read_hydrography_mask(db, tile_id: str) -> np.ndarray | None:
+    """Read Åbent Land hydrography at the requested terrain tile LOD.
+
+    Hydrography is currently ingested at depth 12, but texture demand includes
+    coarser parents. Assemble those parents from their nearest stored
+    descendants so the BLUE diagnostic does not silently disappear with LOD.
+    """
+    exact = _read_mask(db, "hydrography_masks", tile_id)
+    if exact is not None:
+        return exact
+
+    parts = tile_id.split("-")
+    if len(parts) != 3:
+        return None
+    try:
+        depth, column, row = (int(value) for value in parts)
+    except ValueError:
+        return None
+
+    max_depth_row = db.execute(
+        "SELECT MAX(t.depth) FROM hydrography_masks m "
+        "JOIN tiles t ON t.tile_id = m.tile_id"
+    ).fetchone()
+    max_depth = (
+        int(max_depth_row[0])
+        if max_depth_row and max_depth_row[0] is not None
+        else depth
+    )
+    for descendant_depth in range(depth + 1, max_depth + 1):
+        scale = 1 << (descendant_depth - depth)
+        rows = db.execute(
+            "SELECT t.col, t.row, m.width, m.height, m.mask "
+            "FROM hydrography_masks m JOIN tiles t ON t.tile_id = m.tile_id "
+            "WHERE t.depth = ? AND t.col BETWEEN ? AND ? "
+            "AND t.row BETWEEN ? AND ?",
+            (
+                descendant_depth,
+                column * scale, (column + 1) * scale - 1,
+                row * scale, (row + 1) * scale - 1,
+            ),
+        ).fetchall()
+        if not rows:
+            continue
+
+        # Terrain masks have shared edge samples (normally 65x65). Project
+        # every positive descendant sample to its nearest parent sample with
+        # OR/max semantics, preserving narrow cartographic strokes.
+        output_width = int(rows[0][2])
+        output_height = int(rows[0][3])
+        output = np.zeros((output_height, output_width), dtype=bool)
+        for child_column, child_row, width, height, blob in rows:
+            width, height = int(width), int(height)
+            values = np.frombuffer(zlib.decompress(blob), dtype=np.uint8)
+            if values.size != width * height:
+                continue
+            child = values.reshape((height, width)).astype(bool)
+            child_y, child_x = np.nonzero(child)
+            if child_x.size == 0:
+                continue
+            offset_x = int(child_column) - column * scale
+            offset_y = int(child_row) - row * scale
+            parent_x = np.rint(
+                (offset_x * (width - 1) + child_x) * (output_width - 1)
+                / (scale * (width - 1))
+            ).astype(np.intp)
+            parent_y = np.rint(
+                (offset_y * (height - 1) + child_y) * (output_height - 1)
+                / (scale * (height - 1))
+            ).astype(np.intp)
+            output[parent_y, parent_x] = True
+        return output if np.any(output) else None
+    return None
+
+
+def _read_mask(db, table: str, tile_id: str) -> np.ndarray | None:
     row = db.execute(
-        "SELECT width, height, mask FROM coastline_masks WHERE tile_id = ?",
+        f"SELECT width, height, mask FROM {table} WHERE tile_id = ?",
         (tile_id,),
     ).fetchone()
     if row is None:
@@ -180,6 +297,179 @@ def read_water_mask(db, tile_id: str) -> np.ndarray | None:
             f"expected {width * height}"
         )
     return values.reshape((height, width)).astype(bool)
+
+
+def _mask_rows_at_depth(db, table: str, depth: int):
+    rows = db.execute(
+        f"SELECT m.tile_id, t.col, t.row, m.width, m.height, m.mask, "
+        f"t.heightmap "
+        f"FROM {table} m JOIN tiles t ON t.tile_id = m.tile_id "
+        "WHERE t.depth = ?",
+        (depth,),
+    ).fetchall()
+    result = {}
+    for tile_id, col, row, width, height, blob, heightmap_blob in rows:
+        values = np.frombuffer(zlib.decompress(blob), dtype=np.uint8)
+        if values.size != int(width) * int(height):
+            continue
+        result[(int(col), int(row))] = (
+            tile_id,
+            values.reshape((int(height), int(width))).astype(bool),
+            heightmap_blob,
+        )
+    return result
+
+
+def _connectivity_signature(db, depth: int) -> tuple:
+    mask_signature = tuple(
+        value
+        for table in ("coastline_masks", "hydrography_masks")
+        for value in db.execute(
+            f"SELECT COUNT(*), COALESCE(MAX(m.updated_at), '') "
+            f"FROM {table} m JOIN tiles t ON t.tile_id = m.tile_id "
+            "WHERE t.depth = ?",
+            (depth,),
+        ).fetchone()
+    )
+    terrain_signature = db.execute(
+        "SELECT COUNT(*), COALESCE(MAX(t.updated_at), '') "
+        "FROM hydrography_masks m JOIN tiles t ON t.tile_id = m.tile_id "
+        "WHERE t.depth = ?",
+        (depth,),
+    ).fetchone()
+    return mask_signature + tuple(terrain_signature)
+
+
+def _database_cache_key(db, depth: int) -> tuple[str, int]:
+    path = db.execute("PRAGMA database_list").fetchone()[2]
+    return (path or f":memory:{id(db)}", depth)
+
+
+def _build_connected_hydrography(db, depth: int) -> dict[str, np.ndarray]:
+    """Flood Åbent Land components from trusted GTK50 tidal-sea edges.
+
+    Connectivity is four-neighbour and crosses only matching samples on exact
+    shared tile edges. Narrow dashed creek strokes therefore cannot bridge
+    gaps or carry the sea flood uphill.
+    """
+    from scipy.ndimage import label
+
+    hydro = _mask_rows_at_depth(db, "hydrography_masks", depth)
+    coast = _mask_rows_at_depth(db, "coastline_masks", depth)
+    structure = np.asarray([[0, 1, 0], [1, 1, 1], [0, 1, 0]], dtype=np.uint8)
+    labeled = {}
+    component_count = 0
+    for address, (tile_id, mask, _) in hydro.items():
+        labels, count = cast(
+            tuple[np.ndarray, int], label(mask, structure=structure),
+        )
+        labeled[address] = (tile_id, mask, labels, count, component_count)
+        component_count += count
+    if component_count == 0:
+        return {
+            tile_id: np.zeros_like(mask)
+            for tile_id, mask, _ in hydro.values()
+        }
+
+    parent = np.arange(component_count, dtype=np.int32)
+    seeded = np.zeros(component_count, dtype=bool)
+
+    def find(value: int) -> int:
+        while parent[value] != value:
+            parent[value] = parent[parent[value]]
+            value = int(parent[value])
+        return value
+
+    def union(left: int, right: int) -> None:
+        left_root, right_root = find(left), find(right)
+        if left_root != right_root:
+            parent[right_root] = left_root
+
+    def component_ids(entry, values):
+        labels, base = entry[2], entry[4]
+        local = np.unique(labels[values])
+        return base + local[local > 0] - 1
+
+    for (col, row), entry in labeled.items():
+        _, mask, labels, _, base = entry
+        heightmap_blob = hydro[(col, row)][2]
+        if heightmap_blob is not None:
+            heightmap = np.frombuffer(
+                zlib.decompress(heightmap_blob), dtype=np.float32,
+            )
+            if heightmap.size == mask.size:
+                heightmap = heightmap.reshape(mask.shape)
+                finite = heightmap[np.isfinite(heightmap)]
+                # Only an entirely sea-level tile seeds the WMS component.
+                # A low creek/lake sample inside otherwise elevated terrain
+                # cannot independently grant itself tidal authority.
+                if finite.size and float(np.max(finite)) <= SEA_SEED_MAX_ELEV_M:
+                    for node in component_ids(entry, mask):
+                        seeded[int(node)] = True
+
+        same_coast = coast.get((col, row))
+        if same_coast is not None and same_coast[1].shape == mask.shape:
+            for node in component_ids(entry, mask & same_coast[1]):
+                seeded[int(node)] = True
+
+        for dc, dr, own_edge, other_edge in (
+            (1, 0, (slice(None), -1), (slice(None), 0)),
+            (0, 1, (-1, slice(None)), (0, slice(None))),
+        ):
+            neighbor = labeled.get((col + dc, row + dr))
+            if neighbor is not None:
+                touching = mask[own_edge] & neighbor[1][other_edge]
+                own_labels = labels[own_edge][touching]
+                neighbor_labels = neighbor[2][other_edge][touching]
+                for own_label, neighbor_label in zip(own_labels, neighbor_labels):
+                    union(base + int(own_label) - 1, neighbor[4] + int(neighbor_label) - 1)
+
+        for dc, dr, own_edge, coast_edge in (
+            (-1, 0, (slice(None), 0), (slice(None), -1)),
+            (1, 0, (slice(None), -1), (slice(None), 0)),
+            (0, -1, (0, slice(None)), (-1, slice(None))),
+            (0, 1, (-1, slice(None)), (0, slice(None))),
+        ):
+            neighbor_coast = coast.get((col + dc, row + dr))
+            if neighbor_coast is None:
+                continue
+            coast_mask = neighbor_coast[1]
+            if mask[own_edge].shape != coast_mask[coast_edge].shape:
+                continue
+            touching = mask[own_edge] & coast_mask[coast_edge]
+            for own_label in np.unique(labels[own_edge][touching]):
+                if own_label > 0:
+                    seeded[base + int(own_label) - 1] = True
+
+    seed_roots = {find(int(index)) for index in np.flatnonzero(seeded)}
+    result = {}
+    for tile_id, mask, labels, count, base in labeled.values():
+        accepted = [
+            local_label for local_label in range(1, count + 1)
+            if find(base + local_label - 1) in seed_roots
+        ]
+        result[tile_id] = np.isin(labels, accepted) if accepted else np.zeros_like(mask)
+    return result
+
+
+def _connected_hydrography_for_tile(db, tile_id: str) -> np.ndarray | None:
+    row = db.execute(
+        "SELECT depth FROM tiles WHERE tile_id = ?", (tile_id,)
+    ).fetchone()
+    if row is None:
+        return None
+    depth = int(row[0])
+    key = _database_cache_key(db, depth)
+    signature = _connectivity_signature(db, depth)
+    with _connected_hydro_cache_lock:
+        cached = _connected_hydro_cache.get(key)
+    if cached is None or cached[0] != signature:
+        masks = _build_connected_hydrography(db, depth)
+        with _connected_hydro_cache_lock:
+            _connected_hydro_cache[key] = (signature, masks)
+    else:
+        masks = cached[1]
+    return masks.get(tile_id)
 
 
 def cache_official_water_mask(db, tile_id: str, bbox=None, resolution=65):
@@ -201,8 +491,11 @@ def cache_official_water_mask(db, tile_id: str, bbox=None, resolution=65):
             return water
     water = fetch_official_water_mask(bbox, resolution)
     if water is not None:
-        write_water_mask(db, tile_id, water)
-    return water
+        write_hydrography_mask(db, tile_id, water)
+    # The rendered map also contains lakes and watercourses. Retain it as raw
+    # hydrography; only a separately proven flood-connected component can
+    # later participate in the effective tidal mask.
+    return None
 
 
 def ensure_water_floor_version(db) -> None:
@@ -251,7 +544,7 @@ def effective_heightmap(db, tile_id: str, raw_heightmap):
     if should_log:
         raw = np.asarray(raw_heightmap, dtype=np.float32)
         finite_water = water & np.isfinite(raw)
-        raised_water = finite_water & (raw > 0.0)
+        clamped_water = finite_water & (raw > -WATER_FLOOR_DROP_M)
         source_row = db.execute(
             "SELECT source FROM coastline_masks WHERE tile_id = ?", (tile_id,)
         ).fetchone()
@@ -262,7 +555,7 @@ def effective_heightmap(db, tile_id: str, raw_heightmap):
         log_coast.info(
             f"[coastline-apply] tile={tile_id} source={mask_source} "
             f"water_vertices={int(np.sum(water))} "
-            f"clamped_vertices={int(np.sum(raised_water))} "
+            f"clamped_vertices={int(np.sum(clamped_water))} "
             f"raw_water_max_m={raw_water_max:.3f}"
         )
     return result

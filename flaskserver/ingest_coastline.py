@@ -1,9 +1,9 @@
 """Download Åbent Land Grønland 1:50k vector blocks for shoreline masks.
 
 Fetches GL50 GeoPackages from the Dataforsyningen Databoks FTPS into
-``gtk50_blocks/``. Once a block is local, ``coastline.py`` builds sea
-masks from its vectors instead of decoding the rendered WMS map — the
-masks themselves are still created lazily per tile as terrain streams in.
+``gtk50_blocks/``. Once a block is local, ``coastline.py`` builds authoritative
+sea masks from its vectors. Rendered-WMS lakes and watercourses remain in a
+separate hydrography store. Masks are created lazily as terrain streams in.
 
 Usage:
     ./venv/bin/python ingest_coastline.py 71_-1 71_-2
@@ -91,7 +91,9 @@ def _refresh_cached_masks() -> None:
     db = sqlite3.connect(str(Path(__file__).parent / "terrain.db"))
     rows = db.execute(
         "SELECT m.tile_id, t.x_min, t.y_min, t.x_max, t.y_max "
-        "FROM coastline_masks m JOIN tiles t ON t.tile_id = m.tile_id"
+        "FROM (SELECT tile_id FROM coastline_masks UNION "
+        "SELECT tile_id FROM hydrography_masks) m "
+        "JOIN tiles t ON t.tile_id = m.tile_id"
     ).fetchall()
     todo = [
         (tile_id, (x0, y0, x1, y1))
@@ -146,8 +148,8 @@ def ensure_gtk50_blocks() -> None:
             f"GTK50 VECTOR COASTLINE BLOCKS MISSING: {', '.join(missing)}\n"
             "No Dataforsyningen account login found (DATAFORSYNINGEN_FTP_USER /\n"
             "DATAFORSYNINGEN_FTP_PASS in flaskserver/.env), so they cannot be\n"
-            "downloaded. Coastline masks will fall back to decoding the rendered\n"
-            "WMS map — expect phantom lakes at altitude and narrow-fjord dropouts.\n"
+            "downloaded. Rendered WMS hydrography will still be retained, but it\n"
+            "is not trusted as sea because it includes lakes and watercourses.\n"
             "Fix: create a free account at https://dataforsyningen.dk, put the\n"
             "login in flaskserver/.env, and restart. Or run manually:\n"
             f"  ./venv/bin/python ingest_coastline.py {' '.join(missing)}\n"

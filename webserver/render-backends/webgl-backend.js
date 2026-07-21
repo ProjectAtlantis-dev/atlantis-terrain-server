@@ -68,11 +68,11 @@ export function createTerrainBackend({
     createWater(options) { return createWebGLWater({ renderer, ...options }); },
     prepareUntexturedTerrain(mesh) {
       if (!mesh?.material || mesh.material.map) return;
-      if (mesh.material.vertexColors) {
-        mesh.material.vertexColors = false;
+      if (!mesh.material.vertexColors) {
+        mesh.material.vertexColors = true;
         mesh.material.needsUpdate = true;
       }
-      mesh.material.color.set(0x29313a);
+      mesh.material.color.set(0xffffff);
       backend.markSceneMutated();
     },
     setTakramCloudsEnabled(enabled) {
@@ -95,8 +95,8 @@ export function createTerrainBackend({
       backend.markSceneMutated();
       backend.requestRender();
     },
-    configureScenePipeline({ scene, camera, normalPass, cloudsEffect, aerialPerspective, sunDirection }) {
-      lensFlare.configure({ camera, sunDirection });
+    configureScenePipeline({ scene, camera, normalPass, cloudsEffect, aerialPerspective, sunDirection, up }) {
+      lensFlare.configure({ camera, sunDirection, surfaceUp: up });
       cloudsEffectRef = cloudsEffect;
       aerialPerspectiveRef = aerialPerspective;
       // IMPORTANT — verified visual regression fix:

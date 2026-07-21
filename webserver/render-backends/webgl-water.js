@@ -19,7 +19,7 @@ import {
 //     the dropped seabed carries the satellite imagery OF the water, so the
 //     surface lets it show through — colour inheritance is per-pixel and
 //     free, with veil/reflection/glint composited on top. Depth read by
-//     the post passes is the seabed, 10 m below the surface — negligible.
+//     the post passes is the seabed, 3 m below the surface — negligible.
 
 const SKY_GLSL = /* glsl */ `
   vec3 skyColor(vec3 dir, vec3 sunDir, vec3 horizonWarm, vec3 horizonCool, vec3 zenithCol, vec3 sunCol, float cloud) {
@@ -28,7 +28,10 @@ const SKY_GLSL = /* glsl */ `
     vec2 dh = normalize(dir.xy + vec2(1e-5, 0.0));
     vec2 sh = normalize(sunDir.xy + vec2(1e-5, 0.0));
     float az = 0.5 + 0.5 * dot(dh, sh);
-    vec3 horizonCol = mix(horizonCool, horizonWarm, az * az);
+    // Keep the orange sunset reflection in a narrow sunward lane so the
+    // violet off-axis sky remains visible on both sides of the glitter path.
+    float sunward = pow(az, 6.0);
+    vec3 horizonCol = mix(horizonCool, horizonWarm, sunward);
     vec3 col = mix(horizonCol, zenithCol, pow(t, 0.48));
     float sd = max(dot(dir, sunDir), 0.0);
     // sun disk + circumsolar haze; cloud diffuses the disk away

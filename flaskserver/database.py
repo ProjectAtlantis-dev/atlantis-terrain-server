@@ -42,7 +42,7 @@ CONFIDENCE = {
 }
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 _SCHEMA_VERSION_KEY = "schema_version"
 
 
@@ -108,6 +108,21 @@ CREATE TABLE IF NOT EXISTS metadata (
 );
 
 CREATE TABLE IF NOT EXISTS coastline_masks (
+    tile_id    TEXT PRIMARY KEY,
+    width      INTEGER NOT NULL CHECK (width > 0),
+    height     INTEGER NOT NULL CHECK (height > 0),
+    mask       BLOB NOT NULL,
+    source     TEXT NOT NULL,
+    version    INTEGER NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY (tile_id) REFERENCES tiles(tile_id) ON DELETE CASCADE
+);
+
+-- Åbent Land's rendered WMS exposes useful general hydrography, including
+-- lakes and watercourses. Keep the raw source separate so only components
+-- flood-connected to trusted tidal masks or a wholly sea-level DEM tile can
+-- participate in sea flattening.
+CREATE TABLE IF NOT EXISTS hydrography_masks (
     tile_id    TEXT PRIMARY KEY,
     width      INTEGER NOT NULL CHECK (width > 0),
     height     INTEGER NOT NULL CHECK (height > 0),
@@ -252,6 +267,44 @@ def _migrate_to_v3(db):
         )
 
 
+def _migrate_to_v4(db):
+    """Separate rendered-WMS hydrography from tidal coastline authority."""
+    source = "govmin_gl_aabent_land"
+    tile_ids = [
+        row[0] for row in db.execute(
+            "SELECT tile_id FROM coastline_masks WHERE source = ?", (source,)
+        )
+    ]
+    if not tile_ids:
+        return
+    db.execute(
+        "INSERT OR REPLACE INTO hydrography_masks "
+        "(tile_id, width, height, mask, source, version, updated_at) "
+        "SELECT tile_id, width, height, mask, source, version, updated_at "
+        "FROM coastline_masks WHERE source = ?",
+        (source,),
+    )
+    db.execute("DELETE FROM coastline_masks WHERE source = ?", (source,))
+    tables = {
+        row[0] for row in db.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        )
+    }
+    if "classifier_tiles" in tables:
+        db.executemany(
+            "DELETE FROM classifier_tiles WHERE tile_id = ?",
+            ((tile_id,) for tile_id in tile_ids),
+        )
+    if "terrain_seam_cache" in tables:
+        db.executemany(
+            "DELETE FROM terrain_seam_cache WHERE tile_a = ? OR tile_b = ?",
+            ((tile_id, tile_id) for tile_id in tile_ids),
+        )
+    log_db.info(
+        f"Separated {len(tile_ids)} Åbent Land hydrography masks from tidal coastline masks"
+    )
+
+
 def _migrate_schema(db):
     row = db.execute(
         "SELECT value FROM metadata WHERE key = ?", (_SCHEMA_VERSION_KEY,)
@@ -281,6 +334,13 @@ def _migrate_schema(db):
         db.execute(
             "INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)",
             (_SCHEMA_VERSION_KEY, "3"),
+        )
+        version = 3
+    if version < 4:
+        _migrate_to_v4(db)
+        db.execute(
+            "INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)",
+            (_SCHEMA_VERSION_KEY, "4"),
         )
 
 

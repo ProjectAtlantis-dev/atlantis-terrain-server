@@ -46,6 +46,8 @@ export function createWebGLGpuProfiler(renderer, {
   let activeRenderInfo = null;
   let frame = 0;
   let samplingFrame = false;
+  let samplingWholeFrame = false;
+  let sampledFrameCount = 0;
   let isEnabled = Boolean(enabled && supported);
   let interval = Math.max(1, Math.round(sampleInterval));
   let maxHistory = Math.max(1, Math.round(historySize));
@@ -107,16 +109,26 @@ export function createWebGLGpuProfiler(renderer, {
       renderer.info.autoReset = false;
       renderer.info.reset?.();
     }
+    if (samplingFrame) {
+      sampledFrameCount += 1;
+      samplingWholeFrame = sampledFrameCount % 2 === 0;
+      if (samplingWholeFrame) beginPass('whole-frame');
+    }
   }
 
   function endFrame() {
     if (activeQuery != null) endPass();
     samplingFrame = false;
+    samplingWholeFrame = false;
     restoreRenderInfoReset();
   }
 
   function beginPass(name) {
-    if (!samplingFrame || activeQuery != null) return false;
+    if (
+      !samplingFrame
+      || activeQuery != null
+      || (samplingWholeFrame && name !== 'whole-frame')
+    ) return false;
     const query = gl.createQuery();
     if (query == null) return false;
     activeQuery = query;
@@ -170,12 +182,13 @@ export function createWebGLGpuProfiler(renderer, {
         latestTriangles: latest.triangles,
         latestFrame: latest.frame,
       };
-      measuredTotalMs += summary.averageMs;
+      if (name !== 'whole-frame') measuredTotalMs += summary.averageMs;
       passes[name] = summary;
     }
     for (const summary of Object.values(passes)) {
       summary.percent = measuredTotalMs > 0 ? summary.averageMs / measuredTotalMs * 100 : 0;
     }
+    if (passes['whole-frame'] != null) passes['whole-frame'].percent = 100;
     return {
       supported,
       enabled: isEnabled,
@@ -183,6 +196,7 @@ export function createWebGLGpuProfiler(renderer, {
       pendingQueries: pending.length,
       disjointCount,
       measuredTotalAverageMs: measuredTotalMs,
+      wholeFrameAverageMs: passes['whole-frame']?.averageMs ?? null,
       passes,
     };
   }

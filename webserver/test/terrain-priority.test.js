@@ -30,7 +30,10 @@ import { createTerrainFetchRuntime } from '../terrain-fetch-runtime.js';
 import { restoreTerrainCameraState, terrainCameraState } from '../terrain-camera-state.js';
 import { createTerrainClientLogger } from '../terrain-client-logging.js';
 import { createTerrainFpsCounter } from '../terrain-fps-counter.js';
-import { projectSunDirectionToUv } from '../terrain-sun-flare-effect.js';
+import {
+  projectSunDirectionToUv,
+  sunFlareElevationVisibility,
+} from '../terrain-sun-flare-effect.js';
 import { loadTerrainStartupAssets, normalizeTerrainStartupAssets } from '../terrain-startup-assets.js';
 import { createTerrainAtmosphereTextureRuntime } from '../terrain-atmosphere-textures.js';
 import { createTerrainGridlinesController } from '../terrain-gridlines.js';
@@ -38,6 +41,7 @@ import { createTerrainTuningControls } from '../terrain-tuning-controls.js';
 import { waterCascadeUpdateDue, waterCascadeUpdateRate } from '../water/water-spectrum.js';
 import {
   bindTerrainCloudComposition,
+  cloudWeatherUvVelocity,
   configureTerrainClouds,
   invalidateTerrainCloudHistory,
   installTerrainCloudHistoryReset,
@@ -68,16 +72,24 @@ test('gridlines batch terrain-conforming tile edges without replacing textures',
   const mesh = new THREE.Mesh(geometry, new THREE.MeshBasicMaterial({ map: {} }));
   mesh.userData = { tileId: '1-0-0', resolution: 2 };
   terrainRoot.add(mesh);
+  const originalMaterial = mesh.material;
   const originalTexture = mesh.material.map;
+  const originalColor = mesh.material.color.getHex();
+  const originalVertexColors = mesh.material.vertexColors;
   const grid = createTerrainGridlinesController({ terrainRoot });
   grid.setVisible(true);
   assert.equal(grid.lines.geometry.getAttribute('position').count, 24);
   assert.equal(grid.lines.isMesh, true);
   assert.equal(grid.lines.material.side, THREE.DoubleSide);
   assert.equal(grid.lines.visible, true);
+  assert.equal(mesh.material, originalMaterial);
   assert.equal(mesh.material.map, originalTexture);
+  assert.equal(mesh.material.color.getHex(), originalColor);
+  assert.equal(mesh.material.vertexColors, originalVertexColors);
   grid.setVisible(false);
   assert.equal(grid.lines.visible, false);
+  assert.equal(mesh.material, originalMaterial);
+  assert.equal(mesh.material.map, originalTexture);
 });
 
 test('water cascade pacing slows long and aerial waves without starving updates', () => {
@@ -111,6 +123,20 @@ test('analytic sun flare projects a moving world direction into screen space', (
   assert.ok(Math.abs(uv.x - 0.5) < 1e-12);
   assert.ok(Math.abs(uv.y - 0.5) < 1e-12);
   assert.equal(projectSunDirectionToUv(camera, new THREE.Vector3(0, 0, 1), uv), false);
+});
+
+test('analytic sun flare fades gradually through golden hour', () => {
+  const up = new THREE.Vector3(0, 0, 1);
+  const sunAtElevation = degrees => new THREE.Vector3(
+    Math.cos(THREE.MathUtils.degToRad(degrees)),
+    0,
+    Math.sin(THREE.MathUtils.degToRad(degrees)),
+  );
+  assert.ok(sunFlareElevationVisibility(sunAtElevation(2), up) < 1e-12);
+  const midFade = sunFlareElevationVisibility(sunAtElevation(9), up);
+  assert.ok(midFade > 0.2 && midFade < 0.3);
+  assert.ok(1 - sunFlareElevationVisibility(sunAtElevation(16), up) < 1e-12);
+  assert.equal(sunFlareElevationVisibility(sunAtElevation(-2), up), 0);
 });
 
 test('terrain camera persistence round-trips pose and frame state', () => {
@@ -340,24 +366,48 @@ test('shared tuning controls initialize, persist, update, and reset widgets', ()
     value: 1, min: 0, max: 4, step: 0.1, decimals: 1,
     onChange: value => changes.push(['exposure', value]),
   });
+  const altitude = tuning.slider('cloud altitude', {
+    value: 0, min: -2000, max: 5000, step: 50, decimals: 0,
+    onChange: value => changes.push(['cloud altitude', value]),
+  });
   const toggle = tuning.toggle('clouds', {
     value: true, onChange: value => changes.push(['clouds', value]),
   });
   assert.deepEqual(changes, [['exposure', 2], ['clouds', false]]);
+  assert.deepEqual(state, { exposure: 2, clouds: false, 'cloud altitude': 0 });
 
   slider.value = '3.5';
   slider.oninput();
+  altitude.value = '1250';
+  altitude.oninput();
   toggle.checked = true;
   toggle.onchange();
-  assert.deepEqual(state, { exposure: 3.5, clouds: true });
-  assert.equal(saves, 2);
+  assert.deepEqual(state, { exposure: 3.5, clouds: true, 'cloud altitude': 1250 });
+  assert.equal(saves, 3);
+
+  const restoredChanges = [];
+  const restoredTuning = createTerrainTuningControls({
+    body: documentImpl.createElement('section'),
+    state: JSON.parse(JSON.stringify(state)),
+    documentImpl,
+    save: () => {},
+  });
+  const restoredAltitude = restoredTuning.slider('cloud altitude', {
+    value: 0, min: -2000, max: 5000, step: 50, decimals: 0,
+    onChange: value => restoredChanges.push(value),
+  });
+  assert.equal(restoredAltitude.value, 1250);
+  assert.deepEqual(restoredChanges, [1250]);
 
   tuning.setSliderValue('exposure', 2.25);
   assert.equal(slider.value, 2.25);
   tuning.reset();
   assert.equal(slider.value, 1);
+  assert.equal(altitude.value, 0);
   assert.equal(toggle.checked, true);
-  assert.deepEqual(changes.slice(-2), [['exposure', 1], ['clouds', true]]);
+  assert.deepEqual(changes.slice(-3), [
+    ['exposure', 1], ['cloud altitude', 0], ['clouds', true],
+  ]);
 });
 
 test('shared cloud runtime configures layers and synchronizes atmosphere composition', () => {
@@ -366,7 +416,7 @@ test('shared cloud runtime configures layers and synchronizes atmosphere composi
   const effect = {
     cloudLayers: Array.from({ length: 4 }, () => ({})),
     localWeatherVelocity: vector(), shapeVelocity: vector(), shapeDetailVelocity: vector(),
-    shadow: {}, scatteringCoefficient: 2, absorptionCoefficient: 3,
+    clouds: {}, shadow: {}, scatteringCoefficient: 2, absorptionCoefficient: 3,
     atmosphereOverlay: 'overlay', atmosphereShadow: 'shadow', atmosphereShadowLength: 42,
     events: {
       addEventListener(type, listener) { listeners.set(type, listener); },
@@ -383,6 +433,12 @@ test('shared cloud runtime configures layers and synchronizes atmosphere composi
     effect, LocalWeather, CloudShape, CloudShapeDetail, Turbulence,
   }), { scattering: 2, absorption: 3 });
   assert.deepEqual(effect.cloudLayers.map(layer => layer.altitude), [1550, 1800, 8300, 9100]);
+  assert.deepEqual(effect.clouds, {
+    minStepSize: 20,
+    maxStepSize: 400,
+    perspectiveStepScale: 1.005,
+    maxIterationCount: 750,
+  });
   assert.equal(effect.cloudLayers[3].densityScale, 0);
   assert.deepEqual(effect.localWeatherVelocity.values, [0.00004, 0]);
   assert.ok(effect.localWeatherTexture instanceof LocalWeather);
@@ -451,6 +507,7 @@ test('cloud history invalidation seeds every temporal-upscale phase from the cur
 test('shared cloud tuning registers controls and applies altitude, cirrus, and drift changes', () => {
   const definitions = new Map();
   const sections = [];
+  let windDirection = 0;
   const effect = {
     coverage: 0.28,
     cloudLayers: [1550, 1800, 8300, 9100].map(altitude => ({
@@ -464,7 +521,7 @@ test('shared cloud tuning registers controls and applies altitude, cirrus, and d
     section: label => sections.push(label),
     slider: (label, options) => { definitions.set(label, options); return { label }; },
     toggle: (label, options) => { definitions.set(label, options); return { label }; },
-    getWindDirection: () => 0,
+    getWindDirection: () => windDirection,
   });
   assert.deepEqual(sections, ['Clouds']);
   assert.equal(definitions.size, 7);
@@ -476,11 +533,49 @@ test('shared cloud tuning registers controls and applies altitude, cirrus, and d
   assert.equal(effect.cloudLayers[3].densityScale, 0.004);
   // Drift heading is slaved to the water wind (compass "blows toward" 0 =
   // north), so speed changes re-resolve the heading instead of a dedicated
-  // direction slider. Compass north maps to +y in the weather-uv frame.
+  // direction slider. Takram offsets texture sampling, so visible northward
+  // motion requires -y in the weather-uv frame.
   definitions.get('drift speed').onChange(0.001);
   assert.ok(Math.abs(effect.localWeatherVelocity.values[0]) < 1e-12);
-  assert.ok(Math.abs(effect.localWeatherVelocity.values[1] - 0.001) < 1e-12);
+  assert.ok(Math.abs(effect.localWeatherVelocity.values[1] + 0.001) < 1e-12);
   assert.equal(typeof tuning.syncDrift, 'function');
+
+  windDirection = 90;
+  tuning.syncDrift();
+  assert.ok(Math.abs(effect.localWeatherVelocity.values[0] + 0.001) < 1e-12);
+  assert.ok(Math.abs(effect.localWeatherVelocity.values[1]) < 1e-12);
+});
+
+test('cloud weather follows compass headings through the Nuuk cube-sphere basis', () => {
+  const degrees = Math.PI / 180;
+  const longitude = -51.7216 * degrees;
+  const latitude = 64.1835 * degrees;
+  const weatherUvBasis = {
+    position: {
+      x: Math.cos(latitude) * Math.cos(longitude),
+      y: Math.cos(latitude) * Math.sin(longitude),
+      z: Math.sin(latitude),
+    },
+    east: { x: -Math.sin(longitude), y: Math.cos(longitude), z: 0 },
+    north: {
+      x: -Math.sin(latitude) * Math.cos(longitude),
+      y: -Math.sin(latitude) * Math.sin(longitude),
+      z: Math.cos(latitude),
+    },
+  };
+  const east = cloudWeatherUvVelocity({
+    compassDegrees: 90, speed: 1, weatherUvBasis,
+  });
+  // Geographic east is ~36.8 degrees in the local cube-sphere UV basis, not
+  // the texture's +u axis. The negative is the sampling-offset inversion.
+  assert.ok(Math.abs(east.x + 0.8003) < 0.001);
+  assert.ok(Math.abs(east.y + 0.5996) < 0.001);
+
+  const north = cloudWeatherUvVelocity({
+    compassDegrees: 0, speed: 1, weatherUvBasis,
+  });
+  assert.ok(Math.abs(north.x - 0.6375) < 0.001);
+  assert.ok(Math.abs(north.y + 0.7705) < 0.001);
 });
 
 test('shared cloud tuning puts the Takram rendering checkbox first in the Clouds section', () => {
@@ -1751,6 +1846,50 @@ test('road debug invalidates cached variants and marks texture requests', async 
   assert.match(requestedUrl, /roadDebug=1/);
   assert.equal(streamer.releaseStaleTexture(stale), true);
   assert.equal(stale.disposed, true);
+});
+
+test('pink water debug is independent from roads and marks texture requests', async () => {
+  let requestedUrl = null;
+  const streamer = createTextureStreamer({
+    log: () => {},
+    fetchImpl: async url => {
+      requestedUrl = url;
+      return { status: 202, ok: false };
+    },
+  });
+  assert.equal(streamer.roadDebug, false);
+  assert.equal(streamer.setWaterDebug(true), true);
+  assert.equal(streamer.roadDebug, false);
+  streamer.pump([{ tile: { id: '12-1-2', bbox: [0, 0, 1, 1] } }], {
+    isCovered: () => false,
+    onPlaceholder: () => {},
+    onTexture: () => {},
+  });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.match(requestedUrl, /waterDebug=1/);
+  assert.doesNotMatch(requestedUrl, /roadDebug=1/);
+});
+
+test('Åbent Land hydrography debug is independently requested in blue mode', async () => {
+  let requestedUrl = null;
+  const streamer = createTextureStreamer({
+    log: () => {},
+    fetchImpl: async url => {
+      requestedUrl = url;
+      return { status: 202, ok: false };
+    },
+  });
+  assert.equal(streamer.waterDebug, false);
+  assert.equal(streamer.setHydroDebug(true), true);
+  assert.equal(streamer.waterDebug, false);
+  streamer.pump([{ tile: { id: '12-1409-827', bbox: [0, 0, 1, 1] } }], {
+    isCovered: () => false,
+    onPlaceholder: () => {},
+    onTexture: () => {},
+  });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.match(requestedUrl, /hydroDebug=1/);
+  assert.doesNotMatch(requestedUrl, /waterDebug=1/);
 });
 
 test('shared texture pump records HTTP 202 retry state', async () => {

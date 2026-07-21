@@ -185,7 +185,10 @@ function skyColor(dir, sunDir, horizonWarm, horizonCool, zenithCol, sunCol, clou
   const dh = normalize(dir.xy.add(vec2(1e-5, 0.0)));
   const sh = normalize(sunDir.xy.add(vec2(1e-5, 0.0)));
   const az = dh.dot(sh).mul(0.5).add(0.5);
-  const horizonCol = mix(horizonCool, horizonWarm, az.mul(az));
+  // Keep the orange sunset reflection in a narrow sunward lane so the
+  // violet off-axis sky remains visible on both sides of the glitter path.
+  const sunward = az.pow(6.0);
+  const horizonCol = mix(horizonCool, horizonWarm, sunward);
   const col = mix(horizonCol, zenithCol, t.pow(0.48));
   const sd = dir.dot(sunDir).max(0.0);
   // sun disk + circumsolar haze; cloud diffuses the disk away
