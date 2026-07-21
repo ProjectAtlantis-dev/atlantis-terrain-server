@@ -98,7 +98,9 @@ class OfficialCoastlineTest(unittest.TestCase):
             np.testing.assert_array_equal(stored_raw, raw)
             np.testing.assert_array_equal(read_water_mask(db, "0-0-0"), water)
 
-            effective = read_tile(db, "0-0-0")["heightmap"]
+            tile = read_tile(db, "0-0-0")
+            assert tile is not None
+            effective = tile["heightmap"]
             np.testing.assert_array_equal(effective[:, :10], -WATER_FLOOR_DROP_M)
             np.testing.assert_array_equal(effective[:, 10:], 120.0)
             db.close()
@@ -207,7 +209,9 @@ class OfficialCoastlineTest(unittest.TestCase):
             np.testing.assert_array_equal(
                 read_water_mask(db, "0-0-0"), hydro,
             )
-            effective = read_tile(db, "0-0-0")["heightmap"]
+            tile = read_tile(db, "0-0-0")
+            assert tile is not None
+            effective = tile["heightmap"]
             np.testing.assert_array_equal(
                 effective[hydro], -WATER_FLOOR_DROP_M,
             )
@@ -229,6 +233,7 @@ class OfficialCoastlineTest(unittest.TestCase):
             parent = read_hydrography_mask(db, "0-0-0")
 
             self.assertIsNotNone(parent)
+            assert parent is not None
             self.assertTrue(parent[0, 0])
             self.assertTrue(parent[0, 2])
             self.assertTrue(parent[2, 4])
