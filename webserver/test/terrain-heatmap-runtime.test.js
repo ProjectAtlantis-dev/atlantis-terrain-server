@@ -21,23 +21,27 @@ class FakeElement {
   getContext() { return this.context; }
 }
 
-test('view direction immediately reranks existing heatmap tiles', () => {
+test('heatmap priority is radial and unaffected by view direction', () => {
   const tiles = [
     { id: 'north', bbox: [-10, 90, 10, 110], priority: 0, order: 0 },
     { id: 'south', bbox: [-10, -110, 10, -90], priority: 0, order: 1 },
+    { id: 'east', bbox: [190, -10, 210, 10], priority: 0, order: 2 },
   ];
 
   updateHeatmapViewPriorities(tiles, {
     cameraX: 0, cameraY: 0, yaw: 0,
   });
-  assert.deepEqual(tiles.map(tile => tile.id), ['north', 'south']);
-  assert.deepEqual(tiles.map(tile => tile.order), [0, 1]);
+  assert.deepEqual(tiles.map(tile => tile.id), ['north', 'south', 'east']);
+  assert.equal(tiles[0].priority, tiles[1].priority);
+  assert.ok(Math.abs(
+    tiles[2].priority - tiles[0].priority - Math.log(2),
+  ) < 1e-12);
 
   updateHeatmapViewPriorities(tiles, {
     cameraX: 0, cameraY: 0, yaw: Math.PI,
   });
-  assert.deepEqual(tiles.map(tile => tile.id), ['south', 'north']);
-  assert.deepEqual(tiles.map(tile => tile.order), [0, 1]);
+  assert.deepEqual(tiles.map(tile => tile.id), ['north', 'south', 'east']);
+  assert.deepEqual(tiles.map(tile => tile.order), [0, 1, 2]);
 });
 
 test('heatmap uses browser demand and never mutates its tile ordering', () => {

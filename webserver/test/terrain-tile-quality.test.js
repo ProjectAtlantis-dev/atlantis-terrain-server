@@ -4,6 +4,7 @@ import assert from 'node:assert/strict';
 import {
   classifyDemSource,
   classifyTextureTile,
+  mergeTerrainTilesAgainstCurrentHeatmap,
   retryableSyntheticDemCount,
 } from '../terrain-tile-quality.js';
 import { terrainPipelineStatus } from '../terrain-tile-fetch.js';
@@ -36,4 +37,54 @@ test('retryable synthetic heightmaps keep browser reconciliation polling alive',
     terrainPipelineStatus({ tiles, missing: [], downloading: [] }, false, 2).nextAction,
     'poll',
   );
+});
+
+test('late terrain data upgrades exact heatmap tiles without changing topology', () => {
+  const current = [
+    {
+      id: '10-381-194', source: 'arcticdem_10m', heightmap: 'current-parent',
+      texStatus: 'ready', hasTexture: true,
+    },
+    {
+      id: '11-763-389', source: 'parent_resampled', heightmap: 'synthetic',
+      texStatus: 'ancestor_fallback', texIsPlaceholder: true,
+    },
+  ];
+  const result = mergeTerrainTilesAgainstCurrentHeatmap(current, [
+    {
+      id: '12-1525-779', source: 'arcticdem_10m', heightmap: 'late-child',
+      texStatus: 'ready', hasTexture: true,
+    },
+    {
+      id: '11-763-389', source: 'arcticdem_10m', heightmap: 'real',
+      texStatus: 'ready', hasTexture: true, texIsPlaceholder: false,
+    },
+  ]);
+
+  assert.deepEqual(result.tiles.map(tile => tile.id), ['10-381-194', '11-763-389']);
+  assert.equal(result.tiles[0].heightmap, 'current-parent');
+  assert.equal(result.tiles[1].heightmap, 'real');
+  assert.equal(result.tiles[1].texStatus, 'ready');
+  assert.deepEqual(result.acceptedTileIds, ['11-763-389']);
+  assert.deepEqual(result.rejectedTileIds, ['12-1525-779']);
+  assert.equal(result.demUpgraded, 1);
+  assert.equal(result.textureUpgraded, 1);
+});
+
+test('late DEM upgrade cannot regress an exact tile ready texture', () => {
+  const result = mergeTerrainTilesAgainstCurrentHeatmap([
+    {
+      id: '11-763-389', source: 'parent_resampled', heightmap: 'synthetic',
+      texStatus: 'ready', hasTexture: true,
+    },
+  ], [
+    {
+      id: '11-763-389', source: 'arcticdem_10m', heightmap: 'real',
+      texStatus: 'ancestor_fallback', texIsPlaceholder: true,
+    },
+  ]);
+
+  assert.equal(result.tiles[0].heightmap, 'real');
+  assert.equal(result.tiles[0].texStatus, 'ready');
+  assert.equal(result.textureUpgraded, 0);
 });

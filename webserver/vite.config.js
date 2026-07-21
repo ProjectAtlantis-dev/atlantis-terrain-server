@@ -3,6 +3,8 @@ import path from 'node:path';
 import { defineConfig } from 'vite';
 
 const pkg = name => path.resolve(__dirname, 'three-geospatial/packages', name, 'src');
+const flaskProxyTarget = process.env.FLASK_PROXY_TARGET || 'http://localhost:5180';
+const devServerPort = Number(process.env.VITE_PORT || 5173);
 
 // Bound connections from the dev proxy to Flask. Browser-side aborts can
 // otherwise leave hundreds of upstream sockets alive while terrain demand is
@@ -70,11 +72,11 @@ export default defineConfig({
     ]
   },
   server: {
-    port: 5173,
+    port: devServerPort,
     strictPort: true,
     proxy: {
       '/api': {
-        target: 'http://localhost:5180',
+        target: flaskProxyTarget,
         agent: flaskProxyAgent,
         proxyTimeout: 30_000,
       },

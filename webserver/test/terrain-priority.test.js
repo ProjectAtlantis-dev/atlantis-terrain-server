@@ -1260,7 +1260,7 @@ test('shared fetch runtime rejects an HTTP error before terrain reconciliation',
   assert.equal(state.fetching, false);
 });
 
-test('reset aborts the active terrain generation and ignores its completion', async () => {
+test('reset aborts the active terrain request and gates its completion by current heatmap', async () => {
   let activeSignal = null;
   let release;
   const { runtime, state } = createTestFetchRuntime({
@@ -1277,7 +1277,83 @@ test('reset aborts the active terrain generation and ignores its completion', as
   }) });
   await request;
   assert.equal(state.loadPass, 1);
+  assert.equal(state.lastTiles, null);
   assert.equal(state.fetching, false);
+});
+
+test('superseded depth-12 response cannot replace latest depth-10 demand', async () => {
+  const releases = [];
+  const { runtime, state } = createTestFetchRuntime({
+    fetchImpl: () => new Promise(resolve => { releases.push(resolve); }),
+  });
+  const oldRequest = runtime.request();
+  runtime.reset(2);
+  const latestRequest = runtime.request();
+
+  releases[0]({ status: 200, json: async () => ({
+    ox: 0, oy: 0, qx: 12, qy: 12,
+    tiles: [{ id: '12-old', heightmap: 'old' }],
+    missing: [], downloading: [], texFetching: 0,
+  }) });
+  await oldRequest;
+  assert.equal(state.lastTiles, null);
+
+  releases[1]({ status: 200, json: async () => ({
+    ox: 0, oy: 0, qx: 10, qy: 10,
+    tiles: [{ id: '10-latest', heightmap: 'latest' }],
+    missing: [], downloading: [], texFetching: 0,
+  }) });
+  await latestRequest;
+  assert.deepEqual(state.lastTiles.map(tile => tile.id), ['10-latest']);
+  assert.equal(state.cameraStereoX, 10);
+  assert.equal(state.cameraStereoY, 10);
+});
+
+test('superseded response admits only exact quality upgrades in the latest heatmap', async () => {
+  const releases = [];
+  const { runtime, state } = createTestFetchRuntime({
+    fetchImpl: () => new Promise(resolve => { releases.push(resolve); }),
+  });
+  state.loadPass = 2;
+
+  const baseline = runtime.request();
+  releases[0]({ status: 200, json: async () => ({
+    ox: 0, oy: 0, qx: 0, qy: 0,
+    tiles: [], missing: [], downloading: [], texFetching: 0,
+  }) });
+  await baseline;
+
+  const oldRequest = runtime.request();
+  runtime.reset(2);
+  const latestRequest = runtime.request();
+  releases[2]({ status: 200, json: async () => ({
+    ox: 0, oy: 0, qx: 10, qy: 10,
+    tiles: [
+      { id: '10-381-194', source: 'arcticdem_10m', heightmap: 'latest-parent' },
+      { id: '11-800-400', source: 'procedural', heightmap: 'latest-synthetic' },
+    ],
+    missing: [], downloading: [], texFetching: 0,
+  }) });
+  await latestRequest;
+
+  releases[1]({ status: 200, json: async () => ({
+    ox: 0, oy: 0, qx: 12, qy: 12,
+    tiles: [
+      { id: '12-1525-779', source: 'arcticdem_10m', heightmap: 'stale-child' },
+      { id: '11-800-400', source: 'arcticdem_10m', heightmap: 'late-real' },
+    ],
+    missing: [], downloading: [], texFetching: 0,
+  }) });
+  await oldRequest;
+
+  assert.deepEqual(
+    state.lastTiles.map(tile => tile.id),
+    ['10-381-194', '11-800-400'],
+  );
+  assert.equal(state.lastTiles[0].heightmap, 'latest-parent');
+  assert.equal(state.lastTiles[1].heightmap, 'late-real');
+  assert.equal(state.cameraStereoX, 10);
+  assert.equal(state.cameraStereoY, 10);
 });
 
 test('shared texture controller budgets scene applications per frame', () => {
@@ -1803,7 +1879,7 @@ test('texture heatmap refines equivalent coverage before coarse parents', () => 
   ]);
 });
 
-test('flushing texture work always advances the server demand generation', () => {
+test('flushing texture work always advances the cache version', () => {
   const streamer = createTextureStreamer({ log: () => {} });
   const initial = streamer.version;
   streamer.abortAll();
@@ -1844,6 +1920,7 @@ test('road debug invalidates cached variants and marks texture requests', async 
   });
   await new Promise(resolve => setTimeout(resolve, 0));
   assert.match(requestedUrl, /roadDebug=1/);
+  assert.doesNotMatch(requestedUrl, /[?&]demand(?:Client)?=/);
   assert.equal(streamer.releaseStaleTexture(stale), true);
   assert.equal(stale.disposed, true);
 });

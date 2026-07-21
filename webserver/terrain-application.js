@@ -102,8 +102,12 @@ const webgpuCloudShadowSettings = {
   debugSurface: window.location.hash === '#shadow-mask'
 };
 
-// The main view is controlled entirely through its UI. Discard stale query
-// parameters instead of exposing URL state that does not stay in sync.
+// Capture one-shot boot commands before cleaning the visible URL. In
+// particular, ?tile= must survive until the camera runtime exists below.
+const bootQuery = new URLSearchParams(window.location.search);
+const bootFlyToTileId = bootQuery.get('tile');
+// The main view is controlled entirely through its UI after boot. Discard
+// one-shot query parameters instead of exposing stale URL state.
 if (window.location.search) {
   history.replaceState(null, '', `${window.location.pathname}${window.location.hash}`);
 }
@@ -939,16 +943,23 @@ heatmapRuntime = createTerrainHeatmapRuntime({
   getTiles: () => terrainPipelineState.lastTiles,
   getView: () => {
     if (terrainPipelineState.firstLoad) return null;
+    // Tile response bboxes have already been converted from absolute EPSG:3413
+    // into the floating-origin scene frame by offsetTerrainPayload(). Keep the
+    // heatmap camera in that same frame or every tile lands off-canvas.
+    const cameraSceneX = terrainPipelineState.cameraStereoX
+      - terrainPipelineState.originX + terrainPipelineState.frameOffsetX;
+    const cameraSceneY = terrainPipelineState.cameraStereoY
+      - terrainPipelineState.originY + terrainPipelineState.frameOffsetY;
     const cosine = Math.cos(controls.yaw);
     const sine = Math.sin(controls.yaw);
     const panX = controls.mapPanEast * cosine - controls.mapPanNorth * sine;
     const panY = controls.mapPanEast * sine + controls.mapPanNorth * cosine;
     const relative = camera.position.clone().sub(anchorPosition);
     return {
-      x: terrainPipelineState.cameraStereoX + panX,
-      y: terrainPipelineState.cameraStereoY + panY,
-      cameraX: terrainPipelineState.cameraStereoX,
-      cameraY: terrainPipelineState.cameraStereoY,
+      x: cameraSceneX + panX,
+      y: cameraSceneY + panY,
+      cameraX: cameraSceneX,
+      cameraY: cameraSceneY,
       alt: relative.dot(up),
       yaw: getTerrainViewHeading(),
       zoom: controls.mapZoom,
@@ -1545,7 +1556,6 @@ terrainPipelineState.ready = true;
 // ?tile=12-1461-786 starts the session centered over that tile (overrides the
 // restored camera). flyToTile triggers the initial fetch itself, so the tile
 // becomes the adopted origin; fall back to a normal fetch on a bad id.
-const bootFlyToTileId = new URLSearchParams(window.location.search).get('tile');
 if (!bootFlyToTileId || !flyToTileRuntime.flyToTile(bootFlyToTileId).ok) {
   terrainFetchRuntime.request();
 }

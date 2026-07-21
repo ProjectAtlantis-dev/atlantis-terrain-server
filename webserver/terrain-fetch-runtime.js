@@ -5,6 +5,7 @@ import {
   terrainCameraStereoPosition, terrainPipelineStatus,
 } from './terrain-tile-fetch.js';
 import { priorityHeading } from './terrain-priority.js';
+import { mergeTerrainTilesAgainstCurrentHeatmap } from './terrain-tile-quality.js';
 
 export function createTerrainFetchRuntime({
   state,
@@ -33,7 +34,6 @@ export function createTerrainFetchRuntime({
     onSettled = () => {},
   } = events;
   let pollTimer = null;
-  let generation = 0;
   let activeController = null;
 
   function getCameraCoordinates() {
@@ -103,6 +103,35 @@ export function createTerrainFetchRuntime({
     }
     if (!Array.isArray(data?.tiles)) {
       throw new TypeError('terrain tile response is missing a tiles array');
+    }
+    // The server may still complete and cache work from an older camera view.
+    // The current browser heatmap, rather than the response epoch, owns tile
+    // topology. A late response may improve an exact resident tile, but may
+    // not introduce children, parents, or geography absent from that heatmap.
+    if (signal?.aborted) {
+      offsetTerrainPayload(data, state.frameOffsetX, state.frameOffsetY);
+      const admission = mergeTerrainTilesAgainstCurrentHeatmap(
+        state.lastTiles,
+        data.tiles,
+      );
+      logger.enqueue('info', 'fetchTiles.response.superseded', {
+        responseTiles: data.tiles.length,
+        currentHeatmapTiles: state.lastTiles?.length ?? 0,
+        admittedExactUpgrades: admission.acceptedTileIds.length,
+        rejectedOutsideHeatmap: admission.rejectedTileIds.length,
+        demUpgraded: admission.demUpgraded,
+        textureUpgraded: admission.textureUpgraded,
+      });
+      if (admission.acceptedTileIds.length === 0) {
+        return { nextAction: 'discarded' };
+      }
+      terrain.reconcile(admission.tiles, {
+        onDiff: details => logger.enqueue('info', 'fetchTiles.diff[superseded]', details),
+      });
+      terrain.updateTextures(admission.tiles);
+      state.lastTiles = admission.tiles;
+      onResponseApplied();
+      return { nextAction: 'stale-upgrades' };
     }
     const local = testOverrides.getCameraLocalPosition?.() ?? {
       x: cameraCoordinates.eastM,
@@ -193,14 +222,14 @@ export function createTerrainFetchRuntime({
       return;
     }
     state.fetching = true;
-    const requestGeneration = generation;
-    activeController = new AbortController();
+    const controller = new AbortController();
+    activeController = controller;
     try {
       const result = await execute({
-        lat, lon, pass: state.loadPass, signal: activeController.signal,
+        lat, lon, pass: state.loadPass, signal: controller.signal,
       });
-      if (requestGeneration !== generation) return;
-      activeController = null;
+      if (controller.signal.aborted) return;
+      if (activeController === controller) activeController = null;
       if (pollTimer != null) {
         cancelPoll(pollTimer);
         pollTimer = null;
@@ -220,16 +249,15 @@ export function createTerrainFetchRuntime({
         }, pollMs);
       }
     } catch (error) {
-      if (requestGeneration !== generation || error?.name === 'AbortError') return;
+      if (controller.signal.aborted || error?.name === 'AbortError') return;
       onError(error);
     }
-    activeController = null;
+    if (activeController === controller) activeController = null;
     state.fetching = false;
     onSettled();
   }
 
   function reset(nextPass = 1) {
-    generation += 1;
     activeController?.abort();
     activeController = null;
     if (pollTimer != null) cancelPoll(pollTimer);

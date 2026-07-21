@@ -188,27 +188,10 @@ _init_textures: Any = None
 _init_classifier_tiles: Any = None
 
 _tex_pool = ThreadPoolExecutor(max_workers=4)
-_tex_fetching: dict[str, tuple[str, int]] = {}
+_tex_fetching: set[str] = set()
 _tex_fetching_lock = threading.Lock()
-_tex_demand_generations: dict[str, int] = {}
 _tex_metatile_locks: dict[str, threading.Lock] = {}
 _tex_metatile_locks_guard = threading.Lock()
-
-
-def _texture_demand_is_stale(client_id: str, generation: int) -> bool:
-  with _tex_fetching_lock:
-    return generation < _tex_demand_generations.get(client_id, 0)
-
-
-def _register_texture_demand(client_id: str, raw_generation: str | None) -> int:
-  try:
-    generation = int(raw_generation or 0)
-  except (TypeError, ValueError):
-    generation = 0
-  with _tex_fetching_lock:
-    if generation > _tex_demand_generations.get(client_id, 0):
-      _tex_demand_generations[client_id] = generation
-  return generation
 
 # --- Texture retry queue (transient Dataforsyningen failures) ---
 # A provider throttle is never evidence that coverage is absent. Retries stay
@@ -1038,28 +1021,17 @@ def _store_texture_metatile(db, children: dict[str, bytes]) -> tuple[set[str], s
 def _queue_texture_fetch(
   tile_id: str,
   bbox: tuple[float, float, float, float],
-  demand_generation: int = 0,
-  demand_client: str = "server",
 ) -> None:
-  if demand_generation <= 0:
-    with _tex_fetching_lock:
-      demand_generation = _tex_demand_generations.get(demand_client, 0)
   with _tex_fetching_lock:
-    existing_demand = _tex_fetching.get(tile_id)
-    if existing_demand is not None:
-      existing_client, existing_generation = existing_demand
-      if existing_generation >= _tex_demand_generations.get(existing_client, 0):
-        return
-    _tex_fetching[tile_id] = (demand_client, demand_generation)
+    if tile_id in _tex_fetching:
+      return
+    _tex_fetching.add(tile_id)
 
   _RE_FETCHABLE = _METATILE_UPGRADEABLE_SOURCES - {"ancestor_crop_ratelimit"}
 
   def _worker() -> None:
     db = None
     try:
-      if _texture_demand_is_stale(demand_client, demand_generation):
-        log_tex.debug(f"[tex-worker] {tile_id}: stale demand {demand_generation}, skipping")
-        return
       db = sqlite3.connect(str(DB_PATH), check_same_thread=False)
       db.execute("PRAGMA journal_mode=WAL")
       if _init_textures is not None:
@@ -1098,9 +1070,6 @@ def _queue_texture_fetch(
           f"[tex-worker] {tile_id}: fetching metatile {metatile_id} bbox={metatile_bbox}"
         )
         children, fail_reason = _fetch_texture_metatile(tile_id)
-        if _texture_demand_is_stale(demand_client, demand_generation):
-          log_tex.debug(f"[tex-worker] {tile_id}: demand changed during fetch, discarding")
-          return
         if children is not None:
           written, no_coverage = _store_texture_metatile(db, children)
           log_tex.debug(
@@ -1137,8 +1106,7 @@ def _queue_texture_fetch(
       if db is not None:
         db.close()
       with _tex_fetching_lock:
-        if _tex_fetching.get(tile_id) == (demand_client, demand_generation):
-          _tex_fetching.pop(tile_id, None)
+        _tex_fetching.discard(tile_id)
 
   _tex_pool.submit(_worker)
 
@@ -1412,9 +1380,6 @@ def api_texture(tile_id: str):
   if unavailable is not None:
     return unavailable
 
-  demand_client = request.args.get("demandClient") or "legacy"
-  demand_generation = _register_texture_demand(demand_client, request.args.get("demand"))
-
   log_tex.debug(f"[/api/texture] tile_id={tile_id}")
 
   parsed = _parse_tile_id(tile_id)
@@ -1476,7 +1441,7 @@ def api_texture(tile_id: str):
   if source == "ancestor_crop_ratelimit":
     _tex_retry_enqueue(tile_id, _tile_bbox(d, c, r), attempt=0)
   else:
-    _queue_texture_fetch(tile_id, _tile_bbox(d, c, r), demand_generation, demand_client)
+    _queue_texture_fetch(tile_id, _tile_bbox(d, c, r))
 
   if cached_crop is not None:
     return _painted_texture_response(
