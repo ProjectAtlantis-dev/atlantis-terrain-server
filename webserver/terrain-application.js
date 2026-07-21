@@ -25,7 +25,6 @@ import { createTerrainVehicleRuntime } from './terrain-vehicle-runtime.js';
 import { createTileHistory, terrainFogDistance, tileDepthFromId } from './terrain-tile-runtime.js';
 import { createTextureStreamer, rendererTextureAnisotropy } from './terrain-texture-streamer.js';
 import { evaluateTerrainRefetch, summarizeTerrainCamera, terrainCameraCoordinates, terrainCameraGridPosition, terrainCameraStereoPosition } from './terrain-tile-fetch.js';
-import { applyTerrainAvailabilityStatus } from './terrain-status-controller.js';
 import { collectTerrainDebugMeshes, createTerrainHoverOutlineController, createTerrainMapGridController, formatTerrainSeamDiagnostic, summarizeTerrainMesh } from './terrain-debug-runtime.js';
 import { createTerrainFetchRuntime } from './terrain-fetch-runtime.js';
 import { createTerrainTileSet } from './terrain-tile-set.js';
@@ -1056,7 +1055,7 @@ renderBackend.configureScenePipeline({
 
 // --- Heightmap decode + mesh building (adapted for ENU frame) ---
 
-// --- Status colors for untextured tiles ---
+// --- Tile priority colors ---
 
 function priorityColor(priority, minP, maxP) {
   if (maxP <= minP) return new THREE.Color(1, 0, 0);
@@ -1064,21 +1063,6 @@ function priorityColor(priority, minP, maxP) {
   if (t < 0.33) return new THREE.Color(1, t / 0.33, 0);
   if (t < 0.66) return new THREE.Color(1 - (t - 0.33) / 0.33, 1, 0);
   return new THREE.Color(0, 1 - (t - 0.66) / 0.34, (t - 0.66) / 0.34);
-}
-
-const COLOR_DOWNLOADING = new THREE.Color(0xff2200);
-const COLOR_MISSING = new THREE.Color(0x666666);
-
-function markMissing(missing, downloading) {
-  applyTerrainAvailabilityStatus({
-    terrainRoot, missing, downloading,
-    applyStatus: (mesh, status) => {
-      mesh.material.color.copy(status === 'downloading' ? COLOR_DOWNLOADING : COLOR_MISSING);
-      mesh.material.vertexColors = false;
-      mesh.material.needsUpdate = true;
-      markSceneMutated();
-    },
-  });
 }
 
 // --- Deferred tile system ---
@@ -1351,7 +1335,6 @@ function runStreamingMaintenance() {
 const terrainFetchEvents = {
   onResponseApplied: requestRender,
   onBuildings: buildings => buildingsRuntime?.reconcile(buildings),
-  onAvailability: markMissing,
   onSkip: () => enqueueClientLog('debug', 'fetchTiles.skip', {
     reason: 'already fetching', ...getCameraLogSnapshot(),
   }),

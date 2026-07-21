@@ -72,11 +72,11 @@ export function createTerrainBackend({
     prepareUntexturedTerrain(mesh) {
       if (!mesh?.material || mesh.material.map) return;
       let needsUpdate = false;
-      if (mesh.material.vertexColors) {
-        mesh.material.vertexColors = false;
+      if (!mesh.material.vertexColors) {
+        mesh.material.vertexColors = true;
         needsUpdate = true;
       }
-      mesh.material.color.set(0x29313a);
+      mesh.material.color.set(0xffffff);
       if (needsUpdate) {
         mesh.material.needsUpdate = true;
       }

@@ -71,16 +71,24 @@ test('gridlines batch terrain-conforming tile edges without replacing textures',
   const mesh = new THREE.Mesh(geometry, new THREE.MeshBasicMaterial({ map: {} }));
   mesh.userData = { tileId: '1-0-0', resolution: 2 };
   terrainRoot.add(mesh);
+  const originalMaterial = mesh.material;
   const originalTexture = mesh.material.map;
+  const originalColor = mesh.material.color.getHex();
+  const originalVertexColors = mesh.material.vertexColors;
   const grid = createTerrainGridlinesController({ terrainRoot });
   grid.setVisible(true);
   assert.equal(grid.lines.geometry.getAttribute('position').count, 24);
   assert.equal(grid.lines.isMesh, true);
   assert.equal(grid.lines.material.side, THREE.DoubleSide);
   assert.equal(grid.lines.visible, true);
+  assert.equal(mesh.material, originalMaterial);
   assert.equal(mesh.material.map, originalTexture);
+  assert.equal(mesh.material.color.getHex(), originalColor);
+  assert.equal(mesh.material.vertexColors, originalVertexColors);
   grid.setVisible(false);
   assert.equal(grid.lines.visible, false);
+  assert.equal(mesh.material, originalMaterial);
+  assert.equal(mesh.material.map, originalTexture);
 });
 
 test('water cascade pacing slows long and aerial waves without starving updates', () => {

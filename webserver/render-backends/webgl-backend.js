@@ -68,11 +68,11 @@ export function createTerrainBackend({
     createWater(options) { return createWebGLWater({ renderer, ...options }); },
     prepareUntexturedTerrain(mesh) {
       if (!mesh?.material || mesh.material.map) return;
-      if (mesh.material.vertexColors) {
-        mesh.material.vertexColors = false;
+      if (!mesh.material.vertexColors) {
+        mesh.material.vertexColors = true;
         mesh.material.needsUpdate = true;
       }
-      mesh.material.color.set(0x29313a);
+      mesh.material.color.set(0xffffff);
       backend.markSceneMutated();
     },
     setTakramCloudsEnabled(enabled) {
