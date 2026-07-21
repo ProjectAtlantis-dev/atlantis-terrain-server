@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import datetime
 import io
 import json
 import logging
@@ -210,22 +211,35 @@ def _register_texture_demand(client_id: str, raw_generation: str | None) -> int:
   return generation
 
 # --- Texture retry queue (transient Dataforsyningen failures) ---
-_TEX_RETRY_MAX = 3
-_TEX_RETRY_DELAYS = [30, 60, 120]  # seconds between retries
+# A provider throttle is never evidence that coverage is absent. Retries stay
+# live with capped backoff until the provider succeeds or explicitly returns a
+# valid no-coverage frame.
+_TEX_RETRY_DELAYS = [30, 60, 120, 300]  # seconds between retries, then cap
 _tex_retry_queue: list[tuple[str, tuple, int]] = []  # (tile_id, bbox, attempt)
 _tex_retry_lock = threading.Lock()
+_tex_retry_tiles: set[str] = set()  # queued or currently sleeping/fetching
 _tex_retry_thread: threading.Thread | None = None
 
 
 def _tex_retry_enqueue(tile_id: str, bbox: tuple, attempt: int = 0) -> None:
   with _tex_retry_lock:
-    # Don't double-queue
-    for tid, _, _ in _tex_retry_queue:
-      if tid == tile_id:
-        return
+    if tile_id in _tex_retry_tiles:
+      return
+    _tex_retry_tiles.add(tile_id)
     _tex_retry_queue.append((tile_id, bbox, attempt))
     log_tex.debug(f"[tex-retry] enqueued {tile_id} attempt={attempt}")
   _ensure_tex_retry_thread()
+
+
+def _tex_retry_finish(tile_id: str) -> None:
+  with _tex_retry_lock:
+    _tex_retry_tiles.discard(tile_id)
+
+
+def _tex_retry_again(tile_id: str, bbox: tuple, attempt: int) -> None:
+  """Requeue an active transient retry without opening a duplicate window."""
+  with _tex_retry_lock:
+    _tex_retry_queue.append((tile_id, bbox, attempt))
 
 
 def _ensure_tex_retry_thread() -> None:
@@ -245,7 +259,10 @@ def _tex_retry_worker() -> None:
       tile_id, bbox, attempt = _tex_retry_queue.pop(0)
 
     delay = _TEX_RETRY_DELAYS[min(attempt, len(_TEX_RETRY_DELAYS) - 1)]
-    log_tex.debug(f"[tex-retry] {tile_id}: waiting {delay}s (attempt {attempt + 1}/{_TEX_RETRY_MAX})")
+    log_tex.info(
+      f"[tex-retry] {tile_id}: waiting {delay}s before provider attempt "
+      f"{attempt + 1}"
+    )
     time.sleep(delay)
 
     db = None
@@ -261,6 +278,7 @@ def _tex_retry_worker() -> None:
       ).fetchone()
       if cur_row and cur_row[0] not in _METATILE_UPGRADEABLE_SOURCES:
         log_tex.debug(f"[tex-retry] {tile_id}: already upgraded to {cur_row[0]}, skipping")
+        _tex_retry_finish(tile_id)
         continue
 
       metatile_id, _, _, _ = _texture_metatile_spec(tile_id)
@@ -270,20 +288,28 @@ def _tex_retry_worker() -> None:
           written, no_coverage = _store_texture_metatile(db, children)
           if tile_id in written:
             log_tex.info(f"[tex-retry] {tile_id}: SUCCESS on attempt {attempt + 1}")
+            _tex_retry_finish(tile_id)
           elif tile_id in no_coverage:
             _resolve_no_coverage(db, tile_id, cur_row[1] if cur_row else None, "[tex-retry]")
+            _tex_retry_finish(tile_id)
+          else:
+            # A sibling request may have filled the aligned metatile while
+            # this retry waited. The next demand will inspect the final row.
+            _tex_retry_finish(tile_id)
         elif fail_reason == 'no_coverage':
           _resolve_no_coverage(db, tile_id, cur_row[1] if cur_row else None, "[tex-retry]")
+          _tex_retry_finish(tile_id)
         else:
-          # Still transient
-          if attempt + 1 < _TEX_RETRY_MAX:
-            _tex_retry_enqueue(tile_id, bbox, attempt + 1)
-            log_tex.debug(f"[tex-retry] {tile_id}: still transient, re-queued attempt {attempt + 2}")
-          else:
-            log_tex.warning(f"[tex-retry] {tile_id}: max retries exhausted")
-            _resolve_no_coverage(db, tile_id, cur_row[1] if cur_row else None, "[tex-retry]")
+          # Still transient. Never convert a throttle/timeout into terminal
+          # no-coverage; retain the ancestor crop and capped retry loop.
+          _tex_retry_again(tile_id, bbox, attempt + 1)
+          log_tex.warning(
+            f"[tex-retry] {tile_id}: provider still transient; "
+            f"re-queued attempt {attempt + 2}"
+          )
     except Exception as exc:
       log_tex.error(f"[tex-retry] {tile_id}: FAILED: {type(exc).__name__}: {exc}")
+      _tex_retry_again(tile_id, bbox, attempt + 1)
     finally:
       if db is not None:
         db.close()
@@ -296,8 +322,81 @@ _cog_demand_ids: set[str] = set()
 _cog_fetched_total = 0      # lifetime count of COG tiles fetched from S3
 _cog_skipped_total = 0      # lifetime count of tiles skipped (already had data)
 _cog_already_fetched: set[str] = set()  # tile IDs we've already fetched this session
+_cog_synthetic_retry_at: dict[str, float] = {}
 _COG_TILE_WORKERS = max(1, _env_int("COG_TILE_WORKERS", 6))
+_COG_SYNTHETIC_RETRY_SECONDS = max(
+  1, _env_int("COG_SYNTHETIC_RETRY_SECONDS", 300)
+)
 _cog_pool = ThreadPoolExecutor(max_workers=_COG_TILE_WORKERS)
+_cog_audit_lock = threading.Lock()
+
+
+def _request_timestamp() -> str:
+  return datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+
+def _record_dem_requests(db, missing, requested_at: str | None = None) -> int:
+  """Record that the terrain algorithm demanded these tile heightmaps."""
+  tile_ids = list(dict.fromkeys(tile_id for tile_id, _ in missing))
+  if not tile_ids:
+    return 0
+  timestamp = requested_at or _request_timestamp()
+  db.executemany(
+    "UPDATE tiles SET dem_demanded_at = ? WHERE tile_id = ?",
+    ((timestamp, tile_id) for tile_id in tile_ids),
+  )
+  db.commit()
+  for tile_id in tile_ids:
+    log_cog.info(
+      f"[tile-audit] tile={tile_id} stage=dem_demanded at={timestamp}"
+    )
+  return len(tile_ids)
+
+
+def _record_dem_request(db, tile_id: str, requested_at: str | None = None) -> str:
+  """Persist proof that a DEM worker began processing this tile."""
+  timestamp = requested_at or _request_timestamp()
+  db.execute(
+    "UPDATE tiles SET dem_requested_at = ? WHERE tile_id = ?",
+    (timestamp, tile_id),
+  )
+  db.commit()
+  log_cog.info(
+    f"[tile-audit] tile={tile_id} stage=dem_requested at={timestamp}"
+  )
+  return timestamp
+
+
+def _record_cog_request(tile_id: str, event: dict) -> None:
+  """Record every concrete provider COG attempt in the existing server log."""
+  timestamp = event.get("at") or _request_timestamp()
+  stage = event.get("stage", "cog_event")
+  provider = event.get("provider", "unknown")
+  outcome = event.get("outcome")
+  detail = event.get("detail")
+  parts = [
+    f"tile={tile_id}", f"stage={stage}", f"provider={provider}",
+    f"at={timestamp}",
+  ]
+  if outcome is not None:
+    parts.append(f"outcome={outcome}")
+  if detail is not None:
+    parts.append(f"detail={json.dumps(detail, sort_keys=True, separators=(',', ':'))}")
+  log_cog.info(f"[tile-audit] {' '.join(parts)}")
+  if stage != "cog_requested":
+    return
+  # The provider callback can run in an ArcticDEM sub-worker. Use its own
+  # short connection and serialize this single-row proof update.
+  with _cog_audit_lock:
+    audit_db = sqlite3.connect(str(DB_PATH), check_same_thread=False)
+    try:
+      audit_db.execute(
+        "UPDATE tiles SET cog_requested_at = ? WHERE tile_id = ?",
+        (timestamp, tile_id),
+      )
+      audit_db.commit()
+    finally:
+      audit_db.close()
 
 
 def _tile_ancestor_ids(tile_id: str):
@@ -332,11 +431,18 @@ def _fetch_one_cog_tile(tile_id, bbox):
       f"[cog-worker] {tile_id}: reading "
       f"bbox=[{bbox[0]:.0f},{bbox[1]:.0f},{bbox[2]:.0f},{bbox[3]:.0f}]"
     )
-    data, src_name = _read_cog_heightmap(bbox, _GRID_N)
+    _record_dem_request(db, tile_id)
+    data, src_name = _read_cog_heightmap(
+      bbox, _GRID_N, audit=lambda event: _record_cog_request(tile_id, event)
+    )
 
     if data is None:
       water = _cache_coastline(db, tile_id, bbox)
       if water is not None and _np.all(water):
+        log_cog.info(
+          f"[tile-audit] tile={tile_id} stage=dem_completed "
+          "outcome=official_ocean"
+        )
         _mark_official_ocean(db, tile_id)
         return "fetched"
 
@@ -349,12 +455,18 @@ def _fetch_one_cog_tile(tile_id, bbox):
           for ancestor in _tile_ancestor_ids(tile_id)
         )
       if ancestor_work:
+        log_cog.info(
+          f"[tile-audit] tile={tile_id} stage=dem_completed outcome=deferred"
+        )
         return "defer"
 
       data, src_name = _resample_from_parent(
         db, tile_id, bbox=None, resolution=_GRID_N
       )
       if data is None:
+        log_cog.info(
+          f"[tile-audit] tile={tile_id} stage=dem_completed outcome=no_data"
+        )
         mark_no_data(db, tile_id)
         return "no_data"
 
@@ -370,14 +482,25 @@ def _fetch_one_cog_tile(tile_id, bbox):
       _cache_coastline(db, tile_id, bbox)
       if source_name == "parent_resampled":
         log_cog.info(f"[PARENT RESAMPLE] {tile_id}: filled from parent")
-      return "fetched"
+      log_cog.info(
+        f"[tile-audit] tile={tile_id} stage=dem_completed "
+        f"outcome=stored source={source_name}"
+      )
+      return "synthetic" if source_name == "parent_resampled" else "fetched"
     except TileClobberError:
+      log_cog.info(
+        f"[tile-audit] tile={tile_id} stage=dem_completed outcome=clobber_skipped"
+      )
       return "skipped"
   except Exception as exc:
     log_cog.warning(
       f"[COG FETCH] {tile_id}: {type(exc).__name__}: {exc}"
     )
     try:
+      log_cog.info(
+        f"[tile-audit] tile={tile_id} stage=dem_completed "
+        f"outcome=error error={type(exc).__name__}"
+      )
       mark_no_data(db, tile_id)
     except Exception:
       pass
@@ -392,6 +515,7 @@ def _fill_cog_workers_locked():
     bbox = _cog_pending_tiles.pop(tile_id)
     _cog_fetching_tiles.add(tile_id)
     _cog_already_fetched.add(tile_id)
+    log_cog.info(f"[tile-audit] tile={tile_id} stage=dem_dispatched")
     future = _cog_pool.submit(_fetch_one_cog_tile, tile_id, bbox)
     future.add_done_callback(
       lambda completed, tid=tile_id, tile_bbox=bbox:
@@ -414,19 +538,42 @@ def _finish_cog_tile(tile_id, bbox, future):
       if tile_id in _cog_demand_ids:
         _cog_pending_tiles[tile_id] = bbox
     elif outcome == "fetched":
+      _cog_synthetic_retry_at.pop(tile_id, None)
       _cog_fetched_total += 1
+    elif outcome == "synthetic":
+      _cog_fetched_total += 1
+      _cog_synthetic_retry_at[tile_id] = (
+        time.time() + _COG_SYNTHETIC_RETRY_SECONDS
+      )
+      log_cog.info(
+        f"[tile-audit] tile={tile_id} stage=dem_retry_scheduled "
+        f"delay_s={_COG_SYNTHETIC_RETRY_SECONDS}"
+      )
     elif outcome == "skipped":
       _cog_skipped_total += 1
     _fill_cog_workers_locked()
 
 
-def _schedule_cog_demand(missing):
+def _schedule_cog_demand(missing, visible_synthetic=()):
   """Replace unstarted work with the latest camera-priority ordering."""
   global _cog_pending_tiles, _cog_demand_ids
   with _cog_scheduler_lock:
-    _cog_demand_ids = {tile_id for tile_id, _ in missing}
+    now = time.time()
+    visible_retry_bboxes = dict(visible_synthetic)
+    due_retries = []
+    for tile_id, retry_at in list(_cog_synthetic_retry_at.items()):
+      if retry_at > now or tile_id not in visible_retry_bboxes:
+        continue
+      _cog_synthetic_retry_at.pop(tile_id, None)
+      _cog_already_fetched.discard(tile_id)
+      due_retries.append((tile_id, visible_retry_bboxes[tile_id]))
+      log_cog.info(
+        f"[tile-audit] tile={tile_id} stage=dem_retry_due"
+      )
+    demand = list(missing) + due_retries
+    _cog_demand_ids = {tile_id for tile_id, _ in demand}
     _cog_pending_tiles = {
-      tile_id: bbox for tile_id, bbox in missing
+      tile_id: bbox for tile_id, bbox in demand
       if tile_id not in _cog_already_fetched
       and tile_id not in _cog_fetching_tiles
     }
@@ -1098,6 +1245,7 @@ def api_tiles():
         "id": tid,
         "bbox": [bbox[0] - ox, bbox[1] - oy, bbox[2] - ox, bbox[3] - oy],
         "depth": tile["depth"],
+        "source": tile["source"],
         "resolution": _GRID_N,
         "heightmap": base64.b64encode(hm.astype(_np.float32).tobytes()).decode("ascii"),
         "hasTexture": bool(tex_flags["has_texture"]),
@@ -1120,7 +1268,15 @@ def api_tiles():
 
   # Continuously feed free workers. Unstarted work is replaced by every new
   # camera-priority list, so there is neither a wave barrier nor a stale queue.
-  active_cog, pending_cog = _schedule_cog_demand(missing)
+  _record_dem_requests(_get_db(), missing)
+  visible_synthetic = [
+    (tile["id"], tile["bbox"])
+    for tile in tiles
+    if tile.get("source") == "parent_resampled"
+  ]
+  active_cog, pending_cog = _schedule_cog_demand(
+    missing, visible_synthetic
+  )
   if missing:
     log_cog.debug(
       f"[COG scheduler] {active_cog} active, {pending_cog} priority-queued"
@@ -1313,10 +1469,13 @@ def api_texture(tile_id: str):
   if row is None:
     log_tex.debug(f"[/api/texture] {tile_id}: cache MISS, queuing fetch (depth={d} col={c} row={r})")
 
-  # Queue a fetch for cache misses and re-fetchable sources.
-  # Skip for ancestor_crop_ratelimit — the retry queue already handles those.
+  # Queue a fetch for cache misses and re-fetchable sources. A persisted
+  # rate-limit row re-registers with the retry queue after a server restart;
+  # the queued/active set prevents duplicate work during normal polling.
   source = row[1] if row else None
-  if source != "ancestor_crop_ratelimit":
+  if source == "ancestor_crop_ratelimit":
+    _tex_retry_enqueue(tile_id, _tile_bbox(d, c, r), attempt=0)
+  else:
     _queue_texture_fetch(tile_id, _tile_bbox(d, c, r), demand_generation, demand_client)
 
   if cached_crop is not None:
@@ -1444,7 +1603,7 @@ def api_tile_package(tile_id: str):
   if row is None:
     return jsonify({"error": "tile not found"}), 404
   depth, column, tile_row = int(row[0]), int(row[1]), int(row[2])
-  bbox = tuple(float(value) for value in row[3:7])
+  bbox = (float(row[3]), float(row[4]), float(row[5]), float(row[6]))
 
   texture_row = db.execute(
     "SELECT texture, source, updated_at FROM textures WHERE tile_id = ?",
@@ -1540,7 +1699,7 @@ def api_tile_package(tile_id: str):
         )
     if canonical_texture:
       archive.writestr("texture-source.jpg", canonical_texture)
-      archive.writestr("texture-final.jpg", rendered_texture)
+      archive.writestr("texture-final.jpg", rendered_texture or canonical_texture)
     if coastline_mask is not None:
       archive.writestr("coastline-mask.png", _tile_package_png(coastline_mask, boolean=True))
     if hydrography_mask is not None:
@@ -1796,7 +1955,9 @@ def api_pipeline(tile_id: str):
   db = _get_db()
   t = db.execute(
     "SELECT depth, x_min, y_min, x_max, y_max, heightmap IS NOT NULL, source, "
-    "updated_at FROM tiles WHERE tile_id = ?", (tile_id,)).fetchone()
+    "updated_at, dem_demanded_at, dem_requested_at, cog_requested_at "
+    "FROM tiles WHERE tile_id = ?",
+    (tile_id,)).fetchone()
   if t is None:
     return jsonify({"error": "tile not in grid — never seeded"}), 404
   x = db.execute(
@@ -1807,7 +1968,11 @@ def api_pipeline(tile_id: str):
     "depth": t[0],
     "bbox": list(t[1:5]),
     "size_m": round(t[3] - t[1], 1),
-    "heightmap": {"ok": bool(t[5]), "source": t[6], "updated": t[7]},
+    "heightmap": {
+      "ok": bool(t[5]), "source": t[6], "updated": t[7],
+      "dem_demanded_at": t[8], "dem_requested_at": t[9],
+      "cog_requested_at": t[10],
+    },
     "texture": ({"ok": True, "source": x[0], "bytes": x[1], "updated": x[2]}
                 if x else {"ok": False}),
   })
@@ -1862,7 +2027,9 @@ def api_tile_inspect():
     d, c, r = parsed
     tile_row = db.execute(
       "SELECT depth, x_min, y_min, x_max, y_max, geometric_error, source, "
-      "updated_at, heightmap, confidence_map FROM tiles WHERE tile_id = ?",
+      "updated_at, heightmap, confidence_map, dem_demanded_at, "
+      "dem_requested_at, cog_requested_at "
+      "FROM tiles WHERE tile_id = ?",
       (tid,),
     ).fetchone()
     if tile_row:
@@ -1870,12 +2037,19 @@ def api_tile_inspect():
       tile_src = tile_row[6]
       tile_updated = tile_row[7]
       hm_blob, cm_blob = tile_row[8], tile_row[9]
+      dem_demanded_at = tile_row[10]
+      dem_requested_at, cog_requested_at = tile_row[11], tile_row[12]
       bbox_db = [tile_row[1], tile_row[2], tile_row[3], tile_row[4]]
       tile_w = bbox_db[2] - bbox_db[0]
       tile_h = bbox_db[3] - bbox_db[1]
       log_db.info(f"  tile: source={tile_src} geo_err={geo_err:.2f}m depth={d} "
             f"size={tile_w:.0f}x{tile_h:.0f}m")
       log_db.info(f"  bbox: [{bbox_db[0]:.0f}, {bbox_db[1]:.0f}, {bbox_db[2]:.0f}, {bbox_db[3]:.0f}]")
+      log_db.info(
+        f"  requests: dem_demanded_at={dem_demanded_at} "
+        f"dem_requested_at={dem_requested_at} "
+        f"cog_requested_at={cog_requested_at}"
+      )
       if hm_blob:
         try:
           import zlib

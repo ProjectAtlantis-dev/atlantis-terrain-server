@@ -4,7 +4,7 @@ import unittest
 from unittest.mock import patch
 
 from serve import (
-    _lod_complete_ancestors, _lod_leaf_descendants_cover, _traverse,
+    _UPGRADEABLE_SOURCES, _lod_complete_ancestors, _lod_leaf_descendants_cover, _traverse,
     bbox_in_view_circle,
 )
 
@@ -15,6 +15,9 @@ def _bbox_at(cx, cy, size=100.0):
 
 
 class TestViewCoverageCircle(unittest.TestCase):
+    def test_parent_resampled_tiles_remain_visible_upgrade_candidates(self):
+        self.assertIn('parent_resampled', _UPGRADEABLE_SOURCES)
+
     def test_lod_history_requires_complete_descendant_coverage(self):
         complete = {'12-20-40', '12-21-40', '12-20-41', '12-21-41'}
         self.assertTrue(_lod_leaf_descendants_cover(11, 10, 20, complete))

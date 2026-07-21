@@ -1,8 +1,10 @@
 import io
 import os
+from pathlib import Path
 import sqlite3
+import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import numpy as np
 from PIL import Image
@@ -176,6 +178,50 @@ class TextureMetatileFetchTest(unittest.TestCase):
         self.assertEqual(sources["2-0-0"], "dataforsyningen_metatile4h2")
         self.assertEqual(sources["2-0-1"], "dataforsyningen_metatile4h2")
         self.assertEqual(sources["2-1-0"], "ocean_nodata")
+
+    def test_persistent_transient_stays_retryable_until_success(self):
+        tile_id = "12-1525-779"
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "terrain.db"
+            db = sqlite3.connect(db_path)
+            init_textures(db)
+            crop = _encoded_image(
+                np.full((256, 256, 3), (80, 100, 120)), "JPEG"
+            )
+            write_texture(db, tile_id, crop, "ancestor_crop")
+            write_texture(db, tile_id, crop, "ancestor_crop_ratelimit")
+            db.close()
+
+            fetch_results = iter([
+                (None, "transient"),
+                ({tile_id: b"provider-image"}, None),
+            ])
+            resolve_no_coverage = Mock()
+            with (
+                patch.object(serve_flask, "DB_PATH", db_path),
+                patch.object(serve_flask, "_init_textures", init_textures),
+                patch.object(serve_flask, "_TEX_RETRY_DELAYS", [0]),
+                patch.object(
+                    serve_flask, "_tex_retry_queue", [(tile_id, (0, 0, 1, 1), 0)]
+                ),
+                patch.object(serve_flask, "_tex_retry_tiles", {tile_id}),
+                patch.object(
+                    serve_flask, "_fetch_texture_metatile",
+                    side_effect=lambda _tile_id: next(fetch_results),
+                ),
+                patch.object(
+                    serve_flask, "_store_texture_metatile",
+                    return_value=({tile_id}, set()),
+                ),
+                patch.object(
+                    serve_flask, "_resolve_no_coverage", resolve_no_coverage
+                ),
+            ):
+                serve_flask._tex_retry_worker()
+
+                self.assertEqual(serve_flask._tex_retry_queue, [])
+                self.assertEqual(serve_flask._tex_retry_tiles, set())
+                resolve_no_coverage.assert_not_called()
 
 
 if __name__ == "__main__":

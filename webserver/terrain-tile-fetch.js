@@ -207,14 +207,18 @@ export function terrainPipelineStatus(data, wasFirstLoad, pass = wasFirstLoad ? 
   const missing = data?.missing?.length ?? 0;
   const downloading = data?.downloading?.length ?? 0;
   const textureFetching = data?.texFetching ?? 0;
+  const syntheticHeightmaps = retryableSyntheticDemCount(data?.tiles);
   return {
     missing,
     downloading,
+    syntheticHeightmaps,
     textureFetching,
     textureRetryQueue: data?.texRetryQueue ?? 0,
     textureStatusCounts: data?.texStatusCounts || {},
     nextAction: pass === 1
       ? 'full-pass'
-      : (missing > 0 || downloading > 0 || textureFetching > 0 ? 'poll' : 'idle'),
+      : (missing > 0 || downloading > 0 || textureFetching > 0
+          || syntheticHeightmaps > 0 ? 'poll' : 'idle'),
   };
 }
+import { retryableSyntheticDemCount } from './terrain-tile-quality.js';

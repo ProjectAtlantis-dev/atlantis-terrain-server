@@ -43,6 +43,7 @@ REAL_SOURCES = (
 # Sources that should be refetched at higher DEM resolution
 _UPGRADEABLE_SOURCES = {
     'arcticdem',  # old 32m data
+    'parent_resampled',
     'unmasked_arcticdem',
     'unmasked_arcticdem_10m',
     'unmasked_copernicus',

@@ -102,14 +102,21 @@ export function createTerrainHeatmapRuntime({
       // Priority sorting is presentation state. Keep it off the renderer's
       // authoritative demand array so the heatmap cannot influence residency
       // or eviction order.
-      tiles: Array.isArray(sourceTiles) ? sourceTiles.map(tile => ({
-        id: tile.id,
-        bbox: Array.isArray(tile.bbox) ? [...tile.bbox] : tile.bbox,
-        depth: tile.depth,
-        hasTexture: Boolean(tile.hasTexture),
-        hasHeightmap: Boolean(tile.heightmap),
-        texStatus: tile.texStatus,
-      })) : [],
+      tiles: Array.isArray(sourceTiles) ? sourceTiles.map(tile => {
+        const demQuality = classifyDemSource(tile.source);
+        const textureQuality = classifyTextureTile(tile);
+        return {
+          id: tile.id,
+          bbox: Array.isArray(tile.bbox) ? [...tile.bbox] : tile.bbox,
+          depth: tile.depth,
+          source: tile.source,
+          demQuality,
+          textureQuality,
+          hasTexture: Boolean(tile.hasTexture),
+          hasHeightmap: Boolean(tile.heightmap),
+          texStatus: tile.texStatus,
+        };
+      }) : [],
     };
     lastPriorityView = null;
     updateMeta();
@@ -319,6 +326,8 @@ export function createTerrainHeatmapRuntime({
     tip.textContent = `${tile.id} (d${tile.depth})\npriority ${tile.priority.toFixed(2)} · order ${tile.order}` +
       (tile.hasTexture ? ' · texture cached' : '') +
       `\nterrain ${tile.source || 'none'} · heightmap ${tile.hasHeightmap ? 'yes' : 'no'}` +
+      ` · ${tile.demQuality?.synthetic ? 'synthetic' : tile.demQuality?.kind}` +
+      `\nimage ${tile.textureQuality?.kind || 'missing'} · ${tile.textureQuality?.retryState || 'unknown'}` +
       `\nconfidence ${confidence}`;
     tip.style.left = `${event.clientX + 14}px`;
     tip.style.top = `${event.clientY + 10}px`;
@@ -343,3 +352,4 @@ export function createTerrainHeatmapRuntime({
     toggle() { setActive(presentation !== 'heatmap'); },
   };
 }
+import { classifyDemSource, classifyTextureTile } from './terrain-tile-quality.js';

@@ -169,7 +169,7 @@ class OfficialCoastlineTest(unittest.TestCase):
                 db.execute(
                     "SELECT value FROM metadata WHERE key = 'schema_version'"
                 ).fetchone()[0],
-                "4",
+                "5",
             )
             db.close()
 
