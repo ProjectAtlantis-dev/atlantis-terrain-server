@@ -115,7 +115,7 @@ export function createTileLifecycle({
   }
 
   // Exact texture applications call evictCoveredAncestors with the leaf that
-  // changed. Do not independently reinterpret the heatmap here: the existing
+  // changed. Do not independently reinterpret the tile set here: the existing
   // four-quadrant coverage check owns parent retirement.
   function sweepStaleParents() { return 0; }
 
@@ -397,8 +397,8 @@ export function reconcileTerrainTiles({
   }
 
   // Keep a coarse tile whenever the new demand contains descendants inside
-  // it. Only demanded descendants matter: quadrants outside the circular
-  // heatmap are intentionally absent and must not force a boundary hole.
+  // it. Only demanded descendants matter: quadrants outside the demand
+  // circle are intentionally absent and must not force a boundary hole.
   let released = 0;
   const retainedFallbackIds = new Set(
     removed.filter(id => desiredDescendantIds(id, nextTileIds).length > 0),

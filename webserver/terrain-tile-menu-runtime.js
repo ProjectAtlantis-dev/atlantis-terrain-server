@@ -29,7 +29,35 @@ export function createTerrainTileMenuRuntime({
     return element;
   }
 
-  function show(x, y, tileId, source) {
+  function addPackageDownload(tileId, heightmapPayload, resolution) {
+    addAction('Save tile package as…', async event => {
+      const action = event?.currentTarget;
+      if (action) action.textContent = 'Building package…';
+      try {
+        const response = await windowImpl.fetch(`/api/tile-package/${encodeURIComponent(tileId)}.zip`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ heightmap: heightmapPayload, resolution }),
+        });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const url = windowImpl.URL.createObjectURL(await response.blob());
+        const link = documentImpl.createElement('a');
+        link.href = url;
+        link.download = `${tileId}-package.zip`;
+        documentImpl.body.appendChild(link);
+        link.click();
+        link.remove();
+        windowImpl.URL.revokeObjectURL(url);
+        hide();
+      } catch (error) {
+        if (action) action.textContent = 'Package failed — click to retry';
+        console.error(`[tile-package] ${tileId}:`, error);
+      }
+    });
+  }
+
+  function show(x, y, tileId, source, heightmapPayload = '', resolution = 0) {
+    tileInfoElement.style.display = 'none';
     menu.innerHTML = '';
     const header = documentImpl.createElement('div');
     header.style.cssText = 'padding:4px 12px;color:#aaa;font-size:11px;border-bottom:1px solid #444';
@@ -39,7 +67,11 @@ export function createTerrainTileMenuRuntime({
       hide();
       windowImpl.open(`/pipeline.html?tile=${tileId}`, '_blank');
     });
-    if (!source) {
+    if (source) {
+      if (heightmapPayload && Number.isInteger(resolution) && resolution > 1) {
+        addPackageDownload(tileId, heightmapPayload, resolution);
+      }
+    } else {
       const note = documentImpl.createElement('div');
       note.style.cssText = 'padding:6px 12px;color:#888;font-style:italic';
       note.textContent = 'no texture';
@@ -51,5 +83,10 @@ export function createTerrainTileMenuRuntime({
   }
 
   documentImpl.addEventListener('click', event => { if (!menu.contains(event.target)) hide(); });
-  return { hide, menu, show };
+  return {
+    hide,
+    menu,
+    show,
+    get active() { return menu.style.display !== 'none'; },
+  };
 }

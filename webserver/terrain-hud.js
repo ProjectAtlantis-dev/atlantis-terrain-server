@@ -12,7 +12,7 @@ function appendPanel(cssText) {
 export function createTerrainHud({
   onToggleMapMode,
   onToggleSeamMode,
-  onToggleHeatmap,
+  onToggleTileInspector,
   onToggleGridlines,
   onToggleWaterOverlay,
   onToggleHydrographyOverlay,
@@ -33,7 +33,7 @@ export function createTerrainHud({
     const isLink = (
       event.target.id === 'mapModeLink' ||
       event.target.id === 'seamModeLink' ||
-      event.target.id === 'heatmapModeLink' ||
+      event.target.id === 'tileInspectorModeLink' ||
       event.target.id === 'gridlinesModeLink' ||
       event.target.id === 'waterOverlayLink' ||
       event.target.id === 'hydrographyOverlayLink' ||
@@ -55,10 +55,10 @@ export function createTerrainHud({
       onToggleSeamMode();
       return;
     }
-    if (event.target.id === 'heatmapModeLink') {
+    if (event.target.id === 'tileInspectorModeLink') {
       event.stopPropagation();
       event.preventDefault();
-      onToggleHeatmap();
+      onToggleTileInspector();
       return;
     }
     if (event.target.id === 'gridlinesModeLink') {
@@ -117,7 +117,7 @@ export function createTerrainHud({
   hud.addEventListener('click', event => {
     if (
       event.target.id === 'mapModeLink' || event.target.id === 'seamModeLink' ||
-      event.target.id === 'heatmapModeLink' ||
+      event.target.id === 'tileInspectorModeLink' ||
       event.target.id === 'gridlinesModeLink' ||
       event.target.id === 'waterOverlayLink' ||
       event.target.id === 'hydrographyOverlayLink' ||

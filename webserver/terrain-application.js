@@ -43,7 +43,7 @@ import {
 } from './terrain-cloud-runtime.js';
 import { createTerrainBuildingsRuntime } from './terrain-buildings-runtime.js';
 import { createTerrainTileMenuRuntime } from './terrain-tile-menu-runtime.js';
-import { createTerrainHeatmapRuntime } from './terrain-heatmap-runtime.js';
+import { createTerrainTileInspectorRuntime } from './terrain-tile-inspector-runtime.js';
 import { resolveTerrainViewToggle } from './terrain-view-mode.js';
 import { googleMaps3dUrl } from './terrain-google-maps.js';
 import { createTerrainFlyToTileRuntime } from './terrain-fly-to-tile.js';
@@ -102,8 +102,12 @@ const webgpuCloudShadowSettings = {
   debugSurface: window.location.hash === '#shadow-mask'
 };
 
-// The main view is controlled entirely through its UI. Discard stale query
-// parameters instead of exposing URL state that does not stay in sync.
+// Capture one-shot boot commands before cleaning the visible URL. In
+// particular, ?tile= must survive until the camera runtime exists below.
+const bootQuery = new URLSearchParams(window.location.search);
+const bootFlyToTileId = bootQuery.get('tile');
+// The main view is controlled entirely through its UI after boot. Discard
+// one-shot query parameters instead of exposing stale URL state.
 if (window.location.search) {
   history.replaceState(null, '', `${window.location.pathname}${window.location.hash}`);
 }
@@ -229,7 +233,7 @@ const controls = {
   mapZoom: DEFAULT_MAP_ZOOM,
   mapPanEast: 0,
   mapPanNorth: 0,
-  terrainRange: 30000,
+  terrainRange: 20000,
   keys: {}
 };
 const terrainViewForward = new THREE.Vector3();
@@ -292,12 +296,12 @@ const maybeLogWebGPUSun = (...args) => webgpuAtmosphere?.maybeLogSun(...args);
 const renderer = renderBackend.renderer;
 document.body.appendChild(renderer.domElement);
 renderer.domElement.addEventListener('contextmenu', event => event.preventDefault());
-let heatmapRuntime = null;
+let tileInspectorRuntime = null;
 
 const { hud, alt, gameClock: gameClockEl } = createTerrainHud({
   onToggleMapMode: () => toggleMapMode(),
   onToggleSeamMode: () => toggleSeamMode(),
-  onToggleHeatmap: () => toggleHeatmap(),
+  onToggleTileInspector: () => toggleTileInspector(),
   onToggleGridlines: () => toggleGridlines(),
   onToggleWaterOverlay: () => toggleWaterOverlay(),
   onToggleHydrographyOverlay: () => toggleHydrographyOverlay(),
@@ -925,7 +929,6 @@ const terrainPipelineState = {
   lastFetchTriggerMs: 0,
   fetching: false,
   firstLoad: true,
-  loadPass: 1,
   bootFetchLogged: false,
   lastTiles: null,
   heightmapsMissing: 0,
@@ -935,19 +938,27 @@ const terrainPipelineState = {
   serverTextureStatus: {},
 }; // end terrain pipeline state
 
-heatmapRuntime = createTerrainHeatmapRuntime({
+tileInspectorRuntime = createTerrainTileInspectorRuntime({
+  getTiles: () => terrainPipelineState.lastTiles,
   getView: () => {
     if (terrainPipelineState.firstLoad) return null;
+    // Tile response bboxes have already been converted from absolute EPSG:3413
+    // into the floating-origin scene frame by offsetTerrainPayload(). Keep the
+    // inspector camera in that same frame or every tile lands off-canvas.
+    const cameraSceneX = terrainPipelineState.cameraStereoX
+      - terrainPipelineState.originX + terrainPipelineState.frameOffsetX;
+    const cameraSceneY = terrainPipelineState.cameraStereoY
+      - terrainPipelineState.originY + terrainPipelineState.frameOffsetY;
     const cosine = Math.cos(controls.yaw);
     const sine = Math.sin(controls.yaw);
     const panX = controls.mapPanEast * cosine - controls.mapPanNorth * sine;
     const panY = controls.mapPanEast * sine + controls.mapPanNorth * cosine;
     const relative = camera.position.clone().sub(anchorPosition);
     return {
-      x: terrainPipelineState.cameraStereoX + panX,
-      y: terrainPipelineState.cameraStereoY + panY,
-      cameraX: terrainPipelineState.cameraStereoX,
-      cameraY: terrainPipelineState.cameraStereoY,
+      x: cameraSceneX + panX,
+      y: cameraSceneY + panY,
+      cameraX: cameraSceneX,
+      cameraY: cameraSceneY,
       alt: relative.dot(up),
       yaw: getTerrainViewHeading(),
       zoom: controls.mapZoom,
@@ -1095,7 +1106,6 @@ function priorityColor(priority, minP, maxP) {
 
 // --- Deferred tile system ---
 const { history: tileHistory, log: tileLog } = createTileHistory({
-  getPass: () => terrainPipelineState.loadPass,
   emit: (details, level) => enqueueClientLog(level, 'tile', details),
 });
 
@@ -1303,7 +1313,6 @@ function getCameraLogSnapshot(camLL = null) {
 
 // --- Tile fetching ---
 
-const PREVIEW_MAX_DEPTH = 10;
 const clock = new THREE.Clock();
 const STREAMING_MAINTENANCE_MS = 1000;
 const fpsCounter = createTerrainFpsCounter();
@@ -1367,10 +1376,6 @@ const terrainFetchEvents = {
   onSkip: () => enqueueClientLog('debug', 'fetchTiles.skip', {
     reason: 'already fetching', ...getCameraLogSnapshot(),
   }),
-  onPreviewComplete(result) {
-    bootLog('tiles.pass1-preview-done', result.previewDetails);
-    requestRender();
-  },
   onPoll: requestRender,
   onError(error) {
     if (!terrainPipelineState.bootFetchLogged) {
@@ -1391,7 +1396,6 @@ const terrainFetchEvents = {
 };
 const terrainFetchRuntime = createTerrainFetchRuntime({
   state: terrainPipelineState,
-  previewMaxDepth: PREVIEW_MAX_DEPTH,
   view: {
     camera, anchorPosition, east, north, up, controls,
     anchorLatitude: anchorLat,
@@ -1544,7 +1548,6 @@ terrainPipelineState.ready = true;
 // ?tile=12-1461-786 starts the session centered over that tile (overrides the
 // restored camera). flyToTile triggers the initial fetch itself, so the tile
 // becomes the adopted origin; fall back to a normal fetch on a bad id.
-const bootFlyToTileId = new URLSearchParams(window.location.search).get('tile');
 if (!bootFlyToTileId || !flyToTileRuntime.flyToTile(bootFlyToTileId).ok) {
   terrainFetchRuntime.request();
 }
@@ -1814,10 +1817,7 @@ function updateHud() {
   const { degrees: deg, compass } = compassHeading(headingForHud);
   // Heightmap line — always present, stable width
   const hmPending = terrainPipelineState.heightmapsMissing + terrainPipelineState.heightmapsDownloading;
-  const passLabel = terrainPipelineState.loadPass === 1
-    ? '<span style="color:#ff0">PASS 1 (preview)</span>'
-    : '<span style="color:#8f8">PASS 2 (full)</span>';
-  const hmLine = `${passLabel}  hm: ${terrainTileSet.currentTileIds.size} tiles`
+  const hmLine = `hm: ${terrainTileSet.currentTileIds.size} tiles`
     + (hmPending > 0
       ? `  <span style="color:#fc8">${terrainPipelineState.heightmapsDownloading} downloading  ${terrainPipelineState.heightmapsMissing} queued</span>`
       : '');
@@ -1839,8 +1839,8 @@ function updateHud() {
     if (terrainPipelineState.serverTexturesRetrying > 0) texLine += `  <span style="color:#f66">${terrainPipelineState.serverTexturesRetrying} retry</span>`;
     if (srvMissing > 0) texLine += `  <span style="color:#999">${srvMissing} missing</span>`;
   }
-  const modeLabel = heatmapRuntime?.active
-    ? 'HEATMAP'
+  const modeLabel = tileInspectorRuntime?.active
+    ? 'TILE INSPECTOR'
     : controls.seamMode
       ? 'SEAMS'
       : controls.mapMode
@@ -1895,9 +1895,9 @@ function updateHud() {
       ? 'W/S drive, A/D steer, mouse orbit camera, Esc exits vehicle control'
       : 'WASD or Arrows move, Q/Z altitude, drag look',
     'map: left-drag rotate, right-drag pan, wheel zoom',
-    `<span id="mapModeLink" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">${controls.mapMode && !controls.seamMode && !heatmapRuntime?.active ? '3D view' : 'map mode'}</span> (M)` +
+    `<span id="mapModeLink" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">${controls.mapMode && !controls.seamMode && !tileInspectorRuntime?.active ? '3D view' : 'map mode'}</span> (M)` +
       ` · <span id="seamModeLink" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">${controls.seamMode ? '3D view' : 'seam view'}</span>` +
-      ` · <span id="heatmapModeLink" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">${heatmapRuntime?.active ? '3D view' : 'heatmap'}</span>` +
+      ` · <span id="tileInspectorModeLink" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">${tileInspectorRuntime?.active ? '3D view' : 'tile inspector'}</span>` +
       ' · Google 3D (G)' +
       ' · fast time 03:00–03:00 (P)' +
       ` · <span id="roadDebugLink" style="color:${roadDebugColor};text-decoration:underline;cursor:pointer;pointer-events:auto">${roadDebugLabel}</span>` +
@@ -1923,8 +1923,8 @@ function updateHud() {
   const altText =
     `${altM.toFixed(0)}m / ${(altM * 3.28084).toFixed(0)}ft  ${deg.toFixed(0)}° ${compass}` +
     `  FOV ${camera.fov.toFixed(0)}°` +
-    (heatmapRuntime?.active
-      ? '  [HEATMAP]'
+    (tileInspectorRuntime?.active
+      ? '  [TILE INSPECTOR]'
       : (controls.seamMode
         ? '  [SEAMS]'
         : (controls.mapMode ? '  [MAP]' : (vehicleRuntime.vehicleControlActive ? '  [VEHICLE]' : ''))));
@@ -1947,7 +1947,7 @@ function resetView() {
   controls.dragButton = 0;
   controls.mapMode = false;
   controls.seamMode = false;
-  heatmapRuntime?.setPresentation('hidden');
+  tileInspectorRuntime?.setPresentation('hidden');
   vehicleRuntime.setVehicleControlActive(false, 'reset');
   controls.mapPanEast = 0;
   controls.mapPanNorth = 0;
@@ -1995,36 +1995,36 @@ function syncMapModePresentation() {
   // Map-only presentation belongs to one state boundary. The world-space
   // marker remains disabled; the centered DOM arrow is backend-independent.
   camMarker.visible = false;
-  const heatmapActive = Boolean(heatmapRuntime?.active);
-  if (heatmapRuntime) {
-    heatmapRuntime.setPresentation(
-      controls.mapMode ? (heatmapActive ? 'heatmap' : 'edges') : 'hidden',
+  const tileInspectorActive = Boolean(tileInspectorRuntime?.active);
+  if (tileInspectorRuntime) {
+    tileInspectorRuntime.setPresentation(
+      controls.mapMode ? (tileInspectorActive ? 'inspector' : 'edges') : 'hidden',
     );
   }
-  mapLocationMarkerEl.style.display = controls.mapMode && !heatmapActive ? 'block' : 'none';
-  renderer.domElement.style.visibility = heatmapActive ? 'hidden' : 'visible';
+  mapLocationMarkerEl.style.display = controls.mapMode && !tileInspectorActive ? 'block' : 'none';
+  renderer.domElement.style.visibility = tileInspectorActive ? 'hidden' : 'visible';
   tuningPanel.style.display = controls.mapMode ? 'none' : '';
-  seamLegendEl.style.display = controls.seamMode && !heatmapActive ? 'block' : 'none';
+  seamLegendEl.style.display = controls.seamMode && !tileInspectorActive ? 'block' : 'none';
 }
 
-function toggleHeatmap() {
+function toggleTileInspector() {
   const transition = resolveTerrainViewToggle({
     mapMode: controls.mapMode,
-    heatmapActive: heatmapRuntime.active,
+    tileInspectorActive: tileInspectorRuntime.active,
     seamMode: controls.seamMode,
-  }, 'heatmap');
+  }, 'inspector');
   if (!transition.accepted) return;
   controls.mapMode = transition.mapMode;
   controls.seamMode = transition.seamMode;
-  if (transition.heatmapActive) {
+  if (transition.tileInspectorActive) {
     cameraRuntimeState.driftMode = false;
     controls.strafeSpeed = 0;
-    vehicleRuntime.setVehicleControlActive(false, 'heatmap-mode');
+    vehicleRuntime.setVehicleControlActive(false, 'inspector-mode');
     controls.mapPanEast = 0;
     controls.mapPanNorth = 0;
     updateMapCamera();
   }
-  heatmapRuntime.setPresentation(transition.heatmapActive ? 'heatmap' : 'hidden');
+  tileInspectorRuntime.setPresentation(transition.tileInspectorActive ? 'inspector' : 'hidden');
   hideTileInfo();
   hideTileMenu();
   syncMapModePresentation();
@@ -2035,13 +2035,13 @@ function toggleHeatmap() {
 function toggleMapMode() {
   const transition = resolveTerrainViewToggle({
     mapMode: controls.mapMode,
-    heatmapActive: heatmapRuntime.active,
+    tileInspectorActive: tileInspectorRuntime.active,
     seamMode: controls.seamMode,
   }, 'map');
   if (!transition.accepted) return;
   controls.mapMode = transition.mapMode;
   controls.seamMode = transition.seamMode;
-  heatmapRuntime.setPresentation('hidden');
+  tileInspectorRuntime.setPresentation('hidden');
   cameraRuntimeState.driftMode = false;
   controls.strafeSpeed = 0;
   if (controls.mapMode) {
@@ -2064,13 +2064,13 @@ function toggleMapMode() {
 function toggleSeamMode() {
   const transition = resolveTerrainViewToggle({
     mapMode: controls.mapMode,
-    heatmapActive: heatmapRuntime.active,
+    tileInspectorActive: tileInspectorRuntime.active,
     seamMode: controls.seamMode,
   }, 'seam');
   if (!transition.accepted) return;
   controls.mapMode = transition.mapMode;
   controls.seamMode = transition.seamMode;
-  heatmapRuntime.setPresentation('hidden');
+  tileInspectorRuntime.setPresentation('hidden');
   cameraRuntimeState.driftMode = false;
   controls.strafeSpeed = 0;
   if (controls.mapMode) {
@@ -2173,7 +2173,11 @@ renderer.domElement.addEventListener('click', event => {
   // Show context menu for the top-most hit
   const topInfo = summarizeTerrainMesh(hits[0].object);
   const topSrc = texSource.get(topInfo.tileId) || '';
-  showTileMenu(event.clientX, event.clientY, topInfo.tileId, topSrc);
+  showTileMenu(
+    event.clientX, event.clientY, topInfo.tileId, topSrc,
+    hits[0].object.userData.heightmapPayload,
+    hits[0].object.userData.resolution,
+  );
 
   hits.forEach((hit, index) => {
     const info = summarizeTerrainMesh(hit.object);
@@ -2198,6 +2202,10 @@ renderer.domElement.addEventListener('click', event => {
 });
 
 renderer.domElement.addEventListener('mousemove', event => {
+  if (tileMenuRuntime.active) {
+    hideTileInfo();
+    return;
+  }
   const gridlines3dHover = gridlinesRuntime.active && !controls.mapMode;
   if ((!controls.mapMode && !gridlines3dHover) || controls.dragging) {
     hideTileInfo();
@@ -2268,7 +2276,8 @@ renderer.domElement.addEventListener('mouseleave', hideTileInfo);
 
 renderer.domElement.addEventListener('contextmenu', event => {
   event.preventDefault();
-  if (!controls.mapMode) {
+  const gridlines3dContextMenu = gridlinesRuntime.active && !controls.mapMode;
+  if (!controls.mapMode && !gridlines3dContextMenu) {
     vehicleRuntime.tryEnterVehicleControlFromPointer(event);
     return;
   }
@@ -2276,12 +2285,17 @@ renderer.domElement.addEventListener('contextmenu', event => {
   if (targets.length === 0) return;
   mouseNDC.x = (event.clientX / window.innerWidth) * 2 - 1;
   mouseNDC.y = -(event.clientY / window.innerHeight) * 2 + 1;
-  raycaster.setFromCamera(mouseNDC, mapCam);
+  raycaster.setFromCamera(mouseNDC, controls.mapMode ? mapCam : camera);
   const hits = raycaster.intersectObjects(targets);
   if (hits.length === 0) return;
-  const info = summarizeTerrainMesh(hits[0].object);
+  const mesh = hits[0].object;
+  const info = summarizeTerrainMesh(mesh);
   const src = texSource.get(info.tileId) || '';
-  showTileMenu(event.clientX, event.clientY, info.tileId, src);
+  showTileMenu(
+    event.clientX, event.clientY, info.tileId, src,
+    mesh.userData.heightmapPayload,
+    mesh.userData.resolution,
+  );
 });
 
 renderer.domElement.addEventListener(
@@ -2392,9 +2406,9 @@ function render() {
   vehicleRuntime.syncVehicleShadowReceivers();
   vehicleRuntime.updateVehicleShadowSystem();
   vehicleRuntime.vehicleMarkerLayer.visible = controls.mapMode;
-  mapGridController.setVisible(controls.seamMode && !heatmapRuntime.active);
+  mapGridController.setVisible(controls.seamMode && !tileInspectorRuntime.active);
   if (controls.mapMode) {
-    if (!heatmapRuntime.active) {
+    if (!tileInspectorRuntime.active) {
       mapGridController.update(collectTerrainDebugMeshes(terrainRoot, debugIntersectables));
     }
     updateMapCamera();

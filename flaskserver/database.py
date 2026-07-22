@@ -42,7 +42,7 @@ CONFIDENCE = {
 }
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 _SCHEMA_VERSION_KEY = "schema_version"
 
 
@@ -98,6 +98,9 @@ CREATE TABLE IF NOT EXISTS tiles (
     geometric_error REAL NOT NULL DEFAULT 0.0,
     source          TEXT NOT NULL DEFAULT 'empty',
     updated_at      TEXT NOT NULL,
+    dem_demanded_at TEXT,
+    dem_requested_at TEXT,
+    cog_requested_at TEXT,
     heightmap       BLOB,
     confidence_map  BLOB
 );
@@ -305,6 +308,17 @@ def _migrate_to_v4(db):
     )
 
 
+def _migrate_to_v5(db):
+    """Persist demand and provider-request evidence for terrain DEM tiles."""
+    columns = {row[1] for row in db.execute("PRAGMA table_info(tiles)")}
+    if "dem_demanded_at" not in columns:
+        db.execute("ALTER TABLE tiles ADD COLUMN dem_demanded_at TEXT")
+    if "dem_requested_at" not in columns:
+        db.execute("ALTER TABLE tiles ADD COLUMN dem_requested_at TEXT")
+    if "cog_requested_at" not in columns:
+        db.execute("ALTER TABLE tiles ADD COLUMN cog_requested_at TEXT")
+
+
 def _migrate_schema(db):
     row = db.execute(
         "SELECT value FROM metadata WHERE key = ?", (_SCHEMA_VERSION_KEY,)
@@ -341,6 +355,13 @@ def _migrate_schema(db):
         db.execute(
             "INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)",
             (_SCHEMA_VERSION_KEY, "4"),
+        )
+        version = 4
+    if version < 5:
+        _migrate_to_v5(db)
+        db.execute(
+            "INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)",
+            (_SCHEMA_VERSION_KEY, "5"),
         )
 
 

@@ -43,6 +43,7 @@ REAL_SOURCES = (
 # Sources that should be refetched at higher DEM resolution
 _UPGRADEABLE_SOURCES = {
     'arcticdem',  # old 32m data
+    'parent_resampled',
     'unmasked_arcticdem',
     'unmasked_arcticdem_10m',
     'unmasked_copernicus',
@@ -57,6 +58,55 @@ _UPGRADEABLE_SOURCES = {
 # Seeded from DB on startup, updated as new tiles are discovered.
 _no_data_cache = set()
 LOD_COARSEN_RATIO = 0.75
+# Shape the radial LOD ceiling as equal-width rings outside the full-detail
+# center. The rim must never become coarser than depth 8.
+LOD_COARSE_FLOOR_DEPTH = 8
+LOD_FINE_PLATEAU_RATIO = 0.55
+# A depth-12 tile is about 659 m wide. Keep the full-detail response band to
+# roughly six tile widths around the camera.
+LOD_FINE_PLATEAU_MAX_M = 4000.0
+# Keep the complete 12 -> 8 transition within a bounded distance so large
+# coverage requests retain a cheap depth-8 rim instead of expanding every
+# intermediate band without limit.
+LOD_TRANSITION_MAX_M = 12000.0
+
+
+def _lod_target_depth(distance, max_range, max_depth):
+    """Return the radial LOD ceiling for a horizontal camera distance.
+
+    Up to the smaller of the inner 55% of the requested range or 4 km is a
+    full-detail plateau (roughly six depth-12 tile widths).
+    Equal-width radial bands then step through every intermediate depth toward
+    the outer rim. The full transition is capped at 12 km so very large
+    coverage ranges cannot overwhelm the tile budget. For requests capable of
+    reaching it, the outer floor is always depth 8 (``8-*`` tiles), never
+    depth 7 or 6.
+    """
+    max_depth = max(0, int(max_depth))
+    coarse_depth = min(max_depth, LOD_COARSE_FLOOR_DEPTH)
+    if max_range <= 0 or max_depth == coarse_depth:
+        return max_depth
+
+    fine_plateau_end = min(
+        max_range * LOD_FINE_PLATEAU_RATIO,
+        LOD_FINE_PLATEAU_MAX_M,
+    )
+    coarse_rim_start = min(max_range, fine_plateau_end + LOD_TRANSITION_MAX_M)
+    distance = max(0.0, distance)
+    if distance <= fine_plateau_end:
+        return max_depth
+    if distance >= coarse_rim_start:
+        return coarse_depth
+
+    transition = (
+        (distance - fine_plateau_end)
+        / (coarse_rim_start - fine_plateau_end)
+    )
+    depth_falloff = max_depth - coarse_depth
+    continuous_depth = max_depth - depth_falloff * transition
+    # This is a ceiling, so never round a fractional transition depth upward:
+    # doing so extends the full-detail band beyond fine_plateau_end.
+    return max(coarse_depth, min(max_depth, math.floor(continuous_depth)))
 
 
 def _lod_complete_ancestors(leaf_ids):
@@ -92,6 +142,41 @@ def _lod_complete_ancestors(leaf_ids):
 def _lod_leaf_descendants_cover(depth, col, row, leaf_ids):
     """Whether strict descendant leaves completely cover this tile."""
     return (depth, col, row) in _lod_complete_ancestors(leaf_ids)
+
+
+def _coarse_lod_neighbors(leaf_ids):
+    """Return leaves bordering another leaf more than one level finer."""
+    addresses = set()
+    for tile_id in leaf_ids:
+        try:
+            addresses.add(tuple(map(int, tile_id.split('-'))))
+        except (AttributeError, TypeError, ValueError):
+            continue
+
+    coarse = set()
+    for fine_depth, fine_col, fine_row in addresses:
+        if fine_depth < 2:
+            continue
+        limit = 1 << fine_depth
+        for neighbor_col, neighbor_row in (
+            (fine_col - 1, fine_row),
+            (fine_col + 1, fine_row),
+            (fine_col, fine_row - 1),
+            (fine_col, fine_row + 1),
+        ):
+            if not (0 <= neighbor_col < limit and 0 <= neighbor_row < limit):
+                continue
+            for coarse_depth in range(fine_depth - 2, -1, -1):
+                scale = 1 << (fine_depth - coarse_depth)
+                candidate = (
+                    coarse_depth,
+                    neighbor_col // scale,
+                    neighbor_row // scale,
+                )
+                if candidate in addresses:
+                    coarse.add(candidate)
+                    break
+    return coarse
 
 
 def load_no_data_cache(db):
@@ -142,8 +227,6 @@ def bbox_in_view_circle(qx, qy, bbox, max_range):
     if max_range <= 0:
         return True
     return _distance_to_bbox(qx, qy, bbox) <= max_range
-
-
 def _fetch_tile(db, tile_id, bbox, allow_overwrite=False):
     """Fetch a single tile from COG, write to DB. Returns True if data found."""
     if tile_id in _no_data_cache:
@@ -276,19 +359,32 @@ def _traverse(db, depth, col, row, qx, qy, max_depth, error_threshold,
     should_subdivide = False
     if depth < max_depth:
         dist = max(math.sqrt(dist_to_tile**2 + altitude**2), 1.0)
-        tile_size = meta['bbox'][2] - meta['bbox'][0]
 
         screen_error = geo_err / dist
 
         if _debug:
             log_trav.debug(f"{tid}: screen_error={screen_error:.6f} threshold={error_threshold:.6f} dist={dist:.0f}")
 
-        was_subdivided = (depth, col, row) in (previous_subdivided or ())
-        active_threshold = error_threshold * (
-            LOD_COARSEN_RATIO if was_subdivided else 1.0
-        )
+        if max_range > 0:
+            # A coarse tile must subdivide whenever any part of its footprint
+            # reaches a finer radial band. Center-distance classification lets
+            # a 10 km-wide depth-8 tile remain terminal beside depth-12 tiles.
+            lod_distance = dist_to_tile
+            target_depth = _lod_target_depth(
+                lod_distance, max_range, max_depth
+            )
+            wants_subdivision = depth < target_depth
+        else:
+            # Preserve error-based traversal for callers that explicitly ask
+            # for unlimited coverage and therefore provide no radial curve.
+            was_subdivided = (depth, col, row) in (previous_subdivided or ())
+            active_threshold = error_threshold * (
+                LOD_COARSEN_RATIO if was_subdivided else 1.0
+            )
+            target_depth = max_depth
+            wants_subdivision = screen_error > active_threshold
 
-        if screen_error > active_threshold:
+        if wants_subdivision:
             # Hard subdivision ceiling for the current terrain dataset.
             if depth >= MAX_TILE_DEPTH:
                 if _debug:
@@ -323,7 +419,12 @@ def _traverse(db, depth, col, row, qx, qy, max_depth, error_threshold,
                         missing.append((ct, cm['bbox']))
                 return
         elif _debug:
-            log_trav.debug(f"{tid}: screen_error too low, NOT subdividing")
+            reason = (
+                f"radial LOD target depth {target_depth}"
+                if max_range > 0
+                else "screen error too low"
+            )
+            log_trav.debug(f"{tid}: {reason}, NOT subdividing")
 
     if should_subdivide:
         c2, r2 = col * 2, row * 2
@@ -373,6 +474,83 @@ def _traverse(db, depth, col, row, qx, qy, max_depth, error_threshold,
             results.append(tid)
         elif tid not in _no_data_cache:
             missing.append((tid, meta['bbox']))
+
+
+def _balance_lod_leaves(
+    db, leaf_ids, missing, qx, qy, max_depth, error_threshold,
+    max_range, altitude, previous_subdivided,
+):
+    """Enforce a 2:1 quadtree transition between adjacent returned leaves.
+
+    Radial thresholds are symmetric, but the camera is not generally aligned
+    to the quadtree grid. Refining only the coarse side of any depth gap keeps
+    the inexpensive depth-8 rim while guaranteeing the visible sequence never
+    jumps directly from depth 8 to 10 (or across a larger gap).
+    """
+    leaves = set(leaf_ids)
+    refined = 0
+
+    for _ in range(max_depth + 1):
+        coarse_neighbors = _coarse_lod_neighbors(leaves)
+        if not coarse_neighbors:
+            break
+
+        changed = False
+        for depth, col, row in sorted(coarse_neighbors):
+            tile_id = _tile_id(depth, col, row)
+            if tile_id not in leaves or depth >= max_depth:
+                continue
+
+            c2, r2 = col * 2, row * 2
+            children = [(c2, r2), (c2 + 1, r2), (c2, r2 + 1), (c2 + 1, r2 + 1)]
+            first_child_id = _tile_id(depth + 1, c2, r2)
+            if read_tile_metadata(db, first_child_id) is None:
+                _ensure_children(db, depth, col, row)
+
+            child_rows = []
+            ready = True
+            for child_col, child_row in children:
+                child_id = _tile_id(depth + 1, child_col, child_row)
+                child_bbox = _tile_bbox(depth + 1, child_col, child_row)
+                if not bbox_in_view_circle(qx, qy, child_bbox, max_range):
+                    continue
+                child_meta = read_tile_metadata(db, child_id)
+                if child_meta is None:
+                    ready = False
+                    continue
+                child_rows.append((child_id, child_col, child_row, child_meta))
+                if (
+                    child_meta['source'] not in REAL_SOURCES
+                    and child_id not in _no_data_cache
+                ):
+                    missing.append((child_id, child_meta['bbox']))
+                    ready = False
+
+            if not ready:
+                continue
+
+            replacements = []
+            replacement_missing = []
+            for child_id, child_col, child_row, child_meta in child_rows:
+                if child_meta['source'] not in REAL_SOURCES:
+                    continue
+                _traverse(
+                    db, depth + 1, child_col, child_row, qx, qy, max_depth,
+                    error_threshold, replacements, replacement_missing,
+                    max_range, altitude, previous_subdivided,
+                )
+
+            leaves.remove(tile_id)
+            leaves.update(replacements)
+            missing.extend(replacement_missing)
+            refined += 1
+            changed = True
+
+        if not changed:
+            break
+
+    leaf_ids[:] = list(leaves)
+    return refined
 
 
 def query_tiles_stereo(db, qx, qy, error_threshold=0.001, max_depth=None,
@@ -437,6 +615,13 @@ def _query_tiles_impl(db, qx, qy, error_threshold, max_depth, max_range, log,
         leaf_ids, missing_raw, max_range, altitude,
         previous_subdivided,
     )
+
+    balanced = _balance_lod_leaves(
+        db, leaf_ids, missing_raw, qx, qy, max_depth, error_threshold,
+        max_range, altitude, previous_subdivided,
+    )
+    if balanced:
+        log(f"  [LOD BALANCE] refined {balanced} coarse neighbor tiles")
 
     # Tile budget: if LOD produced too many tiles, drop the deepest/farthest.
     # Keep coarse tiles (coverage) and nearest deep tiles (detail where it matters).

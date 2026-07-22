@@ -113,11 +113,14 @@ class RetiredTerrainMigrationTest(unittest.TestCase):
                 db.execute(
                     "SELECT value FROM metadata WHERE key = 'schema_version'"
                 ).fetchone(),
-                ("4",),
+                ("5",),
             )
             columns = {row[1] for row in db.execute("PRAGMA table_info(tiles)")}
             self.assertNotIn("has_sealevel_water", columns)
             self.assertNotIn("has_flattened_water", columns)
+            self.assertIn("dem_demanded_at", columns)
+            self.assertIn("dem_requested_at", columns)
+            self.assertIn("cog_requested_at", columns)
 
             rows = {
                 row[0]: row[1:]

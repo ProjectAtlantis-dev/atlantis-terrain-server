@@ -13,44 +13,32 @@ function priorityColor(value) {
   return `rgb(0,${Math.round(224 * (1 - amount))},${Math.round(80 + amount * 175)})`;
 }
 
-export function updateHeatmapViewPriorities(tiles, view) {
+export function updateTileInspectorViewPriorities(tiles, view) {
   if (!Array.isArray(tiles) || !view) return;
   const cameraX = Number(view.cameraX);
   const cameraY = Number(view.cameraY);
-  const heading = Number(view.yaw);
-  if (![cameraX, cameraY, heading].every(Number.isFinite)) return;
-  const forwardX = -Math.sin(heading);
-  const forwardY = Math.cos(heading);
+  if (![cameraX, cameraY].every(Number.isFinite)) return;
   for (const tile of tiles) {
     const [xMin, yMin, xMax, yMax] = tile.bbox;
     const dx = (xMin + xMax) / 2 - cameraX;
     const dy = (yMin + yMax) / 2 - cameraY;
-    const distance = Math.hypot(dx, dy);
-    if (distance <= 0) {
-      tile.priority = 0;
-      continue;
-    }
-    const dot = (dx * forwardX + dy * forwardY) / distance;
-    const priorityDistance = radialPriorityDistance(dx, dy);
-    tile.priority = Math.log(Math.max(
-      priorityDistance / Math.max(dot, 0.01), 1,
-    ));
+    tile.priority = Math.log(Math.max(radialPriorityDistance(dx, dy), 1));
   }
   tiles.sort((a, b) => a.priority - b.priority);
   tiles.forEach((tile, order) => { tile.order = order; });
 }
 
-export function createTerrainHeatmapRuntime({
+export function createTerrainTileInspectorRuntime({
   getView,
+  getTiles,
   onWheel,
   onDrag,
   onTileClick,
-  fetchImpl = (...args) => fetch(...args),
   documentImpl = document,
   windowImpl = window,
 } = {}) {
   const layer = documentImpl.createElement('div');
-  layer.id = 'terrain-heatmap-layer';
+  layer.id = 'terrain-tile-inspector-layer';
   layer.style.cssText = [
     'position:fixed', 'inset:0', 'display:none', 'z-index:4',
     'background:#060a10', 'overflow:hidden',
@@ -69,7 +57,7 @@ export function createTerrainHeatmapRuntime({
     'font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace',
     'pointer-events:none', 'white-space:nowrap',
   ].join(';');
-  meta.textContent = 'waiting for heatmap…';
+  meta.textContent = 'waiting for browser terrain demand…';
   layer.appendChild(meta);
 
   const tip = documentImpl.createElement('div');
@@ -83,19 +71,44 @@ export function createTerrainHeatmapRuntime({
   documentImpl.body.appendChild(layer);
 
   let presentation = 'hidden';
-  let heatmap = null;
+  let snapshot = null;
   let width = 0;
   let height = 0;
-  let pollTimer = null;
   let animationFrame = null;
-  let activePollController = null;
-  let pollGeneration = 0;
   let dragging = false;
   let dragButton = 0;
   let dragged = false;
   let lastView = null;
   let lastPriorityView = null;
-  let lastRequestedHeading = null;
+  let lastSourceTiles = null;
+
+  function syncBrowserTiles() {
+    const sourceTiles = getTiles?.();
+    if (sourceTiles === lastSourceTiles) return;
+    lastSourceTiles = sourceTiles;
+    snapshot = {
+      // Priority sorting is presentation state. Keep it off the renderer's
+      // authoritative demand array so this overlay cannot influence residency
+      // or eviction order.
+      tiles: Array.isArray(sourceTiles) ? sourceTiles.map(tile => {
+        const demQuality = classifyDemSource(tile.source);
+        const textureQuality = classifyTextureTile(tile);
+        return {
+          id: tile.id,
+          bbox: Array.isArray(tile.bbox) ? [...tile.bbox] : tile.bbox,
+          depth: tile.depth,
+          source: tile.source,
+          demQuality,
+          textureQuality,
+          hasTexture: Boolean(tile.hasTexture),
+          hasHeightmap: Boolean(tile.heightmap),
+          texStatus: tile.texStatus,
+        };
+      }) : [],
+    };
+    lastPriorityView = null;
+    updateMeta();
+  }
 
   function resize() {
     width = windowImpl.innerWidth;
@@ -118,10 +131,10 @@ export function createTerrainHeatmapRuntime({
   }
 
   function hit(clientX, clientY) {
-    if (!lastView || !heatmap?.tiles) return null;
+    if (!lastView || !snapshot?.tiles) return null;
     const [worldX, worldY] = screenToWorld(clientX, clientY, lastView);
     let best = null;
-    for (const tile of heatmap.tiles) {
+    for (const tile of snapshot.tiles) {
       const [xMin, yMin, xMax, yMax] = tile.bbox;
       if (
         worldX >= xMin && worldX < xMax && worldY >= yMin && worldY < yMax &&
@@ -145,14 +158,13 @@ export function createTerrainHeatmapRuntime({
       return;
     }
 
-    const tiles = heatmap?.tiles || [];
-    const priorityView = `${view.cameraX}:${view.cameraY}:${view.yaw}`;
+    syncBrowserTiles();
+    const tiles = snapshot?.tiles || [];
+    const priorityView = `${view.cameraX}:${view.cameraY}`;
     if (priorityView !== lastPriorityView) {
-      updateHeatmapViewPriorities(tiles, view);
+      updateTileInspectorViewPriorities(tiles, view);
       lastPriorityView = priorityView;
     }
-    const requestedHeading = String(view.yaw);
-    if (requestedHeading !== lastRequestedHeading) rebuildForHeading(view);
     const priorities = tiles.map(tile => tile.priority);
     const minPriority = priorities.length ? Math.min(...priorities) : 0;
     const maxPriority = priorities.length ? Math.max(...priorities) : 0;
@@ -173,7 +185,7 @@ export function createTerrainHeatmapRuntime({
         ? (tile.priority - minPriority) / (maxPriority - minPriority)
         : 0;
       const tileColor = priorityColor(normalized);
-      if (presentation === 'heatmap') {
+      if (presentation === 'inspector') {
         context.globalAlpha = 0.72;
         context.fillStyle = tileColor;
         context.fillRect(x, y, tileWidth, tileHeight);
@@ -190,7 +202,7 @@ export function createTerrainHeatmapRuntime({
         context.lineWidth = 1;
       }
       if (
-        presentation === 'heatmap' && tile.order != null &&
+        presentation === 'inspector' && tile.order != null &&
         tileWidth > 26 && tileHeight > 16
       ) {
         labels.push({
@@ -217,7 +229,7 @@ export function createTerrainHeatmapRuntime({
       context.fillText(label.text, screenX, screenY);
     }
 
-    if (presentation === 'heatmap') {
+    if (presentation === 'inspector') {
       context.save();
       context.translate(width / 2, height / 2);
       context.fillStyle = '#ffe14a';
@@ -239,69 +251,20 @@ export function createTerrainHeatmapRuntime({
   }
 
   function updateMeta() {
-    const count = heatmap?.tiles?.length ?? 0;
+    const count = snapshot?.tiles?.length ?? 0;
     meta.innerHTML = count
-      ? `<b style="color:#dbe5f1">${count}</b> quadtree tiles · priority ` +
+      ? `<b style="color:#dbe5f1">${count}</b> quadtree tiles · distance ` +
         '<span style="display:inline-block;width:90px;height:10px;border:1px solid #000;' +
-        'background:linear-gradient(to right,#ff2020,#ffff00,#00e050,#0066ff)"></span> hot→cold · numbers = fetch order'
-      : 'waiting for /api/heatmap…';
-  }
-
-  async function poll(viewOverride = null) {
-    if (presentation === 'hidden') return;
-    const requestGeneration = ++pollGeneration;
-    activePollController?.abort();
-    const controller = new AbortController();
-    activePollController = controller;
-    let delay = 2000;
-    try {
-      const view = viewOverride ?? getView?.();
-      const params = new URLSearchParams();
-      if (view) {
-        params.set('qx', String(view.cameraX));
-        params.set('qy', String(view.cameraY));
-        params.set('alt', String(view.alt));
-        params.set('heading', String(view.yaw));
-        if (Number.isFinite(view.range)) params.set('range', String(view.range));
-        lastRequestedHeading = String(view.yaw);
-      }
-      const response = await fetchImpl(`/api/heatmap?${params}`, {
-        signal: controller.signal,
-      });
-      if (!response.ok) throw new Error(String(response.status));
-      const data = await response.json();
-      if (requestGeneration !== pollGeneration) return;
-      if (data) {
-        heatmap = data;
-        lastPriorityView = null;
-      }
-      updateMeta();
-    } catch (error) {
-      if (requestGeneration !== pollGeneration || error?.name === 'AbortError') return;
-      delay = 5000;
-      meta.textContent = 'heatmap unavailable — retrying…';
-    }
-    if (requestGeneration !== pollGeneration || presentation === 'hidden') return;
-    activePollController = null;
-    pollTimer = windowImpl.setTimeout(() => {
-      pollTimer = null;
-      poll();
-    }, delay);
-  }
-
-  function rebuildForHeading(view) {
-    lastRequestedHeading = String(view.yaw);
-    if (pollTimer != null) windowImpl.clearTimeout(pollTimer);
-    pollTimer = null;
-    poll(view);
+        'background:linear-gradient(to right,#ff2020,#ffff00,#00e050,#0066ff)"></span> near→far · numbers = distance order'
+      : 'waiting for terrain tiles…';
   }
 
   function setPresentation(next) {
-    if (!['hidden', 'edges', 'heatmap'].includes(next)) return;
+    if (!['hidden', 'edges', 'inspector'].includes(next)) return;
     if (next === presentation) return;
-    const wasVisible = presentation === 'heatmap';
+    const wasVisible = presentation === 'inspector';
     presentation = next;
-    const visible = presentation === 'heatmap';
+    const visible = presentation === 'inspector';
     layer.style.display = visible ? 'block' : 'none';
     layer.style.background = '#060a10';
     layer.style.pointerEvents = 'auto';
@@ -310,22 +273,16 @@ export function createTerrainHeatmapRuntime({
     tip.style.display = 'none';
     if (visible && !wasVisible) {
       resize();
-      poll();
+      syncBrowserTiles();
       animationFrame = windowImpl.requestAnimationFrame(draw);
     } else if (!visible && wasVisible) {
-      pollGeneration += 1;
-      activePollController?.abort();
-      activePollController = null;
-      if (pollTimer != null) windowImpl.clearTimeout(pollTimer);
       if (animationFrame != null) windowImpl.cancelAnimationFrame(animationFrame);
-      pollTimer = null;
       animationFrame = null;
-      lastRequestedHeading = null;
     }
   }
 
   function setActive(next) {
-    setPresentation(next ? 'heatmap' : 'edges');
+    setPresentation(next ? 'inspector' : 'edges');
   }
 
   canvas.addEventListener('wheel', event => {
@@ -339,7 +296,7 @@ export function createTerrainHeatmapRuntime({
     dragButton = event.button;
   });
   windowImpl.addEventListener('mousemove', event => {
-    if (presentation !== 'heatmap' || !dragging) return;
+    if (presentation !== 'inspector' || !dragging) return;
     if (event.movementX !== 0 || event.movementY !== 0) dragged = true;
     onDrag?.(event, dragButton);
   });
@@ -357,6 +314,8 @@ export function createTerrainHeatmapRuntime({
     tip.textContent = `${tile.id} (d${tile.depth})\npriority ${tile.priority.toFixed(2)} · order ${tile.order}` +
       (tile.hasTexture ? ' · texture cached' : '') +
       `\nterrain ${tile.source || 'none'} · heightmap ${tile.hasHeightmap ? 'yes' : 'no'}` +
+      ` · ${tile.demQuality?.synthetic ? 'synthetic' : tile.demQuality?.kind}` +
+      `\nimage ${tile.textureQuality?.kind || 'missing'} · ${tile.textureQuality?.retryState || 'unknown'}` +
       `\nconfidence ${confidence}`;
     tip.style.left = `${event.clientX + 14}px`;
     tip.style.top = `${event.clientY + 10}px`;
@@ -368,16 +327,17 @@ export function createTerrainHeatmapRuntime({
     if (tile) onTileClick?.(tile);
   });
   windowImpl.addEventListener('resize', () => {
-    if (presentation === 'heatmap') resize();
+    if (presentation === 'inspector') resize();
   });
 
   return {
     canvas,
     layer,
-    get active() { return presentation === 'heatmap'; },
+    get active() { return presentation === 'inspector'; },
     get presentation() { return presentation; },
     setActive,
     setPresentation,
-    toggle() { setActive(presentation !== 'heatmap'); },
+    toggle() { setActive(presentation !== 'inspector'); },
   };
 }
+import { classifyDemSource, classifyTextureTile } from './terrain-tile-quality.js';

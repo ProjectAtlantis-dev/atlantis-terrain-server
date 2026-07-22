@@ -35,13 +35,11 @@ export function createTextureStreamer({
   const texRetryCount = new Map();
   const ancestorLogged = new Set();
   const staleTextures = new Set();
-  const demandClient = globalThis.crypto?.randomUUID?.() ?? `terrain-${Date.now()}-${Math.random()}`;
   let version = Date.now();
   let roadDebug = false;
   let waterDebug = false;
   let hydroDebug = false;
   let activeDemand = null;
-  let demandGeneration = 0;
   let refillPending = false;
 
   function advanceVersion() {
@@ -62,12 +60,12 @@ export function createTextureStreamer({
       : 1;
   }
 
-  function scheduleRefill(generation) {
-    if (generation !== demandGeneration || refillPending || activeDemand == null) return;
+  function scheduleRefill() {
+    if (refillPending || activeDemand == null) return;
     refillPending = true;
     queueMicrotaskImpl(() => {
       refillPending = false;
-      if (generation === demandGeneration && activeDemand != null) fillAvailableSlots();
+      if (activeDemand != null) fillAvailableSlots();
     });
   }
 
@@ -92,11 +90,10 @@ export function createTextureStreamer({
 
       const controller = new AbortController();
       texInflight.set(tileId, controller);
-      const requestGeneration = demandGeneration;
       const debugQuery = `${roadDebug ? '&roadDebug=1' : ''}`
         + `${waterDebug ? '&waterDebug=1' : ''}`
         + `${hydroDebug ? '&hydroDebug=1' : ''}`;
-      fetchImpl(`/api/texture/${tileId}.jpg?v=${version}&demand=${version}&demandClient=${encodeURIComponent(demandClient)}${debugQuery}`, { signal: controller.signal })
+      fetchImpl(`/api/texture/${tileId}.jpg?v=${version}${debugQuery}`, { signal: controller.signal })
         .then(response => {
           texInflight.delete(tileId);
           if (response.status === 202) {
@@ -154,7 +151,7 @@ export function createTextureStreamer({
             console.warn(`[TEX] ${tileId}:`, error.message);
           }
         })
-        .finally(() => scheduleRefill(requestGeneration));
+        .finally(scheduleRefill);
     }
   }
 
@@ -190,7 +187,7 @@ export function createTextureStreamer({
   }
 
   function releaseTileDemand(tileId) {
-    // Ordinary heatmap motion removes scene residency, not cached paint.
+    // Ordinary browser-demand motion removes scene residency, not cached paint.
     // Retaining the decoded texture makes a heading reversal an immediate
     // materialization instead of a grey fetch/decode/repaint cycle.
     texInflight.get(tileId)?.abort();
@@ -202,7 +199,6 @@ export function createTextureStreamer({
   }
 
   function abortAll() {
-    demandGeneration += 1;
     activeDemand = null;
     for (const controller of texInflight.values()) controller.abort();
     texInflight.clear();

@@ -6,6 +6,7 @@ ArcticDEM v4.1 10m mosaic from S3, Copernicus 30m fallback.
 from __future__ import annotations
 
 from contextlib import contextmanager
+import datetime
 import math
 import os
 import threading
@@ -157,7 +158,9 @@ _MAX_ARCTIC_TILES = 16       # Don't attempt more than this many ArcticDEM COGs 
 _ARCTIC_COG_WORKERS = 6      # Parallel HTTP readers for ArcticDEM
 
 
-def _read_cog_heightmap(bbox, resolution=GRID_N, arctic_workers=_ARCTIC_COG_WORKERS):
+def _read_cog_heightmap(
+    bbox, resolution=GRID_N, arctic_workers=_ARCTIC_COG_WORKERS, audit=None
+):
     """Read heightmap from ArcticDEM and Copernicus, compare, pick best.
 
     ArcticDEM COG tiles are fetched in parallel (up to _ARCTIC_COG_WORKERS).
@@ -168,6 +171,27 @@ def _read_cog_heightmap(bbox, resolution=GRID_N, arctic_workers=_ARCTIC_COG_WORK
     """
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
+    def _audit(stage, provider, outcome=None, detail=None):
+        if audit is None:
+            return
+        event = {
+            "stage": stage,
+            "provider": provider,
+            "at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        }
+        if outcome is not None:
+            event["outcome"] = outcome
+        if detail is not None:
+            event["detail"] = detail
+        try:
+            audit(event)
+        except Exception as exc:
+            # Audit persistence must never turn a provider result into a false
+            # terrain-fetch failure. The server logger still records the gap.
+            log_cog.error(
+                f"  COG audit callback FAILED: {type(exc).__name__}: {exc}"
+            )
+
     log_cog.info(f"Fetching heightmap bbox=[{bbox[0]:.0f},{bbox[1]:.0f},{bbox[2]:.0f},{bbox[3]:.0f}] res={resolution}")
 
     # --- ArcticDEM (parallel) ---
@@ -175,6 +199,10 @@ def _read_cog_heightmap(bbox, resolution=GRID_N, arctic_workers=_ARCTIC_COG_WORK
     tiles_needed = _tiles_for_bbox(bbox)
 
     if len(tiles_needed) > _MAX_ARCTIC_TILES:
+        _audit(
+            "cog_skipped", "arcticdem", "tile_cap",
+            {"tiles_needed": len(tiles_needed), "cap": _MAX_ARCTIC_TILES},
+        )
         log_cog.info(f"  ArcticDEM: {len(tiles_needed)} COG tiles needed — too many (cap={_MAX_ARCTIC_TILES}), skipping")
     else:
         worker_count = max(1, min(int(arctic_workers), len(tiles_needed)))
@@ -187,20 +215,35 @@ def _read_cog_heightmap(bbox, resolution=GRID_N, arctic_workers=_ARCTIC_COG_WORK
             """Fetch one ArcticDEM COG tile, resample to output grid."""
             url = _tile_url(row, col)
             log_cog.info(f"    ArcticDEM row={row} col={col} URL={url}")
-            with _open_remote_cog(url) as src:
-                window = window_from_bounds(*bbox, src.transform)  # type: ignore[call-arg]
-                win_c0 = int(np.floor(window.col_off)) - 1
-                win_r0 = int(np.floor(window.row_off)) - 1
-                win_c1 = int(np.ceil(window.col_off + window.width)) + 1
-                win_r1 = int(np.ceil(window.row_off + window.height)) + 1
-                int_window = Window(win_c0, win_r0, win_c1 - win_c0, win_r1 - win_r0)  # type: ignore[call-arg]
+            resource = {"row": row, "col": col, "url": url}
+            _audit("cog_requested", "arcticdem", detail=resource)
+            try:
+                with _open_remote_cog(url) as src:
+                    window = window_from_bounds(*bbox, src.transform)  # type: ignore[call-arg]
+                    win_c0 = int(np.floor(window.col_off)) - 1
+                    win_r0 = int(np.floor(window.row_off)) - 1
+                    win_c1 = int(np.ceil(window.col_off + window.width)) + 1
+                    win_r1 = int(np.ceil(window.row_off + window.height)) + 1
+                    int_window = Window(win_c0, win_r0, win_c1 - win_c0, win_r1 - win_r0)  # type: ignore[call-arg]
 
-                data = src.read(1, window=int_window, boundless=True).astype(np.float32)
-                data[data <= NODATA] = np.nan
-                valid_pct = np.mean(~np.isnan(data)) * 100
-                log_cog.info(f"    ArcticDEM row={row} col={col} OK: shape={data.shape} valid={valid_pct:.1f}%")
-
-                return _resample_native(data, src.window_transform(int_window), bbox, resolution)
+                    data = src.read(1, window=int_window, boundless=True).astype(np.float32)
+                    data[data <= NODATA] = np.nan
+                    valid_pct = np.mean(~np.isnan(data)) * 100
+                    log_cog.info(f"    ArcticDEM row={row} col={col} OK: shape={data.shape} valid={valid_pct:.1f}%")
+                    result = _resample_native(
+                        data, src.window_transform(int_window), bbox, resolution
+                    )
+                _audit(
+                    "cog_completed", "arcticdem", "success",
+                    {**resource, "valid_pct": round(float(valid_pct), 3)},
+                )
+                return result
+            except Exception as exc:
+                _audit(
+                    "cog_completed", "arcticdem", "error",
+                    {**resource, "error": type(exc).__name__, "message": str(exc)},
+                )
+                raise
 
         def _merge_arctic(resampled):
             nonlocal arctic
@@ -239,7 +282,11 @@ def _read_cog_heightmap(bbox, resolution=GRID_N, arctic_workers=_ARCTIC_COG_WORK
     try:
         cop_url, cop_lon, cop_lat = _copernicus_url(bbox)
         log_cog.info(f"  Copernicus URL={cop_url} (center lon={cop_lon:.3f} lat={cop_lat:.3f})")
-        dst_transform = transform_from_bounds(*bbox, resolution, resolution)  # type: ignore[call-arg]
+        cop_resource = {"url": cop_url, "retry": False}
+        _audit("cog_requested", "copernicus", detail=cop_resource)
+        dst_transform = transform_from_bounds(
+            bbox[0], bbox[1], bbox[2], bbox[3], resolution, resolution,
+        )
         cop_data = np.empty((resolution, resolution), dtype=np.float32)
         with _open_remote_cog(cop_url) as src:
             reproject(
@@ -252,7 +299,16 @@ def _read_cog_heightmap(bbox, resolution=GRID_N, arctic_workers=_ARCTIC_COG_WORK
         cop_data = np.flipud(cop_data)
         if np.any(~np.isnan(cop_data)) and np.any(cop_data != 0):
             cop = cop_data
+        _audit(
+            "cog_completed", "copernicus",
+            "success" if cop is not None else "no_data", cop_resource,
+        )
     except Exception as exc:
+        _audit(
+            "cog_completed", "copernicus", "error",
+            {**locals().get("cop_resource", {}), "error": type(exc).__name__,
+             "message": str(exc)},
+        )
         log_cog.warning(f"  Copernicus FAILED: {type(exc).__name__}: {exc}")
 
     # --- Copernicus expanded bbox retry ---
@@ -263,7 +319,11 @@ def _read_cog_heightmap(bbox, resolution=GRID_N, arctic_workers=_ARCTIC_COG_WORK
             exp_bbox = (bbox[0] - dx, bbox[1] - dy, bbox[2] + dx, bbox[3] + dy)
             cop_url2, cop_lon2, cop_lat2 = _copernicus_url(exp_bbox)
             log_cog.info(f"  Copernicus retry (expanded bbox +10%): URL={cop_url2}")
-            dst_transform2 = transform_from_bounds(*bbox, resolution, resolution)
+            cop_retry_resource = {"url": cop_url2, "retry": True}
+            _audit("cog_requested", "copernicus", detail=cop_retry_resource)
+            dst_transform2 = transform_from_bounds(
+                bbox[0], bbox[1], bbox[2], bbox[3], resolution, resolution,
+            )
             cop_data2 = np.empty((resolution, resolution), dtype=np.float32)
             with _open_remote_cog(cop_url2) as src:
                 reproject(
@@ -279,7 +339,16 @@ def _read_cog_heightmap(bbox, resolution=GRID_N, arctic_workers=_ARCTIC_COG_WORK
                 log_cog.info(f"  Copernicus expanded bbox: got data!")
             else:
                 log_cog.info(f"  Copernicus expanded bbox: still no valid data")
+            _audit(
+                "cog_completed", "copernicus",
+                "success" if cop is not None else "no_data", cop_retry_resource,
+            )
         except Exception as exc:
+            _audit(
+                "cog_completed", "copernicus", "error",
+                {**locals().get("cop_retry_resource", {}),
+                 "error": type(exc).__name__, "message": str(exc)},
+            )
             log_cog.warning(f"  Copernicus expanded FAILED: {type(exc).__name__}: {exc}")
 
     cop_ok = cop is not None

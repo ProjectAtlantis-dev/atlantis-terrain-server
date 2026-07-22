@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import base64
+import binascii
+import datetime
 import io
 import json
 import logging
@@ -12,6 +14,7 @@ import sqlite3
 import threading
 import time
 import zlib
+import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from logging import FileHandler
 from pathlib import Path
@@ -185,45 +188,41 @@ _init_textures: Any = None
 _init_classifier_tiles: Any = None
 
 _tex_pool = ThreadPoolExecutor(max_workers=4)
-_tex_fetching: dict[str, tuple[str, int]] = {}
+_tex_fetching: set[str] = set()
 _tex_fetching_lock = threading.Lock()
-_tex_demand_generations: dict[str, int] = {}
 _tex_metatile_locks: dict[str, threading.Lock] = {}
 _tex_metatile_locks_guard = threading.Lock()
 
-
-def _texture_demand_is_stale(client_id: str, generation: int) -> bool:
-  with _tex_fetching_lock:
-    return generation < _tex_demand_generations.get(client_id, 0)
-
-
-def _register_texture_demand(client_id: str, raw_generation: str | None) -> int:
-  try:
-    generation = int(raw_generation or 0)
-  except (TypeError, ValueError):
-    generation = 0
-  with _tex_fetching_lock:
-    if generation > _tex_demand_generations.get(client_id, 0):
-      _tex_demand_generations[client_id] = generation
-  return generation
-
 # --- Texture retry queue (transient Dataforsyningen failures) ---
-_TEX_RETRY_MAX = 3
-_TEX_RETRY_DELAYS = [30, 60, 120]  # seconds between retries
+# A provider throttle is never evidence that coverage is absent. Retries stay
+# live with capped backoff until the provider succeeds or explicitly returns a
+# valid no-coverage frame.
+_TEX_RETRY_DELAYS = [30, 60, 120, 300]  # seconds between retries, then cap
 _tex_retry_queue: list[tuple[str, tuple, int]] = []  # (tile_id, bbox, attempt)
 _tex_retry_lock = threading.Lock()
+_tex_retry_tiles: set[str] = set()  # queued or currently sleeping/fetching
 _tex_retry_thread: threading.Thread | None = None
 
 
 def _tex_retry_enqueue(tile_id: str, bbox: tuple, attempt: int = 0) -> None:
   with _tex_retry_lock:
-    # Don't double-queue
-    for tid, _, _ in _tex_retry_queue:
-      if tid == tile_id:
-        return
+    if tile_id in _tex_retry_tiles:
+      return
+    _tex_retry_tiles.add(tile_id)
     _tex_retry_queue.append((tile_id, bbox, attempt))
     log_tex.debug(f"[tex-retry] enqueued {tile_id} attempt={attempt}")
   _ensure_tex_retry_thread()
+
+
+def _tex_retry_finish(tile_id: str) -> None:
+  with _tex_retry_lock:
+    _tex_retry_tiles.discard(tile_id)
+
+
+def _tex_retry_again(tile_id: str, bbox: tuple, attempt: int) -> None:
+  """Requeue an active transient retry without opening a duplicate window."""
+  with _tex_retry_lock:
+    _tex_retry_queue.append((tile_id, bbox, attempt))
 
 
 def _ensure_tex_retry_thread() -> None:
@@ -243,7 +242,10 @@ def _tex_retry_worker() -> None:
       tile_id, bbox, attempt = _tex_retry_queue.pop(0)
 
     delay = _TEX_RETRY_DELAYS[min(attempt, len(_TEX_RETRY_DELAYS) - 1)]
-    log_tex.debug(f"[tex-retry] {tile_id}: waiting {delay}s (attempt {attempt + 1}/{_TEX_RETRY_MAX})")
+    log_tex.info(
+      f"[tex-retry] {tile_id}: waiting {delay}s before provider attempt "
+      f"{attempt + 1}"
+    )
     time.sleep(delay)
 
     db = None
@@ -259,6 +261,7 @@ def _tex_retry_worker() -> None:
       ).fetchone()
       if cur_row and cur_row[0] not in _METATILE_UPGRADEABLE_SOURCES:
         log_tex.debug(f"[tex-retry] {tile_id}: already upgraded to {cur_row[0]}, skipping")
+        _tex_retry_finish(tile_id)
         continue
 
       metatile_id, _, _, _ = _texture_metatile_spec(tile_id)
@@ -268,20 +271,28 @@ def _tex_retry_worker() -> None:
           written, no_coverage = _store_texture_metatile(db, children)
           if tile_id in written:
             log_tex.info(f"[tex-retry] {tile_id}: SUCCESS on attempt {attempt + 1}")
+            _tex_retry_finish(tile_id)
           elif tile_id in no_coverage:
             _resolve_no_coverage(db, tile_id, cur_row[1] if cur_row else None, "[tex-retry]")
+            _tex_retry_finish(tile_id)
+          else:
+            # A sibling request may have filled the aligned metatile while
+            # this retry waited. The next demand will inspect the final row.
+            _tex_retry_finish(tile_id)
         elif fail_reason == 'no_coverage':
           _resolve_no_coverage(db, tile_id, cur_row[1] if cur_row else None, "[tex-retry]")
+          _tex_retry_finish(tile_id)
         else:
-          # Still transient
-          if attempt + 1 < _TEX_RETRY_MAX:
-            _tex_retry_enqueue(tile_id, bbox, attempt + 1)
-            log_tex.debug(f"[tex-retry] {tile_id}: still transient, re-queued attempt {attempt + 2}")
-          else:
-            log_tex.warning(f"[tex-retry] {tile_id}: max retries exhausted")
-            _resolve_no_coverage(db, tile_id, cur_row[1] if cur_row else None, "[tex-retry]")
+          # Still transient. Never convert a throttle/timeout into terminal
+          # no-coverage; retain the ancestor crop and capped retry loop.
+          _tex_retry_again(tile_id, bbox, attempt + 1)
+          log_tex.warning(
+            f"[tex-retry] {tile_id}: provider still transient; "
+            f"re-queued attempt {attempt + 2}"
+          )
     except Exception as exc:
       log_tex.error(f"[tex-retry] {tile_id}: FAILED: {type(exc).__name__}: {exc}")
+      _tex_retry_again(tile_id, bbox, attempt + 1)
     finally:
       if db is not None:
         db.close()
@@ -294,8 +305,81 @@ _cog_demand_ids: set[str] = set()
 _cog_fetched_total = 0      # lifetime count of COG tiles fetched from S3
 _cog_skipped_total = 0      # lifetime count of tiles skipped (already had data)
 _cog_already_fetched: set[str] = set()  # tile IDs we've already fetched this session
+_cog_synthetic_retry_at: dict[str, float] = {}
 _COG_TILE_WORKERS = max(1, _env_int("COG_TILE_WORKERS", 6))
+_COG_SYNTHETIC_RETRY_SECONDS = max(
+  1, _env_int("COG_SYNTHETIC_RETRY_SECONDS", 300)
+)
 _cog_pool = ThreadPoolExecutor(max_workers=_COG_TILE_WORKERS)
+_cog_audit_lock = threading.Lock()
+
+
+def _request_timestamp() -> str:
+  return datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+
+def _record_dem_requests(db, missing, requested_at: str | None = None) -> int:
+  """Record that the terrain algorithm demanded these tile heightmaps."""
+  tile_ids = list(dict.fromkeys(tile_id for tile_id, _ in missing))
+  if not tile_ids:
+    return 0
+  timestamp = requested_at or _request_timestamp()
+  db.executemany(
+    "UPDATE tiles SET dem_demanded_at = ? WHERE tile_id = ?",
+    ((timestamp, tile_id) for tile_id in tile_ids),
+  )
+  db.commit()
+  for tile_id in tile_ids:
+    log_cog.info(
+      f"[tile-audit] tile={tile_id} stage=dem_demanded at={timestamp}"
+    )
+  return len(tile_ids)
+
+
+def _record_dem_request(db, tile_id: str, requested_at: str | None = None) -> str:
+  """Persist proof that a DEM worker began processing this tile."""
+  timestamp = requested_at or _request_timestamp()
+  db.execute(
+    "UPDATE tiles SET dem_requested_at = ? WHERE tile_id = ?",
+    (timestamp, tile_id),
+  )
+  db.commit()
+  log_cog.info(
+    f"[tile-audit] tile={tile_id} stage=dem_requested at={timestamp}"
+  )
+  return timestamp
+
+
+def _record_cog_request(tile_id: str, event: dict) -> None:
+  """Record every concrete provider COG attempt in the existing server log."""
+  timestamp = event.get("at") or _request_timestamp()
+  stage = event.get("stage", "cog_event")
+  provider = event.get("provider", "unknown")
+  outcome = event.get("outcome")
+  detail = event.get("detail")
+  parts = [
+    f"tile={tile_id}", f"stage={stage}", f"provider={provider}",
+    f"at={timestamp}",
+  ]
+  if outcome is not None:
+    parts.append(f"outcome={outcome}")
+  if detail is not None:
+    parts.append(f"detail={json.dumps(detail, sort_keys=True, separators=(',', ':'))}")
+  log_cog.info(f"[tile-audit] {' '.join(parts)}")
+  if stage != "cog_requested":
+    return
+  # The provider callback can run in an ArcticDEM sub-worker. Use its own
+  # short connection and serialize this single-row proof update.
+  with _cog_audit_lock:
+    audit_db = sqlite3.connect(str(DB_PATH), check_same_thread=False)
+    try:
+      audit_db.execute(
+        "UPDATE tiles SET cog_requested_at = ? WHERE tile_id = ?",
+        (timestamp, tile_id),
+      )
+      audit_db.commit()
+    finally:
+      audit_db.close()
 
 
 def _tile_ancestor_ids(tile_id: str):
@@ -330,11 +414,18 @@ def _fetch_one_cog_tile(tile_id, bbox):
       f"[cog-worker] {tile_id}: reading "
       f"bbox=[{bbox[0]:.0f},{bbox[1]:.0f},{bbox[2]:.0f},{bbox[3]:.0f}]"
     )
-    data, src_name = _read_cog_heightmap(bbox, _GRID_N)
+    _record_dem_request(db, tile_id)
+    data, src_name = _read_cog_heightmap(
+      bbox, _GRID_N, audit=lambda event: _record_cog_request(tile_id, event)
+    )
 
     if data is None:
       water = _cache_coastline(db, tile_id, bbox)
       if water is not None and _np.all(water):
+        log_cog.info(
+          f"[tile-audit] tile={tile_id} stage=dem_completed "
+          "outcome=official_ocean"
+        )
         _mark_official_ocean(db, tile_id)
         return "fetched"
 
@@ -347,12 +438,18 @@ def _fetch_one_cog_tile(tile_id, bbox):
           for ancestor in _tile_ancestor_ids(tile_id)
         )
       if ancestor_work:
+        log_cog.info(
+          f"[tile-audit] tile={tile_id} stage=dem_completed outcome=deferred"
+        )
         return "defer"
 
       data, src_name = _resample_from_parent(
         db, tile_id, bbox=None, resolution=_GRID_N
       )
       if data is None:
+        log_cog.info(
+          f"[tile-audit] tile={tile_id} stage=dem_completed outcome=no_data"
+        )
         mark_no_data(db, tile_id)
         return "no_data"
 
@@ -368,14 +465,25 @@ def _fetch_one_cog_tile(tile_id, bbox):
       _cache_coastline(db, tile_id, bbox)
       if source_name == "parent_resampled":
         log_cog.info(f"[PARENT RESAMPLE] {tile_id}: filled from parent")
-      return "fetched"
+      log_cog.info(
+        f"[tile-audit] tile={tile_id} stage=dem_completed "
+        f"outcome=stored source={source_name}"
+      )
+      return "synthetic" if source_name == "parent_resampled" else "fetched"
     except TileClobberError:
+      log_cog.info(
+        f"[tile-audit] tile={tile_id} stage=dem_completed outcome=clobber_skipped"
+      )
       return "skipped"
   except Exception as exc:
     log_cog.warning(
       f"[COG FETCH] {tile_id}: {type(exc).__name__}: {exc}"
     )
     try:
+      log_cog.info(
+        f"[tile-audit] tile={tile_id} stage=dem_completed "
+        f"outcome=error error={type(exc).__name__}"
+      )
       mark_no_data(db, tile_id)
     except Exception:
       pass
@@ -390,6 +498,7 @@ def _fill_cog_workers_locked():
     bbox = _cog_pending_tiles.pop(tile_id)
     _cog_fetching_tiles.add(tile_id)
     _cog_already_fetched.add(tile_id)
+    log_cog.info(f"[tile-audit] tile={tile_id} stage=dem_dispatched")
     future = _cog_pool.submit(_fetch_one_cog_tile, tile_id, bbox)
     future.add_done_callback(
       lambda completed, tid=tile_id, tile_bbox=bbox:
@@ -412,19 +521,42 @@ def _finish_cog_tile(tile_id, bbox, future):
       if tile_id in _cog_demand_ids:
         _cog_pending_tiles[tile_id] = bbox
     elif outcome == "fetched":
+      _cog_synthetic_retry_at.pop(tile_id, None)
       _cog_fetched_total += 1
+    elif outcome == "synthetic":
+      _cog_fetched_total += 1
+      _cog_synthetic_retry_at[tile_id] = (
+        time.time() + _COG_SYNTHETIC_RETRY_SECONDS
+      )
+      log_cog.info(
+        f"[tile-audit] tile={tile_id} stage=dem_retry_scheduled "
+        f"delay_s={_COG_SYNTHETIC_RETRY_SECONDS}"
+      )
     elif outcome == "skipped":
       _cog_skipped_total += 1
     _fill_cog_workers_locked()
 
 
-def _schedule_cog_demand(missing):
+def _schedule_cog_demand(missing, visible_synthetic=()):
   """Replace unstarted work with the latest camera-priority ordering."""
   global _cog_pending_tiles, _cog_demand_ids
   with _cog_scheduler_lock:
-    _cog_demand_ids = {tile_id for tile_id, _ in missing}
+    now = time.time()
+    visible_retry_bboxes = dict(visible_synthetic)
+    due_retries = []
+    for tile_id, retry_at in list(_cog_synthetic_retry_at.items()):
+      if retry_at > now or tile_id not in visible_retry_bboxes:
+        continue
+      _cog_synthetic_retry_at.pop(tile_id, None)
+      _cog_already_fetched.discard(tile_id)
+      due_retries.append((tile_id, visible_retry_bboxes[tile_id]))
+      log_cog.info(
+        f"[tile-audit] tile={tile_id} stage=dem_retry_due"
+      )
+    demand = list(missing) + due_retries
+    _cog_demand_ids = {tile_id for tile_id, _ in demand}
     _cog_pending_tiles = {
-      tile_id: bbox for tile_id, bbox in missing
+      tile_id: bbox for tile_id, bbox in demand
       if tile_id not in _cog_already_fetched
       and tile_id not in _cog_fetching_tiles
     }
@@ -889,28 +1021,17 @@ def _store_texture_metatile(db, children: dict[str, bytes]) -> tuple[set[str], s
 def _queue_texture_fetch(
   tile_id: str,
   bbox: tuple[float, float, float, float],
-  demand_generation: int = 0,
-  demand_client: str = "server",
 ) -> None:
-  if demand_generation <= 0:
-    with _tex_fetching_lock:
-      demand_generation = _tex_demand_generations.get(demand_client, 0)
   with _tex_fetching_lock:
-    existing_demand = _tex_fetching.get(tile_id)
-    if existing_demand is not None:
-      existing_client, existing_generation = existing_demand
-      if existing_generation >= _tex_demand_generations.get(existing_client, 0):
-        return
-    _tex_fetching[tile_id] = (demand_client, demand_generation)
+    if tile_id in _tex_fetching:
+      return
+    _tex_fetching.add(tile_id)
 
   _RE_FETCHABLE = _METATILE_UPGRADEABLE_SOURCES - {"ancestor_crop_ratelimit"}
 
   def _worker() -> None:
     db = None
     try:
-      if _texture_demand_is_stale(demand_client, demand_generation):
-        log_tex.debug(f"[tex-worker] {tile_id}: stale demand {demand_generation}, skipping")
-        return
       db = sqlite3.connect(str(DB_PATH), check_same_thread=False)
       db.execute("PRAGMA journal_mode=WAL")
       if _init_textures is not None:
@@ -949,9 +1070,6 @@ def _queue_texture_fetch(
           f"[tex-worker] {tile_id}: fetching metatile {metatile_id} bbox={metatile_bbox}"
         )
         children, fail_reason = _fetch_texture_metatile(tile_id)
-        if _texture_demand_is_stale(demand_client, demand_generation):
-          log_tex.debug(f"[tex-worker] {tile_id}: demand changed during fetch, discarding")
-          return
         if children is not None:
           written, no_coverage = _store_texture_metatile(db, children)
           log_tex.debug(
@@ -988,15 +1106,13 @@ def _queue_texture_fetch(
       if db is not None:
         db.close()
       with _tex_fetching_lock:
-        if _tex_fetching.get(tile_id) == (demand_client, demand_generation):
-          _tex_fetching.pop(tile_id, None)
+        _tex_fetching.discard(tile_id)
 
   _tex_pool.submit(_worker)
 
 
 _api_tiles_state: dict[str, str | None] = {"last_result": None}
 _terrain_lod_history: set[str] = set()
-_last_camera: dict[str, float] | None = None  # last /api/tiles pose, feeds /api/heatmap
 _BUILDING_QUERY_RANGE_M = 25000.0
 
 
@@ -1018,7 +1134,7 @@ def api_tiles():
     return unavailable
 
   error = _arg_float("error", 0.0005)
-  max_depth = min(_arg_int("maxDepth", MAX_TILE_DEPTH), MAX_TILE_DEPTH)
+  max_depth = MAX_TILE_DEPTH
   max_range = _arg_float("range", 16000.0)
 
   if "sx" in request.args and "sy" in request.args:
@@ -1035,10 +1151,6 @@ def api_tiles():
   oy = _arg_float("oy", qy)
   alt = _arg_float("alt", 0.0)
   heading = _arg_float("heading", 0.0)
-  global _last_camera
-  _last_camera = {"qx": qx, "qy": qy, "alt": alt, "heading": heading,
-                  "maxDepth": max_depth, "range": max_range}
-
   try:
     tiles, missing = _query_tiles_stereo(
       _get_db(),
@@ -1101,6 +1213,7 @@ def api_tiles():
         "id": tid,
         "bbox": [bbox[0] - ox, bbox[1] - oy, bbox[2] - ox, bbox[3] - oy],
         "depth": tile["depth"],
+        "source": tile["source"],
         "resolution": _GRID_N,
         "heightmap": base64.b64encode(hm.astype(_np.float32).tobytes()).decode("ascii"),
         "hasTexture": bool(tex_flags["has_texture"]),
@@ -1123,7 +1236,15 @@ def api_tiles():
 
   # Continuously feed free workers. Unstarted work is replaced by every new
   # camera-priority list, so there is neither a wave barrier nor a stale queue.
-  active_cog, pending_cog = _schedule_cog_demand(missing)
+  _record_dem_requests(_get_db(), missing)
+  visible_synthetic = [
+    (tile["id"], tile["bbox"])
+    for tile in tiles
+    if tile.get("source") == "parent_resampled"
+  ]
+  active_cog, pending_cog = _schedule_cog_demand(
+    missing, visible_synthetic
+  )
   if missing:
     log_cog.debug(
       f"[COG scheduler] {active_cog} active, {pending_cog} priority-queued"
@@ -1259,9 +1380,6 @@ def api_texture(tile_id: str):
   if unavailable is not None:
     return unavailable
 
-  demand_client = request.args.get("demandClient") or "legacy"
-  demand_generation = _register_texture_demand(demand_client, request.args.get("demand"))
-
   log_tex.debug(f"[/api/texture] tile_id={tile_id}")
 
   parsed = _parse_tile_id(tile_id)
@@ -1316,11 +1434,14 @@ def api_texture(tile_id: str):
   if row is None:
     log_tex.debug(f"[/api/texture] {tile_id}: cache MISS, queuing fetch (depth={d} col={c} row={r})")
 
-  # Queue a fetch for cache misses and re-fetchable sources.
-  # Skip for ancestor_crop_ratelimit — the retry queue already handles those.
+  # Queue a fetch for cache misses and re-fetchable sources. A persisted
+  # rate-limit row re-registers with the retry queue after a server restart;
+  # the queued/active set prevents duplicate work during normal polling.
   source = row[1] if row else None
-  if source != "ancestor_crop_ratelimit":
-    _queue_texture_fetch(tile_id, _tile_bbox(d, c, r), demand_generation, demand_client)
+  if source == "ancestor_crop_ratelimit":
+    _tex_retry_enqueue(tile_id, _tile_bbox(d, c, r), attempt=0)
+  else:
+    _queue_texture_fetch(tile_id, _tile_bbox(d, c, r))
 
   if cached_crop is not None:
     return _painted_texture_response(
@@ -1402,10 +1523,173 @@ def api_texture(tile_id: str):
   )
 
 
+def _tile_package_png(values, *, boolean: bool = False) -> bytes:
+  """Encode a south-first terrain raster as a north-first PNG."""
+  array = _np.asarray(values)
+  if boolean:
+    array = array.astype(_np.uint8) * 255
+  else:
+    array = array.astype(_np.uint8)
+  output = io.BytesIO()
+  _Image.fromarray(_np.ascontiguousarray(array[::-1]), mode="L").save(
+    output, format="PNG"
+  )
+  return output.getvalue()
+
+
+@app.post("/api/tile-package/<tile_id>.zip")
+def api_tile_package(tile_id: str):
+  """Download all cached inputs plus the exact seam-repaired render DEM."""
+  unavailable = _terrain_unavailable_response()
+  if unavailable is not None:
+    return unavailable
+  parsed = _parse_tile_id(tile_id)
+  if parsed is None:
+    return jsonify({"error": "invalid tile id"}), 400
+
+  payload = request.get_json(silent=True) or {}
+  try:
+    resolution = int(payload.get("resolution", 0))
+    encoded_heightmap = str(payload.get("heightmap", ""))
+    heightmap_bytes = base64.b64decode(encoded_heightmap, validate=True)
+    final_heightmap = _np.frombuffer(heightmap_bytes, dtype=_np.float32).copy()
+  except (TypeError, ValueError, binascii.Error):
+    return jsonify({"error": "invalid rendered heightmap"}), 400
+  if resolution < 2 or resolution > 2048 or final_heightmap.size != resolution ** 2:
+    return jsonify({"error": "rendered heightmap shape mismatch"}), 400
+  final_heightmap = final_heightmap.reshape((resolution, resolution))
+
+  db = _get_db()
+  row = db.execute(
+    "SELECT depth, col, row, x_min, y_min, x_max, y_max, source, "
+    "updated_at, confidence_map FROM tiles WHERE tile_id = ?",
+    (tile_id,),
+  ).fetchone()
+  if row is None:
+    return jsonify({"error": "tile not found"}), 404
+  depth, column, tile_row = int(row[0]), int(row[1]), int(row[2])
+  bbox = (float(row[3]), float(row[4]), float(row[5]), float(row[6]))
+
+  texture_row = db.execute(
+    "SELECT texture, source, updated_at FROM textures WHERE tile_id = ?",
+    (tile_id,),
+  ).fetchone()
+  canonical_texture = texture_row[0] if texture_row else None
+  rendered_texture = canonical_texture
+  roads = []
+  if ASSETS_DB_PATH.exists():
+    from asset_catalog import connect as connect_assets, paint_roads, query_roads
+    assets_db = connect_assets(ASSETS_DB_PATH)
+    try:
+      roads = query_roads(assets_db, bbox)
+    finally:
+      assets_db.close()
+    if canonical_texture:
+      rendered_texture, _ = paint_roads(canonical_texture, bbox, ASSETS_DB_PATH)
+
+  from classifier.storage import decode_class_map
+  from coastline import read_hydrography_mask, read_water_mask
+
+  def exact_mask(table):
+    mask_row = db.execute(
+      f"SELECT width, height, mask, source, version, updated_at "
+      f"FROM {table} WHERE tile_id = ?", (tile_id,),
+    ).fetchone()
+    if mask_row is None:
+      return None, None
+    width, height = int(mask_row[0]), int(mask_row[1])
+    values = _np.frombuffer(zlib.decompress(mask_row[2]), dtype=_np.uint8)
+    if values.size != width * height:
+      return None, None
+    return values.reshape((height, width)).astype(bool), {
+      "source": mask_row[3], "version": mask_row[4], "updated_at": mask_row[5],
+    }
+
+  coastline_mask, coastline_meta = exact_mask("coastline_masks")
+  hydrography_mask = read_hydrography_mask(db, tile_id)
+  effective_water_mask = read_water_mask(db, tile_id)
+  classifier_row = db.execute(
+    "SELECT class_schema, width, height, class_map, source, updated_at "
+    "FROM classifier_tiles WHERE tile_id = ?", (tile_id,),
+  ).fetchone()
+
+  seam_rows = db.execute(
+    "SELECT tile_a, direction, tile_b, edge, updated_at "
+    "FROM terrain_seam_cache WHERE tile_a = ? OR tile_b = ? "
+    "ORDER BY updated_at", (tile_id, tile_id),
+  ).fetchall()
+  seam_metadata = [{
+    "tileA": seam[0], "direction": seam[1], "tileB": seam[2],
+    "edge": _np.frombuffer(seam[3], dtype=_np.float32).tolist(),
+    "updatedAt": seam[4],
+  } for seam in seam_rows]
+
+  manifest = {
+    "format": "atlantis-terrain-tile-package-v1",
+    "tileId": tile_id,
+    "address": {"depth": depth, "column": column, "row": tile_row},
+    "bbox": {"crs": "EPSG:3413", "values": list(bbox)},
+    "heightmap": {
+      "file": "heightmap-final.npy", "dtype": "float32",
+      "shape": [resolution, resolution], "rowOrder": "south-to-north",
+      "seamCacheApplied": True, "source": row[7], "updatedAt": row[8],
+    },
+    "texture": ({
+      "sourceFile": "texture-source.jpg", "renderedFile": "texture-final.jpg",
+      "source": texture_row[1], "updatedAt": texture_row[2],
+    } if texture_row else None),
+    "masks": {
+      "coastline": coastline_meta,
+      "hydrography": hydrography_mask is not None,
+      "effectiveWater": effective_water_mask is not None,
+      "classifier": classifier_row[0] if classifier_row else None,
+    },
+    "roads": {"file": "roads.json", "count": len(roads), "crs": "EPSG:3413"},
+    "seamCache": {"file": "seam-cache.json", "entries": len(seam_metadata)},
+  }
+
+  archive_buffer = io.BytesIO()
+  with zipfile.ZipFile(archive_buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+    archive.writestr("manifest.json", json.dumps(manifest, indent=2, default=str))
+    heightmap_buffer = io.BytesIO()
+    _np.save(heightmap_buffer, final_heightmap, allow_pickle=False)
+    archive.writestr("heightmap-final.npy", heightmap_buffer.getvalue())
+    archive.writestr("heightmap-final.f32", final_heightmap.tobytes())
+    if row[9] is not None:
+      confidence = _np.frombuffer(zlib.decompress(row[9]), dtype=_np.uint8)
+      if confidence.size == resolution ** 2:
+        archive.writestr(
+          "confidence-map.png",
+          _tile_package_png(confidence.reshape((resolution, resolution))),
+        )
+    if canonical_texture:
+      archive.writestr("texture-source.jpg", canonical_texture)
+      archive.writestr("texture-final.jpg", rendered_texture or canonical_texture)
+    if coastline_mask is not None:
+      archive.writestr("coastline-mask.png", _tile_package_png(coastline_mask, boolean=True))
+    if hydrography_mask is not None:
+      archive.writestr("hydrography-mask.png", _tile_package_png(hydrography_mask, boolean=True))
+    if effective_water_mask is not None:
+      archive.writestr("effective-water-mask.png", _tile_package_png(effective_water_mask, boolean=True))
+    if classifier_row is not None:
+      labels = decode_class_map(classifier_row[3], classifier_row[1], classifier_row[2])
+      archive.writestr("classifier-map.png", _tile_package_png(_np.flipud(labels)))
+    archive.writestr("roads.json", json.dumps(roads, indent=2, default=str))
+    archive.writestr("seam-cache.json", json.dumps(seam_metadata, indent=2))
+
+  return Response(
+    archive_buffer.getvalue(), mimetype="application/zip",
+    headers={
+      "Content-Disposition": f'attachment; filename="{tile_id}-package.zip"',
+      "Cache-Control": "no-store",
+    },
+  )
+
+
 def _heightmap_ancestor_crop(db, d: int, c: int, r: int, max_up: int = 4):
   """Tile heightmap, cropped out of the nearest ancestor's when the tile
   itself was never seeded/flown (pipeline.html can ask for any tile id; tile
-  rows only exist where the frontend heatmap demanded them). Same philosophy
+  rows only exist where browser terrain demand requested them). Same philosophy
   as ancestor-crop textures. Returns (hm, source, depth_found) or
   (None, None, None); hm is (GRID_N, GRID_N), row 0 = south.
   """
@@ -1601,100 +1885,6 @@ def api_classifier_tile(tile_id: str):
   return Response(buf.getvalue(), mimetype="image/png", headers=headers)
 
 
-@app.get("/api/heatmap")
-def api_heatmap():
-  """Quadtree grid and cached terrain diagnostics for the last /api/tiles
-  camera. hasTexture marks tiles whose own texture is already cached (safe to
-  pull /api/texture without triggering an upstream fetch)."""
-  import numpy as np
-  from database import CONFIDENCE, GRID_N, _decompress_uint8
-  from tiles import build_lod_tree, get_leaves
-  from serve import bbox_in_view_circle
-
-  cam = _last_camera
-  if cam is None:
-    return jsonify(None)
-
-  qx = _arg_float("qx", cam["qx"])
-  qy = _arg_float("qy", cam["qy"])
-  alt = _arg_float("alt", cam["alt"])
-  heading = _arg_float("heading", cam["heading"])
-  max_range = _arg_float("range", cam.get("range", 20000.0))
-  # This is a diagnostic view of the terrain traversal, not a speculative
-  # quadtree. Never advertise leaves deeper than the renderer can request.
-  max_depth = min(
-    _arg_int("maxDepth", int(cam["maxDepth"])),
-    MAX_TILE_DEPTH,
-  )
-  lod_factor = _arg_float("lod", 2.0)
-
-  root = build_lod_tree(qx, qy, max_depth=max_depth, lod_factor=lod_factor)
-  # The heatmap visualizes the same local demand region as /api/tiles. Do not
-  # expose the coarse leaves covering the rest of Greenland's root quadtree.
-  leaves = [
-    leaf for leaf in get_leaves(root)
-    if bbox_in_view_circle(
-      qx, qy,
-      [leaf.center[0], leaf.center[1], leaf.center[0], leaf.center[1]],
-      max_range,
-    )
-  ]
-
-  # Only count permanently cached textures — temporary placeholder sources
-  # would make /api/texture queue an upstream re-fetch when the map page
-  # pulls them (mirror of api_texture's _TEX_TEMPORARY).
-  leaf_ids = [leaf.id for leaf in leaves]
-  placeholders = ",".join("?" for _ in leaf_ids)
-  texture_ids = {r[0] for r in _get_db().execute(
-    f"SELECT tile_id FROM textures WHERE tile_id IN ({placeholders}) "
-    "AND source NOT IN ('sentinel2_crop', 'ancestor_crop', 'ancestor_crop_ratelimit')",
-    leaf_ids).fetchall()} if leaf_ids else set()
-  terrain_rows = {r[0]: r[1:] for r in _get_db().execute(
-    f"SELECT tile_id, source, geometric_error, heightmap IS NOT NULL, confidence_map "
-    f"FROM tiles WHERE tile_id IN ({placeholders})",
-    leaf_ids).fetchall()} if leaf_ids else {}
-  confidence_names = {value: name for name, value in reversed(CONFIDENCE.items())}
-  tiles = []
-  for leaf in leaves:
-    bbox = list(leaf.bbox)
-    tile = {
-      "id": leaf.id,
-      "bbox": bbox,
-      "depth": leaf.depth,
-      "hasTexture": leaf.id in texture_ids,
-    }
-    terrain_row = terrain_rows.get(leaf.id)
-    if terrain_row is not None:
-      source, geometric_error, has_heightmap, confidence_blob = terrain_row
-      tile.update({
-        "source": source,
-        "geometricError": geometric_error,
-        "hasHeightmap": bool(has_heightmap),
-      })
-      if confidence_blob:
-        confidence_map = _decompress_uint8(confidence_blob, (GRID_N, GRID_N))
-        values, counts = np.unique(confidence_map, return_counts=True)
-        tile["confidence"] = {
-          "min": int(values[0]),
-          "max": int(values[-1]),
-          "mean": round(float(confidence_map.mean()), 2),
-          "levels": {
-            confidence_names.get(int(value), str(int(value))): int(count)
-            for value, count in zip(values, counts)
-          },
-        }
-    tiles.append(tile)
-
-  return jsonify({
-    "timestamp": time.time(),
-    "camera": {
-      "qx": qx, "qy": qy, "alt": alt, "heading": heading,
-      "range": max_range,
-    },
-    "tiles": tiles,
-  })
-
-
 @app.get("/api/pipeline/at.json")
 def api_pipeline_at():
   """Resolve lat/lon (e.g. the 3D camera position) to the deepest tile that
@@ -1730,7 +1920,9 @@ def api_pipeline(tile_id: str):
   db = _get_db()
   t = db.execute(
     "SELECT depth, x_min, y_min, x_max, y_max, heightmap IS NOT NULL, source, "
-    "updated_at FROM tiles WHERE tile_id = ?", (tile_id,)).fetchone()
+    "updated_at, dem_demanded_at, dem_requested_at, cog_requested_at "
+    "FROM tiles WHERE tile_id = ?",
+    (tile_id,)).fetchone()
   if t is None:
     return jsonify({"error": "tile not in grid — never seeded"}), 404
   x = db.execute(
@@ -1741,7 +1933,11 @@ def api_pipeline(tile_id: str):
     "depth": t[0],
     "bbox": list(t[1:5]),
     "size_m": round(t[3] - t[1], 1),
-    "heightmap": {"ok": bool(t[5]), "source": t[6], "updated": t[7]},
+    "heightmap": {
+      "ok": bool(t[5]), "source": t[6], "updated": t[7],
+      "dem_demanded_at": t[8], "dem_requested_at": t[9],
+      "cog_requested_at": t[10],
+    },
     "texture": ({"ok": True, "source": x[0], "bytes": x[1], "updated": x[2]}
                 if x else {"ok": False}),
   })
@@ -1796,7 +1992,9 @@ def api_tile_inspect():
     d, c, r = parsed
     tile_row = db.execute(
       "SELECT depth, x_min, y_min, x_max, y_max, geometric_error, source, "
-      "updated_at, heightmap, confidence_map FROM tiles WHERE tile_id = ?",
+      "updated_at, heightmap, confidence_map, dem_demanded_at, "
+      "dem_requested_at, cog_requested_at "
+      "FROM tiles WHERE tile_id = ?",
       (tid,),
     ).fetchone()
     if tile_row:
@@ -1804,12 +2002,19 @@ def api_tile_inspect():
       tile_src = tile_row[6]
       tile_updated = tile_row[7]
       hm_blob, cm_blob = tile_row[8], tile_row[9]
+      dem_demanded_at = tile_row[10]
+      dem_requested_at, cog_requested_at = tile_row[11], tile_row[12]
       bbox_db = [tile_row[1], tile_row[2], tile_row[3], tile_row[4]]
       tile_w = bbox_db[2] - bbox_db[0]
       tile_h = bbox_db[3] - bbox_db[1]
       log_db.info(f"  tile: source={tile_src} geo_err={geo_err:.2f}m depth={d} "
             f"size={tile_w:.0f}x{tile_h:.0f}m")
       log_db.info(f"  bbox: [{bbox_db[0]:.0f}, {bbox_db[1]:.0f}, {bbox_db[2]:.0f}, {bbox_db[3]:.0f}]")
+      log_db.info(
+        f"  requests: dem_demanded_at={dem_demanded_at} "
+        f"dem_requested_at={dem_requested_at} "
+        f"cog_requested_at={cog_requested_at}"
+      )
       if hm_blob:
         try:
           import zlib

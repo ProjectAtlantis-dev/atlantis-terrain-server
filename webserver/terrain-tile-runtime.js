@@ -35,31 +35,29 @@ export function scoreTextureTiles(tiles, priorityForTile, maxPriority, refinemen
       });
     }
   }
-  // Refine within a nearby heatmap band before spending capacity on another
+  // Refine within a nearby tile band before spending capacity on another
   // coarse covering tile. Spatial priority remains dominant over large gaps.
   scored.sort((a, b) => a.score - b.score || a.prio - b.prio);
   return { tileIds, scored };
 }
 
-export function createTileHistory({ getPass, emit, maxTiles = 1000, maxEvents = 40 }) {
+export function createTileHistory({ emit, maxTiles = 1000, maxEvents = 40 }) {
   const history = new Map();
   const log = (tileId, message) => {
     if (!history.has(tileId)) {
       if (history.size >= maxTiles) history.delete(history.keys().next().value);
       history.set(tileId, []);
     }
-    const pass = getPass();
-    const passTag = pass === 1 ? '[P1-preview]' : '[P2-full]';
     const timestamp = (performance.now() / 1000).toFixed(1);
     const events = history.get(tileId);
-    events.push(`${timestamp}s ${passTag} ${message}`);
+    events.push(`${timestamp}s ${message}`);
     if (events.length > maxEvents) events.shift();
     // Normal tile chatter is intentionally debug-only, but evictions must be
     // durable diagnostics. The client logger defaults to an info threshold,
     // which previously meant every eviction vanished before reaching
     // client_debug.log and its live ring.
     const level = message.startsWith('evict') ? 'info' : 'debug';
-    emit({ tileId, pass, msg: message, ts: `${timestamp}s` }, level);
+    emit({ tileId, msg: message, ts: `${timestamp}s` }, level);
   };
   return { history, log };
 }
