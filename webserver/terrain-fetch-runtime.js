@@ -31,6 +31,7 @@ export function createTerrainFetchRuntime({
   } = events;
   let pollTimer = null;
   let activeController = null;
+  let queuedRequest = null;
 
   function getCameraCoordinates() {
     return testOverrides.getCameraCoordinates?.() ?? terrainCameraCoordinates({
@@ -101,6 +102,9 @@ export function createTerrainFetchRuntime({
     // The browser's current tile set, rather than the response epoch, owns
     // tile topology. A late response may improve an exact resident tile, but
     // may not introduce children, parents, or geography absent from that set.
+    // Only an aborted request is demoted to this merge path: the single
+    // in-flight request is always the newest one dispatched, and demoting it
+    // for a merely-queued follow-up starves topology updates entirely.
     if (signal?.aborted) {
       offsetTerrainPayload(data, state.frameOffsetX, state.frameOffsetY);
       const admission = mergeTerrainTilesAgainstCurrentTileSet(
@@ -198,25 +202,15 @@ export function createTerrainFetchRuntime({
     return { nextAction: pipeline.nextAction };
   }
 
-  async function request(lat, lon) {
-    if (state.fetching) {
-      onSkip();
-      return;
-    }
+  async function runRequest({ lat, lon }) {
     state.fetching = true;
     const controller = new AbortController();
     activeController = controller;
     try {
-      const result = await execute({
-        lat, lon, signal: controller.signal,
-      });
-      if (controller.signal.aborted) return;
-      if (activeController === controller) activeController = null;
-      if (pollTimer != null) {
-        cancelPoll(pollTimer);
-        pollTimer = null;
-      }
-      if (result.nextAction === 'poll') {
+      const result = await execute({ lat, lon, signal: controller.signal });
+      if (controller.signal.aborted || activeController !== controller) return;
+      // A queued follow-up starts as soon as this settles; it owns polling.
+      if (result.nextAction === 'poll' && !queuedRequest) {
         pollTimer = schedulePoll(() => {
           pollTimer = null;
           onPoll();
@@ -226,13 +220,38 @@ export function createTerrainFetchRuntime({
     } catch (error) {
       if (controller.signal.aborted || error?.name === 'AbortError') return;
       onError(error);
+    } finally {
+      if (activeController === controller) {
+        activeController = null;
+        if (queuedRequest) {
+          const next = queuedRequest;
+          queuedRequest = null;
+          await runRequest(next);
+        } else {
+          state.fetching = false;
+          onSettled();
+        }
+      }
     }
-    if (activeController === controller) activeController = null;
-    state.fetching = false;
-    onSettled();
+  }
+
+  function request(lat, lon) {
+    // Coalesce, never abort: the in-flight request stays authoritative and
+    // the newest coordinates run immediately after it settles.
+    if (activeController) {
+      onSkip();
+      queuedRequest = { lat, lon };
+      return;
+    }
+    if (pollTimer != null) {
+      cancelPoll(pollTimer);
+      pollTimer = null;
+    }
+    return runRequest({ lat, lon });
   }
 
   function reset() {
+    queuedRequest = null;
     activeController?.abort();
     activeController = null;
     if (pollTimer != null) cancelPoll(pollTimer);
