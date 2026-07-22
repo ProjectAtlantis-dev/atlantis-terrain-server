@@ -38,7 +38,7 @@ OFFICIAL_COASTLINE_SOURCE = HYDROGRAPHY_SOURCE  # compatibility alias
 # Masked water is dropped below sea level at read time so a sea-level water
 # surface has volume above the seabed. Bump WATER_FLOOR_VERSION whenever the
 # derived geometry changes: open_db() flushes every cached seam on mismatch.
-WATER_FLOOR_DROP_M = 3.0
+WATER_FLOOR_DROP_M = 5.0
 WATER_FLOOR_VERSION = 5
 SEA_SEED_MAX_ELEV_M = 0.5
 _WMS_URL = "https://gis.govmin.gl/geoserver/wms"

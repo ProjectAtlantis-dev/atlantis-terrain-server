@@ -193,6 +193,11 @@ export function createTerrainFetchRuntime({
 
     state.cameraStereoX = state.lastFetchX = data.qx;
     state.cameraStereoY = state.lastFetchY = data.qy;
+    // Altitude affects the server-side LOD ceiling just as horizontal
+    // position affects its radial bands. Advance this only when an
+    // authoritative response applies so a descent can keep requesting until
+    // the response topology catches up with the live camera height.
+    state.lastFetchAltitude = cameraCoordinates.alt;
     const pipeline = terrainPipelineStatus(data);
     state.heightmapsMissing = pipeline.missing;
     state.heightmapsDownloading = pipeline.downloading;
@@ -241,7 +246,7 @@ export function createTerrainFetchRuntime({
     //
     // LIVELOCK WARNING — the movement-refetch trigger re-fires every 500ms
     // for as long as the camera sits farther than REFETCH_DIST from
-    // state.lastFetchX/Y, and lastFetch only advances when a response fully
+    // state.lastFetchX/Y/Altitude, and lastFetch only advances when a response fully
     // applies. A radial fetch usually takes longer than 500ms, so under
     // movement a newer request() always lands mid-flight. Any scheme that
     // lets that newer arrival cancel or demote the in-flight work (aborting

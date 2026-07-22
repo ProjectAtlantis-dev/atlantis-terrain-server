@@ -16,29 +16,39 @@ LOD edge stitching eliminates cross-depth seams at query time.
 import math
 import os
 import datetime
+import time
 import numpy as np
 
 from colored_log import get_logger
 
 log_trav = get_logger("terrain.trav")
+log_d13 = get_logger("terrain.d13")
 
 from coords import to_stereo
 from database import (
     open_db, read_tile, read_tile_metadata, write_tile, TileClobberError,
     GRID_N, CONFIDENCE, _tile_id, _tile_bbox, compute_geometric_error,
 )
-from terrain_config import MAX_TILE_DEPTH
+from terrain_config import MAX_TILE_DEPTH, WMS_CONTRACT_DEPTH
 from terrain_seams import SqliteSeamCache, repair_lod_seams as _stitch_lod_edges
 
 
 REAL_SOURCES = (
     'arcticdem', 'arcticdem_10m', 'copernicus', 'parent_resampled',
-    'official_coastline',
+    'official_coastline', 'fractal_dem',
     'unmasked_arcticdem', 'unmasked_arcticdem_10m',
     'unmasked_copernicus', 'unmasked_parent_resampled',
     'clobbered_arcticdem_10m', 'clobbered_copernicus',
     'clobbered_parent_resampled', 'clobbered_official_coastline',
 )
+
+# Past-contract DEMs are cooked from the parent heightmap, never read from
+# COG (ArcticDEM 10 m is exhausted at the depth-12 grid; deeper reads are
+# interpolation mush). Only parents in states the pipeline never refetches
+# may be cooked from — derived tiles therefore cannot go stale through the
+# normal flow, and depths <= WMS_CONTRACT_DEPTH are untouched by all of it.
+FRACTAL_DEM_SOURCE = 'fractal_dem'
+_FRACTAL_DEM_PARENT_SOURCES = {'arcticdem_10m', 'copernicus', 'official_coastline'}
 
 # Sources that should be refetched at higher DEM resolution
 _UPGRADEABLE_SOURCES = {
@@ -63,50 +73,111 @@ LOD_COARSEN_RATIO = 0.75
 LOD_COARSE_FLOOR_DEPTH = 8
 LOD_FINE_PLATEAU_RATIO = 0.55
 # A depth-12 tile is about 659 m wide. Keep the full-detail response band to
-# roughly six tile widths around the camera.
-LOD_FINE_PLATEAU_MAX_M = 4000.0
+# roughly four and a half tile widths around the camera.
+LOD_FINE_PLATEAU_MAX_M = 3000.0
 # Keep the complete 12 -> 8 transition within a bounded distance so large
 # coverage requests retain a cheap depth-8 rim instead of expanding every
 # intermediate band without limit.
 LOD_TRANSITION_MAX_M = 12000.0
+# Depths past the WMS contract never widen the radial curve: the contract
+# depth keeps the full plateau it always had, and each deeper level only
+# claims an inner core this fraction of the radius above it (depth 13 disc
+# = 750 m of the 3 km depth-12 plateau, depth 14 ~188 m, ...).
+LOD_PAST_CONTRACT_CORE_RATIO = 0.25
+# Camera altitude caps the radial LOD ceiling: a depth stops being worth
+# fetching once the camera is more than this many of its tile-widths up.
+# At 2.0, depth 13 (~330 m tiles) drops out above ~659 m altitude, depth 12
+# above ~1.3 km, and so on down to the depth-8 rim floor. Altitude is the
+# camera's up-axis height (same approximation as the screen-error slant
+# distance), not height above the local surface.
+LOD_ALTITUDE_WIDTH_FACTOR = 2.0
+
+_tile_width_cache: dict[int, float] = {}
 
 
-def _lod_target_depth(distance, max_range, max_depth):
+def _tile_width_m(depth):
+    width = _tile_width_cache.get(depth)
+    if width is None:
+        bbox = _tile_bbox(depth, 0, 0)
+        width = float(bbox[2] - bbox[0])
+        _tile_width_cache[depth] = width
+    return width
+
+
+def _altitude_depth_cap(altitude, max_depth):
+    """Deepest LOD worth fetching from a camera this high up."""
+    depth = max_depth
+    while (
+        depth > LOD_COARSE_FLOOR_DEPTH
+        and altitude > LOD_ALTITUDE_WIDTH_FACTOR * _tile_width_m(depth)
+    ):
+        depth -= 1
+    return depth
+
+
+def _lod_target_depth(distance, max_range, max_depth, altitude=0.0):
     """Return the radial LOD ceiling for a horizontal camera distance.
 
-    Up to the smaller of the inner 55% of the requested range or 4 km is a
-    full-detail plateau (roughly six depth-12 tile widths).
+    Up to the smaller of the inner 55% of the requested range or 3 km is a
+    full-detail plateau (roughly four and a half depth-12 tile widths).
     Equal-width radial bands then step through every intermediate depth toward
     the outer rim. The full transition is capped at 12 km so very large
     coverage ranges cannot overwhelm the tile budget. For requests capable of
     reaching it, the outer floor is always depth 8 (``8-*`` tiles), never
     depth 7 or 6.
+
+    Altitude lowers the whole ceiling before the radial curve applies: a
+    camera above LOD_ALTITUDE_WIDTH_FACTOR tile-widths of a depth never
+    requests that depth anywhere, plateau included.
+
+    Depths past WMS_CONTRACT_DEPTH never occupy the plateau: the contract
+    depth keeps the exact curve it had before deeper levels existed, and
+    each deeper level only claims an inner core that shrinks by
+    LOD_PAST_CONTRACT_CORE_RATIO per depth (depth 13 = a quarter of the
+    plateau radius). This keeps the expensive 4x-tile levels confined near the
+    camera instead of quadrupling the whole plateau.
     """
     max_depth = max(0, int(max_depth))
-    coarse_depth = min(max_depth, LOD_COARSE_FLOOR_DEPTH)
-    if max_range <= 0 or max_depth == coarse_depth:
+    if altitude > 0.0:
+        max_depth = min(max_depth, _altitude_depth_cap(altitude, max_depth))
+    if max_range <= 0:
         return max_depth
-
+    contract_ceiling = min(max_depth, WMS_CONTRACT_DEPTH)
+    coarse_depth = min(contract_ceiling, LOD_COARSE_FLOOR_DEPTH)
+    distance = max(0.0, distance)
     fine_plateau_end = min(
         max_range * LOD_FINE_PLATEAU_RATIO,
         LOD_FINE_PLATEAU_MAX_M,
     )
-    coarse_rim_start = min(max_range, fine_plateau_end + LOD_TRANSITION_MAX_M)
-    distance = max(0.0, distance)
-    if distance <= fine_plateau_end:
-        return max_depth
-    if distance >= coarse_rim_start:
-        return coarse_depth
 
-    transition = (
-        (distance - fine_plateau_end)
-        / (coarse_rim_start - fine_plateau_end)
-    )
-    depth_falloff = max_depth - coarse_depth
-    continuous_depth = max_depth - depth_falloff * transition
-    # This is a ceiling, so never round a fractional transition depth upward:
-    # doing so extends the full-detail band beyond fine_plateau_end.
-    return max(coarse_depth, min(max_depth, math.floor(continuous_depth)))
+    if contract_ceiling == coarse_depth:
+        depth = contract_ceiling
+    elif distance <= fine_plateau_end:
+        depth = contract_ceiling
+    else:
+        coarse_rim_start = min(max_range, fine_plateau_end + LOD_TRANSITION_MAX_M)
+        if distance >= coarse_rim_start:
+            depth = coarse_depth
+        else:
+            transition = (
+                (distance - fine_plateau_end)
+                / (coarse_rim_start - fine_plateau_end)
+            )
+            depth_falloff = contract_ceiling - coarse_depth
+            continuous_depth = contract_ceiling - depth_falloff * transition
+            # This is a ceiling, so never round a fractional transition depth
+            # upward: doing so extends the full-detail band beyond
+            # fine_plateau_end.
+            depth = max(
+                coarse_depth, min(contract_ceiling, math.floor(continuous_depth))
+            )
+
+    core = fine_plateau_end
+    for deeper in range(WMS_CONTRACT_DEPTH + 1, max_depth + 1):
+        core *= LOD_PAST_CONTRACT_CORE_RATIO
+        if distance <= core:
+            depth = deeper
+    return depth
 
 
 def _lod_complete_ancestors(leaf_ids):
@@ -227,10 +298,109 @@ def bbox_in_view_circle(qx, qy, bbox, max_range):
     if max_range <= 0:
         return True
     return _distance_to_bbox(qx, qy, bbox) <= max_range
+def _cook_fractal_dem_quad(db, tile_id, allow_overwrite=False):
+    """Cook tile_id's parent quad of heightmaps with the fractal upscaler.
+
+    One upscale_heightmap call per parent produces the 129x129 surface whose
+    quadrants become all four 65x65 children — siblings share edge samples
+    from the same array, parent border rows are preserved exactly, and this
+    same surface is what the texture cook conditions on, so geometry and
+    imagery agree. Past WMS_CONTRACT_DEPTH this surface increasingly drives
+    content (rock vs vegetation), so it is the authoritative artifact.
+
+    Returns False (leaving the tile in missing, retried on later demand)
+    when the parent is not yet in a stable non-refetchable state.
+    """
+    from coastline import read_water_mask
+    from terrain_upscale import upscale_heightmap
+
+    depth, col, row = (int(part) for part in tile_id.split('-'))
+    if depth > MAX_TILE_DEPTH:
+        log_d13.info(
+            f"{tile_id}: DEM cook refused — depth {depth} beyond "
+            f"MAX_TILE_DEPTH={MAX_TILE_DEPTH} (upscaling disabled)"
+        )
+        return False
+    meta = read_tile_metadata(db, tile_id)
+    if meta is not None and meta['source'] in REAL_SOURCES:
+        return True
+
+    parent_col, parent_row = col // 2, row // 2
+    parent_id = _tile_id(depth - 1, parent_col, parent_row)
+    parent = read_tile(db, parent_id)
+    if (
+        parent is None
+        or parent['heightmap'] is None
+        or parent['source'] not in _FRACTAL_DEM_PARENT_SOURCES
+    ):
+        log_d13.info(
+            f"{tile_id}: DEM cook DEFERRED — parent {parent_id} not stable "
+            f"({parent['source'] if parent else 'missing'})"
+        )
+        return False
+
+    try:
+        water_mask = read_water_mask(db, parent_id)
+        if water_mask is not None and water_mask.shape != parent['heightmap'].shape:
+            water_mask = None
+    except Exception:
+        water_mask = None
+
+    cook_started = time.perf_counter()
+    upscaled = upscale_heightmap(
+        parent['heightmap'],
+        list(parent['bbox']),
+        factor=2,
+        water_mask=water_mask,
+    )
+    confidence = np.full(
+        (GRID_N, GRID_N), np.uint8(CONFIDENCE[FRACTAL_DEM_SOURCE])
+    )
+    _ensure_children(db, depth - 1, parent_col, parent_row)
+    base_col, base_row = parent_col * 2, parent_row * 2
+    written, kept = [], []
+    step = GRID_N - 1
+    for col_bit in (0, 1):
+        for row_bit in (0, 1):
+            child_id = _tile_id(depth, base_col + col_bit, base_row + row_bit)
+            child_meta = read_tile_metadata(db, child_id)
+            if child_meta is not None and child_meta['source'] in REAL_SOURCES:
+                kept.append(f"{child_id}({child_meta['source']})")
+                continue
+            # Heightmaps are south-first; child row bit increases northward.
+            quadrant = upscaled[
+                row_bit * step: row_bit * step + GRID_N,
+                col_bit * step: col_bit * step + GRID_N,
+            ].astype(np.float32).copy()
+            try:
+                write_tile(
+                    db, child_id, quadrant, confidence, FRACTAL_DEM_SOURCE,
+                    reconcile=False, allow_overwrite=allow_overwrite,
+                )
+                written.append(child_id)
+            except TileClobberError:
+                kept.append(f"{child_id}(clobber-guard)")
+    cook_ms = (time.perf_counter() - cook_started) * 1000.0
+    log_d13.info(
+        f"{tile_id}: DEM COOKED quad from {parent_id} "
+        f"({parent['source']}, water_mask={'yes' if water_mask is not None else 'no'}) — "
+        f"wrote {len(written)} as {FRACTAL_DEM_SOURCE}"
+        + (f", kept {', '.join(kept)}" if kept else "")
+        + f" in {cook_ms:.0f}ms"
+    )
+    return bool(written) or bool(kept)
+
+
 def _fetch_tile(db, tile_id, bbox, allow_overwrite=False):
     """Fetch a single tile from COG, write to DB. Returns True if data found."""
     if tile_id in _no_data_cache:
         return False
+
+    # Past the WMS contract depth heightmaps are derived, never fetched.
+    # Depths at or below the contract fall through to the unchanged COG path.
+    depth = int(tile_id.split('-', 1)[0])
+    if depth > WMS_CONTRACT_DEPTH:
+        return _cook_fractal_dem_quad(db, tile_id, allow_overwrite=allow_overwrite)
 
     from ingest import _read_cog_heightmap, _resample_from_parent
 
@@ -371,7 +541,7 @@ def _traverse(db, depth, col, row, qx, qy, max_depth, error_threshold,
             # a 10 km-wide depth-8 tile remain terminal beside depth-12 tiles.
             lod_distance = dist_to_tile
             target_depth = _lod_target_depth(
-                lod_distance, max_range, max_depth
+                lod_distance, max_range, max_depth, altitude
             )
             wants_subdivision = depth < target_depth
         else:
@@ -753,6 +923,30 @@ def fetch_missing_tiles(db, missing, max_workers=6, log=print):
 
     if not missing:
         return 0
+
+    # Past-contract heightmaps are derived from their parent, never read
+    # from COG (interpolation mush past the 10m data). Split them off here
+    # so depths <= WMS_CONTRACT_DEPTH flow through the unchanged path below.
+    deep = [
+        (tid, bbox) for tid, bbox in missing
+        if int(tid.split('-', 1)[0]) > WMS_CONTRACT_DEPTH
+    ]
+    if deep:
+        cooked = 0
+        for tid, _bbox in deep:
+            try:
+                if _cook_fractal_dem_quad(db, tid):
+                    cooked += 1
+            except Exception as exc:
+                log_d13.error(
+                    f"{tid}: DEM cook FAILED: {type(exc).__name__}: {exc}"
+                )
+        missing = [
+            (tid, bbox) for tid, bbox in missing
+            if int(tid.split('-', 1)[0]) <= WMS_CONTRACT_DEPTH
+        ]
+        if not missing:
+            return cooked
 
     log(f"  [COG FETCH] Starting {len(missing)} tile reads from S3 "
         f"({max_workers} workers)...")

@@ -15,10 +15,13 @@ from texture import (
     init_textures,
     harmonize_texture_metatile,
     is_no_coverage_fill_jpeg,
+    metatile_is_upsampled,
     split_texture_metatile,
+    texture_sources_in,
     write_texture,
 )
 import serve_flask
+from terrain_config import MAX_TILE_DEPTH, WMS_CONTRACT_DEPTH
 
 
 def _encoded_image(array, image_format="PNG"):
@@ -178,6 +181,207 @@ class TextureMetatileFetchTest(unittest.TestCase):
         self.assertEqual(sources["2-0-0"], "dataforsyningen_metatile4h2")
         self.assertEqual(sources["2-0-1"], "dataforsyningen_metatile4h2")
         self.assertEqual(sources["2-1-0"], "ocean_nodata")
+
+    def test_upsample_detector_separates_blowups_from_genuine_detail(self):
+        rng = np.random.default_rng(11)
+        gradient = np.linspace(60, 200, 512, dtype=np.float32)[None, :]
+        genuine = np.clip(
+            gradient + rng.normal(0, 18, (512, 512)).astype(np.float32), 0, 255
+        )
+        genuine_rgb = np.repeat(genuine[..., None], 3, axis=2)
+
+        full = Image.fromarray(genuine, mode="F")
+        half = full.resize((256, 256), Image.Resampling.LANCZOS)
+        blowup = np.asarray(half.resize((512, 512), Image.Resampling.LANCZOS))
+        carve = np.asarray(half.resize((512, 512), Image.Resampling.NEAREST))
+
+        cheated, recon, spectral = metatile_is_upsampled(_encoded_image(genuine_rgb))
+        self.assertFalse(cheated, f"genuine flagged (recon={recon}, spectral={spectral})")
+
+        for name, image in (("blowup", blowup), ("carve", carve)):
+            rgb = np.repeat(np.clip(image, 0, 255)[..., None], 3, axis=2)
+            cheated, recon, spectral = metatile_is_upsampled(_encoded_image(rgb))
+            self.assertTrue(
+                cheated, f"{name} not flagged (recon={recon}, spectral={spectral})"
+            )
+
+    def test_texture_sources_in_maps_cached_tiles_to_sources(self):
+        db = sqlite3.connect(":memory:")
+        init_textures(db)
+        jpeg = _encoded_image(np.full((8, 8, 3), 128), "JPEG")
+        write_texture(db, "13-8-8", jpeg, "fractal_upscale")
+        write_texture(db, "12-0-0", jpeg, "dataforsyningen_metatile4h2")
+
+        sources = texture_sources_in(db, ["13-8-8", "12-0-0", "13-9-9"])
+
+        self.assertEqual(
+            sources,
+            {"13-8-8": "fractal_upscale", "12-0-0": "dataforsyningen_metatile4h2"},
+        )
+
+    @unittest.skipUnless(
+        MAX_TILE_DEPTH > WMS_CONTRACT_DEPTH,
+        "upscaling disabled: MAX_TILE_DEPTH held at the WMS contract depth",
+    )
+    def test_fractal_cook_writes_quad_with_provenance_without_clobbering(self):
+        db = sqlite3.connect(":memory:")
+        init_textures(db)
+        rng = np.random.default_rng(3)
+        parent_rgb = rng.integers(0, 255, (256, 256, 3)).astype(np.uint8)
+        parent_jpeg = _encoded_image(parent_rgb, "JPEG")
+        genuine = _encoded_image(np.full((256, 256, 3), 99), "JPEG")
+        write_texture(db, "12-10-20", parent_jpeg, "dataforsyningen_metatile4h2")
+        # One child already has genuine provider detail — must survive the cook.
+        write_texture(db, "13-21-41", genuine, "dataforsyningen_metatile4h2")
+
+        with (
+            patch.object(
+                serve_flask, "_tile_bbox",
+                lambda depth, column, row: (0.0, 0.0, 659.0, 659.0),
+            ),
+            patch.object(serve_flask, "_write_texture", write_texture),
+            patch.object(serve_flask, "_split_texture_metatile", split_texture_metatile),
+            patch("database.read_tile", lambda _db, _tid: {"heightmap": None}),
+            patch("coastline.read_water_mask", lambda _db, _tid: None),
+        ):
+            cooked = serve_flask._cook_fractal_quad(db, "13-20-40")
+
+        self.assertTrue(cooked)
+        sources = dict(db.execute("SELECT tile_id, source FROM textures"))
+        for child in ("13-20-40", "13-21-40", "13-20-41"):
+            self.assertEqual(sources[child], "fractal_upscale")
+        self.assertEqual(sources["13-21-41"], "dataforsyningen_metatile4h2")
+
+    def test_fractal_cook_defers_until_parent_texture_is_final(self):
+        db = sqlite3.connect(":memory:")
+        init_textures(db)
+        write_texture(
+            db, "12-10-20",
+            _encoded_image(np.full((256, 256, 3), 128), "JPEG"),
+            "ancestor_crop",
+        )
+        queued = []
+
+        with (
+            patch.object(
+                serve_flask, "_tile_bbox",
+                lambda depth, column, row: (0.0, 0.0, 659.0, 659.0),
+            ),
+            patch.object(
+                serve_flask, "_queue_texture_fetch",
+                lambda tile_id, bbox: queued.append(tile_id),
+            ),
+        ):
+            cooked = serve_flask._cook_fractal_quad(db, "13-20-40")
+
+        self.assertFalse(cooked)
+        self.assertEqual(
+            db.execute("SELECT COUNT(*) FROM textures").fetchone()[0], 1
+        )
+
+    def test_real_parent_change_drops_stale_fractal_children(self):
+        db = sqlite3.connect(":memory:")
+        init_textures(db)
+        jpeg = _encoded_image(np.full((8, 8, 3), 128), "JPEG")
+        jpeg2 = _encoded_image(np.full((8, 8, 3), 90), "JPEG")
+        write_texture(db, "12-10-20", jpeg, "dataforsyningen_metatile4h2")
+        for child in ("13-20-40", "13-21-40", "13-20-41"):
+            write_texture(db, child, jpeg, "fractal_upscale")
+        # A genuine provider child is not derived data — it must survive.
+        write_texture(db, "13-21-41", jpeg, "dataforsyningen_metatile4h2")
+
+        write_texture(db, "12-10-20", jpeg2, "dataforsyningen_metatile4h2")
+
+        sources = dict(db.execute("SELECT tile_id, source FROM textures"))
+        for child in ("13-20-40", "13-21-40", "13-20-41"):
+            self.assertNotIn(child, sources)
+        self.assertEqual(sources["13-21-41"], "dataforsyningen_metatile4h2")
+
+    def test_placeholder_parent_write_keeps_cooked_children(self):
+        db = sqlite3.connect(":memory:")
+        init_textures(db)
+        jpeg = _encoded_image(np.full((8, 8, 3), 128), "JPEG")
+        write_texture(db, "13-20-40", jpeg, "fractal_upscale")
+
+        write_texture(db, "12-10-20", jpeg, "ancestor_crop")
+
+        sources = dict(db.execute("SELECT tile_id, source FROM textures"))
+        self.assertEqual(sources["13-20-40"], "fractal_upscale")
+
+    def test_clobbering_terminal_source_logs_error_not_warning(self):
+        db = sqlite3.connect(":memory:")
+        init_textures(db)
+        jpeg = _encoded_image(np.full((8, 8, 3), 128), "JPEG")
+        write_texture(db, "13-5-5", jpeg, "fractal_upscale")
+
+        with self.assertLogs("terrain.tex", level="ERROR") as captured:
+            write_texture(db, "13-5-5", jpeg, "ancestor_crop")
+        self.assertTrue(
+            any("TEX CLOBBER-TERMINAL" in line for line in captured.output)
+        )
+
+    def test_audit_flags_only_stale_unattended_temporary_rows(self):
+        import datetime
+
+        db = sqlite3.connect(":memory:")
+        init_textures(db)
+        jpeg = _encoded_image(np.full((8, 8, 3), 128), "JPEG")
+        write_texture(db, "13-1-1", jpeg, "ancestor_crop")        # stale+unattended → stuck
+        write_texture(db, "13-2-2", jpeg, "ancestor_crop")        # in fetching set → fine
+        write_texture(db, "13-3-3", jpeg, "ancestor_crop")        # fresh → fine
+        write_texture(db, "13-4-4", jpeg, "fractal_upscale")      # terminal → fine
+        write_texture(db, "12-0-0", jpeg, "ancestor_crop")        # at contract depth → ignored
+        stale = (
+            datetime.datetime.now(datetime.timezone.utc)
+            - datetime.timedelta(seconds=serve_flask._D13_STUCK_AFTER_S + 60)
+        ).isoformat()
+        for tile_id in ("13-1-1", "13-2-2"):
+            db.execute(
+                "UPDATE textures SET updated_at = ? WHERE tile_id = ?",
+                (stale, tile_id),
+            )
+
+        serve_flask._tex_fetching.add("13-2-2")
+        try:
+            audit = serve_flask._d13_texture_audit(db)
+        finally:
+            serve_flask._tex_fetching.discard("13-2-2")
+
+        self.assertEqual(audit["rows"], 4)
+        self.assertEqual([tile_id for tile_id, _, _ in audit["stuck"]], ["13-1-1"])
+        self.assertEqual(
+            audit["distribution"],
+            {"ancestor_crop": 3, "fractal_upscale": 1},
+        )
+
+    def test_watchdog_requeues_stuck_tiles_through_normal_pipeline(self):
+        import datetime
+
+        db = sqlite3.connect(":memory:")
+        init_textures(db)
+        jpeg = _encoded_image(np.full((8, 8, 3), 128), "JPEG")
+        write_texture(db, "13-7-7", jpeg, "ancestor_crop")
+        stale = (
+            datetime.datetime.now(datetime.timezone.utc)
+            - datetime.timedelta(seconds=serve_flask._D13_STUCK_AFTER_S + 60)
+        ).isoformat()
+        db.execute("UPDATE textures SET updated_at = ?", (stale,))
+        requeued = []
+
+        with (
+            patch.object(
+                serve_flask, "_tile_bbox",
+                lambda depth, column, row: (0.0, 0.0, 330.0, 330.0),
+            ),
+            patch.object(
+                serve_flask, "_queue_texture_fetch",
+                lambda tile_id, bbox: requeued.append(tile_id),
+            ),
+            patch.object(serve_flask, "_d13_last_distribution", None),
+        ):
+            serve_flask._d13_watchdog_sweep(db)
+
+        self.assertEqual(requeued, ["13-7-7"])
 
     def test_persistent_transient_stays_retryable_until_success(self):
         tile_id = "12-1525-779"

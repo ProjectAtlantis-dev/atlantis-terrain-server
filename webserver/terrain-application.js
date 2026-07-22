@@ -918,6 +918,10 @@ function attachTileScatter(mesh, tile, hm) {
 // threshold allowed the camera to leave that band before requesting a new
 // topology, making the entire fine-LOD region visibly trail behind it.
 const REFETCH_DIST = 1000;
+// Altitude directly caps the deepest server LOD. Refresh well within one
+// depth-12 tile width so a vertical descent reveals finer tiles promptly even
+// when the camera has not moved horizontally.
+const REFETCH_ALTITUDE_DELTA = 100;
 const terrainPipelineState = {
   ready: false,
   originX: 0,
@@ -926,6 +930,7 @@ const terrainPipelineState = {
   cameraStereoY: 0,
   lastFetchX: 0,
   lastFetchY: 0,
+  lastFetchAltitude: null,
   frameOffsetX: 0,
   frameOffsetY: 0,
   frameOffsetReady: false,
@@ -1979,6 +1984,7 @@ function resetView() {
   terrainPipelineState.originX = 0; terrainPipelineState.originY = 0;
   terrainPipelineState.cameraStereoX = 0; terrainPipelineState.cameraStereoY = 0;
   terrainPipelineState.lastFetchX = 0; terrainPipelineState.lastFetchY = 0;
+  terrainPipelineState.lastFetchAltitude = null;
   terrainPipelineState.frameOffsetX = 0; terrainPipelineState.frameOffsetY = 0;
   terrainPipelineState.frameOffsetReady = false;
   terrainFetchRuntime.request();
@@ -2393,8 +2399,11 @@ function render() {
     const refetch = evaluateTerrainRefetch({
       cameraX: terrainPipelineState.cameraStereoX, cameraY: terrainPipelineState.cameraStereoY,
       lastFetchX: terrainPipelineState.lastFetchX, lastFetchY: terrainPipelineState.lastFetchY,
+      cameraAltitude: coordinates.alt,
+      lastFetchAltitude: terrainPipelineState.lastFetchAltitude,
       nowMs, lastTriggerMs: terrainPipelineState.lastFetchTriggerMs,
-      distanceThreshold: REFETCH_DIST, triggerIntervalMs: 500,
+      distanceThreshold: REFETCH_DIST, altitudeThreshold: REFETCH_ALTITUDE_DELTA,
+      triggerIntervalMs: 500,
     });
     terrainPipelineState.lastFetchTriggerMs = refetch.nextTriggerMs;
     if (refetch.shouldFetch) terrainFetchRuntime.request();

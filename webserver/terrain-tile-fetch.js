@@ -147,12 +147,19 @@ export function terrainCameraGridPosition({
 
 export function evaluateTerrainRefetch({
   cameraX, cameraY, lastFetchX, lastFetchY,
-  nowMs, lastTriggerMs, distanceThreshold, triggerIntervalMs,
+  cameraAltitude, lastFetchAltitude,
+  nowMs, lastTriggerMs, distanceThreshold, altitudeThreshold = Infinity,
+  triggerIntervalMs,
 }) {
   const distance = Math.hypot(cameraX - lastFetchX, cameraY - lastFetchY);
-  const shouldFetch = distance > distanceThreshold && nowMs - lastTriggerMs > triggerIntervalMs;
+  const altitudeDelta = Number.isFinite(cameraAltitude) && Number.isFinite(lastFetchAltitude)
+    ? Math.abs(cameraAltitude - lastFetchAltitude)
+    : 0;
+  const demandChanged = distance > distanceThreshold || altitudeDelta > altitudeThreshold;
+  const shouldFetch = demandChanged && nowMs - lastTriggerMs > triggerIntervalMs;
   return {
     distance,
+    altitudeDelta,
     shouldFetch,
     nextTriggerMs: shouldFetch ? nowMs : lastTriggerMs,
   };

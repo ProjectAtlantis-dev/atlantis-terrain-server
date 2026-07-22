@@ -213,6 +213,14 @@ def upscale_heightmap(
         + (bbox[3] - bbox[1]) / (source.shape[0] - 1)
     )
     noise = _fbm(x, y, source_spacing * 2.0, int(octaves), int(seed))
+    # Slow world-scale amplitude modulation keeps the synthetic relief from
+    # reading as uniform stucco: some areas get rough, others stay calm,
+    # coherently across tile borders. Applied before the lattice bridge so
+    # measured samples remain exactly preserved.
+    noise = noise * (0.35 + 0.65 * _smoothstep(np.clip(
+        0.5 + 0.75 * _fbm(x, y, 900.0, 4, int(seed) ^ 0x414D50),
+        0.0, 1.0,
+    )))
 
     # A fractal bridge: subtract the interpolation of fBm at the measured DEM
     # lattice.  The residual is therefore exactly zero at every source sample.
@@ -273,6 +281,8 @@ def upscale_texture(
     octaves=3,
     terrain_heightmap=None,
     water_mask=None,
+    amplitude_map=None,
+    character_map=None,
 ):
     """Enlarge imagery and add deterministic world-space fractal microdetail."""
     if factor < 1 or int(factor) != factor:
@@ -303,7 +313,42 @@ def upscale_texture(
             int(seed) ^ 0x52494447,
         ))
         ridged -= np.mean(ridged)
-        fractal_detail = fractal * 0.65 + ridged * 0.35
+        # The fine band alone is a single-scale stamp: constant amplitude and
+        # a fixed smooth/ridged mix repeat the same blob size everywhere
+        # ("leopard skin"). Two slow world-space fields extend the spectrum
+        # upward — one varies detail amplitude, one varies its character —
+        # over hundreds of meters, coherently across tile borders.
+        amplitude_field = 0.35 + 0.65 * _smoothstep(np.clip(
+            0.5 + 0.75 * _fbm(x, y, 700.0, 4, int(seed) ^ 0x414D50),
+            0.0, 1.0,
+        ))
+        character = np.clip(
+            0.5 + 0.9 * _fbm(x, y, 450.0, 3, int(seed) ^ 0x43484152),
+            0.0, 1.0,
+        )
+        ridged_weight = 0.15 + 0.55 * character
+        # Classified cooks replace the noise-driven fields with semantic
+        # ones (rock rough and ridged, vegetation soft, snow calm); the
+        # world-noise amplitude survives only as within-class variation.
+        if character_map is not None:
+            ridged_weight = np.clip(
+                _resize_bilinear(
+                    np.asarray(character_map, dtype=np.float64),
+                    size[1], size[0],
+                ),
+                0.0, 0.9,
+            )
+        if amplitude_map is not None:
+            amplitude_field = np.clip(
+                _resize_bilinear(
+                    np.asarray(amplitude_map, dtype=np.float64),
+                    size[1], size[0],
+                ),
+                0.0, 1.5,
+            ) * (0.7 + 0.3 * amplitude_field)
+        fractal_detail = (
+            fractal * (1.0 - ridged_weight) + ridged * ridged_weight
+        ) * amplitude_field
 
         # Recover the source's real high-frequency structure first, then add
         # only sub-pixel fractal bands. This makes the result read as an actual

@@ -3,9 +3,14 @@
 import unittest
 from unittest.mock import patch
 
+import numpy as np
+
+from database import GRID_N
+from terrain_config import MAX_TILE_DEPTH, WMS_CONTRACT_DEPTH
 from serve import (
     _UPGRADEABLE_SOURCES,
-    _balance_lod_leaves, _coarse_lod_neighbors, _lod_complete_ancestors,
+    _balance_lod_leaves, _coarse_lod_neighbors, _cook_fractal_dem_quad,
+    _lod_complete_ancestors,
     _lod_leaf_descendants_cover, _lod_target_depth,
     _traverse, bbox_in_view_circle,
 )
@@ -57,19 +62,19 @@ class TestViewCoverageCircle(unittest.TestCase):
     def test_radial_lod_curve_uses_every_depth_before_the_rim(self):
         max_range = 16000
         self.assertEqual(_lod_target_depth(0, max_range, 12), 12)
-        self.assertEqual(_lod_target_depth(4000, max_range, 12), 12)
-        self.assertEqual(_lod_target_depth(4001, max_range, 12), 11)
-        self.assertEqual(_lod_target_depth(7000, max_range, 12), 11)
-        self.assertEqual(_lod_target_depth(7001, max_range, 12), 10)
-        self.assertEqual(_lod_target_depth(10000, max_range, 12), 10)
-        self.assertEqual(_lod_target_depth(10001, max_range, 12), 9)
-        self.assertEqual(_lod_target_depth(13000, max_range, 12), 9)
-        self.assertEqual(_lod_target_depth(13001, max_range, 12), 8)
+        self.assertEqual(_lod_target_depth(3000, max_range, 12), 12)
+        self.assertEqual(_lod_target_depth(3001, max_range, 12), 11)
+        self.assertEqual(_lod_target_depth(6000, max_range, 12), 11)
+        self.assertEqual(_lod_target_depth(6001, max_range, 12), 10)
+        self.assertEqual(_lod_target_depth(9000, max_range, 12), 10)
+        self.assertEqual(_lod_target_depth(9001, max_range, 12), 9)
+        self.assertEqual(_lod_target_depth(12000, max_range, 12), 9)
+        self.assertEqual(_lod_target_depth(12001, max_range, 12), 8)
         self.assertEqual(_lod_target_depth(16000, max_range, 12), 8)
 
         # A very large view range must not expand the depth-12 plateau.
-        self.assertEqual(_lod_target_depth(4000, 50000, 12), 12)
-        self.assertLess(_lod_target_depth(4001, 50000, 12), 12)
+        self.assertEqual(_lod_target_depth(3000, 50000, 12), 12)
+        self.assertLess(_lod_target_depth(3001, 50000, 12), 12)
 
     def test_radial_lod_floor_is_always_depth_eight_when_reachable(self):
         # A shallower internal caller must not produce a depth-6 rim.
@@ -79,6 +84,96 @@ class TestViewCoverageCircle(unittest.TestCase):
         # A future finer dataset must retain that same floor.
         self.assertEqual(_lod_target_depth(16000, 16000, 13), 8)
         self.assertEqual(_lod_target_depth(16000, 16000, 14), 8)
+
+    def test_past_contract_depth_only_claims_a_shrinking_inner_core(self):
+        max_range = 16000
+        # Depth 13 is confined to a 750 m core of the 3 km depth-12 plateau.
+        self.assertEqual(_lod_target_depth(0, max_range, 13), 13)
+        self.assertEqual(_lod_target_depth(750, max_range, 13), 13)
+        self.assertEqual(_lod_target_depth(751, max_range, 13), 12)
+        # The depth-12 plateau and outer bands are exactly the pre-13 curve.
+        self.assertEqual(_lod_target_depth(3000, max_range, 13), 12)
+        self.assertEqual(_lod_target_depth(3001, max_range, 13), 11)
+        self.assertEqual(_lod_target_depth(16000, max_range, 13), 8)
+        # A hypothetical depth 14 would shrink by the same ratio again.
+        self.assertEqual(_lod_target_depth(150, max_range, 14), 14)
+        self.assertEqual(_lod_target_depth(300, max_range, 14), 13)
+
+    def test_altitude_caps_lod_ceiling_before_the_radial_curve(self):
+        max_range = 16000
+        # Depth-13 tiles are ~330 m wide; the factor-2 ceiling is ~659 m.
+        self.assertEqual(_lod_target_depth(0, max_range, 13, altitude=0), 13)
+        self.assertEqual(_lod_target_depth(0, max_range, 13, altitude=600), 13)
+        self.assertEqual(_lod_target_depth(0, max_range, 13, altitude=700), 12)
+        # Depth 12 (~659 m tiles) drops out above ~1.3 km, and so on.
+        self.assertEqual(_lod_target_depth(0, max_range, 13, altitude=1400), 11)
+        # The cap never digs below the depth-8 rim floor.
+        self.assertEqual(_lod_target_depth(0, max_range, 13, altitude=1e6), 8)
+        # Altitude lowers the ceiling everywhere, plateau included, but the
+        # radial curve still coarsens with horizontal distance beneath it.
+        self.assertEqual(_lod_target_depth(3000, max_range, 13, altitude=700), 12)
+        self.assertLess(_lod_target_depth(8000, max_range, 13, altitude=700), 12)
+
+    @unittest.skipUnless(
+        MAX_TILE_DEPTH > WMS_CONTRACT_DEPTH,
+        "upscaling disabled: MAX_TILE_DEPTH held at the WMS contract depth",
+    )
+    def test_fractal_dem_cook_quadrants_preserve_parent_samples_and_seams(self):
+        rng = np.random.default_rng(5)
+        parent_hm = (rng.normal(200, 40, (GRID_N, GRID_N))).astype(np.float32)
+        parent = {
+            'heightmap': parent_hm, 'source': 'arcticdem_10m',
+            'bbox': (0.0, 0.0, 659.18, 659.18),
+            'confidence_map': np.full((GRID_N, GRID_N), 6, np.uint8),
+        }
+        written = {}
+
+        def fake_write(_db, child_id, hm, cm, source, **_kwargs):
+            written[child_id] = (hm, source)
+            return True
+
+        with (
+            patch('serve.read_tile', return_value=parent),
+            patch('serve.read_tile_metadata', return_value=None),
+            patch('serve.write_tile', side_effect=fake_write),
+            patch('serve._ensure_children', lambda *a: None),
+            patch('coastline.read_water_mask', lambda _db, _tid: None),
+        ):
+            cooked = _cook_fractal_dem_quad(None, '13-20-40')
+
+        self.assertTrue(cooked)
+        self.assertEqual(
+            set(written),
+            {'13-20-40', '13-21-40', '13-20-41', '13-21-41'},
+        )
+        for child_id, (hm, source) in written.items():
+            self.assertEqual(source, 'fractal_dem')
+            self.assertEqual(hm.shape, (GRID_N, GRID_N))
+        sw, se = written['13-20-40'][0], written['13-21-40'][0]
+        nw = written['13-20-41'][0]
+        # Measured parent samples are preserved exactly at even vertices.
+        self.assertEqual(sw[0, 0], parent_hm[0, 0])
+        self.assertEqual(written['13-21-41'][0][-1, -1], parent_hm[-1, -1])
+        # Siblings share their boundary rows/columns from the same surface.
+        np.testing.assert_array_equal(sw[:, -1], se[:, 0])
+        np.testing.assert_array_equal(sw[-1, :], nw[0, :])
+
+    def test_fractal_dem_cook_defers_until_parent_is_stable(self):
+        parent = {
+            'heightmap': np.zeros((GRID_N, GRID_N), np.float32),
+            'source': 'parent_resampled',
+            'bbox': (0.0, 0.0, 659.18, 659.18),
+            'confidence_map': np.full((GRID_N, GRID_N), 2, np.uint8),
+        }
+        with (
+            patch('serve.read_tile', return_value=parent),
+            patch('serve.read_tile_metadata', return_value=None),
+            patch('serve.write_tile') as write_tile_mock,
+        ):
+            cooked = _cook_fractal_dem_quad(None, '13-20-40')
+
+        self.assertFalse(cooked)
+        write_tile_mock.assert_not_called()
 
     def test_lod_neighbor_balance_detects_only_gaps_larger_than_one(self):
         # 8-1-1 spans depth-10 cells [4..7] in both axes. 10-8-4 touches
@@ -140,11 +235,11 @@ class TestViewCoverageCircle(unittest.TestCase):
 
     def test_coarse_tile_intruding_into_fine_band_must_subdivide(self):
         parent = {
-            'source': 'arcticdem', 'bbox': [3900, 0, 4500, 600],
+            'source': 'arcticdem', 'bbox': [2900, 0, 3500, 600],
             'geometric_error': 1000,
         }
         child = {
-            'source': 'arcticdem', 'bbox': [3900, 0, 4200, 300],
+            'source': 'arcticdem', 'bbox': [2900, 0, 3200, 300],
             'geometric_error': 1000,
         }
 
@@ -158,7 +253,7 @@ class TestViewCoverageCircle(unittest.TestCase):
                 results, [], max_range=16000,
             )
 
-        # The parent center is outside the 4 km depth-12 band, but its near
+        # The parent center is outside the 3 km depth-12 band, but its near
         # edge intrudes into it. It must not remain as one coarse neighbor.
         self.assertEqual(set(results), {
             '12-2-2', '12-3-2', '12-2-3', '12-3-3',

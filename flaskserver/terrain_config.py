@@ -1,9 +1,19 @@
 """Shared terrain runtime configuration constants."""
 
 # Maximum terrain tile depth and subdivision ceiling.
-# Depth 12 ≈ 659 m tiles — Sentinel-2 z14 (~2.4 m/px) and ArcticDEM 10 m
-# still have headroom.
+# Depth 13 ≈ 330 m tiles. Past WMS_CONTRACT_DEPTH the provider imagery may
+# be a plain blowup of the level above; fetched metatiles are inspected and
+# fall back to the deterministic fractal upscaler when they carry no new
+# detail (source "fractal_upscale").
+# Upscaling is DISABLED for verification (2026-07-22): ceiling held at the
+# WMS contract depth and all depth-13 rows purged from the DB. Restore to
+# 13 to re-enable the fractal cooks.
 MAX_TILE_DEPTH = 12
+
+# Deepest level where provider imagery is trusted at face value.
+# Depth 12 ≈ 659 m tiles — Sentinel-2 z14 (~2.4 m/px) and ArcticDEM 10 m
+# still have headroom there.
+WMS_CONTRACT_DEPTH = 12
 
 # Initial skeleton depth used on a brand-new DB at server startup.
 # Keep this shallow so Flask becomes responsive quickly; deeper levels

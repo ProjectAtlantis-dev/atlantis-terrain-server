@@ -23,12 +23,16 @@ from typing import Any, cast
 import asyncio
 
 from colored_log import get_logger
-from terrain_config import BOOTSTRAP_SEED_DEPTH, MAX_TILE_DEPTH
+from terrain_config import BOOTSTRAP_SEED_DEPTH, MAX_TILE_DEPTH, WMS_CONTRACT_DEPTH
 
 log = get_logger("terrain")
 log_db = get_logger("terrain.db")
 log_tex = get_logger("terrain.tex")
 log_cog = get_logger("terrain.cog")
+# Everything past WMS_CONTRACT_DEPTH: blowup inspection verdicts, fractal
+# cooks, deferrals. Every line carries running totals so detector-floor and
+# rate-limit tuning can be read straight off a tail of this channel.
+log_d13 = get_logger("terrain.d13")
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -178,6 +182,8 @@ _load_no_data_cache: Any = None
 _GRID_N: int = 65
 _tile_bbox: Any = None
 _texture_ids_in: Any = None
+_texture_sources_in: Any = None
+_metatile_is_upsampled: Any = None
 _read_texture: Any = None
 _write_texture: Any = None
 _fetch_sentinel2_texture: Any = None
@@ -190,6 +196,152 @@ _init_classifier_tiles: Any = None
 _tex_pool = ThreadPoolExecutor(max_workers=4)
 _tex_fetching: set[str] = set()
 _tex_fetching_lock = threading.Lock()
+
+# Cumulative past-contract-depth texture pipeline counters (process lifetime).
+_d13_stats = {
+  "inspected": 0,       # past-contract metatiles scored by the detector
+  "genuine": 0,         # verdict: real provider detail, stored as usual
+  "blowup": 0,          # verdict: provider upsample, routed to fractal cook
+  "cooked": 0,          # fractal cooks completed (parent quads)
+  "cook_children": 0,   # child textures written by cooks
+  "cook_skipped": 0,    # cook children skipped (terminal source already present)
+  "deferred": 0,        # cooks deferred because the parent texture is not final
+  "cook_failed": 0,     # cooks that raised (bad parent JPEG etc.)
+}
+_d13_stats_lock = threading.Lock()
+
+
+def _d13_count(**deltas) -> str:
+  """Apply counter deltas and return the totals string for log lines."""
+  with _d13_stats_lock:
+    for key, delta in deltas.items():
+      _d13_stats[key] += delta
+    return (
+      "totals: "
+      f"{_d13_stats['inspected']} inspected, "
+      f"{_d13_stats['genuine']} genuine, "
+      f"{_d13_stats['blowup']} blowups, "
+      f"{_d13_stats['cooked']} cooked "
+      f"({_d13_stats['cook_children']} children, {_d13_stats['cook_skipped']} skipped), "
+      f"{_d13_stats['deferred']} deferred, "
+      f"{_d13_stats['cook_failed']} failed"
+    )
+
+
+# A past-contract texture row still on a temporary source after this long,
+# with no worker on it and no retry queued, has fallen out of the workflow.
+_D13_STUCK_AFTER_S = 300.0
+_D13_WATCHDOG_INTERVAL_S = 120.0
+_D13_WATCHDOG_REQUEUE_CAP = 64
+_d13_watchdog_thread: threading.Thread | None = None
+_d13_last_distribution: dict[str, int] | None = None
+
+
+def _d13_texture_audit(db, now=None):
+  """Workflow-invariant audit of every past-contract texture row.
+
+  Returns the source distribution plus the rows that violate the pipeline's
+  liveness invariant: temporary source, older than _D13_STUCK_AFTER_S, and
+  not in the fetching set or the retry queue — i.e. nothing will ever
+  upscale them unless someone re-demands the tile. These are the
+  "forgot to upscale" bugs; the watchdog requeues them.
+  """
+  if now is None:
+    now = datetime.datetime.now(datetime.timezone.utc)
+  rows = db.execute(
+    "SELECT tile_id, source, updated_at FROM textures "
+    "WHERE CAST(substr(tile_id, 1, instr(tile_id, '-') - 1) AS INTEGER) > ?",
+    (WMS_CONTRACT_DEPTH,),
+  ).fetchall()
+  with _tex_fetching_lock:
+    fetching = set(_tex_fetching)
+  with _tex_retry_lock:
+    retrying = set(_tex_retry_tiles)
+
+  distribution: dict[str, int] = {}
+  stuck = []
+  for tile_id, source, updated_at in rows:
+    distribution[source] = distribution.get(source, 0) + 1
+    if source not in _TEX_TEMPORARY:
+      continue
+    if tile_id in fetching or tile_id in retrying:
+      continue
+    try:
+      age_s = (now - datetime.datetime.fromisoformat(updated_at)).total_seconds()
+    except (TypeError, ValueError):
+      age_s = float("inf")
+    if age_s >= _D13_STUCK_AFTER_S:
+      stuck.append((tile_id, source, age_s))
+  stuck.sort(key=lambda item: -item[2])
+  return {
+    "rows": len(rows),
+    "distribution": distribution,
+    "stuck": stuck,
+    "fetching": len(fetching),
+    "retrying": len(retrying),
+  }
+
+
+def _d13_watchdog_sweep(db) -> None:
+  global _d13_last_distribution
+  audit = _d13_texture_audit(db)
+  if audit["rows"] == 0:
+    return
+
+  if audit["stuck"]:
+    requeue = audit["stuck"][:_D13_WATCHDOG_REQUEUE_CAP]
+    for tile_id, _source, _age_s in requeue:
+      parsed = _parse_tile_id(tile_id)
+      if parsed is not None:
+        _queue_texture_fetch(tile_id, _tile_bbox(*parsed))
+    sample = ", ".join(
+      f"{tile_id}({source}, {age_s / 60.0:.0f}min)"
+      for tile_id, source, age_s in requeue[:8]
+    )
+    log_d13.warning(
+      f"[watchdog] {len(audit['stuck'])} past-contract tiles STUCK on temporary "
+      f"sources with no in-flight work — requeued {len(requeue)} "
+      f"(cap {_D13_WATCHDOG_REQUEUE_CAP}): {sample}"
+      + ("…" if len(requeue) > 8 else "")
+    )
+
+  if audit["distribution"] != _d13_last_distribution:
+    _d13_last_distribution = dict(audit["distribution"])
+    breakdown = ", ".join(
+      f"{source}={count}"
+      for source, count in sorted(audit["distribution"].items())
+    )
+    log_d13.info(
+      f"[watchdog] past-contract textures: {audit['rows']} rows ({breakdown}); "
+      f"{audit['fetching']} fetching, {audit['retrying']} in retry, "
+      f"{len(audit['stuck'])} stuck"
+    )
+
+
+def _d13_watchdog_worker() -> None:
+  while True:
+    time.sleep(_D13_WATCHDOG_INTERVAL_S)
+    db = None
+    try:
+      db = sqlite3.connect(str(DB_PATH), check_same_thread=False)
+      _d13_watchdog_sweep(db)
+    except Exception as exc:  # pragma: no cover - background sweep
+      log_d13.error(f"[watchdog] sweep FAILED: {type(exc).__name__}: {exc}")
+    finally:
+      if db is not None:
+        db.close()
+
+
+def _ensure_d13_watchdog() -> None:
+  global _d13_watchdog_thread
+  if _d13_watchdog_thread is not None and _d13_watchdog_thread.is_alive():
+    return
+  _d13_watchdog_thread = threading.Thread(target=_d13_watchdog_worker, daemon=True)
+  _d13_watchdog_thread.start()
+  log_d13.info(
+    f"[watchdog] started: sweep every {_D13_WATCHDOG_INTERVAL_S:.0f}s, "
+    f"stuck after {_D13_STUCK_AFTER_S:.0f}s, requeue cap {_D13_WATCHDOG_REQUEUE_CAP}"
+  )
 _tex_metatile_locks: dict[str, threading.Lock] = {}
 _tex_metatile_locks_guard = threading.Lock()
 
@@ -570,6 +722,7 @@ def _bootstrap_backend() -> None:
   global _fetch_sentinel2_texture, _fetch_dataforsyningen_texture, _split_texture_metatile
   global _harmonize_texture_metatile
   global _init_textures, _init_classifier_tiles
+  global _texture_sources_in, _metatile_is_upsampled
 
   if _backend_ready or _backend_error is not None:
     return
@@ -587,9 +740,11 @@ def _bootstrap_backend() -> None:
       fetch_sentinel2_texture,
       harmonize_texture_metatile,
       init_textures,
+      metatile_is_upsampled,
       read_texture,
       split_texture_metatile,
       texture_ids_in,
+      texture_sources_in,
       write_texture,
     )
 
@@ -632,6 +787,8 @@ def _bootstrap_backend() -> None:
     _query_tiles_stereo = query_tiles_stereo
     _load_no_data_cache = load_no_data_cache
     _texture_ids_in = texture_ids_in
+    _texture_sources_in = texture_sources_in
+    _metatile_is_upsampled = metatile_is_upsampled
     _read_texture = read_texture
     _write_texture = write_texture
     _fetch_sentinel2_texture = fetch_sentinel2_texture
@@ -644,6 +801,8 @@ def _bootstrap_backend() -> None:
     _backend_ready = True
     log.info(f"Terrain backend ready. DB={DB_PATH}")
     log_db.info(f"No-data cache: {no_data_count} tiles")
+
+    _ensure_d13_watchdog()
 
     import grundkort
     grundkort.ensure_grundkort_async()
@@ -925,6 +1084,10 @@ def _parse_tile_id(tile_id: str) -> tuple[int, int, int] | None:
 
 
 _METATILE_FINAL_SOURCE = "dataforsyningen_metatile4h2"
+# Past WMS_CONTRACT_DEPTH, tiles whose metatile came back as a provider
+# blowup are cooked from the parent's final texture instead. Terminal, same
+# standing as _METATILE_FINAL_SOURCE; the value itself records provenance.
+_FRACTAL_SOURCE = "fractal_upscale"
 _METATILE_UPGRADEABLE_SOURCES = {
   "sentinel2_crop",
   "ancestor_crop",
@@ -933,6 +1096,17 @@ _METATILE_UPGRADEABLE_SOURCES = {
   "dataforsyningen_metatile",
   "dataforsyningen_metatile4",
   "dataforsyningen_metatile4h",
+}
+
+# Sources that are temporary placeholders — serve them but let client re-fetch.
+_TEX_TEMPORARY = {
+  "sentinel2_crop",
+  "ancestor_crop",
+  "ancestor_crop_ratelimit",
+  "dataforsyningen",  # legacy independent fetch; upgrade to aligned metatile
+  "dataforsyningen_metatile",  # legacy 2x2 group; upgrade to aligned 4x4
+  "dataforsyningen_metatile4",  # legacy 4x4 group without harmonization
+  "dataforsyningen_metatile4h",  # legacy conservative harmonization
 }
 
 
@@ -978,6 +1152,42 @@ def _fetch_texture_metatile(tile_id: str) -> tuple[dict[str, bytes] | None, str 
   )
   if jpeg is None:
     return None, fail_reason
+
+  # Past the WMS contract depth the provider may fill the request with a
+  # blowup of the level above. Inspect the finest-octave energy before
+  # trusting it; a blowup routes the caller to the fractal cook instead.
+  parsed = _parse_tile_id(tile_id)
+  if parsed is not None and parsed[0] > WMS_CONTRACT_DEPTH:
+    from texture import METATILE_RECON_MIN, METATILE_SPECTRAL_MIN
+
+    inspect_started = time.perf_counter()
+    cheated, reconstruction, spectral = _metatile_is_upsampled(jpeg)
+    inspect_ms = (time.perf_counter() - inspect_started) * 1000.0
+    if cheated:
+      tripped = []
+      if reconstruction < METATILE_RECON_MIN:
+        tripped.append(
+          f"recon {reconstruction:.3f} < {METATILE_RECON_MIN} (reconstructible from half-res)"
+        )
+      if spectral < METATILE_SPECTRAL_MIN:
+        tripped.append(
+          f"spectral {spectral:.3f} < {METATILE_SPECTRAL_MIN} (outer frequency band empty)"
+        )
+      totals = _d13_count(inspected=1, blowup=1)
+      log_d13.info(
+        f"{tile_id}: BLOWUP metatile {bbox[2] - bbox[0]:.0f}m/{resolution}px "
+        f"({len(jpeg)}b, {inspect_ms:.0f}ms) — {'; '.join(tripped)} "
+        f"→ fractal cook | {totals}"
+      )
+      return None, "wms_upsampled"
+    totals = _d13_count(inspected=1, genuine=1)
+    log_d13.info(
+      f"{tile_id}: GENUINE metatile {bbox[2] - bbox[0]:.0f}m/{resolution}px "
+      f"({len(jpeg)}b, {inspect_ms:.0f}ms) recon={reconstruction:.3f} "
+      f"spectral={spectral:.3f} (floors {METATILE_RECON_MIN}/{METATILE_SPECTRAL_MIN}) "
+      f"→ storing provider detail | {totals}"
+    )
+
   if resolution == 256:
     return {tile_id: jpeg}, None
   jpeg = _harmonize_texture_metatile(
@@ -1016,6 +1226,175 @@ def _store_texture_metatile(db, children: dict[str, bytes]) -> tuple[set[str], s
     written.add(child_id)
   return written, no_coverage
 
+
+
+def _cook_fractal_quad(db, tile_id: str) -> bool:
+  """Cook tile_id's parent quad from the parent's final texture.
+
+  Runs the deterministic fractal upscaler on the depth-(d-1) parent texture
+  and writes all four depth-d children with source "fractal_upscale" — the
+  provenance record the client and DB keep. Returns False when the parent
+  texture is missing or still temporary; the parent fetch is queued and the
+  caller should retry this tile later.
+  """
+  from coastline import read_water_mask
+  from database import read_tile
+  from terrain_upscale import upscale_heightmap, upscale_texture
+
+  parsed = _parse_tile_id(tile_id)
+  if parsed is None:
+    log_d13.warning(f"{tile_id}: fractal cook refused — unparseable tile id")
+    return False
+  depth, column, row = parsed
+  if depth == 0:
+    log_d13.warning(f"{tile_id}: fractal cook refused — root tile has no parent")
+    return False
+  if depth > MAX_TILE_DEPTH:
+    log_d13.info(
+      f"{tile_id}: fractal cook refused — depth {depth} beyond "
+      f"MAX_TILE_DEPTH={MAX_TILE_DEPTH} (upscaling disabled)"
+    )
+    return False
+  cook_started = time.perf_counter()
+  parent_column, parent_row = column // 2, row // 2
+  parent_id = f"{depth - 1}-{parent_column}-{parent_row}"
+  parent = db.execute(
+    "SELECT texture, source FROM textures WHERE tile_id = ?", (parent_id,)
+  ).fetchone()
+  parent_bbox = list(_tile_bbox(depth - 1, parent_column, parent_row))
+  if parent is None or parent[0] is None or parent[1] in _TEX_TEMPORARY:
+    reason = (
+      "no parent texture row"
+      if parent is None
+      else "parent texture blob is empty"
+      if parent[0] is None
+      else f"parent source '{parent[1]}' is temporary"
+    )
+    totals = _d13_count(deferred=1)
+    log_d13.info(
+      f"{tile_id}: cook DEFERRED — {reason}; queued parent {parent_id} fetch, "
+      f"child retries later | {totals}"
+    )
+    _queue_texture_fetch(parent_id, tuple(parent_bbox))
+    return False
+
+  parent_tile = read_tile(db, parent_id)
+  heightmap = parent_tile["heightmap"] if parent_tile else None
+  try:
+    water_mask = read_water_mask(db, parent_id)
+  except Exception as exc:
+    log_d13.warning(
+      f"{tile_id}: water mask unavailable for cook "
+      f"({type(exc).__name__}: {exc}); cooking without it — "
+      f"fractal detail may land on fjord water"
+    )
+    water_mask = None
+  conditioning = "heightmap=NO"
+  if heightmap is not None:
+    # Condition on the same fractal surface the DEM cook serves as the
+    # child meshes (identical function, seed, and inputs), so painted
+    # channels and ridges sit on geometry that actually exists.
+    if water_mask is not None and water_mask.shape != heightmap.shape:
+      water_mask = None
+    try:
+      heightmap = upscale_heightmap(
+        heightmap, parent_bbox, factor=2, water_mask=water_mask
+      )
+      conditioning = "heightmap=upscaled"
+    except ValueError as exc:
+      log_d13.warning(
+        f"{tile_id}: heightmap upscale failed for texture conditioning "
+        f"({exc}); conditioning on raw parent grid"
+      )
+      conditioning = "heightmap=raw"
+
+  # Classify the quad from the same surface the meshes are served from:
+  # imagery proposes, physics vetoes (steep and north faces carry nothing
+  # living). Labels drive where the painter puts rough rock vs soft
+  # vegetation detail, and are stored for procgen to consume later.
+  class_labels = amplitude_map = character_map = None
+  if conditioning == "heightmap=upscaled":
+    try:
+      from cook_classifier import classify_cooked_quad
+
+      parent_rgb = _np.asarray(
+        _Image.open(io.BytesIO(parent[0])).convert("RGB")
+      )
+      class_labels, amplitude_map, character_map = classify_cooked_quad(
+        parent_rgb, heightmap, parent_bbox, water_mask=water_mask
+      )
+      conditioning += " classes=yes"
+    except Exception as exc:
+      log_d13.warning(
+        f"{tile_id}: cook classification failed "
+        f"({type(exc).__name__}: {exc}); painting unclassified"
+      )
+      conditioning += " classes=FAILED"
+  conditioning += f" water_mask={'yes' if water_mask is not None else 'no'}"
+
+  upscale_started = time.perf_counter()
+  # Painted micro-detail is SHELVED (2026-07-22): synthetic luminance read
+  # as dark shadow artifacts of dubious value. detail_strength=0 makes the
+  # cook a clean Lanczos enlarge of the parent; the upscaled heightmap and
+  # its erosion carry the visual detail through real lighting instead.
+  # Class maps are still cooked and stored above for procgen.
+  upscaled, _size = upscale_texture(
+    parent[0],
+    parent_bbox,
+    factor=2,
+    detail_strength=0.0,
+    terrain_heightmap=heightmap,
+    water_mask=water_mask,
+    amplitude_map=amplitude_map,
+    character_map=character_map,
+  )
+  upscale_ms = (time.perf_counter() - upscale_started) * 1000.0
+  quadrants = _split_texture_metatile(
+    upscaled, child_resolution=256, grid_size=2
+  )
+  written, skipped = [], []
+  for column_bit in range(2):
+    for row_bit in range(2):
+      child_id = f"{depth}-{parent_column * 2 + column_bit}-{parent_row * 2 + row_bit}"
+      existing = db.execute(
+        "SELECT source FROM textures WHERE tile_id = ?", (child_id,)
+      ).fetchone()
+      if existing and existing[0] not in _METATILE_UPGRADEABLE_SOURCES:
+        skipped.append(f"{child_id}({existing[0]})")
+        continue
+      _write_texture(db, child_id, quadrants[(column_bit, row_bit)], _FRACTAL_SOURCE)
+      written.append(child_id)
+      if class_labels is not None:
+        try:
+          from classifier.storage import init_classifier_tiles, write_classifier_tile
+          from cook_classifier import COOK_CLASS_SOURCE
+
+          init_classifier_tiles(db)
+          half = class_labels.shape[0] // 2
+          top = (1 - row_bit) * half
+          left = column_bit * half
+          write_classifier_tile(
+            db, child_id,
+            class_labels[top:top + half, left:left + half],
+            source=COOK_CLASS_SOURCE,
+          )
+        except Exception as exc:
+          log_d13.warning(
+            f"{tile_id}: classifier tile write failed for {child_id} "
+            f"({type(exc).__name__}: {exc})"
+          )
+  cook_ms = (time.perf_counter() - cook_started) * 1000.0
+  totals = _d13_count(
+    cooked=1, cook_children=len(written), cook_skipped=len(skipped)
+  )
+  log_d13.info(
+    f"{tile_id}: COOKED quad from {parent_id} "
+    f"({parent[1]}, {len(parent[0])}b, {conditioning}) — "
+    f"wrote {len(written)} as {_FRACTAL_SOURCE}"
+    + (f", kept {', '.join(skipped)}" if skipped else "")
+    + f" in {cook_ms:.0f}ms (upscale {upscale_ms:.0f}ms) | {totals}"
+  )
+  return True
 
 
 def _queue_texture_fetch(
@@ -1062,8 +1441,13 @@ def _queue_texture_fetch(
         existing = db.execute(
           "SELECT source FROM textures WHERE tile_id = ?", (tile_id,)
         ).fetchone()
-        if existing and existing[0] == _METATILE_FINAL_SOURCE:
-          log_tex.debug(f"[tex-worker] {tile_id}: metatile sibling already filled it")
+        if existing and existing[0] not in _RE_FETCHABLE:
+          # A sibling holding this lock already finished the group — via
+          # metatile store or fractal cook. Without this check every queued
+          # sibling re-downloads the 2MB metatile and re-cooks for nothing.
+          log_tex.debug(
+            f"[tex-worker] {tile_id}: sibling already filled it ({existing[0]})"
+          )
           return
 
         log_tex.debug(
@@ -1089,6 +1473,22 @@ def _queue_texture_fetch(
             "SELECT texture FROM textures WHERE tile_id = ?", (tile_id,)
           ).fetchone()
           _resolve_no_coverage(db, tile_id, existing[0] if existing else None, "[tex-worker]")
+        elif fail_reason == 'wms_upsampled':
+          # Provider blowup past the contract depth — cook the parent quad
+          # with the fractal upscaler at the same finality as a real fetch.
+          # Every non-cooked outcome re-enters the retry queue: a tile must
+          # never leave this branch with no future work scheduled.
+          try:
+            cooked = _cook_fractal_quad(db, tile_id)
+          except Exception as exc:
+            totals = _d13_count(cook_failed=1)
+            log_d13.error(
+              f"{tile_id}: fractal cook FAILED "
+              f"({type(exc).__name__}: {exc}) — queued for retry | {totals}"
+            )
+            cooked = False
+          if not cooked:
+            _tex_retry_enqueue(tile_id, bbox, attempt=0)
         else:
           # Transient (rate limit / timeout). Mark and enqueue for retry.
           existing = db.execute(
@@ -1184,7 +1584,8 @@ def api_tiles():
       r //= 2
       check_ids.add(f"{d}-{c}-{r}")
 
-  texture_ids = _texture_ids_in(_get_db(), list(check_ids))
+  texture_sources = _texture_sources_in(_get_db(), list(check_ids))
+  texture_ids = set(texture_sources)
   with _tex_fetching_lock:
     tex_fetching = list(_tex_fetching)
   tex_fetching_set = set(tex_fetching)
@@ -1219,6 +1620,7 @@ def api_tiles():
         "hasTexture": bool(tex_flags["has_texture"]),
         "texAvailable": bool(tex_flags["available"]),
         "texStatus": tex_status,
+        "texSource": texture_sources.get(tid),
         "texIsPlaceholder": bool(tex_flags["is_placeholder"]),
         "texAncestorId": tex_flags["ancestor_id"],
         "texIsFetching": bool(tex_flags["is_fetching"]),
@@ -1374,6 +1776,36 @@ def _painted_texture_response(
   return Response(painted, mimetype="image/jpeg", headers=response_headers)
 
 
+@app.get("/api/d13/status")
+def api_d13_status():
+  """Workflow-accuracy audit for everything past WMS_CONTRACT_DEPTH.
+
+  Live process counters (inspections, verdicts, cooks, deferrals) plus a DB
+  audit: texture source distribution, in-flight/retry sizes, and any rows
+  stuck outside the workflow (the watchdog requeues these on its own sweep).
+  """
+  unavailable = _terrain_unavailable_response()
+  if unavailable is not None:
+    return unavailable
+  with _d13_stats_lock:
+    counters = dict(_d13_stats)
+  audit = _d13_texture_audit(_get_db())
+  return jsonify({
+    "contractDepth": WMS_CONTRACT_DEPTH,
+    "maxDepth": MAX_TILE_DEPTH,
+    "counters": counters,
+    "textureRows": audit["rows"],
+    "sourceDistribution": audit["distribution"],
+    "fetching": audit["fetching"],
+    "retrying": audit["retrying"],
+    "stuck": [
+      {"id": tile_id, "source": source, "ageSeconds": round(age_s, 1)}
+      for tile_id, source, age_s in audit["stuck"][:50]
+    ],
+    "stuckTotal": len(audit["stuck"]),
+  })
+
+
 @app.get("/api/texture/<tile_id>.jpg")
 def api_texture(tile_id: str):
   unavailable = _terrain_unavailable_response()
@@ -1399,16 +1831,6 @@ def api_texture(tile_id: str):
   ).fetchone()
 
   cached_crop = None
-  # Sources that are temporary placeholders — serve them but let client re-fetch
-  _TEX_TEMPORARY = {
-    "sentinel2_crop",
-    "ancestor_crop",
-    "ancestor_crop_ratelimit",
-    "dataforsyningen",  # legacy independent fetch; upgrade to aligned metatile
-    "dataforsyningen_metatile",  # legacy 2x2 group; upgrade to aligned 4x4
-    "dataforsyningen_metatile4",  # legacy 4x4 group without harmonization
-    "dataforsyningen_metatile4h",  # legacy conservative harmonization
-  }
   if row is not None:
     cached, source = row[0], row[1]
     log_tex.debug(f"[/api/texture] {tile_id}: cache HIT source={source} size={len(cached)} bytes")

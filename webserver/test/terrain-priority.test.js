@@ -1119,7 +1119,7 @@ test('shared terrain refetch decision enforces distance and trigger interval', (
   assert.deepEqual(evaluateTerrainRefetch({
     cameraX: 6000, cameraY: 0, lastFetchX: 0, lastFetchY: 0,
     nowMs: 1000, lastTriggerMs: 0, distanceThreshold: 5000, triggerIntervalMs: 500,
-  }), { distance: 6000, shouldFetch: true, nextTriggerMs: 1000 });
+  }), { distance: 6000, altitudeDelta: 0, shouldFetch: true, nextTriggerMs: 1000 });
   assert.equal(evaluateTerrainRefetch({
     cameraX: 7000, cameraY: 0, lastFetchX: 0, lastFetchY: 0,
     nowMs: 1200, lastTriggerMs: 1000, distanceThreshold: 5000, triggerIntervalMs: 500,
@@ -1127,6 +1127,24 @@ test('shared terrain refetch decision enforces distance and trigger interval', (
   assert.equal(evaluateTerrainRefetch({
     cameraX: 100, cameraY: 0, lastFetchX: 0, lastFetchY: 0,
     nowMs: 5000, lastTriggerMs: 0, distanceThreshold: 5000, triggerIntervalMs: 500,
+  }).shouldFetch, false);
+});
+
+test('shared terrain refetch decision reacts to a vertical descent', () => {
+  const descent = {
+    cameraX: 0, cameraY: 0, lastFetchX: 0, lastFetchY: 0,
+    cameraAltitude: 1190, lastFetchAltitude: 1400,
+    nowMs: 1000, lastTriggerMs: 0,
+    distanceThreshold: 1000, altitudeThreshold: 100, triggerIntervalMs: 500,
+  };
+  assert.deepEqual(evaluateTerrainRefetch(descent), {
+    distance: 0, altitudeDelta: 210, shouldFetch: true, nextTriggerMs: 1000,
+  });
+  assert.equal(evaluateTerrainRefetch({
+    ...descent, cameraAltitude: 1350,
+  }).shouldFetch, false);
+  assert.equal(evaluateTerrainRefetch({
+    ...descent, nowMs: 1200, lastTriggerMs: 1000,
   }).shouldFetch, false);
 });
 
@@ -1199,7 +1217,7 @@ test('shared fetch runtime polls pending terrain without a duplicate startup pas
     ox: 0, oy: 0, qx: 0, qy: 0, tiles: [],
     missing: requests === 1 ? [{}] : [], downloading: [], texFetching: 0,
   });
-  const { runtime } = createTestFetchRuntime({
+  const { runtime, state } = createTestFetchRuntime({
     fetchImpl: async () => {
       requests += 1;
       return { status: 200, json: async () => responseData() };
@@ -1209,6 +1227,7 @@ test('shared fetch runtime polls pending terrain without a duplicate startup pas
   });
   await runtime.request();
   assert.equal(requests, 1);
+  assert.equal(state.lastFetchAltitude, 100);
   assert.equal(typeof pollCallback, 'function');
   await pollCallback();
   assert.equal(requests, 2);
