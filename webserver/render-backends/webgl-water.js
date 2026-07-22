@@ -19,7 +19,7 @@ import {
 //     the dropped seabed carries the satellite imagery OF the water, so the
 //     surface lets it show through — colour inheritance is per-pixel and
 //     free, with veil/reflection/glint composited on top. Depth read by
-//     the post passes is the seabed, 3 m below the surface — negligible.
+//     the post passes is the seabed, 5 m below the surface — negligible.
 
 const SKY_GLSL = /* glsl */ `
   vec3 skyColor(vec3 dir, vec3 sunDir, vec3 horizonWarm, vec3 horizonCool, vec3 zenithCol, vec3 sunCol, float cloud) {
@@ -117,13 +117,13 @@ const BATHY_GLSL = /* glsl */ `
   uniform float uFetchRamp;    // metres of open water upwind for a full sea
                                // state; 0 disables the lee-shore calm zone
 
-  // local terrain height under the water plane; -3 m (the synthetic fjord
+  // local terrain height under the water plane; -5 m (the synthetic fjord
   // floor) wherever the capture has no coverage
   vec4 bathyAt(vec2 p) {
     vec2 uv = (p - uBathyCenter) / uBathyExtent + 0.5;
     float inB = step(abs(uv.x - 0.5), 0.5) * step(abs(uv.y - 0.5), 0.5);
     vec4 b = texture2D(uBathy, uv);
-    return mix(vec4(-3.0, 0.0, 0.0, 0.0), b, b.a * inB);
+    return mix(vec4(-5.0, 0.0, 0.0, 0.0), b, b.a * inB);
   }
 
   // Lee-shore fetch: waves need open water upwind to build, so a shore the
@@ -418,9 +418,9 @@ const WATER_FRAGMENT = /* glsl */ `
     // only calls a pixel black when all three are nearly absent.
     float bottomReflection = reflectionGateAt(pxy);
 
-    // Wall detection: the open fjord floor is a flat synthetic -3 m plane —
+    // Wall detection: the open fjord floor is a flat synthetic -5 m plane —
     // the only steep thing under the surface is the artificial mask-drop wall
-    // at the shoreline (3 m over a texel or two). The veil below must hide
+    // at the shoreline (5 m over a texel or two). The veil below must hide
     // exactly that band and nothing else, so measure seabed slope in world
     // metres (central differences one texel apart, resolution-independent).
     float h = uBathyTexel;
@@ -648,7 +648,7 @@ const WATER_FRAGMENT = /* glsl */ `
     // transparent surface. This is extinction only: feeding its weight into
     // the sky-lit body colour creates an opaque cyan ribbon along the shore.
     // Cap it so even a full-depth mask wall only darkens rather than becoming
-    // a replacement surface. The gate matters: ungated, the uniform -3 m
+    // a replacement surface. The gate matters: ungated, the uniform -5 m
     // floor made the veil a de facto 40% opacity over EVERY open-water
     // pixel, replacing the satellite colour with the shader's own sky-lit
     // teal — exactly the veil light the design forbids.

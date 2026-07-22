@@ -1,13 +1,20 @@
 """Physics-first classification inside the fractal cook."""
 
+import io
+import os
+import sqlite3
 import unittest
+from unittest.mock import patch
 
 import numpy as np
+
+os.environ.setdefault("DATAFORSYNINGEN_TOKEN", "test-token")
 
 from cook_classifier import (
     DARK, GREEN, GREY, WATER, WHITE,
     SLOPE_ROCK_MIN,
     classify_cooked_quad,
+    classify_tile_surface,
 )
 
 N = 65
@@ -74,6 +81,20 @@ class CookClassifierTest(unittest.TestCase):
         self.assertEqual(amplitude[SIZE // 2, SIZE // 4], 0.0)
         self.assertEqual(labels[SIZE // 2, 3 * SIZE // 4], GREEN)
 
+    def test_live_tile_surface_classification_matches_quad_labels(self):
+        # A d12 tile classifying itself uses its own 65x65 measured grid and
+        # 256px texture — same physics, no cook. Labels must agree with the
+        # quad path given the same inputs.
+        surface = np.zeros((N, N), dtype=np.float32)
+        rows = np.arange(N, dtype=np.float32) * 0.2 * (BBOX[2] / (N - 1))
+        surface += rows[:, None]
+        rgb = _uniform_rgb(GREEN_RGB)
+        labels = classify_tile_surface(rgb, surface, BBOX)
+        self.assertEqual(labels.shape, (256, 256))
+        self.assertEqual(labels[128, 128], GREEN)
+        expected, _, _ = classify_cooked_quad(rgb, surface, BBOX, output_size=256)
+        np.testing.assert_array_equal(labels, expected)
+
     def test_detail_energy_orders_rock_above_vegetation(self):
         steep_rock = _north_rising_surface(0.8)
         _, rock_amp, rock_char = classify_cooked_quad(
@@ -86,6 +107,109 @@ class CookClassifierTest(unittest.TestCase):
         self.assertGreater(rock_amp[center], veg_amp[center])
         self.assertGreater(rock_char[center], veg_char[center])
         self.assertLessEqual(veg_char[center], 0.3)
+
+
+class BakeTextureDetailTest(unittest.TestCase):
+    def test_bake_is_deterministic_and_class_gated(self):
+        from cook_classifier import WATER, bake_texture_detail
+
+        rgb = np.full((128, 128, 3), 128, np.uint8)
+        labels = np.zeros((128, 128), np.uint8)  # all rock
+        labels[:, 64:] = WATER
+        bbox = (1000.0, 2000.0, 1329.6, 2329.6)
+        first = bake_texture_detail(rgb, labels, bbox)
+        second = bake_texture_detail(rgb, labels, bbox)
+        np.testing.assert_array_equal(first, second)
+        # Rock half carries visible grain; water half is untouched.
+        self.assertGreater(int(np.ptp(first[:, :64])), 10)
+        np.testing.assert_array_equal(first[:, 64:], rgb[:, 64:])
+
+    def test_bake_is_continuous_across_a_shared_tile_border(self):
+        from cook_classifier import bake_texture_detail
+
+        rgb = np.full((128, 128, 3), 128, np.uint8)
+        labels = np.zeros((128, 128), np.uint8)
+        west = (0.0, 0.0, 329.6, 329.6)
+        east = (329.6, 0.0, 659.2, 329.6)
+        west_baked = bake_texture_detail(rgb, labels, west)
+        east_baked = bake_texture_detail(rgb, labels, east)
+        # linspace includes both endpoints, so the shared world column is
+        # sampled by both tiles and must bake to the same values.
+        np.testing.assert_array_equal(west_baked[:, -1], east_baked[:, 0])
+
+    def test_bake_never_brightens_black_shadow(self):
+        from cook_classifier import bake_texture_detail
+
+        rgb = np.zeros((64, 64, 3), np.uint8)  # pitch-dark imagery
+        labels = np.zeros((64, 64), np.uint8)
+        baked = bake_texture_detail(rgb, labels, (0.0, 0.0, 100.0, 100.0))
+        # Multiplicative modulation: black stays black, no grey splotches.
+        np.testing.assert_array_equal(baked, rgb)
+
+
+class LiveD12ClassificationTest(unittest.TestCase):
+    def _database_with_d12_tile(self, texture_source):
+        from PIL import Image
+
+        import database
+        from classifier.storage import init_classifier_tiles
+        from texture import init_textures, write_texture
+
+        db = sqlite3.connect(":memory:")
+        db.executescript(database._SCHEMA)
+        init_textures(db)
+        init_classifier_tiles(db)
+        surface = np.zeros((65, 65), dtype=np.float32)
+        surface += (
+            np.arange(65, dtype=np.float32)[:, None] * 0.2 * (659.18 / 64.0)
+        )
+        db.execute(
+            "INSERT INTO tiles (tile_id, depth, col, row, x_min, y_min, "
+            "x_max, y_max, source, updated_at, heightmap, confidence_map) "
+            "VALUES (?, 12, 100, 200, 0, 0, 659.18, 659.18, 'arcticdem_10m', "
+            "'now', ?, ?)",
+            (
+                "12-100-200",
+                database._compress_array(surface),
+                database._compress_array(np.full((65, 65), 6, np.uint8)),
+            ),
+        )
+        buf = io.BytesIO()
+        Image.fromarray(
+            np.tile(np.asarray(GREEN_RGB, np.uint8), (256, 256, 1)), "RGB"
+        ).save(buf, format="JPEG")
+        write_texture(db, "12-100-200", buf.getvalue(), texture_source)
+        return db
+
+    def test_final_texture_classifies_and_stores_on_demand(self):
+        import serve_flask
+
+        db = self._database_with_d12_tile("dataforsyningen_metatile4h2")
+        with patch(
+            "classifier.official_water.classifier_water_mask_for_tile",
+            return_value=None,
+        ):
+            serve_flask._ensure_d12_class_map(db, "12-100-200")
+        row = db.execute(
+            "SELECT source FROM classifier_tiles WHERE tile_id = '12-100-200'"
+        ).fetchone()
+        self.assertIsNotNone(row)
+        self.assertEqual(row[0], "coarse_d12_live_v1")
+
+        # Second call must be a no-op read, never a re-classification.
+        with patch("cook_classifier.classify_tile_surface") as untouched:
+            serve_flask._ensure_d12_class_map(db, "12-100-200")
+            untouched.assert_not_called()
+
+    def test_placeholder_texture_is_never_persisted_as_classification(self):
+        import serve_flask
+
+        db = self._database_with_d12_tile("ancestor_crop")
+        serve_flask._ensure_d12_class_map(db, "12-100-200")
+        row = db.execute(
+            "SELECT source FROM classifier_tiles WHERE tile_id = '12-100-200'"
+        ).fetchone()
+        self.assertIsNone(row)
 
 
 if __name__ == "__main__":

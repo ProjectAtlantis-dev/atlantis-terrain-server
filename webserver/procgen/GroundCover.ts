@@ -37,6 +37,19 @@ const INSTANCE_CHUNK = /* glsl */ `
   #endif
   mvPos = modelViewMatrix * mvPos;
   gl_Position = projectionMatrix * mvPos;
+  #include <logdepthbuf_vertex>
+`;
+
+// The renderer runs a logarithmic depth buffer; raw ShaderMaterials must
+// emit log fragment depth or they lose the depth test against the terrain
+// (assets degrade to ghost outlines). No-ops when log depth is off.
+const LOGDEPTH_VERT_PARS = /* glsl */ `
+  #include <common>
+  #include <logdepthbuf_pars_vertex>
+`;
+const LOGDEPTH_FRAG_PARS = /* glsl */ `
+  #include <common>
+  #include <logdepthbuf_pars_fragment>
 `;
 
 /** single grass blade: tapered 4-segment strip with a built-in bend */
@@ -45,7 +58,10 @@ export function grassBladeGeometry(SEG = 4): BufferGeometry {
   const nrm: number[] = [];
   const uvA: number[] = [];
   const idx: number[] = [];
-  const W = 0.014;
+  // Tundra sedge reads as wide flat tufts, not lawn filaments — and wide
+  // blades are the cheap way to CARPET: ground-hiding coverage scales with
+  // blade area, not blade count.
+  const W = 0.030;
   const H = 1; // unit height; instance scales
   // rounded cross-section normals (Ghost of Tsushima): edge verts tilt
   // ±38° around the blade axis so the strip shades like a half-cylinder
@@ -84,6 +100,7 @@ export function grassBladeGeometry(SEG = 4): BufferGeometry {
 export function grassMaterial(): ShaderMaterial {
   return new ShaderMaterial({
     vertexShader: /* glsl */ `
+      ${LOGDEPTH_VERT_PARS}
       attribute vec4 idata;
       varying float vT;
       varying vec4 vId;
@@ -95,9 +112,11 @@ export function grassMaterial(): ShaderMaterial {
     `,
     fragmentShader: /* glsl */ `
       precision highp float;
+      ${LOGDEPTH_FRAG_PARS}
       varying float vT;
       varying vec4 vId;
       void main() {
+        #include <logdepthbuf_fragment>
         vec3 fresh = mix(vec3(0.026, 0.06, 0.012), vec3(0.1, 0.16, 0.035), vT * vT);
         vec3 dry = mix(vec3(0.07, 0.055, 0.02), vec3(0.21, 0.16, 0.07), vT);
         vec3 albedo = mix(fresh, dry, vId.y) * (vId.x * 0.16 + 1.0);
@@ -282,6 +301,7 @@ export function debrisMaterial(kind: 'twig' | 'chip'): ShaderMaterial {
   return new ShaderMaterial({
     uniforms: { baseColor: { value: base } },
     vertexShader: /* glsl */ `
+      ${LOGDEPTH_VERT_PARS}
       attribute vec4 vdata;
       varying vec4 vData;
       void main() {
@@ -291,9 +311,11 @@ export function debrisMaterial(kind: 'twig' | 'chip'): ShaderMaterial {
     `,
     fragmentShader: /* glsl */ `
       precision highp float;
+      ${LOGDEPTH_FRAG_PARS}
       uniform vec3 baseColor;
       varying vec4 vData;
       void main() {
+        #include <logdepthbuf_fragment>
         gl_FragColor = vec4(baseColor * (vData.x * 0.2 + 1.0) * vData.w * 2.2, 1.0);
       }
     `,
@@ -306,6 +328,7 @@ export function litterMaterial(atlas: Texture): ShaderMaterial {
   return new ShaderMaterial({
     uniforms: { atlas: { value: atlas } },
     vertexShader: /* glsl */ `
+      ${LOGDEPTH_VERT_PARS}
       varying vec2 vUvV;
       void main() {
         vUvV = uv;
@@ -314,9 +337,11 @@ export function litterMaterial(atlas: Texture): ShaderMaterial {
     `,
     fragmentShader: /* glsl */ `
       precision highp float;
+      ${LOGDEPTH_FRAG_PARS}
       uniform sampler2D atlas;
       varying vec2 vUvV;
       void main() {
+        #include <logdepthbuf_fragment>
         vec4 t = texture2D(atlas, vUvV);
         if (t.a < 0.32) discard;
         vec3 albedo = t.rgb * t.rgb; // decode sqrt-encoded atlas

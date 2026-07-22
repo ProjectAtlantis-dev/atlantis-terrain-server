@@ -23,7 +23,10 @@ from typing import Any, cast
 import asyncio
 
 from colored_log import get_logger
-from terrain_config import BOOTSTRAP_SEED_DEPTH, MAX_TILE_DEPTH, WMS_CONTRACT_DEPTH
+from terrain_config import (
+  BOOTSTRAP_SEED_DEPTH, MAX_TILE_DEPTH, WMS_CONTRACT_DEPTH,
+  WMS_TEXTURE_PROBE_MAX_DEPTH,
+)
 
 log = get_logger("terrain")
 log_db = get_logger("terrain.db")
@@ -558,6 +561,29 @@ def _fetch_one_cog_tile(tile_id, bbox):
   db = sqlite3.connect(str(DB_PATH), check_same_thread=False)
   db.execute("PRAGMA journal_mode=WAL")
   try:
+    # Past-contract heightmaps are DERIVED, never read from COG — a raw
+    # 10m/30m read on a 41-165m tile is interpolation mush whose edges
+    # ignore every neighbor (visible as raised square tile corners). This
+    # gate mirrors serve._fetch_tile; the cook defers until the measured
+    # parent chain exists, riding the scheduler's normal retry path.
+    parsed = _parse_tile_id(tile_id)
+    if parsed is not None and parsed[0] > WMS_CONTRACT_DEPTH:
+      from serve import _cook_fractal_dem_quad
+
+      _record_dem_request(db, tile_id)
+      if _cook_fractal_dem_quad(db, tile_id):
+        log_cog.info(
+          f"[tile-audit] tile={tile_id} stage=dem_completed outcome=cooked"
+        )
+        return "fetched"
+      log_cog.info(
+        f"[tile-audit] tile={tile_id} stage=dem_completed "
+        "outcome=cook_deferred"
+      )
+      # NOT "defer": that requeues and redispatches immediately, and a
+      # cook-defer is millisecond-fast — it would hot-loop a worker until
+      # the parent lands. This outcome waits for the next demand refresh.
+      return "cook_deferred"
     row = db.execute(
       "SELECT source FROM tiles WHERE tile_id = ?", (tile_id,)
     ).fetchone()
@@ -672,6 +698,10 @@ def _finish_cog_tile(tile_id, bbox, future):
       _cog_already_fetched.discard(tile_id)
       if tile_id in _cog_demand_ids:
         _cog_pending_tiles[tile_id] = bbox
+    elif outcome == "cook_deferred":
+      # Eligible again, but only the next demand refresh re-queues it —
+      # by then the measured parent this cook was waiting on may exist.
+      _cog_already_fetched.discard(tile_id)
     elif outcome == "fetched":
       _cog_synthetic_retry_at.pop(tile_id, None)
       _cog_fetched_total += 1
@@ -1297,8 +1327,10 @@ def _cook_fractal_quad(db, tile_id: str) -> bool:
     if water_mask is not None and water_mask.shape != heightmap.shape:
       water_mask = None
     try:
+      # amplitude_m=0 must match the DEM cook exactly (fBm purged there
+      # too) — conditioning and served geometry are the same surface.
       heightmap = upscale_heightmap(
-        heightmap, parent_bbox, factor=2, water_mask=water_mask
+        heightmap, parent_bbox, factor=2, amplitude_m=0.0, water_mask=water_mask
       )
       conditioning = "heightmap=upscaled"
     except ValueError as exc:
@@ -1333,11 +1365,10 @@ def _cook_fractal_quad(db, tile_id: str) -> bool:
   conditioning += f" water_mask={'yes' if water_mask is not None else 'no'}"
 
   upscale_started = time.perf_counter()
-  # Painted micro-detail is SHELVED (2026-07-22): synthetic luminance read
-  # as dark shadow artifacts of dubious value. detail_strength=0 makes the
-  # cook a clean Lanczos enlarge of the parent; the upscaled heightmap and
-  # its erosion carry the visual detail through real lighting instead.
-  # Class maps are still cooked and stored above for procgen.
+  # The old fBm paint is SHELVED (2026-07-22: dark shadow artifacts), and a
+  # bare Lanczos enlarge is explicitly not enough either. detail_strength=0
+  # keeps the noise painter off; the class-conditioned world-anchored bake
+  # below is what makes each cooked level genuinely sharper than its parent.
   upscaled, _size = upscale_texture(
     parent[0],
     parent_bbox,
@@ -1348,6 +1379,20 @@ def _cook_fractal_quad(db, tile_id: str) -> bool:
     amplitude_map=amplitude_map,
     character_map=character_map,
   )
+  if class_labels is not None:
+    # Bake this level's frequency octave, classifier-gated per surface.
+    from cook_classifier import bake_texture_detail
+
+    baked = bake_texture_detail(
+      _np.asarray(_Image.open(io.BytesIO(upscaled)).convert("RGB")),
+      class_labels,
+      parent_bbox,
+    )
+    buffer = io.BytesIO()
+    _Image.fromarray(baked, mode="RGB").save(
+      buffer, format="JPEG", quality=92, subsampling=0,
+    )
+    upscaled = buffer.getvalue()
   upscale_ms = (time.perf_counter() - upscale_started) * 1000.0
   quadrants = _split_texture_metatile(
     upscaled, child_resolution=256, grid_size=2
@@ -1450,10 +1495,20 @@ def _queue_texture_fetch(
           )
           return
 
-        log_tex.debug(
-          f"[tex-worker] {tile_id}: fetching metatile {metatile_id} bbox={metatile_bbox}"
-        )
-        children, fail_reason = _fetch_texture_metatile(tile_id)
+        if parsed is not None and parsed[0] > WMS_TEXTURE_PROBE_MAX_DEPTH:
+          # Beyond the measured WMS ceiling every metatile comes back as a
+          # blowup; skip the provider round-trip and take the cook branch
+          # directly, same as an inspected blowup would.
+          log_tex.debug(
+            f"[tex-worker] {tile_id}: depth {parsed[0]} beyond WMS probe "
+            f"ceiling {WMS_TEXTURE_PROBE_MAX_DEPTH} — cooking directly"
+          )
+          children, fail_reason = None, "wms_upsampled"
+        else:
+          log_tex.debug(
+            f"[tex-worker] {tile_id}: fetching metatile {metatile_id} bbox={metatile_bbox}"
+          )
+          children, fail_reason = _fetch_texture_metatile(tile_id)
         if children is not None:
           written, no_coverage = _store_texture_metatile(db, children)
           log_tex.debug(
@@ -2193,6 +2248,66 @@ def api_terrain_channel(tile_id: str, chan: str):
 CLASSIFIER_PINK_WATER_ENABLED = False
 
 
+def _ensure_d12_class_map(db, tile_id: str) -> None:
+  """Classify a contract-depth tile on demand from its own texture + DEM.
+
+  The cook classifier's proposal/veto physics needs no cook and no parent:
+  a d12 tile's final texture and measured heightmap are enough. Rows are
+  stored only when the texture is final, so placeholder-derived labels are
+  never persisted; until then the tile simply stays unclassified and the
+  caller's ancestor-walk behaves as before. Deterministic given its inputs.
+  """
+  parsed = _parse_tile_id(tile_id)
+  if parsed is None or parsed[0] != WMS_CONTRACT_DEPTH:
+    return
+  existing = db.execute(
+    "SELECT 1 FROM classifier_tiles WHERE tile_id = ?", (tile_id,)
+  ).fetchone()
+  if existing:
+    return
+  texture_row = db.execute(
+    "SELECT texture, source FROM textures WHERE tile_id = ?", (tile_id,)
+  ).fetchone()
+  if (
+    texture_row is None or texture_row[0] is None
+    or texture_row[1] in _TEX_TEMPORARY
+  ):
+    return
+  from database import read_tile
+  tile = read_tile(db, tile_id)
+  if tile is None or tile.get("heightmap") is None:
+    return
+  try:
+    import numpy as np
+    from PIL import Image
+
+    from classifier.storage import init_classifier_tiles, write_classifier_tile
+    from coastline import read_water_mask
+    from cook_classifier import LIVE_D12_CLASS_SOURCE, classify_tile_surface
+
+    try:
+      water_mask = read_water_mask(db, tile_id)
+      if water_mask is not None and water_mask.shape != tile["heightmap"].shape:
+        water_mask = None
+    except Exception:
+      water_mask = None
+    rgb = np.asarray(Image.open(io.BytesIO(texture_row[0])).convert("RGB"))
+    labels = classify_tile_surface(
+      rgb, tile["heightmap"], list(tile["bbox"]), water_mask=water_mask,
+    )
+    init_classifier_tiles(db)
+    write_classifier_tile(db, tile_id, labels, source=LIVE_D12_CLASS_SOURCE)
+    log.info(
+      f"[classifier] {tile_id}: live d12 classification stored "
+      f"({texture_row[1]} texture, {labels.shape[0]}px)"
+    )
+  except Exception as exc:
+    log.warning(
+      f"[classifier] {tile_id}: live d12 classification failed "
+      f"({type(exc).__name__}: {exc})"
+    )
+
+
 @app.get("/api/classifier/<tile_id>.png")
 def api_classifier_tile(tile_id: str):
   """Colorized semantic labels for a terrain tile.
@@ -2200,6 +2315,13 @@ def api_classifier_tile(tile_id: str):
   The database stores raw uint8 labels. Exact rows are preferred; descendants
   can reuse the nearest classified ancestor through a nearest-neighbor crop so
   class boundaries and label identities are never blended.
+
+  With ``?raw=1`` the response is a surface-channel mask for the renderer's
+  detail materials instead of the colorized debug view: one-hot uint8
+  channels R=rock (grey+dark), G=vegetation, B=snow; water and unclassified
+  ground are black (no detail). One channel per surface lets the client
+  filter linearly across class boundaries — the blend weights stay valid,
+  which label indices never would.
   """
   unavailable = _terrain_unavailable_response()
   if unavailable is not None:
@@ -2207,6 +2329,7 @@ def api_classifier_tile(tile_id: str):
   parsed = _parse_tile_id(tile_id)
   if parsed is None:
     return Response(b"", status=400)
+  raw_mask = request.args.get("raw") == "1"
   try:
     resolution = max(16, min(2048, int(request.args.get("res", "512"))))
   except ValueError:
@@ -2223,6 +2346,14 @@ def api_classifier_tile(tile_id: str):
   depth, col, row = parsed
   found = None
   db = _get_db()
+  if child_depth >= WMS_CONTRACT_DEPTH:
+    # Contract-depth ground classifies itself on first demand, so surface
+    # masks exist everywhere walkable without waiting for deep cooks.
+    shift = child_depth - WMS_CONTRACT_DEPTH
+    _ensure_d12_class_map(
+      db,
+      f"{WMS_CONTRACT_DEPTH}-{child_col >> shift}-{child_row >> shift}",
+    )
   effective_water = read_water_mask(db, tile_id)
   water_source_row = db.execute(
     "SELECT source FROM coastline_masks WHERE tile_id = ?", (tile_id,)
@@ -2247,6 +2378,7 @@ def api_classifier_tile(tile_id: str):
       row //= 2
 
   try:
+    label_array = None
     if found is None:
       class_schema, source = "effective_water_only", "coastline_masks"
       rgb = _np.full((resolution, resolution, 3), 42, dtype=_np.uint8)
@@ -2268,9 +2400,53 @@ def api_classifier_tile(tile_id: str):
       label_image = label_image.resize(
         (resolution, resolution), _Image.Resampling.NEAREST,
       )
+      label_array = _np.asarray(label_image)
       rgb = colorize_class_map(
-        _np.asarray(label_image), class_schema,
+        label_array, class_schema,
         highlight_water=CLASSIFIER_PINK_WATER_ENABLED,
+      )
+    if raw_mask:
+      # coarse_v1 indices: grey 0, green 1, dark 2, white 3, water 4.
+      # RGB only — NOT RGBA. An alpha channel here previously carried DARK,
+      # but the client decodes via a 2D canvas drawImage/getImageData round
+      # trip, which premultiplies alpha by default: wherever alpha (dark)
+      # was 0, the browser zeroed R/G/B too, corrupting rock/veg/snow
+      # everywhere except on dark patches ("only rocks on black patches").
+      # DARK now lives inside R itself as a distinct value: grey (light
+      # rock) = 255, dark = 128, neither = 0. Consumers that only care
+      # "is this rock at all" (R > 0, e.g. the ground-detail shader) are
+      # unaffected; consumers that need light-vs-dark test the exact value.
+      mask = _np.zeros((resolution, resolution, 3), dtype=_np.uint8)
+      if label_array is not None and class_schema == "coarse_v1":
+        mask[..., 0] = _np.select(
+          [label_array == 0, label_array == 2], [255, 128], default=0,
+        )
+        mask[..., 1] = _np.where(label_array == 1, 255, 0)
+        mask[..., 2] = _np.where(label_array == 3, 255, 0)
+      if effective_water is not None:
+        mask[
+          smooth_effective_water_mask(effective_water, resolution, resolution)
+        ] = 0
+      buf = _io.BytesIO()
+      _Image.fromarray(mask, mode="RGB").save(buf, format="PNG")
+      # "pending" (no real classifier row anywhere in the ancestor chain,
+      # this is the all-black water-only fallback) MUST be distinguished
+      # from "ready" (a real classification, even an inherited coarse one):
+      # the client's surface-field store caches every 200 permanently, and
+      # a d12 tile is routinely still mid-fetch/mid-cook on its first
+      # request. Caching that transient blank as if it were final left
+      # most of the map permanently grass-less — the client now treats
+      # "pending" as retryable instead of caching it.
+      classifier_status = "ready" if found is not None else "pending"
+      return Response(
+        buf.getvalue(), mimetype="image/png",
+        headers={
+          "Cache-Control": "no-store",
+          "X-Classifier-Status": classifier_status,
+          "X-Classifier-Schema": str(class_schema),
+          "X-Classifier-Source": str(source),
+          "X-Classifier-Mask": "surface_rgb_v1",
+        },
       )
     if effective_water is not None:
       # Reconstruct the terrain-grid boundary at the output resolution before
@@ -2293,7 +2469,7 @@ def api_classifier_tile(tile_id: str):
   _Image.fromarray(rgb, mode="RGB").save(buf, format="PNG")
   headers = {
     "Cache-Control": "no-store",
-    "X-Classifier-Status": "ready",
+    "X-Classifier-Status": "ready" if found is not None else "pending",
     "X-Classifier-Schema": str(class_schema),
     "X-Classifier-Source": str(source),
     "X-Classifier-Pink-Water": (

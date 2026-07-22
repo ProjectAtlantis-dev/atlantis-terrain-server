@@ -11,6 +11,7 @@ import {
   tileDepthFromId,
   terrainVisibilityDistance,
 } from './terrain-tile-runtime.js';
+import { createTerrainDetailRuntime } from './terrain-detail-runtime.js';
 
 function parseTileId(tileId) {
   const match = /^(\d+)-(\d+)-(\d+)$/.exec(tileId || '');
@@ -613,6 +614,14 @@ export function createTerrainTileSet({
       needsUpdate = true;
     }
     if (!resolvedTexture) {
+      if (mesh.material.userData?.terrainDetail) {
+        // A detail colorNode captures its texture objects; without a live
+        // satellite map it must not keep sampling a stale one.
+        mesh.material.colorNode = null;
+        mesh.material.userData.terrainDetailMap = null;
+        mesh.material.userData.terrainDetailMask = null;
+        needsUpdate = true;
+      }
       needsUpdate = selectVertexColors(mesh, mesh.userData?.terrainColorAttribute) || needsUpdate;
       if (needsUpdate) mesh.material.needsUpdate = true;
       renderBackend.prepareUntexturedTerrain(mesh);
@@ -627,11 +636,22 @@ export function createTerrainTileSet({
       mesh.material.needsUpdate = true;
       onMutated();
     }
+    // Frequency-split ground detail: modulate the satellite color with tiled
+    // per-surface detail near the camera (mask-gated, distance-faded).
+    terrainDetail.apply(mesh);
   }
 
   function prepareUntexturedMesh(mesh) {
     renderBackend.prepareUntexturedTerrain(mesh);
   }
+  const terrainDetail = testOverrides.terrainDetail ?? createTerrainDetailRuntime({
+    backendKind: renderBackend.kind,
+    requestRender: () => {
+      onMutated();
+      renderBackend.requestRender?.();
+    },
+    log: (tileId, message) => log(tileId, message),
+  });
   const lifecycle = createTileLifecycle({
     terrainRoot, disposeScatter: disposeTileScatter, log, onSceneMutated: onMutated,
   });

@@ -407,33 +407,45 @@ TEMPORARY_SOURCES = {
 
 
 def drop_fractal_children(db, tile_id):
-    """Delete direct fractal_upscale children of tile_id; returns their ids.
+    """Delete the fractal_upscale subtree under tile_id; returns its ids.
 
     Cooked tiles are derived data: when the real parent texture changes,
-    the derivation is stale. Dropping the rows returns the children to the
-    missing state, so the next demand re-runs the full pipeline (fetch →
-    inspect → cook) against the new parent.
+    the derivation is stale. Cooks recurse (a depth-14 tile is cooked from
+    a depth-13 cook), so the staleness cascades — every fractal descendant
+    of a dropped fractal tile was derived, transitively, from the changed
+    parent. Dropping the rows returns them to the missing state, so the
+    next demand re-runs the full pipeline (fetch → inspect → cook) level
+    by level against the new parent.
     """
     parts = tile_id.split("-")
     if len(parts) != 3:
         return []
     try:
-        depth, column, row = (int(p) for p in parts)
+        int(parts[0]), int(parts[1]), int(parts[2])
     except ValueError:
         return []
-    child_ids = [
-        f"{depth + 1}-{column * 2 + column_bit}-{row * 2 + row_bit}"
-        for column_bit in (0, 1)
-        for row_bit in (0, 1)
-    ]
-    placeholders = ",".join("?" for _ in child_ids)
-    stale = [
-        r[0] for r in db.execute(
-            f"SELECT tile_id FROM textures WHERE tile_id IN ({placeholders}) "
-            "AND source = 'fractal_upscale'",
-            child_ids,
-        ).fetchall()
-    ]
+
+    stale = []
+    frontier = [tile_id]
+    while frontier:
+        child_ids = []
+        for parent in frontier:
+            depth, column, row = (int(p) for p in parent.split("-"))
+            child_ids.extend(
+                f"{depth + 1}-{column * 2 + column_bit}-{row * 2 + row_bit}"
+                for column_bit in (0, 1)
+                for row_bit in (0, 1)
+            )
+        placeholders = ",".join("?" for _ in child_ids)
+        frontier = [
+            r[0] for r in db.execute(
+                f"SELECT tile_id FROM textures WHERE tile_id IN ({placeholders}) "
+                "AND source = 'fractal_upscale'",
+                child_ids,
+            ).fetchall()
+        ]
+        stale.extend(frontier)
+
     if stale:
         marks = ",".join("?" for _ in stale)
         db.execute(f"DELETE FROM textures WHERE tile_id IN ({marks})", stale)
@@ -532,9 +544,12 @@ def write_texture(db, tile_id, jpeg_bytes, source):
     )
     db.commit()
 
-    # Cooked children are derived from this tile's texture: any real
-    # (non-placeholder) change to it makes them stale. Cook writes
-    # themselves can't invalidate anything — their children don't exist.
+    # Cooked descendants are derived from this tile's texture: any real
+    # (non-placeholder) change to it makes the whole fractal subtree stale
+    # (drop cascades — deep cooks recurse on cooked parents). Cook writes
+    # themselves can't invalidate anything: a cook only runs after the
+    # parent-change drop already cleared the subtree, so its children
+    # don't exist yet.
     if source not in TEMPORARY_SOURCES and source != "fractal_upscale":
         stale = drop_fractal_children(db, tile_id)
         if stale:

@@ -38,7 +38,14 @@ const SUN = [0.33, -0.5, 0.8];
 const SUN_LEN = Math.hypot(SUN[0]!, SUN[1]!, SUN[2]!);
 const SUN_N = [SUN[0]! / SUN_LEN, SUN[1]! / SUN_LEN, SUN[2]! / SUN_LEN];
 
+// The renderer runs a logarithmic depth buffer. Built-in materials get the
+// log-depth chunks automatically, but a raw ShaderMaterial does NOT — and a
+// standard-z fragment depth-tested against logarithmic terrain depth loses
+// almost everywhere (assets render as ghost outlines). The chunk includes
+// are no-ops when USE_LOGDEPTHBUF is off, so this stays portable.
 const VERT_COMMON = /* glsl */ `
+  #include <common>
+  #include <logdepthbuf_pars_vertex>
   attribute vec4 vdata;
   varying vec4 vData;
   varying vec2 vUvV;
@@ -56,6 +63,7 @@ const VERT_COMMON = /* glsl */ `
     // carry an ECEF orientation, so modelMatrix must NOT touch the normal
     vWorldN = normalize(n);
     gl_Position = projectionMatrix * modelViewMatrix * p;
+    #include <logdepthbuf_vertex>
   }
 `;
 
@@ -70,16 +78,25 @@ const LAMBERT_FN = /* glsl */ `
 `;
 
 function unlitMaterial(fragBody: string, uniforms: Record<string, { value: unknown }>, opts?: { doubleSide?: boolean }): ShaderMaterial {
+  // Every material main() must emit logarithmic fragment depth to match the
+  // rest of the scene (see VERT_COMMON note); inject the chunk so each
+  // fragBody stays plain GLSL.
+  const bodyWithLogDepth = fragBody.replace(
+    'void main() {',
+    'void main() {\n      #include <logdepthbuf_fragment>',
+  );
   const mat = new ShaderMaterial({
     uniforms: { sunDir: { value: SUN_N }, ...uniforms },
     vertexShader: VERT_COMMON,
     fragmentShader: /* glsl */ `
       precision highp float;
+      #include <common>
+      #include <logdepthbuf_pars_fragment>
       varying vec4 vData;
       varying vec2 vUvV;
       varying vec3 vWorldN;
       ${LAMBERT_FN}
-      ${fragBody}
+      ${bodyWithLogDepth}
     `,
   });
   if (opts?.doubleSide) mat.side = DoubleSide;
@@ -394,9 +411,12 @@ export function buildAssetLibrary(renderer: WebGLRenderer, seedN = 1337): AssetL
   }
 
   // ---- grass: pre-baked clumped patches, instanced per tile ----------------
+  // 420 wide blades over 3 m ≈ 2/3 ground coverage inside a patch — with the
+  // tundra scatter density (~1 patch / 8 m²) the carpet hides most bare
+  // terrain where the vegetation mask passes.
   for (let v = 0; v < 3; v++) {
     const rng = seed.rng(`grass/${v}`);
-    const patch = grassPatch(rng, 200, 3, { dryBase: 0.15 });
+    const patch = grassPatch(rng, 420, 3, { dryBase: 0.15 });
     const geo = bakeInstanced(patch);
     patch.geometry.dispose(); // blade geometry was baked into the merged patch
     add(`grass/${v}`, [{ geo, mat: patch.material as ShaderMaterial }], 120, [0.8, 1.4], true);

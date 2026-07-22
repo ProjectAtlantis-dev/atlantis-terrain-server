@@ -12,7 +12,12 @@
       "Bash(sqlite3 terrain.db .tables*)",
       "Bash(sqlite3 /Users/reinman/work/aud/atlantis-terrain/flaskserver/terrain.db \"SELECT *)",
       "Bash(sqlite3 /Users/reinman/work/aud/atlantis-terrain/flaskserver/terrain.db .schema*)",
-      "Bash(sqlite3 /Users/reinman/work/aud/atlantis-terrain/flaskserver/terrain.db .tables*)"
+      "Bash(sqlite3 /Users/reinman/work/aud/atlantis-terrain/flaskserver/terrain.db .tables*)",
+      "Bash(npm test)",
+      "Bash(curl -s http://localhost:5180/*)",
+      "Bash(curl -s \"http://localhost:5180/*)",
+      "Bash(curl -sI http://localhost:5180/*)",
+      "Bash(curl -sI \"http://localhost:5180/*)"
     ]
   }
 }

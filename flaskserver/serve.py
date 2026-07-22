@@ -47,8 +47,12 @@ REAL_SOURCES = (
 # interpolation mush). Only parents in states the pipeline never refetches
 # may be cooked from — derived tiles therefore cannot go stale through the
 # normal flow, and depths <= WMS_CONTRACT_DEPTH are untouched by all of it.
+# fractal_dem itself is a valid parent: cooks recurse deterministically
+# (d14 cooks from cooked d13, ...), rooted in a measured depth-12 surface.
 FRACTAL_DEM_SOURCE = 'fractal_dem'
-_FRACTAL_DEM_PARENT_SOURCES = {'arcticdem_10m', 'copernicus', 'official_coastline'}
+_FRACTAL_DEM_PARENT_SOURCES = {
+    'arcticdem_10m', 'copernicus', 'official_coastline', FRACTAL_DEM_SOURCE,
+}
 
 # Sources that should be refetched at higher DEM resolution
 _UPGRADEABLE_SOURCES = {
@@ -81,9 +85,11 @@ LOD_FINE_PLATEAU_MAX_M = 3000.0
 LOD_TRANSITION_MAX_M = 12000.0
 # Depths past the WMS contract never widen the radial curve: the contract
 # depth keeps the full plateau it always had, and each deeper level only
-# claims an inner core this fraction of the radius above it (depth 13 disc
-# = 750 m of the 3 km depth-12 plateau, depth 14 ~188 m, ...).
-LOD_PAST_CONTRACT_CORE_RATIO = 0.25
+# claims an inner core of this many of its own tile widths (depth 13 disc
+# ≈ 989 m, depth 14 ≈ 494 m, ... depth 16 ≈ 124 m). A core of R tile
+# widths holds ~pi*R^2 tiles regardless of depth, so every past-contract
+# level adds the same bounded render cost (~28 tiles at 3.0).
+LOD_PAST_CONTRACT_CORE_TILE_WIDTHS = 3.0
 # Camera altitude caps the radial LOD ceiling: a depth stops being worth
 # fetching once the camera is more than this many of its tile-widths up.
 # At 2.0, depth 13 (~330 m tiles) drops out above ~659 m altitude, depth 12
@@ -132,10 +138,11 @@ def _lod_target_depth(distance, max_range, max_depth, altitude=0.0):
 
     Depths past WMS_CONTRACT_DEPTH never occupy the plateau: the contract
     depth keeps the exact curve it had before deeper levels existed, and
-    each deeper level only claims an inner core that shrinks by
-    LOD_PAST_CONTRACT_CORE_RATIO per depth (depth 13 = a quarter of the
-    plateau radius). This keeps the expensive 4x-tile levels confined near the
-    camera instead of quadrupling the whole plateau.
+    each deeper level only claims an inner core of
+    LOD_PAST_CONTRACT_CORE_TILE_WIDTHS of its own tile widths (capped at
+    the plateau). The core therefore holds a constant tile count per level,
+    keeping the expensive 4x-tile levels confined near the camera instead
+    of quadrupling the whole plateau.
     """
     max_depth = max(0, int(max_depth))
     if altitude > 0.0:
@@ -172,9 +179,11 @@ def _lod_target_depth(distance, max_range, max_depth, altitude=0.0):
                 coarse_depth, min(contract_ceiling, math.floor(continuous_depth))
             )
 
-    core = fine_plateau_end
     for deeper in range(WMS_CONTRACT_DEPTH + 1, max_depth + 1):
-        core *= LOD_PAST_CONTRACT_CORE_RATIO
+        core = min(
+            fine_plateau_end,
+            LOD_PAST_CONTRACT_CORE_TILE_WIDTHS * _tile_width_m(deeper),
+        )
         if distance <= core:
             depth = deeper
     return depth
@@ -347,10 +356,14 @@ def _cook_fractal_dem_quad(db, tile_id, allow_overwrite=False):
         water_mask = None
 
     cook_started = time.perf_counter()
+    # amplitude_m=0: synthetic fBm relief is PURGED (user directive; see
+    # erosion-bake redesign). Cooked surfaces are a clean bilinear of the
+    # parent until the regional erosion bake fills this slot.
     upscaled = upscale_heightmap(
         parent['heightmap'],
         list(parent['bbox']),
         factor=2,
+        amplitude_m=0.0,
         water_mask=water_mask,
     )
     confidence = np.full(

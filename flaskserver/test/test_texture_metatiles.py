@@ -297,6 +297,30 @@ class TextureMetatileFetchTest(unittest.TestCase):
             self.assertNotIn(child, sources)
         self.assertEqual(sources["13-21-41"], "dataforsyningen_metatile4h2")
 
+    def test_real_parent_change_cascades_through_deep_fractal_subtree(self):
+        db = sqlite3.connect(":memory:")
+        init_textures(db)
+        jpeg = _encoded_image(np.full((8, 8, 3), 128), "JPEG")
+        jpeg2 = _encoded_image(np.full((8, 8, 3), 90), "JPEG")
+        write_texture(db, "12-10-20", jpeg, "dataforsyningen_metatile4h2")
+        # A cooked chain 13 -> 14 -> 15, each level derived from the one
+        # above; all of it is transitively stale when depth 12 changes.
+        write_texture(db, "13-20-40", jpeg, "fractal_upscale")
+        write_texture(db, "14-40-80", jpeg, "fractal_upscale")
+        write_texture(db, "15-80-160", jpeg, "fractal_upscale")
+        # A genuine provider tile inside the subtree is not derived data.
+        write_texture(db, "14-41-80", jpeg, "dataforsyningen_metatile4h2")
+        # An unrelated deep cook outside the subtree must survive.
+        write_texture(db, "14-96-96", jpeg, "fractal_upscale")
+
+        write_texture(db, "12-10-20", jpeg2, "dataforsyningen_metatile4h2")
+
+        sources = dict(db.execute("SELECT tile_id, source FROM textures"))
+        for stale in ("13-20-40", "14-40-80", "15-80-160"):
+            self.assertNotIn(stale, sources)
+        self.assertEqual(sources["14-41-80"], "dataforsyningen_metatile4h2")
+        self.assertEqual(sources["14-96-96"], "fractal_upscale")
+
     def test_placeholder_parent_write_keeps_cooked_children(self):
         db = sqlite3.connect(":memory:")
         init_textures(db)

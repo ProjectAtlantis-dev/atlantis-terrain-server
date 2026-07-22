@@ -87,17 +87,23 @@ class TestViewCoverageCircle(unittest.TestCase):
 
     def test_past_contract_depth_only_claims_a_shrinking_inner_core(self):
         max_range = 16000
-        # Depth 13 is confined to a 750 m core of the 3 km depth-12 plateau.
+        # Each past-contract depth claims a core of ~3 of its own tile
+        # widths: depth 13 (~330 m tiles) gets a ~989 m disc.
         self.assertEqual(_lod_target_depth(0, max_range, 13), 13)
-        self.assertEqual(_lod_target_depth(750, max_range, 13), 13)
-        self.assertEqual(_lod_target_depth(751, max_range, 13), 12)
+        self.assertEqual(_lod_target_depth(988, max_range, 13), 13)
+        self.assertEqual(_lod_target_depth(989, max_range, 13), 12)
         # The depth-12 plateau and outer bands are exactly the pre-13 curve.
         self.assertEqual(_lod_target_depth(3000, max_range, 13), 12)
         self.assertEqual(_lod_target_depth(3001, max_range, 13), 11)
         self.assertEqual(_lod_target_depth(16000, max_range, 13), 8)
-        # A hypothetical depth 14 would shrink by the same ratio again.
-        self.assertEqual(_lod_target_depth(150, max_range, 14), 14)
-        self.assertEqual(_lod_target_depth(300, max_range, 14), 13)
+        # Cores halve with tile width — constant tile count per level —
+        # down to the depth-16 walking core (~124 m).
+        self.assertEqual(_lod_target_depth(123, max_range, 16), 16)
+        self.assertEqual(_lod_target_depth(124, max_range, 16), 15)
+        self.assertEqual(_lod_target_depth(247, max_range, 16), 15)
+        self.assertEqual(_lod_target_depth(248, max_range, 16), 14)
+        self.assertEqual(_lod_target_depth(494, max_range, 16), 14)
+        self.assertEqual(_lod_target_depth(495, max_range, 16), 13)
 
     def test_altitude_caps_lod_ceiling_before_the_radial_curve(self):
         max_range = 16000

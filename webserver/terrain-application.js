@@ -16,6 +16,8 @@ import { Ellipsoid, Geodetic, radians } from '@takram/three-geospatial';
 import { NormalPass } from 'postprocessing';
 import { buildAssetLibrary } from './procgen/library.ts';
 import { buildTileScatter, updateScatterVisibility, SCATTER_MIN_DEPTH } from './procgen/scatter.ts';
+import { sharedSurfaceFieldStore } from './terrain-surface-fields.js';
+import { createWebGLGroundRing } from './render-backends/webgl-ground-ring.js';
 import { headingFromForward2D } from './terrain-priority.js';
 import { createTerrainHeadingDemandController } from './terrain-heading-demand.js';
 import { compassHeading, createTerrainHud, renderGameClock } from './terrain-hud.js';
@@ -250,7 +252,10 @@ const BASE_BRAKE = 800;
 const BASE_MAX_SPEED = 5000;
 const BASE_STRAFE_SPEED = 800;
 const TURN_SPEED = 1.5;
-const MIN_FLIGHT_ALT = paramNumber('minFlightAlt', 2);
+// The synthetic fjord floor sits at -5 m. Leave a metre of clearance while
+// still allowing the free-flight camera to cross the waterline and explore
+// the water column.
+const MIN_FLIGHT_ALT = paramNumber('minFlightAlt', -4);
 // AGL-based speed scaling: full speed at AGL_FULL_SPEED_M, minimum factor at ground level
 const AGL_FULL_SPEED_M = 500;
 const AGL_MIN_FACTOR = 0.05;
@@ -803,7 +808,7 @@ scene.add(terrainRoot);
 
 // --- Fjord water (ocean2 FFT port) ---
 // A camera-following FFT water surface at local z=0; masked water terrain is
-// dropped to -3 m server-side, so the surface has volume above the seabed
+// dropped to -5 m server-side, so the surface has volume above the seabed
 // and land occludes it naturally. Inert on backends without createWater.
 const waterParams = { ...DEFAULT_WATER_PARAMS };
 // Bumped whenever a tile's displayed texture actually changes; the water
@@ -873,10 +878,31 @@ const mapGridController = createTerrainMapGridController({ terrainRoot });
 // --- Terrain streaming state ---
 const EXAG = 1.0;
 
-// --- Procedural asset scatter (fable5-world-demo port, chain validation) ---
-// Temporarily disabled; keep the procedural vegetation pipeline intact for re-enabling.
-const SCATTER_ENABLED = false;
+// --- Procedural asset scatter (treeless tundra clutter) ---
+// The asset library is raw GLSL ShaderMaterial — WebGL only. WebGPU clutter
+// is the procedural-runtime port (see the procedural-greenland checkout),
+// a separate work item.
+const SCATTER_ENABLED = renderBackend.kind === 'webgl';
+// Only the deep LOD cores get clutter: their ~3-tile-width discs ARE the
+// camera-following near-field window the tundra densities are budgeted for.
+// d14 core ≈ 494 m — beyond that the frequency-split detail carries the eye.
+const SCATTER_ATTACH_MIN_DEPTH = 14;
 const SCATTER_SEED = 1337;
+// Camera-following grass carpet (WebGL clipmap ring): the layer that hides
+// bare terrain in the final ~50 m. Created lazily with the scatter library.
+let groundRing = null;
+if (SCATTER_ENABLED) {
+  try {
+    groundRing = createWebGLGroundRing({
+      terrainRoot,
+      surfaceFields: sharedSurfaceFieldStore({ log: () => {} }),
+      log: message => enqueueClientLog('info', 'ground-ring', { message }),
+    });
+  } catch (err) {
+    console.error('[ground-ring] init failed', err);
+    enqueueClientLog('error', 'ground-ring', { error: String(err) });
+  }
+}
 let _scatterLib = null;   // built lazily on the first deep tile
 let _scatterLibFailed = false;
 function scatterLibrary() {
@@ -893,25 +919,70 @@ function scatterLibrary() {
   return _scatterLib;
 }
 
+// Classification runs asynchronously server-side (baked from the tile's own
+// texture on first classifier demand) and is routinely still "pending" the
+// moment a freshly-loaded tile first asks for it. Scatter builds ONCE per
+// tile, unlike the ground ring which recomposes continuously — a build that
+// lands on a pending/blank mask would otherwise freeze that tile's rocks and
+// vegetation as if the ground were uniformly bare, forever. Retry a few
+// times with backoff until a real classification shows up.
+const SCATTER_RETRY_DELAYS_MS = [1500, 4000, 10000];
+
 function attachTileScatter(mesh, tile, hm) {
   if (!SCATTER_ENABLED || !mesh || !tile?.id) return;
   const depth = tileDepthFromId(tile.id);
-  if (depth < SCATTER_MIN_DEPTH) return;
+  if (depth < Math.max(SCATTER_MIN_DEPTH, SCATTER_ATTACH_MIN_DEPTH)) return;
   const lib = scatterLibrary();
   if (!lib) return;
-  try {
-    const group = buildTileScatter({
-      tileId: tile.id,
-      bbox: tile.bbox,
-      hm,
-      res: tile.resolution,
-      lib,
-      exag: EXAG
-    });
-    if (group) mesh.add(group);
-  } catch (err) {
-    enqueueClientLog('error', 'scatter.tile', { tileId: tile.id, error: String(err) });
+
+  let currentGroup = null;
+
+  function disposeGroup(group) {
+    if (!group) return;
+    mesh.remove(group);
+    for (const child of group.children) {
+      if (child.isInstancedMesh) child.dispose();
+    }
   }
+
+  function fetchAndBuild(attempt) {
+    // Tile evicted or its mesh recycled for a different tile since we
+    // scheduled this retry — nothing to attach to anymore.
+    if (mesh.userData?.tileId !== tile.id) return;
+    // Surface fields gate WHERE things go (water hard-excludes, vegetation
+    // density follows the mask); the same store feeds the detail shader, so
+    // this is one shared fetch. Placement itself stays deterministic per
+    // tile id — the fields only veto/weight, they carry no randomness.
+    sharedSurfaceFieldStore({ log: () => {} }).get(tile.id).then(entry => {
+      if (mesh.userData?.tileId !== tile.id) return;
+      try {
+        const group = buildTileScatter({
+          tileId: tile.id,
+          bbox: tile.bbox,
+          hm,
+          res: tile.resolution,
+          lib,
+          exag: EXAG,
+          fields: entry?.fields,
+        });
+        disposeGroup(currentGroup);
+        currentGroup = group;
+        if (group) {
+          mesh.add(group);
+          requestRender();
+        }
+      } catch (err) {
+        enqueueClientLog('error', 'scatter.tile', { tileId: tile.id, error: String(err) });
+      }
+      if (entry?.pending && attempt < SCATTER_RETRY_DELAYS_MS.length) {
+        setTimeout(
+          () => fetchAndBuild(attempt + 1), SCATTER_RETRY_DELAYS_MS[attempt],
+        );
+      }
+    });
+  }
+
+  fetchAndBuild(0);
 }
 
 // Keep the camera comfortably inside the 4 km depth-12 plateau. A 5 km
@@ -1012,6 +1083,25 @@ const vehicleRuntime = createTerrainVehicleRuntime({
 });
 
 const normalPass = new NormalPass(scene, camera);
+// The ground ring's clipmap transform lives in its custom vertex shader;
+// the NormalPass override material would render its 124k instances as an
+// untransformed blob at the terrain origin, corrupting the normal buffer
+// (same failure class as the 2a092d9 black-sprite fix). Hide it during the
+// pass — grass pixels then inherit the terrain's normals in the relight,
+// which is the right lighting for ground-hugging vegetation anyway.
+{
+  const _originalNormalRender = normalPass.render.bind(normalPass);
+  normalPass.render = function (...args) {
+    const rings = groundRing?.meshes ?? [];
+    const visibility = rings.map(ring => ring.visible);
+    for (const ring of rings) ring.visible = false;
+    try {
+      return _originalNormalRender(...args);
+    } finally {
+      rings.forEach((ring, index) => { ring.visible = visibility[index]; });
+    }
+  };
+}
 
 const cloudsEffect = new CloudsEffect(camera, { resolutionScale: 1 });
 const cloudsDefaults = configureTerrainClouds({
@@ -2449,6 +2539,14 @@ function render() {
     return;
   }
   if (SCATTER_ENABLED && _scatterLib) updateScatterVisibility(terrainRoot, camera);
+  if (groundRing && terrainPipelineState.ready) {
+    groundRing.update({
+      camera,
+      worldOffsetX: terrainPipelineState.originX - terrainPipelineState.frameOffsetX,
+      worldOffsetY: terrainPipelineState.originY - terrainPipelineState.frameOffsetY,
+      timeMs: performance.now(),
+    });
+  }
   webgpuAtmosphere?.updateCloudShadows(clock.elapsedTime);
   try {
     renderBackend.renderScene(scene, camera);

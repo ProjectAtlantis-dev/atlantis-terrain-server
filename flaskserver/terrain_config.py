@@ -1,19 +1,26 @@
 """Shared terrain runtime configuration constants."""
 
 # Maximum terrain tile depth and subdivision ceiling.
-# Depth 13 ≈ 330 m tiles. Past WMS_CONTRACT_DEPTH the provider imagery may
-# be a plain blowup of the level above; fetched metatiles are inspected and
-# fall back to the deterministic fractal upscaler when they carry no new
-# detail (source "fractal_upscale").
-# Upscaling is DISABLED for verification (2026-07-22): ceiling held at the
-# WMS contract depth and all depth-13 rows purged from the DB. Restore to
-# 13 to re-enable the fractal cooks.
-MAX_TILE_DEPTH = 12
+# Depth 13 ≈ 330 m tiles, halving each level to depth 16 ≈ 41 m — walking
+# scale. Past WMS_CONTRACT_DEPTH the provider imagery may be a plain blowup
+# of the level above; fetched metatiles are inspected and fall back to the
+# deterministic fractal upscaler when they carry no new detail (source
+# "fractal_upscale"). Past WMS_TEXTURE_PROBE_MAX_DEPTH the fetch is not even
+# attempted and cooks recurse on cooked parents. Render cost of the deep
+# levels is bounded by the per-depth LOD cores in serve.py (~3 tile widths
+# per level), not by this ceiling.
+MAX_TILE_DEPTH = 16
 
 # Deepest level where provider imagery is trusted at face value.
 # Depth 12 ≈ 659 m tiles — Sentinel-2 z14 (~2.4 m/px) and ArcticDEM 10 m
 # still have headroom there.
 WMS_CONTRACT_DEPTH = 12
+
+# Deepest level worth asking the WMS for at all. Depth 13 metatiles are
+# fetched and blowup-inspected (measured: occasionally genuine); deeper
+# requests always came back as upsamples, so past this depth the texture
+# worker skips the provider round-trip and cooks directly.
+WMS_TEXTURE_PROBE_MAX_DEPTH = 13
 
 # Initial skeleton depth used on a brand-new DB at server startup.
 # Keep this shallow so Flask becomes responsive quickly; deeper levels
