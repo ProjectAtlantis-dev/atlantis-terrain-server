@@ -43,6 +43,8 @@ REAL_SOURCES = (
 # Sources that should be refetched at higher DEM resolution
 _UPGRADEABLE_SOURCES = {
     'arcticdem',  # old 32m data
+    # Do not add parent_resampled here: coarse distant render fallbacks must
+    # not turn every camera update into a DEM restoration pass.
     'unmasked_arcticdem',
     'unmasked_arcticdem_10m',
     'unmasked_copernicus',
@@ -57,6 +59,37 @@ _UPGRADEABLE_SOURCES = {
 # Seeded from DB on startup, updated as new tiles are discovered.
 _no_data_cache = set()
 LOD_COARSEN_RATIO = 0.75
+LOD_COARSE_FLOOR_DEPTH = 8
+LOD_FINE_PLATEAU_RATIO = 0.55
+LOD_FINE_PLATEAU_MAX_M = 4000.0
+LOD_TRANSITION_MAX_M = 12000.0
+
+
+def _lod_target_depth(distance, max_range, max_depth):
+    """Choose a render-only depth ceiling from distance to the camera."""
+    max_depth = max(0, int(max_depth))
+    coarse_depth = min(max_depth, LOD_COARSE_FLOOR_DEPTH)
+    if max_range <= 0 or max_depth == coarse_depth:
+        return max_depth
+
+    fine_plateau_end = min(
+        max_range * LOD_FINE_PLATEAU_RATIO,
+        LOD_FINE_PLATEAU_MAX_M,
+    )
+    coarse_rim_start = min(max_range, fine_plateau_end + LOD_TRANSITION_MAX_M)
+    distance = max(0.0, distance)
+    if distance <= fine_plateau_end:
+        return max_depth
+    if distance >= coarse_rim_start:
+        return coarse_depth
+
+    transition = (
+        (distance - fine_plateau_end)
+        / (coarse_rim_start - fine_plateau_end)
+    )
+    depth_falloff = max_depth - coarse_depth
+    continuous_depth = max_depth - depth_falloff * transition
+    return max(coarse_depth, min(max_depth, math.floor(continuous_depth)))
 
 
 def _lod_complete_ancestors(leaf_ids):
@@ -87,6 +120,41 @@ def _lod_complete_ancestors(leaf_ids):
             complete_ancestors.add(parent)
             covered.add(parent)
     return complete_ancestors
+
+
+def _coarse_lod_neighbors(leaf_ids):
+    """Return leaves bordering another leaf more than one level finer."""
+    addresses = set()
+    for tile_id in leaf_ids:
+        try:
+            addresses.add(tuple(map(int, tile_id.split('-'))))
+        except (AttributeError, TypeError, ValueError):
+            continue
+
+    coarse = set()
+    for fine_depth, fine_col, fine_row in addresses:
+        if fine_depth < 2:
+            continue
+        limit = 1 << fine_depth
+        for neighbor_col, neighbor_row in (
+            (fine_col - 1, fine_row),
+            (fine_col + 1, fine_row),
+            (fine_col, fine_row - 1),
+            (fine_col, fine_row + 1),
+        ):
+            if not (0 <= neighbor_col < limit and 0 <= neighbor_row < limit):
+                continue
+            for coarse_depth in range(fine_depth - 2, -1, -1):
+                scale = 1 << (fine_depth - coarse_depth)
+                candidate = (
+                    coarse_depth,
+                    neighbor_col // scale,
+                    neighbor_row // scale,
+                )
+                if candidate in addresses:
+                    coarse.add(candidate)
+                    break
+    return coarse
 
 
 def _lod_leaf_descendants_cover(depth, col, row, leaf_ids):
@@ -283,12 +351,20 @@ def _traverse(db, depth, col, row, qx, qy, max_depth, error_threshold,
         if _debug:
             log_trav.debug(f"{tid}: screen_error={screen_error:.6f} threshold={error_threshold:.6f} dist={dist:.0f}")
 
-        was_subdivided = (depth, col, row) in (previous_subdivided or ())
-        active_threshold = error_threshold * (
-            LOD_COARSEN_RATIO if was_subdivided else 1.0
-        )
+        if max_range > 0:
+            target_depth = _lod_target_depth(
+                dist_to_tile, max_range, max_depth
+            )
+            wants_subdivision = depth < target_depth
+        else:
+            was_subdivided = (depth, col, row) in (previous_subdivided or ())
+            active_threshold = error_threshold * (
+                LOD_COARSEN_RATIO if was_subdivided else 1.0
+            )
+            target_depth = max_depth
+            wants_subdivision = screen_error > active_threshold
 
-        if screen_error > active_threshold:
+        if wants_subdivision:
             # Hard subdivision ceiling for the current terrain dataset.
             if depth >= MAX_TILE_DEPTH:
                 if _debug:
@@ -323,7 +399,12 @@ def _traverse(db, depth, col, row, qx, qy, max_depth, error_threshold,
                         missing.append((ct, cm['bbox']))
                 return
         elif _debug:
-            log_trav.debug(f"{tid}: screen_error too low, NOT subdividing")
+            reason = (
+                f"radial LOD target depth {target_depth}"
+                if max_range > 0
+                else "screen error too low"
+            )
+            log_trav.debug(f"{tid}: {reason}, NOT subdividing")
 
     if should_subdivide:
         c2, r2 = col * 2, row * 2
@@ -377,7 +458,8 @@ def _traverse(db, depth, col, row, qx, qy, max_depth, error_threshold,
 
 def query_tiles_stereo(db, qx, qy, error_threshold=0.001, max_depth=None,
                        max_range=0.0, log=print, altitude=0.0,
-                       heading=None, preview=False, lod_history=None):
+                       heading=None, preview=False, lod_history=None,
+                       max_tiles=2500, include_heightmaps=True):
     """Query tiles using error-based LOD with stereo coords directly.
 
     Same as query_tiles() but takes EPSG:3413 coords instead of lat/lon.
@@ -390,7 +472,8 @@ def query_tiles_stereo(db, qx, qy, error_threshold=0.001, max_depth=None,
     """
     return _query_tiles_impl(db, qx, qy, error_threshold, max_depth, max_range,
                              log, altitude, heading=heading, preview=preview,
-                             lod_history=lod_history)
+                             lod_history=lod_history, max_tiles=max_tiles,
+                             include_heightmaps=include_heightmaps)
 
 
 def query_tiles(db, lat, lon, error_threshold=0.001, max_depth=None,
@@ -436,9 +519,139 @@ def bbox_view_priority(qx, qy, fwd_x, fwd_y, bbox, forward_scale=2.0):
     return priority_dist / max(dot, 0.01)
 
 
+def _balance_lod_leaves(
+    db, leaf_ids, missing, qx, qy, max_depth, error_threshold,
+    max_range, altitude, heading, previous_subdivided,
+):
+    """Keep adjacent render leaves within one quadtree depth."""
+    leaves = set(leaf_ids)
+    refined = 0
+
+    for _ in range(max_depth + 1):
+        coarse_neighbors = _coarse_lod_neighbors(leaves)
+        if not coarse_neighbors:
+            break
+
+        changed = False
+        for depth, col, row in sorted(coarse_neighbors):
+            tile_id = _tile_id(depth, col, row)
+            if tile_id not in leaves or depth >= max_depth:
+                continue
+
+            c2, r2 = col * 2, row * 2
+            children = [(c2, r2), (c2 + 1, r2), (c2, r2 + 1), (c2 + 1, r2 + 1)]
+            first_child_id = _tile_id(depth + 1, c2, r2)
+            if read_tile_metadata(db, first_child_id) is None:
+                _ensure_children(db, depth, col, row)
+
+            child_rows = []
+            ready = True
+            for child_col, child_row in children:
+                child_id = _tile_id(depth + 1, child_col, child_row)
+                child_bbox = _tile_bbox(depth + 1, child_col, child_row)
+                if not bbox_in_view_circle(qx, qy, child_bbox, max_range):
+                    continue
+                child_meta = read_tile_metadata(db, child_id)
+                if child_meta is None:
+                    ready = False
+                    continue
+                child_rows.append((child_id, child_col, child_row, child_meta))
+                if (
+                    child_meta['source'] not in REAL_SOURCES
+                    and child_id not in _no_data_cache
+                ):
+                    missing.append((child_id, child_meta['bbox']))
+                    ready = False
+
+            if not ready:
+                continue
+
+            replacements = []
+            replacement_missing = []
+            for child_id, child_col, child_row, child_meta in child_rows:
+                if child_meta['source'] not in REAL_SOURCES:
+                    continue
+                _traverse(
+                    db, depth + 1, child_col, child_row, qx, qy, max_depth,
+                    error_threshold, replacements, replacement_missing,
+                    max_range, altitude, heading, previous_subdivided,
+                )
+
+            leaves.remove(tile_id)
+            leaves.update(replacements)
+            missing.extend(replacement_missing)
+            refined += 1
+            changed = True
+
+        if not changed:
+            break
+
+    leaf_ids[:] = list(leaves)
+    return refined
+
+
+def _collapse_leaf_budget(db, leaf_ids, qx, qy, max_tiles, log):
+    """Replace distant descendants with real ancestors without opening holes."""
+    if max_tiles <= 0 or len(leaf_ids) <= max_tiles:
+        return leaf_ids
+    leaves = set(leaf_ids)
+    metadata_cache = {}
+
+    def metadata(tile_id):
+        if tile_id not in metadata_cache:
+            metadata_cache[tile_id] = read_tile_metadata(db, tile_id)
+        return metadata_cache[tile_id]
+
+    original_count = len(leaves)
+    while len(leaves) > max_tiles:
+        descendants_by_parent = {}
+        for tile_id in leaves:
+            depth, col, row = (int(part) for part in tile_id.split('-'))
+            for parent_depth in range(depth - 1, -1, -1):
+                shift = depth - parent_depth
+                parent_id = _tile_id(parent_depth, col >> shift, row >> shift)
+                descendants_by_parent.setdefault(parent_id, set()).add(tile_id)
+
+        candidates = []
+        for parent_id, descendants in descendants_by_parent.items():
+            if len(descendants) < 2:
+                continue
+            parent = metadata(parent_id)
+            if parent is None or parent['source'] not in REAL_SOURCES:
+                continue
+            reduction = len(descendants) - 1
+            distance = _distance_to_bbox(qx, qy, parent['bbox'])
+            candidates.append(
+                (distance, parent['depth'], reduction, parent_id, descendants)
+            )
+        if not candidates:
+            break
+
+        needed = len(leaves) - max_tiles
+        within_budget = [candidate for candidate in candidates if candidate[2] <= needed]
+        if within_budget:
+            # Preserve detail near the camera by collapsing the farthest viable
+            # region first. Prefer a finer ancestor when distances tie.
+            chosen = max(within_budget, key=lambda item: (item[0], item[1], item[2]))
+        else:
+            # The final collapse may cross below the exact ceiling. Minimize
+            # that overshoot, using distance and depth only as tie-breakers.
+            chosen = min(candidates, key=lambda item: (item[2], -item[0], -item[1]))
+        _, _, _, parent_id, descendants = chosen
+        leaves.difference_update(descendants)
+        leaves.add(parent_id)
+
+    log(
+        f"  [BALANCED BUDGET] {original_count} leaves collapsed to "
+        f"{len(leaves)} (target {max_tiles})"
+    )
+    return list(leaves)
+
+
 def _query_tiles_impl(db, qx, qy, error_threshold, max_depth, max_range, log,
                       altitude=0.0, heading=None, preview=False,
-                      lod_history=None):
+                      lod_history=None, max_tiles=2500,
+                      include_heightmaps=True):
     from database import get_metadata
     from collections import Counter
 
@@ -461,26 +674,19 @@ def _query_tiles_impl(db, qx, qy, error_threshold, max_depth, max_range, log,
         previous_subdivided,
     )
 
-    # Tile budget: if LOD produced too many tiles, drop the deepest/farthest.
-    # Keep coarse tiles (coverage) and nearest deep tiles (detail where it matters).
-    MAX_TILES = 2500
-    if len(leaf_ids) > MAX_TILES:
-        # Score each tile: (depth, distance) — drop highest scores first
-        def _tile_score(tid):
-            parts = tid.split('-')
-            d = int(parts[0])
-            bbox = _tile_bbox(d, int(parts[1]), int(parts[2]))
-            dist = _distance_to_bbox(qx, qy, bbox)
-            return (d, dist)
-        leaf_ids.sort(key=_tile_score)
-        dropped = len(leaf_ids) - MAX_TILES
-        leaf_ids = leaf_ids[:MAX_TILES]
-        log(f"  [BUDGET] dropped {dropped} deepest/farthest tiles, capped at {MAX_TILES}")
+    balanced = _balance_lod_leaves(
+        db, leaf_ids, missing_raw, qx, qy, max_depth, error_threshold,
+        max_range, altitude, heading, previous_subdivided,
+    )
+    if balanced:
+        log(f"  [LOD BALANCE] refined {balanced} coarse neighbor tiles")
+
+    leaf_ids = _collapse_leaf_budget(db, leaf_ids, qx, qy, max_tiles, log)
 
     # Read full tile data for leaves
     results = []
     for tid in leaf_ids:
-        tile = read_tile(db, tid)
+        tile = read_tile(db, tid) if include_heightmaps else read_tile_metadata(db, tid)
         if tile is None:
             continue
 
@@ -496,9 +702,11 @@ def _query_tiles_impl(db, qx, qy, error_threshold, max_depth, max_range, log,
             'center': [cx, cy],
             'size': size,
             'resolution': GRID_N,
-            'heightmap': tile['heightmap'],
+            'heightmap': tile.get('heightmap'),
             'source': tile['source'],
             'geometric_error': tile['geometric_error'],
+            'updated_at': tile.get('updated_at'),
+            'has_heightmap': tile.get('has_heightmap', tile.get('heightmap') is not None),
         })
 
     # Treat raw restoration and ordinary misses as one priority queue.  The
@@ -539,17 +747,18 @@ def _query_tiles_impl(db, qx, qy, error_threshold, max_depth, max_range, log,
         )
 
     results = sorted(results, key=lambda t: -t['depth'])
-    seam_cache = SqliteSeamCache(db)
-    seam_repairs = _stitch_lod_edges(results, cache=seam_cache)
-    if seam_repairs["cache_writes"]:
-        db.commit()
-    if seam_repairs["same_depth"] or seam_repairs["cross_lod"]:
-        log(
-            "[SEAM CACHE] "
-            f"same={seam_repairs['same_depth']} cross={seam_repairs['cross_lod']} "
-            f"hits={seam_repairs['cache_hits']} misses={seam_repairs['cache_misses']} "
-            f"writes={seam_repairs['cache_writes']}"
-        )
+    if include_heightmaps:
+        seam_cache = SqliteSeamCache(db)
+        seam_repairs = _stitch_lod_edges(results, cache=seam_cache)
+        if seam_repairs["cache_writes"]:
+            db.commit()
+        if seam_repairs["same_depth"] or seam_repairs["cross_lod"]:
+            log(
+                "[SEAM CACHE] "
+                f"same={seam_repairs['same_depth']} cross={seam_repairs['cross_lod']} "
+                f"hits={seam_repairs['cache_hits']} misses={seam_repairs['cache_misses']} "
+                f"writes={seam_repairs['cache_writes']}"
+            )
 
     # --- Clear logging: what came from where ---
     db_depths = Counter(t['depth'] for t in results)

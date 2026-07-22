@@ -179,6 +179,7 @@ test('startup asset normalization clones valid records and rejects junk', () => 
   });
   assert.deepEqual(normalized, {
     vehicle_definition: { model: 'truck' },
+    vehicle_definitions: {},
     structure_definition: {},
     vehicle_instances: [{ id: 'v1' }],
     structure_instances: [{ id: 's1' }],
@@ -222,8 +223,8 @@ test('shared startup asset loader returns complete defaults on failure', async (
       fetchImpl: async () => ({ ok: false, status: 503 }),
     });
     assert.deepEqual(result, {
-      source: 'defaults', schemaVersion: 4, seeded: null,
-      vehicle_definition: {}, structure_definition: {},
+      source: 'defaults', schemaVersion: 5, seeded: null,
+      vehicle_definition: {}, vehicle_definitions: {}, structure_definition: {},
       vehicle_instances: [], structure_instances: [],
     });
   } finally {
@@ -1413,11 +1414,15 @@ test('shared fetch runtime preserves initial response transition ordering', asyn
     events: {
       onBuildings(buildings) { events.push(`buildings:${buildings.length}`); },
       onAvailability() { events.push('missing'); },
+      onResponseApplied(data, pass) {
+        events.push(`applied:${pass}:${data.worldSeed}:${data.procgenVersion}`);
+      },
     },
     fetchImpl: async () => ({
       status: 200,
       json: async () => ({
         ox: 10, oy: 20, qx: 11, qy: 21, tiles: [], buildings: [{ id: 'b' }],
+        worldSeed: 1337, procgenVersion: 2,
         missing: [], downloading: [],
         texFetching: 0, texRetryQueue: 0, texStatusCounts: {},
       }),
@@ -1432,7 +1437,7 @@ test('shared fetch runtime preserves initial response transition ordering', asyn
     'fetchTiles.request[pass1]', 'fetchTiles.frame.offset.set',
     'fetchTiles.response[pass1]', 'tiles.initial-fetch.response',
     'fetchTiles.origin.set', 'buildings:1', 'fetchTiles.diff[pass1]', 'fetchTiles.built[pass1]',
-    'textures', 'missing',
+    'textures', 'missing', 'applied:1:1337:2',
   ]);
 });
 
@@ -1548,10 +1553,16 @@ test('shared vehicle persistence helpers preserve coordinates and normalize save
 
   assert.deepEqual(normalizeSavedVehicleState({
     lat: '64.1', lon: '-51.2', headingDeg: '361.5', z: '8.25', terrainDepth: '7.9',
-  }), { lat: 64.1, lon: -51.2, headingDeg: 361.5, z: 8.25, terrainDepth: 7 });
+  }), {
+    lat: 64.1, lon: -51.2, headingDeg: 361.5, z: 8.25,
+    terrainDepth: 7, terrainTileId: null,
+  });
   assert.deepEqual(normalizeSavedVehicleState({
     lat: 64, lon: -51, headingDeg: 0, z: 'bad', terrainDepth: -2,
-  }), { lat: 64, lon: -51, headingDeg: 0, z: null, terrainDepth: 0 });
+  }), {
+    lat: 64, lon: -51, headingDeg: 0, z: null,
+    terrainDepth: 0, terrainTileId: null,
+  });
   assert.equal(normalizeSavedVehicleState({ lat: 64, lon: 'bad', headingDeg: 0 }), null);
 });
 

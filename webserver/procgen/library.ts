@@ -1,5 +1,5 @@
 /**
- * library — boot-time geometry/material pools of the fable5-world-demo asset
+ * library — boot-time geometry/material pools for the legacy scatter path
  * set, ported to the Greenland WebGL app. One entry per asset kind; the
  * scatter stage instances each kind's parts per terrain tile.
  *

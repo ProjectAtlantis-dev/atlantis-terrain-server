@@ -12,6 +12,8 @@ export function buildTerrainTilesRequest({
   originY,
   queryX,
   queryY,
+  useManifest = false,
+  tileBudget = 384,
   cameraSnapshot = {},
 }) {
   const preview = pass === 1;
@@ -23,6 +25,7 @@ export function buildTerrainTilesRequest({
   // preview=1 keeps the server's closest-first flood for the quick paint;
   // full passes let it order heightmap fetches by view priority instead.
   if (preview) url += `&maxDepth=${previewMaxDepth}&preview=1`;
+  if (useManifest) url += `&manifest=1&budget=${tileBudget}`;
   if (!isFirstLoad || frameOffsetReady) url += `&ox=${originX}&oy=${originY}`;
   return {
     url,
@@ -37,9 +40,54 @@ export function buildTerrainTilesRequest({
       requestAltM: altitude,
       headingRad: heading,
       maxDepth: preview ? previewMaxDepth : null,
+      ...(useManifest ? { manifest: true, tileBudget } : {}),
       ...cameraSnapshot,
     },
   };
+}
+
+export async function hydrateTerrainHeightmaps(tiles, {
+  cache,
+  fetchImpl = (...args) => fetch(...args),
+  signal,
+  concurrency = 12,
+} = {}) {
+  const pending = [];
+  let resident = 0;
+  for (const tile of tiles || []) {
+    if (tile.heightmap instanceof Float32Array) {
+      resident++;
+      continue;
+    }
+    const cached = cache?.get(tile.id);
+    if (cached && cached.version === tile.heightVersion) {
+      tile.heightmap = cached.heightmap;
+      resident++;
+      continue;
+    }
+    if (tile.heightmapUrl) pending.push(tile);
+  }
+  let cursor = 0;
+  const workers = Array.from(
+    { length: Math.min(concurrency, pending.length) },
+    async () => {
+      while (cursor < pending.length) {
+        const tile = pending[cursor++];
+        const response = await fetchImpl(tile.heightmapUrl, { signal });
+        if (!response.ok) throw new Error(`height ${tile.id}: HTTP ${response.status}`);
+        const buffer = await response.arrayBuffer();
+        const expectedBytes = tile.resolution * tile.resolution * Float32Array.BYTES_PER_ELEMENT;
+        if (buffer.byteLength !== expectedBytes) {
+          throw new Error(`height ${tile.id}: ${buffer.byteLength} bytes, expected ${expectedBytes}`);
+        }
+        const heightmap = new Float32Array(buffer);
+        tile.heightmap = heightmap;
+        cache?.set(tile.id, { version: tile.heightVersion, heightmap });
+      }
+    },
+  );
+  await Promise.all(workers);
+  return { requested: pending.length, resident };
 }
 
 export function diffTerrainTileIds(tiles, currentTileIds) {
@@ -89,6 +137,14 @@ export function summarizeTerrainResponse({
 }) {
   const tiles = Array.isArray(data?.tiles) ? data.tiles : [];
   const withHm = tiles.filter(tile => tile.heightmap).length;
+  const depthCounts = {};
+  const sourceCounts = {};
+  for (const tile of tiles) {
+    const depth = Number(tile?.depth);
+    if (Number.isInteger(depth)) depthCounts[depth] = (depthCounts[depth] || 0) + 1;
+    const source = typeof tile?.source === 'string' ? tile.source : 'unknown';
+    sourceCounts[source] = (sourceCounts[source] || 0) + 1;
+  }
   let closest = null;
   for (const tile of tiles) {
     if (!Array.isArray(tile?.bbox) || tile.bbox.length !== 4) continue;
@@ -104,6 +160,8 @@ export function summarizeTerrainResponse({
     tiles: tiles.length,
     withHm,
     noHm: tiles.length - withHm,
+    depths: depthCounts,
+    sources: sourceCounts,
     missing: data?.missing?.length ?? 0,
     downloading: data?.downloading?.length ?? 0,
     qx: rounded(data?.qx), qy: rounded(data?.qy),
@@ -215,6 +273,8 @@ export function terrainPipelineStatus(data, wasFirstLoad, pass = wasFirstLoad ? 
     textureStatusCounts: data?.texStatusCounts || {},
     nextAction: pass === 1
       ? 'full-pass'
+      // Parent-resampled distant render tiles are usable. Poll only active
+      // work, otherwise a settled camera hammers Flask every three seconds.
       : (missing > 0 || downloading > 0 || textureFetching > 0 ? 'poll' : 'idle'),
   };
 }

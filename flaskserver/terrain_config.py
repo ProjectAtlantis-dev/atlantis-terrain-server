@@ -1,9 +1,43 @@
 """Shared terrain runtime configuration constants."""
 
-# Maximum terrain tile depth and subdivision ceiling.
-# Depth 12 ≈ 659 m tiles — Sentinel-2 z14 (~2.4 m/px) and ArcticDEM 10 m
-# still have headroom.
-MAX_TILE_DEPTH = 12
+import os
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return default
+
+
+# Optional local ComfyUI enhancement is never enabled implicitly.
+ENHANCE_ENABLED = _env_bool("COMFY_ENHANCE_ENABLED", False)
+ENHANCE_DEPTH = 12
+
+# Maximum terrain tile depth and subdivision ceiling. Depth 12 is the default
+# measured-quality ceiling. A future Atlantis upscaler may opt into deeper
+# render tiles without silently changing the data used for procedural flora.
+TERRAIN_MAX_DEPTH = max(0, min(20, _env_int("TERRAIN_MAX_DEPTH", 12)))
+# Compatibility name used by the modular Flask server and traversal modules.
+MAX_TILE_DEPTH = TERRAIN_MAX_DEPTH
+
+# DEM and satellite field depth used to seed procedural vegetation and rocks.
+# Keep this independent from the render ceiling: deeper visual tiles must not
+# affect placement until their upscaling method is explicitly approved.
+PROCGEN_SOURCE_DEPTH = max(
+    0,
+    min(TERRAIN_MAX_DEPTH, _env_int("PROCGEN_SOURCE_DEPTH", 12)),
+)
 
 # Initial skeleton depth used on a brand-new DB at server startup.
 # Keep this shallow so Flask becomes responsive quickly; deeper levels

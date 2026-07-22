@@ -3,6 +3,7 @@ import path from 'node:path';
 import { defineConfig } from 'vite';
 
 const pkg = name => path.resolve(__dirname, 'three-geospatial/packages', name, 'src');
+const terrainApiTarget = process.env.TERRAIN_API_TARGET ?? 'http://localhost:5180';
 
 // Bound connections from the dev proxy to Flask. Browser-side aborts can
 // otherwise leave hundreds of upstream sockets alive while terrain demand is
@@ -62,6 +63,10 @@ export default defineConfig({
     target: 'esnext'
   },
   resolve: {
+    // three-geospatial can be linked from a sibling checkout during local
+    // development. Force its peer imports through this application's r184
+    // dependency graph so Three.js and postprocessing are not bundled twice.
+    dedupe: ['three', 'postprocessing'],
     alias: [
       { find: '@takram/three-atmosphere', replacement: pkg('atmosphere') },
       { find: '@takram/three-clouds', replacement: pkg('clouds') },
@@ -74,7 +79,7 @@ export default defineConfig({
     strictPort: true,
     proxy: {
       '/api': {
-        target: 'http://localhost:5180',
+        target: terrainApiTarget,
         agent: flaskProxyAgent,
         proxyTimeout: 30_000,
       },

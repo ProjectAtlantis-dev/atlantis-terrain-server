@@ -30,21 +30,36 @@ export function installTerrainPointerControls({
   mouseSensitivity,
   mapPanFactor,
   isVehicleActive,
+  isTurretActive = () => false,
   onVehicleOrbit,
+  onTurretAim = () => {},
+  onFireStart = () => {},
+  onFireStop = () => {},
   onMapCameraChanged,
   onChanged = () => {},
 }) {
   const onMouseDown = event => {
+    if (isTurretActive() && event.button === 0) {
+      onFireStart();
+      onChanged();
+      return;
+    }
     controls.dragging = true;
     controls.dragButton = event.button;
     onChanged();
   };
-  const onMouseUp = () => {
+  const onMouseUp = event => {
+    if (event.button === 0) onFireStop();
     controls.dragging = false;
     controls.dragButton = 0;
     onChanged();
   };
   const onMouseMove = event => {
+    if (isTurretActive()) {
+      onTurretAim(event.movementX, event.movementY);
+      onChanged();
+      return;
+    }
     if (!controls.dragging) return;
     if (controls.mapMode) {
       const action = applyMapDrag(controls, event, mouseSensitivity, mapPanFactor);
@@ -76,16 +91,24 @@ export function installTerrainPointerControls({
 export function installTerrainKeyboardControls({
   controls,
   isVehicleActive,
+  isTurretActive = () => false,
   onForwardDoubleTap,
   onEscapeVehicle,
+  onEscapeTurret = () => {},
   onToggleMap,
   onOpenGoogleMaps = () => {},
+  onToggleGoogleNavigator = onOpenGoogleMaps,
+  onOpenPipeline = () => {},
   onToggleHeatmap = () => {},
+  onOpenHeatmap = onToggleHeatmap,
   onToggleClassifier = () => {},
   onToggleRoadDebug = () => {},
   onFlyToTile = () => {},
   onHouseAction,
   onToggleHeadlights,
+  onCycleVehicleCamera = () => {},
+  onToggleTurret = () => {},
+  onToggleAircraftEngine = () => {},
   onChanged = () => {},
   doubleTapMs = 300,
 }) {
@@ -106,15 +129,22 @@ export function installTerrainKeyboardControls({
       }
     }
     if (event.repeat) return;
+    if (event.code === 'Escape' && isTurretActive()) {
+      onEscapeTurret();
+      controls.keys[event.code] = false;
+      return;
+    }
     if (event.code === 'Escape' && isVehicleActive()) {
       onEscapeVehicle();
       controls.keys[event.code] = false;
       return;
     }
     if (event.code === 'KeyM') return onToggleMap();
-    if (event.code === 'KeyG') return onOpenGoogleMaps();
+    if (event.code === 'KeyG') return onToggleGoogleNavigator();
+    if (event.code === 'KeyP') return onOpenPipeline();
     if (event.code === 'KeyC') return onToggleClassifier();
     if (event.code === 'KeyT') {
+      if (isVehicleActive()) return onToggleTurret();
       // Clear the key first — the prompt dialog swallows the keyup event,
       // which would leave KeyT stuck and force continuous rendering.
       controls.keys[event.code] = false;
@@ -123,9 +153,11 @@ export function installTerrainKeyboardControls({
     if (event.code === 'KeyR') return onToggleRoadDebug();
     if (event.code === 'KeyH') {
       if (event.shiftKey) return onHouseAction(true);
-      return onToggleHeatmap();
+      return onOpenHeatmap();
     }
     if (event.code === 'KeyL' && isVehicleActive()) onToggleHeadlights();
+    if (event.code === 'KeyV' && isVehicleActive() && !isTurretActive()) onCycleVehicleCamera();
+    if (event.code === 'KeyE' && isVehicleActive()) onToggleAircraftEngine();
   };
   const onKeyUp = event => {
     controls.keys[event.code] = false;

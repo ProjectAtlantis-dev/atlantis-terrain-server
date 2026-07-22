@@ -66,15 +66,18 @@ export function createWaterRuntime({
   getTextureVersion = null,
   log = null,
   params = { ...DEFAULT_WATER_PARAMS },
+  initializationDelayMs = 750,
 }) {
-  const water = backend.createWater?.({ geometry: buildRadialGridGeometry(), log }) ?? null;
-  if (!water?.mesh) {
+  const canCreateWater = typeof backend.createWater === 'function';
+  if (!canCreateWater) {
     return {
       enabled: false, params,
       applyWind() {}, update() {}, dispose() {}, setDebugMode() {},
     };
   }
-  terrainRoot.add(water.mesh);
+  let water = null;
+  let initializeAfterMs = null;
+  let disposed = false;
 
   const palette = createWaterPalette();
   const rel = new THREE.Vector3();
@@ -87,8 +90,24 @@ export function createWaterRuntime({
   let lastCaptureMs = -Infinity;
   let lastCaptureTextureVersion = null;
 
+  function ensureWater(nowMs) {
+    if (water || disposed) return water;
+    if (initializeAfterMs == null) {
+      initializeAfterMs = nowMs + Math.max(0, initializationDelayMs);
+      log?.('water.initialize.deferred', { delayMs: initializationDelayMs });
+    }
+    if (nowMs < initializeAfterMs) return null;
+    const created = backend.createWater({ geometry: buildRadialGridGeometry(), log });
+    if (!created?.mesh) return null;
+    water = created;
+    terrainRoot.add(water.mesh);
+    applyWind();
+    log?.('water.initialize.ready', { delayMs: initializationDelayMs });
+    return water;
+  }
+
   function applyWind() {
-    water.setWind({
+    water?.setWind({
       speed: params.windSpeed,
       directionRad: THREE.MathUtils.degToRad(params.windDirection),
       amplitude: params.amplitude,
@@ -97,9 +116,10 @@ export function createWaterRuntime({
       fetchKm: params.fetchKm,
     });
   }
-  applyWind();
 
   function update({ dt, camera, visible }) {
+    if (!water && visible) ensureWater(performance.now());
+    if (!water) return;
     water.mesh.visible = visible;
     if (!visible) return;
 
@@ -168,10 +188,13 @@ export function createWaterRuntime({
     params,
     applyWind,
     update,
-    setDebugMode(mode) { water.setDebugMode?.(mode); },
+    setDebugMode(mode) { water?.setDebugMode?.(mode); },
     dispose() {
+      disposed = true;
+      if (!water) return;
       terrainRoot.remove(water.mesh);
       water.dispose();
+      water = null;
     },
   };
 }

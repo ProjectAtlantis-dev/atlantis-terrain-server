@@ -14,6 +14,21 @@ const TC = Math.tan(Math.PI / 4 - STANDARD_PARALLEL / 2) / Math.pow(
   ECCENTRICITY / 2,
 );
 
+export function wgs84ToEpsg3413(lat, lon) {
+  const latitude = Number(lat) * DEG_TO_RAD;
+  const longitudeDelta = (Number(lon) - CENTRAL_MERIDIAN) * DEG_TO_RAD;
+  const sinLatitude = Math.sin(latitude);
+  const t = Math.tan(Math.PI / 4 - latitude / 2) / Math.pow(
+    (1 - ECCENTRICITY * sinLatitude) / (1 + ECCENTRICITY * sinLatitude),
+    ECCENTRICITY / 2,
+  );
+  const rho = WGS84_A * MC * t / TC;
+  return {
+    x: rho * Math.sin(longitudeDelta),
+    y: -rho * Math.cos(longitudeDelta),
+  };
+}
+
 export function epsg3413ToWgs84(x, y) {
   const rho = Math.hypot(x, y);
   if (rho === 0) return { lat: 90, lon: CENTRAL_MERIDIAN };

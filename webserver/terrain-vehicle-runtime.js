@@ -3,15 +3,36 @@ import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { rendererTextureAnisotropy } from './terrain-texture-streamer.js';
 import { tileDepthFromId } from './terrain-tile-runtime.js';
 import {
+  AIRCRAFT_CAMERA_MODES,
+  createAircraftState,
+  setupAircraftModelParts,
+  stepAircraftFlight,
+  toggleAircraftEngine,
+  updateAircraftVisuals,
+} from './terrain-aircraft-runtime.js';
+import { applyV22Materials, loadV22TextureSet } from './terrain-v22-materials.js';
+import {
   createVehiclePersistenceRuntime,
   normalizeSavedVehicleState,
   stepSuspension,
+  terrainBboxIntersectsCircle,
   vehicleLocalToLatLon as terrainVehicleLocalToLatLon,
   vehicleStateSnapshot,
 } from './terrain-vehicle.js';
+import {
+  createVehicleTurretRig,
+  createVehicleWheelRig,
+  discoverVehicleParts,
+  spinVehicleWheelRig,
+  summarizeVehicleTurretRig,
+  summarizeVehicleWheelRig,
+} from './terrain-vehicle-parts.js';
+
+const DEFAULT_VEHICLE_INSTANCE_ID = 'amv-01';
 
 export function createTerrainVehicleRuntime({
   vehicleDefinition: VEHICLE_DEFINITION,
+  vehicleDefinitions: VEHICLE_DEFINITIONS = {},
   vehicleHeadlights: VEHICLE_HEADLIGHTS,
   assetVehicleInstances: ASSET_VEHICLE_INSTANCES,
   startupAssetsResponse,
@@ -19,6 +40,7 @@ export function createTerrainVehicleRuntime({
   vehicleStateEndpoint: VEHICLE_STATE_ENDPOINT,
   vehicleSaveTimeoutMs: VEHICLE_SAVE_FETCH_TIMEOUT_MS,
   vehicleSaveFailureCooldownMs: VEHICLE_SAVE_FAILURE_COOLDOWN_MS,
+  vehiclePersistenceEnabled = true,
   houseMarkerBaseLift: HOUSE_MARKER_BASE_LIFT,
   houseMarkerHeight: HOUSE_MARKER_HEIGHT,
   houseMarkerHaloGeo,
@@ -30,26 +52,32 @@ export function createTerrainVehicleRuntime({
   paramNumber, bootLog, enqueueClientLog,
   houseTerrainMeshes, houseLocalFromLatLon,
   getSunDirection,
+  onMutated = () => {},
   windowImpl = globalThis.window,
 } = {}) {
   // ── Patria AMV vehicle ──────────────────────────────────────────────────
-  const _vehicleSeedInstance = ASSET_VEHICLE_INSTANCES.length > 0 ? ASSET_VEHICLE_INSTANCES[0] : {};
+  const _vehicleSeedInstance = ASSET_VEHICLE_INSTANCES.find(instance => (
+    VEHICLE_DEFINITIONS?.[instance?.definitionId]?.vehicleType !== 'aircraft'
+  )) ?? {};
+  const GROUND_VEHICLE_DEFINITION = (
+    VEHICLE_DEFINITIONS?.[_vehicleSeedInstance.definitionId] ?? VEHICLE_DEFINITION
+  );
   const VEHICLE_MODEL = {
-    url: (typeof VEHICLE_DEFINITION.url === 'string' && VEHICLE_DEFINITION.url.trim() !== '')
-      ? VEHICLE_DEFINITION.url
+    url: (typeof GROUND_VEHICLE_DEFINITION.url === 'string' && GROUND_VEHICLE_DEFINITION.url.trim() !== '')
+      ? GROUND_VEHICLE_DEFINITION.url
       : '/models/patria_amv.glb',
     lat: Number.isFinite(_vehicleSeedInstance.lat) ? _vehicleSeedInstance.lat : anchorLat,
     lon: Number.isFinite(_vehicleSeedInstance.lon) ? _vehicleSeedInstance.lon : anchorLon,
     headingDeg: Number.isFinite(_vehicleSeedInstance.headingDeg) ? _vehicleSeedInstance.headingDeg : 0,
     z: Number.isFinite(_vehicleSeedInstance.z) ? _vehicleSeedInstance.z : 0,
-    realLengthM: Number.isFinite(VEHICLE_DEFINITION.realLengthM) ? VEHICLE_DEFINITION.realLengthM : 7.7,
+    realLengthM: Number.isFinite(GROUND_VEHICLE_DEFINITION.realLengthM) ? GROUND_VEHICLE_DEFINITION.realLengthM : 7.7,
     tireDiameterM: paramNumber(
       'vehicleTireDiameterM',
-      Number.isFinite(VEHICLE_DEFINITION.tireDiameterM)
-        ? VEHICLE_DEFINITION.tireDiameterM
+      Number.isFinite(GROUND_VEHICLE_DEFINITION.tireDiameterM)
+        ? GROUND_VEHICLE_DEFINITION.tireDiameterM
         : 1.27
     ),
-    altOffsetM: Number.isFinite(VEHICLE_DEFINITION.altOffsetM) ? VEHICLE_DEFINITION.altOffsetM : 0.05,
+    altOffsetM: Number.isFinite(GROUND_VEHICLE_DEFINITION.altOffsetM) ? GROUND_VEHICLE_DEFINITION.altOffsetM : 0.05,
   };
   bootLog('assets.loaded', {
     source: startupAssetsResponse.source,
@@ -138,6 +166,7 @@ export function createTerrainVehicleRuntime({
   const VEHICLE_SHADOW_LIGHT_DISTANCE = 250;
   const VEHICLE_SHADOW_MIN_RADIUS = 60;
   const VEHICLE_SHADOW_MAX_RADIUS = 180;
+  const VEHICLE_SHADOW_MIN_SUN_PROJECTION = 0.2;
   const VEHICLE_SHADOW_TEXEL_SNAP = true;
   const VEHICLE_SHADOW_GROUND_ANCHOR = THREE.MathUtils.clamp(
     paramNumber('vehicleShadowGroundAnchor', 1.0),
@@ -183,6 +212,70 @@ export function createTerrainVehicleRuntime({
   const vehicleShadowSnapOffsetWorld = new THREE.Vector3();
   const vehicleShadowSnapOffsetLocal = new THREE.Vector3();
   const vehicleLoader = new GLTFLoader();
+  const aircraftEntries = [];
+  const aircraftMeshOwners = new Map();
+  let activeAircraft = null;
+  let vehicleSelected = false;
+  let aircraftLoadStarted = false;
+
+  function createAircraftMarker(entryId, displayName) {
+    const marker = new THREE.Group();
+    marker.name = `vehicle-marker-${entryId}`;
+    const color = 0x5ac8fa;
+    const line = new THREE.Line(
+      new THREE.BufferGeometry().setFromPoints([
+        new THREE.Vector3(0, 0, 0),
+        new THREE.Vector3(0, 0, HOUSE_MARKER_HEIGHT),
+      ]),
+      new THREE.LineBasicMaterial({
+        color, depthTest: false, depthWrite: false, transparent: true, opacity: 0.95,
+      }),
+    );
+    const halo = new THREE.Mesh(
+      houseMarkerHaloGeo,
+      new THREE.MeshBasicMaterial({
+        color, depthTest: false, depthWrite: false, transparent: true,
+        opacity: 0.85, side: THREE.DoubleSide,
+      }),
+    );
+    halo.position.z = HOUSE_MARKER_HEIGHT;
+    const dot = new THREE.Mesh(
+      houseMarkerDotGeo,
+      new THREE.MeshBasicMaterial({ color, depthTest: false, depthWrite: false }),
+    );
+    dot.position.z = HOUSE_MARKER_HEIGHT;
+    const label = createHouseLabelSprite(displayName || 'VTOL', color);
+    label.position.set(0, 0, HOUSE_MARKER_HEIGHT + 900);
+    marker.add(line, halo, dot, label);
+    return marker;
+  }
+
+  for (const instance of ASSET_VEHICLE_INSTANCES) {
+    const definition = VEHICLE_DEFINITIONS?.[instance?.definitionId];
+    if (definition?.vehicleType !== 'aircraft') continue;
+    const id = typeof instance.id === 'string' && instance.id.trim()
+      ? instance.id.trim()
+      : `aircraft-${aircraftEntries.length + 1}`;
+    const group = new THREE.Group();
+    group.name = id;
+    group.visible = false;
+    terrainRoot.add(group);
+    const marker = createAircraftMarker(id, definition.displayName);
+    vehicleMarkerLayer.add(marker);
+    const entry = createAircraftState({ id, definition, instance, group, marker });
+    entry.sunLight = new THREE.DirectionalLight(0xffffff, 3);
+    entry.sunLight.castShadow = false;
+    group.add(entry.sunLight, entry.sunLight.target, new THREE.AmbientLight(0x8090b0, 1));
+    aircraftEntries.push(entry);
+  }
+  bootLog('vehicle.registry.ready', {
+    groundCount: _vehicleSeedInstance?.id ? 1 : 0,
+    aircraftCount: aircraftEntries.length,
+    ids: [
+      ...(_vehicleSeedInstance?.id ? [_vehicleSeedInstance.id] : []),
+      ...aircraftEntries.map(entry => entry.id),
+    ],
+  });
   const vehicleDownRaycaster = new THREE.Raycaster();
   const vehicleDownDirection = up.clone().negate().normalize();
   const vehicleTargetWorld = new THREE.Vector3();
@@ -195,6 +288,7 @@ export function createTerrainVehicleRuntime({
   let vehicleAwaitingInitialSnap = false;
   let vehicleRestoreRequiresDepth = false;
   let vehicleRestoreDepthTarget = -1;
+  let terrainDepthCeiling = 12;
   let vehicleGroundZTarget = null;
   let vehicleVerticalVelocity = 0;
   let vehicleHeadingRad = THREE.MathUtils.degToRad(VEHICLE_MODEL.headingDeg);
@@ -205,14 +299,50 @@ export function createTerrainVehicleRuntime({
   const vehicleUpRaycaster = new THREE.Raycaster();
   const vehicleUpDirection = up.clone().normalize();
   let vehicleMeshes = [];
+  let vehicleCollisionMeshes = [];
+  let vehicleWheelRig = null;
+  let vehicleTurretRig = null;
+  let vehicleTurretControlActive = false;
+  let vehicleTurretYawRad = 0;
+  let vehicleTurretPitchRad = 0;
+  let vehicleFireHeld = false;
+  let vehicleFireRuntime = null;
+  let vehicleFireRuntimePromise = null;
+  const vehicleFireState = {
+    id: _vehicleSeedInstance.id ?? DEFAULT_VEHICLE_INSTANCE_ID,
+    lastFireAt: -Infinity,
+  };
   let vehicleHeadlightSpots = [];
+  const TURRET_MOUSE_SENSITIVITY = paramNumber('vehicleTurretMouseSensitivity', MOUSE_SENS);
+  const TURRET_PITCH_MIN = THREE.MathUtils.degToRad(-12);
+  const TURRET_PITCH_MAX = THREE.MathUtils.degToRad(42);
+  const TURRET_CAMERA_BEHIND_M = 0.8;
+  const TURRET_CAMERA_ABOVE_M = 0.35;
+  const vehicleBarrelTipLocal = new THREE.Vector3();
+  const vehicleTurretDirectionLocal = new THREE.Vector3();
+  const vehicleTurretOriginLocal = new THREE.Vector3();
+  const vehicleTurretCameraLocal = new THREE.Vector3();
+  const vehicleTurretLookLocal = new THREE.Vector3();
+  const vehicleTurretCameraWorld = new THREE.Vector3();
+  const vehicleTurretLookWorld = new THREE.Vector3();
+  const vehicleTurretUpLocal = new THREE.Vector3();
   const VEHICLE_DRIVE_SPEED = paramNumber('vehicleDriveSpeed', 24);
   const VEHICLE_ACCEL = paramNumber('vehicleAccel', 24);      // m/s² throttle
   const VEHICLE_BRAKE = paramNumber('vehicleBrake', 3);       // m/s² engine brake (coast-down)
   const VEHICLE_STEER_SPEED = paramNumber('vehicleSteerSpeed', 1.5);
+  const VEHICLE_CAMERA_MODES = Object.freeze([
+    Object.freeze({ name: 'CLOSE', dist: 15, height: 5 }),
+    Object.freeze({ name: 'MEDIUM', dist: 25, height: 8 }),
+    Object.freeze({ name: 'FAR', dist: 38, height: 12 }),
+  ]);
   let vehicleSpeed = 0; // current vehicle speed in m/s
   let VEHICLE_CAMERA_FOLLOW_DISTANCE = paramNumber('vehicleCamDistance', 38);
   let VEHICLE_CAMERA_FOLLOW_HEIGHT = paramNumber('vehicleCamHeight', 12);
+  let vehicleCameraModeIndex = VEHICLE_CAMERA_MODES.findIndex(mode => (
+    mode.dist === VEHICLE_CAMERA_FOLLOW_DISTANCE
+    && mode.height === VEHICLE_CAMERA_FOLLOW_HEIGHT
+  ));
+  if (vehicleCameraModeIndex < 0) vehicleCameraModeIndex = VEHICLE_CAMERA_MODES.length - 1;
   const VEHICLE_CAMERA_LOOK_HEIGHT = paramNumber('vehicleCamLookHeight', 2.2);
   const VEHICLE_CAMERA_ORBIT_SENS = paramNumber('vehicleCamOrbitSens', MOUSE_SENS);
   const VEHICLE_CAMERA_ORBIT_PITCH_MIN = THREE.MathUtils.degToRad(
@@ -300,6 +430,234 @@ export function createTerrainVehicleRuntime({
     applyVehicleTextureSampling(material.aoMap);
     applyVehicleTextureSampling(material.emissiveMap);
     applyVehicleTextureSampling(material.alphaMap);
+  }
+
+  const aircraftGroundOrigin = new THREE.Vector3();
+  const aircraftGroundLocal = new THREE.Vector3();
+  const aircraftCameraLocal = new THREE.Vector3();
+  const aircraftLookLocal = new THREE.Vector3();
+  const aircraftCameraWorld = new THREE.Vector3();
+  const aircraftLookWorld = new THREE.Vector3();
+  const aircraftHeadingQuaternion = new THREE.Quaternion();
+  const aircraftLocalUp = new THREE.Vector3(0, 0, 1);
+
+  function sampleAircraftGroundZ(entry) {
+    const targets = houseTerrainMeshes();
+    if (targets.length === 0) return entry.lastKnownGroundZ;
+    aircraftGroundOrigin.set(entry.group.position.x, entry.group.position.y, 20000);
+    terrainRoot.localToWorld(aircraftGroundOrigin);
+    vehicleDownRaycaster.set(aircraftGroundOrigin, vehicleDownDirection);
+    const hit = vehicleDownRaycaster.intersectObjects(targets, false)[0];
+    if (!hit) return entry.lastKnownGroundZ;
+    aircraftGroundLocal.copy(hit.point);
+    terrainRoot.worldToLocal(aircraftGroundLocal);
+    return aircraftGroundLocal.z;
+  }
+
+  function loadAircraftModels() {
+    if (aircraftLoadStarted || aircraftEntries.length === 0) return;
+    aircraftLoadStarted = true;
+    const v22Textures = loadV22TextureSet();
+    for (const entry of aircraftEntries) {
+      vehicleLoader.load(
+        entry.definition.url,
+        gltf => {
+          const model = gltf.scene;
+          const rotation = entry.definition.modelRotationDeg;
+          if (Array.isArray(rotation) && rotation.length === 3) {
+            model.rotation.set(...rotation.map(THREE.MathUtils.degToRad));
+          } else {
+            model.rotation.x = Math.PI * 0.5;
+          }
+          const materials = applyV22Materials(model, v22Textures);
+          model.traverse(object => {
+            if (!object.isMesh) return;
+            object.castShadow = true;
+            object.receiveShadow = true;
+            const objectMaterials = Array.isArray(object.material)
+              ? object.material
+              : [object.material];
+            for (const material of objectMaterials) applyVehicleMaterialSampling(material);
+          });
+          const bounds = new THREE.Box3().setFromObject(model);
+          const size = new THREE.Vector3();
+          bounds.getSize(size);
+          const modelLength = Math.max(size.x, size.y, size.z);
+          const scale = modelLength > 0 ? entry.definition.realLengthM / modelLength : 1;
+          model.position.z -= bounds.min.z;
+          entry.group.add(model);
+          entry.group.scale.setScalar(scale);
+          entry.meshes = [];
+          model.traverse(object => {
+            if (!object.isMesh) return;
+            entry.meshes.push(object);
+            aircraftMeshOwners.set(object, entry);
+          });
+          const latitude = Number.isFinite(Number(entry.instance.lat))
+            ? Number(entry.instance.lat)
+            : anchorLat;
+          const longitude = Number.isFinite(Number(entry.instance.lon))
+            ? Number(entry.instance.lon)
+            : anchorLon;
+          const local = houseLocalFromLatLon(latitude, longitude);
+          entry.group.position.set(local.x, local.y, Number(entry.instance.z) || 0);
+          entry.marker.position.set(local.x, local.y, HOUSE_MARKER_BASE_LIFT);
+          entry.loaded = true;
+          entry.group.visible = true;
+          entry.altitudeAGL = Math.max(
+            0,
+            entry.group.position.z - (sampleAircraftGroundZ(entry) ?? 0),
+          );
+          const parts = setupAircraftModelParts(entry, model, bootLog);
+          updateAircraftVisuals(entry, 0);
+          bootLog('vehicle.load.success', {
+            id: entry.id,
+            vehicleType: 'aircraft',
+            url: entry.definition.url,
+            scale: Number(scale.toFixed(5)),
+            parts,
+            materials,
+          });
+          onMutated();
+        },
+        undefined,
+        error => bootLog('vehicle.load.error', {
+          id: entry.id,
+          vehicleType: 'aircraft',
+          message: error?.message ?? String(error),
+        }, 'error'),
+      );
+    }
+  }
+
+  function updateAircraftFlight(input, dt) {
+    if (!activeAircraft?.loaded || !vehicleControlActive) return false;
+    stepAircraftFlight(activeAircraft, input, dt, sampleAircraftGroundZ(activeAircraft));
+    if (
+      input.forward || input.back || input.left || input.right || input.climb || input.descend ||
+      Math.abs(activeAircraft.forwardSpeedMs) > 0.01 ||
+      Math.abs(activeAircraft.verticalSpeedMs) > 0.01
+    ) {
+      throttledVehicleSave('flight-throttle');
+    }
+    return true;
+  }
+
+  function updateAircraftSystems(dt) {
+    for (const entry of aircraftEntries) {
+      if (!entry.loaded) continue;
+      updateAircraftVisuals(entry, dt);
+      entry.marker.position.set(
+        entry.group.position.x,
+        entry.group.position.y,
+        entry.group.position.z + HOUSE_MARKER_BASE_LIFT,
+      );
+    }
+  }
+
+  function updateAircraftFollowCamera(entry = activeAircraft) {
+    if (!entry?.loaded) return;
+    const mode = AIRCRAFT_CAMERA_MODES[entry.cameraModeIndex] ?? AIRCRAFT_CAMERA_MODES[1];
+    const radius = Math.hypot(mode.dist, mode.height) * entry.cameraZoom;
+    const horizontalRadius = radius * Math.cos(entry.cameraOrbitPitch);
+    aircraftCameraLocal.set(
+      Math.sin(entry.cameraOrbitYaw) * horizontalRadius,
+      -Math.cos(entry.cameraOrbitYaw) * horizontalRadius,
+      radius * Math.sin(entry.cameraOrbitPitch),
+    );
+    aircraftHeadingQuaternion.setFromAxisAngle(aircraftLocalUp, entry.headingRad);
+    aircraftCameraLocal.applyQuaternion(aircraftHeadingQuaternion).add(entry.group.position);
+    aircraftLookLocal.copy(entry.group.position).addScaledVector(aircraftLocalUp, 2);
+    aircraftCameraWorld.copy(aircraftCameraLocal);
+    terrainRoot.localToWorld(aircraftCameraWorld);
+    aircraftLookWorld.copy(aircraftLookLocal);
+    terrainRoot.localToWorld(aircraftLookWorld);
+    camera.position.copy(aircraftCameraWorld);
+    camera.up.copy(up);
+    camera.lookAt(aircraftLookWorld);
+    const lookDirection = aircraftLookLocal.clone().sub(aircraftCameraLocal).normalize();
+    controls.yaw = Math.atan2(-lookDirection.x, lookDirection.y);
+    controls.pitch = Math.asin(THREE.MathUtils.clamp(lookDirection.z, -1, 1));
+  }
+
+  function toggleControlledAircraftEngine() {
+    if (!activeAircraft?.loaded || !vehicleControlActive) return false;
+    const running = toggleAircraftEngine(activeAircraft);
+    bootLog('vehicle.aircraft.engine', { id: activeAircraft.id, running });
+    return running;
+  }
+
+  function cycleVehicleCameraMode(reason = 'manual') {
+    if (!vehicleControlActive || vehicleTurretControlActive) return false;
+    if (activeAircraft != null) {
+      activeAircraft.cameraModeIndex = (
+        activeAircraft.cameraModeIndex + 1
+      ) % AIRCRAFT_CAMERA_MODES.length;
+      activeAircraft.cameraZoom = 1;
+      bootLog('vehicle.camera.mode', {
+        id: activeAircraft.id,
+        mode: AIRCRAFT_CAMERA_MODES[activeAircraft.cameraModeIndex].name,
+        reason,
+      });
+    } else {
+      vehicleCameraModeIndex = (vehicleCameraModeIndex + 1) % VEHICLE_CAMERA_MODES.length;
+      const mode = VEHICLE_CAMERA_MODES[vehicleCameraModeIndex];
+      VEHICLE_CAMERA_FOLLOW_DISTANCE = mode.dist;
+      VEHICLE_CAMERA_FOLLOW_HEIGHT = mode.height;
+      vehicleCameraOrbitPitch = THREE.MathUtils.clamp(
+        Math.atan2(mode.height, mode.dist),
+        VEHICLE_CAMERA_ORBIT_PITCH_MIN,
+        VEHICLE_CAMERA_ORBIT_PITCH_MAX,
+      );
+      bootLog('vehicle.camera.mode', {
+        id: _vehicleSeedInstance.id ?? DEFAULT_VEHICLE_INSTANCE_ID,
+        mode: mode.name,
+        reason,
+      });
+    }
+    updateVehicleFollowCamera();
+    onMutated();
+    return true;
+  }
+
+  function getSelectedVehicleStatus() {
+    if (!vehicleSelected) return null;
+    if (activeAircraft != null) {
+      return {
+        selected: true,
+        loaded: activeAircraft.loaded,
+        active: vehicleControlActive,
+        displayName: activeAircraft.definition.displayName || 'VTOL',
+        speedMps: activeAircraft.forwardSpeedMs,
+        hasLights: false,
+        hasTurret: false,
+        turretActive: false,
+        isAircraft: true,
+        engineRunning: activeAircraft.engineRunning,
+        rotorSpool: activeAircraft.rotorSpool,
+        altitudeAGL: activeAircraft.altitudeAGL,
+        verticalSpeedMs: activeAircraft.verticalSpeedMs,
+        flightRegime: activeAircraft.flightRegime,
+        cameraMode: AIRCRAFT_CAMERA_MODES[activeAircraft.cameraModeIndex]?.name ?? 'CUSTOM',
+      };
+    }
+    return {
+      selected: true,
+      loaded: vehicleLoaded,
+      active: vehicleControlActive,
+      displayName: GROUND_VEHICLE_DEFINITION.displayName || 'Vehicle',
+      speedMps: vehicleSpeed,
+      hasLights: vehicleHeadlightSpots.length > 0,
+      hasTurret: vehicleTurretRig?.gunPivot != null,
+      turretActive: vehicleTurretControlActive,
+      isAircraft: false,
+      engineRunning: false,
+      rotorSpool: 0,
+      altitudeAGL: 0,
+      verticalSpeedMs: 0,
+      flightRegime: 'GROUND',
+      cameraMode: VEHICLE_CAMERA_MODES[vehicleCameraModeIndex]?.name ?? 'CUSTOM',
+    };
   }
   
   function vehicleLocalToLatLon(x, y) {
@@ -494,6 +852,15 @@ export function createTerrainVehicleRuntime({
     vehicleGroup.quaternion.slerp(vehicleOrientationTargetQuat, orientationAlpha);
     vehicleMarker.position.z = vehicleGroup.position.z + HOUSE_MARKER_BASE_LIFT;
   }
+
+  function updateVehicleWheelSpin(dt) {
+    if (!vehicleLoaded || vehicleWheelRig == null) return false;
+    return spinVehicleWheelRig(
+      vehicleWheelRig,
+      vehicleSpeed * Math.max(0, Number(dt) || 0),
+      VEHICLE_TIRE_RADIUS_M,
+    );
+  }
   
   function createVehicleSaveSnapshot(options = {}) {
     const { snapToGround = false, bypassSnapThrottle = false } = options;
@@ -503,6 +870,8 @@ export function createTerrainVehicleRuntime({
     }
     const state = getVehicleStateSnapshot();
     if (state == null) return null;
+    state.vehicleId = _vehicleSeedInstance.id ?? DEFAULT_VEHICLE_INSTANCE_ID;
+    state.vehicleType = 'ground';
     if (Number.isFinite(vehicleGroundZTarget)) {
       state.z = Number(vehicleGroundZTarget.toFixed(3));
     }
@@ -512,15 +881,56 @@ export function createTerrainVehicleRuntime({
     return state;
   }
   
-  const vehiclePersistence = createVehiclePersistenceRuntime({
-    endpoint: VEHICLE_STATE_ENDPOINT,
-    timeoutMs: VEHICLE_SAVE_FETCH_TIMEOUT_MS,
-    failureCooldownMs: VEHICLE_SAVE_FAILURE_COOLDOWN_MS,
-    createSnapshot: createVehicleSaveSnapshot,
-    bootLog,
-  });
-  const saveVehicleState = vehiclePersistence.save;
-  const throttledVehicleSave = vehiclePersistence.throttledSave;
+  const vehiclePersistence = vehiclePersistenceEnabled
+    ? createVehiclePersistenceRuntime({
+        endpoint: VEHICLE_STATE_ENDPOINT,
+        timeoutMs: VEHICLE_SAVE_FETCH_TIMEOUT_MS,
+        failureCooldownMs: VEHICLE_SAVE_FAILURE_COOLDOWN_MS,
+        createSnapshot: createVehicleSaveSnapshot,
+        bootLog,
+      })
+    : {
+        save: async () => false,
+        throttledSave() {},
+      };
+  const aircraftPersistence = new Map(aircraftEntries.map(entry => [
+    entry.id,
+    vehiclePersistenceEnabled
+      ? createVehiclePersistenceRuntime({
+          endpoint: VEHICLE_STATE_ENDPOINT,
+          timeoutMs: VEHICLE_SAVE_FETCH_TIMEOUT_MS,
+          failureCooldownMs: VEHICLE_SAVE_FAILURE_COOLDOWN_MS,
+          createSnapshot: () => {
+            const state = vehicleStateSnapshot({
+              loaded: entry.loaded,
+              position: entry.group.position,
+              headingRad: entry.headingRad,
+              anchorLat,
+              anchorLon,
+            });
+            if (state == null) return null;
+            state.vehicleId = entry.id;
+            state.vehicleType = 'aircraft';
+            return state;
+          },
+          bootLog,
+        })
+      : { save: async () => false, throttledSave() {} },
+  ]));
+
+  function selectedVehiclePersistence() {
+    return activeAircraft == null
+      ? vehiclePersistence
+      : aircraftPersistence.get(activeAircraft.id);
+  }
+
+  function saveVehicleState(reason = 'manual', options = {}) {
+    return selectedVehiclePersistence()?.save(reason, options) ?? Promise.resolve(false);
+  }
+
+  function throttledVehicleSave(reason = 'movement-throttle') {
+    selectedVehiclePersistence()?.throttledSave(reason);
+  }
   
   function loadVehicleState() {
     const state = ASSET_VEHICLE_INSTANCES.length > 0 ? ASSET_VEHICLE_INSTANCES[0] : null;
@@ -538,6 +948,10 @@ export function createTerrainVehicleRuntime({
   }
   
   function loadVehicleModel() {
+    // Keep the terrain/AMV first paint fast. Aircraft and its texture set are
+    // loaded after the initial vehicle request has had time to complete.
+    const scheduleAircraftLoad = windowImpl.setTimeout ?? globalThis.setTimeout;
+    scheduleAircraftLoad(loadAircraftModels, 1200);
     vehicleLoader.load(
       VEHICLE_MODEL.url,
       gltf => {
@@ -610,7 +1024,27 @@ export function createTerrainVehicleRuntime({
             vehicleHeadlightSpots.push(hl);
           }
         }
-        // Collect vehicle meshes for upward raycast collision
+        // Use the live Patria wheel rig: the source meshes contain multiple
+        // wheels, so rotate eight vertex clusters around their own centres.
+        // Grounding uses only the static body meshes so wheel animation cannot
+        // move the collision floor underneath the vehicle.
+        const vehicleParts = discoverVehicleParts(model, GROUND_VEHICLE_DEFINITION);
+        vehicleWheelRig = createVehicleWheelRig(THREE, vehicleParts);
+        const wheelSummary = summarizeVehicleWheelRig(vehicleWheelRig);
+        bootLog('vehicle.wheels.rigged', wheelSummary,
+          wheelSummary.clusterCount === 8 && wheelSummary.skipped.length === 0
+            ? 'info'
+            : 'warn');
+        vehicleTurretRig = createVehicleTurretRig(THREE, vehicleParts);
+        const turretSummary = summarizeVehicleTurretRig(vehicleTurretRig);
+        bootLog('vehicle.turret.rigged', turretSummary,
+          turretSummary.warnings.length > 0 ? 'warn' : 'info');
+        const animatedWheelMeshes = new Set(vehicleParts.wheels);
+        vehicleCollisionMeshes = [];
+        model.traverse(obj => {
+          if (obj.isMesh && !animatedWheelMeshes.has(obj)) vehicleCollisionMeshes.push(obj);
+        });
+        // Keep all meshes selectable, including the animated wheels.
         vehicleMeshes = [];
         model.traverse(obj => { if (obj.isMesh) vehicleMeshes.push(obj); });
         const savedState = vehicleSavedStatePending;
@@ -631,9 +1065,12 @@ export function createTerrainVehicleRuntime({
         vehicleSnapPending = true;
         vehicleAwaitingInitialSnap = true;
         vehicleRestoreRequiresDepth = Boolean(savedState);
-        vehicleRestoreDepthTarget = Number.isFinite(savedState?.terrainDepth)
-          ? savedState.terrainDepth
-          : VEHICLE_RESTORE_MIN_DEPTH;
+        vehicleRestoreDepthTarget = Math.min(
+          Number.isFinite(savedState?.terrainDepth)
+            ? savedState.terrainDepth
+            : VEHICLE_RESTORE_MIN_DEPTH,
+          terrainDepthCeiling,
+        );
         vehicleGroundZTarget = Number.isFinite(startZ) ? startZ : null;
         vehicleVerticalVelocity = 0;
         vehicleLastContactDepth = -1;
@@ -663,23 +1100,26 @@ export function createTerrainVehicleRuntime({
   
   const _vehicleSunLocal = new THREE.Vector3();
   function syncVehicleSunLight() {
-    if (!vehicleLoaded) return;
     // sunDirection is in ECEF; convert to terrainRoot local (ENU-ish)
     _vehicleSunLocal.set(
       getSunDirection().dot(east),
       getSunDirection().dot(north),
       getSunDirection().dot(up)
     ).normalize();
-    // Convert from terrainRoot local into vehicleGroup local so vehicle lighting follows slope tilt.
-    vehicleInvQuat.copy(vehicleGroup.quaternion).invert();
-    _vehicleSunLocal.applyQuaternion(vehicleInvQuat);
-    // Position directional light
-    vehicleSunLight.target.position.set(0, 0, 0);
-    vehicleSunLight.position.set(
-      _vehicleSunLocal.x * 40,
-      _vehicleSunLocal.y * 40,
-      _vehicleSunLocal.z * 40
-    );
+    if (vehicleLoaded) {
+      // Convert from terrainRoot local into vehicleGroup local so vehicle lighting follows slope tilt.
+      vehicleInvQuat.copy(vehicleGroup.quaternion).invert();
+      const groundLightDirection = _vehicleSunLocal.clone().applyQuaternion(vehicleInvQuat);
+      vehicleSunLight.target.position.set(0, 0, 0);
+      vehicleSunLight.position.copy(groundLightDirection).multiplyScalar(40);
+    }
+    for (const entry of aircraftEntries) {
+      if (!entry.loaded) continue;
+      vehicleInvQuat.copy(entry.group.quaternion).invert();
+      const aircraftLightDirection = _vehicleSunLocal.clone().applyQuaternion(vehicleInvQuat);
+      entry.sunLight.target.position.set(0, 0, 0);
+      entry.sunLight.position.copy(aircraftLightDirection).multiplyScalar(40);
+    }
   }
   
   function createVehicleShadowReceiverFromTerrainMesh(terrainMesh) {
@@ -689,7 +1129,7 @@ export function createTerrainVehicleRuntime({
     receiver.scale.copy(terrainMesh.scale);
     receiver.receiveShadow = true;
     receiver.castShadow = false;
-    receiver.frustumCulled = false;
+    receiver.frustumCulled = true;
     receiver.renderOrder = 25;
     receiver.userData.vehicleShadowTileId = terrainMesh.userData.tileId;
     receiver.userData.sourceGeometry = terrainMesh.geometry;
@@ -704,15 +1144,24 @@ export function createTerrainVehicleRuntime({
   }
   
   function syncVehicleShadowReceivers() {
-    if (!vehicleLoaded) {
+    if (!vehicleLoaded || !vehicleGroup.visible || controls.mapMode) {
       clearVehicleShadowReceivers();
       return;
     }
+    const sunUp = Math.abs(getSunDirection().dot(up));
+    const receiverRadius = vehicleShadowRadius * Math.SQRT2
+      / Math.max(VEHICLE_SHADOW_MIN_SUN_PROJECTION, sunUp);
     const activeTileIds = new Set();
     const terrainMeshes = houseTerrainMeshes();
     for (const terrainMesh of terrainMeshes) {
       const tileId = terrainMesh.userData?.tileId;
       if (!tileId) continue;
+      if (!terrainBboxIntersectsCircle(
+        terrainMesh.userData?.bbox,
+        vehicleGroup.position.x,
+        vehicleGroup.position.y,
+        receiverRadius,
+      )) continue;
       activeTileIds.add(tileId);
       const existing = vehicleShadowReceivers.get(tileId);
       if (existing) {
@@ -825,7 +1274,7 @@ export function createTerrainVehicleRuntime({
     if (!bypassThrottle && now - lastVehicleSnapAttemptAt < minInterval) return;
     lastVehicleSnapAttemptAt = now;
     const terrainMeshes = houseTerrainMeshes();
-    if (terrainMeshes.length === 0 || vehicleMeshes.length === 0) return;
+    if (terrainMeshes.length === 0 || vehicleCollisionMeshes.length === 0) return;
     const terrainSample = sampleBestVehicleTerrainHit(
       vehicleGroup.position.x,
       vehicleGroup.position.y,
@@ -857,7 +1306,7 @@ export function createTerrainVehicleRuntime({
     vehicleGroup.updateMatrixWorld(true);
     // Step 3: raycast UP from terrain surface to find vehicle bottom
     vehicleUpRaycaster.set(terrainPoint, vehicleUpDirection);
-    const vehicleHits = vehicleUpRaycaster.intersectObjects(vehicleMeshes);
+    const vehicleHits = vehicleUpRaycaster.intersectObjects(vehicleCollisionMeshes);
     let groundedZ = vehicleTargetLocal.z + VEHICLE_TERRAIN_LIFT_M;
     if (vehicleHits.length === 0) {
       // Fallback: just use terrain height + small offset
@@ -901,8 +1350,143 @@ export function createTerrainVehicleRuntime({
       vehicleGroup.visible = true;
     }
   }
-  
+
+  function updateVehicleTurretRig() {
+    if (!vehicleLoaded || vehicleTurretRig == null) return;
+    if (vehicleTurretRig.turretPivot) {
+      vehicleTurretRig.turretPivot.rotation.z = vehicleTurretYawRad;
+    }
+    if (vehicleTurretRig.gunPivot) {
+      vehicleTurretRig.gunPivot.rotation.x = vehicleTurretPitchRad;
+    }
+    vehicleGroup.updateWorldMatrix(true, true);
+  }
+
+  function getVehicleBarrelTipTerrainLocal(target) {
+    if (vehicleTurretRig?.gunPivot == null) return target.copy(vehicleGroup.position);
+    target.copy(vehicleTurretRig.barrelTipLocal);
+    vehicleTurretRig.gunPivot.localToWorld(target);
+    terrainRoot.worldToLocal(target);
+    return target;
+  }
+
+  function getVehicleTurretDirectionLocal(target) {
+    if (vehicleTurretRig?.gunPivot == null) {
+      return target.set(0, 1, 0).applyQuaternion(vehicleGroup.quaternion).normalize();
+    }
+    const origin = vehicleTurretOriginLocal.set(0, 0, 0);
+    target.set(0, 1, 0);
+    vehicleTurretRig.gunPivot.localToWorld(origin);
+    vehicleTurretRig.gunPivot.localToWorld(target);
+    terrainRoot.worldToLocal(origin);
+    terrainRoot.worldToLocal(target);
+    return target.sub(origin).normalize();
+  }
+
+  function updateVehicleTurretCamera() {
+    if (!vehicleLoaded || !vehicleTurretControlActive) return;
+    getVehicleBarrelTipTerrainLocal(vehicleBarrelTipLocal);
+    getVehicleTurretDirectionLocal(vehicleTurretDirectionLocal);
+    vehicleTurretCameraLocal.copy(vehicleBarrelTipLocal)
+      .addScaledVector(vehicleTurretDirectionLocal, -TURRET_CAMERA_BEHIND_M);
+    vehicleTurretUpLocal.set(0, 0, 1).applyQuaternion(vehicleGroup.quaternion).normalize();
+    vehicleTurretCameraLocal.addScaledVector(vehicleTurretUpLocal, TURRET_CAMERA_ABOVE_M);
+    vehicleTurretLookLocal.copy(vehicleBarrelTipLocal)
+      .addScaledVector(vehicleTurretDirectionLocal, 500);
+    vehicleTurretCameraWorld.copy(vehicleTurretCameraLocal);
+    terrainRoot.localToWorld(vehicleTurretCameraWorld);
+    vehicleTurretLookWorld.copy(vehicleTurretLookLocal);
+    terrainRoot.localToWorld(vehicleTurretLookWorld);
+    camera.position.copy(vehicleTurretCameraWorld);
+    camera.up.copy(up);
+    camera.lookAt(vehicleTurretLookWorld);
+  }
+
+  function setVehicleTurretControlActive(nextActive, reason = 'manual') {
+    const available = vehicleTurretRig?.turretPivot != null
+      && vehicleTurretRig?.gunPivot != null;
+    const next = Boolean(nextActive)
+      && available
+      && vehicleControlActive
+      && activeAircraft == null;
+    if (vehicleTurretControlActive === next) return vehicleTurretControlActive;
+    vehicleTurretControlActive = next;
+    if (next) {
+      renderer.domElement.requestPointerLock?.();
+    } else if (globalThis.document?.pointerLockElement === renderer.domElement) {
+      globalThis.document.exitPointerLock?.();
+    }
+    if (!next) {
+      vehicleFireHeld = false;
+      vehicleFireRuntime?.stop?.();
+    }
+    bootLog('vehicle.turret.control', { active: next, available, reason });
+    onMutated();
+    return next;
+  }
+
+  function aimVehicleTurret(movementX, movementY) {
+    if (!vehicleTurretControlActive) return false;
+    vehicleTurretYawRad -= movementX * TURRET_MOUSE_SENSITIVITY;
+    vehicleTurretPitchRad = THREE.MathUtils.clamp(
+      vehicleTurretPitchRad - movementY * TURRET_MOUSE_SENSITIVITY,
+      TURRET_PITCH_MIN,
+      TURRET_PITCH_MAX,
+    );
+    return true;
+  }
+
+  async function ensureVehicleFireRuntime() {
+    if (vehicleFireRuntime != null) return vehicleFireRuntime;
+    if (vehicleFireRuntimePromise == null) {
+      vehicleFireRuntimePromise = import('./terrain-vehicle-fire.js').then(module => {
+        vehicleFireRuntime = module.createVehicleFireRuntime({
+          terrainRoot,
+          camera,
+          getTerrainTargets: houseTerrainMeshes,
+          bootLog,
+        });
+        return vehicleFireRuntime;
+      });
+    }
+    return vehicleFireRuntimePromise;
+  }
+
+  function setVehicleFireHeld(held) {
+    if (!vehicleTurretControlActive || !vehicleControlActive || activeAircraft != null) {
+      vehicleFireHeld = false;
+      return false;
+    }
+    vehicleFireHeld = Boolean(held);
+    if (vehicleFireHeld) {
+      void ensureVehicleFireRuntime().then(runtime => {
+        if (!vehicleFireHeld || !vehicleTurretControlActive) return;
+        runtime.primeAudio();
+        getVehicleBarrelTipTerrainLocal(vehicleBarrelTipLocal);
+        runtime.fire(vehicleFireState, vehicleBarrelTipLocal);
+      });
+    }
+    return vehicleFireHeld;
+  }
+
+  function updateVehicleCombat(dt) {
+    updateVehicleTurretRig();
+    if (vehicleFireHeld && vehicleTurretControlActive && vehicleFireRuntime != null) {
+      getVehicleBarrelTipTerrainLocal(vehicleBarrelTipLocal);
+      vehicleFireRuntime.fire(vehicleFireState, vehicleBarrelTipLocal);
+    }
+    vehicleFireRuntime?.update?.(dt);
+  }
+
   function updateVehicleFollowCamera() {
+    if (vehicleTurretControlActive && activeAircraft == null) {
+      updateVehicleTurretCamera();
+      return;
+    }
+    if (activeAircraft != null) {
+      updateAircraftFollowCamera(activeAircraft);
+      return;
+    }
     if (!vehicleLoaded) return;
     const heading = vehicleHeadingRad;
     const forwardX = -Math.sin(heading);
@@ -948,7 +1532,8 @@ export function createTerrainVehicleRuntime({
   function setVehicleControlActive(nextActive, reason = 'manual', options = {}) {
     const { skipExitSave = false } = options;
     const requested = Boolean(nextActive);
-    if (requested && (!vehicleLoaded || controls.mapMode)) {
+    const selectedLoaded = activeAircraft?.loaded ?? vehicleLoaded;
+    if (requested && (!selectedLoaded || controls.mapMode)) {
       return false;
     }
     const wasActive = vehicleControlActive;
@@ -960,20 +1545,32 @@ export function createTerrainVehicleRuntime({
     if (vehicleControlActive) {
       controls.speed = 0;
       controls.strafeSpeed = 0;
-      vehicleCameraOrbitYaw = 0;
-      vehicleCameraOrbitPitch = THREE.MathUtils.clamp(
-        Math.atan2(VEHICLE_CAMERA_FOLLOW_HEIGHT, VEHICLE_CAMERA_FOLLOW_DISTANCE),
-        VEHICLE_CAMERA_ORBIT_PITCH_MIN,
-        VEHICLE_CAMERA_ORBIT_PITCH_MAX
-      );
-      controls.yaw = vehicleHeadingRad;
+      if (activeAircraft != null) {
+        const mode = AIRCRAFT_CAMERA_MODES[activeAircraft.cameraModeIndex]
+          ?? AIRCRAFT_CAMERA_MODES[1];
+        activeAircraft.cameraOrbitYaw = 0;
+        activeAircraft.cameraOrbitPitch = Math.atan2(mode.height, mode.dist);
+        controls.yaw = activeAircraft.headingRad;
+      } else {
+        vehicleCameraOrbitYaw = 0;
+        vehicleCameraOrbitPitch = THREE.MathUtils.clamp(
+          Math.atan2(VEHICLE_CAMERA_FOLLOW_HEIGHT, VEHICLE_CAMERA_FOLLOW_DISTANCE),
+          VEHICLE_CAMERA_ORBIT_PITCH_MIN,
+          VEHICLE_CAMERA_ORBIT_PITCH_MAX
+        );
+        controls.yaw = vehicleHeadingRad;
+      }
       updateVehicleFollowCamera();
     }
     if (wasActive && !vehicleControlActive) {
+      setVehicleTurretControlActive(false, `vehicle-exit-${reason}`);
+      vehicleTurretYawRad = 0;
+      vehicleTurretPitchRad = 0;
+      updateVehicleTurretRig();
       controls.speed = 0; // stop camera drift when exiting vehicle mode
       controls.strafeSpeed = 0;
     }
-    if (wasActive && !vehicleControlActive && vehicleLoaded && !skipExitSave) {
+    if (wasActive && !vehicleControlActive && activeAircraft == null && vehicleLoaded && !skipExitSave) {
       saveVehicleState(`exit-${reason}`, {
         snapToGround: true,
         requireGroundedZ: false,
@@ -982,23 +1579,69 @@ export function createTerrainVehicleRuntime({
     }
     bootLog('vehicle.control', {
       active: vehicleControlActive,
+      id: activeAircraft?.id ?? _vehicleSeedInstance.id ?? DEFAULT_VEHICLE_INSTANCE_ID,
+      vehicleType: activeAircraft == null ? 'ground' : 'aircraft',
       reason,
     });
     return vehicleControlActive;
   }
   
   function tryEnterVehicleControlFromPointer(event) {
-    if (controls.mapMode || !vehicleLoaded || vehicleMeshes.length === 0) {
-      return false;
+    return trySelectVehicleFromPointer(event, { activate: true });
+  }
+
+  function pointerVehicleEntry(event) {
+    const selectableMeshes = [
+      ...(vehicleLoaded ? vehicleMeshes : []),
+      ...aircraftEntries.flatMap(entry => entry.loaded ? entry.meshes : []),
+    ];
+    if (controls.mapMode || selectableMeshes.length === 0) {
+      return null;
     }
     mouseNDC.x = (event.clientX / windowImpl.innerWidth) * 2 - 1;
     mouseNDC.y = -(event.clientY / windowImpl.innerHeight) * 2 + 1;
     raycaster.setFromCamera(mouseNDC, camera);
-    const hits = raycaster.intersectObjects(vehicleMeshes, false);
+    const hits = raycaster.intersectObjects(selectableMeshes, false);
     if (hits.length === 0) {
-      return false;
+      return null;
     }
-    return setVehicleControlActive(true, 'right-click-vehicle');
+    return aircraftMeshOwners.get(hits[0].object) ?? {
+      id: _vehicleSeedInstance.id ?? DEFAULT_VEHICLE_INSTANCE_ID,
+      vehicleType: 'ground',
+    };
+  }
+
+  function trySelectVehicleFromPointer(event, { activate = false } = {}) {
+    const entry = pointerVehicleEntry(event);
+    if (entry == null) return false;
+    const nextAircraft = entry.vehicleType === 'aircraft' ? entry : null;
+    if (vehicleControlActive && nextAircraft !== activeAircraft) {
+      setVehicleControlActive(false, 'selection-changed');
+    }
+    activeAircraft = nextAircraft;
+    vehicleSelected = true;
+    bootLog('vehicle.selection', {
+      id: entry.id,
+      vehicleType: entry.vehicleType,
+      reason: activate ? 'right-click-pointer' : 'left-click-pointer',
+      activate,
+    });
+    onMutated();
+    return activate ? setVehicleControlActive(true, 'right-click-vehicle') : true;
+  }
+
+  function selectVehicle(vehicleId, reason = 'manual') {
+    const groundId = _vehicleSeedInstance.id ?? DEFAULT_VEHICLE_INSTANCE_ID;
+    const nextAircraft = aircraftEntries.find(entry => entry.id === vehicleId) ?? null;
+    if (vehicleId !== groundId && nextAircraft == null) return false;
+    if (vehicleControlActive && nextAircraft !== activeAircraft) {
+      setVehicleControlActive(false, 'selection-changed');
+    }
+    activeAircraft = nextAircraft;
+    vehicleSelected = true;
+    bootLog('vehicle.selection', { id: vehicleId, reason });
+    onMutated();
+    return true;
   }
   // ── Patria AMV diesel audio ─────────────────────────────────────────────
   // Non-positional audio with manual distance-based volume (avoids ECEF panner issues)
@@ -1046,30 +1689,137 @@ export function createTerrainVehicleRuntime({
   });
   // ── end Patria AMV ──────────────────────────────────────────────────────
   
+  function setTerrainDepthCeiling(value) {
+    const parsed = Number(value);
+    if (!Number.isInteger(parsed) || parsed < 0 || parsed > 20) return false;
+    terrainDepthCeiling = parsed;
+    if (vehicleRestoreRequiresDepth) {
+      const savedDepth = Number(vehicleSavedStatePending?.terrainDepth);
+      const requestedDepth = Number.isFinite(savedDepth)
+        ? savedDepth
+        : VEHICLE_RESTORE_MIN_DEPTH;
+      vehicleRestoreDepthTarget = Math.min(requestedDepth, terrainDepthCeiling);
+    }
+    enqueueClientLog('info', 'vehicle.terrain-depth-ceiling', {
+      terrainDepthCeiling,
+      restoreDepthTarget: vehicleRestoreDepthTarget,
+    });
+    return true;
+  }
+
   const runtime = {
-    vehicleGroup, vehicleMarkerLayer, vehicleMarker, dieselSound,
+    vehicleMarkerLayer, dieselSound,
     VEHICLE_MARKER_MAP_SCALE, VEHICLE_DRIVE_SPEED, VEHICLE_ACCEL,
     VEHICLE_BRAKE, VEHICLE_STEER_SPEED, VEHICLE_CAMERA_ORBIT_SENS,
     VEHICLE_CAMERA_ORBIT_PITCH_MIN, VEHICLE_CAMERA_ORBIT_PITCH_MAX,
-    VEHICLE_CAMERA_FOLLOW_HEIGHT, VEHICLE_CAMERA_FOLLOW_DISTANCE,
     DIESEL_MAX_VOL, DIESEL_FULL_DIST, DIESEL_ZERO_DIST,
     loadVehicleState, loadVehicleModel, saveVehicleState, throttledVehicleSave,
+    setTerrainDepthCeiling,
     requestVehicleTerrainResnap, vehicleNearTileBbox, snapVehicleToTerrain,
     syncVehicleSunLight, syncVehicleShadowReceivers, updateVehicleShadowSystem,
-    updateVehicleSuspension, updateVehicleFollowCamera, updateDieselVolume,
-    setVehicleControlActive, tryEnterVehicleControlFromPointer,
+    updateVehicleSuspension, updateVehicleWheelSpin, updateVehicleFollowCamera, updateDieselVolume,
+    updateVehicleCombat, setVehicleTurretControlActive, aimVehicleTurret, setVehicleFireHeld,
+    updateAircraftFlight, updateAircraftSystems, toggleControlledAircraftEngine,
+    cycleVehicleCameraMode, getSelectedVehicleStatus,
+    setVehicleControlActive, selectVehicle,
+    trySelectVehicleFromPointer, tryEnterVehicleControlFromPointer,
+    getVehicleWheelRigSummary: () => summarizeVehicleWheelRig(vehicleWheelRig),
+    getVehicleTurretRigSummary: () => summarizeVehicleTurretRig(vehicleTurretRig),
+    requiresContinuousRender: () => aircraftEntries.some(entry => (
+      entry.engineRunning || Math.abs(entry.rotorAngularVelocity) > 1e-4
+    )),
+    getVehicleFireSummary: () => vehicleFireRuntime?.summary?.() ?? {
+      shotsFired: 0,
+      activeTracers: 0,
+      activeImpacts: 0,
+      muzzleVisible: false,
+    },
+    getVehicleRegistry: () => [
+      {
+        id: _vehicleSeedInstance.id ?? 'amv-01',
+        vehicleType: 'ground',
+        loaded: vehicleLoaded,
+        visible: vehicleGroup.visible,
+        meshCount: vehicleMeshes.length,
+        position: vehicleGroup.position.toArray(),
+      },
+      ...aircraftEntries.map(entry => ({
+        id: entry.id,
+        vehicleType: 'aircraft',
+        loaded: entry.loaded,
+        visible: entry.group.visible,
+        meshCount: entry.meshes.length,
+        position: entry.group.position.toArray(),
+        engineRunning: entry.engineRunning,
+        rotorSpool: entry.rotorSpool,
+        flightRegime: entry.flightRegime,
+      })),
+    ],
   };
   Object.defineProperties(runtime, {
     vehicleControlActive: { get: () => vehicleControlActive },
-    vehicleHeadingRad: { get: () => vehicleHeadingRad, set: value => { vehicleHeadingRad = value; } },
-    vehicleSpeed: { get: () => vehicleSpeed, set: value => { vehicleSpeed = value; } },
-    vehicleCameraOrbitYaw: { get: () => vehicleCameraOrbitYaw, set: value => { vehicleCameraOrbitYaw = value; } },
-    vehicleCameraOrbitPitch: { get: () => vehicleCameraOrbitPitch, set: value => { vehicleCameraOrbitPitch = value; } },
-    vehicleLoaded: { get: () => vehicleLoaded },
-    vehicleSnapPending: { get: () => vehicleSnapPending },
+    vehicleTurretControlActive: { get: () => vehicleTurretControlActive },
+    vehicleType: { get: () => activeAircraft == null ? 'ground' : 'aircraft' },
+    vehicleGroup: { get: () => activeAircraft?.group ?? vehicleGroup },
+    vehicleMarker: { get: () => activeAircraft?.marker ?? vehicleMarker },
+    vehicleHeadingRad: {
+      get: () => activeAircraft?.headingRad ?? vehicleHeadingRad,
+      set: value => {
+        if (activeAircraft != null) activeAircraft.headingRad = value;
+        else vehicleHeadingRad = value;
+      },
+    },
+    vehicleSpeed: {
+      get: () => activeAircraft?.forwardSpeedMs ?? vehicleSpeed,
+      set: value => {
+        if (activeAircraft != null) activeAircraft.forwardSpeedMs = value;
+        else vehicleSpeed = value;
+      },
+    },
+    vehicleCameraOrbitYaw: {
+      get: () => activeAircraft?.cameraOrbitYaw ?? vehicleCameraOrbitYaw,
+      set: value => {
+        if (activeAircraft != null) activeAircraft.cameraOrbitYaw = value;
+        else vehicleCameraOrbitYaw = value;
+      },
+    },
+    vehicleCameraOrbitPitch: {
+      get: () => activeAircraft?.cameraOrbitPitch ?? vehicleCameraOrbitPitch,
+      set: value => {
+        if (activeAircraft != null) activeAircraft.cameraOrbitPitch = value;
+        else vehicleCameraOrbitPitch = value;
+      },
+    },
+    VEHICLE_CAMERA_FOLLOW_DISTANCE: {
+      get: () => activeAircraft != null
+        ? (AIRCRAFT_CAMERA_MODES[activeAircraft.cameraModeIndex]?.dist ?? 40) * activeAircraft.cameraZoom
+        : VEHICLE_CAMERA_FOLLOW_DISTANCE,
+      set: value => {
+        if (activeAircraft != null) {
+          const base = AIRCRAFT_CAMERA_MODES[activeAircraft.cameraModeIndex]?.dist ?? 40;
+          activeAircraft.cameraZoom = THREE.MathUtils.clamp(value / base, 0.4, 4);
+        } else VEHICLE_CAMERA_FOLLOW_DISTANCE = value;
+      },
+    },
+    VEHICLE_CAMERA_FOLLOW_HEIGHT: {
+      get: () => activeAircraft != null
+        ? (AIRCRAFT_CAMERA_MODES[activeAircraft.cameraModeIndex]?.height ?? 15) * activeAircraft.cameraZoom
+        : VEHICLE_CAMERA_FOLLOW_HEIGHT,
+      set: value => {
+        if (activeAircraft != null) {
+          const base = AIRCRAFT_CAMERA_MODES[activeAircraft.cameraModeIndex]?.height ?? 15;
+          activeAircraft.cameraZoom = THREE.MathUtils.clamp(value / base, 0.4, 4);
+        } else VEHICLE_CAMERA_FOLLOW_HEIGHT = value;
+      },
+    },
+    vehicleLoaded: { get: () => activeAircraft?.loaded ?? vehicleLoaded },
+    vehicleSnapPending: {
+      get: () => vehicleSnapPending,
+      set: value => { vehicleSnapPending = Boolean(value); },
+    },
     vehicleLastContactDepth: { get: () => vehicleLastContactDepth },
-    vehicleGroundNormal: { get: () => vehicleGroundNormal },
-    vehicleHeadlightSpots: { get: () => vehicleHeadlightSpots },
+    vehicleGroundNormal: { get: () => activeAircraft == null ? vehicleGroundNormal : aircraftLocalUp },
+    vehicleHeadlightSpots: { get: () => activeAircraft == null ? vehicleHeadlightSpots : [] },
   });
   return runtime;
 }

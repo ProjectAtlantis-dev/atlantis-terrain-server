@@ -11,6 +11,7 @@ webserver/node_modules
 assetserver/node_modules
 webserver/dist
 webserver/dist-ssr
+webserver/three-geospatial
 *.local
 
 # Editor directories and files
@@ -27,6 +28,8 @@ webserver/dist-ssr
 # Secrets
 .env
 .env.*
+!.env.example
+!**/.env.example
 *.pem
 *.key
 *.p12

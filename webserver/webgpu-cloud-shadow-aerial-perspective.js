@@ -1,46 +1,32 @@
 import { hash } from 'three/src/nodes/core/NodeUtils.js';
 import {
   Fn,
-  If,
-  mix,
-  positionGeometry,
-  remapClamp,
-  select,
-  uv,
-  vec3,
-  vec4
+  screenCoordinate,
+  vec4,
+  viewportUV,
 } from 'three/tsl';
 import {
   AerialPerspectiveNode,
-  getSkyLuminanceToPoint,
-  getSunAndSkyIlluminance
+  getAtmosphereContext,
 } from '@takram/three-atmosphere/webgpu';
 import {
-  cameraFar,
-  cameraNear,
   depthToViewZ,
   inverseProjectionMatrix,
-  inverseViewMatrix,
   projectionMatrix,
-  rayEllipsoidIntersection,
-  screenToPositionView
+  screenToPositionView,
 } from '@takram/three-geospatial/webgpu';
 
-// Project-owned adapter for the first WebGPU cloud-shadow integration point.
-// Takram's node keeps direct and indirect surface illuminance separate, but it
-// does not expose a surface-shadow input. Keep the change here instead of in
-// the ignored local three-geospatial checkout.
+// Adds the project cloud-transmittance field to the stock r184 aerial pass.
+// The r184 atmosphere context is supplied by renderer.contextNode; it is no
+// longer a constructor argument of AerialPerspectiveNode.
 export class CloudShadowAerialPerspectiveNode extends AerialPerspectiveNode {
   static get type() {
-    return 'CloudShadowAerialPerspectiveNode';
+    return 'AtlantisCloudAerialPerspectiveNode';
   }
 
-  constructor(atmosphereContext, colorNode, depthNode, normalNode, cloudShadow) {
-    super(atmosphereContext, colorNode, depthNode, normalNode);
-    // A null normal buffer selects the continuous ellipsoid-normal fallback
-    // in setup(). Keep surface illumination enabled so terrain still receives
-    // direct sun plus spectral sky/ambient light without cross-LOD
-    // seams from independently computed tile normals.
+  constructor(colorNode, depthNode, normalNode, cloudShadow) {
+    super('CAMERA', colorNode, depthNode);
+    this.normalNode = normalNode;
     this.lighting = true;
     this.cloudShadow = cloudShadow;
   }
@@ -50,175 +36,52 @@ export class CloudShadowAerialPerspectiveNode extends AerialPerspectiveNode {
   }
 
   setup(builder) {
-    const camera = this.atmosphereContext.camera ?? builder.camera;
-    if (camera == null) {
-      return;
-    }
+    if (this.cloudShadow == null) return super.setup(builder);
 
-    builder.getContext().atmosphere = this.atmosphereContext;
+    const atmosphereContext = getAtmosphereContext(builder);
+    const camera = atmosphereContext.camera ?? builder.camera;
+    if (camera == null) return super.setup(builder);
 
-    const {
-      ellipsoid,
-      worldToUnit,
-      matrixWorldToECEF,
-      sunDirectionECEF,
-      cameraPositionUnit,
-      altitudeCorrectionECEF,
-      altitudeCorrectionUnit
-    } = this.atmosphereContext;
-
-    const { colorNode, depthNode, normalNode } = this;
-    const depth = depthNode.r.toVar();
-
-    const getSurfacePositionECEF = () => {
-      const viewZ = depthToViewZ(depth, cameraNear(camera), cameraFar(camera), {
-        perspective: camera.isPerspectiveCamera,
-        logarithmic: builder.renderer.logarithmicDepthBuffer
-      });
+    const sourceColorNode = this.colorNode;
+    const depthNode = this.depthNode;
+    const cloudShadow = this.cloudShadow;
+    const cloudShadowedColor = Fn(() => {
+      const depth = depthNode.load(screenCoordinate).r.toConst();
+      const viewZ = depthToViewZ(depth, camera);
       const positionView = screenToPositionView(
-        uv(),
+        viewportUV,
         depth,
         viewZ,
         projectionMatrix(camera),
-        inverseProjectionMatrix(camera)
+        inverseProjectionMatrix(camera),
       );
-      const positionWorld = inverseViewMatrix(camera).mul(
-        vec4(positionView, 1)
-      ).xyz;
-      return matrixWorldToECEF.mul(vec4(positionWorld, 1)).xyz;
-    };
-
-    const getRayDirectionECEF = () => {
-      const positionView = inverseProjectionMatrix(camera).mul(
-        vec4(positionGeometry, 1)
-      ).xyz;
-      const directionWorld = inverseViewMatrix(camera).mul(
-        vec4(positionView, 0)
-      ).xyz;
-      const directionECEF = matrixWorldToECEF.mul(
-        vec4(directionWorld, 0)
-      ).xyz;
-      return directionECEF.toVertexStage().normalize();
-    };
-
-    const surfaceLuminance = Fn(() => {
-      const positionECEF = getSurfacePositionECEF().toVar();
-      const positionUnit = positionECEF.mul(worldToUnit).toVar();
-      const shadowPositionECEF = this.atmosphereContext.correctAltitude
-        ? positionECEF.add(altitudeCorrectionECEF)
-        : positionECEF;
-      const cloudTransmittance = this.cloudShadow.getTransmittanceNode(
-        shadowPositionECEF
-      );
-
-      const geometryCorrectionAmount = remapClamp(
-        positionUnit.distance(cameraPositionUnit),
-        worldToUnit.mul(336_000),
-        worldToUnit.mul(876_000)
-      );
-
-      const radiiUnit = vec3(ellipsoid.radii).mul(worldToUnit);
-      const normalCorrected = positionUnit.div(radiiUnit.pow2()).normalize();
-
-      if (this.correctGeometricError) {
-        const rayDirectionECEF = getRayDirectionECEF();
-        const intersection = rayEllipsoidIntersection(
-          cameraPositionUnit,
-          rayDirectionECEF,
-          radiiUnit
-        ).x;
-
-        const positionCorrected = select(
-          intersection.greaterThanEqual(0),
-          rayDirectionECEF.mul(intersection).add(cameraPositionUnit),
-          normalCorrected.mul(radiiUnit)
-        );
-        positionUnit.assign(
-          mix(positionUnit, positionCorrected, geometryCorrectionAmount)
-        );
+      let positionECEF = atmosphereContext.matrixViewToECEF
+        .mul(vec4(positionView, 1))
+        .xyz;
+      if (atmosphereContext.correctAltitude) {
+        positionECEF = positionECEF.add(atmosphereContext.altitudeCorrectionECEF);
       }
-
-      const illuminance = Fn(() => {
-        let normalECEF;
-        if (normalNode != null) {
-          const normalView = normalNode.xyz;
-          const normalWorld = inverseViewMatrix(camera).mul(
-            vec4(normalView, 0)
-          ).xyz;
-          normalECEF = matrixWorldToECEF.mul(vec4(normalWorld, 0)).xyz;
-
-          if (this.correctGeometricError) {
-            normalECEF.assign(
-              mix(normalECEF, normalCorrected, geometryCorrectionAmount)
-            );
-          }
-        } else {
-          normalECEF = positionUnit.normalize();
-        }
-
-        const sunSkyIlluminance = getSunAndSkyIlluminance(
-          positionUnit.add(altitudeCorrectionUnit),
-          normalECEF,
-          sunDirectionECEF
-        );
-        let sunIlluminance = sunSkyIlluminance.get('sunIlluminance');
-        const skyIlluminance = sunSkyIlluminance.get('skyIlluminance');
-
-        sunIlluminance = sunIlluminance.mul(cloudTransmittance);
-        return sunIlluminance.add(skyIlluminance);
-      })();
-
-      const diffuse = this.lighting
-        ? colorNode.rgb.mul(illuminance).mul(1 / Math.PI)
-        : colorNode.rgb;
-
-      const luminanceTransfer = getSkyLuminanceToPoint(
-        cameraPositionUnit.add(altitudeCorrectionUnit),
-        positionUnit.add(altitudeCorrectionUnit),
-        this.shadowLengthNode ?? 0,
-        sunDirectionECEF
-      ).toVar();
-      const inscatter = luminanceTransfer.get('luminance');
-      const transmittance = luminanceTransfer.get('transmittance');
-
-      let output = diffuse;
-      if (this.transmittance) {
-        output = output.mul(transmittance);
-      }
-      if (this.inscatter) {
-        output = output.add(inscatter);
-      }
-      return select(
-        this.cloudShadow.debugSurface,
-        vec3(cloudTransmittance),
-        output
-      );
+      const transmittance = cloudShadow.getTransmittanceNode(positionECEF);
+      return vec4(sourceColorNode.rgb.mul(transmittance), sourceColorNode.a);
     })().context(builder.getContext());
 
-    return Fn(() => {
-      const luminance = colorNode.toVar();
-      If(depth.greaterThanEqual(1), () => {
-        if (this.skyNode != null) {
-          luminance.rgb.assign(this.skyNode);
-        }
-      }).Else(() => {
-        luminance.rgb.assign(surfaceLuminance);
-      });
-      return luminance;
-    })();
+    this.colorNode = cloudShadowedColor;
+    try {
+      return super.setup(builder);
+    } finally {
+      this.colorNode = sourceColorNode;
+    }
   }
 }
 
 export const cloudShadowAerialPerspective = (
-  atmosphereContext,
   colorNode,
   depthNode,
   normalNode,
-  cloudShadow
+  cloudShadow,
 ) => new CloudShadowAerialPerspectiveNode(
-  atmosphereContext,
   colorNode,
   depthNode,
   normalNode,
-  cloudShadow
+  cloudShadow,
 );

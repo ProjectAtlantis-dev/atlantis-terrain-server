@@ -1,5 +1,23 @@
 import { headingForward2D } from './terrain-priority.js';
 
+export function terrainBboxIntersectsCircle(bbox, centerX, centerY, radius) {
+  if (
+    !Array.isArray(bbox)
+    || bbox.length < 4
+    || !Number.isFinite(centerX)
+    || !Number.isFinite(centerY)
+    || !Number.isFinite(radius)
+    || radius < 0
+  ) return false;
+  const [x0, y0, x1, y1] = bbox.map(Number);
+  if (![x0, y0, x1, y1].every(Number.isFinite)) return false;
+  const nearestX = Math.max(Math.min(x0, x1), Math.min(Math.max(x0, x1), centerX));
+  const nearestY = Math.max(Math.min(y0, y1), Math.min(Math.max(y0, y1), centerY));
+  const dx = centerX - nearestX;
+  const dy = centerY - nearestY;
+  return dx * dx + dy * dy <= radius * radius;
+}
+
 export function vehicleLocalToLatLon(x, y, anchorLat, anchorLon) {
   return {
     lat: anchorLat + y / 111320,
@@ -26,6 +44,9 @@ export function normalizeSavedVehicleState(state) {
   const headingDeg = Number(state.headingDeg);
   const z = Number(state.z);
   const terrainDepthRaw = Number(state.terrainDepth);
+  const terrainTileId = typeof state.terrainTileId === 'string' && state.terrainTileId.trim()
+    ? state.terrainTileId.trim()
+    : null;
   if (!Number.isFinite(lat) || !Number.isFinite(lon) || !Number.isFinite(headingDeg)) {
     return null;
   }
@@ -37,6 +58,7 @@ export function normalizeSavedVehicleState(state) {
     terrainDepth: Number.isFinite(terrainDepthRaw)
       ? Math.max(0, Math.floor(terrainDepthRaw))
       : null,
+    terrainTileId,
   };
 }
 
@@ -86,14 +108,23 @@ export function createVehiclePersistenceRuntime({
           `vehicle_state save status ${response.status}${preview ? ` body=${preview}` : ''}`,
         );
       }
-      if (failureReported) bootLog('vehicle.state.save.recovered', { reason });
+      if (failureReported) bootLog('vehicle.state.save.recovered', {
+        id: state.vehicleId ?? null,
+        reason,
+      });
       failureUntilMs = 0;
       failureReported = false;
+      bootLog('vehicle.state.save.ok', {
+        id: state.vehicleId ?? null,
+        reason,
+        vehicleType: state.vehicleType ?? null,
+      });
       return true;
     } catch (error) {
       failureUntilMs = dateNow() + failureCooldownMs;
       if (!failureReported) {
         bootLog('vehicle.state.save.error', {
+          id: state.vehicleId ?? null,
           reason,
           timeoutMs,
           timedOut: error?.name === 'AbortError',
@@ -106,16 +137,16 @@ export function createVehiclePersistenceRuntime({
     }
   }
 
-  function throttledSave() {
+  function throttledSave(reason = 'drive-throttle') {
     const now = performanceNow();
     if (now - lastSaveAt >= throttleMs) {
       lastSaveAt = now;
-      save('drive-throttle');
+      save(reason);
     }
     clearTimeoutImpl(trailingTimer);
     trailingTimer = setTimeoutImpl(() => {
       lastSaveAt = performanceNow();
-      save('drive-trailing');
+      save(`${reason}-trailing`);
     }, trailingMs);
   }
 

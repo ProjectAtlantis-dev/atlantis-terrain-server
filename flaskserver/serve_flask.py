@@ -11,6 +11,7 @@ import socket
 import sqlite3
 import threading
 import time
+import urllib.parse
 import zlib
 from concurrent.futures import ThreadPoolExecutor
 from logging import FileHandler
@@ -21,6 +22,7 @@ import asyncio
 
 from colored_log import get_logger
 from terrain_config import BOOTSTRAP_SEED_DEPTH, MAX_TILE_DEPTH
+from world_identity import ensure_world_identity, read_world_identity
 
 log = get_logger("terrain")
 log_db = get_logger("terrain.db")
@@ -208,22 +210,32 @@ def _register_texture_demand(client_id: str, raw_generation: str | None) -> int:
   return generation
 
 # --- Texture retry queue (transient Dataforsyningen failures) ---
-_TEX_RETRY_MAX = 3
-_TEX_RETRY_DELAYS = [30, 60, 120]  # seconds between retries
+_TEX_RETRY_DELAYS = [30, 60, 120, 300]  # seconds between retries, then cap
 _tex_retry_queue: list[tuple[str, tuple, int]] = []  # (tile_id, bbox, attempt)
 _tex_retry_lock = threading.Lock()
+_tex_retry_tiles: set[str] = set()  # queued or currently sleeping/fetching
 _tex_retry_thread: threading.Thread | None = None
 
 
 def _tex_retry_enqueue(tile_id: str, bbox: tuple, attempt: int = 0) -> None:
   with _tex_retry_lock:
-    # Don't double-queue
-    for tid, _, _ in _tex_retry_queue:
-      if tid == tile_id:
-        return
+    if tile_id in _tex_retry_tiles:
+      return
+    _tex_retry_tiles.add(tile_id)
     _tex_retry_queue.append((tile_id, bbox, attempt))
     log_tex.debug(f"[tex-retry] enqueued {tile_id} attempt={attempt}")
   _ensure_tex_retry_thread()
+
+
+def _tex_retry_finish(tile_id: str) -> None:
+  with _tex_retry_lock:
+    _tex_retry_tiles.discard(tile_id)
+
+
+def _tex_retry_again(tile_id: str, bbox: tuple, attempt: int) -> None:
+  """Requeue an active transient retry without opening a duplicate window."""
+  with _tex_retry_lock:
+    _tex_retry_queue.append((tile_id, bbox, attempt))
 
 
 def _ensure_tex_retry_thread() -> None:
@@ -243,7 +255,10 @@ def _tex_retry_worker() -> None:
       tile_id, bbox, attempt = _tex_retry_queue.pop(0)
 
     delay = _TEX_RETRY_DELAYS[min(attempt, len(_TEX_RETRY_DELAYS) - 1)]
-    log_tex.debug(f"[tex-retry] {tile_id}: waiting {delay}s (attempt {attempt + 1}/{_TEX_RETRY_MAX})")
+    log_tex.info(
+      f"[tex-retry] {tile_id}: waiting {delay}s before provider attempt "
+      f"{attempt + 1}"
+    )
     time.sleep(delay)
 
     db = None
@@ -259,6 +274,7 @@ def _tex_retry_worker() -> None:
       ).fetchone()
       if cur_row and cur_row[0] not in _METATILE_UPGRADEABLE_SOURCES:
         log_tex.debug(f"[tex-retry] {tile_id}: already upgraded to {cur_row[0]}, skipping")
+        _tex_retry_finish(tile_id)
         continue
 
       metatile_id, _, _, _ = _texture_metatile_spec(tile_id)
@@ -268,31 +284,193 @@ def _tex_retry_worker() -> None:
           written, no_coverage = _store_texture_metatile(db, children)
           if tile_id in written:
             log_tex.info(f"[tex-retry] {tile_id}: SUCCESS on attempt {attempt + 1}")
+            _tex_retry_finish(tile_id)
           elif tile_id in no_coverage:
             _resolve_no_coverage(db, tile_id, cur_row[1] if cur_row else None, "[tex-retry]")
+            _tex_retry_finish(tile_id)
+          else:
+            _tex_retry_finish(tile_id)
         elif fail_reason == 'no_coverage':
           _resolve_no_coverage(db, tile_id, cur_row[1] if cur_row else None, "[tex-retry]")
+          _tex_retry_finish(tile_id)
         else:
-          # Still transient
-          if attempt + 1 < _TEX_RETRY_MAX:
-            _tex_retry_enqueue(tile_id, bbox, attempt + 1)
-            log_tex.debug(f"[tex-retry] {tile_id}: still transient, re-queued attempt {attempt + 2}")
-          else:
-            log_tex.warning(f"[tex-retry] {tile_id}: max retries exhausted")
-            _resolve_no_coverage(db, tile_id, cur_row[1] if cur_row else None, "[tex-retry]")
+          # Provider throttling/timeouts are not proof of no coverage. Keep
+          # the visual fallback and continue at the capped retry cadence.
+          _tex_retry_again(tile_id, bbox, attempt + 1)
+          log_tex.warning(
+            f"[tex-retry] {tile_id}: provider still transient; "
+            f"re-queued attempt {attempt + 2}"
+          )
     except Exception as exc:
       log_tex.error(f"[tex-retry] {tile_id}: FAILED: {type(exc).__name__}: {exc}")
+      _tex_retry_again(tile_id, bbox, attempt + 1)
     finally:
       if db is not None:
         db.close()
 
 
-_cog_fetch_lock = threading.Lock()
+_cog_scheduler_lock = threading.RLock()
 _cog_fetching_tiles: set[str] = set()
+_cog_pending_tiles: dict[str, tuple[float, float, float, float]] = {}
+_cog_demand_ids: set[str] = set()
 _cog_fetched_total = 0      # lifetime count of COG tiles fetched from S3
 _cog_skipped_total = 0      # lifetime count of tiles skipped (already had data)
 _cog_already_fetched: set[str] = set()  # tile IDs we've already fetched this session
+_cog_synthetic_retry_at: dict[str, float] = {}
+_cog_error_retry_at: dict[str, float] = {}
 _COG_TILE_WORKERS = max(1, _env_int("COG_TILE_WORKERS", 6))
+_COG_SYNTHETIC_RETRY_SECONDS = max(1, _env_int("COG_SYNTHETIC_RETRY_SECONDS", 300))
+_COG_ERROR_RETRY_SECONDS = max(1, _env_int("COG_ERROR_RETRY_SECONDS", 30))
+_cog_pool = ThreadPoolExecutor(max_workers=_COG_TILE_WORKERS)
+
+
+def _tile_ancestor_ids(tile_id: str):
+  parsed = _parse_tile_id(tile_id)
+  if parsed is None:
+    return
+  depth, column, row = parsed
+  while depth > 0:
+    depth -= 1
+    column //= 2
+    row //= 2
+    yield f"{depth}-{column}-{row}"
+
+
+def _fetch_one_cog_tile(tile_id, bbox):
+  """Fetch one DEM tile without waiting for an unrelated demand batch."""
+  from ingest import _read_cog_heightmap, _resample_from_parent
+  from database import CONFIDENCE, TileClobberError, write_tile
+  from serve import (
+    mark_no_data, _UPGRADEABLE_SOURCES, _cache_coastline,
+    _mark_official_ocean,
+  )
+
+  db = sqlite3.connect(str(DB_PATH), check_same_thread=False)
+  db.execute("PRAGMA journal_mode=WAL")
+  try:
+    row = db.execute(
+      "SELECT source FROM tiles WHERE tile_id = ?", (tile_id,)
+    ).fetchone()
+    upgrade = bool(row and row[0] in _UPGRADEABLE_SOURCES)
+    log_cog.debug(
+      f"[cog-worker] {tile_id}: reading "
+      f"bbox=[{bbox[0]:.0f},{bbox[1]:.0f},{bbox[2]:.0f},{bbox[3]:.0f}]"
+    )
+    data, src_name = _read_cog_heightmap(bbox, _GRID_N)
+
+    if data is None:
+      water = _cache_coastline(db, tile_id, bbox)
+      if water is not None and _np.all(water):
+        _mark_official_ocean(db, tile_id)
+        return "fetched"
+
+      with _cog_scheduler_lock:
+        ancestor_work = any(
+          ancestor in _cog_fetching_tiles or ancestor in _cog_pending_tiles
+          for ancestor in _tile_ancestor_ids(tile_id)
+        )
+      if ancestor_work:
+        return "defer"
+
+      data, src_name = _resample_from_parent(
+        db, tile_id, bbox=None, resolution=_GRID_N
+      )
+      if data is None:
+        mark_no_data(db, tile_id)
+        return "no_data"
+
+    source_name = src_name if isinstance(src_name, str) else "parent_resampled"
+    conf = CONFIDENCE.get(source_name, CONFIDENCE["arcticdem"])
+    cm = _np.where(_np.isnan(data), _np.uint8(0), _np.uint8(conf))
+    hm = _np.where(_np.isnan(data), 0.0, data).astype(_np.float32)
+    try:
+      write_tile(
+        db, tile_id, hm, cm, source_name, reconcile=False,
+        allow_overwrite=upgrade,
+      )
+      _cache_coastline(db, tile_id, bbox)
+      synthetic = source_name in {
+        "parent_resampled", "unmasked_parent_resampled",
+        "clobbered_parent_resampled",
+      }
+      if synthetic:
+        log_cog.info(f"[PARENT RESAMPLE] {tile_id}: temporary DEM from parent")
+      return "synthetic" if synthetic else "fetched"
+    except TileClobberError:
+      return "skipped"
+  except Exception as exc:
+    # Provider or transport failures are not evidence of absent terrain.
+    log_cog.warning(f"[COG FETCH] {tile_id}: {type(exc).__name__}: {exc}")
+    return "retry"
+  finally:
+    db.close()
+
+
+def _fill_cog_workers_locked():
+  while _cog_pending_tiles and len(_cog_fetching_tiles) < _COG_TILE_WORKERS:
+    tile_id = next(iter(_cog_pending_tiles))
+    bbox = _cog_pending_tiles.pop(tile_id)
+    _cog_fetching_tiles.add(tile_id)
+    _cog_already_fetched.add(tile_id)
+    future = _cog_pool.submit(_fetch_one_cog_tile, tile_id, bbox)
+    future.add_done_callback(
+      lambda completed, tid=tile_id, tile_bbox=bbox:
+        _finish_cog_tile(tid, tile_bbox, completed)
+    )
+
+
+def _finish_cog_tile(tile_id, bbox, future):
+  global _cog_fetched_total, _cog_skipped_total
+  try:
+    outcome = future.result()
+  except Exception as exc:
+    log_cog.error(f"[COG worker] {tile_id}: {type(exc).__name__}: {exc}")
+    outcome = "retry"
+
+  with _cog_scheduler_lock:
+    _cog_fetching_tiles.discard(tile_id)
+    if outcome == "defer":
+      _cog_already_fetched.discard(tile_id)
+      if tile_id in _cog_demand_ids:
+        _cog_pending_tiles[tile_id] = bbox
+    elif outcome == "retry":
+      _cog_already_fetched.discard(tile_id)
+      _cog_error_retry_at[tile_id] = time.time() + _COG_ERROR_RETRY_SECONDS
+    elif outcome == "fetched":
+      _cog_synthetic_retry_at.pop(tile_id, None)
+      _cog_error_retry_at.pop(tile_id, None)
+      _cog_fetched_total += 1
+    elif outcome == "synthetic":
+      _cog_fetched_total += 1
+      _cog_synthetic_retry_at[tile_id] = time.time() + _COG_SYNTHETIC_RETRY_SECONDS
+    elif outcome == "skipped":
+      _cog_skipped_total += 1
+    _fill_cog_workers_locked()
+
+
+def _schedule_cog_demand(missing, visible_synthetic=()):
+  """Replace unstarted work with the latest camera-priority ordering."""
+  global _cog_pending_tiles, _cog_demand_ids
+  with _cog_scheduler_lock:
+    now = time.time()
+    visible_retry_bboxes = dict(visible_synthetic)
+    due_synthetic = []
+    for tile_id, retry_at in list(_cog_synthetic_retry_at.items()):
+      if retry_at > now or tile_id not in visible_retry_bboxes:
+        continue
+      _cog_synthetic_retry_at.pop(tile_id, None)
+      _cog_already_fetched.discard(tile_id)
+      due_synthetic.append((tile_id, visible_retry_bboxes[tile_id]))
+    demand = list(missing) + due_synthetic
+    _cog_demand_ids = {tile_id for tile_id, _ in demand}
+    _cog_pending_tiles = {
+      tile_id: bbox for tile_id, bbox in demand
+      if tile_id not in _cog_already_fetched
+      and tile_id not in _cog_fetching_tiles
+      and now >= _cog_error_retry_at.get(tile_id, 0)
+    }
+    _fill_cog_workers_locked()
+    return len(_cog_fetching_tiles), len(_cog_pending_tiles)
 
 def _bootstrap_backend() -> None:
   global _backend_ready, _backend_error
@@ -348,6 +526,13 @@ def _bootstrap_backend() -> None:
       db.commit()
       log_db.info(f"Updated max_depth metadata to {MAX_TILE_DEPTH}")
 
+    world_identity = ensure_world_identity(db)
+    log_db.info(
+      "World identity: seed=%d procgenVersion=%d",
+      world_identity["worldSeed"],
+      world_identity["procgenVersion"],
+    )
+
     try:
       no_data_count = load_no_data_cache(db)
     except Exception:
@@ -377,7 +562,7 @@ def _bootstrap_backend() -> None:
     log_db.info(f"No-data cache: {no_data_count} tiles")
 
     import grundkort
-    grundkort.ensure_grundkort_async()
+    grundkort.ensure_grundkort_async(DB_PATH, ASSETS_DB_PATH)
 
     from ingest_coastline import ensure_gtk50_blocks
     threading.Thread(target=ensure_gtk50_blocks, daemon=True).start()
@@ -878,6 +1063,19 @@ _api_tiles_state: dict[str, str | None] = {"last_result": None}
 _terrain_lod_history: set[str] = set()
 _last_camera: dict[str, float] | None = None  # last /api/tiles pose, feeds /api/heatmap
 _BUILDING_QUERY_RANGE_M = 25000.0
+_HEIGHT_PAGE_BATCH_LIMIT = 4
+_height_page_batches: dict[str, dict[str, bytes]] = {}
+_height_page_batches_lock = threading.Lock()
+
+
+def _store_height_page_batch(batch_id: str, pages: dict[str, bytes]) -> None:
+  """Keep a few response-specific, seam-repaired binary height batches."""
+  with _height_page_batches_lock:
+    _height_page_batches.pop(batch_id, None)
+    _height_page_batches[batch_id] = pages
+    while len(_height_page_batches) > _HEIGHT_PAGE_BATCH_LIMIT:
+      oldest = next(iter(_height_page_batches))
+      _height_page_batches.pop(oldest, None)
 
 
 def _buildings_for_tile_query(qx: float, qy: float, ox: float, oy: float):
@@ -900,6 +1098,10 @@ def api_tiles():
   error = _arg_float("error", 0.0005)
   max_depth = min(_arg_int("maxDepth", MAX_TILE_DEPTH), MAX_TILE_DEPTH)
   max_range = _arg_float("range", 16000.0)
+  manifest_only = request.args.get("manifest", "0").lower() in {"1", "true", "yes"}
+  default_budget = 384 if manifest_only else 2500
+  minimum_budget = 16 if manifest_only else 64
+  tile_budget = max(minimum_budget, min(2500, _arg_int("budget", default_budget)))
 
   if "sx" in request.args and "sy" in request.args:
     qx = _arg_float("sx", 0.0)
@@ -935,6 +1137,10 @@ def api_tiles():
       heading=heading if has_heading else None,
       preview=preview,
       lod_history=_terrain_lod_history,
+      max_tiles=tile_budget,
+      # Manifest responses still run the normal response-wide seam repair. The
+      # repaired arrays become binary pages instead of base64 JSON payloads.
+      include_heightmaps=True,
       log=lambda msg: log.debug(f"[/api/tiles] {msg}"),
     )
   except Exception as exc:
@@ -948,7 +1154,10 @@ def api_tiles():
   else:
     log.debug(f"[/api/tiles] result: {len(tiles)} tiles, {len(missing)} missing")
 
-  all_tile_ids = [t["id"] for t in tiles if t["heightmap"] is not None]
+  all_tile_ids = [
+    t["id"] for t in tiles
+    if t.get("heightmap") is not None or bool(t.get("has_heightmap"))
+  ]
   check_ids = set(all_tile_ids)
   for tid in all_tile_ids:
     d, c, r = _parse_tile_id(tid) or (0, 0, 0)
@@ -969,6 +1178,13 @@ def api_tiles():
   fwd_y = math.cos(heading) if heading else 1.0
 
   tile_data = []
+  height_pages: dict[str, bytes] = {}
+  height_batch_id = None
+  if manifest_only:
+    page_identity = "|".join(
+      f"{tile['id']}:{tile.get('updated_at') or '0'}" for tile in tiles
+    )
+    height_batch_id = f"{zlib.crc32(page_identity.encode('utf-8')) & 0xffffffff:08x}"
   tex_status_counts = {
     "ready": 0,
     "ancestor_fallback": 0,
@@ -976,7 +1192,7 @@ def api_tiles():
     "missing": 0,
   }
   for tile in tiles:
-    hm = tile["heightmap"]
+    hm = tile.get("heightmap")
     if hm is None:
       continue
 
@@ -988,13 +1204,12 @@ def api_tiles():
     if tex_status in tex_status_counts:
       tex_status_counts[tex_status] += 1
 
-    tile_data.append(
-      {
+    item = {
         "id": tid,
         "bbox": [bbox[0] - ox, bbox[1] - oy, bbox[2] - ox, bbox[3] - oy],
         "depth": tile["depth"],
+        "source": tile["source"],
         "resolution": _GRID_N,
-        "heightmap": base64.b64encode(hm.astype(_np.float32).tobytes()).decode("ascii"),
         "hasTexture": bool(tex_flags["has_texture"]),
         "texAvailable": bool(tex_flags["available"]),
         "texStatus": tex_status,
@@ -1003,7 +1218,21 @@ def api_tiles():
         "texIsFetching": bool(tex_flags["is_fetching"]),
         "texPriority": math.log(max(priority, 1.0)),
       }
-    )
+    if manifest_only:
+      height_version = tile.get("updated_at") or "0"
+      page_version = f"{height_version}:{height_batch_id}"
+      height_pages[tid] = hm.astype(_np.float32).tobytes()
+      item["heightmapUrl"] = (
+        f"/api/height/{tid}.bin?batch={height_batch_id}"
+        f"&v={urllib.parse.quote(page_version)}"
+      )
+      item["heightVersion"] = page_version
+    else:
+      item["heightmap"] = base64.b64encode(hm.astype(_np.float32).tobytes()).decode("ascii")
+    tile_data.append(item)
+
+  if manifest_only and height_batch_id is not None:
+    _store_height_page_batch(height_batch_id, height_pages)
 
   missing_data = []
   for tid, bbox in missing:
@@ -1016,134 +1245,18 @@ def api_tiles():
       }
     )
 
-  # Background COG fetch for missing heightmap tiles
-  if missing and _cog_fetch_lock.acquire(blocking=False):
-    # Dedup: skip tiles we've already fetched or attempted this session
-    deduped = [(tid, bbox) for tid, bbox in missing if tid not in _cog_already_fetched]
-    skipped = len(missing) - len(deduped)
-    if skipped:
-      log_cog.info(f"[COG dedup] {skipped} already fetched this session, {len(deduped)} new")
-    if not deduped:
-      _cog_fetch_lock.release()
-    else:
-      # Mark all as attempted before spawning thread
-      for tid, _ in deduped:
-        _cog_already_fetched.add(tid)
-
-      def _bg_cog_fetch(missing_list):
-        global _cog_fetched_total, _cog_skipped_total
-        db = None
-        try:
-          from concurrent.futures import ThreadPoolExecutor, as_completed
-          from ingest import _read_cog_heightmap, _resample_from_parent
-          from database import CONFIDENCE, write_tile
-          from serve import (
-            mark_no_data, _UPGRADEABLE_SOURCES, _cache_coastline,
-            _mark_official_ocean,
-          )
-
-          db = sqlite3.connect(str(DB_PATH), check_same_thread=False)
-          db.execute("PRAGMA journal_mode=WAL")
-          log_cog.info(f"Starting {len(missing_list)} tiles from S3... (session: {_cog_fetched_total} fetched, {_cog_skipped_total} skipped)")
-
-          upgrade_ids = set()
-          bbox_by_id = {tid: bbox for tid, bbox in missing_list}
-          for tid, _ in missing_list:
-            row = db.execute(
-              "SELECT source FROM tiles WHERE tile_id = ?", (tid,)
-            ).fetchone()
-            if row and row[0] in _UPGRADEABLE_SOURCES:
-              upgrade_ids.add(tid)
-
-          def _worker(tile_id, bbox):
-            log_cog.debug(f"[cog-worker] {tile_id}: reading bbox=[{bbox[0]:.0f},{bbox[1]:.0f},{bbox[2]:.0f},{bbox[3]:.0f}]")
-            return tile_id, _read_cog_heightmap(bbox, _GRID_N)
-
-          fetched, no_data_count, parent_resampled_count = 0, 0, 0
-          # Collect tiles that COG couldn't resolve for a second-pass parent resample
-          cog_failed = []
-          with ThreadPoolExecutor(max_workers=_COG_TILE_WORKERS) as pool:
-            futs = {pool.submit(_worker, tid, bbox): tid for tid, bbox in missing_list}
-            for fut in as_completed(futs):
-              tid = futs[fut]
-              try:
-                tile_id, (data, src_name) = fut.result()
-                if data is None:
-                  water = _cache_coastline(db, tile_id, bbox_by_id[tile_id])
-                  if water is not None and _np.all(water):
-                    _mark_official_ocean(db, tile_id)
-                    fetched += 1
-                    _cog_fetched_total += 1
-                    continue
-                  cog_failed.append(tile_id)
-                  continue
-                conf = CONFIDENCE.get(src_name, CONFIDENCE['arcticdem'])
-                cm = _np.where(_np.isnan(data), _np.uint8(0), _np.uint8(conf))
-                hm = _np.where(_np.isnan(data), 0.0, data).astype(_np.float32)
-                write_tile(
-                  db, tile_id, hm, cm, src_name, reconcile=False,
-                  allow_overwrite=tile_id in upgrade_ids,
-                )
-                _cache_coastline(db, tile_id, bbox_by_id[tile_id])
-                fetched += 1
-                _cog_fetched_total += 1
-              except Exception as exc:
-                log_cog.warning(
-                  f"  [COG FETCH] {tid}: failed after source read: "
-                  f"{type(exc).__name__}: {exc}"
-                )
-                cog_failed.append(tid)
-              finally:
-                _cog_fetching_tiles.discard(tid)
-
-          # Second pass: try parent resampling for tiles that had no COG data.
-          # Sort by depth (shallowest first) so parent tiles get written before
-          # their children try to resample from them — enables chaining
-          # (depth-10 → depth-11 → depth-12 in one pass).
-          cog_failed.sort(key=lambda tid: int(tid.split('-')[0]))
-          for tile_id in cog_failed:
-            try:
-              data, src_name = _resample_from_parent(db, tile_id, bbox=None, resolution=_GRID_N)
-              if data is not None:
-                source_name = src_name if isinstance(src_name, str) else "parent_resampled"
-                conf = CONFIDENCE.get(source_name, CONFIDENCE['arcticdem'])
-                cm = _np.where(_np.isnan(data), _np.uint8(0), _np.uint8(conf))
-                hm = _np.where(_np.isnan(data), 0.0, data).astype(_np.float32)
-                from database import TileClobberError
-                try:
-                  write_tile(
-                    db, tile_id, hm, cm, source_name, reconcile=False,
-                    allow_overwrite=tile_id in upgrade_ids,
-                  )
-                  _cache_coastline(db, tile_id, bbox_by_id[tile_id])
-                  parent_resampled_count += 1
-                  _cog_fetched_total += 1
-                  log_cog.info(f"  [PARENT RESAMPLE] {tile_id}: filled from parent")
-                except TileClobberError:
-                  # Already has data (e.g. from a previous request) — that's fine
-                  parent_resampled_count += 1
-                  _cog_skipped_total += 1
-              else:
-                mark_no_data(db, tile_id)
-                no_data_count += 1
-            except Exception as exc:
-              log_cog.warning(f"  [PARENT RESAMPLE] {tile_id}: failed: {exc}")
-              mark_no_data(db, tile_id)
-              no_data_count += 1
-
-          log_cog.info(f"Done: {fetched} fetched, {parent_resampled_count} parent-resampled, {no_data_count} no data (session totals: {_cog_fetched_total} fetched, {_cog_skipped_total} skipped)")
-        finally:
-          if db is not None:
-            db.close()
-          _cog_fetching_tiles.clear()
-          _cog_fetch_lock.release()
-
-      _cog_fetching_tiles.clear()
-      for tid, _ in deduped:
-        _cog_fetching_tiles.add(tid)
-      threading.Thread(target=_bg_cog_fetch, args=(deduped,), daemon=True).start()
-
-  downloading = list(_cog_fetching_tiles)
+  # Feed every free worker from the current camera-priority order. Unstarted
+  # work is replaced on each request, so a stale batch cannot block the view.
+  # Only genuine misses enter the live camera queue. Parent-resampled tiles
+  # are valid visual fallbacks; globally restoring every visible one caused
+  # distant LOD to saturate Flask and compete with the renderer.
+  active_cog, pending_cog = _schedule_cog_demand(missing, ())
+  if missing:
+    log_cog.debug(
+      f"[COG scheduler] {active_cog} active, {pending_cog} priority-queued"
+    )
+  with _cog_scheduler_lock:
+    downloading = list(_cog_fetching_tiles)
 
   try:
     buildings = _buildings_for_tile_query(qx, qy, ox, oy)
@@ -1169,10 +1282,47 @@ def api_tiles():
       "texQueued": len(tex_fetching),
       "texRetryQueue": len(_tex_retry_queue),
       "texStatusCounts": tex_status_counts,
+      "manifest": manifest_only,
+      "tileBudget": tile_budget,
+      "heightPageBatch": height_batch_id,
+      "heightPageSeams": "response-repaired" if manifest_only else None,
       "buildings": buildings,
       "buildingCount": len(buildings) if buildings is not None else None,
+      **read_world_identity(_get_db()),
     }
   )
+
+
+@app.get("/api/height/<tile_id>.bin")
+def api_tile_height(tile_id: str):
+  """Return a response-repaired little-endian float32 height page."""
+  if _parse_tile_id(tile_id) is None:
+    return Response(b"", status=400)
+  batch_id = request.args.get("batch", "").strip()
+  if batch_id:
+    with _height_page_batches_lock:
+      raw = _height_page_batches.get(batch_id, {}).get(tile_id)
+    if raw is None:
+      return Response(b"", status=410, headers={"X-Height-Status": "batch_expired"})
+    response = Response(raw, mimetype="application/octet-stream")
+    response.headers["Cache-Control"] = "private, max-age=31536000, immutable"
+    response.headers["X-Height-Resolution"] = str(_GRID_N)
+    response.headers["X-Height-Seams"] = "response-repaired"
+    response.headers["ETag"] = f'"{tile_id}:{batch_id}"'
+    return response
+  from database import read_tile
+  tile = read_tile(_get_db(), tile_id)
+  heightmap = tile.get("heightmap") if tile else None
+  if heightmap is None:
+    return Response(b"", status=404)
+  raw = heightmap.astype(_np.float32).tobytes()
+  response = Response(raw, mimetype="application/octet-stream")
+  response.headers["Cache-Control"] = "private, max-age=31536000, immutable"
+  response.headers["X-Height-Resolution"] = str(_GRID_N)
+  version = tile.get("updated_at")
+  if version is not None:
+    response.headers["ETag"] = f'"{tile_id}:{version}"'
+  return response
 
 
 @app.get("/api/assets")
@@ -1453,6 +1603,97 @@ def api_terrain_channel(tile_id: str, chan: str):
     mimetype="image/png",
     headers={"Cache-Control": "no-store", "X-Tex-Source": f"channel_{chan}",
              "X-DEM-Depth": str(hm_depth), "X-DEM-Source": str(hm_source)},
+  )
+
+
+@app.get("/api/fields/<tile_id>")
+def api_tile_fields(tile_id: str):
+  """Return cached continuous procedural fields for one terrain tile."""
+  unavailable = _terrain_unavailable_response()
+  if unavailable is not None:
+    return unavailable
+  parsed = _parse_tile_id(tile_id)
+  if parsed is None:
+    return Response(b"", status=400)
+  depth, column, row = parsed
+
+  from fields import (
+    FIELD_KEYS,
+    FIELD_RES,
+    compute_fields,
+    init_fields_cache,
+    pack_fields,
+    read_fields_cache,
+    write_fields_cache,
+  )
+  try:
+    resolution = max(32, min(256, int(request.args.get("res", str(FIELD_RES)))))
+  except ValueError:
+    return Response(b"", status=400)
+
+  db = _get_db()
+  init_fields_cache(db)
+  source_rows = (
+    db.execute(
+      "SELECT updated_at FROM textures WHERE tile_id = ?", (tile_id,)
+    ).fetchone(),
+    db.execute(
+      "SELECT updated_at FROM tiles WHERE tile_id = ?", (tile_id,)
+    ).fetchone(),
+    db.execute(
+      "SELECT updated_at FROM coastline_masks WHERE tile_id = ?", (tile_id,)
+    ).fetchone(),
+  )
+  source_version = "|".join(str(item[0]) if item else "" for item in source_rows)
+  headers = {
+    "Cache-Control": "no-store",
+    "X-Field-Keys": ",".join(FIELD_KEYS),
+  }
+  cached = read_fields_cache(db, tile_id, resolution, source_version)
+  if cached is not None:
+    return Response(
+      cached,
+      mimetype="application/octet-stream",
+      headers={**headers, "X-Fields": "cache"},
+    )
+
+  heightmap, height_source, _height_depth = _heightmap_ancestor_crop(
+    db, depth, column, row
+  )
+  if heightmap is None:
+    return Response(b"", status=404, headers={"X-Tex-Status": "no_heightmap"})
+  # The browser already locks classifier requests to PROCGEN_SOURCE_DEPTH.
+  # Do not make a temporary provenance upgrade hide the procedural window.
+  texture = _read_texture(db, tile_id)
+  if texture is None:
+    return Response(b"", status=202, headers={"X-Tex-Status": "no_texture"})
+
+  from coastline import read_water_mask
+  water_mask = read_water_mask(db, tile_id)
+  if water_mask is not None:
+    # Coastline storage follows the DEM (south-first); procedural fields are
+    # texture-aligned (north-first).
+    water_mask = _np.ascontiguousarray(_np.flipud(water_mask), dtype=_np.float32)
+  rgb = _np.asarray(
+    _Image.open(io.BytesIO(texture)).convert("RGB"), dtype=_np.uint8
+  )
+  bbox = _tile_bbox(depth, column, row)
+  field_values = compute_fields(
+    rgb,
+    heightmap,
+    bbox[2] - bbox[0],
+    water_mask=water_mask,
+  )
+  blob = pack_fields(field_values, resolution)
+  write_fields_cache(db, tile_id, resolution, blob, source_version)
+  return Response(
+    blob,
+    mimetype="application/octet-stream",
+    headers={
+      **headers,
+      "X-Fields": "computed",
+      "X-DEM-Source": str(height_source),
+    },
   )
 
 

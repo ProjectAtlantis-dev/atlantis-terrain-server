@@ -1,6 +1,7 @@
 export function defaultTerrainStartupAssets() {
   return {
     vehicle_definition: {},
+    vehicle_definitions: {},
     structure_definition: {},
     vehicle_instances: [],
     structure_instances: [],
@@ -13,6 +14,15 @@ export function normalizeTerrainStartupAssets(payload) {
 
   if (payload.vehicle_definition != null && typeof payload.vehicle_definition === 'object') {
     normalized.vehicle_definition = { ...payload.vehicle_definition };
+  }
+  if (payload.vehicle_definitions != null
+    && typeof payload.vehicle_definitions === 'object'
+    && !Array.isArray(payload.vehicle_definitions)) {
+    normalized.vehicle_definitions = Object.fromEntries(
+      Object.entries(payload.vehicle_definitions)
+        .filter(([, value]) => value != null && typeof value === 'object' && !Array.isArray(value))
+        .map(([id, value]) => [id, { ...value }]),
+    );
   }
   if (payload.structure_definition != null && typeof payload.structure_definition === 'object') {
     normalized.structure_definition = { ...payload.structure_definition };
@@ -41,7 +51,7 @@ export async function loadTerrainStartupAssets({
 } = {}) {
   const fallback = {
     source: 'defaults',
-    schemaVersion: 4,
+    schemaVersion: 5,
     seeded: null,
     ...defaultTerrainStartupAssets(),
   };
@@ -63,7 +73,7 @@ export async function loadTerrainStartupAssets({
     const payload = await response.json();
     const normalized = normalizeTerrainStartupAssets(payload);
     const source = typeof payload?.source === 'string' ? payload.source : 'metadata';
-    const schemaVersion = Number.isFinite(payload?.schemaVersion) ? payload.schemaVersion : 4;
+    const schemaVersion = Number.isFinite(payload?.schemaVersion) ? payload.schemaVersion : 5;
     bootLog('assets.fetch.ok', {
       endpoint,
       status: response.status,

@@ -1,6 +1,6 @@
 import {
   adoptTerrainOrigin, buildTerrainTilesRequest, offsetTerrainPayload,
-  selectTerrainFrameOffset, summarizeTerrainResponse,
+  hydrateTerrainHeightmaps, selectTerrainFrameOffset, summarizeTerrainResponse,
   summarizeTerrainCamera, terrainCameraCoordinates, terrainCameraGridPosition,
   terrainCameraStereoPosition, terrainPipelineStatus,
 } from './terrain-tile-fetch.js';
@@ -16,10 +16,17 @@ export function createTerrainFetchRuntime({
   fetchImpl = (...args) => fetch(...args),
   now = () => performance.now(),
   pollMs = 3000,
-  scheduleFrame = callback => requestAnimationFrame(callback),
+  // WebGPU pipeline compilation can occupy the first animation frame for a
+  // long time. Terrain residency must still advance while frames are
+  // throttled or the tab is backgrounded.
+  scheduleFrame = callback => setTimeout(callback, 0),
   schedulePoll = (callback, delay) => setTimeout(callback, delay),
   cancelPoll = timer => clearTimeout(timer),
   events = {},
+  getRequestFocus = null,
+  useManifest = false,
+  tileBudget = 384,
+  previewTileBudget = 16,
   testOverrides = {},
 }) {
   const {
@@ -35,6 +42,7 @@ export function createTerrainFetchRuntime({
   let pollTimer = null;
   let generation = 0;
   let activeController = null;
+  const heightmapCache = new Map();
 
   function getCameraCoordinates() {
     return testOverrides.getCameraCoordinates?.() ?? terrainCameraCoordinates({
@@ -65,7 +73,7 @@ export function createTerrainFetchRuntime({
     const started = now();
     const cameraCoordinates = getCameraCoordinates();
     const cameraSnapshot = getCameraSnapshot(cameraCoordinates);
-    const gridPosition = state.frameOffsetReady
+    const cameraGridPosition = state.frameOffsetReady
       ? terrainCameraGridPosition({
           eastM: cameraCoordinates.eastM,
           northM: cameraCoordinates.northM,
@@ -75,9 +83,21 @@ export function createTerrainFetchRuntime({
           frameOffsetY: state.frameOffsetY,
         })
       : null;
+    const explicitCoordinates = Number.isFinite(lat) && Number.isFinite(lon);
+    const requestFocus = explicitCoordinates
+      ? { lat, lon }
+      : (getRequestFocus?.({
+          cameraCoordinates,
+          gridPosition: cameraGridPosition,
+        }) ?? {
+          lat: cameraCoordinates.lat,
+          lon: cameraCoordinates.lon,
+          x: cameraGridPosition?.x,
+          y: cameraGridPosition?.y,
+        });
     const request = buildTerrainTilesRequest({
-      lat: lat ?? cameraCoordinates.lat,
-      lon: lon ?? cameraCoordinates.lon,
+      lat: requestFocus.lat ?? cameraCoordinates.lat,
+      lon: requestFocus.lon ?? cameraCoordinates.lon,
       altitude: cameraCoordinates.alt,
       heading: testOverrides.getHeading?.()
         ?? view.getHeading?.()
@@ -91,9 +111,13 @@ export function createTerrainFetchRuntime({
       previewMaxDepth, isFirstLoad: state.firstLoad,
       frameOffsetReady: state.frameOffsetReady,
       originX: state.originX, originY: state.originY,
-      queryX: gridPosition?.x, queryY: gridPosition?.y,
+      queryX: explicitCoordinates ? null : requestFocus.x,
+      queryY: explicitCoordinates ? null : requestFocus.y,
+      useManifest,
+      tileBudget: pass === 1 ? Math.min(tileBudget, previewTileBudget) : tileBudget,
       cameraSnapshot,
     });
+    Object.assign(request.logDetails, requestFocus.logDetails ?? {});
     logger.enqueue('info', `fetchTiles.request[pass${pass}]`, request.logDetails);
     const response = await fetchImpl(request.url, { signal });
     const data = await response.json();
@@ -103,6 +127,19 @@ export function createTerrainFetchRuntime({
     }
     if (!Array.isArray(data?.tiles)) {
       throw new TypeError('terrain tile response is missing a tiles array');
+    }
+    if (data.manifest) {
+      const hydration = await hydrateTerrainHeightmaps(data.tiles, {
+        cache: heightmapCache,
+        fetchImpl,
+        signal,
+      });
+      logger.enqueue('info', `fetchTiles.heightPages[pass${pass}]`, {
+        ...hydration,
+        tileBudget: data.tileBudget ?? null,
+        pageBatch: data.heightPageBatch ?? null,
+        seamPolicy: data.heightPageSeams ?? 'unknown',
+      });
     }
     const local = testOverrides.getCameraLocalPosition?.() ?? {
       x: cameraCoordinates.eastM,
@@ -167,7 +204,7 @@ export function createTerrainFetchRuntime({
     terrain.updateTextures(data.tiles);
     onAvailability(data.missing || [], data.downloading || []);
     state.lastTiles = data.tiles;
-    onResponseApplied();
+    onResponseApplied(data, pass);
 
     state.cameraStereoX = state.lastFetchX = data.qx;
     state.cameraStereoY = state.lastFetchY = data.qy;

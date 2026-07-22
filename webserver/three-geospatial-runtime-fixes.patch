@@ -1,0 +1,88 @@
+diff --git a/packages/clouds/src/webgpu/CloudBeerShadowMapNode.ts b/packages/clouds/src/webgpu/CloudBeerShadowMapNode.ts
+--- a/packages/clouds/src/webgpu/CloudBeerShadowMapNode.ts
++++ b/packages/clouds/src/webgpu/CloudBeerShadowMapNode.ts
+@@ -121,6 +121,12 @@ export class CloudBeerShadowMapNode extends TempNode {
+   // leaves the fitted cascades, and at most every `updateInterval` frames
+   // otherwise (there is no temporal accumulation to feed every frame).
+   updateInterval = 30
++  // Floor between movement-triggered dispatches. Without it, sustained fast
++  // flight (>10 m per frame) re-submits the full density march every frame —
++  // one large ingredient of the flythrough freeze. Cloud shadows lagging a
++  // few frames behind a fast camera is invisible; a per-frame ~39 M-sample
++  // dispatch is not.
++  minDispatchInterval = 10
+   /** Diagnostic: number of compute dispatches actually submitted. */
+   dispatchCount = 0
+ 
+@@ -192,6 +198,9 @@ export class CloudBeerShadowMapNode extends TempNode {
+     ) {
+       return
+     }
++    if (this.framesSinceDispatch < this.minDispatchInterval) {
++      return
++    }
+     this.framesSinceDispatch = 0
+     this.lastSunDirection.copy(sunDirectionWorld)
+     this.lastCameraPosition.copy(this.camera.position)
+diff --git a/packages/clouds/src/webgpu/ProceduralTexture3DNode.ts b/packages/clouds/src/webgpu/ProceduralTexture3DNode.ts
+--- a/packages/clouds/src/webgpu/ProceduralTexture3DNode.ts
++++ b/packages/clouds/src/webgpu/ProceduralTexture3DNode.ts
+@@ -106,12 +106,25 @@ export abstract class ProceduralTexture3DNode extends TempNode {
+     return super.setup(builder)
+   }
+ 
+-  override updateBefore(frame: NodeFrame): void {
++  // When managed externally (autoDispatch = false), the owner must call
++  // dispatch(renderer) from the application loop OUTSIDE the frame: in-frame
++  // compute submits race the first-frame pipeline builds on three r182 and
++  // nondeterministically corrupt unrelated passes (e.g. atmosphere LUTs ->
++  // black sky).
++  autoDispatch = true
++
++  dispatch(renderer: { compute: (node: never) => unknown }): void {
+     if (this.computeDispatched || this.computeNode == null) {
+       return
+     }
+     this.computeDispatched = true
+-    void frame.renderer!.compute(this.computeNode as never)
++    void renderer.compute(this.computeNode as never)
++  }
++
++  override updateBefore(frame: NodeFrame): void {
++    if (this.autoDispatch) {
++      this.dispatch(frame.renderer as never)
++    }
+   }
+ 
+   override dispose(): void {
+diff --git a/packages/clouds/src/webgpu/ProceduralTextureNode.ts b/packages/clouds/src/webgpu/ProceduralTextureNode.ts
+--- a/packages/clouds/src/webgpu/ProceduralTextureNode.ts
++++ b/packages/clouds/src/webgpu/ProceduralTextureNode.ts
+@@ -104,12 +104,25 @@ export abstract class ProceduralTextureNode extends TempNode {
+     return super.setup(builder)
+   }
+ 
+-  override updateBefore(frame: NodeFrame): void {
++  // When managed externally (autoDispatch = false), the owner must call
++  // dispatch(renderer) from the application loop OUTSIDE the frame: in-frame
++  // compute submits race the first-frame pipeline builds on three r182 and
++  // nondeterministically corrupt unrelated passes (e.g. atmosphere LUTs ->
++  // black sky).
++  autoDispatch = true
++
++  dispatch(renderer: { compute: (node: never) => unknown }): void {
+     if (this.computeDispatched || this.computeNode == null) {
+       return
+     }
+     this.computeDispatched = true
+-    void frame.renderer!.compute(this.computeNode as never)
++    void renderer.compute(this.computeNode as never)
++  }
++
++  override updateBefore(frame: NodeFrame): void {
++    if (this.autoDispatch) {
++      this.dispatch(frame.renderer as never)
++    }
+   }
+ 
+   override dispose(): void {

@@ -1,6 +1,15 @@
 import * as THREE from 'three';
 
 export function decodeTerrainHeightmap(base64, decodeBase64 = value => atob(value)) {
+  if (base64 instanceof Float32Array) return base64;
+  if (base64 instanceof ArrayBuffer) return new Float32Array(base64);
+  if (ArrayBuffer.isView(base64)) {
+    return new Float32Array(
+      base64.buffer,
+      base64.byteOffset,
+      Math.floor(base64.byteLength / Float32Array.BYTES_PER_ELEMENT),
+    );
+  }
   const raw = decodeBase64(base64);
   const bytes = new Uint8Array(raw.length);
   for (let index = 0; index < raw.length; index++) bytes[index] = raw.charCodeAt(index);
@@ -143,6 +152,7 @@ export function createTerrainMeshBuilder({ exaggeration, attachScatter }) {
       // Keep the exact payload that produced this mesh so reconciliation can
       // replace stale geometry without requiring a page refresh.
       heightmapPayload: tile.heightmap,
+      heightmapVersion: tile.heightVersion ?? null,
       terrainColorAttribute,
       classifierColorAttribute,
     });

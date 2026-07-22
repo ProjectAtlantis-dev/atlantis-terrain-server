@@ -114,7 +114,10 @@ def _ensure_schema(db) -> None:
     db.commit()
 
 
-def ensure_grundkort(db_path: Path = DB_PATH) -> None:
+def ensure_grundkort(
+    db_path: Path = DB_PATH,
+    assets_db_path: Path = ASSETS_DB_PATH,
+) -> None:
     """Download configured settlements, ingest missing rows. Idempotent."""
     ZIP_DIR.mkdir(exist_ok=True)
     for folder in GRUNDKORT_SETTLEMENTS:
@@ -159,22 +162,27 @@ def ensure_grundkort(db_path: Path = DB_PATH) -> None:
     db = sqlite3.connect(str(db_path))
     _, pending = repair_unsampled_ground(db)
     db.close()
-    sync_buildings_to_assets(db_path)
-    sync_roads_to_assets(db_path)
+    sync_buildings_to_assets(db_path, assets_db_path)
+    sync_roads_to_assets(db_path, assets_db_path)
     if pending:
         log.info(
             f"[grundkort] {pending} building grounds still estimated — "
             f"retrying every {_GROUND_RETRY_S:.0f}s as heightmaps arrive"
         )
         threading.Thread(
-            target=_ground_retry_loop, args=(db_path,), daemon=True
+            target=_ground_retry_loop,
+            args=(db_path, assets_db_path),
+            daemon=True,
         ).start()
 
 
-def ensure_grundkort_async() -> None:
+def ensure_grundkort_async(
+    db_path: Path = DB_PATH,
+    assets_db_path: Path = ASSETS_DB_PATH,
+) -> None:
     def _run() -> None:
         try:
-            ensure_grundkort()
+            ensure_grundkort(db_path, assets_db_path)
         except Exception as exc:
             log.error(f"[grundkort] startup ingest failed: {type(exc).__name__}: {exc}")
 
@@ -337,7 +345,7 @@ def sync_roads_to_assets(
     return len(rows)
 
 
-def _ground_retry_loop(db_path: Path) -> None:
+def _ground_retry_loop(db_path: Path, assets_db_path: Path = ASSETS_DB_PATH) -> None:
     """Retry ground re-sampling until no building is left on an estimate."""
     while True:
         time.sleep(_GROUND_RETRY_S)
@@ -345,7 +353,7 @@ def _ground_retry_loop(db_path: Path) -> None:
         fixed, pending = repair_unsampled_ground(db)
         db.close()
         if fixed:
-            sync_buildings_to_assets(db_path)
+            sync_buildings_to_assets(db_path, assets_db_path)
         if pending == 0:
             log.info("[grundkort] all building grounds sampled from heightmaps")
             return

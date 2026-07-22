@@ -5,7 +5,7 @@ import unittest
 from unittest.mock import patch
 
 from serve import (
-    _lod_complete_ancestors, _lod_leaf_descendants_cover, _traverse,
+    _collapse_leaf_budget, _lod_complete_ancestors, _lod_leaf_descendants_cover, _traverse,
     bbox_in_view_circle,
     bbox_view_priority,
 )
@@ -49,6 +49,22 @@ class TestBboxViewPriority(unittest.TestCase):
 
 
 class TestViewCoverageCircle(unittest.TestCase):
+    def test_tile_budget_uses_a_real_parent_instead_of_dropping_coverage(self):
+        leaves = {'12-20-40', '12-21-40', '12-20-41', '12-21-41'}
+        parent = {
+            'tile_id': '11-10-20',
+            'depth': 11,
+            'source': 'arcticdem',
+            'bbox': [100, 0, 200, 100],
+        }
+
+        with patch('serve.read_tile_metadata', side_effect=lambda _db, tile_id: (
+            parent if tile_id == '11-10-20' else None
+        )):
+            result = _collapse_leaf_budget(None, leaves, 0, 0, 2, lambda _message: None)
+
+        self.assertEqual(result, ['11-10-20'])
+
     def test_lod_history_requires_complete_descendant_coverage(self):
         complete = {'12-20-40', '12-21-40', '12-20-41', '12-21-41'}
         self.assertTrue(_lod_leaf_descendants_cover(11, 10, 20, complete))

@@ -3,7 +3,19 @@
 
 Our 3D Greenland terrain system. Clone the repo, follow the install instructions below, and start exploring — all terrain data (heightmaps and textures) is downloaded automatically as you fly around. No bulk downloads or pre-processing needed.
 
-The front end in /webserver folder is running vite. The entry point is `main.js` → `main.terrain.js`. The SPA uses a heatmap priority approach to determine what tiles/textures to load or drop, and uses [Takram three-geospatial](https://github.com/takram-design-engineering/three-geospatial) for atmosphere and cloud effects. There is a map view (no clouds) to help with navigation and tile debugging.
+The frontend in `/webserver` runs on Vite. `main.js` selects WebGPU or WebGL and starts the shared `terrain-application.js`; renderer-specific code lives behind adapters in `render-backends/`. Terrain streaming, controls, vehicles, buildings, roads, and water lifecycle are shared by both renderers. Camera demand drives a bounded preview/full tile stream, with heading-aware fetch priority and radial levels of detail. [Takram three-geospatial](https://github.com/takram-design-engineering/three-geospatial) provides atmosphere and cloud effects. There is a map view (no clouds) to help with navigation and tile debugging.
+
+## Rendering and Procedural Detail
+
+The frontend uses Three.js r184. WebGL and WebGPU render the same streamed ArcticDEM geometry and satellite imagery through separate backend adapters. Animated FFT water has GLSL and TSL implementations backed by the same spectrum model. The expensive water simulation is initialized only after terrain is visible, so it does not block the initial terrain response.
+
+WebGPU additionally loads `terrain-procedural-assets-runtime.js` as a separate chunk; WebGL never imports or initializes its compute resources. This Atlantis runtime maintains a compact camera- or vehicle-centered detail window over the authoritative streamed terrain. It resamples tile heightmaps and server classifier fields, then deterministically places tundra ground cover, understory plants, and rocks with GPU compute. Window identity comes from the server world seed and procgen version, placement uses absolute EPSG:3413 coordinates, and fine detail is hidden at flight altitude or speed. Satellite imagery remains authoritative outside the near field and whenever procedural inputs are unavailable.
+
+Rendering and procedural classification have separate depth policies. The renderer may step from depth 12 near the camera down to depth 8 at the distant rim, while procedural generation samples only tiles at `PROCGEN_SOURCE_DEPTH` (12 by default); distant render LOD never drives vegetation or rock placement. `TERRAIN_MAX_DEPTH` and `PROCGEN_SOURCE_DEPTH` are environment settings, so a future Atlantis upscaler can opt into a deeper authoritative source without rewriting the runtime.
+
+The WebGPU post stack uses three invalidation-driven shadow cascades (500 m, 8 km, and 50 km), temporal antialiasing, GTAO/contact grounding, atmospheric lens flare, procedural cloud surface shadows, and cloud-density god rays. Shadow refresh work is budgeted across frames, and the expensive cloud-density march is throttled during fast travel. WebGL keeps its established atmosphere/cloud effects and receives the same terrain, texture, vehicle, building, road, and water state.
+
+Use the renderer button in the HUD to switch between WebGL and WebGPU. `/webgpu.html` and `/webgl.html` explicitly select a renderer; the root URL uses the selection persisted in local storage, and unsupported browsers fall back to WebGL. Add `?procgenPatch=0` on the initial WebGPU URL to disable near-field procedural detail for comparison. Terrain heightmaps stream as bounded binary page batches by default; Flask repairs same-depth and cross-LOD seams before publishing each batch. Use `?manifest=0` only to compare the legacy base64 JSON transport. Runtime startup, streaming passes, WebGPU device/compute failures, procedural window changes, vehicles, and persistence events are sent to `/client_log.html`.
 
 The backend in /flaskserver manages terrain heightmaps and textures in a SQLite db (terrain.db). It always assumes the user starts from scratch and will rebuild all missing data as needed. FIRST VISIT TO ANY LOCATION WILL BE SLOW — heightmaps and textures are fetched on demand and cached in the DB. Subsequent visits are fast. All tile demand is driven from the frontend heatmap.
 
@@ -144,12 +156,11 @@ npm install
 
 ### Frontend (Vite)
 
-The frontend depends on a local clone of the [Takram three-geospatial](https://github.com/takram-design-engineering/three-geospatial) monorepo for atmosphere and cloud effects. Vite aliases `@takram/*` imports to this local source.
+The frontend depends on a local clone of the [Takram three-geospatial](https://github.com/takram-design-engineering/three-geospatial) monorepo for atmosphere and cloud effects. Vite aliases `@takram/*` imports to this local source. The setup script checks out the pinned base and applies the tracked r184 WebGPU atmosphere/cloud patches, including the runtime dispatch throttling used by the viewer.
 
 ```bash
 cd webserver
-git clone https://github.com/takram-design-engineering/three-geospatial.git
-cd three-geospatial && git checkout ab3d1cf5 && cd ..
+./setup-three-geospatial.sh
 npm install
 ```
 

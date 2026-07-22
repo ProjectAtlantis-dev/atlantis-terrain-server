@@ -18,6 +18,6 @@
     "@takram/three-clouds": "^0.2.0",
     "maplibre-gl": "^5.24.0",
     "postprocessing": "^6.39.2",
-    "three": "^0.182.0"
+    "three": "0.184.0"
   }
 }

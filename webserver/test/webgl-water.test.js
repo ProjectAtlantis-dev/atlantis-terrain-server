@@ -98,6 +98,7 @@ test('bathymetry recaptures on movement, settled texture changes, and the lazy b
       up: new THREE.Vector3(0, 0, 1),
       getSunDirection: () => new THREE.Vector3(0, 0, 1),
       getTextureVersion: () => textureVersion,
+      initializationDelayMs: 0,
     });
     const camera = { position: new THREE.Vector3(0, 0, 100) };
     const step = dt => { nowMs += dt; runtime.update({ dt, camera, visible: true }); };

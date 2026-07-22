@@ -3,6 +3,8 @@ import { WebGPURenderer } from 'three/webgpu';
 import { color, densityFogFactor, fog, uniform } from 'three/tsl';
 import { createWebGPUAtmosphereController } from './webgpu-atmosphere.js';
 import { createWebGPUWater } from './webgpu-water.js';
+import { installMaterialKeyMemo } from '../procedural-runtime/render/ThreePatches.ts';
+import { installPositionInvariance } from '../procedural-runtime/render/VegPrepass.ts';
 
 /**
  * Create the WebGPU renderer adapter used by the shared terrain application.
@@ -22,6 +24,10 @@ export function createTerrainBackend({
     samples: 4,
     depth: true,
     logarithmicDepthBuffer: true,
+    // Procedural terrain combines satellite imagery with field/noise maps.
+    // WebGPU grants only conservative defaults unless a higher supported
+    // limit is requested during device creation.
+    requiredLimits: { maxSampledTexturesPerShaderStage: 24 },
   });
   renderer.setSize(width, height);
   renderer.setPixelRatio(pixelRatio);
@@ -31,6 +37,7 @@ export function createTerrainBackend({
   renderer.toneMappingExposure = toneMappingExposure;
   let postProcessing = null;
   let atmosphere = null;
+  let pendingSceneDate = null;
   let ready = false;
   let animationLoopActive = false;
   let sceneMutationVersion = 0;
@@ -62,7 +69,11 @@ export function createTerrainBackend({
       return atmosphere;
     },
     configureScenePipeline({ date }) {
-      atmosphere?.rebuild(date);
+      pendingSceneDate = date ?? pendingSceneDate;
+      if (ready) {
+        atmosphere?.rebuild(pendingSceneDate ?? undefined);
+        pendingSceneDate = null;
+      }
     },
     setFogDensity(value) { fogDensity.value = value; },
     setMapMode(active) { fogDensity.value = active ? 0 : fogDensity.value; },
@@ -108,7 +119,10 @@ export function createTerrainBackend({
       sceneMutationVersion += 1;
     },
     startRenderLoop() {
-      if (animationLoopActive || demandRendering == null) return;
+      // WebGPURenderer does not reliably retain an animation loop installed
+      // before its asynchronous init completes. Leave the loop inactive until
+      // the ready callback below requests the first render.
+      if (!ready || animationLoopActive || demandRendering == null) return;
       animationLoopActive = true;
       demandRendering.onStart?.();
       renderer.setAnimationLoop(demandRendering.render);
@@ -135,13 +149,49 @@ export function createTerrainBackend({
       renderer.dispose();
     },
   };
-  renderer.init().then(() => {
+  async function clampRequiredLimits() {
+    const requested = renderer.backend?.parameters?.requiredLimits;
+    if (requested == null || navigator.gpu == null) return;
+    const adapter = await navigator.gpu.requestAdapter().catch(() => null);
+    if (adapter == null) return;
+    for (const [name, value] of Object.entries(requested)) {
+      const supported = adapter.limits[name];
+      if (typeof supported === 'number' && value > supported) {
+        requested[name] = supported;
+        bootLog('renderer.webgpu.limit.clamped', {
+          limit: name,
+          requested: value,
+          supported,
+        }, 'warn');
+      }
+    }
+  }
+
+  clampRequiredLimits().then(() => renderer.init()).then(() => {
+    // The vegetation depth prepass requires invariant vertex positions, and
+    // material-key memoization prevents shadow passes from rehashing the same
+    // r184 node graphs for every object.
+    installPositionInvariance(renderer);
+    installMaterialKeyMemo(renderer);
+    const device = renderer.backend?.device;
+    device?.addEventListener?.('uncapturederror', event => {
+      bootLog('renderer.webgpu.uncaptured', {
+        message: event.error?.message ?? String(event.error),
+      }, 'error');
+    });
+    device?.lost?.then(info => {
+      bootLog('renderer.webgpu.device.lost', {
+        reason: info.reason,
+        message: info.message,
+      }, 'error');
+    });
     ready = true;
     bootLog('renderer.webgpu.ready');
     // Build the atmosphere against the initialized WebGPU device. The removed
     // water runtime used to trigger this rebuild incidentally when it became
     // ready; lighting must not depend on an unrelated optional surface.
-    atmosphere?.rebuild?.();
+    atmosphere?.rebuild?.(pendingSceneDate ?? undefined);
+    pendingSceneDate = null;
     backend.requestRender();
   }).catch(error => {
     bootLog('renderer.webgpu.error', {

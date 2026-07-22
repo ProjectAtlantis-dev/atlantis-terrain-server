@@ -22,10 +22,11 @@ import { createTerrainHeadingDemandController } from './terrain-heading-demand.j
 import { compassHeading, createTerrainHud, renderGameClock } from './terrain-hud.js';
 import { applyMapDrag, installTerrainKeyboardControls, installTerrainPointerControls } from './terrain-controls.js';
 import { stepVehicleDrive } from './terrain-vehicle.js';
+import { createVehicleControlUI } from './terrain-vehicle-controls-ui.js';
 import { createTerrainVehicleRuntime } from './terrain-vehicle-runtime.js';
 import { createTileHistory, terrainFogDistance, tileDepthFromId } from './terrain-tile-runtime.js';
 import { createTextureStreamer, rendererTextureAnisotropy } from './terrain-texture-streamer.js';
-import { evaluateTerrainRefetch, summarizeTerrainCamera, terrainCameraCoordinates, terrainCameraGridPosition, terrainCameraStereoPosition } from './terrain-tile-fetch.js';
+import { summarizeTerrainCamera, terrainCameraCoordinates, terrainCameraGridPosition, terrainCameraStereoPosition } from './terrain-tile-fetch.js';
 import { applyTerrainAvailabilityStatus } from './terrain-status-controller.js';
 import { collectTerrainDebugMeshes, createTerrainHoverOutlineController, createTerrainMapGridController, formatTerrainSeamDiagnostic, summarizeTerrainMesh } from './terrain-debug-runtime.js';
 import { createTerrainFetchRuntime } from './terrain-fetch-runtime.js';
@@ -49,8 +50,10 @@ import { createTerrainTileMenuRuntime } from './terrain-tile-menu-runtime.js';
 import { createTerrainHeatmapRuntime } from './terrain-heatmap-runtime.js';
 import { resolveTerrainViewToggle } from './terrain-view-mode.js';
 import { googleMaps3dUrl } from './terrain-google-maps.js';
+import { createGoogleNavigator } from './terrain-google-navigator.js';
 import { createTerrainFlyToTileRuntime } from './terrain-fly-to-tile.js';
-import { epsg3413DirectionBearing, epsg3413ToWgs84 } from './terrain-polar-stereo.js';
+import { epsg3413DirectionBearing, epsg3413ToWgs84, wgs84ToEpsg3413 } from './terrain-polar-stereo.js';
+import { predictTerrainStreamingFocus, predictiveRefetchDecision } from './terrain-streaming-prediction.js';
 import { createWaterRuntime, DEFAULT_WATER_PARAMS } from './water/water-runtime.js';
 
 export async function startTerrainApplication({
@@ -61,6 +64,13 @@ if (backend !== 'webgl' && backend !== 'webgpu') {
   throw new TypeError(`unsupported terrain backend: ${backend}`);
 }
 const USE_WEBGPU_RENDER_BACKEND = backend === 'webgpu';
+// Preserve boot-only switches before the application normalizes its URL.
+// Runtime UI state still lives outside the query string.
+const BOOT_QUERY = new URLSearchParams(window.location.search);
+// Binary pages are the default, but Flask still performs response-wide seam
+// repair before exposing them. Use ?manifest=0 to compare base64 JSON transport.
+const USE_TERRAIN_MANIFEST = BOOT_QUERY.get('manifest') !== '0';
+window.__BOOT_QUERY = BOOT_QUERY;
 const backendModule = USE_WEBGPU_RENDER_BACKEND
   ? await import('./render-backends/webgpu-backend.js')
   : await import('./render-backends/webgl-backend.js');
@@ -82,9 +92,8 @@ const WEBGPU_ATMOSPHERE_DEFAULTS = Object.freeze({
   groundAlbedo: 0.3
 });
 const WEBGPU_CLOUD_SHADOW_DEFAULTS = Object.freeze({
-  // WebGPU clouds are intentionally unavailable for now. Takram CloudsEffect
-  // is WebGL-only; keep this provisional shadow path hard-disabled until a
-  // complete WebGPU cloud renderer exists.
+  // The WebGPU backend owns its cloud density, surface-shadow, and god-ray
+  // pipeline. This switch controls the shared cloud-shadow feature state.
   enabled: false,
   debugSurface: false,
   coverage: 0.52,
@@ -160,6 +169,7 @@ const startupAssetsResponse = await loadTerrainStartupAssets({
   bootLog,
 });
 const VEHICLE_DEFINITION = startupAssetsResponse.vehicle_definition;
+const VEHICLE_DEFINITIONS = startupAssetsResponse.vehicle_definitions;
 const STRUCTURE_DEFINITION = startupAssetsResponse.structure_definition;
 const VEHICLE_HEADLIGHTS = (
   VEHICLE_DEFINITION.headlights != null &&
@@ -666,6 +676,48 @@ Ellipsoid.WGS84
   .decompose(terrainRoot.position, terrainRoot.quaternion, terrainRoot.scale);
 scene.add(terrainRoot);
 
+const proceduralAssetsRuntime = USE_WEBGPU_RENDER_BACKEND
+  ? (await import('./terrain-procedural-assets-runtime.js'))
+      .createTerrainProceduralAssetsRuntime({
+        backend,
+        renderer,
+        terrainRoot,
+        camera,
+        anchorPosition,
+        east,
+        north,
+        bootQuery: BOOT_QUERY,
+        getSunLight: () => webgpuAtmosphere?.getLight?.() ?? null,
+        getCSM: () => webgpuAtmosphere?.getCSM?.() ?? null,
+        markSceneMutated: () => markSceneMutated(),
+        requestRender: () => requestRender(),
+        log: enqueueClientLog,
+      })
+  : {
+      enabled: false,
+      attachTerrainData() {},
+      applyTerrainMaterial() { return false; },
+      prefetchFields() {},
+      setWorldIdentity() { return false; },
+      markClassifierReady() {},
+      resetClassifierReadiness() {},
+      update() {},
+      requiresContinuousRender() { return false; },
+    };
+bootLog('runtime.capabilities.ready', {
+  backend,
+  threeRevision: THREE.REVISION,
+  sharedRuntime: [
+    'terrain-streaming', 'textures', 'water', 'vehicles',
+    'buildings', 'roads', 'navigation',
+  ],
+  predictiveStreaming: true,
+  manifestHeightPages: USE_TERRAIN_MANIFEST ? 'response-repaired' : 'disabled',
+  proceduralDetail: proceduralAssetsRuntime.enabled,
+  initialMapMode: controls.mapMode,
+  clientLog: '/client_log.html',
+});
+
 // --- Fjord water (ocean2 FFT port) ---
 // A camera-following FFT water surface at local z=0; masked water terrain is
 // dropped to -10 m server-side, so the surface has volume above the seabed
@@ -738,7 +790,7 @@ const mapGridController = createTerrainMapGridController({ terrainRoot });
 // --- Terrain streaming state ---
 const EXAG = 1.0;
 
-// --- Procedural asset scatter (fable5-world-demo port, chain validation) ---
+// --- Legacy renderer-neutral procedural asset scatter ---
 // Temporarily disabled; keep the procedural vegetation pipeline intact for re-enabling.
 const SCATTER_ENABLED = false;
 const SCATTER_SEED = 1337;
@@ -759,6 +811,7 @@ function scatterLibrary() {
 }
 
 function attachTileScatter(mesh, tile, hm) {
+  proceduralAssetsRuntime.attachTerrainData(mesh, tile, hm);
   if (!SCATTER_ENABLED || !mesh || !tile?.id) return;
   const depth = tileDepthFromId(tile.id);
   if (depth < SCATTER_MIN_DEPTH) return;
@@ -779,7 +832,7 @@ function attachTileScatter(mesh, tile, hm) {
   }
 }
 
-const REFETCH_DIST = 5000;
+const STREAMING_FOCUS_REFETCH_DIST = 1200;
 const terrainPipelineState = {
   ready: false,
   originX: 0,
@@ -854,12 +907,14 @@ const houseRuntime = createTerrainHouseSceneRuntime({
 });
 const vehicleRuntime = createTerrainVehicleRuntime({
   vehicleDefinition: VEHICLE_DEFINITION,
+  vehicleDefinitions: VEHICLE_DEFINITIONS,
   vehicleHeadlights: VEHICLE_HEADLIGHTS,
   assetVehicleInstances: ASSET_VEHICLE_INSTANCES,
   startupAssetsResponse, houseSites: houseRuntime.houseSites,
   vehicleStateEndpoint: VEHICLE_STATE_ENDPOINT,
   vehicleSaveTimeoutMs: VEHICLE_SAVE_FETCH_TIMEOUT_MS,
   vehicleSaveFailureCooldownMs: VEHICLE_SAVE_FAILURE_COOLDOWN_MS,
+  vehiclePersistenceEnabled: BOOT_QUERY.get('vehiclePersistence') !== '0',
   houseMarkerBaseLift: houseRuntime.HOUSE_MARKER_BASE_LIFT,
   houseMarkerHeight: houseRuntime.HOUSE_MARKER_HEIGHT,
   houseMarkerHaloGeo: houseRuntime.houseMarkerHaloGeo,
@@ -872,7 +927,66 @@ const vehicleRuntime = createTerrainVehicleRuntime({
   houseTerrainMeshes: houseRuntime.houseTerrainMeshes,
   houseLocalFromLatLon: houseRuntime.houseLocalFromLatLon,
   getSunDirection: () => sunDirection,
+  onMutated: markSceneMutated,
 });
+const vehicleControlUI = createVehicleControlUI();
+
+function proceduralTraversalMotion() {
+  const vehicleActive = vehicleRuntime.vehicleControlActive;
+  const controlledPosition = vehicleActive ? vehicleRuntime.vehicleGroup?.position : null;
+  return {
+    heading: headingFromForward2D(
+      -Math.sin(vehicleActive ? vehicleRuntime.vehicleHeadingRad : controls.yaw),
+      Math.cos(vehicleActive ? vehicleRuntime.vehicleHeadingRad : controls.yaw),
+    ),
+    speedMps: vehicleActive
+      ? Math.abs(vehicleRuntime.vehicleSpeed)
+      : Math.hypot(controls.speed, controls.strafeSpeed),
+    // Keep residency centered on the driven vehicle while the chase camera
+    // orbits independently. Vehicle positions are terrainRoot-local.
+    focusTerrainX: Number.isFinite(controlledPosition?.x) ? controlledPosition.x : null,
+    focusTerrainY: Number.isFinite(controlledPosition?.y) ? controlledPosition.y : null,
+    focusTerrainZ: Number.isFinite(controlledPosition?.z) ? controlledPosition.z : null,
+  };
+}
+
+let lastStreamingFocus = null;
+
+function terrainStreamingFocus(gridPosition = null) {
+  let current = gridPosition;
+  if (!current && terrainPipelineState.frameOffsetReady) {
+    const coordinates = terrainCameraCoordinates({
+      position: camera.position, anchorPosition, east, north, up,
+      anchorLatitude: anchorLat, anchorLongitude: anchorLon,
+      originX: terrainPipelineState.originX, originY: terrainPipelineState.originY,
+    });
+    current = terrainCameraGridPosition({
+      eastM: coordinates.eastM,
+      northM: coordinates.northM,
+      originX: terrainPipelineState.originX,
+      originY: terrainPipelineState.originY,
+      frameOffsetX: terrainPipelineState.frameOffsetX,
+      frameOffsetY: terrainPipelineState.frameOffsetY,
+    });
+  }
+  if (!current) return null;
+  const motion = proceduralTraversalMotion();
+  const predicted = predictTerrainStreamingFocus({
+    x: current.x,
+    y: current.y,
+    heading: motion.heading,
+    speedMps: motion.speedMps,
+  });
+  const coordinates = epsg3413ToWgs84(predicted.x, predicted.y);
+  lastStreamingFocus = {
+    ...predicted,
+    lat: coordinates.lat,
+    lon: coordinates.lon,
+    currentX: current.x,
+    currentY: current.y,
+  };
+  return lastStreamingFocus;
+}
 
 const normalPass = new NormalPass(scene, camera);
 
@@ -1010,6 +1124,7 @@ const terrainTileSet = createTerrainTileSet({
   terrain: {
     exaggeration: EXAG,
     attachScatter: attachTileScatter,
+    forceUntexturedBuild: tile => proceduralAssetsRuntime.requiresFineTerrain?.(tile) ?? false,
   },
   renderBackend,
   view: {
@@ -1027,6 +1142,7 @@ const terrainTileSet = createTerrainTileSet({
     // (a full ortho scene render) every debounce interval forever.
     onMaterialApplied: mesh => {
       const map = mesh?.material?.map ?? null;
+      proceduralAssetsRuntime.applyTerrainMaterial(mesh, map);
       if (appliedTileTextures.get(mesh) !== map) {
         appliedTileTextures.set(mesh, map);
         terrainTextureVersion += 1;
@@ -1162,6 +1278,62 @@ function openGoogleMapsView() {
   window.open(url, '_blank', 'noopener,noreferrer');
 }
 
+function navigateCameraTo(lat, lon) {
+  if (!Number.isFinite(lat) || !Number.isFinite(lon)
+      || Math.abs(lat) > 90 || Math.abs(lon) > 180) return false;
+  const targetGrid = wgs84ToEpsg3413(lat, lon);
+  if (!Number.isFinite(targetGrid.x) || !Number.isFinite(targetGrid.y)) return false;
+  const altitude = Math.max(MIN_FLIGHT_ALT, getCameraLatLon().alt);
+
+  if (!terrainPipelineState.frameOffsetReady) {
+    terrainPipelineState.originX = targetGrid.x;
+    terrainPipelineState.originY = targetGrid.y;
+    terrainPipelineState.frameOffsetX = 0;
+    terrainPipelineState.frameOffsetY = 0;
+    terrainPipelineState.frameOffsetReady = true;
+  }
+  const targetEastM = targetGrid.x - terrainPipelineState.originX
+    + terrainPipelineState.frameOffsetX;
+  const targetNorthM = targetGrid.y - terrainPipelineState.originY
+    + terrainPipelineState.frameOffsetY;
+  controls.speed = 0;
+  controls.strafeSpeed = 0;
+  controls.dragging = false;
+  cameraRuntimeState.driftMode = false;
+  for (const code of Object.keys(controls.keys)) controls.keys[code] = false;
+  vehicleRuntime.setVehicleControlActive(false, 'google-navigate');
+  camera.position.copy(anchorPosition)
+    .addScaledVector(east, targetEastM)
+    .addScaledVector(north, targetNorthM)
+    .addScaledVector(up, altitude);
+  cameraRuntimeState.lastMoveTime = performance.now();
+  applyCameraOrientation();
+  updateMapCamera();
+
+  textureStreamer.abortAll();
+  terrainTileSet.resetTextureApplications();
+  terrainFetchRuntime.reset(1);
+  terrainPipelineState.firstLoad = true;
+  terrainPipelineState.cameraStereoX = targetGrid.x;
+  terrainPipelineState.cameraStereoY = targetGrid.y;
+  terrainPipelineState.lastFetchX = targetGrid.x;
+  terrainPipelineState.lastFetchY = targetGrid.y;
+  terrainPipelineState.lastFetchTriggerMs = 0;
+  houseRuntime.markHousesNeedSnap();
+  enqueueClientLog('info', 'google.navigate', {
+    lat: Number(lat.toFixed(7)),
+    lon: Number(lon.toFixed(7)),
+    altitude: Number(altitude.toFixed(1)),
+    gridX: Number(targetGrid.x.toFixed(3)),
+    gridY: Number(targetGrid.y.toFixed(3)),
+    backend,
+  });
+  terrainFetchRuntime.request(lat, lon);
+  updateHud();
+  requestRender();
+  return true;
+}
+
 function getCameraLogSnapshot(camLL = null) {
   const coordinates = terrainCameraCoordinates({
     position: camera.position, anchorPosition, east, north, up,
@@ -1205,10 +1377,13 @@ function needsContinuousRender() {
     Math.abs(controls.speed) > 1e-3 ||
     Math.abs(controls.strafeSpeed) > 1e-3 ||
     vehicleRuntime.vehicleControlActive ||
+    vehicleRuntime.requiresContinuousRender() ||
+    proceduralAssetsRuntime.requiresContinuousRender() ||
     // Animated water must hold the loop open on backends that actually idle
     // (WebGPU; the WebGL backend never stops once started). Mirrors the
     // waterRuntime.update visibility gate.
     (waterRuntime.enabled && waterParams.enabled &&
+      Array.isArray(terrainPipelineState.lastTiles) &&
       !controls.mapMode && !classifierRuntime.active)
   );
 }
@@ -1245,7 +1420,16 @@ function runStreamingMaintenance() {
 }
 
 const terrainFetchEvents = {
-  onResponseApplied: requestRender,
+  onResponseApplied(data) {
+    vehicleRuntime.setTerrainDepthCeiling(data?.terrainMaxDepth);
+    proceduralAssetsRuntime.setWorldIdentity({
+      worldSeed: data?.worldSeed,
+      procgenVersion: data?.procgenVersion,
+      procgenSourceDepth: data?.procgenSourceDepth,
+    });
+    proceduralAssetsRuntime.prefetchFields(data?.tiles, proceduralTraversalMotion());
+    requestRender();
+  },
   onBuildings: buildings => buildingsRuntime?.reconcile(buildings),
   onAvailability: markMissing,
   onSkip: () => enqueueClientLog('debug', 'fetchTiles.skip', {
@@ -1266,6 +1450,9 @@ const terrainFetchEvents = {
     console.error('Fetch error:', error);
   },
   onSettled() {
+    if (terrainPipelineState.loadPass === 2) {
+      proceduralAssetsRuntime.markClassifierReady();
+    }
     // Drain accumulated dt so the next render frame doesn't lurch the camera.
     clock.getDelta();
     requestRender();
@@ -1284,6 +1471,53 @@ const terrainFetchRuntime = createTerrainFetchRuntime({
   terrain: terrainTileSet,
   logger: { enqueue: enqueueClientLog, boot: bootLog },
   events: terrainFetchEvents,
+  useManifest: USE_TERRAIN_MANIFEST,
+  tileBudget: 384,
+  previewTileBudget: 16,
+  getRequestFocus: ({ gridPosition }) => {
+    if (terrainPipelineState.firstLoad || !gridPosition) return null;
+    const focus = terrainStreamingFocus(gridPosition);
+    if (!focus) return null;
+    return {
+      x: focus.x,
+      y: focus.y,
+      lat: focus.lat,
+      lon: focus.lon,
+      logDetails: {
+        streamFocusX: Number(focus.x.toFixed(1)),
+        streamFocusY: Number(focus.y.toFixed(1)),
+        streamLookaheadM: Number(focus.lookaheadMetres.toFixed(1)),
+        streamLookaheadS: Number(focus.lookaheadSeconds.toFixed(1)),
+        traversalSpeedMps: Number(focus.speedMps.toFixed(1)),
+      },
+    };
+  },
+});
+const googleNavigator = createGoogleNavigator({
+  getCameraLatLon: getRenderedTerrainLatLon,
+  navigateTo: navigateCameraTo,
+  openGoogle3d: openGoogleMapsView,
+  onChanged: () => {
+    enqueueClientLog('info', 'google.navigator.state', {
+      open: googleNavigator.isOpen,
+      activeTab: googleNavigator.activeTab,
+    });
+    requestRender();
+  },
+});
+bootLog('terrain.loader.features.ready', {
+  previewContinuation: 'task-queue',
+  predictiveStreaming: true,
+  refetchDistanceM: STREAMING_FOCUS_REFETCH_DIST,
+  manifest: USE_TERRAIN_MANIFEST,
+  manifestSeamPolicy: USE_TERRAIN_MANIFEST
+    ? 'response-repaired-pages'
+    : 'server-repaired-json',
+});
+bootLog('google.navigator.ready', {
+  key: 'G',
+  embeddedMap: true,
+  coordinateNavigation: true,
 });
 const initialTerrainDemandHeading = getTerrainViewHeading();
 const TERRAIN_DEMAND_HEADING_THRESHOLD = 2 * Math.PI / 180;
@@ -1420,7 +1654,7 @@ terrainPipelineState.ready = true;
 // ?tile=12-1461-786 starts the session centered over that tile (overrides the
 // restored camera). flyToTile triggers the initial fetch itself, so the tile
 // becomes the adopted origin; fall back to a normal fetch on a bad id.
-const bootFlyToTileId = new URLSearchParams(window.location.search).get('tile');
+const bootFlyToTileId = BOOT_QUERY.get('tile');
 if (!bootFlyToTileId || !flyToTileRuntime.flyToTile(bootFlyToTileId).ok) {
   terrainFetchRuntime.request();
 }
@@ -1454,6 +1688,14 @@ window.takramDebug = {
   loadVehicleState: vehicleRuntime.loadVehicleState,
   setVehicleControlActive: active => vehicleRuntime.setVehicleControlActive(Boolean(active), 'debug-api'),
   getVehicleControlActive: () => vehicleRuntime.vehicleControlActive,
+  selectVehicle: vehicleId => vehicleRuntime.selectVehicle(vehicleId, 'debug-api'),
+  setVehicleTurretControlActive: active => vehicleRuntime.setVehicleTurretControlActive(
+    Boolean(active),
+    'debug-api',
+  ),
+  setVehicleFireHeld: held => vehicleRuntime.setVehicleFireHeld(Boolean(held)),
+  getVehicleFireSummary: vehicleRuntime.getVehicleFireSummary,
+  getVehicleRegistry: vehicleRuntime.getVehicleRegistry,
   houseInstances: houseRuntime.houseInstances,
   houseZSummary: houseRuntime.houseZSummary,
   houseShadowDebugSummary: houseRuntime.houseShadowDebugSummary,
@@ -1544,6 +1786,18 @@ function updateMovement(dt) {
     controls.strafeSpeed = 0;
     if (!vehicleRuntime.vehicleLoaded) {
       vehicleRuntime.setVehicleControlActive(false, 'vehicle-unloaded');
+      return;
+    }
+    if (vehicleRuntime.vehicleType === 'aircraft') {
+      vehicleRuntime.updateAircraftFlight({
+        forward: forwardPressed,
+        back: backPressed,
+        left: leftPressed,
+        right: rightPressed,
+        climb: isPressed('Space'),
+        descend: isPressed('KeyQ', 'KeyZ'),
+      }, dt);
+      cameraRuntimeState.lastMoveTime = performance.now();
       return;
     }
     const steer = (leftPressed ? 1 : 0) + (rightPressed ? -1 : 0);
@@ -1788,6 +2042,12 @@ function updateHud() {
     alt.textContent = altText;
     lastAltText = altText;
   }
+  const selectedVehicle = vehicleRuntime.getSelectedVehicleStatus();
+  vehicleControlUI.update({
+    ...selectedVehicle,
+    selected: selectedVehicle != null,
+    mapMode: controls.mapMode,
+  });
 }
 
 function resetView() {
@@ -1954,16 +2214,24 @@ function toggleClassifierMode() {
 installTerrainKeyboardControls({
   controls,
   isVehicleActive: () => vehicleRuntime.vehicleControlActive,
+  isTurretActive: () => vehicleRuntime.vehicleTurretControlActive,
   onForwardDoubleTap: () => {
     cameraRuntimeState.driftMode = !cameraRuntimeState.driftMode;
     console.log(`[drift] ${cameraRuntimeState.driftMode ? 'ON' : 'OFF'}`);
   },
   onEscapeVehicle: () => {
-    vehicleRuntime.saveVehicleState('escape', { snapToGround: true, requireGroundedZ: false, bypassSnapThrottle: true });
+    if (vehicleRuntime.vehicleType === 'ground') {
+      vehicleRuntime.saveVehicleState('escape', { snapToGround: true, requireGroundedZ: false, bypassSnapThrottle: true });
+    }
     vehicleRuntime.setVehicleControlActive(false, 'escape', { skipExitSave: true });
   },
+  onEscapeTurret: () => vehicleRuntime.setVehicleTurretControlActive(false, 'escape'),
   onToggleMap: toggleMapMode,
-  onOpenGoogleMaps: openGoogleMapsView,
+  onToggleGoogleNavigator: () => googleNavigator.toggle(),
+  onOpenPipeline: () => {
+    enqueueClientLog('info', 'pipeline.open', { url: '/pipeline.html' });
+    window.open('/pipeline.html', '_blank');
+  },
   onToggleHeatmap: toggleHeatmap,
   onToggleClassifier: toggleClassifierMode,
   onToggleRoadDebug: toggleRoadDebug,
@@ -1974,6 +2242,12 @@ installTerrainKeyboardControls({
   onToggleHeadlights: () => {
     for (const light of vehicleRuntime.vehicleHeadlightSpots) light.visible = !light.visible;
   },
+  onToggleAircraftEngine: () => vehicleRuntime.toggleControlledAircraftEngine(),
+  onCycleVehicleCamera: () => vehicleRuntime.cycleVehicleCameraMode('keyboard'),
+  onToggleTurret: () => vehicleRuntime.setVehicleTurretControlActive(
+    !vehicleRuntime.vehicleTurretControlActive,
+    'keyboard',
+  ),
   onChanged: requestRender,
 });
 
@@ -1983,6 +2257,7 @@ installTerrainPointerControls({
   mouseSensitivity: MOUSE_SENS,
   mapPanFactor: MAP_PAN_FACTOR,
   isVehicleActive: () => vehicleRuntime.vehicleControlActive,
+  isTurretActive: () => vehicleRuntime.vehicleTurretControlActive,
   onVehicleOrbit: (movementX, movementY) => {
     vehicleRuntime.vehicleCameraOrbitYaw -= movementX * vehicleRuntime.VEHICLE_CAMERA_ORBIT_SENS;
     vehicleRuntime.vehicleCameraOrbitPitch = THREE.MathUtils.clamp(
@@ -1991,45 +2266,44 @@ installTerrainPointerControls({
       vehicleRuntime.VEHICLE_CAMERA_ORBIT_PITCH_MAX,
     );
   },
+  onTurretAim: (movementX, movementY) => vehicleRuntime.aimVehicleTurret(
+    movementX,
+    movementY,
+  ),
+  onFireStart: () => vehicleRuntime.setVehicleFireHeld(true),
+  onFireStop: () => vehicleRuntime.setVehicleFireHeld(false),
   onMapCameraChanged: updateMapCamera,
   onChanged: requestRender,
 });
 
+let vehicleSelectionPointerDown = null;
 renderer.domElement.addEventListener('pointerdown', event => {
-  console.warn('[CLICK TEST] pointerdown', {
+  vehicleSelectionPointerDown = {
+    button: event.button,
     x: event.clientX,
     y: event.clientY,
-    button: event.button,
-  });
+  };
 });
 
 renderer.domElement.addEventListener('click', event => {
-  console.warn('[CLICK TEST] click', {
-    x: event.clientX,
-    y: event.clientY,
-    mapMode: controls.mapMode,
-    housesVisible: houseRuntime.housesRuntimeVisible,
-  });
-  enqueueClientLog('info', 'click.test', {
-    x: event.clientX,
-    y: event.clientY,
-    mapMode: controls.mapMode,
-    shadowMode: houseRuntime.HOUSE_SHADOW_MODE,
-    housesVisible: houseRuntime.housesRuntimeVisible,
-  });
-  flushClientLogQueue();
   try {
     houseRuntime.probeHouseShadowIntersections(event);
   } catch (err) {
-    console.error('[CLICK TEST] probe exception', err);
+    console.error('[HOUSE SHADOW] probe exception', err);
     bootLog('house.shadow.click_probe.error', {
       message: err?.message ?? String(err),
       stack: err?.stack ?? null
     }, 'error');
   }
   if (!controls.mapMode) {
+    const down = vehicleSelectionPointerDown;
+    vehicleSelectionPointerDown = null;
+    const isSelectionClick = down != null && down.button === 0 && event.button === 0 &&
+      Math.hypot(event.clientX - down.x, event.clientY - down.y) <= 4;
+    if (isSelectionClick) vehicleRuntime.trySelectVehicleFromPointer(event);
     return;
   }
+  vehicleSelectionPointerDown = null;
   const targets = collectTerrainDebugMeshes(terrainRoot, debugIntersectables);
   if (targets.length === 0) {
     return;
@@ -2202,7 +2476,10 @@ function render() {
   // Keep classifier colors—including the effective-water pink—unobstructed.
   waterRuntime.update({
     dt, camera,
-    visible: waterParams.enabled && !controls.mapMode && !classifierRuntime.active,
+    visible: waterParams.enabled
+      && Array.isArray(terrainPipelineState.lastTiles)
+      && !controls.mapMode
+      && !classifierRuntime.active,
   });
 
   // Terrain streaming: check if camera moved far enough to re-fetch
@@ -2222,24 +2499,38 @@ function render() {
     });
     terrainPipelineState.cameraStereoX = gridPosition.x;
     terrainPipelineState.cameraStereoY = gridPosition.y;
-    const refetch = evaluateTerrainRefetch({
-      cameraX: terrainPipelineState.cameraStereoX, cameraY: terrainPipelineState.cameraStereoY,
-      lastFetchX: terrainPipelineState.lastFetchX, lastFetchY: terrainPipelineState.lastFetchY,
+    const focus = terrainStreamingFocus(gridPosition);
+    const refetch = predictiveRefetchDecision({
+      focusX: focus?.x ?? terrainPipelineState.cameraStereoX,
+      focusY: focus?.y ?? terrainPipelineState.cameraStereoY,
+      lastFocusX: terrainPipelineState.lastFetchX,
+      lastFocusY: terrainPipelineState.lastFetchY,
       nowMs, lastTriggerMs: terrainPipelineState.lastFetchTriggerMs,
-      distanceThreshold: REFETCH_DIST, triggerIntervalMs: 500,
+      distanceThreshold: STREAMING_FOCUS_REFETCH_DIST,
+      triggerIntervalMs: 1000,
     });
     terrainPipelineState.lastFetchTriggerMs = refetch.nextTriggerMs;
     if (refetch.shouldFetch) terrainFetchRuntime.request();
   }
   vehicleRuntime.snapVehicleToTerrain();
   vehicleRuntime.updateDieselVolume();
+  vehicleRuntime.updateVehicleWheelSpin(dt);
   vehicleRuntime.updateVehicleSuspension(dt);
+  vehicleRuntime.updateAircraftSystems(dt);
+  vehicleRuntime.updateVehicleCombat(dt);
   if (vehicleRuntime.vehicleControlActive && !controls.mapMode) {
     vehicleRuntime.updateVehicleFollowCamera();
   }
   vehicleRuntime.syncVehicleSunLight();
   vehicleRuntime.syncVehicleShadowReceivers();
   vehicleRuntime.updateVehicleShadowSystem();
+  proceduralAssetsRuntime.update({
+    cameraAGL: cameraRuntimeState.agl,
+    motion: proceduralTraversalMotion(),
+    terrainReady: terrainPipelineState.loadPass === 2
+      && !terrainPipelineState.fetching
+      && Array.isArray(terrainPipelineState.lastTiles),
+  });
   houseRuntime.update(nowMs, controls.mapMode);
   vehicleRuntime.vehicleMarkerLayer.visible = controls.mapMode;
   mapGridController.setVisible(controls.seamMode && !heatmapRuntime.active);
@@ -2275,6 +2566,13 @@ function render() {
   }
   if (SCATTER_ENABLED && _scatterLib) updateScatterVisibility(terrainRoot, camera);
   webgpuAtmosphere?.updateCloudShadows(clock.elapsedTime);
+  const shadowMotion = proceduralTraversalMotion();
+  webgpuAtmosphere?.updateShadowBudget({
+    sceneVersion: renderBackend.sceneMutationVersion,
+    proceduralCenter: proceduralAssetsRuntime.patch?.centerId ?? null,
+    vehicles: vehicleRuntime.getVehicleRegistry(),
+    traversalSpeedMps: shadowMotion.speedMps,
+  });
   try {
     renderBackend.renderScene(scene, camera);
   } finally {

@@ -522,6 +522,8 @@ def get_assets_response(
                 "headingDeg": heading, "headlightsOn": props.get("headlightsOn", True),
                 "savedAt": saved_at or 0,
             }
+            if isinstance(props.get("definitionId"), str) and props["definitionId"]:
+                item["definitionId"] = props["definitionId"]
             if z is not None:
                 item["z"] = z
             for key in ("terrainDepth", "terrainTileId"):
@@ -536,26 +538,39 @@ def get_assets_response(
             if props.get("tileId"):
                 item["tileId"] = props["tileId"]
             structures.append(item)
-    vehicle_definition = dict(metadata.get("vehicle_definition", {}))
-    headlights = vehicle_definition.get("headlights")
-    if isinstance(headlights, dict):
-        headlights = dict(headlights)
-        color = headlights.get("color")
-        if isinstance(color, str) and color.startswith("#"):
-            try:
-                headlights["color"] = int(color[1:], 16)
-            except ValueError:
-                pass
-        vehicle_definition["headlights"] = headlights
+    def normalized_vehicle_definition(value: Any) -> dict[str, Any]:
+        definition = dict(value) if isinstance(value, dict) else {}
+        headlights = definition.get("headlights")
+        if isinstance(headlights, dict):
+            headlights = dict(headlights)
+            color = headlights.get("color")
+            if isinstance(color, str) and color.startswith("#"):
+                try:
+                    headlights["color"] = int(color[1:], 16)
+                except ValueError:
+                    pass
+            definition["headlights"] = headlights
+        return definition
+
+    vehicle_definition = normalized_vehicle_definition(
+        metadata.get("vehicle_definition", {})
+    )
+    raw_catalog = metadata.get("vehicle_definitions", {})
+    vehicle_definitions = {
+        str(definition_id): normalized_vehicle_definition(definition)
+        for definition_id, definition in raw_catalog.items()
+        if isinstance(definition_id, str) and isinstance(definition, dict)
+    } if isinstance(raw_catalog, dict) else {}
     return {
         "ok": True,
         "source": "asset_catalog",
-        "schemaVersion": 4,
+        "schemaVersion": 5,
         "seeded": {
             "structureInstances": seeded_structures,
             "vehicleInstances": seeded_vehicles,
         },
         "vehicle_definition": vehicle_definition,
+        "vehicle_definitions": vehicle_definitions,
         "structure_definition": metadata.get("structure_definition", {}),
         "vehicle_instances": vehicles,
         "structure_instances": structures,
@@ -565,8 +580,6 @@ def get_assets_response(
 def _ensure_seed_assets(
     db: sqlite3.Connection, asset_type: str, seeds: Any
 ) -> bool:
-    if db.execute("SELECT 1 FROM assets WHERE type=? LIMIT 1", (asset_type,)).fetchone():
-        return False
     if not isinstance(seeds, list):
         return False
     inserted = False
@@ -582,6 +595,8 @@ def _ensure_seed_assets(
             continue
         if asset_type == "vehicle":
             props = {"headlightsOn": seed.get("headlightsOn", True)}
+            if isinstance(seed.get("definitionId"), str) and seed["definitionId"]:
+                props["definitionId"] = seed["definitionId"]
             for key in ("terrainDepth", "terrainTileId"):
                 if seed.get(key) is not None:
                     props[key] = seed[key]
@@ -593,13 +608,13 @@ def _ensure_seed_assets(
                 props["tileId"] = seed["tileId"]
             z = None
             saved_at = None
-        db.execute(
+        cursor = db.execute(
             "INSERT OR IGNORE INTO assets "
             "(id,type,enabled,lat,lon,heading_deg,z,properties,saved_at,updated_at) "
             "VALUES (?,?,1,?,?,?,?,?,?,CURRENT_TIMESTAMP)",
             (asset_id, asset_type, lat, lon, heading, z, json.dumps(props), saved_at),
         )
-        inserted = True
+        inserted = inserted or cursor.rowcount > 0
     if inserted:
         db.commit()
     return inserted
@@ -615,10 +630,17 @@ def save_vehicle_state(db: sqlite3.Connection, payload: dict[str, Any]) -> tuple
     if not all(math.isfinite(value) for value in (lat, lon, heading)):
         return {"error": "invalid vehicle state payload: coordinates must be finite"}, 400
 
-    row = db.execute(
-        "SELECT id, properties FROM assets WHERE type='vehicle' "
-        "ORDER BY enabled DESC, updated_at DESC, id LIMIT 1"
-    ).fetchone()
+    requested_id = payload.get("vehicleId")
+    if isinstance(requested_id, str) and requested_id.strip():
+        row = db.execute(
+            "SELECT id, properties FROM assets WHERE type='vehicle' AND id=?",
+            (requested_id.strip(),),
+        ).fetchone()
+    else:
+        row = db.execute(
+            "SELECT id, properties FROM assets WHERE type='vehicle' "
+            "ORDER BY enabled DESC, updated_at DESC, id LIMIT 1"
+        ).fetchone()
     vehicle_id = str(row[0]) if row else "amv-01"
     props = _properties(row[1]) if row else {"headlightsOn": True}
     for key in ("terrainDepth", "terrainTileId"):

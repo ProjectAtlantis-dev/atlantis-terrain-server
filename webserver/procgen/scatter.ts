@@ -53,20 +53,22 @@ interface CategorySpec {
 // tuned for d12 tiles (~660 m, ~434k m²): budget ≈ 700 instances /
 // ~700k tris per tile — the demo's per-tile-equivalent scatter budget once
 // its GPU ring culling is factored out
+// GREENLAND is TREELESS — no tree/, log/, stump/ (those are Estonia forest).
+// Understory dwarf shrubs (dwarf birch / crowberry / niviarsiaq), grass, and
+// rock only. Vegetation cover + water exclusion come from the classifier fields.
+// DENSE tundra (near-field only, camera-following — so we can afford it). Densities
+// are per-m²; a d12 tile is ~435k m². Understory should read as a carpet of dwarf
+// shrubs, not scattered dots. (The even-denser blade-grass carpet is GroundRing — Tier 2.)
 const CATEGORIES: CategorySpec[] = [
-  { prefix: 'tree/', density: 1 / 1200, cap: 120, maxSlope: 0.6, minElev: 3 },
-  { prefix: 'shrub/', density: 1 / 1500, cap: 100, maxSlope: 0.9, minElev: 2 },
-  { prefix: 'fern/', density: 1 / 4000, cap: 40, maxSlope: 0.8, minElev: 2 },
-  { prefix: 'flower/', density: 1 / 3000, cap: 60, maxSlope: 0.7, minElev: 2 },
-  { prefix: 'grass/', density: 1 / 3000, cap: 80, maxSlope: 0.7, minElev: 2 },
-  { prefix: 'log/', density: 1 / 8000, cap: 15, maxSlope: 0.5, minElev: 3 },
-  { prefix: 'stump/', density: 1 / 10000, cap: 10, maxSlope: 0.5, minElev: 3 },
-  { prefix: 'rock/hero/', density: 1 / 60000, cap: 4, maxSlope: 0.8, minElev: 1 },
-  { prefix: 'rock/boulder/', density: 1 / 3000, cap: 80, maxSlope: 1.0, minElev: 1 },
-  { prefix: 'rock/angular/', density: 1 / 6000, cap: 40, maxSlope: 1.2, minElev: 1 },
-  { prefix: 'rock/slab/', density: 1 / 6000, cap: 40, maxSlope: 1.0, minElev: 1 },
-  { prefix: 'rock/talus/', density: 1 / 4000, cap: 60, maxSlope: 1.4, minElev: 1, slopeBias: 2.0 },
-  { prefix: 'rock/cobble/', density: 1 / 2500, cap: 120, maxSlope: 1.2, minElev: 1 },
+  { prefix: 'shrub/', density: 1 / 12, cap: 12000, maxSlope: 0.9, minElev: 2 },
+  { prefix: 'flower/', density: 1 / 60, cap: 3000, maxSlope: 0.7, minElev: 2 },
+  { prefix: 'grass/', density: 1 / 8, cap: 18000, maxSlope: 0.7, minElev: 2 },
+  { prefix: 'rock/hero/', density: 1 / 20000, cap: 12, maxSlope: 0.8, minElev: 1 },
+  { prefix: 'rock/boulder/', density: 1 / 400, cap: 1200, maxSlope: 1.0, minElev: 1 },
+  { prefix: 'rock/angular/', density: 1 / 800, cap: 600, maxSlope: 1.2, minElev: 1 },
+  { prefix: 'rock/slab/', density: 1 / 1000, cap: 400, maxSlope: 1.0, minElev: 1 },
+  { prefix: 'rock/talus/', density: 1 / 500, cap: 900, maxSlope: 1.4, minElev: 1, slopeBias: 2.0 },
+  { prefix: 'rock/cobble/', density: 1 / 120, cap: 4000, maxSlope: 1.2, minElev: 1 },
 ];
 
 export interface TileScatterInput {
@@ -78,6 +80,31 @@ export interface TileScatterInput {
   lib: AssetLibrary;
   /** vertical exaggeration applied by buildMesh (EXAG) */
   exag?: number;
+  /** classifier field set (from /api/fields), decoded. Each channel is a
+   *  res×res u8 grid, NORTH-UP (row 0 = yMax). When present it drives WHERE:
+   *  water hard-excludes, veg gates living density, rock gates stones. */
+  fields?: TileFields;
+}
+
+export interface TileFields {
+  res: number;
+  chans: Partial<Record<'veg' | 'rock' | 'snow' | 'water' | 'moisture', Uint8Array>>;
+}
+
+/** sample a classifier field (0..1) at a world xz. Fields are NORTH-UP
+ *  (row 0 = yMax) — opposite the heightmap's row 0 = south. */
+function makeFieldSampler(input: TileScatterInput): ((chan: string, x: number, y: number) => number) | null {
+  const f = input.fields;
+  if (!f) return null;
+  const [xMin, yMin, xMax, yMax] = input.bbox;
+  const res = f.res;
+  return (chan: string, x: number, y: number): number => {
+    const arr = (f.chans as Record<string, Uint8Array | undefined>)[chan];
+    if (!arr) return 0;
+    const c = Math.max(0, Math.min(res - 1, Math.round(((x - xMin) / (xMax - xMin)) * (res - 1))));
+    const r = Math.max(0, Math.min(res - 1, Math.round(((yMax - y) / (yMax - yMin)) * (res - 1))));
+    return (arr[r * res + c] ?? 0) / 255;
+  };
 }
 
 interface Sample {
@@ -137,6 +164,7 @@ export function buildTileScatter(input: TileScatterInput): Group | null {
   const area = (xMax - xMin) * (yMax - yMin);
   const exag = input.exag ?? 1;
   const sample = makeSampler(input);
+  const fsample = makeFieldSampler(input);
   const rng = new Rng(hashString(`scatter/${input.tileId}`));
 
   // kinds per category prefix
@@ -168,9 +196,22 @@ export function buildTileScatter(input: TileScatterInput): Group | null {
       if (s.z <= cat.minElev) continue;
       if (s.slope > Math.min(cat.maxSlope, MAX_SLOPE_ALL)) continue;
       if (cat.slopeBias && rng.float() > (s.slope / cat.maxSlope) * cat.slopeBias) continue;
+      // CLASSIFIER water gate: the satellite knows where lakes/fjords are — the
+      // DEM elevation floor misses them (a lake at 50 m passes minElev). Nothing
+      // scatters on water. This is the fix for "trees/plants in the water".
+      if (fsample && fsample('water', x, y) > 0.45) continue;
       const kind = kinds[rng.int(kinds.length)] as AssetKind;
       // HARD RULE: nothing living on north slopes, ever
       if (kind.living && s.southness < VEG_MIN_SOUTHNESS && s.slope > 0.08) continue;
+      // CLASSIFIER cover: living plants only where the imagery reads vegetated
+      // (denser where greener); stones only where it reads bare/rock.
+      if (fsample) {
+        if (kind.living) {
+          if (rng.float() > fsample('veg', x, y) * 1.6) continue;
+        } else if (cat.prefix.startsWith('rock/')) {
+          if (rng.float() > fsample('rock', x, y) * 1.4 + 0.08) continue;
+        }
+      }
       const scale = kind.scale[0] + rng.float() * (kind.scale[1] - kind.scale[0]);
       _qYaw.setFromAxisAngle(_zAxis, rng.float() * Math.PI * 2);
       _q.copy(_qYaw).multiply(_qXup);
