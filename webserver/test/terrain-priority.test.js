@@ -606,31 +606,31 @@ test('shared cloud tuning puts the Takram rendering checkbox first in the Clouds
   assert.deepEqual(renderingStates, [false]);
 });
 
-test('terrain preview request preserves boot frame semantics', () => {
+test('terrain request preserves boot frame semantics without client LOD overrides', () => {
   const request = buildTerrainTilesRequest({
     lat: 64.1, lon: -51.2, altitude: 120, heading: 0.5, range: 30000,
-    pass: 1, previewMaxDepth: 10, isFirstLoad: true,
+    isFirstLoad: true,
     frameOffsetReady: false, originX: 1, originY: 2,
     cameraSnapshot: { camEastM: 3 },
   });
-  assert.equal(request.url, '/api/tiles?lat=64.1&lon=-51.2&alt=120&heading=0.5&range=30000&maxDepth=10&preview=1');
+  assert.equal(request.url, '/api/tiles?lat=64.1&lon=-51.2&alt=120&heading=0.5&range=30000');
   assert.deepEqual(request.logDetails, {
-    pass: 1, passLabel: 'preview', isFirstLoad: true,
+    isFirstLoad: true,
     requestLat: 64.1, requestLon: -51.2, requestAltM: 120,
     requestGridX: null, requestGridY: null,
-    headingRad: 0.5, maxDepth: 10, camEastM: 3,
+    headingRad: 0.5, camEastM: 3,
   });
 });
 
-test('terrain full request reuses a restored frame', () => {
+test('terrain request reuses a restored frame', () => {
   const request = buildTerrainTilesRequest({
     lat: 64, lon: -51, altitude: 50, heading: 0, range: 40000,
-    pass: 2, previewMaxDepth: 10, isFirstLoad: true,
+    isFirstLoad: true,
     frameOffsetReady: true, originX: -12.5, originY: 99.25,
     queryX: 123.5, queryY: -456.25,
   });
   assert.equal(request.url, '/api/tiles?sx=123.5&sy=-456.25&alt=50&heading=0&range=40000&ox=-12.5&oy=99.25');
-  assert.equal(request.logDetails.maxDepth, null);
+  assert.equal('maxDepth' in request.logDetails, false);
 });
 
 test('terrain tile diff and dirty-paint demand are deterministic', () => {
@@ -667,10 +667,10 @@ test('terrain response normalization preserves frame and log semantics', () => {
   assert.deepEqual(data.tiles[0].bbox, [100, -20, 102, -18]);
   assert.deepEqual(data.missing[0].bbox, [102, -18, 103, -17]);
   assert.deepEqual(summarizeTerrainResponse({
-    data, status: 200, pass: 2, cameraX: 101, cameraY: -19,
+    data, status: 200, cameraX: 101, cameraY: -19,
     frameOffsetX: 100, frameOffsetY: -20, frameOffsetReady: true,
   }), {
-    pass: 2, passLabel: 'full', status: 200, tiles: 2, withHm: 1, noHm: 1,
+    status: 200, tiles: 2, withHm: 1, noHm: 1,
     missing: 1, downloading: 1, qx: 1.3, qy: 2.3, ox: 3.5, oy: 4.6,
     closestTileId: 'near', closestTileDistM: 0,
     closestTileCx: 101, closestTileCy: -19,
@@ -678,7 +678,7 @@ test('terrain response normalization preserves frame and log semantics', () => {
   });
 });
 
-test('shared reconciler spends dirty-paint budget in heatmap order', () => {
+test('shared reconciler spends dirty-paint budget in priority order', () => {
   const built = [];
   const deferredTiles = new Map();
   const terrainRoot = {
@@ -717,7 +717,7 @@ test('shared reconciler spends dirty-paint budget in heatmap order', () => {
   });
 });
 
-test('preview reconciliation completes heatmap coverage beyond the build budget', () => {
+test('initial reconciliation completes tile coverage beyond the build budget', () => {
   const built = [];
   const deferredTiles = new Map();
   const terrainRoot = {
@@ -1094,21 +1094,16 @@ test('terrain tile set does not queue excess geometry on animation frames', () =
   assert.equal(frames.length, 0);
 });
 
-test('terrain origin and pipeline decisions preserve two-pass behavior', () => {
+test('terrain origin and pipeline decisions use one request mode', () => {
   const origin = adoptTerrainOrigin({
     data: { ox: -100.25, oy: 200.25, qx: -90, qy: 210 },
-    pass: 1,
     cameraSnapshot: { camStereoApproxX: -95, camStereoApproxY: 205 },
   });
   assert.equal(origin.originX, -100.25);
   assert.equal(origin.cameraY, 210);
   assert.equal(origin.logDetails.originDeltaX, -5.3);
-  assert.equal(terrainPipelineStatus({ missing: [], downloading: [], texFetching: 0 }, true).nextAction, 'full-pass');
-  assert.equal(terrainPipelineStatus(
-    { missing: [], downloading: [], texFetching: 0 }, false, 1,
-  ).nextAction, 'full-pass');
-  assert.equal(terrainPipelineStatus({ missing: [{}], downloading: [], texFetching: 0 }, false).nextAction, 'poll');
-  assert.equal(terrainPipelineStatus({ missing: [], downloading: [], texFetching: 0 }, false).nextAction, 'idle');
+  assert.equal(terrainPipelineStatus({ missing: [{}], downloading: [], texFetching: 0 }).nextAction, 'poll');
+  assert.equal(terrainPipelineStatus({ missing: [], downloading: [], texFetching: 0 }).nextAction, 'idle');
   assert.deepEqual(terrainCameraStereoPosition({
     latitude: 64, longitude: -51, anchorLatitude: 64, anchorLongitude: -51,
     originX: 12, originY: 34,
@@ -1162,7 +1157,7 @@ test('shared camera coordinates and log summary use one ENU conversion', () => {
 
 function createTestFetchRuntime({ fetchImpl, onSkip, ...options } = {}) {
   const state = {
-    loadPass: 1, fetching: false, firstLoad: true, frameOffsetReady: false,
+    fetching: false, firstLoad: true, frameOffsetReady: false,
     frameOffsetX: 0, frameOffsetY: 0, originX: 0, originY: 0,
     cameraStereoX: 0, cameraStereoY: 0, lastFetchX: 0, lastFetchY: 0,
     currentTileIds: new Set(), lastTiles: null, bootFetchLogged: false,
@@ -1171,7 +1166,6 @@ function createTestFetchRuntime({ fetchImpl, onSkip, ...options } = {}) {
   const deferredTiles = new Map();
   const runtime = createTerrainFetchRuntime({
     state,
-    previewMaxDepth: 10,
     view: { anchorLatitude: 64, anchorLongitude: -51 },
     vehicle: {},
     testOverrides: {
@@ -1198,31 +1192,26 @@ function createTestFetchRuntime({ fetchImpl, onSkip, ...options } = {}) {
   return { runtime, state };
 }
 
-test('shared fetch runtime serializes preview, full pass, and polling', async () => {
-  const passes = [];
-  let frameCallback = null;
+test('shared fetch runtime polls pending terrain without a duplicate startup pass', async () => {
+  let requests = 0;
   let pollCallback = null;
   const responseData = () => ({
     ox: 0, oy: 0, qx: 0, qy: 0, tiles: [],
-    missing: passes.length > 1 ? [{}] : [], downloading: [], texFetching: 0,
+    missing: requests === 1 ? [{}] : [], downloading: [], texFetching: 0,
   });
-  const { runtime, state } = createTestFetchRuntime({
+  const { runtime } = createTestFetchRuntime({
     fetchImpl: async () => {
-      passes.push(state.loadPass);
+      requests += 1;
       return { status: 200, json: async () => responseData() };
     },
-    scheduleFrame: callback => { frameCallback = callback; },
     schedulePoll: callback => { pollCallback = callback; return 7; },
     cancelPoll: () => {},
   });
   await runtime.request();
-  assert.deepEqual(passes, [1]);
-  assert.equal(state.loadPass, 2);
-  await frameCallback();
-  assert.deepEqual(passes, [1, 2]);
+  assert.equal(requests, 1);
   assert.equal(typeof pollCallback, 'function');
   await pollCallback();
-  assert.deepEqual(passes, [1, 2, 2]);
+  assert.equal(requests, 2);
 });
 
 test('shared fetch runtime rejects overlapping requests', async () => {
@@ -1260,7 +1249,7 @@ test('shared fetch runtime rejects an HTTP error before terrain reconciliation',
   assert.equal(state.fetching, false);
 });
 
-test('reset aborts the active terrain request and gates its completion by current heatmap', async () => {
+test('reset aborts the active terrain request and gates its completion by the current tile set', async () => {
   let activeSignal = null;
   let release;
   const { runtime, state } = createTestFetchRuntime({
@@ -1270,13 +1259,12 @@ test('reset aborts the active terrain request and gates its completion by curren
     },
   });
   const request = runtime.request();
-  runtime.reset(1);
+  runtime.reset();
   assert.equal(activeSignal.aborted, true);
   release({ status: 200, json: async () => ({
     ox: 0, oy: 0, qx: 0, qy: 0, tiles: [], missing: [], downloading: [], texFetching: 0,
   }) });
   await request;
-  assert.equal(state.loadPass, 1);
   assert.equal(state.lastTiles, null);
   assert.equal(state.fetching, false);
 });
@@ -1287,7 +1275,7 @@ test('superseded depth-12 response cannot replace latest depth-10 demand', async
     fetchImpl: () => new Promise(resolve => { releases.push(resolve); }),
   });
   const oldRequest = runtime.request();
-  runtime.reset(2);
+  runtime.reset();
   const latestRequest = runtime.request();
 
   releases[0]({ status: 200, json: async () => ({
@@ -1309,13 +1297,11 @@ test('superseded depth-12 response cannot replace latest depth-10 demand', async
   assert.equal(state.cameraStereoY, 10);
 });
 
-test('superseded response admits only exact quality upgrades in the latest heatmap', async () => {
+test('superseded response admits only exact quality upgrades in the latest tile set', async () => {
   const releases = [];
   const { runtime, state } = createTestFetchRuntime({
     fetchImpl: () => new Promise(resolve => { releases.push(resolve); }),
   });
-  state.loadPass = 2;
-
   const baseline = runtime.request();
   releases[0]({ status: 200, json: async () => ({
     ox: 0, oy: 0, qx: 0, qy: 0,
@@ -1324,7 +1310,7 @@ test('superseded response admits only exact quality upgrades in the latest heatm
   await baseline;
 
   const oldRequest = runtime.request();
-  runtime.reset(2);
+  runtime.reset();
   const latestRequest = runtime.request();
   releases[2]({ status: 200, json: async () => ({
     ox: 0, oy: 0, qx: 10, qy: 10,
@@ -1601,7 +1587,7 @@ test('seam analysis leaves aligned geometry quiet and detects normal-only seams'
 test('shared fetch runtime preserves initial response transition ordering', async () => {
   const events = [];
   const state = {
-    loadPass: 1, firstLoad: true, frameOffsetReady: false,
+    firstLoad: true, frameOffsetReady: false,
     frameOffsetX: 0, frameOffsetY: 0, originX: 0, originY: 0,
     cameraStereoX: 0, cameraStereoY: 0, lastFetchX: 0, lastFetchY: 0,
     currentTileIds: new Set(), lastTiles: null, bootFetchLogged: false,
@@ -1612,7 +1598,6 @@ test('shared fetch runtime preserves initial response transition ordering', asyn
   const deferredTiles = new Map();
   const runtime = createTerrainFetchRuntime({
     state,
-    previewMaxDepth: 10,
     view: { anchorLatitude: 64, anchorLongitude: -51 },
     vehicle: {},
     testOverrides: {
@@ -1647,16 +1632,15 @@ test('shared fetch runtime preserves initial response transition ordering', asyn
         texFetching: 0, texRetryQueue: 0, texStatusCounts: {},
       }),
     }),
-    now: () => 100,
   });
-  const result = await runtime.execute({ pass: 1 });
-  assert.equal(result.nextAction, 'full-pass');
+  const result = await runtime.execute({});
+  assert.equal(result.nextAction, 'idle');
   assert.equal(state.firstLoad, false);
   assert.equal(state.originX, 10);
   assert.deepEqual(events, [
-    'fetchTiles.request[pass1]', 'fetchTiles.frame.offset.set',
-    'fetchTiles.response[pass1]', 'tiles.initial-fetch.response',
-    'fetchTiles.origin.set', 'buildings:1', 'fetchTiles.diff[pass1]', 'fetchTiles.built[pass1]',
+    'fetchTiles.request', 'fetchTiles.frame.offset.set',
+    'fetchTiles.response', 'tiles.initial-fetch.response',
+    'fetchTiles.origin.set', 'buildings:1', 'fetchTiles.diff', 'fetchTiles.built',
     'textures', 'missing',
   ]);
 });
@@ -1866,7 +1850,7 @@ test('texture candidates are filtered and priority sorted', () => {
   assert.deepEqual([...result.tileIds], ['far', 'hot', 'cold']);
 });
 
-test('texture heatmap refines equivalent coverage before coarse parents', () => {
+test('texture demand refines equivalent coverage before coarse parents', () => {
   const tiles = [
     { id: '8-87-48', bbox: [0, 0, 4, 4], priority: 5.0 },
     { id: '11-699-390', bbox: [1, 1, 3, 3], priority: 5.1 },

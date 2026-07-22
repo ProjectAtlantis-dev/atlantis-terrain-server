@@ -745,7 +745,7 @@ export function createTerrainVehicleRuntime({
     }
     // The light's orthographic square is rotated into the sun frame. Project
     // a conservative circumscribed circle onto the ground so low sun keeps
-    // enough receiving terrain without cloning the entire resident heatmap.
+    // enough receiving terrain without cloning the entire resident tile set.
     const sunUp = Math.abs(getSunDirection().dot(up));
     const receiverRadius = vehicleShadowRadius * Math.SQRT2
       / Math.max(VEHICLE_SHADOW_MIN_SUN_PROJECTION, sunUp);

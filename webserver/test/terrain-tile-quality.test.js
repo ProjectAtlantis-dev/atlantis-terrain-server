@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import {
   classifyDemSource,
   classifyTextureTile,
-  mergeTerrainTilesAgainstCurrentHeatmap,
+  mergeTerrainTilesAgainstCurrentTileSet,
   retryableSyntheticDemCount,
 } from '../terrain-tile-quality.js';
 import { terrainPipelineStatus } from '../terrain-tile-fetch.js';
@@ -39,7 +39,7 @@ test('retryable synthetic heightmaps keep browser reconciliation polling alive',
   );
 });
 
-test('late terrain data upgrades exact heatmap tiles without changing topology', () => {
+test('late terrain data upgrades exact resident tiles without changing topology', () => {
   const current = [
     {
       id: '10-381-194', source: 'arcticdem_10m', heightmap: 'current-parent',
@@ -50,7 +50,7 @@ test('late terrain data upgrades exact heatmap tiles without changing topology',
       texStatus: 'ancestor_fallback', texIsPlaceholder: true,
     },
   ];
-  const result = mergeTerrainTilesAgainstCurrentHeatmap(current, [
+  const result = mergeTerrainTilesAgainstCurrentTileSet(current, [
     {
       id: '12-1525-779', source: 'arcticdem_10m', heightmap: 'late-child',
       texStatus: 'ready', hasTexture: true,
@@ -72,7 +72,7 @@ test('late terrain data upgrades exact heatmap tiles without changing topology',
 });
 
 test('late DEM upgrade cannot regress an exact tile ready texture', () => {
-  const result = mergeTerrainTilesAgainstCurrentHeatmap([
+  const result = mergeTerrainTilesAgainstCurrentTileSet([
     {
       id: '11-763-389', source: 'parent_resampled', heightmap: 'synthetic',
       texStatus: 'ready', hasTexture: true,

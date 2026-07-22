@@ -1134,7 +1134,7 @@ def api_tiles():
     return unavailable
 
   error = _arg_float("error", 0.0005)
-  max_depth = min(_arg_int("maxDepth", MAX_TILE_DEPTH), MAX_TILE_DEPTH)
+  max_depth = MAX_TILE_DEPTH
   max_range = _arg_float("range", 16000.0)
 
   if "sx" in request.args and "sy" in request.args:

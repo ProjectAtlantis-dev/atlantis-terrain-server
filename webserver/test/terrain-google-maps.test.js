@@ -59,7 +59,7 @@ test('G key opens Google Maps once and C remains unassigned', () => {
   }
 });
 
-test('H and R remain unassigned to heatmap and road debug', () => {
+test('H and R remain unassigned to tile inspector and road debug', () => {
   const previousWindow = globalThis.window;
   const listeners = new Map();
   globalThis.window = {
@@ -67,7 +67,7 @@ test('H and R remain unassigned to heatmap and road debug', () => {
     removeEventListener(type) { listeners.delete(type); },
   };
   let roadToggles = 0;
-  let heatmapToggles = 0;
+  let tileInspectorToggles = 0;
   const noop = () => {};
   const dispose = installTerrainKeyboardControls({
     controls: { keys: {} },
@@ -76,7 +76,7 @@ test('H and R remain unassigned to heatmap and road debug', () => {
     onEscapeVehicle: noop,
     onToggleMap: noop,
     onToggleRoadDebug: () => { roadToggles += 1; },
-    onToggleHeatmap: () => { heatmapToggles += 1; },
+    onToggleTileInspector: () => { tileInspectorToggles += 1; },
     onToggleHeadlights: noop,
   });
   try {
@@ -85,7 +85,7 @@ test('H and R remain unassigned to heatmap and road debug', () => {
     listeners.get('keydown')({ code: 'KeyH', repeat: false });
     listeners.get('keydown')({ code: 'KeyH', repeat: true });
     assert.equal(roadToggles, 0);
-    assert.equal(heatmapToggles, 0);
+    assert.equal(tileInspectorToggles, 0);
   } finally {
     dispose();
     globalThis.window = previousWindow;

@@ -1,9 +1,9 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
-  createTerrainHeatmapRuntime,
-  updateHeatmapViewPriorities,
-} from '../terrain-heatmap-runtime.js';
+  createTerrainTileInspectorRuntime,
+  updateTileInspectorViewPriorities,
+} from '../terrain-tile-inspector-runtime.js';
 
 class FakeElement {
   constructor(tagName, context = null) {
@@ -21,14 +21,14 @@ class FakeElement {
   getContext() { return this.context; }
 }
 
-test('heatmap priority is radial and unaffected by view direction', () => {
+test('tile inspector priority is radial and unaffected by view direction', () => {
   const tiles = [
     { id: 'north', bbox: [-10, 90, 10, 110], priority: 0, order: 0 },
     { id: 'south', bbox: [-10, -110, 10, -90], priority: 0, order: 1 },
     { id: 'east', bbox: [190, -10, 210, 10], priority: 0, order: 2 },
   ];
 
-  updateHeatmapViewPriorities(tiles, {
+  updateTileInspectorViewPriorities(tiles, {
     cameraX: 0, cameraY: 0, yaw: 0,
   });
   assert.deepEqual(tiles.map(tile => tile.id), ['north', 'south', 'east']);
@@ -37,14 +37,14 @@ test('heatmap priority is radial and unaffected by view direction', () => {
     tiles[2].priority - tiles[0].priority - Math.log(2),
   ) < 1e-12);
 
-  updateHeatmapViewPriorities(tiles, {
+  updateTileInspectorViewPriorities(tiles, {
     cameraX: 0, cameraY: 0, yaw: Math.PI,
   });
   assert.deepEqual(tiles.map(tile => tile.id), ['north', 'south', 'east']);
   assert.deepEqual(tiles.map(tile => tile.order), [0, 1, 2]);
 });
 
-test('heatmap uses browser demand and never mutates its tile ordering', () => {
+test('tile inspector uses browser demand and never mutates its tile ordering', () => {
   const context = {
     clearRect() {}, setTransform() {}, save() {}, restore() {}, translate() {}, rotate() {},
     fillRect() {}, strokeRect() {}, fillText() {}, beginPath() {}, moveTo() {}, lineTo() {},
@@ -61,7 +61,7 @@ test('heatmap uses browser demand and never mutates its tile ordering', () => {
     { id: 'south', depth: 1, bbox: [-10, -110, 10, -90], heightmap: 'hm' },
     { id: 'north', depth: 1, bbox: [-10, 90, 10, 110], heightmap: 'hm' },
   ];
-  const runtime = createTerrainHeatmapRuntime({
+  const runtime = createTerrainTileInspectorRuntime({
     documentImpl,
     windowImpl: {
       innerWidth: 1000, innerHeight: 800, devicePixelRatio: 1,
@@ -73,7 +73,7 @@ test('heatmap uses browser demand and never mutates its tile ordering', () => {
     getTiles: () => tiles,
   });
 
-  runtime.setPresentation('heatmap');
+  runtime.setPresentation('inspector');
   animationFrames.shift()(0);
   assert.deepEqual(tiles.map(tile => tile.id), ['south', 'north']);
 
@@ -82,7 +82,7 @@ test('heatmap uses browser demand and never mutates its tile ordering', () => {
   assert.deepEqual(tiles.map(tile => tile.id), ['south', 'north']);
 });
 
-test('heatmap runtime keeps the embedded edge mode hidden and renders filled heatmap', async () => {
+test('tile inspector runtime keeps the embedded edge mode hidden and renders filled overlay', async () => {
   const strokes = [];
   let fills = 0;
   const context = {
@@ -108,7 +108,7 @@ test('heatmap runtime keeps the embedded edge mode hidden and renders filled hea
     setTimeout: () => 1,
     clearTimeout() {},
   };
-  const runtime = createTerrainHeatmapRuntime({
+  const runtime = createTerrainTileInspectorRuntime({
     documentImpl,
     windowImpl,
     getView: () => ({ x: 0, y: 0, cameraX: 0, cameraY: 0, alt: 100, yaw: 0, zoom: 1000 }),
@@ -122,7 +122,7 @@ test('heatmap runtime keeps the embedded edge mode hidden and renders filled hea
   assert.equal(runtime.layer.style.display, 'none');
   assert.equal(fills, 0);
 
-  runtime.setPresentation('heatmap');
+  runtime.setPresentation('inspector');
   animationFrames.shift()(16);
   assert.equal(runtime.active, true);
   assert.equal(runtime.layer.style.background, '#060a10');

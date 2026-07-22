@@ -90,12 +90,12 @@ const TEXTURE_FIELDS = [
 ];
 
 /**
- * Admit late response data without allowing it to redefine the heatmap.
+ * Admit late response data without allowing it to redefine the tile set.
  * Only exact IDs in the current browser demand can be upgraded, and DEM and
  * imagery quality are compared independently so one channel cannot regress
  * the other.
  */
-export function mergeTerrainTilesAgainstCurrentHeatmap(currentTiles, incomingTiles) {
+export function mergeTerrainTilesAgainstCurrentTileSet(currentTiles, incomingTiles) {
   const current = Array.isArray(currentTiles) ? currentTiles : [];
   const incoming = Array.isArray(incomingTiles) ? incomingTiles : [];
   const incomingById = new Map(incoming.map(tile => [tile?.id, tile]));

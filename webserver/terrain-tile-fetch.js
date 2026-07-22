@@ -4,8 +4,6 @@ export function buildTerrainTilesRequest({
   altitude,
   heading,
   range,
-  pass,
-  previewMaxDepth,
   isFirstLoad,
   frameOffsetReady,
   originX,
@@ -14,21 +12,15 @@ export function buildTerrainTilesRequest({
   queryY,
   cameraSnapshot = {},
 }) {
-  const preview = pass === 1;
   const hasGridPosition = Number.isFinite(queryX) && Number.isFinite(queryY);
   const positionQuery = hasGridPosition
     ? `sx=${queryX}&sy=${queryY}`
     : `lat=${lat}&lon=${lon}`;
   let url = `/api/tiles?${positionQuery}&alt=${altitude}&heading=${heading}&range=${range}`;
-  // preview=1 keeps the server's closest-first flood for the quick paint;
-  // full passes let it order heightmap fetches by view priority instead.
-  if (preview) url += `&maxDepth=${previewMaxDepth}&preview=1`;
   if (!isFirstLoad || frameOffsetReady) url += `&ox=${originX}&oy=${originY}`;
   return {
     url,
     logDetails: {
-      pass,
-      passLabel: preview ? 'preview' : 'full',
       isFirstLoad,
       requestLat: lat,
       requestLon: lon,
@@ -36,7 +28,6 @@ export function buildTerrainTilesRequest({
       requestGridY: hasGridPosition ? queryY : null,
       requestAltM: altitude,
       headingRad: heading,
-      maxDepth: preview ? previewMaxDepth : null,
       ...cameraSnapshot,
     },
   };
@@ -85,7 +76,7 @@ export function offsetTerrainPayload(data, offsetX, offsetY) {
 const rounded = value => Number.isFinite(value) ? Number(value.toFixed(1)) : null;
 
 export function summarizeTerrainResponse({
-  data, status, pass, cameraX, cameraY, frameOffsetX, frameOffsetY, frameOffsetReady,
+  data, status, cameraX, cameraY, frameOffsetX, frameOffsetY, frameOffsetReady,
 }) {
   const tiles = Array.isArray(data?.tiles) ? data.tiles : [];
   const withHm = tiles.filter(tile => tile.heightmap).length;
@@ -98,8 +89,6 @@ export function summarizeTerrainResponse({
     if (!closest || distance < closest.distance) closest = { tile, cx, cy, distance };
   }
   return {
-    pass,
-    passLabel: pass === 1 ? 'preview' : 'full',
     status,
     tiles: tiles.length,
     withHm,
@@ -118,15 +107,13 @@ export function summarizeTerrainResponse({
   };
 }
 
-export function adoptTerrainOrigin({ data, pass, cameraSnapshot }) {
+export function adoptTerrainOrigin({ data, cameraSnapshot }) {
   return {
     originX: data.ox,
     originY: data.oy,
     cameraX: data.qx,
     cameraY: data.qy,
     logDetails: {
-      pass,
-      passLabel: pass === 1 ? 'preview' : 'full',
       qx: rounded(data.qx), qy: rounded(data.qy),
       ox: rounded(data.ox), oy: rounded(data.oy),
       requestCamStereoApproxX: cameraSnapshot.camStereoApproxX,
@@ -203,7 +190,7 @@ export function summarizeTerrainCamera(coordinates, {
   };
 }
 
-export function terrainPipelineStatus(data, wasFirstLoad, pass = wasFirstLoad ? 1 : 2) {
+export function terrainPipelineStatus(data) {
   const missing = data?.missing?.length ?? 0;
   const downloading = data?.downloading?.length ?? 0;
   const textureFetching = data?.texFetching ?? 0;
@@ -215,10 +202,8 @@ export function terrainPipelineStatus(data, wasFirstLoad, pass = wasFirstLoad ? 
     textureFetching,
     textureRetryQueue: data?.texRetryQueue ?? 0,
     textureStatusCounts: data?.texStatusCounts || {},
-    nextAction: pass === 1
-      ? 'full-pass'
-      : (missing > 0 || downloading > 0 || textureFetching > 0
-          || syntheticHeightmaps > 0 ? 'poll' : 'idle'),
+    nextAction: missing > 0 || downloading > 0 || textureFetching > 0
+      || syntheticHeightmaps > 0 ? 'poll' : 'idle',
   };
 }
 import { retryableSyntheticDemCount } from './terrain-tile-quality.js';
