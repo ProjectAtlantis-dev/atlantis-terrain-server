@@ -1214,20 +1214,51 @@ test('shared fetch runtime polls pending terrain without a duplicate startup pas
   assert.equal(requests, 2);
 });
 
-test('shared fetch runtime rejects overlapping requests', async () => {
-  let release;
-  let skips = 0;
-  const { runtime } = createTestFetchRuntime({
-    fetchImpl: () => new Promise(resolve => { release = resolve; }),
-    onSkip: () => { skips += 1; },
+test('shared fetch runtime coalesces movement without starving the latest request', async () => {
+  const releases = [];
+  const signals = [];
+  const urls = [];
+  let notifySecondStarted;
+  const secondStarted = new Promise(resolve => { notifySecondStarted = resolve; });
+  let coalesced = 0;
+  const { runtime, state } = createTestFetchRuntime({
+    fetchImpl: (url, { signal }) => {
+      urls.push(url);
+      signals.push(signal);
+      if (signals.length === 2) notifySecondStarted();
+      return new Promise(resolve => { releases.push(resolve); });
+    },
+    onSkip: () => { coalesced += 1; },
   });
-  const first = runtime.request();
-  await runtime.request();
-  assert.equal(skips, 1);
-  release({ status: 200, json: async () => ({
-    ox: 0, oy: 0, qx: 0, qy: 0, tiles: [], missing: [], downloading: [], texFetching: 0,
+  const first = runtime.request(64.1, -51.1);
+  runtime.request(64.2, -51.2);
+  runtime.request(64.3, -51.3);
+  assert.equal(coalesced, 2);
+  assert.equal(signals[0].aborted, false);
+  assert.equal(releases.length, 1);
+  assert.match(urls[0], /lat=64\.1&lon=-51\.1/);
+
+  releases[0]({ status: 200, json: async () => ({
+    ox: 0, oy: 0, qx: 1, qy: 2, tiles: [], missing: [], downloading: [], texFetching: 0,
+  }) });
+  await secondStarted;
+  assert.equal(releases.length, 2);
+  assert.equal(signals[1].aborted, false);
+  assert.match(urls[1], /lat=64\.3&lon=-51\.3/);
+  // The in-flight response stays authoritative: it fully applies (advancing
+  // lastFetch so movement refetches cannot starve topology forever) before
+  // the coalesced follow-up runs.
+  assert.equal(state.cameraStereoX, 1);
+  assert.equal(state.lastFetchX, 1);
+  assert.equal(state.fetching, true);
+
+  releases[1]({ status: 200, json: async () => ({
+    ox: 0, oy: 0, qx: 20, qy: 30, tiles: [], missing: [], downloading: [], texFetching: 0,
   }) });
   await first;
+  assert.equal(state.cameraStereoX, 20);
+  assert.equal(state.cameraStereoY, 30);
+  assert.equal(state.fetching, false);
 });
 
 test('shared fetch runtime rejects an HTTP error before terrain reconciliation', async () => {

@@ -914,7 +914,10 @@ function attachTileScatter(mesh, tile, hm) {
   }
 }
 
-const REFETCH_DIST = 5000;
+// Keep the camera comfortably inside the 4 km depth-12 plateau. A 5 km
+// threshold allowed the camera to leave that band before requesting a new
+// topology, making the entire fine-LOD region visibly trail behind it.
+const REFETCH_DIST = 1000;
 const terrainPipelineState = {
   ready: false,
   originX: 0,
@@ -1373,8 +1376,8 @@ function runStreamingMaintenance() {
 const terrainFetchEvents = {
   onResponseApplied: requestRender,
   onBuildings: buildings => buildingsRuntime?.reconcile(buildings),
-  onSkip: () => enqueueClientLog('debug', 'fetchTiles.skip', {
-    reason: 'already fetching', ...getCameraLogSnapshot(),
+  onSkip: () => enqueueClientLog('debug', 'fetchTiles.coalesce', {
+    reason: 'latest camera position queued', ...getCameraLogSnapshot(),
   }),
   onPoll: requestRender,
   onError(error) {
