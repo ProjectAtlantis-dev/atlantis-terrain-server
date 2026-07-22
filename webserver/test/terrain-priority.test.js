@@ -1261,6 +1261,58 @@ test('shared fetch runtime coalesces movement without starving the latest reques
   assert.equal(state.fetching, false);
 });
 
+test('sustained movement pressure never starves topology updates (livelock regression)', async () => {
+  // The maintenance loop re-fires request() every 500ms while the camera sits
+  // far from lastFetchX/Y, and lastFetch only advances on a full apply. With
+  // fetches slower than 500ms, every fetch has a newer request land mid-flight
+  // — forever. Two earlier designs froze LOD topology here: aborting the
+  // in-flight fetch on the newer arrival, and version-demoting its response to
+  // the merge-only path. Each response below must fully own topology and
+  // advance lastFetch despite the runtime never going idle.
+  const releases = [];
+  const signals = [];
+  let fetches = 0;
+  const startWaiters = new Map();
+  const waitForFetch = n => new Promise(resolve => {
+    if (fetches >= n) resolve();
+    else startWaiters.set(n, resolve);
+  });
+  const { runtime, state } = createTestFetchRuntime({
+    fetchImpl: (_url, { signal }) => {
+      fetches += 1;
+      signals.push(signal);
+      startWaiters.get(fetches)?.();
+      return new Promise(resolve => { releases.push(resolve); });
+    },
+  });
+  const respond = (index, qx, tiles) => releases[index]({
+    status: 200,
+    json: async () => ({
+      ox: 0, oy: 0, qx, qy: 0, tiles, missing: [], downloading: [], texFetching: 0,
+    }),
+  });
+
+  const chain = runtime.request();
+  runtime.request();
+  respond(0, 1, [{ id: '9-0-0', heightmap: 'a' }]);
+  await waitForFetch(2);
+  assert.equal(state.lastFetchX, 1);
+  assert.deepEqual(state.lastTiles.map(tile => tile.id), ['9-0-0']);
+
+  runtime.request();
+  respond(1, 2, [{ id: '12-0-0', heightmap: 'b' }]);
+  await waitForFetch(3);
+  assert.equal(state.lastFetchX, 2);
+  assert.deepEqual(state.lastTiles.map(tile => tile.id), ['12-0-0']);
+
+  respond(2, 3, [{ id: '12-1-1', heightmap: 'c' }]);
+  await chain;
+  assert.equal(state.lastFetchX, 3);
+  assert.deepEqual(state.lastTiles.map(tile => tile.id), ['12-1-1']);
+  assert.equal(state.fetching, false);
+  assert.equal(signals.some(signal => signal.aborted), false);
+});
+
 test('shared fetch runtime rejects an HTTP error before terrain reconciliation', async () => {
   let reportedError = null;
   const { runtime, state } = createTestFetchRuntime({

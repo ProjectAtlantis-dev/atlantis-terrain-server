@@ -238,6 +238,17 @@ export function createTerrainFetchRuntime({
   function request(lat, lon) {
     // Coalesce, never abort: the in-flight request stays authoritative and
     // the newest coordinates run immediately after it settles.
+    //
+    // LIVELOCK WARNING — the movement-refetch trigger re-fires every 500ms
+    // for as long as the camera sits farther than REFETCH_DIST from
+    // state.lastFetchX/Y, and lastFetch only advances when a response fully
+    // applies. A radial fetch usually takes longer than 500ms, so under
+    // movement a newer request() always lands mid-flight. Any scheme that
+    // lets that newer arrival cancel or demote the in-flight work (aborting
+    // it, or version-checking its response into the merge-only path) means
+    // no response ever fully applies, lastFetch never advances, the trigger
+    // never clears, and LOD topology freezes until a reset — even after the
+    // camera stops. Both previous designs failed exactly this way.
     if (activeController) {
       onSkip();
       queuedRequest = { lat, lon };

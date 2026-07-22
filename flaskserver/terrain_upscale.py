@@ -12,13 +12,17 @@ import argparse
 import io
 import json
 from pathlib import Path
+from time import perf_counter
 import zipfile
 
 import numpy as np
 from PIL import Image, ImageFilter
 
+from colored_log import get_logger
+
 
 DEFAULT_SEED = 0x41544C41  # "ATLA"
+log_upscale = get_logger("terrain.upscale")
 
 
 def _smoothstep(value):
@@ -369,6 +373,19 @@ def upscale_tile_package(
     """Write a minimal replacement bundle containing only changed files."""
     input_path = Path(input_path)
     output_path = Path(output_path)
+    total_started = perf_counter()
+    log_upscale.info(
+        "Upscale started: input=%s output=%s factor=%dx seed=%d "
+        "amplitude=%.3fm octaves=%d",
+        input_path,
+        output_path,
+        factor,
+        seed,
+        amplitude_m,
+        octaves,
+    )
+
+    read_started = perf_counter()
     with zipfile.ZipFile(input_path, "r") as source_archive:
         manifest = json.loads(source_archive.read("manifest.json"))
         heightmap = np.load(
@@ -381,6 +398,20 @@ def upscale_tile_package(
                 source_archive.read("effective-water-mask.png")
             )
         bbox = manifest["bbox"]["values"]
+        texture_file = manifest.get("texture", {}).get("file", "texture-final.jpg")
+        texture_bytes = source_archive.read(texture_file)
+        read_seconds = perf_counter() - read_started
+        tile_id = manifest.get("tileId") or input_path.stem
+        log_upscale.info(
+            "Read tile %s package in %.1fms (heightmap=%dx%d, texture=%s)",
+            tile_id,
+            read_seconds * 1000.0,
+            heightmap.shape[1],
+            heightmap.shape[0],
+            texture_file,
+        )
+
+        heightmap_started = perf_counter()
         upscaled = upscale_heightmap(
             heightmap,
             bbox,
@@ -390,8 +421,18 @@ def upscale_tile_package(
             octaves=octaves,
             water_mask=water_mask,
         )
-        texture_file = manifest.get("texture", {}).get("file", "texture-final.jpg")
-        texture_bytes = source_archive.read(texture_file)
+        heightmap_seconds = perf_counter() - heightmap_started
+        log_upscale.info(
+            "Upscaled tile %s heightmap %dx%d -> %dx%d in %.1fms",
+            tile_id,
+            heightmap.shape[1],
+            heightmap.shape[0],
+            upscaled.shape[1],
+            upscaled.shape[0],
+            heightmap_seconds * 1000.0,
+        )
+
+        texture_started = perf_counter()
         upscaled_texture, texture_size = upscale_texture(
             texture_bytes,
             bbox,
@@ -400,6 +441,14 @@ def upscale_tile_package(
             octaves=octaves,
             terrain_heightmap=upscaled,
             water_mask=water_mask,
+        )
+        texture_seconds = perf_counter() - texture_started
+        log_upscale.info(
+            "Upscaled tile %s texture to %dx%d in %.1fms",
+            tile_id,
+            texture_size[0],
+            texture_size[1],
+            texture_seconds * 1000.0,
         )
 
         output_manifest = {
@@ -436,6 +485,7 @@ def upscale_tile_package(
             },
         }
 
+        write_started = perf_counter()
         output_path.parent.mkdir(parents=True, exist_ok=True)
         with zipfile.ZipFile(output_path, "w", zipfile.ZIP_DEFLATED) as output_archive:
             output_archive.writestr(
@@ -446,6 +496,19 @@ def upscale_tile_package(
             output_archive.writestr("heightmap-upscaled.npy", buffer.getvalue())
             output_archive.writestr("heightmap-upscaled.f32", upscaled.tobytes())
             output_archive.writestr("texture-upscaled.jpg", upscaled_texture)
+    write_seconds = perf_counter() - write_started
+    total_seconds = perf_counter() - total_started
+    log_upscale.info(
+        "Upscale complete: tile=%s total=%.1fms read=%.1fms heightmap=%.1fms "
+        "texture=%.1fms write=%.1fms output=%.1fKiB",
+        tile_id,
+        total_seconds * 1000.0,
+        read_seconds * 1000.0,
+        heightmap_seconds * 1000.0,
+        texture_seconds * 1000.0,
+        write_seconds * 1000.0,
+        output_path.stat().st_size / 1024.0,
+    )
     return upscaled
 
 
