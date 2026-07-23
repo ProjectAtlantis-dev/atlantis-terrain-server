@@ -37,7 +37,7 @@ CONFIDENCE = {
     'copernicus': 4,
     'external':   4,
     'arcticdem':  5,
-    'fractal_dem': 5,  # derived from a stable parent; below the 10m measured rank
+    'cooked_dem': 5,  # derived from a stable parent; below the 10m measured rank
     'arcticdem_10m': 6,
     'official_coastline': 6,
 }

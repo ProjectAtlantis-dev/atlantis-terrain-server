@@ -56,10 +56,13 @@ const RINGS = [
   },
   {
     name: 'mid',
-    grid: 352,
-    cellM: 0.45,       // ±79 m tuft band
-    fadeStartM: 34,
-    fadeEndM: 55,
+    // Grid doubled from 352 (±79 m) to 490 (±110 m) alongside fadeEndM so
+    // the carpet's actual radius doubles, not just where within the old
+    // radius the fade happened to sit.
+    grid: 490,
+    cellM: 0.45,       // ±110 m tuft band
+    fadeStartM: 68,
+    fadeEndM: 110,
     scaleMin: 0.34,
     scaleMax: 0.70,
     planarMul: 1.6,

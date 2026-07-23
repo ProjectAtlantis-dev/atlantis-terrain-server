@@ -86,7 +86,7 @@ class CogFetchSchedulerTests(unittest.TestCase):
             bbox = (0.0, 0.0, 329.6, 329.6)
             with (
                 patch.object(serve_flask, "DB_PATH", path),
-                patch("serve._cook_fractal_dem_quad", return_value=True) as cook,
+                patch("serve._cook_cooked_dem_quad", return_value=True) as cook,
                 patch.object(
                     ingest, "_read_cog_heightmap",
                     side_effect=AssertionError("COG read past the contract depth"),
@@ -103,7 +103,7 @@ class CogFetchSchedulerTests(unittest.TestCase):
             # a worker on a millisecond-fast defer).
             with (
                 patch.object(serve_flask, "DB_PATH", path),
-                patch("serve._cook_fractal_dem_quad", return_value=False),
+                patch("serve._cook_cooked_dem_quad", return_value=False),
             ):
                 self.assertEqual(
                     serve_flask._fetch_one_cog_tile("13-2754-1568", bbox),

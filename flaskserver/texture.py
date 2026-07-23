@@ -22,7 +22,7 @@ TEXTURE SOURCE STATES:
 - dataforsyningen_metatile4h2: Primary source (SPOT 6/7, 1.6m/0.2m via
                                EPSG:3184), fetched/reprojected as an aligned
                                4x4 group with edge-driven color harmonization.
-- fractal_upscale:          Past WMS_CONTRACT_DEPTH only: the fetched metatile
+- cooked_upscale:          Past WMS_CONTRACT_DEPTH only: the fetched metatile
                             carried no real detail beyond the level above
                             (provider blowup), so the tile was cooked from its
                             parent's final texture by terrain_upscale. Terminal
@@ -387,7 +387,7 @@ def init_textures(db):
 # one is logged as an error by write_texture (see TEX CLOBBER-TERMINAL).
 TERMINAL_SOURCES = {
     "dataforsyningen_metatile4h2",
-    "fractal_upscale",
+    "cooked_upscale",
     "ancestor_crop_nodata",
     "ocean_nodata",
 }
@@ -406,13 +406,13 @@ TEMPORARY_SOURCES = {
 }
 
 
-def drop_fractal_children(db, tile_id):
-    """Delete the fractal_upscale subtree under tile_id; returns its ids.
+def drop_procedural_children(db, tile_id):
+    """Delete the cooked_upscale subtree under tile_id; returns its ids.
 
     Cooked tiles are derived data: when the real parent texture changes,
     the derivation is stale. Cooks recurse (a depth-14 tile is cooked from
-    a depth-13 cook), so the staleness cascades — every fractal descendant
-    of a dropped fractal tile was derived, transitively, from the changed
+    a depth-13 cook), so the staleness cascades — every procedural descendant
+    of a dropped procedural tile was derived, transitively, from the changed
     parent. Dropping the rows returns them to the missing state, so the
     next demand re-runs the full pipeline (fetch → inspect → cook) level
     by level against the new parent.
@@ -440,7 +440,7 @@ def drop_fractal_children(db, tile_id):
         frontier = [
             r[0] for r in db.execute(
                 f"SELECT tile_id FROM textures WHERE tile_id IN ({placeholders}) "
-                "AND source = 'fractal_upscale'",
+                "AND source = 'cooked_upscale'",
                 child_ids,
             ).fetchall()
         ]
@@ -453,7 +453,7 @@ def drop_fractal_children(db, tile_id):
             # Cook-derived class maps are stale with their textures.
             db.execute(
                 f"DELETE FROM classifier_tiles WHERE tile_id IN ({marks}) "
-                "AND source = 'fractal_cook_v1'",
+                "AND source = 'procedural_cook_v1'",
                 stale,
             )
         except Exception:
@@ -514,14 +514,14 @@ def write_texture(db, tile_id, jpeg_bytes, source):
             ("dataforsyningen_metatile", "dataforsyningen_metatile4h2"),
             ("dataforsyningen_metatile4", "dataforsyningen_metatile4h2"),
             ("dataforsyningen_metatile4h", "dataforsyningen_metatile4h2"),
-            ("sentinel2_crop", "fractal_upscale"),
-            ("ancestor_crop", "fractal_upscale"),
-            ("ancestor_crop_ratelimit", "fractal_upscale"),
-            ("sentinel2", "fractal_upscale"),
-            ("dataforsyningen", "fractal_upscale"),
-            ("dataforsyningen_metatile", "fractal_upscale"),
-            ("dataforsyningen_metatile4", "fractal_upscale"),
-            ("dataforsyningen_metatile4h", "fractal_upscale"),
+            ("sentinel2_crop", "cooked_upscale"),
+            ("ancestor_crop", "cooked_upscale"),
+            ("ancestor_crop_ratelimit", "cooked_upscale"),
+            ("sentinel2", "cooked_upscale"),
+            ("dataforsyningen", "cooked_upscale"),
+            ("dataforsyningen_metatile", "cooked_upscale"),
+            ("dataforsyningen_metatile4", "cooked_upscale"),
+            ("dataforsyningen_metatile4h", "cooked_upscale"),
         }
         msg = (
             f"{tile_id}: replacing {ex_source} "
@@ -530,7 +530,7 @@ def write_texture(db, tile_id, jpeg_bytes, source):
         if ex_source != source and (ex_source, source) not in expected_upgrades:
             if ex_source in TERMINAL_SOURCES:
                 # Terminal rows are workflow endpoints (finished provider
-                # detail, fractal cooks, confirmed no-coverage). Nothing in
+                # detail, procedural cooks, confirmed no-coverage). Nothing in
                 # the normal pipeline replaces them — this is either a manual
                 # reset or a bug losing finished work.
                 log_tex.error(f"[TEX CLOBBER-TERMINAL] {msg}")
@@ -545,17 +545,17 @@ def write_texture(db, tile_id, jpeg_bytes, source):
     db.commit()
 
     # Cooked descendants are derived from this tile's texture: any real
-    # (non-placeholder) change to it makes the whole fractal subtree stale
+    # (non-placeholder) change to it makes the whole procedural subtree stale
     # (drop cascades — deep cooks recurse on cooked parents). Cook writes
     # themselves can't invalidate anything: a cook only runs after the
     # parent-change drop already cleared the subtree, so its children
     # don't exist yet.
-    if source not in TEMPORARY_SOURCES and source != "fractal_upscale":
-        stale = drop_fractal_children(db, tile_id)
+    if source not in TEMPORARY_SOURCES and source != "cooked_upscale":
+        stale = drop_procedural_children(db, tile_id)
         if stale:
             log_tex.info(
                 f"[TEX] {tile_id}: parent changed to {source} — dropped stale "
-                f"fractal children for re-cook: {', '.join(stale)}"
+                f"procedural children for re-cook: {', '.join(stale)}"
             )
 
 

@@ -608,7 +608,13 @@ export function createTerrainTileSet({
     if (!mesh?.material) return;
     mesh.userData.terrainBaseTexture = texture ?? null;
     let needsUpdate = false;
-    const resolvedTexture = texture;
+    // Debug overlay hook: when a resolver is installed (classifier /
+    // archetype view), its texture replaces the satellite map — the base
+    // texture is remembered above, so dropping the overlay restores it.
+    const overlayTexture = texture && textureOverlayResolver
+      ? textureOverlayResolver(mesh.userData.tileId) ?? null
+      : null;
+    const resolvedTexture = overlayTexture ?? texture;
     if (mesh.material.map !== resolvedTexture) {
       mesh.material.map = resolvedTexture;
       needsUpdate = true;
@@ -632,13 +638,39 @@ export function createTerrainTileSet({
       needsUpdate = true;
     }
     mesh.material.color.set(0xffffff);
+    if (overlayTexture && mesh.material.userData?.terrainDetail) {
+      // The WebGPU detail colorNode captured the satellite texture when it
+      // was patched — it would keep rendering that instead of the overlay.
+      mesh.material.colorNode = null;
+      mesh.material.userData.terrainDetailMap = null;
+      mesh.material.userData.terrainDetailMask = null;
+      needsUpdate = true;
+    }
     if (needsUpdate) {
       mesh.material.needsUpdate = true;
       onMutated();
     }
     // Frequency-split ground detail: modulate the satellite color with tiled
     // per-surface detail near the camera (mask-gated, distance-faded).
-    terrainDetail.apply(mesh);
+    // Skipped while an overlay is shown — decision colors must stay legible.
+    if (!overlayTexture) terrainDetail.apply(mesh);
+  }
+
+  let textureOverlayResolver = null;
+
+  /** Re-run material application on every live tile with its remembered
+   *  base texture — how overlay changes propagate without a re-fetch. */
+  function refreshTextureOverlay() {
+    for (const child of terrainRoot.children) {
+      if (!child.userData?.tileId || !child.material) continue;
+      applyMaterial(child, child.userData.terrainBaseTexture ?? null);
+    }
+    onMutated();
+  }
+
+  function setTextureOverlay(resolver) {
+    textureOverlayResolver = resolver;
+    refreshTextureOverlay();
   }
 
   function prepareUntexturedMesh(mesh) {
@@ -730,5 +762,7 @@ export function createTerrainTileSet({
     updateTextures,
     refreshTextures,
     resetTextureApplications: updateTextureDemand.reset,
+    setTextureOverlay,
+    refreshTextureOverlay,
   };
 }

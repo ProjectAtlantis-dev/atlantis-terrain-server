@@ -360,7 +360,7 @@ export function buildAssetLibrary(renderer: WebGLRenderer, seedN = 1337): AssetL
         { geo: s.bark, mat: barkMaterial(BARK_COLORS[sp.kind === 'conifer' ? 'spruce' : 'beech'] ?? [0.3, 0.27, 0.24]) },
       ];
       if (s.foliage) parts.push({ geo: s.foliage, mat: cardMaterial(atlasFor(sp)) });
-      add(`shrub/${sp.id}/${v}`, parts, 170, [0.7, 1.25], true);
+      add(`shrub/${sp.id}/${v}`, parts, 340, [0.7, 1.25], true);
     }
   }
 
@@ -378,7 +378,7 @@ export function buildAssetLibrary(renderer: WebGLRenderer, seedN = 1337): AssetL
   for (const kind of ['umbel', 'bell', 'daisy'] as FlowerKind[]) {
     for (let v = 0; v < 2; v++) {
       const geo = buildFlower(kind, seed.rng(`flower/${kind}/${v}`));
-      add(`flower/${kind}/${v}`, [{ geo, mat: flowerMaterial(FLOWER_COLOR[kind]) }], 90, [0.8, 1.3], true);
+      add(`flower/${kind}/${v}`, [{ geo, mat: flowerMaterial(FLOWER_COLOR[kind]) }], 180, [0.8, 1.3], true);
     }
   }
 
@@ -396,12 +396,12 @@ export function buildAssetLibrary(renderer: WebGLRenderer, seedN = 1337): AssetL
   // details follow the demo's SCATTER tuning (Forests stones d1=3/d2=2), not
   // its gallery-hero detail — a scattered boulder at subdiv 5 is 20k tris
   const rocks: { preset: RockPreset; detail: number; maxDist: number; scale: [number, number]; n: number }[] = [
-    { preset: 'hero', detail: 5, maxDist: 1400, scale: [0.6, 1.4], n: 2 },
-    { preset: 'boulder', detail: 3, maxDist: 900, scale: [0.6, 1.5], n: 3 },
-    { preset: 'angular', detail: 3, maxDist: 500, scale: [0.7, 1.4], n: 2 },
-    { preset: 'slab', detail: 3, maxDist: 600, scale: [0.7, 1.4], n: 2 },
-    { preset: 'talus', detail: 3, maxDist: 400, scale: [0.6, 1.3], n: 2 },
-    { preset: 'cobble', detail: 2, maxDist: 280, scale: [1.0, 3.0], n: 2 },
+    { preset: 'hero', detail: 5, maxDist: 700, scale: [0.6, 1.4], n: 2 },
+    { preset: 'boulder', detail: 3, maxDist: 450, scale: [0.6, 1.5], n: 3 },
+    { preset: 'angular', detail: 3, maxDist: 250, scale: [0.7, 1.4], n: 2 },
+    { preset: 'slab', detail: 3, maxDist: 300, scale: [0.7, 1.4], n: 2 },
+    { preset: 'talus', detail: 3, maxDist: 200, scale: [0.6, 1.3], n: 2 },
+    { preset: 'cobble', detail: 2, maxDist: 140, scale: [1.0, 3.0], n: 2 },
   ];
   for (const r of rocks) {
     for (let v = 0; v < r.n; v++) {
@@ -411,15 +411,17 @@ export function buildAssetLibrary(renderer: WebGLRenderer, seedN = 1337): AssetL
   }
 
   // ---- grass: pre-baked clumped patches, instanced per tile ----------------
-  // 420 wide blades over 3 m ≈ 2/3 ground coverage inside a patch — with the
-  // tundra scatter density (~1 patch / 8 m²) the carpet hides most bare
-  // terrain where the vegetation mask passes.
+  // SMALL patches (1.6 m): a 3 m flat patch on curved ground read as
+  // straight blade rows slicing the slope (seen live 2026-07-23); smaller
+  // patches + the terrain-normal tilt scatter applies keep each patch
+  // inside one terrain facet. Coverage comes from texture-driven placement
+  // (greenness-weighted, ground-tinted), not from patch size.
   for (let v = 0; v < 3; v++) {
     const rng = seed.rng(`grass/${v}`);
-    const patch = grassPatch(rng, 420, 3, { dryBase: 0.15 });
+    const patch = grassPatch(rng, 260, 1.6, { dryBase: 0.15 });
     const geo = bakeInstanced(patch);
     patch.geometry.dispose(); // blade geometry was baked into the merged patch
-    add(`grass/${v}`, [{ geo, mat: patch.material as ShaderMaterial }], 120, [0.8, 1.4], true);
+    add(`grass/${v}`, [{ geo, mat: patch.material as ShaderMaterial }], 240, [0.8, 1.4], true);
   }
 
   return { kinds, stats: { kinds: kinds.size, tris, buildMs: performance.now() - t0 } };

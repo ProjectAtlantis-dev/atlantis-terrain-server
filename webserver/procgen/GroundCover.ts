@@ -104,9 +104,18 @@ export function grassMaterial(): ShaderMaterial {
       attribute vec4 idata;
       varying float vT;
       varying vec4 vId;
+      varying vec3 vTint;
       void main() {
         vT = uv.y;
         vId = idata;
+        // Per-instance ground tint (scatter samples the tile's satellite
+        // texture at the placement point) — grass reads as blobs of the
+        // imagery's own color instead of one synthetic green everywhere.
+        #ifdef USE_INSTANCING_COLOR
+          vTint = instanceColor;
+        #else
+          vTint = vec3(-1.0);
+        #endif
         ${INSTANCE_CHUNK}
       }
     `,
@@ -115,6 +124,7 @@ export function grassMaterial(): ShaderMaterial {
       ${LOGDEPTH_FRAG_PARS}
       varying float vT;
       varying vec4 vId;
+      varying vec3 vTint;
       void main() {
         #include <logdepthbuf_fragment>
         vec3 fresh = mix(vec3(0.026, 0.06, 0.012), vec3(0.1, 0.16, 0.035), vT * vT);
@@ -123,7 +133,13 @@ export function grassMaterial(): ShaderMaterial {
         // baked light: base AO ramp + a fixed sky term standing in for the
         // demo's lit material (unlit scene)
         float ao = smoothstep(0.0, 0.55, vT) * 0.55 + 0.45;
-        gl_FragColor = vec4(albedo * ao * 2.4, 1.0);
+        vec3 base = albedo * ao * 2.4;
+        if (vTint.x >= 0.0) {
+          // Pull strongly toward the sampled ground color, keeping the
+          // base->tip ramp so blades still read as blades up close.
+          base = mix(base, vTint * (0.55 + 0.55 * vT), 0.62);
+        }
+        gl_FragColor = vec4(base, 1.0);
       }
     `,
     side: DoubleSide,

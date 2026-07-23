@@ -4,8 +4,8 @@
 # Depth 13 ≈ 330 m tiles, halving each level to depth 16 ≈ 41 m — walking
 # scale. Past WMS_CONTRACT_DEPTH the provider imagery may be a plain blowup
 # of the level above; fetched metatiles are inspected and fall back to the
-# deterministic fractal upscaler when they carry no new detail (source
-# "fractal_upscale"). Past WMS_TEXTURE_PROBE_MAX_DEPTH the fetch is not even
+# deterministic procedural upscaler when they carry no new detail (source
+# "cooked_upscale"). Past WMS_TEXTURE_PROBE_MAX_DEPTH the fetch is not even
 # attempted and cooks recurse on cooked parents. Render cost of the deep
 # levels is bounded by the per-depth LOD cores in serve.py (~3 tile widths
 # per level), not by this ceiling.

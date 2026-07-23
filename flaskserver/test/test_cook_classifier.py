@@ -1,4 +1,4 @@
-"""Physics-first classification inside the fractal cook."""
+"""Physics-first classification inside the procedural cook."""
 
 import io
 import os
@@ -61,15 +61,29 @@ class CookClassifierTest(unittest.TestCase):
             self.assertEqual(labels[SIZE // 2, SIZE // 2], GREY)
 
     def test_color_proposals_hold_on_flat_ground(self):
+        # DARK/WHITE are RELATIVE to each tile's own land luminance (no
+        # fixed absolute threshold works across an imagery source whose
+        # exposure varies tile to tile) — a perfectly uniform image has no
+        # "brighter than the rest of this tile" region, so it must all
+        # read as GREY regardless of its absolute brightness.
         flat = _flat_surface()
-        cases = (
-            ((240, 240, 240), WHITE),
-            ((30, 30, 30), DARK),
-            ((128, 128, 128), GREY),
-        )
-        for color, expected in cases:
+        for color in ((240, 240, 240), (30, 30, 30), (128, 128, 128)):
             labels, _, _ = classify_cooked_quad(_uniform_rgb(color), flat, BBOX)
-            self.assertEqual(labels[SIZE // 2, SIZE // 2], expected)
+            self.assertTrue(np.all(labels == GREY), color)
+
+    def test_relative_brightness_finds_dark_and_white_within_one_tile(self):
+        # A mid-grey field with a bright patch and a dark patch: DARK/WHITE
+        # must be assigned by RELATIVE brightness within this tile, not an
+        # absolute luminance cutoff.
+        flat = _flat_surface()
+        rgb = _uniform_rgb((128, 128, 128))
+        w = rgb.shape[1]  # rgb is 256px; labels are resized up to SIZE=512
+        rgb[:, : w // 3] = (20, 20, 20)         # west third: dark patch
+        rgb[:, 2 * w // 3 :] = (235, 235, 235)  # east third: bright patch
+        labels, _, _ = classify_cooked_quad(rgb, flat, BBOX)
+        self.assertEqual(labels[SIZE // 2, SIZE // 6], DARK)
+        self.assertEqual(labels[SIZE // 2, SIZE // 2], GREY)
+        self.assertEqual(labels[SIZE // 2, 5 * SIZE // 6], WHITE)
 
     def test_water_mask_outranks_everything_and_carries_no_detail(self):
         mask = np.zeros((N, N), dtype=bool)
@@ -194,12 +208,38 @@ class LiveD12ClassificationTest(unittest.TestCase):
             "SELECT source FROM classifier_tiles WHERE tile_id = '12-100-200'"
         ).fetchone()
         self.assertIsNotNone(row)
-        self.assertEqual(row[0], "coarse_d12_live_v1")
+        self.assertEqual(row[0], "ladder_d12_v3")
 
         # Second call must be a no-op read, never a re-classification.
-        with patch("cook_classifier.classify_tile_surface") as untouched:
+        with patch("classifier.ladder.classify_ladder") as untouched:
             serve_flask._ensure_d12_class_map(db, "12-100-200")
             untouched.assert_not_called()
+
+    def test_old_ladder_source_is_reclassified_on_demand(self):
+        import classifier.ladder
+        import serve_flask
+
+        db = self._database_with_d12_tile("dataforsyningen_metatile4h2")
+        with patch(
+            "classifier.official_water.classifier_water_mask_for_tile",
+            return_value=None,
+        ):
+            serve_flask._ensure_d12_class_map(db, "12-100-200")
+            db.execute(
+                "UPDATE classifier_tiles SET source = 'ladder_d12_v2' "
+                "WHERE tile_id = '12-100-200'"
+            )
+            db.commit()
+            with patch(
+                "classifier.ladder.classify_ladder",
+                wraps=classifier.ladder.classify_ladder,
+            ) as refreshed:
+                serve_flask._ensure_d12_class_map(db, "12-100-200")
+            refreshed.assert_called_once()
+        source = db.execute(
+            "SELECT source FROM classifier_tiles WHERE tile_id = '12-100-200'"
+        ).fetchone()[0]
+        self.assertEqual(source, "ladder_d12_v3")
 
     def test_placeholder_texture_is_never_persisted_as_classification(self):
         import serve_flask

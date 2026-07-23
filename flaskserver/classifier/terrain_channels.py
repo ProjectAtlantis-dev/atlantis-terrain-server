@@ -71,9 +71,14 @@ def render_channel(channels, channel):
     return _gray(channels["slope"], 0.0, 1.0)
   if channel == "sun":
     return _gray(channels["sun"], 0.0, 1.3)
+  # Histogram-equalized: linear min->max let a single peak own the whole
+  # range and rendered the rest of the tile near-black ("heightmap looks
+  # broken" on any tile with one summit). Rank mapping shows relief
+  # structure everywhere; this is a debug view, not a measurement.
   elevation = channels["elev"]
-  return _gray(
-    elevation,
-    float(np.nanmin(elevation)),
-    float(np.nanmax(elevation)) + 1e-6,
-  )
+  flat = elevation.ravel()
+  order = np.argsort(flat, kind="stable")
+  ranks = np.empty(flat.size, dtype=np.float64)
+  ranks[order] = np.arange(flat.size, dtype=np.float64)
+  equalized = (ranks / max(flat.size - 1, 1)).reshape(elevation.shape)
+  return _gray(equalized, 0.0, 1.0)

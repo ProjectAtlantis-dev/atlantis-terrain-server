@@ -36,7 +36,7 @@ import {
 } from '../terrain-sun-flare-effect.js';
 import { loadTerrainStartupAssets, normalizeTerrainStartupAssets } from '../terrain-startup-assets.js';
 import { createTerrainAtmosphereTextureRuntime } from '../terrain-atmosphere-textures.js';
-import { createTerrainGridlinesController } from '../terrain-gridlines.js';
+import { GRIDLINES_COLOR, createTerrainGridlinesController } from '../terrain-gridlines.js';
 import { createTerrainTuningControls } from '../terrain-tuning-controls.js';
 import { waterCascadeUpdateDue, waterCascadeUpdateRate } from '../water/water-spectrum.js';
 import {
@@ -81,6 +81,9 @@ test('gridlines batch terrain-conforming tile edges without replacing textures',
   assert.equal(grid.lines.geometry.getAttribute('position').count, 24);
   assert.equal(grid.lines.isMesh, true);
   assert.equal(grid.lines.material.side, THREE.DoubleSide);
+  assert.equal(grid.lines.material.depthTest, true);
+  assert.equal(grid.lines.material.depthWrite, false);
+  assert.equal(grid.lines.material.color.getHex(), GRIDLINES_COLOR);
   assert.equal(grid.lines.visible, true);
   assert.equal(mesh.material, originalMaterial);
   assert.equal(mesh.material.map, originalTexture);

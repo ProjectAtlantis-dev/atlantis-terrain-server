@@ -67,6 +67,32 @@ export function createTerrainTileMenuRuntime({
       hide();
       windowImpl.open(`/pipeline.html?tile=${tileId}`, '_blank');
     });
+    // The classifier regression loop: the USER curates the known-bad set
+    // by flagging tiles live; the server bakes the full verification
+    // panels (ladder steps, Google ref, Asiaq overlay) immediately and
+    // the gallery at /api/regression/ is re-eyeballed after every
+    // classifier change.
+    addAction('⚑ Flag classifier regression…', async event => {
+      const action = event?.currentTarget;
+      const note = windowImpl.prompt(
+        `What looks wrong on ${tileId}? (stored with the regression case)`,
+      );
+      if (note === null) return; // cancelled
+      if (action) action.textContent = 'Flagging…';
+      try {
+        const response = await windowImpl.fetch('/api/regression/cases', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ tile: tileId, note }),
+        });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        hide();
+        windowImpl.open('/api/regression/', '_blank');
+      } catch (error) {
+        if (action) action.textContent = '⚑ Flag failed — click to retry';
+        console.error(`[regression-flag] ${tileId}:`, error);
+      }
+    });
     if (source) {
       if (heightmapPayload && Number.isInteger(resolution) && resolution > 1) {
         addPackageDownload(tileId, heightmapPayload, resolution);

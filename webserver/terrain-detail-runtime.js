@@ -45,7 +45,13 @@ export function createTerrainDetailRuntime({
         textures: detailTextures(),
         uv: detailUvTransform(tileId),
       });
-      if (applied) requestRender();
+      if (applied) {
+        // Diagnosis breadcrumb (cheap, once per texture land): "is the
+        // detail layer even patching this tile" must be answerable from
+        // the client log, not from theorizing over screenshots.
+        log(tileId, 'ground-detail applied');
+        requestRender();
+      }
     });
   }
 

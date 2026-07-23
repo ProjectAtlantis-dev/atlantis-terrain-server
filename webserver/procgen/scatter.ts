@@ -16,6 +16,7 @@
  */
 
 import {
+  Color,
   Group,
   InstancedMesh,
   Matrix4,
@@ -56,16 +57,25 @@ interface CategorySpec {
 // DENSE tundra (near-field only, camera-following — so we can afford it). Densities
 // are per-m²; a d12 tile is ~435k m². Understory should read as a carpet of dwarf
 // shrubs, not scattered dots. (The even-denser blade-grass carpet is GroundRing — Tier 2.)
+// ALL rock/* categories are REMOVED (2026-07-22, user directive): every
+// attempt to gate rock placement on the classifier's "light ground" signal
+// has been disputed live (rocks on dark streaks, rocks missing from bright
+// ridges, rocks blanketing indiscriminately) faster than it could be
+// verified against real screenshots. Rocks stay off until the light/rock
+// classification channel is proven correct against real placed-instance
+// coordinates vs. the actual served texture, not just code review — see
+// the classification-pipeline fix in serve_flask.py (classify from the
+// same pre-bake image instead of a separately-resampled parent) for the
+// most recent attempt at the underlying cause.
+// grass cap: patches are ~2.3k tris each and per-instance culling does not
+// exist (visibility is per-InstancedMesh) — the old cap of 18000 was a
+// ~40M-tri bomb that never detonated only because the veg gate starved
+// grass to nothing. 1200 tinted patches ≈ 2.8M tris worst case, and the
+// greenness²-weighted acceptance concentrates them into the green blobs.
 const CATEGORIES: CategorySpec[] = [
   { prefix: 'shrub/', density: 1 / 12, cap: 12000, maxSlope: 0.9, minElev: 2 },
   { prefix: 'flower/', density: 1 / 60, cap: 3000, maxSlope: 0.7, minElev: 2 },
-  { prefix: 'grass/', density: 1 / 8, cap: 18000, maxSlope: 0.7, minElev: 2 },
-  { prefix: 'rock/hero/', density: 1 / 20000, cap: 12, maxSlope: 0.8, minElev: 1 },
-  { prefix: 'rock/boulder/', density: 1 / 400, cap: 1200, maxSlope: 1.0, minElev: 1 },
-  { prefix: 'rock/angular/', density: 1 / 800, cap: 600, maxSlope: 1.2, minElev: 1 },
-  { prefix: 'rock/slab/', density: 1 / 1000, cap: 400, maxSlope: 1.0, minElev: 1 },
-  { prefix: 'rock/talus/', density: 1 / 500, cap: 900, maxSlope: 1.4, minElev: 1, slopeBias: 2.0 },
-  { prefix: 'rock/cobble/', density: 1 / 120, cap: 4000, maxSlope: 1.2, minElev: 1 },
+  { prefix: 'grass/', density: 1 / 24, cap: 1200, maxSlope: 0.7, minElev: 2 },
 ];
 
 export interface TileScatterInput {
@@ -81,12 +91,46 @@ export interface TileScatterInput {
    *  res×res u8 grid, NORTH-UP (row 0 = yMax). When present it drives WHERE:
    *  water hard-excludes, veg gates living density, rock gates stones. */
   fields?: TileFields;
+  /** archetype decision grid; when present it REPLACES the per-attempt
+   *  veg/dark channel juggling with recipe lookups. */
+  archetypes?: TileArchetypes;
+  /** the tile's own satellite texture, decoded to pixels (NORTH-UP).
+   *  Grass density follows its measured greenness (continuous — no
+   *  classifier threshold cliff) and grass gets tinted with the sampled
+   *  ground color, so cover reads as blobs of the imagery's own color. */
+  tex?: { res: number; rgba: Uint8ClampedArray | Uint8Array };
 }
 
 export interface TileFields {
   res: number;
   chans: Partial<Record<'veg' | 'rock' | 'snow' | 'water' | 'moisture' | 'dark', Uint8Array>>;
 }
+
+/** archetype decision grid from /api/archetypes/<id>.json — the NMS-style
+ *  intermediate rung. Cells are NORTH-UP indices into archetype names
+ *  (classifier/archetypes.py ARCHETYPE_NAMES order). */
+export interface TileArchetypes {
+  grid: number;
+  cells: Uint8Array | number[];
+}
+
+// Index constants mirroring classifier/archetypes.py ARCHETYPE_NAMES.
+const A = {
+  unknown: 0, water: 1, lake: 2, shore: 3, bench: 4, bog: 5, slab: 6,
+  face: 7, talus: 8, ridge: 9, shadow: 10, snow: 11,
+} as const;
+
+/** Density multiplier per (archetype, category prefix). THE decision table:
+ *  a cell's archetype fully determines what may grow there — scatter no
+ *  longer re-derives meaning from raw veg/dark channels per attempt.
+ *  Absent entries mean 0 (nothing of that category, full stop): water,
+ *  lake, face, ridge, shadow, snow and talus carry no vegetation.
+ *  (Talus is reserved for boulders once rock assets return.) */
+const ARCHETYPE_RECIPES: Record<string, Partial<Record<number, number>>> = {
+  'shrub/': { [A.bench]: 1, [A.bog]: 1, [A.shore]: 0.3, [A.slab]: 0.06 },
+  'grass/': { [A.bench]: 1, [A.bog]: 0.15, [A.shore]: 0.6, [A.slab]: 0.04 },
+  'flower/': { [A.bench]: 1, [A.bog]: 0.3, [A.shore]: 0.5, [A.slab]: 0.05 },
+};
 
 /** smooth 0..1 taper, like GLSL smoothstep — used in place of hard
  *  boolean cutoffs so deterministic gates read as a natural thinning
@@ -112,10 +156,47 @@ function makeFieldSampler(input: TileScatterInput): ((chan: string, x: number, y
   };
 }
 
+/** sample the archetype cell index at a world xy (NORTH-UP grid). */
+function makeArchetypeSampler(input: TileScatterInput): ((x: number, y: number) => number) | null {
+  const a = input.archetypes;
+  if (!a || !a.grid || !a.cells?.length) return null;
+  const [xMin, yMin, xMax, yMax] = input.bbox;
+  const grid = a.grid;
+  return (x: number, y: number): number => {
+    const c = Math.max(0, Math.min(grid - 1, Math.floor(((x - xMin) / (xMax - xMin)) * grid)));
+    const r = Math.max(0, Math.min(grid - 1, Math.floor(((yMax - y) / (yMax - yMin)) * grid)));
+    return (a.cells[r * grid + c] as number) ?? 0;
+  };
+}
+
+/** sample the tile texture at a world xy → [r,g,b] in 0..1 (NORTH-UP). */
+function makeTexSampler(input: TileScatterInput): ((x: number, y: number, out: number[]) => void) | null {
+  const t = input.tex;
+  if (!t || !t.res || !t.rgba?.length) return null;
+  const [xMin, yMin, xMax, yMax] = input.bbox;
+  const res = t.res;
+  return (x: number, y: number, out: number[]): void => {
+    const c = Math.max(0, Math.min(res - 1, Math.floor(((x - xMin) / (xMax - xMin)) * res)));
+    const r = Math.max(0, Math.min(res - 1, Math.floor(((yMax - y) / (yMax - yMin)) * res)));
+    const o = (r * res + c) * 4;
+    out[0] = (t.rgba[o] as number) / 255;
+    out[1] = (t.rgba[o + 1] as number) / 255;
+    out[2] = (t.rgba[o + 2] as number) / 255;
+  };
+}
+
+/** archetypes where nothing may grow regardless of what the texture says */
+const GROWTH_EXCLUDED = new Set<number>([
+  A.water, A.lake, A.face, A.ridge, A.shadow, A.snow, A.talus,
+]);
+
 interface Sample {
   z: number;
   slope: number;
   southness: number;
+  /** raw height gradient (for terrain-normal alignment of flat patches) */
+  gx: number;
+  gy: number;
 }
 
 function makeSampler(input: TileScatterInput): (x: number, y: number) => Sample {
@@ -144,16 +225,20 @@ function makeSampler(input: TileScatterInput): (x: number, y: number) => Sample 
     // grid orientation, no convergence correction — same convention as the
     // backend southness channel)
     const southness = slope > 1e-6 ? gy / slope : 0;
-    return { z, slope, southness };
+    return { z, slope, southness, gx, gy };
   };
 }
 
 const _m = new Matrix4();
 const _q = new Quaternion();
 const _qYaw = new Quaternion();
+const _qTilt = new Quaternion();
+const _normal = new Vector3();
 const _p = new Vector3();
 const _s = new Vector3();
 const _zAxis = new Vector3(0, 0, 1);
+const _c = new Color();
+const _texColor: number[] = [0, 0, 0];
 // y-up asset → z-up world
 const _qXup = new Quaternion().setFromAxisAngle(new Vector3(1, 0, 0), Math.PI / 2);
 
@@ -170,6 +255,8 @@ export function buildTileScatter(input: TileScatterInput): Group | null {
   const exag = input.exag ?? 1;
   const sample = makeSampler(input);
   const fsample = makeFieldSampler(input);
+  const asample = makeArchetypeSampler(input);
+  const tsample = makeTexSampler(input);
   const rng = new Rng(hashString(`scatter/${input.tileId}`));
 
   // kinds per category prefix
@@ -184,7 +271,7 @@ export function buildTileScatter(input: TileScatterInput): Group | null {
     }
   }
 
-  const placements = new Map<AssetKind, Matrix4[]>();
+  const placements = new Map<AssetKind, { mats: Matrix4[]; colors: number[] }>();
   let total = 0;
 
   for (const cat of CATEGORIES) {
@@ -238,34 +325,65 @@ export function buildTileScatter(input: TileScatterInput): Group | null {
       // skipped outright — clearly dark ground gets its bush, clearly
       // light ground gets its rock, full stop; the probability only
       // still applies in the ambiguous middle.
-      if (fsample) {
+      // rock/* categories (and their light/dark gating logic) are removed
+      // above — every kind reaching this point is living (shrub/flower/
+      // grass), so there is no non-living branch to gate here anymore.
+      const arch = asample ? asample(x, y) : -1;
+      if (arch >= 0 && GROWTH_EXCLUDED.has(arch)) continue;
+      let tint: number[] | null = null;
+      if (cat.prefix === 'grass/' && tsample) {
+        // TEXTURE path for grass: density follows the imagery's measured
+        // greenness (continuous — no classifier threshold cliff, which is
+        // what starved the pale-green Malene slopes), squared so patches
+        // cluster into the greenest blobs; each patch is tinted with the
+        // sampled ground color so cover reads as the imagery's own color.
+        tsample(x, y, _texColor);
+        const excess = _texColor[1]! - 0.5 * (_texColor[0]! + _texColor[2]!);
+        const greenness = Math.max(0, Math.min(1, excess * 14 + 0.2));
+        if (rng.float() > greenness * greenness) continue;
+        tint = [_texColor[0]!, _texColor[1]!, _texColor[2]!];
+      } else if (asample) {
+        // ARCHETYPE path (NMS-style): the cell already committed to one
+        // landform decision server-side; the recipe table says what may
+        // grow there. No per-attempt re-derivation from raw channels —
+        // disputes go to the archetype map, not to gate probabilities.
+        const mult = ARCHETYPE_RECIPES[cat.prefix]?.[arch] ?? 0;
+        if (mult <= 0) continue;
+        if (mult < 1 && rng.float() > mult) continue;
+      } else if (fsample) {
+        // Legacy channel path, kept only for tiles whose archetype grid
+        // has not landed yet.
         const dark = fsample('dark', x, y);
-        if (kind.living) {
-          const veg = fsample('veg', x, y);
-          if (cat.prefix === 'shrub/') {
-            const cover = Math.max(veg, dark);
-            if (cover < 0.55 && rng.float() > cover * 1.6) continue;
-          } else {
-            // grass/flower: green-only, and suppressed on strongly dark
-            // ground (shrubs, not fine grass, own dark soil).
-            if (rng.float() > veg * 1.6) continue;
-            if (dark > 0.45 && rng.float() > (1 - dark) * 1.1 + 0.15) continue;
-          }
-        } else if (cat.prefix.startsWith('rock/')) {
-          const light = fsample('rock', x, y) * (1 - dark);
-          if (light < 0.6 && rng.float() > light * 1.4 + 0.08) continue;
+        const veg = fsample('veg', x, y);
+        if (cat.prefix === 'shrub/') {
+          const cover = Math.max(veg, dark);
+          if (cover < 0.55 && rng.float() > cover * 1.6) continue;
+        } else {
+          // grass/flower: green-only, and suppressed on strongly dark
+          // ground (shrubs, not fine grass, own dark soil).
+          if (rng.float() > veg * 1.6) continue;
+          if (dark > 0.45 && rng.float() > (1 - dark) * 1.1 + 0.15) continue;
         }
       }
       const scale = kind.scale[0] + rng.float() * (kind.scale[1] - kind.scale[0]);
       _qYaw.setFromAxisAngle(_zAxis, rng.float() * Math.PI * 2);
       _q.copy(_qYaw).multiply(_qXup);
+      if (cat.prefix === 'grass/') {
+        // Flat patches must lie ON the slope: un-tilted 3 m planes sliced
+        // through curved ground and read as straight blade rows. Shrubs
+        // stay gravity-upright like real woody stems.
+        _normal.set(-s.gx, -s.gy, 1).normalize();
+        _qTilt.setFromUnitVectors(_zAxis, _normal);
+        _q.copy(_qTilt).multiply(_qYaw).multiply(_qXup);
+      }
       // sink slightly so bases don't hover on slopes
       _p.set(x, y, (s.z - 0.12 * scale * (1 + s.slope)) * exag);
       _s.set(scale, scale, scale);
       _m.compose(_p, _q, _s);
-      let arr = placements.get(kind);
-      if (!arr) placements.set(kind, arr = []);
-      arr.push(_m.clone());
+      let entry = placements.get(kind);
+      if (!entry) placements.set(kind, entry = { mats: [], colors: [] });
+      entry.mats.push(_m.clone());
+      if (tint) entry.colors.push(tint[0]!, tint[1]!, tint[2]!);
       placed++;
       total++;
     }
@@ -276,10 +394,20 @@ export function buildTileScatter(input: TileScatterInput): Group | null {
   const group = new Group();
   group.name = `scatter/${input.tileId}`;
   group.userData.isScatter = true;
-  for (const [kind, mats] of placements) {
+  for (const [kind, { mats, colors }] of placements) {
     for (const part of kind.parts) {
       const mesh = new InstancedMesh(part.geo, part.mat, mats.length);
       for (let i = 0; i < mats.length; i++) mesh.setMatrixAt(i, mats[i] as Matrix4);
+      if (colors.length === mats.length * 3) {
+        for (let i = 0; i < mats.length; i++) {
+          mesh.setColorAt(i, _c.setRGB(
+            colors[i * 3] as number,
+            colors[i * 3 + 1] as number,
+            colors[i * 3 + 2] as number,
+          ));
+        }
+        if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
+      }
       mesh.instanceMatrix.needsUpdate = true;
       // instance-aware bounds (three r160+) so frustum culling works per mesh
       mesh.computeBoundingSphere();

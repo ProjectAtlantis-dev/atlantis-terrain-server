@@ -209,21 +209,21 @@ class TextureMetatileFetchTest(unittest.TestCase):
         db = sqlite3.connect(":memory:")
         init_textures(db)
         jpeg = _encoded_image(np.full((8, 8, 3), 128), "JPEG")
-        write_texture(db, "13-8-8", jpeg, "fractal_upscale")
+        write_texture(db, "13-8-8", jpeg, "cooked_upscale")
         write_texture(db, "12-0-0", jpeg, "dataforsyningen_metatile4h2")
 
         sources = texture_sources_in(db, ["13-8-8", "12-0-0", "13-9-9"])
 
         self.assertEqual(
             sources,
-            {"13-8-8": "fractal_upscale", "12-0-0": "dataforsyningen_metatile4h2"},
+            {"13-8-8": "cooked_upscale", "12-0-0": "dataforsyningen_metatile4h2"},
         )
 
     @unittest.skipUnless(
         MAX_TILE_DEPTH > WMS_CONTRACT_DEPTH,
         "upscaling disabled: MAX_TILE_DEPTH held at the WMS contract depth",
     )
-    def test_fractal_cook_writes_quad_with_provenance_without_clobbering(self):
+    def test_procedural_cook_writes_quad_with_provenance_without_clobbering(self):
         db = sqlite3.connect(":memory:")
         init_textures(db)
         rng = np.random.default_rng(3)
@@ -244,15 +244,15 @@ class TextureMetatileFetchTest(unittest.TestCase):
             patch("database.read_tile", lambda _db, _tid: {"heightmap": None}),
             patch("coastline.read_water_mask", lambda _db, _tid: None),
         ):
-            cooked = serve_flask._cook_fractal_quad(db, "13-20-40")
+            cooked = serve_flask._cook_texture_quad(db, "13-20-40")
 
         self.assertTrue(cooked)
         sources = dict(db.execute("SELECT tile_id, source FROM textures"))
         for child in ("13-20-40", "13-21-40", "13-20-41"):
-            self.assertEqual(sources[child], "fractal_upscale")
+            self.assertEqual(sources[child], "cooked_upscale")
         self.assertEqual(sources["13-21-41"], "dataforsyningen_metatile4h2")
 
-    def test_fractal_cook_defers_until_parent_texture_is_final(self):
+    def test_procedural_cook_defers_until_parent_texture_is_final(self):
         db = sqlite3.connect(":memory:")
         init_textures(db)
         write_texture(
@@ -272,21 +272,21 @@ class TextureMetatileFetchTest(unittest.TestCase):
                 lambda tile_id, bbox: queued.append(tile_id),
             ),
         ):
-            cooked = serve_flask._cook_fractal_quad(db, "13-20-40")
+            cooked = serve_flask._cook_texture_quad(db, "13-20-40")
 
         self.assertFalse(cooked)
         self.assertEqual(
             db.execute("SELECT COUNT(*) FROM textures").fetchone()[0], 1
         )
 
-    def test_real_parent_change_drops_stale_fractal_children(self):
+    def test_real_parent_change_drops_stale_procedural_children(self):
         db = sqlite3.connect(":memory:")
         init_textures(db)
         jpeg = _encoded_image(np.full((8, 8, 3), 128), "JPEG")
         jpeg2 = _encoded_image(np.full((8, 8, 3), 90), "JPEG")
         write_texture(db, "12-10-20", jpeg, "dataforsyningen_metatile4h2")
         for child in ("13-20-40", "13-21-40", "13-20-41"):
-            write_texture(db, child, jpeg, "fractal_upscale")
+            write_texture(db, child, jpeg, "cooked_upscale")
         # A genuine provider child is not derived data — it must survive.
         write_texture(db, "13-21-41", jpeg, "dataforsyningen_metatile4h2")
 
@@ -297,7 +297,7 @@ class TextureMetatileFetchTest(unittest.TestCase):
             self.assertNotIn(child, sources)
         self.assertEqual(sources["13-21-41"], "dataforsyningen_metatile4h2")
 
-    def test_real_parent_change_cascades_through_deep_fractal_subtree(self):
+    def test_real_parent_change_cascades_through_deep_procedural_subtree(self):
         db = sqlite3.connect(":memory:")
         init_textures(db)
         jpeg = _encoded_image(np.full((8, 8, 3), 128), "JPEG")
@@ -305,13 +305,13 @@ class TextureMetatileFetchTest(unittest.TestCase):
         write_texture(db, "12-10-20", jpeg, "dataforsyningen_metatile4h2")
         # A cooked chain 13 -> 14 -> 15, each level derived from the one
         # above; all of it is transitively stale when depth 12 changes.
-        write_texture(db, "13-20-40", jpeg, "fractal_upscale")
-        write_texture(db, "14-40-80", jpeg, "fractal_upscale")
-        write_texture(db, "15-80-160", jpeg, "fractal_upscale")
+        write_texture(db, "13-20-40", jpeg, "cooked_upscale")
+        write_texture(db, "14-40-80", jpeg, "cooked_upscale")
+        write_texture(db, "15-80-160", jpeg, "cooked_upscale")
         # A genuine provider tile inside the subtree is not derived data.
         write_texture(db, "14-41-80", jpeg, "dataforsyningen_metatile4h2")
         # An unrelated deep cook outside the subtree must survive.
-        write_texture(db, "14-96-96", jpeg, "fractal_upscale")
+        write_texture(db, "14-96-96", jpeg, "cooked_upscale")
 
         write_texture(db, "12-10-20", jpeg2, "dataforsyningen_metatile4h2")
 
@@ -319,24 +319,24 @@ class TextureMetatileFetchTest(unittest.TestCase):
         for stale in ("13-20-40", "14-40-80", "15-80-160"):
             self.assertNotIn(stale, sources)
         self.assertEqual(sources["14-41-80"], "dataforsyningen_metatile4h2")
-        self.assertEqual(sources["14-96-96"], "fractal_upscale")
+        self.assertEqual(sources["14-96-96"], "cooked_upscale")
 
     def test_placeholder_parent_write_keeps_cooked_children(self):
         db = sqlite3.connect(":memory:")
         init_textures(db)
         jpeg = _encoded_image(np.full((8, 8, 3), 128), "JPEG")
-        write_texture(db, "13-20-40", jpeg, "fractal_upscale")
+        write_texture(db, "13-20-40", jpeg, "cooked_upscale")
 
         write_texture(db, "12-10-20", jpeg, "ancestor_crop")
 
         sources = dict(db.execute("SELECT tile_id, source FROM textures"))
-        self.assertEqual(sources["13-20-40"], "fractal_upscale")
+        self.assertEqual(sources["13-20-40"], "cooked_upscale")
 
     def test_clobbering_terminal_source_logs_error_not_warning(self):
         db = sqlite3.connect(":memory:")
         init_textures(db)
         jpeg = _encoded_image(np.full((8, 8, 3), 128), "JPEG")
-        write_texture(db, "13-5-5", jpeg, "fractal_upscale")
+        write_texture(db, "13-5-5", jpeg, "cooked_upscale")
 
         with self.assertLogs("terrain.tex", level="ERROR") as captured:
             write_texture(db, "13-5-5", jpeg, "ancestor_crop")
@@ -353,7 +353,7 @@ class TextureMetatileFetchTest(unittest.TestCase):
         write_texture(db, "13-1-1", jpeg, "ancestor_crop")        # stale+unattended → stuck
         write_texture(db, "13-2-2", jpeg, "ancestor_crop")        # in fetching set → fine
         write_texture(db, "13-3-3", jpeg, "ancestor_crop")        # fresh → fine
-        write_texture(db, "13-4-4", jpeg, "fractal_upscale")      # terminal → fine
+        write_texture(db, "13-4-4", jpeg, "cooked_upscale")      # terminal → fine
         write_texture(db, "12-0-0", jpeg, "ancestor_crop")        # at contract depth → ignored
         stale = (
             datetime.datetime.now(datetime.timezone.utc)
@@ -375,7 +375,7 @@ class TextureMetatileFetchTest(unittest.TestCase):
         self.assertEqual([tile_id for tile_id, _, _ in audit["stuck"]], ["13-1-1"])
         self.assertEqual(
             audit["distribution"],
-            {"ancestor_crop": 3, "fractal_upscale": 1},
+            {"ancestor_crop": 3, "cooked_upscale": 1},
         )
 
     def test_watchdog_requeues_stuck_tiles_through_normal_pipeline(self):

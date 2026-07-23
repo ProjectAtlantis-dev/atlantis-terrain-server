@@ -1,11 +1,9 @@
 import * as THREE from 'three';
 import {
-  DETAIL_FADE_END_M,
-  DETAIL_FADE_START_M,
   DETAIL_RELATIVE_PERIOD,
   DETAIL_SHADE_STRENGTH,
-  DETAIL_STRENGTH,
   DETAIL_SUN_DIR,
+  detailParams,
 } from '../terrain-detail-layer.js';
 
 // WebGL side of the frequency-split ground detail. Keep the math in sync
@@ -87,11 +85,8 @@ export function applyTerrainDetailWebGL(mesh, context) {
     detailUvOffset: {
       value: new THREE.Vector2(context.uv.offsetX, context.uv.offsetY),
     },
-    detailParams: {
-      value: new THREE.Vector3(
-        DETAIL_FADE_START_M, DETAIL_FADE_END_M, DETAIL_STRENGTH,
-      ),
-    },
+    // Shared live-tuning vector — the tuning panel mutates it in place.
+    detailParams: { value: detailParams },
   };
   state.terrainDetailUniforms = uniforms;
   material.onBeforeCompile = shader => {

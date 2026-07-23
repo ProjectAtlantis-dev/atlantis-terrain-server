@@ -1,4 +1,4 @@
-"""Physics-first coarse classification inside the fractal texture cook.
+"""Physics-first coarse classification inside the procedural texture cook.
 
 There is no semantic contract below the official water mask yet (no d12
 classifier coverage beyond water and roads), so cooked tiles classify
@@ -20,7 +20,7 @@ from PIL import Image
 
 from terrain_upscale import _resize_bilinear
 
-COOK_CLASS_SOURCE = "fractal_cook_v1"
+COOK_CLASS_SOURCE = "procedural_cook_v1"
 # Classification of a contract-depth tile from its own final texture and
 # measured heightmap — no cook involved. Same proposal/veto physics; d12 is
 # "good enough to get the general idea" and everything deeper derives from it.
@@ -35,9 +35,19 @@ SLOPE_ROCK_MIN = 0.70     # ~35 deg: bare rock regardless of imagery color
 VEG_MIN_SOUTHNESS = 0.05  # north SLOPES never carry anything living...
 ASPECT_SLOPE_MIN = 0.08   # ...but flat ground has no aspect; valleys stay green
 
-# Color proposal thresholds on the parent imagery (0-255).
-WHITE_MIN_LUMINANCE = 190.0
-DARK_MAX_LUMINANCE = 55.0
+# DARK/WHITE are RELATIVE to each tile's own land luminance distribution,
+# not absolute 0-255 values — a fixed absolute threshold can't be right
+# across an imagery source whose exposure/contrast varies tile to tile.
+# Percentiles chosen 2026-07-22 against MEASURED live luminance across 8
+# real served tiles (524,288 px): median 94.5, p90 117.6, p95 124.0, p99
+# 142.6, max 254.6. The old fixed WHITE_MIN_LUMINANCE=190 sat above the
+# 99.9th percentile of what this orthophoto source ever produces — WHITE
+# fired on ~0.45% of all pixels regardless of tile, meaning virtually
+# every non-green/dark/water pixel fell into GREY no matter how bright it
+# actually read. DARK_PERCENTILE=3 roughly matches the old DARK_MAX=55's
+# real-world hit rate (measured ~2.96%), so that side wasn't badly off.
+DARK_PERCENTILE = 3.0
+WHITE_PERCENTILE = 90.0
 GREEN_MIN_EXCESS = 10.0
 
 # Detail energy per class: rock carries the roughness, vegetation softens
@@ -168,10 +178,45 @@ def classify_cooked_quad(
         & (rgb[..., 1] >= rgb[..., 2])
     )
 
+    # Water excluded from the stats: a water-heavy quad would otherwise
+    # skew the land luminance distribution the DARK/WHITE thresholds are
+    # measured against.
+    water = None
+    if water_mask is not None:
+        water = _resize_bilinear(
+            np.flipud(np.asarray(water_mask, dtype=np.float64)),
+            output_size,
+            output_size,
+        ) >= 0.5
+    land_luminance = luminance[~water] if water is not None else luminance.ravel()
+
+    # RELATIVE, not absolute: a fixed luminance threshold can't be right
+    # across a whole imagery source whose exposure/contrast varies tile to
+    # tile — one region's overcast midtone is another's bright highlight.
+    # DARK/WHITE are the bottom/top percentile of THIS tile's own land
+    # luminance, so the labels track relative brightness within the quad
+    # instead of an assumed absolute brightness scale.
+    has_spread = False
+    if land_luminance.size:
+        dark_threshold = np.percentile(land_luminance, DARK_PERCENTILE)
+        white_threshold = np.percentile(land_luminance, WHITE_PERCENTILE)
+        # No real brightness spread (a uniform or near-uniform tile) means
+        # DARK/WHITE aren't meaningful relative to anything — everything
+        # stays GREY rather than the whole tile collapsing to one label.
+        has_spread = white_threshold > dark_threshold
+    else:
+        dark_threshold = white_threshold = np.float32(np.nan)  # all water
+
     labels = np.full((output_size, output_size), np.uint8(GREY))
-    labels[luminance < DARK_MAX_LUMINANCE] = np.uint8(DARK)
+    if has_spread:
+        # Inclusive (<=/>=): a distinct uniform patch can land exactly ON
+        # its own percentile threshold (e.g. a clean third of the tile at
+        # one value) — strict inequality would exclude the very patch the
+        # percentile was computed from.
+        labels[luminance <= dark_threshold] = np.uint8(DARK)
     labels[(green_excess > GREEN_MIN_EXCESS) | yellow_green] = np.uint8(GREEN)
-    labels[luminance > WHITE_MIN_LUMINANCE] = np.uint8(WHITE)
+    if has_spread:
+        labels[luminance >= white_threshold] = np.uint8(WHITE)
 
     # Physics vetoes outrank every color proposal.
     living_banned = (slope > SLOPE_VEG_MAX) | (
@@ -180,12 +225,7 @@ def classify_cooked_quad(
     labels[(labels == GREEN) & living_banned] = np.uint8(GREY)
     labels[slope > SLOPE_ROCK_MIN] = np.uint8(GREY)
 
-    if water_mask is not None:
-        water = _resize_bilinear(
-            np.flipud(np.asarray(water_mask, dtype=np.float64)),
-            output_size,
-            output_size,
-        ) >= 0.5
+    if water is not None:
         labels[water] = np.uint8(WATER)
 
     slope_norm = np.clip(slope, 0.0, 1.0)

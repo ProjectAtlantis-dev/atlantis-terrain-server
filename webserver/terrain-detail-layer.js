@@ -30,6 +30,21 @@ export const DETAIL_FADE_END_M = 360;
 // Modulation strength: 0 = satellite only, 1 = full-range multiply.
 export const DETAIL_STRENGTH = 0.55;
 
+// Live tuning: every patched material (both backends) references this ONE
+// vector — x = fade start, y = fade end, z = strength — so the tuning-panel
+// sliders update all tiles in place, no recompiles, no per-material walks.
+export const detailParams = new THREE.Vector3(
+  DETAIL_FADE_START_M, DETAIL_FADE_END_M, DETAIL_STRENGTH,
+);
+
+export function setDetailTuning({ strength, fadeEnd } = {}) {
+  if (strength != null) detailParams.z = strength;
+  if (fadeEnd != null) {
+    detailParams.y = fadeEnd;
+    detailParams.x = fadeEnd / 3;
+  }
+}
+
 // Pseudo-lighting from the detail normal maps. The terrain material is
 // unlit (the satellite photo carries the real sun), so grain relief is a
 // directional shading term: a fixed low southern sun — Greenland's sun
@@ -52,7 +67,7 @@ export function tileDepthFromTileId(tileId) {
 }
 
 export function detailMaskUrl(tileId) {
-  return `/api/classifier/${tileId}.png?raw=1&res=256`;
+  return `/api/classifier/${tileId}.png?raw=1&res=256&v=3`;
 }
 
 // World-anchored tiling UV transform, exact from the tile id: world position

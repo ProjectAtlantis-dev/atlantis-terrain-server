@@ -61,8 +61,18 @@ export function createSurfaceFieldStore({
       water[index] = 255 - known;
     }
 
-    const texture = new THREE.Texture(bitmap);
-    texture.flipY = false;
+    // ORIENTATION: tile mesh UVs put v=0 at the SOUTH edge; the mask PNG's
+    // row 0 is NORTH. The satellite map corrects this via default
+    // flipY=true — the mask must flip the same way or every GPU consumer
+    // reads it north/south MIRRORED (seen live as rock detail on dark
+    // streaks and bare bright ridges — the CPU fields path below does its
+    // own row math and was correct, which made the shader disagree with
+    // scatter about where rock was). flipY on an ImageBitmap upload is
+    // IGNORED by WebGL (spec: bitmaps carry their own orientation), so the
+    // texture is built from the canvas we already drew — canvas uploads
+    // respect flipY.
+    const texture = new THREE.CanvasTexture(canvas);
+    texture.flipY = true;
     texture.colorSpace = THREE.NoColorSpace;
     texture.wrapS = THREE.ClampToEdgeWrapping;
     texture.wrapT = THREE.ClampToEdgeWrapping;
@@ -70,6 +80,7 @@ export function createSurfaceFieldStore({
     texture.minFilter = THREE.LinearMipmapLinearFilter;
     texture.generateMipmaps = true;
     texture.needsUpdate = true;
+    bitmap.close?.();
 
     return {
       texture,

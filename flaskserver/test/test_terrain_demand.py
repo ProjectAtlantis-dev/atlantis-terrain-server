@@ -9,7 +9,7 @@ from database import GRID_N
 from terrain_config import MAX_TILE_DEPTH, WMS_CONTRACT_DEPTH
 from serve import (
     _UPGRADEABLE_SOURCES,
-    _balance_lod_leaves, _coarse_lod_neighbors, _cook_fractal_dem_quad,
+    _balance_lod_leaves, _coarse_lod_neighbors, _cook_cooked_dem_quad,
     _lod_complete_ancestors,
     _lod_leaf_descendants_cover, _lod_target_depth,
     _traverse, bbox_in_view_circle,
@@ -124,7 +124,7 @@ class TestViewCoverageCircle(unittest.TestCase):
         MAX_TILE_DEPTH > WMS_CONTRACT_DEPTH,
         "upscaling disabled: MAX_TILE_DEPTH held at the WMS contract depth",
     )
-    def test_fractal_dem_cook_quadrants_preserve_parent_samples_and_seams(self):
+    def test_cooked_dem_cook_quadrants_preserve_parent_samples_and_seams(self):
         rng = np.random.default_rng(5)
         parent_hm = (rng.normal(200, 40, (GRID_N, GRID_N))).astype(np.float32)
         parent = {
@@ -145,7 +145,7 @@ class TestViewCoverageCircle(unittest.TestCase):
             patch('serve._ensure_children', lambda *a: None),
             patch('coastline.read_water_mask', lambda _db, _tid: None),
         ):
-            cooked = _cook_fractal_dem_quad(None, '13-20-40')
+            cooked = _cook_cooked_dem_quad(None, '13-20-40')
 
         self.assertTrue(cooked)
         self.assertEqual(
@@ -153,7 +153,7 @@ class TestViewCoverageCircle(unittest.TestCase):
             {'13-20-40', '13-21-40', '13-20-41', '13-21-41'},
         )
         for child_id, (hm, source) in written.items():
-            self.assertEqual(source, 'fractal_dem')
+            self.assertEqual(source, 'cooked_dem')
             self.assertEqual(hm.shape, (GRID_N, GRID_N))
         sw, se = written['13-20-40'][0], written['13-21-40'][0]
         nw = written['13-20-41'][0]
@@ -164,7 +164,7 @@ class TestViewCoverageCircle(unittest.TestCase):
         np.testing.assert_array_equal(sw[:, -1], se[:, 0])
         np.testing.assert_array_equal(sw[-1, :], nw[0, :])
 
-    def test_fractal_dem_cook_defers_until_parent_is_stable(self):
+    def test_cooked_dem_cook_defers_until_parent_is_stable(self):
         parent = {
             'heightmap': np.zeros((GRID_N, GRID_N), np.float32),
             'source': 'parent_resampled',
@@ -176,7 +176,7 @@ class TestViewCoverageCircle(unittest.TestCase):
             patch('serve.read_tile_metadata', return_value=None),
             patch('serve.write_tile') as write_tile_mock,
         ):
-            cooked = _cook_fractal_dem_quad(None, '13-20-40')
+            cooked = _cook_cooked_dem_quad(None, '13-20-40')
 
         self.assertFalse(cooked)
         write_tile_mock.assert_not_called()

@@ -30,6 +30,7 @@ import { evaluateTerrainRefetch, summarizeTerrainCamera, terrainCameraCoordinate
 import { collectTerrainDebugMeshes, createTerrainHoverOutlineController, createTerrainMapGridController, formatTerrainSeamDiagnostic, summarizeTerrainMesh } from './terrain-debug-runtime.js';
 import { createTerrainFetchRuntime } from './terrain-fetch-runtime.js';
 import { createTerrainTileSet } from './terrain-tile-set.js';
+import { createClassifierOverlay } from './terrain-classifier-overlay.js';
 import { createTerrainGridlinesRuntime } from './terrain-gridlines-runtime.js';
 import { restoreTerrainCameraState, terrainCameraState } from './terrain-camera-state.js';
 import { createTerrainClientLogger } from './terrain-client-logging.js';
@@ -53,6 +54,7 @@ import { epsg3413DirectionBearing, epsg3413ToWgs84 } from './terrain-polar-stere
 import { createWaterRuntime, DEFAULT_WATER_PARAMS } from './water/water-runtime.js';
 import { FAST_TIME_SCALE, getFastTimeRange } from './terrain-game-clock.js';
 import { advanceRealtimeMovement, MAX_REALTIME_STEP_SECONDS } from './terrain-realtime-step.js';
+import { DETAIL_FADE_END_M, DETAIL_STRENGTH, setDetailTuning } from './terrain-detail-layer.js';
 
 export async function startTerrainApplication({
   backend = 'webgl',
@@ -308,6 +310,7 @@ const { hud, alt, gameClock: gameClockEl } = createTerrainHud({
   onToggleSeamMode: () => toggleSeamMode(),
   onToggleTileInspector: () => toggleTileInspector(),
   onToggleGridlines: () => toggleGridlines(),
+  onToggleClassifierOverlay: () => cycleClassifierOverlay(),
   onToggleWaterOverlay: () => toggleWaterOverlay(),
   onToggleHydrographyOverlay: () => toggleHydrographyOverlay(),
   onToggleRenderBackend: () => {
@@ -528,6 +531,17 @@ function buildTuningControls(ap, ce) {
       currentDate.setUTCMonth(v - 1);
       applyDate(currentDate);
     }
+  });
+
+  tuningSectionLabel('Ground Detail');
+  tuningSlider('detail str', {
+    min: 0, max: 1, step: 0.05, value: DETAIL_STRENGTH,
+    onChange: v => setDetailTuning({ strength: v }),
+  });
+  tuningSlider('detail fade m', {
+    min: 60, max: 3000, step: 20, value: DETAIL_FADE_END_M,
+    decimals: 0,
+    onChange: v => setDetailTuning({ fadeEnd: v }),
   });
 
   if (!USE_WEBGPU_RENDER_BACKEND) {
@@ -951,9 +965,18 @@ function attachTileScatter(mesh, tile, hm) {
     if (mesh.userData?.tileId !== tile.id) return;
     // Surface fields gate WHERE things go (water hard-excludes, vegetation
     // density follows the mask); the same store feeds the detail shader, so
-    // this is one shared fetch. Placement itself stays deterministic per
-    // tile id — the fields only veto/weight, they carry no randomness.
-    sharedSurfaceFieldStore({ log: () => {} }).get(tile.id).then(entry => {
+    // this is one shared fetch. The archetype grid (NMS-style decision
+    // rung) rides alongside: when it lands, scatter keys recipes off the
+    // per-cell landform decision instead of raw channels. Placement itself
+    // stays deterministic per tile id — both only veto/weight, they carry
+    // no randomness.
+    const archetypesPromise = fetch(`/api/archetypes/${tile.id}.json`)
+      .then(r => (r.ok ? r.json() : null))
+      .catch(() => null);
+    Promise.all([
+      sharedSurfaceFieldStore({ log: () => {} }).get(tile.id),
+      archetypesPromise,
+    ]).then(([entry, archetypes]) => {
       if (mesh.userData?.tileId !== tile.id) return;
       try {
         const group = buildTileScatter({
@@ -964,6 +987,9 @@ function attachTileScatter(mesh, tile, hm) {
           lib,
           exag: EXAG,
           fields: entry?.fields,
+          archetypes: archetypes && archetypes.grid
+            ? { grid: archetypes.grid, cells: archetypes.cells }
+            : undefined,
         });
         disposeGroup(currentGroup);
         currentGroup = group;
@@ -1259,6 +1285,34 @@ const terrainTileSet = createTerrainTileSet({
     },
   },
 });
+// Classifier/archetype decision colors painted straight onto the terrain
+// (the HUD "classifier" link cycles off → classifier → archetypes) — judge
+// classification against the macro relief it drives without leaving the 3D
+// view.
+const classifierOverlay = createClassifierOverlay({
+  tileSet: terrainTileSet,
+  requestRender,
+  log: tileLog,
+});
+let gridlinesActiveBeforeClassifier = null;
+function cycleClassifierOverlay() {
+  const previousMode = classifierOverlay.mode;
+  const nextMode = classifierOverlay.cycle();
+  if (previousMode === 'off' && nextMode !== 'off') {
+    gridlinesActiveBeforeClassifier = gridlinesRuntime.active;
+    gridlinesRuntime.setActive(true);
+  } else if (nextMode === 'off') {
+    gridlinesRuntime.setActive(gridlinesActiveBeforeClassifier ?? false);
+    gridlinesActiveBeforeClassifier = null;
+  } else if (!gridlinesRuntime.active) {
+    // Each classifier/archetype view opens with the terrain tile boundaries
+    // visible, even if the user hid them while inspecting the previous rung.
+    gridlinesRuntime.setActive(true);
+  }
+  console.log(`[overlay] ${nextMode}`);
+  updateHud();
+  requestRender();
+}
 const gridlinesRuntime = createTerrainGridlinesRuntime({
   terrainRoot,
   onChanged: () => {
@@ -1950,6 +2004,13 @@ function updateHud() {
   const gridlinesLine = gridlinesRuntime.active
     ? 'gridlines: <span id="gridlinesModeLink" style="color:#8f8;text-decoration:underline;cursor:pointer;pointer-events:auto">ON</span>'
     : 'gridlines: <span id="gridlinesModeLink" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">off</span>';
+  const classifierOverlayColor = {
+    off: '#0af', classifier: '#6ecd3c', archetypes: '#9669d2',
+  }[classifierOverlay.mode] ?? '#0af';
+  const classifierOverlayLabel = {
+    off: 'off', classifier: 'CLASSES', archetypes: 'ARCHETYPES',
+  }[classifierOverlay.mode] ?? 'off';
+  const classifierOverlayLine = `classifier: <span id="classifierOverlayLink" title="Paint classifier/archetype decisions on the terrain" style="color:${classifierOverlayColor};text-decoration:underline;cursor:pointer;pointer-events:auto">${classifierOverlayLabel}</span>`;
   const waterOverlayLine = textureStreamer.waterDebug
     ? 'pink water: <span id="waterOverlayLink" style="color:#ff2aa1;text-decoration:underline;cursor:pointer;pointer-events:auto">ON</span>'
     : 'pink water: <span id="waterOverlayLink" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">off</span>';
@@ -1987,6 +2048,7 @@ function updateHud() {
     hmLine,
     texLine,
     gridlinesLine,
+    classifierOverlayLine,
     waterOverlayLine,
     hydrographyOverlayLine,
     vehicleRuntime.vehicleControlActive

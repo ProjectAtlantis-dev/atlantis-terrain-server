@@ -35,7 +35,7 @@ from terrain_seams import SqliteSeamCache, repair_lod_seams as _stitch_lod_edges
 
 REAL_SOURCES = (
     'arcticdem', 'arcticdem_10m', 'copernicus', 'parent_resampled',
-    'official_coastline', 'fractal_dem',
+    'official_coastline', 'cooked_dem',
     'unmasked_arcticdem', 'unmasked_arcticdem_10m',
     'unmasked_copernicus', 'unmasked_parent_resampled',
     'clobbered_arcticdem_10m', 'clobbered_copernicus',
@@ -47,11 +47,11 @@ REAL_SOURCES = (
 # interpolation mush). Only parents in states the pipeline never refetches
 # may be cooked from — derived tiles therefore cannot go stale through the
 # normal flow, and depths <= WMS_CONTRACT_DEPTH are untouched by all of it.
-# fractal_dem itself is a valid parent: cooks recurse deterministically
+# cooked_dem itself is a valid parent: cooks recurse deterministically
 # (d14 cooks from cooked d13, ...), rooted in a measured depth-12 surface.
-FRACTAL_DEM_SOURCE = 'fractal_dem'
-_FRACTAL_DEM_PARENT_SOURCES = {
-    'arcticdem_10m', 'copernicus', 'official_coastline', FRACTAL_DEM_SOURCE,
+COOKED_DEM_SOURCE = 'cooked_dem'
+_COOKED_DEM_PARENT_SOURCES = {
+    'arcticdem_10m', 'copernicus', 'official_coastline', COOKED_DEM_SOURCE,
 }
 
 # Sources that should be refetched at higher DEM resolution
@@ -307,8 +307,76 @@ def bbox_in_view_circle(qx, qy, bbox, max_range):
     if max_range <= 0:
         return True
     return _distance_to_bbox(qx, qy, bbox) <= max_range
-def _cook_fractal_dem_quad(db, tile_id, allow_overwrite=False):
-    """Cook tile_id's parent quad of heightmaps with the fractal upscaler.
+def macro_archetype_field(db, parent_id, resolver=None):
+    """World-anchored archetype field for a cook of ``parent_id``'s children.
+
+    Returns ``(cells, field_bbox)`` — the parent's d12 ancestor archetype
+    grid padded with one ring of its neighbors' border cells, and the world
+    bbox those padded cells span — or ``(None, None)`` when the ancestor has
+    no classification yet. Every descendant cook inside one d12 tile samples
+    this same field at absolute world coordinates, and the neighbor padding
+    makes the sampled weights continuous ACROSS d12 borders too (both sides
+    interpolate the same pair of border cells), so macro relief needs no
+    seam repair: adjacent cooks agree wherever they overlap by construction.
+
+    ``resolver`` (optional) resolves the CENTER d12 tile — the Flask path
+    passes its classify-on-demand hook. Neighbors are always read from
+    storage only: eagerly classifying eight neighbors per cook would turn
+    one tile demand into nine classification jobs.
+    """
+    from classifier.archetypes import resolve_archetype_window
+
+    depth, col, row = (int(part) for part in parent_id.split('-'))
+    if depth < WMS_CONTRACT_DEPTH:
+        return None, None
+    shift = depth - WMS_CONTRACT_DEPTH
+    d12_col, d12_row = col >> shift, row >> shift
+    d12_id = _tile_id(WMS_CONTRACT_DEPTH, d12_col, d12_row)
+    center = (resolver or (
+        lambda tid: resolve_archetype_window(db, tid)
+    ))(d12_id)
+    if center is None:
+        return None, None
+    center = np.asarray(center, dtype=np.uint8)
+    grid = center.shape[0]
+
+    # Pad with our own replicated edges first, then overwrite each strip and
+    # corner with the real neighbor cells where a classified neighbor exists.
+    padded = np.pad(center, 1, mode='edge')
+    # Image-oriented rasters: row 0 = north. Tile rows increase northward,
+    # so the north neighbor is row+1 and contributes its SOUTH edge (its
+    # last image row); columns increase eastward with image column 0 = west.
+    row_dst = {1: slice(0, 1), 0: slice(1, grid + 1), -1: slice(grid + 1, grid + 2)}
+    row_src = {1: slice(grid - 1, grid), 0: slice(0, grid), -1: slice(0, 1)}
+    col_dst = {-1: slice(0, 1), 0: slice(1, grid + 1), 1: slice(grid + 1, grid + 2)}
+    col_src = {-1: slice(grid - 1, grid), 0: slice(0, grid), 1: slice(0, 1)}
+    for dc in (-1, 0, 1):
+        for dr in (-1, 0, 1):
+            if dc == 0 and dr == 0:
+                continue
+            neighbor_id = _tile_id(
+                WMS_CONTRACT_DEPTH, d12_col + dc, d12_row + dr,
+            )
+            try:
+                neighbor = resolve_archetype_window(db, neighbor_id)
+            except Exception:
+                neighbor = None
+            if neighbor is None or neighbor.shape != center.shape:
+                continue
+            padded[row_dst[dr], col_dst[dc]] = neighbor[row_src[dr], col_src[dc]]
+
+    x_min, y_min, x_max, y_max = _tile_bbox(
+        WMS_CONTRACT_DEPTH, d12_col, d12_row,
+    )
+    cell_w = (x_max - x_min) / grid
+    cell_h = (y_max - y_min) / grid
+    field_bbox = (x_min - cell_w, y_min - cell_h, x_max + cell_w, y_max + cell_h)
+    return padded, field_bbox
+
+
+def _cook_cooked_dem_quad(db, tile_id, allow_overwrite=False,
+                           archetype_resolver=None):
+    """Cook tile_id's parent quad of heightmaps with the procedural upscaler.
 
     One upscale_heightmap call per parent produces the 129x129 surface whose
     quadrants become all four 65x65 children — siblings share edge samples
@@ -340,7 +408,7 @@ def _cook_fractal_dem_quad(db, tile_id, allow_overwrite=False):
     if (
         parent is None
         or parent['heightmap'] is None
-        or parent['source'] not in _FRACTAL_DEM_PARENT_SOURCES
+        or parent['source'] not in _COOKED_DEM_PARENT_SOURCES
     ):
         log_d13.info(
             f"{tile_id}: DEM cook DEFERRED — parent {parent_id} not stable "
@@ -356,18 +424,34 @@ def _cook_fractal_dem_quad(db, tile_id, allow_overwrite=False):
         water_mask = None
 
     cook_started = time.perf_counter()
-    # amplitude_m=0: synthetic fBm relief is PURGED (user directive; see
-    # erosion-bake redesign). Cooked surfaces are a clean bilinear of the
-    # parent until the regional erosion bake fills this slot.
-    upscaled = upscale_heightmap(
+    # amplitude_m=0: the old GENERIC fBm relief stays purged (user directive;
+    # it read as uniform stucco). The macro slot is now filled by ARCHETYPE-
+    # CONDITIONED relief instead: the d12 landform decisions (face/talus/
+    # bench/ridge/...) pick per-class amplitude and character, so cliffs get
+    # crags and steepening, talus gets rubble, benches stay gentle, and water
+    # stays flat. Without archetypes (classifier hasn't reached this area
+    # yet) the cook falls back to the clean bilinear it served before.
+    archetype_cells, archetype_bbox = None, None
+    try:
+        archetype_cells, archetype_bbox = macro_archetype_field(
+            db, parent_id, resolver=archetype_resolver,
+        )
+    except Exception as exc:
+        log_d13.warning(
+            f"{tile_id}: archetype resolve failed for {parent_id} "
+            f"({type(exc).__name__}: {exc}); cooking without macro relief"
+        )
+    from terrain_upscale import macro_surfaces
+    _, upscaled = macro_surfaces(
         parent['heightmap'],
         list(parent['bbox']),
-        factor=2,
-        amplitude_m=0.0,
+        depth,
         water_mask=water_mask,
+        archetype_cells=archetype_cells,
+        archetype_bbox=archetype_bbox,
     )
     confidence = np.full(
-        (GRID_N, GRID_N), np.uint8(CONFIDENCE[FRACTAL_DEM_SOURCE])
+        (GRID_N, GRID_N), np.uint8(CONFIDENCE[COOKED_DEM_SOURCE])
     )
     _ensure_children(db, depth - 1, parent_col, parent_row)
     base_col, base_row = parent_col * 2, parent_row * 2
@@ -387,7 +471,7 @@ def _cook_fractal_dem_quad(db, tile_id, allow_overwrite=False):
             ].astype(np.float32).copy()
             try:
                 write_tile(
-                    db, child_id, quadrant, confidence, FRACTAL_DEM_SOURCE,
+                    db, child_id, quadrant, confidence, COOKED_DEM_SOURCE,
                     reconcile=False, allow_overwrite=allow_overwrite,
                 )
                 written.append(child_id)
@@ -396,8 +480,9 @@ def _cook_fractal_dem_quad(db, tile_id, allow_overwrite=False):
     cook_ms = (time.perf_counter() - cook_started) * 1000.0
     log_d13.info(
         f"{tile_id}: DEM COOKED quad from {parent_id} "
-        f"({parent['source']}, water_mask={'yes' if water_mask is not None else 'no'}) — "
-        f"wrote {len(written)} as {FRACTAL_DEM_SOURCE}"
+        f"({parent['source']}, water_mask={'yes' if water_mask is not None else 'no'}, "
+        f"macro_relief={'yes' if archetype_cells is not None else 'NO-ARCHETYPES'}) — "
+        f"wrote {len(written)} as {COOKED_DEM_SOURCE}"
         + (f", kept {', '.join(kept)}" if kept else "")
         + f" in {cook_ms:.0f}ms"
     )
@@ -413,7 +498,7 @@ def _fetch_tile(db, tile_id, bbox, allow_overwrite=False):
     # Depths at or below the contract fall through to the unchanged COG path.
     depth = int(tile_id.split('-', 1)[0])
     if depth > WMS_CONTRACT_DEPTH:
-        return _cook_fractal_dem_quad(db, tile_id, allow_overwrite=allow_overwrite)
+        return _cook_cooked_dem_quad(db, tile_id, allow_overwrite=allow_overwrite)
 
     from ingest import _read_cog_heightmap, _resample_from_parent
 
@@ -948,7 +1033,7 @@ def fetch_missing_tiles(db, missing, max_workers=6, log=print):
         cooked = 0
         for tid, _bbox in deep:
             try:
-                if _cook_fractal_dem_quad(db, tid):
+                if _cook_cooked_dem_quad(db, tid):
                     cooked += 1
             except Exception as exc:
                 log_d13.error(

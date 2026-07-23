@@ -8,17 +8,16 @@ import {
   positionView,
   smoothstep,
   texture,
+  uniform,
   uv,
   vec2,
   vec3,
 } from 'three/tsl';
 import {
-  DETAIL_FADE_END_M,
-  DETAIL_FADE_START_M,
   DETAIL_RELATIVE_PERIOD,
   DETAIL_SHADE_STRENGTH,
-  DETAIL_STRENGTH,
   DETAIL_SUN_DIR,
+  detailParams,
 } from '../terrain-detail-layer.js';
 
 // WebGPU side of the frequency-split ground detail. Keep the math in sync
@@ -26,6 +25,10 @@ import {
 // contract as the water shaders). Tile materials arrive as MeshBasicMaterial
 // from the shared mesh builder; the first detail application swaps in a
 // MeshBasicNodeMaterial whose colorNode implements satellite × detail.
+
+// Shared live-tuning uniform (x = fade start, y = fade end, z = strength):
+// wraps the SAME vector the WebGL twin and the tuning sliders mutate.
+const detailTuning = uniform(detailParams);
 
 function buildColorNode({ map, maskTexture, textures, uvTransform }) {
   return Fn(() => {
@@ -37,8 +40,8 @@ function buildColorNode({ map, maskTexture, textures, uvTransform }) {
       .add(surfaceWeights.b)
       .min(1.0);
     const fade = float(1.0).sub(smoothstep(
-      float(DETAIL_FADE_START_M),
-      float(DETAIL_FADE_END_M),
+      detailTuning.x,
+      detailTuning.y,
       positionView.length(),
     ));
     const detailUv = baseUv
@@ -76,7 +79,7 @@ function buildColorNode({ map, maskTexture, textures, uvTransform }) {
     );
     const modulation = float(1.0).add(
       detailValue.mul(2.0).sub(1.0)
-        .mul(float(DETAIL_STRENGTH))
+        .mul(detailTuning.z)
         .mul(weightTotal)
         .mul(fade),
     );
