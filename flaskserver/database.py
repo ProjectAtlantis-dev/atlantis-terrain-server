@@ -399,6 +399,9 @@ def open_db(path=None):
     from classifier.storage import init_classifier_tiles
     init_classifier_tiles(db)
 
+    from cliff_graft_cache import init_cliff_graft_assets
+    init_cliff_graft_assets(db)
+
     from terrain_seams import init_seam_cache
     init_seam_cache(db)
     if "terrain_seam_cache" not in existing:

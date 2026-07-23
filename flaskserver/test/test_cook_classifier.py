@@ -199,16 +199,22 @@ class LiveD12ClassificationTest(unittest.TestCase):
         import serve_flask
 
         db = self._database_with_d12_tile("dataforsyningen_metatile4h2")
-        with patch(
-            "classifier.official_water.classifier_water_mask_for_tile",
-            return_value=None,
+        with (
+            patch(
+                "classifier.official_water.classifier_water_mask_for_tile",
+                return_value=None,
+            ),
+            patch(
+                "classifier.hierarchy.d12_lake_prior",
+                return_value=np.zeros((256, 256), dtype=bool),
+            ),
         ):
             serve_flask._ensure_d12_class_map(db, "12-100-200")
         row = db.execute(
             "SELECT source FROM classifier_tiles WHERE tile_id = '12-100-200'"
         ).fetchone()
         self.assertIsNotNone(row)
-        self.assertEqual(row[0], "ladder_d12_v3")
+        self.assertEqual(row[0], "ladder_d12_v9")
 
         # Second call must be a no-op read, never a re-classification.
         with patch("classifier.ladder.classify_ladder") as untouched:
@@ -220,9 +226,15 @@ class LiveD12ClassificationTest(unittest.TestCase):
         import serve_flask
 
         db = self._database_with_d12_tile("dataforsyningen_metatile4h2")
-        with patch(
-            "classifier.official_water.classifier_water_mask_for_tile",
-            return_value=None,
+        with (
+            patch(
+                "classifier.official_water.classifier_water_mask_for_tile",
+                return_value=None,
+            ),
+            patch(
+                "classifier.hierarchy.d12_lake_prior",
+                return_value=np.zeros((256, 256), dtype=bool),
+            ),
         ):
             serve_flask._ensure_d12_class_map(db, "12-100-200")
             db.execute(
@@ -239,7 +251,7 @@ class LiveD12ClassificationTest(unittest.TestCase):
         source = db.execute(
             "SELECT source FROM classifier_tiles WHERE tile_id = '12-100-200'"
         ).fetchone()[0]
-        self.assertEqual(source, "ladder_d12_v3")
+        self.assertEqual(source, "ladder_d12_v9")
 
     def test_placeholder_texture_is_never_persisted_as_classification(self):
         import serve_flask

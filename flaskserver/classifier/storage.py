@@ -19,6 +19,8 @@ COARSE_SCHEMA = "coarse_v1"
 # first-class "honestly unknown, geometrically unlit" bucket, never folded
 # into dark ground.
 COARSE_V2_SCHEMA = "coarse_v2"
+COARSE_V3_SCHEMA = "coarse_v3"
+COARSE_V4_SCHEMA = "coarse_v4"
 _COARSE_PALETTE = [
     (150, 105, 210),
     (150, 225, 60),
@@ -41,9 +43,44 @@ CLASS_SCHEMAS = {
             dtype=np.uint8,
         ),
     },
+    COARSE_V3_SCHEMA: {
+        # v3 adds an explicit high-resolution beach class. It is derived
+        # only from vegetation evidence beside classified water, so the
+        # debug color follows the real bank instead of painting a coarse
+        # constant-width ring.
+        "names": (
+            "grey", "green", "dark", "white", "water", "shadow", "lake",
+            "beach",
+        ),
+        "palette": np.asarray(
+            _COARSE_PALETTE
+            + [(60, 120, 255), (0, 200, 220), (255, 230, 90)],
+            dtype=np.uint8,
+        ),
+    },
+    COARSE_V4_SCHEMA: {
+        # v4 splits the former monolithic beach class into full-resolution
+        # sand and shore-rock patches. Both remain shoreline/no-growth
+        # surfaces, but the renderer can now give the latter real rock grain
+        # instead of painting one uniform material around the water.
+        "names": (
+            "grey", "green", "dark", "white", "water", "shadow", "lake",
+            "sand", "shore_rock",
+        ),
+        "palette": np.asarray(
+            _COARSE_PALETTE
+            + [
+                (60, 120, 255), (0, 200, 220), (255, 230, 90),
+                (105, 92, 125),
+            ],
+            dtype=np.uint8,
+        ),
+    },
 }
 # Schemas whose "water" label the official coastline overrides on write.
-_WATER_ENFORCED_SCHEMAS = (COARSE_SCHEMA, COARSE_V2_SCHEMA)
+_WATER_ENFORCED_SCHEMAS = (
+    COARSE_SCHEMA, COARSE_V2_SCHEMA, COARSE_V3_SCHEMA, COARSE_V4_SCHEMA,
+)
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS classifier_tiles (

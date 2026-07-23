@@ -2,8 +2,8 @@
  * scatter — per-tile deterministic placement of library assets on terrain.
  *
  * First-pass chain validation: density is gated by DEM facts only (elevation,
- * slope and southness from the tile heightmap); the classifier hookup comes
- * next. Placement is seeded from the tile id, so a
+ * slope and southness from the tile heightmap), with cover sampled directly
+ * from the full-resolution classifier fields. Placement is seeded from the tile id, so a
  * revisit rebuilds the identical scatter.
  *
  * Frame: tile meshes are flat grids in EPSG:3413 stereo meters, z-up.
@@ -87,13 +87,10 @@ export interface TileScatterInput {
   lib: AssetLibrary;
   /** vertical exaggeration applied by buildMesh (EXAG) */
   exag?: number;
-  /** classifier field set (from /api/fields), decoded. Each channel is a
+  /** classifier field set, decoded. Each channel is a
    *  res×res u8 grid, NORTH-UP (row 0 = yMax). When present it drives WHERE:
-   *  water hard-excludes, veg gates living density, rock gates stones. */
+   *  water/beach/snow hard-exclude and cover follows veg/dark pixels. */
   fields?: TileFields;
-  /** archetype decision grid; when present it REPLACES the per-attempt
-   *  veg/dark channel juggling with recipe lookups. */
-  archetypes?: TileArchetypes;
   /** the tile's own satellite texture, decoded to pixels (NORTH-UP).
    *  Grass density follows its measured greenness (continuous — no
    *  classifier threshold cliff) and grass gets tinted with the sampled
@@ -103,34 +100,8 @@ export interface TileScatterInput {
 
 export interface TileFields {
   res: number;
-  chans: Partial<Record<'veg' | 'rock' | 'snow' | 'water' | 'moisture' | 'dark', Uint8Array>>;
+  chans: Partial<Record<'veg' | 'rock' | 'snow' | 'water' | 'moisture' | 'dark' | 'shore', Uint8Array>>;
 }
-
-/** archetype decision grid from /api/archetypes/<id>.json — the NMS-style
- *  intermediate rung. Cells are NORTH-UP indices into archetype names
- *  (classifier/archetypes.py ARCHETYPE_NAMES order). */
-export interface TileArchetypes {
-  grid: number;
-  cells: Uint8Array | number[];
-}
-
-// Index constants mirroring classifier/archetypes.py ARCHETYPE_NAMES.
-const A = {
-  unknown: 0, water: 1, lake: 2, shore: 3, bench: 4, bog: 5, slab: 6,
-  face: 7, talus: 8, ridge: 9, shadow: 10, snow: 11,
-} as const;
-
-/** Density multiplier per (archetype, category prefix). THE decision table:
- *  a cell's archetype fully determines what may grow there — scatter no
- *  longer re-derives meaning from raw veg/dark channels per attempt.
- *  Absent entries mean 0 (nothing of that category, full stop): water,
- *  lake, face, ridge, shadow, snow and talus carry no vegetation.
- *  (Talus is reserved for boulders once rock assets return.) */
-const ARCHETYPE_RECIPES: Record<string, Partial<Record<number, number>>> = {
-  'shrub/': { [A.bench]: 1, [A.bog]: 1, [A.shore]: 0.3, [A.slab]: 0.06 },
-  'grass/': { [A.bench]: 1, [A.bog]: 0.15, [A.shore]: 0.6, [A.slab]: 0.04 },
-  'flower/': { [A.bench]: 1, [A.bog]: 0.3, [A.shore]: 0.5, [A.slab]: 0.05 },
-};
 
 /** smooth 0..1 taper, like GLSL smoothstep — used in place of hard
  *  boolean cutoffs so deterministic gates read as a natural thinning
@@ -156,19 +127,6 @@ function makeFieldSampler(input: TileScatterInput): ((chan: string, x: number, y
   };
 }
 
-/** sample the archetype cell index at a world xy (NORTH-UP grid). */
-function makeArchetypeSampler(input: TileScatterInput): ((x: number, y: number) => number) | null {
-  const a = input.archetypes;
-  if (!a || !a.grid || !a.cells?.length) return null;
-  const [xMin, yMin, xMax, yMax] = input.bbox;
-  const grid = a.grid;
-  return (x: number, y: number): number => {
-    const c = Math.max(0, Math.min(grid - 1, Math.floor(((x - xMin) / (xMax - xMin)) * grid)));
-    const r = Math.max(0, Math.min(grid - 1, Math.floor(((yMax - y) / (yMax - yMin)) * grid)));
-    return (a.cells[r * grid + c] as number) ?? 0;
-  };
-}
-
 /** sample the tile texture at a world xy → [r,g,b] in 0..1 (NORTH-UP). */
 function makeTexSampler(input: TileScatterInput): ((x: number, y: number, out: number[]) => void) | null {
   const t = input.tex;
@@ -184,11 +142,6 @@ function makeTexSampler(input: TileScatterInput): ((x: number, y: number, out: n
     out[2] = (t.rgba[o + 2] as number) / 255;
   };
 }
-
-/** archetypes where nothing may grow regardless of what the texture says */
-const GROWTH_EXCLUDED = new Set<number>([
-  A.water, A.lake, A.face, A.ridge, A.shadow, A.snow, A.talus,
-]);
 
 interface Sample {
   z: number;
@@ -255,7 +208,6 @@ export function buildTileScatter(input: TileScatterInput): Group | null {
   const exag = input.exag ?? 1;
   const sample = makeSampler(input);
   const fsample = makeFieldSampler(input);
-  const asample = makeArchetypeSampler(input);
   const tsample = makeTexSampler(input);
   const rng = new Rng(hashString(`scatter/${input.tileId}`));
 
@@ -300,7 +252,11 @@ export function buildTileScatter(input: TileScatterInput): Group | null {
       // CLASSIFIER water gate: the satellite knows where lakes/fjords are — the
       // DEM elevation floor misses them (a lake at 50 m passes minElev). Nothing
       // scatters on water. This is the fix for "trees/plants in the water".
-      if (fsample && fsample('water', x, y) > 0.45) continue;
+      if (fsample && (
+        fsample('water', x, y) > 0.45
+        || fsample('shore', x, y) > 0.45
+        || fsample('snow', x, y) > 0.45
+      )) continue;
       const kind = kinds[rng.int(kinds.length)] as AssetKind;
       // HARD RULE: nothing living on north slopes, ever
       if (kind.living && s.southness < VEG_MIN_SOUTHNESS && s.slope > 0.08) continue;
@@ -328,8 +284,6 @@ export function buildTileScatter(input: TileScatterInput): Group | null {
       // rock/* categories (and their light/dark gating logic) are removed
       // above — every kind reaching this point is living (shrub/flower/
       // grass), so there is no non-living branch to gate here anymore.
-      const arch = asample ? asample(x, y) : -1;
-      if (arch >= 0 && GROWTH_EXCLUDED.has(arch)) continue;
       let tint: number[] | null = null;
       if (cat.prefix === 'grass/' && tsample) {
         // TEXTURE path for grass: density follows the imagery's measured
@@ -342,17 +296,8 @@ export function buildTileScatter(input: TileScatterInput): Group | null {
         const greenness = Math.max(0, Math.min(1, excess * 14 + 0.2));
         if (rng.float() > greenness * greenness) continue;
         tint = [_texColor[0]!, _texColor[1]!, _texColor[2]!];
-      } else if (asample) {
-        // ARCHETYPE path (NMS-style): the cell already committed to one
-        // landform decision server-side; the recipe table says what may
-        // grow there. No per-attempt re-derivation from raw channels —
-        // disputes go to the archetype map, not to gate probabilities.
-        const mult = ARCHETYPE_RECIPES[cat.prefix]?.[arch] ?? 0;
-        if (mult <= 0) continue;
-        if (mult < 1 && rng.float() > mult) continue;
       } else if (fsample) {
-        // Legacy channel path, kept only for tiles whose archetype grid
-        // has not landed yet.
+        // Full-resolution classifier path preserves curved cover boundaries.
         const dark = fsample('dark', x, y);
         const veg = fsample('veg', x, y);
         if (cat.prefix === 'shrub/') {

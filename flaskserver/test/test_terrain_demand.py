@@ -120,6 +120,13 @@ class TestViewCoverageCircle(unittest.TestCase):
         self.assertEqual(_lod_target_depth(3000, max_range, 13, altitude=700), 12)
         self.assertLess(_lod_target_depth(8000, max_range, 13, altitude=700), 12)
 
+    def test_mountainside_lod_uses_agl_not_asl(self):
+        max_range = 16000
+        # At this location 344 m ASL is above the D14 altitude cap, but the
+        # camera is only 8 m above the mountainside and must receive D14.
+        self.assertEqual(_lod_target_depth(0, max_range, 14, altitude=344), 13)
+        self.assertEqual(_lod_target_depth(0, max_range, 14, altitude=8), 14)
+
     @unittest.skipUnless(
         MAX_TILE_DEPTH > WMS_CONTRACT_DEPTH,
         "upscaling disabled: MAX_TILE_DEPTH held at the WMS contract depth",

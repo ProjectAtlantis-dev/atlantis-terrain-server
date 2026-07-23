@@ -9,11 +9,11 @@ Rung 0 — physics, DEM only. Slope, aspect (southness) and a horizon-marched
     imagery is read. A north-facing slope under the low southern sun is
     shadow-prone terrain *immediately*, even though nothing downstream knows
     what to do with shadow yet.
-Rung 1 — macro grain, d8 ancestor. West-coast Greenland structure runs
-    NE-SW (fjord/ridge strike); the structure tensor of the d8 heightmap
-    carries that orientation down as conditioning. Long dark streaks aligned
-    with the grain are ridge-line shadows, not ground cover — recorded in
-    the stats for the later grey→ridges refinement, not yet acted on.
+Rung 1 — hierarchy priors. D10 establishes whether inferred lake water exists
+    at all, D11 localizes that support, and D12 may only refine a candidate
+    that survives both parents. Official water remains authoritative and
+    bypasses this inferred-lake gate. D8 macro grain separately records the
+    regional ridge/fjord strike for later structural refinement.
 Rung 2 — joint color × surface proposals. The heightmap is a CO-PROPOSER,
     not just a veto: a DEM vegetation prior (gentle slope × south aspect ×
     lit × below the greenline) promotes ambiguous green color where the
@@ -33,6 +33,11 @@ Rung 4 — shadow resolution. Dark pixels the sun channel says are unlit are
     SHADOW, a first-class bucket — honestly unknown ground, never "dark
     soil where bushes grow". Dark pixels on lit ground stay DARK.
 Rung 5 — authority overlay. Official water (Åbent Land) outranks everything.
+Rung 6 — coastline prior. Every non-snow land pixel within the DEM-shaped
+    6–15 m reach of WATER/LAKE becomes SAND or SHORE_ROCK. Their
+    deterministic patchwork follows imagery brightness, bank slope, and
+    world-anchored coherent variation, so no vegetation survives at the
+    water edge and the result is not one uniform ring.
 
 Orientation contract: heightmap inputs are south-first (database rows),
 outputs are image-oriented (row 0 = north) to match classifier storage.
@@ -48,12 +53,14 @@ from PIL import Image
 
 from terrain_upscale import _resize_bilinear
 
-LADDER_SOURCE = "ladder_d12_v3"
+LADDER_SOURCE = "ladder_d12_v9"
 
-# coarse_v2 label indices (classifier.storage.CLASS_SCHEMAS order).
+# coarse_v4 label indices (classifier.storage.CLASS_SCHEMAS order).
 # 0-4 match coarse_v1 exactly so every index-based consumer keeps working;
-# SHADOW and LAKE are purely additive.
-GREY, GREEN, DARK, WHITE, WATER, SHADOW, LAKE = 0, 1, 2, 3, 4, 5, 6
+# SHADOW, LAKE, SAND and SHORE_ROCK are purely additive.
+GREY, GREEN, DARK, WHITE, WATER, SHADOW, LAKE, SAND, SHORE_ROCK = range(9)
+# Compatibility name for callers that only need "the sandy shoreline label".
+BEACH = SAND
 
 # --- Rung 0: physics ---------------------------------------------------------
 # Sun model matches classifier/terrain_channels.py: low southern sun.
@@ -96,15 +103,25 @@ GREENLINE_FADE_M = (450.0, 800.0)  # vegetation fades out over this band
 # the DEM knows them anyway — a lake is a LARGE CONNECTED FLAT SHEET at
 # near-constant elevation. Dark flat pixels seed the candidates; only
 # components big enough and level enough (a sheet, not a bog patch) become
-# LAKE — a first-class bucket, never silently merged into official WATER
-# (rendering/ingest decides what to do with it later). Everything else
-# stays honest DARK ground.
+# LAKE after D10 and D11 both support their existence — a first-class bucket,
+# never silently merged into official WATER (rendering/ingest decides what to
+# do with it later). Everything else stays honest DARK ground.
 LAKE_SLOPE_MAX = 0.03
 LAKE_MIN_FRACTION = 0.01   # component ≥1% of the tile: a sheet, not a puddle
+LAKE_MIN_AREA_M2 = 4300.0  # same physical floor when evaluating D10/D11
 LAKE_ELEV_STD_MAX = 1.5    # meters: water is level
 LAKE_EDGE_ELEV_TOLERANCE_M = 1.0
 LAKE_EDGE_SLOPE_MAX = 0.30
-LAKE_EDGE_LUMINANCE_RATIO = 1.10
+LAKE_PRIOR_MIN_OVERLAP = 0.05
+
+# Old coastline prior: foliage-like imagery right beside water is wet rock,
+# algae or coarse-imagery bleed, not living cover. Flat banks use the full
+# historic 15 m reach; steep banks taper toward 6 m so the mask does not
+# read as a mechanically constant ring.
+BEACH_BUFFER_M = 15.0
+BEACH_MIN_BUFFER_M = 6.0
+SHORE_NOISE_FINE_M = 36.0
+SHORE_NOISE_COARSE_M = 108.0
 
 # Ridge crests: a convex break (negated surface laplacian, positive at
 # crests) on sloped ground. Long shadow streaks aligned with these crests
@@ -130,27 +147,32 @@ def _smoothstep(edge0, edge1, x):
     return t * t * (3 - 2 * t)
 
 
-def _detect_lake_sheets(slope, elev, luminance):
+def _detect_lake_sheets(
+    slope, elev, luminance, *, min_component_pixels=None,
+):
     """Seed level lake interiors, then flood-fill their noisy shore edges.
 
     The DEM is cleanest over the middle of a lake. At the shoreline its
     samples blend water and land, so a strict low-slope component stops short
     and leaves a green ring that downstream scatter mistakes for vegetation.
-    Grow only through connected pixels that remain close to the seed's water
-    level, moderately gentle, and darker than the surrounding land.
+    Grow only through connected DEM pixels that remain close to the seed's
+    water level and moderately gentle. Imagery decides whether the initial
+    flat sheet is plausibly water; it does not control where the flood stops.
     """
     from scipy import ndimage
 
     flat = slope < LAKE_SLOPE_MAX
     lake = np.zeros_like(flat)
     components, count = ndimage.label(flat)
+    if min_component_pixels is None:
+        min_component_pixels = LAKE_MIN_FRACTION * flat.size
     land_reference = float(np.median(luminance[~flat])) if np.any(
         ~flat
     ) else float(np.median(luminance))
     structure = np.ones((3, 3), dtype=bool)
     for index in range(1, count + 1):
         component = components == index
-        if np.count_nonzero(component) < LAKE_MIN_FRACTION * flat.size:
+        if np.count_nonzero(component) < min_component_pixels:
             continue
         if float(np.std(elev[component])) > LAKE_ELEV_STD_MAX:
             continue
@@ -160,7 +182,6 @@ def _detect_lake_sheets(slope, elev, luminance):
         floodable = (
             (np.abs(elev - water_level) <= LAKE_EDGE_ELEV_TOLERANCE_M)
             & (slope < LAKE_EDGE_SLOPE_MAX)
-            & (luminance < land_reference * LAKE_EDGE_LUMINANCE_RATIO)
         )
         lake |= ndimage.binary_propagation(
             component,
@@ -168,6 +189,143 @@ def _detect_lake_sheets(slope, elev, luminance):
             structure=structure,
         )
     return lake
+
+
+def _gate_inferred_lakes(lake_candidates, lake_prior):
+    """Keep only D12 lake components supported by the D10∩D11 prior.
+
+    The prior is deliberately component-level rather than a final mask: coarse
+    parents decide whether a water body may exist, while D12 retains authority
+    over its precise shoreline.
+    """
+    from scipy import ndimage
+
+    candidates = np.asarray(lake_candidates, dtype=bool)
+    if lake_prior is None:
+        return np.zeros_like(candidates)
+    prior = np.asarray(lake_prior, dtype=bool)
+    if prior.shape != candidates.shape:
+        raise ValueError("lake prior must match classifier output")
+    gated = np.zeros_like(candidates)
+    components, count = ndimage.label(candidates)
+    for index in range(1, count + 1):
+        component = components == index
+        pixels = int(np.count_nonzero(component))
+        overlap = int(np.count_nonzero(component & prior))
+        if overlap >= max(1, math.ceil(pixels * LAKE_PRIOR_MIN_OVERLAP)):
+            gated |= component
+    return gated
+
+
+def lake_support_mask(rgb, heightmap, bbox, output_size=256):
+    """Coarse visual/DEM evidence that an inferred lake may exist.
+
+    Used on D10 and D11 before D12 classification. The minimum component size
+    is expressed in square metres so the coarse parents do not accidentally
+    require a lake to occupy the same *fraction* of their much larger tiles.
+    """
+    image = np.asarray(
+        Image.fromarray(np.asarray(rgb, dtype=np.uint8), "RGB").resize(
+            (output_size, output_size), Image.Resampling.BILINEAR
+        ),
+        dtype=np.float32,
+    )
+    tile_size_m = float(bbox[2]) - float(bbox[0])
+    channels = physics_channels(heightmap, tile_size_m, output_size)
+    luminance = (
+        image[..., 0] * 0.2126 + image[..., 1] * 0.7152
+        + image[..., 2] * 0.0722
+    )
+    pixel_size_m = tile_size_m / max(1, output_size - 1)
+    minimum_pixels = max(
+        4, math.ceil(LAKE_MIN_AREA_M2 / max(pixel_size_m ** 2, 1e-9)),
+    )
+    return _detect_lake_sheets(
+        channels["slope"], channels["elev"], luminance,
+        min_component_pixels=minimum_pixels,
+    )
+
+
+def _detect_beach(labels, waterish, slope, tile_size_m):
+    """All exposed land in the DEM-shaped water reach becomes shoreline."""
+    from scipy import ndimage
+
+    waterish = np.asarray(waterish, dtype=bool)
+    if not np.any(waterish):
+        return np.zeros_like(waterish)
+    pixel_size_m = float(tile_size_m) / max(1, waterish.shape[0] - 1)
+    distance_m = ndimage.distance_transform_edt(~waterish) * pixel_size_m
+    flatness = 1.0 - _smoothstep(0.08, 0.35, np.maximum(slope, 0.0))
+    reach_m = BEACH_MIN_BUFFER_M + (
+        BEACH_BUFFER_M - BEACH_MIN_BUFFER_M
+    ) * flatness
+    return (
+        (labels != WATER)
+        & (labels != LAKE)
+        & (labels != WHITE)
+        & (distance_m > 0.0)
+        & (distance_m <= reach_m)
+    )
+
+
+def _world_value_noise(bbox, shape, period_m, seed):
+    """Smooth deterministic value noise anchored in EPSG:3413 meters.
+
+    Unlike per-tile RNG, the lattice coordinates come from the real world,
+    so adjacent tiles sample the same variation at their shared edge.
+    """
+    height, width = shape
+    x = np.linspace(float(bbox[0]), float(bbox[2]), width)
+    # Class maps are image-oriented: row zero is the north/max-y edge.
+    y = np.linspace(float(bbox[3]), float(bbox[1]), height)
+    xx, yy = np.meshgrid(x / period_m, y / period_m)
+    x0 = np.floor(xx)
+    y0 = np.floor(yy)
+    tx = _smoothstep(0.0, 1.0, xx - x0)
+    ty = _smoothstep(0.0, 1.0, yy - y0)
+
+    def lattice(ix, iy):
+        phase = ix * 127.1 + iy * 311.7 + float(seed) * 74.7
+        value = np.sin(phase) * 43758.5453123
+        return (value - np.floor(value)) * 2.0 - 1.0
+
+    south = lattice(x0, y0) * (1.0 - tx) + lattice(x0 + 1, y0) * tx
+    north = lattice(x0, y0 + 1) * (1.0 - tx) + lattice(
+        x0 + 1, y0 + 1,
+    ) * tx
+    return south * (1.0 - ty) + north * ty
+
+
+def _split_shore_surfaces(beach, luminance, slope, bbox):
+    """Split shoreline candidates into coherent sand and exposed-rock patches.
+
+    Imagery and DEM supply the physical bias: bright/flat banks lean sand,
+    darker/steeper banks lean rock. World-anchored two-scale value noise
+    prevents either material becoming a continuous artificial ring while
+    remaining identical on every run.
+    """
+    beach = np.asarray(beach, dtype=bool)
+    if not np.any(beach):
+        return np.zeros_like(beach), np.zeros_like(beach)
+    fine = _world_value_noise(
+        bbox, beach.shape, SHORE_NOISE_FINE_M, seed=0x53414E44,
+    )
+    coarse = _world_value_noise(
+        bbox, beach.shape, SHORE_NOISE_COARSE_M, seed=0x524F434B,
+    )
+    # Fine patches own most of the choice so one dark/bright lake quadrant
+    # cannot collapse into a single material; the coarse octave keeps
+    # neighbouring runs related.
+    variation = 0.80 * fine + 0.20 * coarse
+    brightness = _smoothstep(70.0, 125.0, np.asarray(luminance))
+    flatness = 1.0 - _smoothstep(0.04, 0.28, np.maximum(slope, 0.0))
+    sand_score = (
+        0.75 * variation
+        + 0.17 * (brightness * 2.0 - 1.0)
+        + 0.08 * (flatness * 2.0 - 1.0)
+    )
+    sand = beach & (sand_score >= -0.03)
+    return sand, beach & ~sand
 
 
 def physics_channels(heightmap, tile_size_m, output_size):
@@ -286,6 +444,7 @@ def classify_ladder(
     water_mask=None,
     output_size=256,
     grain=None,
+    lake_prior=None,
     debug_dir=None,
 ):
     """Run the full ladder on one tile. Returns (labels, stats).
@@ -295,9 +454,13 @@ def classify_ladder(
     water_mask: south-first bool array on the heightmap grid, or None.
     grain: optional dict from macro_grain(d8 ancestor) — conditioning
     context recorded in stats (nothing labels from it yet).
+    lake_prior: D10∩D11 support raster, image-oriented and matching
+    output_size. D12 may refine only lake components with coarse support;
+    omitting the prior prohibits inferred lakes. Official water is independent
+    and remains authoritative.
     debug_dir: when set, every rung dumps a step_NN_*.png there.
 
-    labels are coarse_v2 uint8; stats is a JSON-able dict of everything a
+    labels are coarse_v4 uint8; stats is a JSON-able dict of everything a
     verification gallery wants to show (fractions, thresholds, exposure
     gain, grain, shadow orientation).
     """
@@ -334,7 +497,8 @@ def classify_ladder(
     # lit-land median down and poison the gain for the whole tile (seen
     # live on 12-1380-791: gain pinned at max, pale rock inflated to
     # WHITE).
-    lake = _detect_lake_sheets(slope, elev, luminance)
+    lake_candidates = _detect_lake_sheets(slope, elev, luminance)
+    lake = _gate_inferred_lakes(lake_candidates, lake_prior)
 
     # Rung 2 exposure normalization: lit land only — shadow, authority
     # water and lake sheets would drag the median and mis-gain the tile.
@@ -423,6 +587,18 @@ def classify_ladder(
     if water is not None:
         labels[water] = np.uint8(WATER)
 
+    # Rung 6: the old coastline prior at classifier resolution. Every exposed
+    # land pixel in the variable DEM-shaped reach resolves to sand or rock,
+    # so vegetation cannot survive directly against water. The split remains
+    # imagery/slope/noise-driven rather than a single painted material ring.
+    waterish = lake.copy()
+    if water is not None:
+        waterish |= water
+    beach = _detect_beach(labels, waterish, slope, tile_size_m)
+    sand, shore_rock = _split_shore_surfaces(beach, lum, slope, bbox)
+    labels[sand] = np.uint8(SAND)
+    labels[shore_rock] = np.uint8(SHORE_ROCK)
+
     total = labels.size
     shadow_shape = _mask_orientation(labels == SHADOW)
     ridge_shape = _mask_orientation(ridge)
@@ -434,11 +610,16 @@ def classify_ladder(
             for name, index in (
                 ("grey", GREY), ("green", GREEN), ("dark", DARK),
                 ("white", WHITE), ("water", WATER), ("shadow", SHADOW),
-                ("lake", LAKE),
+                ("lake", LAKE), ("sand", SAND),
+                ("shore_rock", SHORE_ROCK),
             )
         },
         "veg_prior_mean": float(veg_prior.mean()),
         "ridge_fraction": float(np.count_nonzero(ridge)) / total,
+        "lake_candidate_fraction": (
+            float(np.count_nonzero(lake_candidates)) / total
+        ),
+        "lake_prior_applied": lake_prior is not None,
         "grain": grain,
         "shadow_shape": shadow_shape,
         "ridge_shape": ridge_shape,
@@ -470,7 +651,7 @@ def _dump_debug_steps(
     """One inspectable image per rung: step_NN_name.png."""
     import os
 
-    from classifier.storage import COARSE_V2_SCHEMA, colorize_class_map
+    from classifier.storage import COARSE_V4_SCHEMA, colorize_class_map
 
     os.makedirs(debug_dir, exist_ok=True)
 
@@ -493,6 +674,6 @@ def _dump_debug_steps(
     save("step_07_veg_prior", gray(veg_prior, 0.0, 1.0))
     save("step_08_ridge_crests", gray(ridge.astype(np.float32), 0.0, 1.0))
     save("step_09_lake_sheets", gray(lake.astype(np.float32), 0.0, 1.0))
-    save("step_10_proposals", colorize_class_map(proposals, COARSE_V2_SCHEMA))
-    save("step_11_vetoed", colorize_class_map(vetoed, COARSE_V2_SCHEMA))
-    save("step_12_final", colorize_class_map(labels, COARSE_V2_SCHEMA))
+    save("step_10_proposals", colorize_class_map(proposals, COARSE_V4_SCHEMA))
+    save("step_11_vetoed", colorize_class_map(vetoed, COARSE_V4_SCHEMA))
+    save("step_12_final", colorize_class_map(labels, COARSE_V4_SCHEMA))

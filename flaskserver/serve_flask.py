@@ -571,12 +571,8 @@ def _fetch_one_cog_tile(tile_id, bbox):
       from serve import _cook_cooked_dem_quad
 
       _record_dem_request(db, tile_id)
-      # The live resolver classifies the d12 ancestor on demand, so macro
-      # relief doesn't depend on the client having fetched a classifier mask
-      # for this area first.
       if _cook_cooked_dem_quad(
         db, tile_id,
-        archetype_resolver=lambda tid: _resolve_archetypes(db, tid),
       ):
         log_cog.info(
           f"[tile-audit] tile={tile_id} stage=dem_completed outcome=cooked"
@@ -825,7 +821,7 @@ def _bootstrap_backend() -> None:
     db.commit()
 
     # Cooked DEMs and cooked deep textures are derived artifacts: when the
-    # macro relief / relief-shading recipe changes, every cooked_dem tile
+    # derived terrain / texture recipe changes, every cooked_dem tile
     # and cooked_upscale texture is stale by definition. Reset DEMs to
     # pending skeletons (payload dropped, seams invalidated) and drop the
     # texture rows so normal demand recooks both with the current recipe —
@@ -865,7 +861,7 @@ def _bootstrap_backend() -> None:
       )
       db.commit()
       log_db.info(
-        f"Macro terrain recipe v{MACRO_TERRAIN_VERSION}: reset {len(stale)} "
+        f"Derived terrain recipe v{MACRO_TERRAIN_VERSION}: reset {len(stale)} "
         f"cooked_dem tiles and dropped {stale_textures} "
         f"cooked_upscale textures for recook"
       )
@@ -1377,57 +1373,11 @@ def _cook_texture_quad(db, tile_id: str) -> bool:
     return False
 
   upscale_started = time.perf_counter()
-  # Plain Lanczos enlarge of the parent photo. The fBm noise painter and the
-  # class-conditioned bake_texture_detail that used to condition on the DEM
-  # surface here are REMOVED (2026-07-22/23: both painted fake shadow shapes
-  # onto flat, evenly-lit ground and damaged tiles). Macro procedural
-  # character lives in the DEM cook now — geometry, not painted noise.
+  # Plain Lanczos enlarge of the parent photo. Procedural painters are absent
+  # because they quantized continuous source evidence into square decisions.
   upscaled, _size = upscale_texture(parent[0], factor=2)
 
-  # Slope-aware shading, pre-baked ONCE at the d13 cook: the ENTIRE macro
-  # cascade's relief delta (bands d13-d15, evaluated analytically from the
-  # same world-anchored noise the DEM cooks use) lit by the fixed south sun.
-  # The imagery is noon-lit — every real shadow already falls north — so the
-  # bake speaks the photo's lighting language, and a flat delta multiplies
-  # by exactly 1. Deeper texture cooks add NO shading: per-depth incremental
-  # shading made every texture-streaming frontier a visible fence (a d14
-  # texture beside a still-d13 neighbor differed by exactly one shading
-  # band). With the full cascade baked at d13, every LOD carries identical
-  # shading content and enlarges cannot create edges.
-  shading = "shade=inherited"
-  if depth == WMS_CONTRACT_DEPTH + 1:
-    shading = "shade=no"
-    parent_tile = read_tile(db, parent_id)
-    parent_heightmap = parent_tile["heightmap"] if parent_tile else None
-    if parent_heightmap is not None:
-      from coastline import read_water_mask
-      from serve import macro_archetype_field
-      from terrain_upscale import macro_cascade_delta, shade_texture_with_relief
-      try:
-        macro_cells, macro_bbox = macro_archetype_field(
-          db, parent_id, resolver=lambda tid: _resolve_archetypes(db, tid),
-        )
-      except Exception:
-        macro_cells, macro_bbox = None, None
-      if macro_cells is not None:
-        try:
-          water_mask = read_water_mask(db, parent_id)
-          if water_mask is not None and water_mask.shape != parent_heightmap.shape:
-            water_mask = None
-        except Exception:
-          water_mask = None
-        try:
-          delta = macro_cascade_delta(
-            parent_heightmap, parent_bbox,
-            archetype_cells=macro_cells, archetype_bbox=macro_bbox,
-            water_mask=water_mask,
-          )
-          upscaled = shade_texture_with_relief(upscaled, delta, parent_bbox)
-          shading = "shade=cascade"
-        except ValueError as exc:
-          log_d13.warning(
-            f"{tile_id}: relief shading skipped ({exc})"
-          )
+  shading = "shade=none"
 
   # Classification does NOT happen at every cook depth (user directive,
   # 2026-07-22): there's no ground truth past the WMS contract depth, and
@@ -1639,7 +1589,9 @@ def api_tiles():
 
   ox = _arg_float("ox", qx)
   oy = _arg_float("oy", qy)
-  alt = _arg_float("alt", 0.0)
+  # LOD uses height above local terrain. ``alt`` is retained as a fallback
+  # for older clients, but current clients send the unambiguous ``agl``.
+  lod_altitude = _arg_float("agl", _arg_float("alt", 0.0))
   heading = _arg_float("heading", 0.0)
   try:
     tiles, missing = _query_tiles_stereo(
@@ -1649,7 +1601,7 @@ def api_tiles():
       error_threshold=error,
       max_depth=max_depth,
       max_range=max_range,
-      altitude=alt,
+      altitude=lod_altitude,
       lod_history=_terrain_lod_history,
       log=lambda msg: log.debug(f"[/api/tiles] {msg}"),
     )
@@ -2035,6 +1987,79 @@ def api_texture(tile_id: str):
   )
 
 
+@app.get("/api/cliff-graft/<tile_id>.png")
+def api_cliff_graft(tile_id: str):
+  """Serve one shared, persistently prepared cliff-graft donor.
+
+  The shader projects this asset across every eligible D13+ tile. Water
+  inpainting is deterministic and stored in SQLite, so browsers only decode
+  the finished PNG and never repeat the classifier/image preparation.
+  """
+  unavailable = _terrain_unavailable_response()
+  if unavailable is not None:
+    return unavailable
+  parsed = _parse_tile_id(tile_id)
+  if parsed is None:
+    return Response(b"", status=400)
+
+  depth, column, row = parsed
+  db = _get_db()
+  if depth >= WMS_CONTRACT_DEPTH:
+    shift = depth - WMS_CONTRACT_DEPTH
+    _ensure_d12_class_map(
+      db,
+      f"{WMS_CONTRACT_DEPTH}-{column >> shift}-{row >> shift}",
+    )
+
+  from cliff_graft_cache import (
+    CLIFF_GRAFT_ASSET_VERSION,
+    get_or_create_cliff_graft_asset,
+  )
+
+  try:
+    asset = get_or_create_cliff_graft_asset(db, tile_id)
+  except (TypeError, ValueError, zlib.error) as exc:
+    log_tex.warning(
+      f"[cliff-graft] {tile_id}: preparation failed "
+      f"({type(exc).__name__}: {exc})"
+    )
+    return Response(
+      b"", status=500,
+      headers={"Cache-Control": "no-store", "X-Cliff-Graft-Status": "invalid"},
+    )
+  if asset is None:
+    texture_row = db.execute(
+      "SELECT 1 FROM textures WHERE tile_id = ?", (tile_id,),
+    ).fetchone()
+    if texture_row is None:
+      _queue_texture_fetch(tile_id, tuple(_tile_bbox(*parsed)))
+    return Response(
+      b"", status=202,
+      headers={"Cache-Control": "no-store", "X-Cliff-Graft-Status": "pending"},
+    )
+
+  cache_status = "miss" if asset["generated"] else "hit"
+  if asset["generated"]:
+    log_tex.info(
+      f"[cliff-graft] {tile_id}: persisted recipe "
+      f"v{CLIFF_GRAFT_ASSET_VERSION} ({asset['width']}x{asset['height']}, "
+      f"{asset['water_pixels']} water pixels replaced)"
+    )
+  response = Response(
+    asset["texture"],
+    mimetype="image/png",
+    headers={
+      "Cache-Control": "public, max-age=300",
+      "X-Cliff-Graft-Status": "ready",
+      "X-Cliff-Graft-Cache": cache_status,
+      "X-Cliff-Graft-Recipe": str(CLIFF_GRAFT_ASSET_VERSION),
+      "X-Cliff-Graft-Water-Pixels": str(asset["water_pixels"]),
+    },
+  )
+  response.set_etag(asset["fingerprint"])
+  return response.make_conditional(request)
+
+
 def _tile_package_png(values, *, boolean: bool = False) -> bytes:
   """Encode a south-first terrain raster as a north-first PNG."""
   array = _np.asarray(values)
@@ -2284,13 +2309,13 @@ CLASSIFIER_PINK_WATER_ENABLED = False
 
 
 def _ensure_d12_class_map(db, tile_id: str) -> None:
-  """Classify a contract-depth tile on demand from its own texture + DEM.
+  """Classify D12 on demand from its evidence plus D10/D11 lake priors.
 
-  The cook classifier's proposal/veto physics needs no cook and no parent:
-  a d12 tile's final texture and measured heightmap are enough. Rows are
-  stored only when the texture is final, so placeholder-derived labels are
-  never persisted; until then the tile simply stays unclassified and the
-  caller's ancestor-walk behaves as before. Deterministic given its inputs.
+  D12 supplies the authoritative texture and measured heightmap. D10 decides
+  whether inferred lake water may exist and D11 localizes that hypothesis;
+  neither parent supplies a final D12 boundary. Rows are stored only when all
+  inputs are final, so placeholder-derived labels are never persisted.
+  Deterministic given its inputs.
   """
   parsed = _parse_tile_id(tile_id)
   if parsed is None or parsed[0] != WMS_CONTRACT_DEPTH:
@@ -2318,9 +2343,10 @@ def _ensure_d12_class_map(db, tile_id: str) -> None:
     import numpy as np
     from PIL import Image
 
+    from classifier.hierarchy import d12_lake_prior, lake_prior_ancestor_ids
     from classifier.ladder import classify_ladder, macro_grain
     from classifier.storage import (
-      COARSE_V2_SCHEMA, init_classifier_tiles, write_classifier_tile,
+      COARSE_V4_SCHEMA, init_classifier_tiles, write_classifier_tile,
     )
     from coastline import read_water_mask
 
@@ -2346,18 +2372,33 @@ def _ensure_d12_class_map(db, tile_id: str) -> None:
     except Exception:
       grain = None
     rgb = np.asarray(Image.open(io.BytesIO(texture_row[0])).convert("RGB"))
+    # D10 answers whether inferred water exists at all; D11 localizes that
+    # support. If either parent is unavailable, leave this tile pending rather
+    # than persist a D12-only lake guess that can never repair itself.
+    lake_prior = d12_lake_prior(db, tile_id)
+    if lake_prior is None:
+      for ancestor_id in lake_prior_ancestor_ids(tile_id):
+        ancestor = _parse_tile_id(ancestor_id)
+        if ancestor is not None:
+          _queue_texture_fetch(ancestor_id, tuple(_tile_bbox(*ancestor)))
+      log.info(
+        f"[classifier] {tile_id}: waiting for d10/d11 lake priors"
+      )
+      return
     labels, stats = classify_ladder(
       rgb, tile["heightmap"], list(tile["bbox"]),
-      water_mask=water_mask, grain=grain,
+      water_mask=water_mask, grain=grain, lake_prior=lake_prior,
     )
     init_classifier_tiles(db)
     write_classifier_tile(
-      db, tile_id, labels, class_schema=COARSE_V2_SCHEMA, source=LADDER_SOURCE,
+      db, tile_id, labels, class_schema=COARSE_V4_SCHEMA, source=LADDER_SOURCE,
     )
     log.info(
       f"[classifier] {tile_id}: ladder d12 classification stored "
       f"({texture_row[1]} texture, {labels.shape[0]}px, "
-      f"shadow {stats['fractions']['shadow']:.1%})"
+      f"shadow {stats['fractions']['shadow']:.1%}, "
+      f"lake candidates {stats['lake_candidate_fraction']:.1%} -> "
+      f"{stats['fractions']['lake']:.1%})"
     )
   except Exception as exc:
     log.warning(
@@ -2375,11 +2416,11 @@ def api_classifier_tile(tile_id: str):
   class boundaries and label identities are never blended.
 
   With ``?raw=1`` the response is a surface-channel mask for the renderer's
-  detail materials instead of the colorized debug view: one-hot uint8
-  channels R=rock (grey+dark), G=vegetation, B=snow; water and unclassified
-  ground are black (no detail). One channel per surface lets the client
-  filter linearly across class boundaries — the blend weights stay valid,
-  which label indices never would.
+  detail materials instead of the colorized debug view: uint8 channels
+  R=rock (grey=255, dark=128, sand=64, shore-rock=192), G=vegetation,
+  B=snow; water/lake are exact black and shadow uses the invisible marker
+  R=1. These values let the client recover exact CPU fields while the GPU
+  still filters meaningful surface weights linearly across boundaries.
   """
   unavailable = _terrain_unavailable_response()
   if unavailable is not None:
@@ -2474,18 +2515,33 @@ def api_classifier_tile(tile_id: str):
       # rock) = 255, dark = 128, neither = 0. Consumers that only care
       # "is this rock at all" (R > 0, e.g. the ground-detail shader) are
       # unaffected; consumers that need light-vs-dark test the exact value.
-      # coarse_v2 adds SHADOW (5), which simply never matches a channel
-      # below: shadow stays black = no detail, no scatter — honestly
-      # unknown ground. (Previously shadow-dark pixels were labeled DARK,
+      # coarse_v2 adds SHADOW (5). It gets the near-black RGB marker
+      # (1, 0, 0), visually and materially indistinguishable from black,
+      # but enough for CPU consumers to distinguish unknown shadow from
+      # exact black WATER/LAKE. (Previously shadow-dark pixels were DARK,
       # which scatter reads as "something grows here" — bushes in terrain
       # shadows.)
       mask = _np.zeros((resolution, resolution, 3), dtype=_np.uint8)
-      if label_array is not None and class_schema in ("coarse_v1", "coarse_v2"):
+      if label_array is not None and class_schema in (
+        "coarse_v1", "coarse_v2", "coarse_v3", "coarse_v4",
+      ):
         mask[..., 0] = _np.select(
           [label_array == 0, label_array == 2], [255, 128], default=0,
         )
         mask[..., 1] = _np.where(label_array == 1, 255, 0)
         mask[..., 2] = _np.where(label_array == 3, 255, 0)
+        if class_schema in ("coarse_v2", "coarse_v3", "coarse_v4"):
+          mask[..., 0] = _np.where(label_array == 5, 1, mask[..., 0])
+        if class_schema == "coarse_v3":
+          # BEACH (7): a distinct CPU marker and a subtle 25% rock-detail
+          # weight in the shared RGB texture. It is never vegetation.
+          mask[..., 0] = _np.where(label_array == 7, 64, mask[..., 0])
+        elif class_schema == "coarse_v4":
+          # SAND (7) and SHORE_ROCK (8) are both no-growth shoreline.
+          # Their distinct weights let the GPU alternate weak sand grain
+          # with strong exposed-rock grain without another texture fetch.
+          mask[..., 0] = _np.where(label_array == 7, 64, mask[..., 0])
+          mask[..., 0] = _np.where(label_array == 8, 192, mask[..., 0])
       if effective_water is not None:
         mask[
           smooth_effective_water_mask(effective_water, resolution, resolution)
@@ -2519,7 +2575,13 @@ def api_classifier_tile(tile_id: str):
           "X-Classifier-Status": classifier_status,
           "X-Classifier-Schema": str(class_schema),
           "X-Classifier-Source": str(source),
-          "X-Classifier-Mask": "surface_rgb_v1",
+          "X-Classifier-Mask": (
+            "surface_rgb_v4" if class_schema == "coarse_v4"
+            else (
+              "surface_rgb_v3" if class_schema == "coarse_v3"
+              else "surface_rgb_v2"
+            )
+          ),
         },
       )
     if effective_water is not None:
@@ -2607,76 +2669,6 @@ def api_regression_gallery(subpath="index.html"):
   ):
     regression_cases.build_gallery([])
   return send_from_directory(regression_cases.OUT_DIR, subpath)
-
-
-def _resolve_archetypes(db, tile_id):
-  """Archetype cell grid for a tile, or None.
-
-  Shared logic lives in classifier.archetypes.resolve_archetype_window (the
-  DEM cook uses it too); this wrapper adds the live-classification ensure
-  hook so a first demand classifies the d12 ancestor instead of giving up.
-  """
-  from classifier.archetypes import resolve_archetype_window
-
-  return resolve_archetype_window(
-    db, tile_id,
-    contract_depth=WMS_CONTRACT_DEPTH,
-    ensure_class_map=_ensure_d12_class_map,
-  )
-
-
-@app.get("/api/archetypes/<tile_id>.json")
-def api_archetypes_json(tile_id: str):
-  """Raw archetype cell grid — the procgen consumer's contract."""
-  unavailable = _terrain_unavailable_response()
-  if unavailable is not None:
-    return unavailable
-  cells = _resolve_archetypes(_get_db(), tile_id)
-  if cells is None:
-    return Response(
-      b"", status=404,
-      headers={"Cache-Control": "no-store", "X-Archetypes-Status": "missing"},
-    )
-  from classifier.archetypes import ARCHETYPE_NAMES
-  return {
-    "tile": tile_id,
-    "grid": int(cells.shape[0]),
-    "names": list(ARCHETYPE_NAMES),
-    "cells": cells.ravel().tolist(),
-  }
-
-
-@app.get("/api/archetypes/<tile_id>.png")
-def api_archetypes_png(tile_id: str):
-  """Colorized archetype debug view for the inspector/galleries."""
-  unavailable = _terrain_unavailable_response()
-  if unavailable is not None:
-    return unavailable
-  try:
-    resolution = max(16, min(2048, int(request.args.get("res", "512"))))
-  except ValueError:
-    return Response(b"", status=400)
-  cells = _resolve_archetypes(_get_db(), tile_id)
-  if cells is None:
-    return Response(
-      b"", status=404,
-      headers={"Cache-Control": "no-store", "X-Archetypes-Status": "missing"},
-    )
-  import io as _io
-  from PIL import Image as _Image
-  from classifier.archetypes import colorize_archetypes
-  image = _Image.fromarray(colorize_archetypes(cells), "RGB").resize(
-    (resolution, resolution), _Image.Resampling.NEAREST,
-  )
-  buf = _io.BytesIO()
-  image.save(buf, format="PNG")
-  return Response(
-    buf.getvalue(), mimetype="image/png",
-    headers={
-      "Cache-Control": "public, max-age=300",
-      "X-Archetypes-Status": "ready",
-    },
-  )
 
 
 @app.get("/api/pipeline/at.json")

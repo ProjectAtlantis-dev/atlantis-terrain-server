@@ -2,7 +2,7 @@
 """Verify the d12 classification ladder against data we already have.
 
 For every verified tile this runs the full ladder with per-rung debug
-dumps, stores the fresh coarse_v2 row (so the running client serves the
+dumps, stores the fresh coarse_v4 row (so the running client serves the
 same labels the gallery shows), and measures the labels against every
 independent reference available:
 
@@ -182,7 +182,8 @@ def verify_tile(db, tile_id, out_dir, use_google=True):
     from classifier.ladder import (
         GREEN, LAKE, WATER, LADDER_SOURCE, classify_ladder, macro_grain,
     )
-    from classifier.storage import COARSE_V2_SCHEMA, write_classifier_tile
+    from classifier.hierarchy import d12_lake_prior
+    from classifier.storage import COARSE_V4_SCHEMA, write_classifier_tile
     from coastline import read_water_mask
     from database import read_tile
 
@@ -212,35 +213,22 @@ def verify_tile(db, tile_id, out_dir, use_google=True):
                 ancestor["heightmap"],
                 float(ancestor["bbox"][2]) - float(ancestor["bbox"][0]),
             )
+    lake_prior = d12_lake_prior(db, tile_id)
+    if lake_prior is None:
+        return None
 
     tile_dir = os.path.join(out_dir, tile_id)
     labels, stats = classify_ladder(
         rgb, tile["heightmap"], list(tile["bbox"]),
-        water_mask=water_mask, grain=grain,
+        water_mask=water_mask, grain=grain, lake_prior=lake_prior,
         output_size=SIZE, debug_dir=tile_dir,
     )
     write_classifier_tile(
         db, tile_id, labels,
-        class_schema=COARSE_V2_SCHEMA, source=LADDER_SOURCE,
+        class_schema=COARSE_V4_SCHEMA, source=LADDER_SOURCE,
     )
 
-    # Archetype rung: derived from the labels just stored, persisted for
-    # the client, and rendered as a gallery panel.
-    from classifier.archetypes import (
-        colorize_archetypes, derive_archetypes, init_archetype_tiles,
-        write_archetype_tile,
-    )
-
-    init_archetype_tiles(db)
-    cells, archetype_stats = derive_archetypes(
-        labels, tile["heightmap"], list(tile["bbox"]),
-    )
-    write_archetype_tile(db, tile_id, cells)
-    Image.fromarray(colorize_archetypes(cells), "RGB").resize(
-        (SIZE, SIZE), Image.Resampling.NEAREST,
-    ).save(os.path.join(tile_dir, "archetypes.png"))
-
-    metrics = {"tile": tile_id, "stats": stats, "archetypes": archetype_stats}
+    metrics = {"tile": tile_id, "stats": stats}
 
     built, feature_count = asiaq_built_mask(db, tile["bbox"], SIZE)
     metrics["asiaq_features"] = feature_count
@@ -326,7 +314,6 @@ _PANELS = (
     ("step_01_texture.png", "SPOT texture"),
     ("google.png", "Google ref"),
     ("step_12_final.png", "ladder labels"),
-    ("archetypes.png", "archetypes"),
     ("asiaq_overlay.png", "asiaq (yellow)"),
     ("step_05_sun.png", "sun"),
     ("step_07_veg_prior.png", "veg prior"),
@@ -393,13 +380,15 @@ def build_gallery(out_dir, all_metrics):
         "th a{color:#5af}.m{color:#8fb0cc;font-size:12px}"
         "td div{color:#6889a8;font-size:11px;text-align:center}</style>"
         "<h1>d12 classification ladder — verification</h1>"
-        "<p>coarse_v2: "
+        "<p>coarse_v4: "
         "<span style='background:rgb(150,105,210);padding:0 8px'>&nbsp;</span> grey "
         "<span style='background:rgb(150,225,60);padding:0 8px'>&nbsp;</span> green "
         "<span style='background:rgb(255,140,0);padding:0 8px'>&nbsp;</span> dark "
         "<span style='background:#fff;padding:0 8px'>&nbsp;</span> white "
         "<span style='background:rgb(255,42,161);padding:0 8px'>&nbsp;</span> water "
         "<span style='background:rgb(60,120,255);padding:0 8px'>&nbsp;</span> shadow"
+        "<span style='background:rgb(255,230,90);padding:0 8px'>&nbsp;</span> sand · "
+        "<span style='background:rgb(105,92,125);padding:0 8px'>&nbsp;</span> shore rock"
         "</p><p>Google is water/structure authority only (late spring: "
         "under-shows green, over-shows snow). Lake dropout % = Google-"
         "confirmed water missing from the official mask — ingest gap.</p>"

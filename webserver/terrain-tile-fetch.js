@@ -16,7 +16,10 @@ export function buildTerrainTilesRequest({
   const positionQuery = hasGridPosition
     ? `sx=${queryX}&sy=${queryY}`
     : `lat=${lat}&lon=${lon}`;
-  let url = `/api/tiles?${positionQuery}&alt=${altitude}&heading=${heading}&range=${range}`;
+  // LOD altitude is height above the rendered ground, not geodetic/ASL
+  // camera height. Keep the parameter name explicit so a mountainside
+  // camera at 344 m ASL and 8 m AGL is not incorrectly capped at D13.
+  let url = `/api/tiles?${positionQuery}&agl=${altitude}&heading=${heading}&range=${range}`;
   if (!isFirstLoad || frameOffsetReady) url += `&ox=${originX}&oy=${originY}`;
   return {
     url,
@@ -26,7 +29,7 @@ export function buildTerrainTilesRequest({
       requestLon: lon,
       requestGridX: hasGridPosition ? queryX : null,
       requestGridY: hasGridPosition ? queryY : null,
-      requestAltM: altitude,
+      requestAglM: altitude,
       headingRad: heading,
       ...cameraSnapshot,
     },

@@ -116,6 +116,9 @@ export function createTerrainFlyToTileRuntime({
       .addScaledVector(north, northM)
       .addScaledVector(up, altM);
     cameraRuntimeState.lastGoodPosition.copy(camera.position);
+    // This is a teleport in ASL space; any AGL measured at the old location
+    // is invalid until the new terrain is raycast.
+    cameraRuntimeState.aglValid = false;
   }
 
   // The tile's ground elevation is unknown until its heightmap streams in

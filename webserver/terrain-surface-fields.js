@@ -1,9 +1,10 @@
 import * as THREE from 'three';
 import { detailMaskUrl, tileDepthFromTileId } from './terrain-detail-layer.js';
 
-// Shared per-tile surface-channel store. One fetch of the server's one-hot
-// mask (/api/classifier/<id>.png?raw=1: R=rock, G=vegetation, B=snow,
-// black=water/unclassified) serves BOTH consumers:
+// Shared per-tile surface-channel store. One fetch of the server's surface
+// mask (/api/classifier/<id>.png?raw=1: R=rock/dark/shore markers,
+// G=vegetation, B=snow, exact black=water/lake, near-black=shadow) serves
+// BOTH consumers:
 //  - the ground-detail shader wants a THREE.Texture,
 //  - the clutter scatter wants raw channel grids (procgen TileFields shape).
 // Single-flight, LRU-capped, failure-memoized — same policy the detail
@@ -39,6 +40,7 @@ export function createSurfaceFieldStore({
     const veg = new Uint8Array(size * size);
     const snow = new Uint8Array(size * size);
     const water = new Uint8Array(size * size);
+    const shore = new Uint8Array(size * size);
     // DARK lives inside the R/rock channel as a distinct value (grey=255,
     // dark=128, neither=0) — NOT the PNG alpha channel. Alpha was tried
     // first, but this decode goes through a 2D canvas drawImage/
@@ -49,16 +51,22 @@ export function createSurfaceFieldStore({
     const dark = new Uint8Array(size * size);
     for (let index = 0; index < size * size; index++) {
       const offset = index * 4;
-      rock[index] = pixels[offset];
+      const shadowMarker = pixels[offset] === 1
+        && pixels[offset + 1] === 0 && pixels[offset + 2] === 0;
+      const beachMarker = pixels[offset] === 64
+        && pixels[offset + 1] === 0 && pixels[offset + 2] === 0;
+      const shoreRockMarker = pixels[offset] === 192
+        && pixels[offset + 1] === 0 && pixels[offset + 2] === 0;
+      rock[index] = shadowMarker || beachMarker ? 0
+        : shoreRockMarker ? 255 : pixels[offset];
       veg[index] = pixels[offset + 1];
       snow[index] = pixels[offset + 2];
-      dark[index] = pixels[offset] > 64 && pixels[offset] < 200 ? 255 : 0;
-      // Black mask = water or unclassified: either way nothing lives or
-      // scatters there, matching the shader's "no detail" behavior.
-      const known = Math.max(
-        pixels[offset], pixels[offset + 1], pixels[offset + 2],
-      );
-      water[index] = 255 - known;
+      dark[index] = pixels[offset] === 128 ? 255 : 0;
+      shore[index] = beachMarker || shoreRockMarker ? 255 : 0;
+      // surface_rgb_v4 reserves exact black for WATER/LAKE. SHADOW carries
+      // invisible R=1; SAND carries R=64; SHORE_ROCK carries R=192.
+      water[index] = pixels[offset] === 0
+        && pixels[offset + 1] === 0 && pixels[offset + 2] === 0 ? 255 : 0;
     }
 
     // ORIENTATION: tile mesh UVs put v=0 at the SOUTH edge; the mask PNG's
@@ -86,7 +94,7 @@ export function createSurfaceFieldStore({
       texture,
       // Mask rasters are image-oriented: row 0 = north — the procgen
       // TileFields contract.
-      fields: { res: size, chans: { rock, veg, snow, water } },
+      fields: { res: size, chans: { rock, veg, snow, water, dark, shore } },
     };
   }
 

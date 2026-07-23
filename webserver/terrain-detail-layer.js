@@ -5,7 +5,8 @@ import * as THREE from 'three';
 // class is repeated-but-sharp high frequency. Near the camera the detail
 // modulates the satellite color, selected per-pixel by the server's surface
 // channel mask (/api/classifier/<id>.png?raw=1 — R=rock, G=vegetation,
-// B=snow, black=water/unknown). Beyond the fade range the satellite texture
+// B=snow, exact black=water/lake, near-black=shadow). Beyond the fade range
+// the satellite texture
 // stands alone, so distant terrain is untouched and repeat shimmer never
 // reaches the horizon. All of it is deterministic: the detail textures come
 // from an integer-hash noise with a fixed seed, and the tiling UVs are
@@ -67,7 +68,7 @@ export function tileDepthFromTileId(tileId) {
 }
 
 export function detailMaskUrl(tileId) {
-  return `/api/classifier/${tileId}.png?raw=1&res=256&v=3`;
+  return `/api/classifier/${tileId}.png?raw=1&res=256&v=10`;
 }
 
 // World-anchored tiling UV transform, exact from the tile id: world position

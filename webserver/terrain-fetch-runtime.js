@@ -60,6 +60,13 @@ export function createTerrainFetchRuntime({
   async function execute({ lat, lon, signal }) {
     const cameraCoordinates = getCameraCoordinates();
     const cameraSnapshot = getCameraSnapshot(cameraCoordinates);
+    const measuredAgl = testOverrides.getCameraAGL?.()
+      ?? view.getCameraAGL?.();
+    // Unknown clearance is not camera ASL. Request the ground-level ceiling
+    // until a rendered-terrain raycast supplies a real AGL measurement.
+    const lodAltitude = Number.isFinite(measuredAgl)
+      ? Math.max(0, measuredAgl)
+      : 0;
     const gridPosition = state.frameOffsetReady
       ? terrainCameraGridPosition({
           eastM: cameraCoordinates.eastM,
@@ -73,7 +80,7 @@ export function createTerrainFetchRuntime({
     const request = buildTerrainTilesRequest({
       lat: lat ?? cameraCoordinates.lat,
       lon: lon ?? cameraCoordinates.lon,
-      altitude: cameraCoordinates.alt,
+      altitude: lodAltitude,
       heading: testOverrides.getHeading?.()
         ?? view.getHeading?.()
         ?? priorityHeading(
@@ -197,7 +204,7 @@ export function createTerrainFetchRuntime({
     // position affects its radial bands. Advance this only when an
     // authoritative response applies so a descent can keep requesting until
     // the response topology catches up with the live camera height.
-    state.lastFetchAltitude = cameraCoordinates.alt;
+    state.lastFetchAltitude = lodAltitude;
     const pipeline = terrainPipelineStatus(data);
     state.heightmapsMissing = pipeline.missing;
     state.heightmapsDownloading = pipeline.downloading;

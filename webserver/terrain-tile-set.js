@@ -608,9 +608,9 @@ export function createTerrainTileSet({
     if (!mesh?.material) return;
     mesh.userData.terrainBaseTexture = texture ?? null;
     let needsUpdate = false;
-    // Debug overlay hook: when a resolver is installed (classifier /
-    // archetype view), its texture replaces the satellite map — the base
-    // texture is remembered above, so dropping the overlay restores it.
+    // Debug overlay hook: when the classifier resolver is installed, its
+    // texture replaces the satellite map. The base texture is remembered
+    // above, so dropping the overlay restores it.
     const overlayTexture = texture && textureOverlayResolver
       ? textureOverlayResolver(mesh.userData.tileId) ?? null
       : null;
@@ -650,10 +650,14 @@ export function createTerrainTileSet({
       mesh.material.needsUpdate = true;
       onMutated();
     }
-    // Frequency-split ground detail: modulate the satellite color with tiled
-    // per-surface detail near the camera (mask-gated, distance-faded).
-    // Skipped while an overlay is shown — decision colors must stay legible.
-    if (!overlayTexture) terrainDetail.apply(mesh);
+    // Classifier view deliberately keeps cliff grafts visible as a coverage
+    // diagnostic, but suppresses ordinary grain modulation so decision colors
+    // remain legible. Tint still comes from the real base imagery rather than
+    // from the classifier palette.
+    terrainDetail.apply(mesh, {
+      graftOnly: Boolean(overlayTexture),
+      tintMap: texture,
+    });
   }
 
   let textureOverlayResolver = null;

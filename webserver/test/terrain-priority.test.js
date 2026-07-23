@@ -616,10 +616,10 @@ test('terrain request preserves boot frame semantics without client LOD override
     frameOffsetReady: false, originX: 1, originY: 2,
     cameraSnapshot: { camEastM: 3 },
   });
-  assert.equal(request.url, '/api/tiles?lat=64.1&lon=-51.2&alt=120&heading=0.5&range=30000');
+  assert.equal(request.url, '/api/tiles?lat=64.1&lon=-51.2&agl=120&heading=0.5&range=30000');
   assert.deepEqual(request.logDetails, {
     isFirstLoad: true,
-    requestLat: 64.1, requestLon: -51.2, requestAltM: 120,
+    requestLat: 64.1, requestLon: -51.2, requestAglM: 120,
     requestGridX: null, requestGridY: null,
     headingRad: 0.5, camEastM: 3,
   });
@@ -632,7 +632,7 @@ test('terrain request reuses a restored frame', () => {
     frameOffsetReady: true, originX: -12.5, originY: 99.25,
     queryX: 123.5, queryY: -456.25,
   });
-  assert.equal(request.url, '/api/tiles?sx=123.5&sy=-456.25&alt=50&heading=0&range=40000&ox=-12.5&oy=99.25');
+  assert.equal(request.url, '/api/tiles?sx=123.5&sy=-456.25&agl=50&heading=0&range=40000&ox=-12.5&oy=99.25');
   assert.equal('maxDepth' in request.logDetails, false);
 });
 
@@ -1176,7 +1176,13 @@ test('shared camera coordinates and log summary use one ENU conversion', () => {
   assert.equal(summary.camStereoApproxY, 220);
 });
 
-function createTestFetchRuntime({ fetchImpl, onSkip, ...options } = {}) {
+function createTestFetchRuntime({
+  fetchImpl,
+  onSkip,
+  cameraCoordinates = { lat: 64, lon: -51, alt: 100 },
+  cameraAgl,
+  ...options
+} = {}) {
   const state = {
     fetching: false, firstLoad: true, frameOffsetReady: false,
     frameOffsetX: 0, frameOffsetY: 0, originX: 0, originY: 0,
@@ -1190,7 +1196,8 @@ function createTestFetchRuntime({ fetchImpl, onSkip, ...options } = {}) {
     view: { anchorLatitude: 64, anchorLongitude: -51 },
     vehicle: {},
     testOverrides: {
-      getCameraCoordinates: () => ({ lat: 64, lon: -51, alt: 100 }),
+      getCameraCoordinates: () => cameraCoordinates,
+      getCameraAGL: () => cameraAgl,
       getCameraSnapshot: () => ({ camEastM: 0, camNorthM: 0 }),
       getCameraLocalPosition: () => ({ x: 0, y: 0 }),
       getHeading: () => 0,
@@ -1213,6 +1220,54 @@ function createTestFetchRuntime({ fetchImpl, onSkip, ...options } = {}) {
   return { runtime, state };
 }
 
+test('shared fetch runtime sends AGL rather than ASL for mountainside LOD', async () => {
+  let requestedUrl = null;
+  const { runtime, state } = createTestFetchRuntime({
+    cameraCoordinates: { lat: 64, lon: -51, alt: 344 },
+    cameraAgl: 8,
+    fetchImpl: async url => {
+      requestedUrl = url;
+      return {
+        status: 200,
+        json: async () => ({
+          ox: 0, oy: 0, qx: 0, qy: 0, tiles: [],
+          missing: [], downloading: [], texFetching: 0,
+        }),
+      };
+    },
+  });
+
+  await runtime.request();
+
+  assert.match(requestedUrl, /[?&]agl=8(?:&|$)/);
+  assert.doesNotMatch(requestedUrl, /[?&](?:alt|agl)=344(?:&|$)/);
+  assert.equal(state.lastFetchAltitude, 8);
+});
+
+test('shared fetch runtime never substitutes ASL when AGL is unknown', async () => {
+  let requestedUrl = null;
+  const { runtime, state } = createTestFetchRuntime({
+    cameraCoordinates: { lat: 64, lon: -51, alt: 934 },
+    cameraAgl: undefined,
+    fetchImpl: async url => {
+      requestedUrl = url;
+      return {
+        status: 200,
+        json: async () => ({
+          ox: 0, oy: 0, qx: 0, qy: 0, tiles: [],
+          missing: [], downloading: [], texFetching: 0,
+        }),
+      };
+    },
+  });
+
+  await runtime.request();
+
+  assert.match(requestedUrl, /[?&]agl=0(?:&|$)/);
+  assert.doesNotMatch(requestedUrl, /[?&](?:alt|agl)=934(?:&|$)/);
+  assert.equal(state.lastFetchAltitude, 0);
+});
+
 test('shared fetch runtime polls pending terrain without a duplicate startup pass', async () => {
   let requests = 0;
   let pollCallback = null;
@@ -1230,7 +1285,7 @@ test('shared fetch runtime polls pending terrain without a duplicate startup pas
   });
   await runtime.request();
   assert.equal(requests, 1);
-  assert.equal(state.lastFetchAltitude, 100);
+  assert.equal(state.lastFetchAltitude, 0);
   assert.equal(typeof pollCallback, 'function');
   await pollCallback();
   assert.equal(requests, 2);

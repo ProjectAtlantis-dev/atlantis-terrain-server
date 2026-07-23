@@ -4,7 +4,9 @@ import {
   float,
   max,
   mix,
+  normalLocal,
   normalize,
+  positionLocal,
   positionView,
   smoothstep,
   texture,
@@ -30,20 +32,103 @@ import {
 // wraps the SAME vector the WebGL twin and the tuning sliders mutate.
 const detailTuning = uniform(detailParams);
 
-function buildColorNode({ map, maskTexture, textures, uvTransform }) {
+function graftTextureKey(grafts = []) {
+  return grafts.map(graft => graft.texture.uuid).join('|');
+}
+
+function buildColorNode({
+  map, tintMap, maskTexture, textures, uvTransform, grafts = [],
+  detailEnabled = true,
+}) {
   return Fn(() => {
     const baseUv = uv();
     const base = texture(map, baseUv);
+    const underlayColor = tintMap && tintMap !== map
+      ? texture(tintMap, baseUv).rgb
+      : base.rgb;
     const surfaceWeights = texture(maskTexture, baseUv).rgb;
     const weightTotal = surfaceWeights.r
       .add(surfaceWeights.g)
       .add(surfaceWeights.b)
       .min(1.0);
+    let terrainColor = base.rgb;
+    for (const graft of grafts) {
+      const geometricNormal = normalize(normalLocal);
+      const sideWeights = geometricNormal.xy.abs();
+      const sideWeightTotal = sideWeights.x.add(sideWeights.y).max(0.001);
+      const xWeight = sideWeights.x.div(sideWeightTotal);
+      const yWeight = sideWeights.y.div(sideWeightTotal);
+      const period = float(graft.spec.periodM);
+      const phase = graft.spec.phase;
+      const position = positionLocal;
+      const graftXUv = position.yz.div(period).add(vec2(phase[0], phase[1]));
+      const graftYUv = position.xz.div(period).add(vec2(phase[1], phase[0]));
+      const primary = texture(graft.texture, graftXUv).rgb.mul(xWeight)
+        .add(texture(graft.texture, graftYUv).rgb.mul(yWeight));
+      const secondaryScale = float(graft.spec.secondaryScale);
+      const secondaryXUv = position.zy.div(period).mul(secondaryScale)
+        .add(vec2(phase[2], phase[3]));
+      const secondaryYUv = position.zx.div(period).mul(secondaryScale)
+        .add(vec2(phase[3], phase[2]));
+      const secondary = texture(graft.texture, secondaryXUv).rgb.mul(xWeight)
+        .add(texture(graft.texture, secondaryYUv).rgb.mul(yWeight));
+      let graftColor = mix(
+        primary,
+        secondary,
+        float(graft.spec.secondaryMix),
+      );
+
+      // Preserve macro lighting/shadows from the recipient while replacing
+      // its stretched cliff paint with the donor's intact ground texture.
+      // Transfer bounded chroma separately from luminance: the graft adopts
+      // the underlying terrain's local tint without copying its smeared
+      // cliff projection or allowing near-black pixels to explode saturation.
+      const lumaWeights = vec3(0.2126, 0.7152, 0.0722);
+      const baseLuma = underlayColor.dot(lumaWeights);
+      const donorLuma = graftColor.dot(lumaWeights);
+      const baseChroma = underlayColor.div(baseLuma.max(0.04));
+      const donorChroma = graftColor.div(donorLuma.max(0.04));
+      const tintRatio = baseChroma.div(donorChroma.max(vec3(0.05)))
+        .max(vec3(0.72)).min(vec3(1.38));
+      graftColor = graftColor.mul(mix(
+        vec3(1.0),
+        tintRatio,
+        float(graft.spec.tintStrength),
+      ));
+      const tintedGraftLuma = graftColor.dot(lumaWeights);
+      const toneScale = baseLuma.add(0.03).div(tintedGraftLuma.add(0.03))
+        .max(0.65).min(1.35);
+      graftColor = graftColor.mul(mix(float(1.0), toneScale, float(0.32)));
+
+      const slopeSignal = float(1.0).sub(geometricNormal.z.abs());
+      const targetLand = smoothstep(float(0.001), float(0.02), weightTotal);
+      const graftBlend = smoothstep(
+        float(graft.spec.slopeStart),
+        float(graft.spec.slopeEnd),
+        slopeSignal,
+      );
+      const horizontalLength = geometricNormal.xy.length().max(0.001);
+      const southness = geometricNormal.y.negate().div(horizontalLength).max(0.0);
+      const aspectBlend = smoothstep(
+        float(graft.spec.southStart),
+        float(graft.spec.southEnd),
+        southness,
+      );
+      const finalGraftBlend = graftBlend
+        .mul(aspectBlend)
+        .mul(float(graft.spec.strength))
+        .mul(targetLand);
+      terrainColor = mix(terrainColor, graftColor, finalGraftBlend);
+    }
+
     const fade = float(1.0).sub(smoothstep(
       detailTuning.x,
       detailTuning.y,
       positionView.length(),
     ));
+    const surfaceDetailWeight = detailEnabled
+      ? weightTotal.mul(fade)
+      : float(0.0);
     const detailUv = baseUv
       .mul(float(uvTransform.scale))
       .add(vec2(uvTransform.offsetX, uvTransform.offsetY));
@@ -75,15 +160,14 @@ function buildColorNode({ map, maskTexture, textures, uvTransform }) {
     const grainShade = mix(
       float(1.0),
       float(0.45).add(sunLight.mul(1.1)),
-      float(DETAIL_SHADE_STRENGTH).mul(weightTotal).mul(fade),
+      float(DETAIL_SHADE_STRENGTH).mul(surfaceDetailWeight),
     );
     const modulation = float(1.0).add(
       detailValue.mul(2.0).sub(1.0)
         .mul(detailTuning.z)
-        .mul(weightTotal)
-        .mul(fade),
+        .mul(surfaceDetailWeight),
     );
-    return base.rgb.mul(modulation).mul(grainShade);
+    return terrainColor.mul(modulation).mul(grainShade);
   })();
 }
 
@@ -96,6 +180,9 @@ export function applyTerrainDetailWebGPU(mesh, context) {
     isDetailMaterial
     && previousMap === current.map
     && current.userData.terrainDetailMask === context.maskTexture
+    && current.userData.terrainDetailGraftKey === graftTextureKey(context.grafts)
+    && current.userData.terrainDetailTintMap === context.tintMap
+    && current.userData.terrainDetailSurfaceEnabled === context.detailEnabled
   ) {
     return true;
   }
@@ -113,12 +200,18 @@ export function applyTerrainDetailWebGPU(mesh, context) {
   // surface mask for this tile changes.
   material.colorNode = buildColorNode({
     map: material.map,
+    tintMap: context.tintMap,
     maskTexture: context.maskTexture,
     textures: context.textures,
     uvTransform: context.uv,
+    grafts: context.grafts,
+    detailEnabled: context.detailEnabled,
   });
   material.userData.terrainDetailMap = material.map;
   material.userData.terrainDetailMask = context.maskTexture;
+  material.userData.terrainDetailGraftKey = graftTextureKey(context.grafts);
+  material.userData.terrainDetailTintMap = context.tintMap;
+  material.userData.terrainDetailSurfaceEnabled = context.detailEnabled;
   material.needsUpdate = true;
   if (material !== current) {
     mesh.material = material;

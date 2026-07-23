@@ -93,7 +93,9 @@ function createRuntimeHarness({ raycastGroundAltitude = () => null, mapMode = fa
     yaw: 2, pitch: 0.5, speed: 100, strafeSpeed: 50,
     mapMode, mapPanEast: 1500, mapPanNorth: -900, mapZoom: 20000,
   };
-  const cameraRuntimeState = { driftMode: true, lastGoodPosition: new Vec3() };
+  const cameraRuntimeState = {
+    agl: 8, aglValid: true, driftMode: true, lastGoodPosition: new Vec3(),
+  };
   const runtime = createTerrainFlyToTileRuntime({
     camera,
     anchorPosition: new Vec3(0, 0, 0),
@@ -133,6 +135,7 @@ test('flyToTile centers the camera over the tile in grid space', () => {
   assert.equal(controls.pitch, -1.4);
   assert.equal(controls.speed, 0);
   assert.equal(cameraRuntimeState.driftMode, false);
+  assert.equal(cameraRuntimeState.aglValid, false);
   assert.equal(cameraRuntimeState.lastGoodPosition.distanceToSquared(camera.position), 0);
   assert.equal(calls.exitVehicle, 1);
   assert.equal(calls.requestFetch, 1);

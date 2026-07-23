@@ -267,7 +267,9 @@ const MAP_PAN_FACTOR = 1.2;
 
 const defaultCameraPosition = camera.position.clone();
 const cameraRuntimeState = {
-  agl: AGL_FULL_SPEED_M, // Assume high until the first terrain raycast.
+  // Placeholder drives movement speed only; aglValid keeps it out of LOD.
+  agl: AGL_FULL_SPEED_M,
+  aglValid: false,
   lastGoodPosition: camera.position.clone(),
   lastMoveTime: performance.now(),
   driftMode: false,
@@ -963,20 +965,9 @@ function attachTileScatter(mesh, tile, hm) {
     // Tile evicted or its mesh recycled for a different tile since we
     // scheduled this retry — nothing to attach to anymore.
     if (mesh.userData?.tileId !== tile.id) return;
-    // Surface fields gate WHERE things go (water hard-excludes, vegetation
-    // density follows the mask); the same store feeds the detail shader, so
-    // this is one shared fetch. The archetype grid (NMS-style decision
-    // rung) rides alongside: when it lands, scatter keys recipes off the
-    // per-cell landform decision instead of raw channels. Placement itself
-    // stays deterministic per tile id — both only veto/weight, they carry
-    // no randomness.
-    const archetypesPromise = fetch(`/api/archetypes/${tile.id}.json`)
-      .then(r => (r.ok ? r.json() : null))
-      .catch(() => null);
-    Promise.all([
-      sharedSurfaceFieldStore({ log: () => {} }).get(tile.id),
-      archetypesPromise,
-    ]).then(([entry, archetypes]) => {
+    // Full-resolution classifier fields gate WHERE things go; the same
+    // store feeds the detail shader, so this is one shared fetch.
+    sharedSurfaceFieldStore({ log: () => {} }).get(tile.id).then(entry => {
       if (mesh.userData?.tileId !== tile.id) return;
       try {
         const group = buildTileScatter({
@@ -987,9 +978,6 @@ function attachTileScatter(mesh, tile, hm) {
           lib,
           exag: EXAG,
           fields: entry?.fields,
-          archetypes: archetypes && archetypes.grid
-            ? { grid: archetypes.grid, cells: archetypes.cells }
-            : undefined,
         });
         disposeGroup(currentGroup);
         currentGroup = group;
@@ -1285,10 +1273,8 @@ const terrainTileSet = createTerrainTileSet({
     },
   },
 });
-// Classifier/archetype decision colors painted straight onto the terrain
-// (the HUD "classifier" link cycles off → classifier → archetypes) — judge
-// classification against the macro relief it drives without leaving the 3D
-// view.
+// Classifier decision colors painted straight onto the terrain. The HUD link
+// toggles the full-resolution class map without leaving the 3D view.
 const classifierOverlay = createClassifierOverlay({
   tileSet: terrainTileSet,
   requestRender,
@@ -1305,8 +1291,7 @@ function cycleClassifierOverlay() {
     gridlinesRuntime.setActive(gridlinesActiveBeforeClassifier ?? false);
     gridlinesActiveBeforeClassifier = null;
   } else if (!gridlinesRuntime.active) {
-    // Each classifier/archetype view opens with the terrain tile boundaries
-    // visible, even if the user hid them while inspecting the previous rung.
+    // The classifier view opens with terrain tile boundaries visible.
     gridlinesRuntime.setActive(true);
   }
   console.log(`[overlay] ${nextMode}`);
@@ -1553,6 +1538,9 @@ const terrainFetchRuntime = createTerrainFetchRuntime({
     anchorLatitude: anchorLat,
     anchorLongitude: anchorLon,
     getHeading: getTerrainViewHeading,
+    getCameraAGL: () => (
+      cameraRuntimeState.aglValid ? cameraRuntimeState.agl : null
+    ),
   },
   vehicle: vehicleRuntime,
   terrain: terrainTileSet,
@@ -1810,11 +1798,17 @@ function isPressed(primary, secondary) {
 
 function updateCameraAGL() {
   const terrainMeshes = activeTerrainMeshes();
-  if (terrainMeshes.length === 0) return;
+  if (terrainMeshes.length === 0) {
+    cameraRuntimeState.aglValid = false;
+    return;
+  }
   aglRaycaster.set(camera.position, up.clone().negate());
   const hits = aglRaycaster.intersectObjects(terrainMeshes);
   if (hits.length > 0) {
     cameraRuntimeState.agl = hits[0].distance;
+    cameraRuntimeState.aglValid = true;
+  } else {
+    cameraRuntimeState.aglValid = false;
   }
 }
 
@@ -1824,6 +1818,10 @@ function aglSpeedFactor() {
 }
 
 function updateMovement(dt) {
+  // Terrain refinement and movement speed share one measured AGL. Update it
+  // before the vehicle branch too; returning early there previously froze
+  // the camera clearance used by D15/D16 demand.
+  updateCameraAGL();
   const forwardPressed = isPressed('KeyW', 'ArrowUp');
   const backPressed = isPressed('KeyS', 'ArrowDown');
   const leftPressed = isPressed('KeyA', 'ArrowLeft');
@@ -1858,7 +1856,6 @@ function updateMovement(dt) {
     return;
   }
 
-  updateCameraAGL();
   const sf = aglSpeedFactor();
   const ACCEL = BASE_ACCEL * sf;
   const BRAKE = BASE_BRAKE * sf;
@@ -2005,12 +2002,12 @@ function updateHud() {
     ? 'gridlines: <span id="gridlinesModeLink" style="color:#8f8;text-decoration:underline;cursor:pointer;pointer-events:auto">ON</span>'
     : 'gridlines: <span id="gridlinesModeLink" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">off</span>';
   const classifierOverlayColor = {
-    off: '#0af', classifier: '#6ecd3c', archetypes: '#9669d2',
+    off: '#0af', classifier: '#6ecd3c',
   }[classifierOverlay.mode] ?? '#0af';
   const classifierOverlayLabel = {
-    off: 'off', classifier: 'CLASSES', archetypes: 'ARCHETYPES',
+    off: 'off', classifier: 'CLASSES',
   }[classifierOverlay.mode] ?? 'off';
-  const classifierOverlayLine = `classifier: <span id="classifierOverlayLink" title="Paint classifier/archetype decisions on the terrain" style="color:${classifierOverlayColor};text-decoration:underline;cursor:pointer;pointer-events:auto">${classifierOverlayLabel}</span>`;
+  const classifierOverlayLine = `classifier: <span id="classifierOverlayLink" title="Paint classifier decisions on the terrain" style="color:${classifierOverlayColor};text-decoration:underline;cursor:pointer;pointer-events:auto">${classifierOverlayLabel}</span>`;
   const waterOverlayLine = textureStreamer.waterDebug
     ? 'pink water: <span id="waterOverlayLink" style="color:#ff2aa1;text-decoration:underline;cursor:pointer;pointer-events:auto">ON</span>'
     : 'pink water: <span id="waterOverlayLink" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">off</span>';
@@ -2113,6 +2110,8 @@ function resetView() {
   controls.mapPanNorth = 0;
   controls.mapZoom = DEFAULT_MAP_ZOOM;
   camera.position.copy(defaultCameraPosition);
+  cameraRuntimeState.agl = AGL_FULL_SPEED_M;
+  cameraRuntimeState.aglValid = false;
   camera.fov = 60;
   camera.updateProjectionMatrix();
   syncMapModePresentation();
@@ -2551,7 +2550,9 @@ function render() {
     const refetch = evaluateTerrainRefetch({
       cameraX: terrainPipelineState.cameraStereoX, cameraY: terrainPipelineState.cameraStereoY,
       lastFetchX: terrainPipelineState.lastFetchX, lastFetchY: terrainPipelineState.lastFetchY,
-      cameraAltitude: coordinates.alt,
+      cameraAltitude: cameraRuntimeState.aglValid
+        ? cameraRuntimeState.agl
+        : 0,
       lastFetchAltitude: terrainPipelineState.lastFetchAltitude,
       nowMs, lastTriggerMs: terrainPipelineState.lastFetchTriggerMs,
       distanceThreshold: REFETCH_DIST, altitudeThreshold: REFETCH_ALTITUDE_DELTA,

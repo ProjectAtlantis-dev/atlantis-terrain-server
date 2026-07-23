@@ -94,8 +94,14 @@
 </div>
 <script>
 const RES = 512;
+const CLASSIFIER_VERSION = 9;
+const SURFACE_MASK_VERSION = 10;
 let depth = 0, col = 0, row = 0;
 const $ = id => document.getElementById(id);
+const escapeHtml = value => String(value ?? '?').replace(
+  /[&<>"']/g,
+  char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[char],
+);
 
 // The pipeline, in order. Each stage: what it is, where its image comes from,
 // and how to describe its status from /api/pipeline/<tid>.json.
@@ -132,34 +138,30 @@ const STAGES = [
   },
   {
     key: 'classifier', name: '4 classifier',
-    what: 'hierarchical ladder (coarse_v2): DEM co-proposes with imagery — slope/aspect/sun/greenline gate green, flat level sheets become lake, unlit+dark is shadow (honest unknown). "raw mask" is the exact one-hot surface mask the ground-detail shader and scatter placement actually read (R=rock incl. dark as 128, G=veg, B=snow; shadow/lake stay black = nothing lives or details there).',
+    what: 'hierarchical ladder (coarse_v4): DEM co-proposes with imagery — slope/aspect/sun/greenline gate green; dark flat sheets seed lakes, then DEM-only elevation/slope flood fill finds their edges. Every non-snow land pixel inside the terrain-shaped 6–15 m water reach becomes coherent sand or shore rock at full 256 px resolution, so vegetation cannot survive against water. Bright/flat banks lean sand, dark/steep banks lean rock, and world-anchored deterministic variation breaks up uniform rings without tile seams. "raw mask" is what detail/scatter read (R=rock, sand marker 64, dark 128, shore-rock marker 192; G=veg; B=snow; water/lake black).',
     select: ['colorized', 'raw mask'],
     img: (tid, mode) => mode === 'raw mask'
-      ? `/api/classifier/${tid}.png?raw=1&res=${RES}`
-      : `/api/classifier/${tid}.png?res=${RES}`,
-    // Matches classifier/storage.py CLASS_SCHEMAS['coarse_v2'].palette
+      ? `/api/classifier/${tid}.png?raw=1&res=${RES}&v=${SURFACE_MASK_VERSION}`
+      : `/api/classifier/${tid}.png?res=${RES}&v=${CLASSIFIER_VERSION}`,
+    // Matches classifier/storage.py CLASS_SCHEMAS['coarse_v4'].palette
     // EXACTLY — this is a deliberate high-contrast debug palette, not
     // intuitive tones (grey reads as purple, dark as orange). A legend
     // that doesn't match the real colors makes correct output look wrong.
-    legend: { grey: 'rgb(150,105,210)', green: 'rgb(150,225,60)', dark: 'rgb(255,140,0)', white: 'rgb(255,255,255)', water: 'rgb(255,42,161)', shadow: 'rgb(60,120,255)', lake: 'rgb(0,200,220)' },
-    info: () => ''
+    legend: { grey: 'rgb(150,105,210)', green: 'rgb(150,225,60)', dark: 'rgb(255,140,0)', white: 'rgb(255,255,255)', water: 'rgb(255,42,161)', shadow: 'rgb(60,120,255)', lake: 'rgb(0,200,220)', sand: 'rgb(255,230,90)', 'shore rock': 'rgb(105,92,125)' },
+    info: () => `<span>requesting classifier v${CLASSIFIER_VERSION}…</span>`,
+    responseInfo: response => {
+      const status = response.headers.get('X-Classifier-Status') || '?';
+      const source = response.headers.get('X-Classifier-Source') || '?';
+      const schema = response.headers.get('X-Classifier-Schema') || '?';
+      const ancestor = response.headers.get('X-Classifier-Ancestor');
+      return `<span class="${status === 'ready' ? 'ok' : 'bad'}">${escapeHtml(status)}</span>` +
+        ` · source <b>${escapeHtml(source)}</b> · schema ${escapeHtml(schema)}` +
+        (ancestor ? ` · ancestor ${escapeHtml(ancestor)}` : ' · exact tile');
+    }
   },
   {
-    key: 'archetypes', name: '5 archetypes',
-    what: 'NMS-style decision rung: each ~20 m cell commits to ONE landform (from classes + DEM + adjacency). Scatter recipes, stamps and talus key off the DECISION, not raw channels.',
-    img: tid => `/api/archetypes/${tid}.png?res=${RES}`,
-    // Matches classifier/archetypes.py ARCHETYPE_PALETTE exactly.
-    legend: {
-      water: 'rgb(255,42,161)', lake: 'rgb(0,200,220)', shore: 'rgb(255,230,90)',
-      bench: 'rgb(110,205,60)', bog: 'rgb(120,85,40)', slab: 'rgb(168,168,178)',
-      face: 'rgb(232,90,40)', talus: 'rgb(150,105,210)', ridge: 'rgb(255,255,255)',
-      shadow: 'rgb(60,120,255)', snow: 'rgb(225,240,255)',
-    },
-    info: () => ''
-  },
-  {
-    key: 'procgen', name: '6 procgen',
-    what: 'below-d12 synthesis from archetype decisions + DEM + seed — deterministic',
+    key: 'procgen', name: '5 procgen',
+    what: 'below-d12 clean DEM interpolation + full-resolution classifier fields — deterministic',
     img: null,
     info: () => '<span class="bad">not built yet</span> — this is the next thing'
   },
@@ -208,12 +210,15 @@ async function loadStageImage(s, refresh) {
   stEl.textContent = 'loading…';
   imgEl.style.opacity = 0.35;
   try {
-    const resp = await fetch(url);
+    const resp = await fetch(url, { cache: 'no-store' });
     if (!resp.ok || resp.status === 202) {
       imgEl.removeAttribute('src');
       stEl.textContent = resp.status === 202 ? 'fetching upstream — retry shortly'
         : `HTTP ${resp.status} ${resp.headers.get('X-Tex-Status') || ''}`;
       return;
+    }
+    if (s.responseInfo) {
+      $(`info-${s.key}`).innerHTML = s.responseInfo(resp);
     }
     const blob = await resp.blob();
     if (imgEl.dataset.blobUrl) URL.revokeObjectURL(imgEl.dataset.blobUrl);
@@ -235,7 +240,7 @@ async function load() {
   $('meta').textContent = `depth ${depth}`;
   let meta = null;
   try {
-    const r = await fetch(`/api/pipeline/${tid}.json`);
+    const r = await fetch(`/api/pipeline/${tid}.json`, { cache: 'no-store' });
     meta = r.ok ? await r.json() : null;
     if (meta) $('meta').textContent = `depth ${depth} · ${meta.size_m} m across`;
   } catch (e) { /* statuses degrade gracefully */ }

@@ -1,18 +1,9 @@
 """Deterministic procedural terrain super-resolution.
 
-Two regimes share this module:
-
-- Generic residual (amplitude_m > 0): the measured DEM is bilinearly
-  resampled and a world-coordinate procedural residual is added between
-  measured samples, constrained to zero at every source sample and along
-  the tile border, so processing a tile cannot invalidate repaired seams.
-
-- Macro relief (archetype_cells + macro_depth): past the measured depths we
-  are the terrain authority. Archetype-conditioned relief (faces get crags
-  and steepening, talus gets rubble, benches stay gentle, water stays flat)
-  runs at full strength to every border. Continuity comes from purity, not
-  pinning: noise and class weights are exact functions of absolute world
-  position, so adjacent cooks agree at shared borders by construction.
+The measured DEM is bilinearly resampled and, when requested, a
+world-coordinate procedural residual is added between measured samples. The
+residual is constrained to zero at every source sample and along the tile
+border, so processing a tile cannot invalidate repaired seams.
 """
 
 from __future__ import annotations
@@ -33,42 +24,12 @@ from colored_log import get_logger
 DEFAULT_SEED = 0x41544C41  # "ATLA"
 log_upscale = get_logger("terrain.upscale")
 
-# Bump when the macro relief or relief-shading recipe changes shape.
+# Bump when the derived DEM/texture recipe changes shape.
 # serve_flask compares this against the 'macro_terrain_version' metadata row
 # on startup, resets every cooked_dem tile back to pending, and drops
 # cooked_upscale textures, so exploration recooks both with the current
 # recipe.
-MACRO_TERRAIN_VERSION = 4
-
-# Macro relief cascade root: the depth whose cook adds the largest band.
-# Each deeper cook adds one finer, weaker band on top of its parent's.
-MACRO_BASE_DEPTH = 13
-MACRO_BAND_FALLOFF = 0.55
-
-# Per-archetype relief recipe, indexed by classifier.archetypes cell value
-# (order must match ARCHETYPE_NAMES): (smooth_amp_m, ridged_amp_m, sharpen).
-#   smooth_amp_m — meters of rolling fBm hummock at the depth-13 band
-#   ridged_amp_m — meters of creased/craggy relief (1-|fbm| style)
-#   sharpen      — unsharp gain on the parent's own landform: pushes height
-#                  away from the local mean, which steepens EXISTING walls
-#                  and crests instead of inventing unrelated bumps.
-# Water family and unknown stay dead flat; the water mask flattens them again
-# afterwards regardless.
-MACRO_RELIEF_PARAMS = (
-    (0.0, 0.0, 0.0),   # unknown
-    (0.0, 0.0, 0.0),   # water
-    (0.0, 0.0, 0.0),   # lake
-    (0.3, 0.0, 0.0),   # shore   — low wash-smoothed ripple
-    (0.9, 0.0, 0.1),   # bench   — gentle vegetated hummocks
-    (0.15, 0.0, 0.0),  # bog     — nearly flat wet ground
-    (0.5, 1.3, 0.3),   # slab    — bare rock undulation, mild crease
-    (0.8, 4.5, 0.9),   # face    — full crag: deep creases, steepened wall
-    (1.7, 0.5, 0.15),  # talus   — lumpy rubble apron
-    (0.5, 2.4, 0.7),   # ridge   — sharpened convex crest
-    (0.5, 0.5, 0.2),   # shadow  — undecided: mild neutral texture
-    (0.8, 0.0, 0.0),   # snow    — long soft drifts
-)
-
+MACRO_TERRAIN_VERSION = 5
 
 def _smoothstep(value):
     return value * value * (3.0 - 2.0 * value)
@@ -218,100 +179,6 @@ def _flow_features(elevation, bbox):
     )
 
 
-def _world_bilinear(field, field_bbox, x, y):
-    """Bilinear sample of a south-first cell raster at world coordinates.
-
-    Cell CENTERS span ``field_bbox``; queries outside clamp to the border
-    cells. Because the sample position is absolute world space, two tiles
-    sampling the same field get bit-identical values at shared borders —
-    continuity comes from purity, not from seam repair.
-    """
-    field = np.asarray(field, dtype=np.float64)
-    rows, cols = field.shape
-    u = (x - field_bbox[0]) / (field_bbox[2] - field_bbox[0]) * cols - 0.5
-    v = (y - field_bbox[1]) / (field_bbox[3] - field_bbox[1]) * rows - 0.5
-    u = np.clip(u, 0.0, cols - 1.0)
-    v = np.clip(v, 0.0, rows - 1.0)
-    u0 = np.floor(u).astype(np.int64)
-    v0 = np.floor(v).astype(np.int64)
-    u1 = np.minimum(u0 + 1, cols - 1)
-    v1 = np.minimum(v0 + 1, rows - 1)
-    fu = u - u0
-    fv = v - v0
-    return (
-        field[v0, u0] * (1.0 - fu) * (1.0 - fv)
-        + field[v0, u1] * fu * (1.0 - fv)
-        + field[v1, u0] * (1.0 - fu) * fv
-        + field[v1, u1] * fu * fv
-    )
-
-
-def _macro_relief(source, base, x, y, source_spacing, archetype_cells,
-                  archetype_bbox, macro_depth, seed, edge_window):
-    """Archetype-conditioned relief band for one cook level, in meters.
-
-    ``archetype_cells`` is an image-oriented (row 0 = north) uint8 raster of
-    landform decisions whose cell centers span ``archetype_bbox`` (normally
-    the d12 ancestor grid padded with its neighbors' border cells). The band
-    is world-anchored fBm at wavelengths between roughly two source cells and
-    two output cells, so each deeper cook adds exactly one finer, weaker band
-    on the geometry its parent already built — the NMS cascade: symbolic
-    decision above, one octave of geometry below.
-
-    At these depths WE are the terrain authority (there is no measured data
-    to betray), so the noise band runs at full strength to every border:
-    noise and class weights are pure functions of world position, meaning
-    the neighboring cook computes the identical value at a shared border.
-    Only the parent-grid sharpen term — which is NOT world-pure — fades out
-    at the border via ``edge_window``.
-    """
-    band_scale = float(MACRO_BAND_FALLOFF) ** max(
-        0, int(macro_depth) - MACRO_BASE_DEPTH
-    )
-    # Archetype rasters are image-oriented; heightmaps are south-first.
-    cells_south = np.asarray(archetype_cells, dtype=np.uint8)[::-1, :]
-
-    smooth = _fbm(x, y, source_spacing * 2.0, 3, int(seed) ^ 0x4D414352)
-    creased = _fbm(x, y, source_spacing * 2.0, 3, int(seed) ^ 0x43524147)
-    # Creases: 1-|n| folds noise into sharp ravines/crags. Recentred by a
-    # fixed constant (E[|fbm|] ~ 0.35) so faces don't float upward en masse.
-    ridged = (1.0 - np.abs(creased)) * 2.0 - 1.3
-
-    # Parent-scale unsharp mask: the relief the parent grid carries relative
-    # to a half-resolution blur of itself. Weighted by 'sharpen' this makes
-    # walls taller and crests sharper along the landform that is already
-    # there, instead of inventing unrelated bumps.
-    output_resolution = base.shape[0]
-    coarse_resolution = (source.shape[0] - 1) // 2 + 1
-    if coarse_resolution >= 2:
-        unsharp = (base - _bilinear(
-            _bilinear(source, coarse_resolution), output_resolution
-        )) * edge_window
-    else:
-        unsharp = np.zeros_like(base)
-
-    relief = np.zeros_like(base)
-    for index, (smooth_amp, ridged_amp, sharpen) in enumerate(
-        MACRO_RELIEF_PARAMS
-    ):
-        if smooth_amp == 0.0 and ridged_amp == 0.0 and sharpen == 0.0:
-            continue
-        member = cells_south == index
-        if not member.any():
-            continue
-        # World-space bilinear class weights blend archetypes across ~20 m
-        # cell borders, so a face grades into its talus instead of snapping
-        # at a fence.
-        weight = _world_bilinear(
-            member.astype(np.float64), archetype_bbox, x, y,
-        )
-        relief += weight * (
-            band_scale * (smooth_amp * smooth + ridged_amp * ridged)
-            + sharpen * unsharp
-        )
-    return relief
-
-
 def upscale_heightmap(
     heightmap,
     bbox,
@@ -322,9 +189,6 @@ def upscale_heightmap(
     octaves=3,
     edge_fade_source_cells=1.0,
     water_mask=None,
-    archetype_cells=None,
-    archetype_bbox=None,
-    macro_depth=None,
 ):
     """Upscale a square DEM while retaining its measured constraints.
 
@@ -345,8 +209,7 @@ def upscale_heightmap(
     factor = int(factor)
     output_resolution = factor * (source.shape[0] - 1) + 1
     base = _bilinear(source, output_resolution)
-    macro = archetype_cells is not None and macro_depth is not None
-    if factor == 1 or (amplitude_m == 0 and not macro):
+    if factor == 1 or amplitude_m == 0:
         return base.astype(np.float32)
 
     x = np.linspace(bbox[0], bbox[2], output_resolution)[None, :]
@@ -373,21 +236,6 @@ def upscale_heightmap(
             output_resolution, int(octaves), int(seed), float(amplitude_m),
         ) * edge_window
 
-    if macro:
-        # Archetype-conditioned macro relief — the slot the purged generic
-        # fBm used to fill. Unlike the lattice-bridged residual above, this
-        # band is NOT pinned to interior parent samples or faded at borders:
-        # pinning every ``factor``-th vertex caps relief at checkerboard
-        # wiggles and can never build out a slope, and past the measured
-        # depths we are the terrain authority. Border agreement comes from
-        # the relief being a pure function of world position (see
-        # _macro_relief), not from collapsing to the bilinear base.
-        result = result + _macro_relief(
-            source, base, x, y, source_spacing, archetype_cells,
-            archetype_bbox if archetype_bbox is not None else bbox,
-            macro_depth, seed, edge_window,
-        )
-
     if water_mask is not None:
         mask = np.asarray(water_mask, dtype=bool)
         if mask.shape != source.shape:
@@ -397,13 +245,12 @@ def upscale_heightmap(
         # contract instead of interpolating nearby land into masked water.
         result[high_resolution_water] = 0.0
 
-    if not macro:
-        # Assignment avoids any floating-point roundoff at measured vertices.
-        result[::factor, ::factor] = source
-        result[0, :] = base[0, :]
-        result[-1, :] = base[-1, :]
-        result[:, 0] = base[:, 0]
-        result[:, -1] = base[:, -1]
+    # Assignment avoids any floating-point roundoff at measured vertices.
+    result[::factor, ::factor] = source
+    result[0, :] = base[0, :]
+    result[-1, :] = base[-1, :]
+    result[:, 0] = base[:, 0]
+    result[:, -1] = base[:, -1]
     return result.astype(np.float32)
 
 
@@ -442,189 +289,13 @@ def _read_south_first_mask(data):
         return np.asarray(image.convert("L"), dtype=np.uint8)[::-1] != 0
 
 
-def macro_cascade_delta(parent_heightmap, parent_bbox, *,
-                        archetype_cells, archetype_bbox,
-                        water_mask=None, resolution=513,
-                        seed=DEFAULT_SEED, extra_bands=2):
-    """TOTAL macro relief the whole cascade adds below one d12 quad, in
-    meters, at ``resolution`` — for baking shading ONCE at the d13 cook.
-
-    Per-depth incremental shading was tried first and produced moving
-    fences: a rendered boundary between a tile showing its d14 texture and
-    a neighbor still showing d13 is a boundary between one and two shading
-    bands, so every texture-streaming frontier became a visible edge. The
-    noise bands are continuous world functions, so the d13..d15 sum can be
-    evaluated here directly at texture resolution; deeper texture cooks then
-    add NO shading at all and every LOD carries identical shading content.
-
-    d16's band is omitted (``extra_bands=2``): at d13 texture resolution its
-    ~2.5 m wavelength sits at the sampling limit and would alias, and its
-    0.17x amplitude is visually negligible.
-    """
-    source = np.asarray(parent_heightmap, dtype=np.float64)
-    x = np.linspace(parent_bbox[0], parent_bbox[2], resolution)[None, :]
-    y = np.linspace(parent_bbox[1], parent_bbox[3], resolution)[:, None]
-    source_spacing = 0.5 * (
-        (parent_bbox[2] - parent_bbox[0]) / (source.shape[1] - 1)
-        + (parent_bbox[3] - parent_bbox[1]) / (source.shape[0] - 1)
-    )
-    cells_south = np.asarray(archetype_cells, dtype=np.uint8)[::-1, :]
-
-    # Class weight fields — identical world-space sampling to _macro_relief.
-    weights = {}
-    for index, params in enumerate(MACRO_RELIEF_PARAMS):
-        if params == (0.0, 0.0, 0.0):
-            continue
-        member = cells_south == index
-        if member.any():
-            weights[index] = _world_bilinear(
-                member.astype(np.float64), archetype_bbox, x, y,
-            )
-
-    # Sharpen term exists only at the base band, where the measured parent
-    # grid is available; it fades at the quad border like the DEM cook's.
-    base = _bilinear(source, resolution)
-    coarse_resolution = (source.shape[0] - 1) // 2 + 1
-    if coarse_resolution >= 2:
-        unsharp = base - _bilinear(_bilinear(source, coarse_resolution), resolution)
-    else:
-        unsharp = np.zeros_like(base)
-    fade = np.minimum.reduce([
-        np.arange(resolution, dtype=np.float64),
-        np.arange(resolution - 1, -1, -1, dtype=np.float64),
-    ])
-    edge_window_1d = _smoothstep(np.clip(fade / max(1.0, resolution / 64), 0.0, 1.0))
-    edge_window = np.minimum(edge_window_1d[:, None], edge_window_1d[None, :])
-    unsharp *= edge_window
-
-    total = np.zeros((resolution, resolution), dtype=np.float64)
-    for band in range(0, 1 + int(extra_bands)):
-        wavelength = source_spacing * 2.0 / (2 ** band)
-        band_scale = float(MACRO_BAND_FALLOFF) ** band
-        smooth = _fbm(x, y, wavelength, 3, int(seed) ^ 0x4D414352)
-        creased = _fbm(x, y, wavelength, 3, int(seed) ^ 0x43524147)
-        ridged = (1.0 - np.abs(creased)) * 2.0 - 1.3
-        for index, (smooth_amp, ridged_amp, sharpen) in enumerate(
-            MACRO_RELIEF_PARAMS
-        ):
-            weight = weights.get(index)
-            if weight is None:
-                continue
-            total += weight * band_scale * (
-                smooth_amp * smooth + ridged_amp * ridged
-            )
-            if band == 0 and sharpen:
-                total += weight * sharpen * unsharp
-
-    if water_mask is not None:
-        mask = np.asarray(water_mask, dtype=bool)
-        if mask.shape == source.shape:
-            total[_nearest_mask(mask, resolution)] = 0.0
-    return total
-
-
-def macro_surfaces(parent_heightmap, parent_bbox, depth, *,
-                   water_mask=None, archetype_cells=None,
-                   archetype_bbox=None):
-    """The single authority for one cook level's child surface.
-
-    Returns ``(base, sculpted)`` — the plain bilinear of the parent and the
-    macro-relief surface the DEM cook serves. The texture cook shades with
-    ``sculpted - base``. Both cooks MUST come through here: two hand-copied
-    upscale_heightmap call sites is how served geometry and baked shading
-    drift apart.
-    """
-    base = upscale_heightmap(
-        parent_heightmap, parent_bbox, factor=2, amplitude_m=0.0,
-        water_mask=water_mask,
-    )
-    if archetype_cells is None:
-        return base, base
-    sculpted = upscale_heightmap(
-        parent_heightmap, parent_bbox, factor=2, amplitude_m=0.0,
-        water_mask=water_mask,
-        archetype_cells=archetype_cells, archetype_bbox=archetype_bbox,
-        macro_depth=depth,
-    )
-    return base, sculpted
-
-
-# Pre-baked sun for relief shading: due south, like the client detail
-# layer's DETAIL_SUN_DIR — and like the imagery itself, which is noon-lit
-# (every real shadow falls north), so baked shading and photographed shading
-# speak the same language.
-MACRO_SUN_ELEVATION_DEG = 40.0
-MACRO_SHADE_STRENGTH = 0.85
-# Symmetric around 1.0 on purpose: an asymmetric clamp re-biases the mean
-# wherever slopes saturate it, which is the quad-tone-step failure again.
-MACRO_SHADE_RANGE = (0.55, 1.45)
-
-
-def shade_texture_with_relief(texture_bytes, relief_delta, bbox):
-    """Bake south-sun shading of the SYNTHETIC relief into cooked imagery.
-
-    ``relief_delta`` is the south-first meters the macro cook ADDED to the
-    plain bilinear surface (sculpted minus base). Where the delta is flat the
-    multiplier is exactly 1 and the photograph passes through untouched — the
-    coarse landform's real shading is already in the photo. This is shading
-    derived from geometry the client actually renders, NOT the removed noise
-    painter: it cannot disagree with the terrain because it IS the terrain.
-    """
-    delta = np.asarray(relief_delta, dtype=np.float64)
-    with Image.open(io.BytesIO(texture_bytes)) as image:
-        source = image.convert("RGB")
-        width, height = source.size
-        pixels = np.asarray(source, dtype=np.float64)
-
-    spacing_y = (bbox[3] - bbox[1]) / max(1, delta.shape[0] - 1)
-    gradient_y = np.gradient(delta, spacing_y, axis=0)
-    elevation = np.radians(MACRO_SUN_ELEVATION_DEG)
-    # LINEAR hillshade: 1 + k * (northward slope of the delta). Slopes rising
-    # northward face the south sun and brighten; north faces darken. The
-    # earlier normalized form (dot(normal, sun)/sin(E)) had a systematic
-    # darkening bias proportional to local gradient VARIANCE — rough-relief
-    # quads dimmed en masse while calm quads stayed at 1, which painted a
-    # visible tonal step along every cook boundary (seen live at d14). A pure
-    # derivative of a bounded field has ~zero mean over any region, so this
-    # form cannot shift a quad's overall tone — only sculpt light and shadow
-    # inside it.
-    shade = 1.0 + MACRO_SHADE_STRENGTH * gradient_y / np.tan(elevation)
-    shade = np.clip(shade, *MACRO_SHADE_RANGE)
-    # Feather the outermost ~1.5 grid cells to neutral: np.gradient falls
-    # back to one-sided differences on border rows, which almost-agree with
-    # the neighbor quad's one-sided view from the other side — enough to
-    # etch a thin line. Both neighbors feather symmetrically, so the border
-    # stays continuous instead.
-    def _feather(count):
-        distance = np.minimum(
-            np.arange(count, dtype=np.float64),
-            np.arange(count - 1, -1, -1, dtype=np.float64),
-        )
-        return _smoothstep(np.clip(distance / 1.5, 0.0, 1.0))
-    window = np.minimum(
-        _feather(delta.shape[0])[:, None], _feather(delta.shape[1])[None, :],
-    )
-    shade = 1.0 + (shade - 1.0) * window
-
-    # South-first relief grid -> north-first image rows, at texture size.
-    shade_raster = _resize_bilinear(shade[::-1, :], height, width)
-    shaded = np.clip(pixels * shade_raster[..., None], 0.0, 255.0)
-    output = io.BytesIO()
-    Image.fromarray(shaded.astype(np.uint8), "RGB").save(
-        output, format="JPEG", quality=95, subsampling=0, optimize=True,
-    )
-    return output.getvalue()
-
-
 def upscale_texture(texture_bytes, *, factor=4):
     """Deterministic Lanczos enlarge of tile imagery.
 
     The noise painter that used to live here is REMOVED (2026-07-22
     "dark shadow" artifacts, confirmed 2026-07-23): it repainted synthetic
-    shading and grain over evenly-lit imagery and damaged tiles. Macro
-    procedural character now lives in the DEM cook (archetype-conditioned
-    relief in upscale_heightmap); imagery stays an honest enlarge of the
-    parent photo.
+    shading and grain over evenly-lit imagery and damaged tiles. Imagery now
+    stays an honest enlarge of the parent photo.
     """
     if factor < 1 or int(factor) != factor:
         raise ValueError("texture factor must be a positive integer")
