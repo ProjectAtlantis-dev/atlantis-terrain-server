@@ -2,6 +2,7 @@ import * as THREE from 'three';
 import { FullScreenQuad } from 'three/addons/postprocessing/Pass.js';
 import {
   DEFAULT_CASCADES,
+  GRAVITY,
   buildButterflyData,
   buildInitialSpectra,
   waterCascadeUpdateDue,
@@ -20,8 +21,6 @@ import {
 //   3. assembly: write displacement map (Dx*λ, h, Dz*λ) and derivatives map
 //      (dh/dx, dh/dz, Jacobian) with the (-1)^(x+y) shift correction.
 // ---------------------------------------------------------------------------
-
-const GRAVITY = 9.81;
 
 const COMPLEX_GLSL = /* glsl */ `
   vec2 cmul(vec2 a, vec2 b) { return vec2(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x); }

@@ -160,28 +160,31 @@ export function createTextureStreamer({
     fillAvailableSlots();
   }
 
-  function invalidate(tileId) {
+  function clearTileRequestState(tileId) {
     texInflight.get(tileId)?.abort();
     texInflight.delete(tileId);
     texFetching.delete(tileId);
     texRetryAtMs.delete(tileId);
     texRetryCount.delete(tileId);
     ancestorLogged.delete(tileId);
+  }
+
+  function takeCachedTexture(tileId) {
+    const texture = texCache.get(tileId);
     texCache.delete(tileId);
     texSource.delete(tileId);
+    return texture;
+  }
+
+  function invalidate(tileId) {
+    clearTileRequestState(tileId);
+    takeCachedTexture(tileId);
     return advanceVersion();
   }
 
   function releaseTile(tileId) {
-    texInflight.get(tileId)?.abort();
-    texInflight.delete(tileId);
-    texFetching.delete(tileId);
-    texRetryAtMs.delete(tileId);
-    texRetryCount.delete(tileId);
-    ancestorLogged.delete(tileId);
-    const texture = texCache.get(tileId);
-    texCache.delete(tileId);
-    texSource.delete(tileId);
+    clearTileRequestState(tileId);
+    const texture = takeCachedTexture(tileId);
     texture?.dispose?.();
     return Boolean(texture);
   }
@@ -190,12 +193,7 @@ export function createTextureStreamer({
     // Ordinary browser-demand motion removes scene residency, not cached paint.
     // Retaining the decoded texture makes a heading reversal an immediate
     // materialization instead of a grey fetch/decode/repaint cycle.
-    texInflight.get(tileId)?.abort();
-    texInflight.delete(tileId);
-    texFetching.delete(tileId);
-    texRetryAtMs.delete(tileId);
-    texRetryCount.delete(tileId);
-    ancestorLogged.delete(tileId);
+    clearTileRequestState(tileId);
   }
 
   function abortAll() {
@@ -209,37 +207,38 @@ export function createTextureStreamer({
     advanceVersion();
   }
 
-  function setRoadDebug(enabled) {
-    const next = Boolean(enabled);
-    if (roadDebug === next) return roadDebug;
-    roadDebug = next;
+  function invalidateDebugVariants() {
     abortAll();
     for (const texture of texCache.values()) staleTextures.add(texture);
     texCache.clear();
     texSource.clear();
-    return roadDebug;
+  }
+
+  function setDebugVariant(kind, enabled) {
+    const next = Boolean(enabled);
+    const current = kind === 'road'
+      ? roadDebug
+      : kind === 'water'
+        ? waterDebug
+        : hydroDebug;
+    if (current === next) return current;
+    if (kind === 'road') roadDebug = next;
+    else if (kind === 'water') waterDebug = next;
+    else hydroDebug = next;
+    invalidateDebugVariants();
+    return next;
+  }
+
+  function setRoadDebug(enabled) {
+    return setDebugVariant('road', enabled);
   }
 
   function setWaterDebug(enabled) {
-    const next = Boolean(enabled);
-    if (waterDebug === next) return waterDebug;
-    waterDebug = next;
-    abortAll();
-    for (const texture of texCache.values()) staleTextures.add(texture);
-    texCache.clear();
-    texSource.clear();
-    return waterDebug;
+    return setDebugVariant('water', enabled);
   }
 
   function setHydroDebug(enabled) {
-    const next = Boolean(enabled);
-    if (hydroDebug === next) return hydroDebug;
-    hydroDebug = next;
-    abortAll();
-    for (const texture of texCache.values()) staleTextures.add(texture);
-    texCache.clear();
-    texSource.clear();
-    return hydroDebug;
+    return setDebugVariant('hydro', enabled);
   }
 
   function releaseStaleTexture(texture) {

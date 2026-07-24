@@ -1,7 +1,5 @@
 /**
- * Ground cover: grass blades (instanced, clumped placement preview of the
- * Phase-5 scatter law) + near-field debris classes (twigs, bark chips, leaf
- * litter cards reusing the broadleaf capture atlas as dry litter).
+ * Ground cover: grass blades with instanced, clumped placement.
  *
  * Grass instancing: per-instance vec4 `idata` (hue, dryness, swayPhase,
  * height) on an InstancedBufferAttribute; the blade geometry itself carries
@@ -12,17 +10,14 @@ import {
   BufferAttribute,
   BufferGeometry,
   DoubleSide,
-  Euler,
   InstancedBufferAttribute,
   InstancedMesh,
   Matrix4,
   Quaternion,
   ShaderMaterial,
-  type Texture,
   Vector3,
 } from 'three';
 import type { Rng } from './Seed';
-import { MeshGrower } from './TubeMesh';
 
 /**
  * WebGL port note: the demo's TSL node materials (lit, caustics, translucency)
@@ -200,211 +195,4 @@ export function grassPatch(
   mesh.castShadow = true;
   mesh.receiveShadow = true;
   return mesh;
-}
-
-// ---------------------------------------------------------------------------
-// Debris
-// ---------------------------------------------------------------------------
-
-/** bent twig: 4-sided micro tube, 2 kinks */
-export function twigGeometry(rng: Rng): BufferGeometry {
-  const g = new MeshGrower();
-  const segs = 3;
-  const pts: Vector3[] = [];
-  const dir = new Vector3(1, 0.08 + rng.float() * 0.1, (rng.float() - 0.5) * 0.4).normalize();
-  const p = new Vector3(0, 0.012, 0);
-  const len = 0.22 + rng.float() * 0.3;
-  for (let i = 0; i <= segs; i++) {
-    pts.push(p.clone());
-    dir.x += (rng.float() - 0.5) * 0.5;
-    dir.z += (rng.float() - 0.5) * 0.5;
-    dir.normalize();
-    p.addScaledVector(dir, len / segs);
-  }
-  const radii = pts.map((_, i) => 0.008 * (1 - (i / segs) * 0.6));
-  const dirs = pts.map((_, i) =>
-    i === 0
-      ? (pts[1] as Vector3).clone().sub(pts[0] as Vector3).normalize()
-      : (pts[i] as Vector3).clone().sub(pts[i - 1] as Vector3).normalize(),
-  );
-  // reuse tube path via a minimal inline branch
-  const hue = rng.float() * 2 - 1;
-  const ring = 4;
-  const rings: number[][] = [];
-  const N = new Vector3();
-  const B = new Vector3();
-  for (let i = 0; i <= segs; i++) {
-    const d = dirs[i] as Vector3;
-    const ref = Math.abs(d.y) < 0.9 ? new Vector3(0, 1, 0) : new Vector3(1, 0, 0);
-    N.crossVectors(ref, d).normalize();
-    B.crossVectors(d, N).normalize();
-    const r: number[] = [];
-    for (let k = 0; k <= ring; k++) {
-      const a = (k / ring) * Math.PI * 2;
-      const nx = N.x * Math.cos(a) + B.x * Math.sin(a);
-      const ny = N.y * Math.cos(a) + B.y * Math.sin(a);
-      const nz = N.z * Math.cos(a) + B.z * Math.sin(a);
-      const rr = radii[i] as number;
-      const pt = pts[i] as Vector3;
-      r.push(
-        g.vertex(pt.x + nx * rr, pt.y + ny * rr, pt.z + nz * rr, nx, ny, nz, k / ring, i / segs, hue, 0, 0, 0.85),
-      );
-    }
-    rings.push(r);
-  }
-  for (let i = 0; i < segs; i++) {
-    const a = rings[i] as number[];
-    const b = rings[i + 1] as number[];
-    for (let k = 0; k < ring; k++) {
-      // base-ring-first = front faces outward (same fix as TubeMesh)
-      g.quad(a[k] as number, a[k + 1] as number, b[k + 1] as number, b[k] as number);
-    }
-  }
-  // end caps: fallen-branch variants scale twigs 6.5× — open tube ends read
-  // as holes there. Base fan faces −d0, tip fan +dEnd (mirrored winding).
-  const d0 = dirs[0] as Vector3;
-  const dE = dirs[segs] as Vector3;
-  const p0 = pts[0] as Vector3;
-  const pE = pts[segs] as Vector3;
-  const r0v = radii[0] as number;
-  const rEv = radii[segs] as number;
-  const first = rings[0] as number[];
-  const lastR = rings[segs] as number[];
-  const base = g.vertex(
-    p0.x - d0.x * r0v * 0.6, p0.y - d0.y * r0v * 0.6, p0.z - d0.z * r0v * 0.6,
-    -d0.x, -d0.y, -d0.z, 0.5, 0, hue, 0, 0, 0.8,
-  );
-  const tip = g.vertex(
-    pE.x + dE.x * rEv * 0.8, pE.y + dE.y * rEv * 0.8, pE.z + dE.z * rEv * 0.8,
-    dE.x, dE.y, dE.z, 0.5, 1, hue, 0, 0, 0.85,
-  );
-  for (let k = 0; k < ring; k++) {
-    g.tri(first[k] as number, base, first[k + 1] as number);
-    g.tri(lastR[k + 1] as number, tip, lastR[k] as number);
-  }
-  return g.build();
-}
-
-/** curled bark chip: bent shard */
-export function barkChipGeometry(rng: Rng): BufferGeometry {
-  const g = new MeshGrower();
-  const L = 0.1 + rng.float() * 0.12;
-  const W = L * (0.3 + rng.float() * 0.25);
-  const curl = 0.5 + rng.float() * 0.9;
-  const hue = rng.float() * 2 - 1;
-  const rows = 3;
-  const ids: number[][] = [];
-  for (let i = 0; i <= rows; i++) {
-    const t = i / rows;
-    const ang = (t - 0.5) * curl;
-    const y = 0.012 + Math.cos(ang) * W * 0.18;
-    const off = Math.sin(ang) * W * 0.5;
-    ids.push([
-      g.vertex(t * L, y, -W / 2 + off * 0.3, 0, 1, 0, 0, t, hue, 0, 0, 0.8),
-      g.vertex(t * L, y + off * 0.12, W / 2 + off * 0.3, 0, 1, 0, 1, t, hue, 0, 0, 0.8),
-    ]);
-  }
-  for (let i = 0; i < rows; i++) {
-    const a = ids[i] as number[];
-    const b = ids[i + 1] as number[];
-    g.quad(a[0] as number, b[0] as number, b[1] as number, a[1] as number);
-  }
-  return g.build();
-}
-
-export function debrisMaterial(kind: 'twig' | 'chip'): ShaderMaterial {
-  const base = kind === 'twig' ? [0.1, 0.075, 0.05] : [0.085, 0.06, 0.04];
-  return new ShaderMaterial({
-    uniforms: { baseColor: { value: base } },
-    vertexShader: /* glsl */ `
-      ${LOGDEPTH_VERT_PARS}
-      attribute vec4 vdata;
-      varying vec4 vData;
-      void main() {
-        vData = vdata;
-        ${INSTANCE_CHUNK}
-      }
-    `,
-    fragmentShader: /* glsl */ `
-      precision highp float;
-      ${LOGDEPTH_FRAG_PARS}
-      uniform vec3 baseColor;
-      varying vec4 vData;
-      void main() {
-        #include <logdepthbuf_fragment>
-        gl_FragColor = vec4(baseColor * (vData.x * 0.2 + 1.0) * vData.w * 2.2, 1.0);
-      }
-    `,
-    side: DoubleSide,
-  });
-}
-
-/** dry leaf-litter card material: reuses a foliage atlas, browned */
-export function litterMaterial(atlas: Texture): ShaderMaterial {
-  return new ShaderMaterial({
-    uniforms: { atlas: { value: atlas } },
-    vertexShader: /* glsl */ `
-      ${LOGDEPTH_VERT_PARS}
-      varying vec2 vUvV;
-      void main() {
-        vUvV = uv;
-        ${INSTANCE_CHUNK}
-      }
-    `,
-    fragmentShader: /* glsl */ `
-      precision highp float;
-      ${LOGDEPTH_FRAG_PARS}
-      uniform sampler2D atlas;
-      varying vec2 vUvV;
-      void main() {
-        #include <logdepthbuf_fragment>
-        vec4 t = texture2D(atlas, vUvV);
-        if (t.a < 0.32) discard;
-        vec3 albedo = t.rgb * t.rgb; // decode sqrt-encoded atlas
-        vec3 browned = mix(
-          albedo * vec3(1.7, 1.0, 0.42) + vec3(0.012, 0.006, 0.002),
-          vec3(0.11, 0.072, 0.034),
-          0.5
-        );
-        gl_FragColor = vec4(browned * 2.0, 1.0);
-      }
-    `,
-    side: DoubleSide,
-  });
-}
-
-/** scatter helper for small instanced debris over a square */
-export function scatterInstances(
-  mesh: InstancedMesh,
-  rng: Rng,
-  size: number,
-  yJitter: number,
-  scale: [number, number],
-  flat: boolean,
-): void {
-  const m = new Matrix4();
-  const p = new Vector3();
-  const q = new Quaternion();
-  const e = new Vector3();
-  const eu = new Euler();
-  const s = new Vector3();
-  for (let i = 0; i < mesh.count; i++) {
-    p.set((rng.float() - 0.5) * size, rng.float() * yJitter, (rng.float() - 0.5) * size);
-    if (flat) {
-      q.setFromAxisAngle(e.set(0, 1, 0), rng.float() * Math.PI * 2);
-      const tilt = new Quaternion().setFromAxisAngle(
-        e.set(1, 0, 0).applyQuaternion(q),
-        (rng.float() - 0.5) * 0.5,
-      );
-      q.premultiply(tilt);
-    } else {
-      q.setFromEuler(eu.set(rng.float() * 6.28, rng.float() * 6.28, rng.float() * 6.28));
-    }
-    const sc = scale[0] + rng.float() * (scale[1] - scale[0]);
-    s.set(sc, sc, sc);
-    m.compose(p, q, s);
-    mesh.setMatrixAt(i, m);
-  }
-  mesh.castShadow = true;
-  mesh.receiveShadow = true;
 }

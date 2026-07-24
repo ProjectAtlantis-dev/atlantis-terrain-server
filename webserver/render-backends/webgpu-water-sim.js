@@ -12,6 +12,7 @@ import { NodeMaterial, QuadMesh, RenderTarget, RendererUtils } from 'three/webgp
 import { Fn, float, select, texture, uniform, uv, vec2, vec4 } from 'three/tsl';
 import {
   DEFAULT_CASCADES,
+  GRAVITY,
   buildButterflyData,
   buildInitialSpectra,
   waterCascadeUpdateDue,
@@ -38,7 +39,6 @@ import {
 // three's own feedback nodes (AfterImageNode) use.
 // ---------------------------------------------------------------------------
 
-const GRAVITY = 9.81;
 const TWO_PI = 6.28318530718;
 
 const cmul = /*@__PURE__*/ Fn(([a, b]) =>

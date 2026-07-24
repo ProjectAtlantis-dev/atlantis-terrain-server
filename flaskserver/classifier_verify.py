@@ -35,6 +35,7 @@ import time
 
 import numpy as np
 from PIL import Image, ImageDraw
+from tile_address import require_tile_id
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "terrain.db")
 OUT_DIR = os.path.join(
@@ -204,7 +205,7 @@ def verify_tile(db, tile_id, out_dir, use_google=True):
         water_mask = None
 
     grain = None
-    depth, col, row = (int(v) for v in tile_id.split("-"))
+    depth, col, row = require_tile_id(tile_id)
     shift = depth - 8
     if shift > 0:
         ancestor = read_tile(db, f"8-{col >> shift}-{row >> shift}")

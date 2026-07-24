@@ -7,15 +7,18 @@ from pathlib import Path
 
 from PIL import Image, ImageDraw
 
+import asset_catalog
 from asset_catalog import (
     _roof_color,
     _local_segments,
+    _rgb_pixel,
     _sample_underlying_color,
     _trail_color,
     color_buildings_from_textures,
     paint_roads,
     query_buildings,
     query_roads,
+    road_corridor_mask,
 )
 
 
@@ -29,7 +32,25 @@ CREATE TABLE assets (
 """
 
 
+def _gray_pixel(image: Image.Image, x: int, y: int) -> int:
+    pixel = image.getpixel((x, y))
+    if isinstance(pixel, tuple):
+        return int(pixel[0])
+    if pixel is None:
+        return 0
+    return int(pixel)
+
+
 class AssetCatalogTest(unittest.TestCase):
+    def test_parallel_asset_instances_module_stays_retired(self):
+        module_path = Path(__file__).resolve().parents[1] / "asset_instances.py"
+        self.assertFalse(module_path.exists())
+
+    def test_road_painter_has_no_retired_fixed_color_palette(self):
+        self.assertFalse(hasattr(asset_catalog, "ROAD_COLORS"))
+        self.assertFalse(hasattr(asset_catalog, "DEFAULT_ROAD_COLOR"))
+        self.assertIn("road:Lokalvej", asset_catalog.ROAD_WIDTH_SCALE)
+
     def make_db(self, path):
         db = sqlite3.connect(path)
         db.executescript(SCHEMA)
@@ -81,8 +102,9 @@ class AssetCatalogTest(unittest.TestCase):
             painted, count = paint_roads(source.getvalue(), (0, 0, 100, 100), path)
             self.assertEqual(count, 1)
             image = Image.open(io.BytesIO(painted)).convert("RGB")
-            base = Image.open(io.BytesIO(source.getvalue())).convert("RGB").getpixel((50, 50))
-            vertical = [image.getpixel((50, y)) for y in range(100)]
+            base_image = Image.open(io.BytesIO(source.getvalue())).convert("RGB")
+            base = _rgb_pixel(base_image, 50, 50)
+            vertical = [_rgb_pixel(image, 50, y) for y in range(100)]
             differences = [sum(abs(a - b) for a, b in zip(pixel, base)) for pixel in vertical]
             self.assertGreater(differences[50], 15)
             self.assertGreaterEqual(sum(value > 10 for value in differences), 8)
@@ -95,8 +117,16 @@ class AssetCatalogTest(unittest.TestCase):
                 source.getvalue(), (0, 0, 100, 100), path, debug=True
             )
             self.assertEqual(count, 1)
-            debug_pixel = Image.open(io.BytesIO(debug)).convert("RGB").getpixel((50, 50))
+            debug_image = Image.open(io.BytesIO(debug)).convert("RGB")
+            debug_pixel = _rgb_pixel(debug_image, 50, 50)
             self.assertGreater(debug_pixel[0], debug_pixel[1] * 2)
+
+            corridor, count = road_corridor_mask(
+                (0, 0, 100, 100), 100, 100, path
+            )
+            self.assertEqual(count, 1)
+            self.assertGreater(_gray_pixel(corridor, 50, 50), 200)
+            self.assertLess(_gray_pixel(corridor, 50, 10), 5)
 
     def test_route_color_sampling_stays_local_to_each_painted_segment(self):
         image = Image.new("RGB", (100, 100), (40, 80, 180))
@@ -107,6 +137,8 @@ class AssetCatalogTest(unittest.TestCase):
         self.assertGreater(len(segments), 2)
         first = _sample_underlying_color(image, list(segments[0]), 4)
         last = _sample_underlying_color(image, list(segments[-1]), 4)
+        assert first is not None
+        assert last is not None
         self.assertGreater(first[2], first[0])
         self.assertGreater(last[0], last[2])
 
@@ -119,6 +151,7 @@ class AssetCatalogTest(unittest.TestCase):
             4,
             sample_half_width=8,
         )
+        assert sampled is not None
         # The one-pixel blue centerline must not outweigh the red pixels under
         # the rest of the proposed four-pixel-wide stroke.
         self.assertGreater(sampled[0], sampled[2])
@@ -127,7 +160,7 @@ class AssetCatalogTest(unittest.TestCase):
         brown = (120, 88, 54)
         blue = (40, 90, 190)
         color = _roof_color([brown, brown, brown, blue])
-        self.assertIsNotNone(color)
+        assert color is not None
         self.assertGreater(color[2], color[0])
 
     def test_trail_color_preserves_sampled_hue_but_darkens_terrain(self):
@@ -135,7 +168,12 @@ class AssetCatalogTest(unittest.TestCase):
         constructed = _trail_color(sampled, natural=False)
         natural = _trail_color(sampled, natural=True)
         self.assertLess(sum(constructed), sum(sampled))
-        self.assertLess(sum(natural), sum(constructed))
+        self.assertLess(sum(natural), sum(sampled))
+        self.assertGreater(sum(natural), sum(constructed))
+        self.assertLess(
+            sum(abs(actual - base) for actual, base in zip(natural, sampled)),
+            sum(abs(actual - base) for actual, base in zip(constructed, sampled)),
+        )
         self.assertEqual(natural.index(max(natural)), sampled.index(max(sampled)))
 
     def test_building_color_comes_from_deepest_cached_texture(self):

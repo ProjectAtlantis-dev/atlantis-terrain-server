@@ -1,18 +1,25 @@
+import { terrainTileDepth } from './terrain-tile-address.js';
+
+const EARTH_RADIUS_M = 6371000;
+
+export function terrainHorizonDistance(altitude) {
+  const alt = Math.max(25, altitude);
+  return Math.sqrt(2 * EARTH_RADIUS_M * alt);
+}
+
 export function terrainVisibilityDistance(altitude) {
   const alt = Math.max(25, altitude);
-  const horizon = Math.sqrt(2 * 6371000 * alt);
+  const horizon = terrainHorizonDistance(alt);
   return Math.min(horizon, 30000 + alt * 12);
 }
 
 export function tileDepthFromId(tileId) {
-  if (typeof tileId !== 'string') return -1;
-  const depth = Number.parseInt(tileId.split('-')[0], 10);
-  return Number.isFinite(depth) ? depth : -1;
+  return terrainTileDepth(tileId);
 }
 
 export function terrainFogDistance(altitude) {
   const alt = Math.max(25, altitude);
-  const horizon = Math.sqrt(2 * 6371000 * alt);
+  const horizon = terrainHorizonDistance(alt);
   return Math.min(horizon, 15000 + alt * 8);
 }
 

@@ -14,6 +14,7 @@ from scipy import ndimage
 
 from classifier.ladder import lake_support_mask
 from database import read_tile
+from tile_address import require_tile_id
 
 
 TEMPORARY_TEXTURE_SOURCES = {
@@ -28,7 +29,7 @@ TEMPORARY_TEXTURE_SOURCES = {
 
 
 def lake_prior_ancestor_ids(tile_id: str) -> tuple[str, str]:
-    depth, col, row = (int(value) for value in tile_id.split("-"))
+    depth, col, row = require_tile_id(tile_id)
     if depth != 12:
         raise ValueError("lake hierarchy prior is defined for d12 tiles")
     return (
@@ -38,9 +39,7 @@ def lake_prior_ancestor_ids(tile_id: str) -> tuple[str, str]:
 
 
 def _ancestor_support(db, child_id: str, ancestor_depth: int):
-    child_depth, child_col, child_row = (
-        int(value) for value in child_id.split("-")
-    )
+    child_depth, child_col, child_row = require_tile_id(child_id)
     levels = child_depth - ancestor_depth
     divisions = 1 << levels
     ancestor_col = child_col >> levels
@@ -69,8 +68,10 @@ def _ancestor_support(db, child_id: str, ancestor_depth: int):
     support = ndimage.binary_dilation(support, iterations=1)
     sub_col = child_col % divisions
     sub_row = child_row % divisions
-    x0 = sub_col * support.shape[1] // divisions
-    x1 = (sub_col + 1) * support.shape[1] // divisions
+    # scipy's type stub preserves only ``tuple[int]`` for this result even
+    # though the classifier contract is a 2D mask; ``-1`` is valid for both.
+    x0 = sub_col * support.shape[-1] // divisions
+    x1 = (sub_col + 1) * support.shape[-1] // divisions
     # Support rasters are image-oriented while quadtree rows increase north.
     y0 = (divisions - 1 - sub_row) * support.shape[0] // divisions
     y1 = (divisions - sub_row) * support.shape[0] // divisions

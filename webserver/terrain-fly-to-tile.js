@@ -1,12 +1,15 @@
 import { epsg3413ToWgs84 } from './terrain-polar-stereo.js';
+import { approximateLatLonToLocalMeters } from './terrain-local-coordinates.js';
+import {
+  parseTerrainTileId,
+  terrainTileBbox,
+} from './terrain-tile-address.js';
 
-const METRES_PER_DEGREE = 111320;
-
-// Mirrors GREENLAND_BBOX in flaskserver/tiles.py — the canonical EPSG:3413
-// root square every DB tile row is derived from.
-export const TILE_GRID_ROOT_BBOX = Object.freeze([
-  -1239041.5, -3346077.5, 1460958.5, -646077.5,
-]);
+export {
+  TILE_GRID_ROOT_BBOX,
+  parseTerrainTileId as parseTileId,
+  terrainTileBbox as tileBbox,
+} from './terrain-tile-address.js';
 
 const MAX_CAMERA_ALT_M = 6000; // matches the clampAltitude ceiling
 const MIN_VIEW_ALT_M = 250;
@@ -23,28 +26,6 @@ const MAX_MAP_ZOOM = 40000;
 export function tileMapZoom(sizeM) {
   const halfHeight = (sizeM * VIEW_FIT_MARGIN) / 2;
   return Math.min(Math.max(halfHeight, MIN_MAP_ZOOM), MAX_MAP_ZOOM);
-}
-
-export function parseTileId(tileId) {
-  if (typeof tileId !== 'string') return null;
-  const match = tileId.trim().match(/^(\d+)-(\d+)-(\d+)$/);
-  if (!match) return null;
-  const depth = Number(match[1]);
-  const col = Number(match[2]);
-  const row = Number(match[3]);
-  if (depth > 30) return null;
-  const tilesPerAxis = 2 ** depth;
-  if (col >= tilesPerAxis || row >= tilesPerAxis) return null;
-  return { depth, col, row, id: `${depth}-${col}-${row}` };
-}
-
-export function tileBbox({ depth, col, row }, rootBbox = TILE_GRID_ROOT_BBOX) {
-  const tilesPerAxis = 2 ** depth;
-  const width = (rootBbox[2] - rootBbox[0]) / tilesPerAxis;
-  const height = (rootBbox[3] - rootBbox[1]) / tilesPerAxis;
-  const xMin = rootBbox[0] + col * width;
-  const yMin = rootBbox[1] + row * height;
-  return [xMin, yMin, xMin + width, yMin + height];
 }
 
 /**
@@ -69,9 +50,15 @@ export function flyToTileScenePosition({
     };
   }
   const { lat, lon } = toWgs84(centerX, centerY);
+  const local = approximateLatLonToLocalMeters({
+    lat,
+    lon,
+    anchorLat,
+    anchorLon,
+  });
   return {
-    eastM: (lon - anchorLon) * METRES_PER_DEGREE * Math.cos(anchorLat * Math.PI / 180),
-    northM: (lat - anchorLat) * METRES_PER_DEGREE,
+    eastM: local.eastM,
+    northM: local.northM,
     sizeM,
     usedFrame: false,
   };
@@ -145,7 +132,7 @@ export function createTerrainFlyToTileRuntime({
   }
 
   function flyToTile(tileId) {
-    const parsed = parseTileId(tileId);
+    const parsed = parseTerrainTileId(tileId);
     if (!parsed) {
       console.warn(`[fly-to-tile] bad tile id: ${tileId}`);
       return { ok: false, error: `bad tile id: ${tileId}` };
@@ -155,7 +142,7 @@ export function createTerrainFlyToTileRuntime({
       cancel(pollTimer);
       pollTimer = null;
     }
-    const bbox = tileBbox(parsed);
+    const bbox = terrainTileBbox(parsed);
     const target = flyToTileScenePosition({
       bbox, frame: pipelineState, anchorLat, anchorLon,
     });

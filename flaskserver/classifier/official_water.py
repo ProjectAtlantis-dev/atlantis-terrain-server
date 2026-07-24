@@ -21,19 +21,6 @@ def _resize_for_classifier(south_first, width: int, height: int):
     return np.asarray(resized, dtype=np.uint8) >= 128
 
 
-def classifier_water_mask(bbox, width: int, height: int) -> np.ndarray | None:
-    """Return an official north-first mask matching a classifier raster.
-
-    The coastline authority is sampled on the canonical terrain grid.  GTK50
-    does not justify a denser shoreline, and reusing this grid keeps classifier
-    water aligned with the derived render geometry.
-    """
-    from gtk50_vector import vector_water_mask
-
-    south_first = vector_water_mask(bbox, GRID_N)
-    return _resize_for_classifier(south_first, width, height)
-
-
 def classifier_water_mask_for_tile(db, tile_id: str, width: int, height: int):
     south_first = read_water_mask(db, tile_id)
     if south_first is None:

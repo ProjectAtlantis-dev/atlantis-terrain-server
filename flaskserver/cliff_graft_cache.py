@@ -17,6 +17,7 @@ import numpy as np
 from PIL import Image
 
 from classifier.storage import CLASS_SCHEMAS, decode_class_map
+from tile_address import parse_tile_id
 
 
 CLIFF_GRAFT_ASSET_VERSION = 1
@@ -43,21 +44,8 @@ def init_cliff_graft_assets(db) -> None:
     db.commit()
 
 
-def _parse_tile_id(tile_id: str):
-    parts = str(tile_id).split("-")
-    if len(parts) != 3:
-        return None
-    try:
-        depth, column, row = map(int, parts)
-    except ValueError:
-        return None
-    if min(depth, column, row) < 0:
-        return None
-    return depth, column, row
-
-
 def _classifier_ancestor(db, tile_id: str):
-    parsed = _parse_tile_id(tile_id)
+    parsed = parse_tile_id(tile_id)
     if parsed is None:
         return None
     child_depth, child_col, child_row = parsed
@@ -216,7 +204,7 @@ def get_or_create_cliff_graft_asset(db, tile_id: str):
     ``None`` means the donor texture or a real classifier ancestor is not
     ready yet. The caller should return a retryable response.
     """
-    if _parse_tile_id(tile_id) is None:
+    if parse_tile_id(tile_id) is None:
         raise ValueError(f"invalid cliff graft donor tile id: {tile_id}")
     init_cliff_graft_assets(db)
     with _prepare_lock:

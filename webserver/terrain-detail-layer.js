@@ -1,4 +1,8 @@
 import * as THREE from 'three';
+import {
+  parseTerrainTileId,
+  terrainTileDepth,
+} from './terrain-tile-address.js';
 
 // Frequency-split ground detail (Reforger-style): the satellite texture is
 // unique-but-blurry low frequency; a small tiling detail texture per surface
@@ -13,7 +17,7 @@ import * as THREE from 'three';
 // anchored to absolute EPSG:3413 world space via the tile id, so every
 // client renders the identical ground.
 
-// Root quadtree extent in meters — must match flaskserver/tiles.py
+// Root quadtree extent in meters — must match flaskserver/terrain_config.py
 // GREENLAND_BBOX (a 2,700,000 m square).
 export const TERRAIN_ROOT_WIDTH_M = 2700000;
 
@@ -64,11 +68,11 @@ export const DETAIL_TEXTURE_SIZE = 256;
 export const DETAIL_SEED = 0x41544C41; // "ATLA", same seed family as the server
 
 export function tileDepthFromTileId(tileId) {
-  return Number.parseInt(String(tileId).split('-')[0], 10);
+  return terrainTileDepth(tileId);
 }
 
 export function detailMaskUrl(tileId) {
-  return `/api/classifier/${tileId}.png?raw=1&res=256&v=10`;
+  return `/api/classifier/${tileId}.png?raw=1&res=256&v=11`;
 }
 
 // World-anchored tiling UV transform, exact from the tile id: world position
@@ -76,14 +80,15 @@ export function detailMaskUrl(tileId) {
 // per-tile offset is reduced mod 1 in double precision so float32 uniforms
 // stay accurate at depth 16, and neighbouring tiles remain seam-continuous.
 export function detailUvTransform(tileId) {
-  const [depth, column, row] = String(tileId).split('-').map(Number);
-  const tileWidth = TERRAIN_ROOT_WIDTH_M / 2 ** depth;
+  const address = parseTerrainTileId(tileId);
+  if (!address) return null;
+  const tileWidth = TERRAIN_ROOT_WIDTH_M / 2 ** address.depth;
   const scale = tileWidth / DETAIL_PERIOD_M;
   const fract = value => value - Math.floor(value);
   return {
     scale,
-    offsetX: fract(column * scale),
-    offsetY: fract(row * scale),
+    offsetX: fract(address.col * scale),
+    offsetY: fract(address.row * scale),
   };
 }
 

@@ -9,6 +9,7 @@ from unittest.mock import patch
 import numpy as np
 from PIL import Image
 
+import coastline
 from coastline import (
     _OVERSAMPLE,
     WATER_FLOOR_DROP_M,
@@ -32,6 +33,13 @@ def _png_bytes(rgb):
 
 
 class OfficialCoastlineTest(unittest.TestCase):
+    def test_hydrography_source_has_no_retired_coastline_alias(self):
+        self.assertEqual(
+            coastline.HYDROGRAPHY_SOURCE,
+            "govmin_gl_aabent_land",
+        )
+        self.assertFalse(hasattr(coastline, "OFFICIAL_COASTLINE_SOURCE"))
+
     def test_oversampling_rejects_cartographic_lines_and_label_holes(self):
         resolution = 3
         size = resolution * _OVERSAMPLE

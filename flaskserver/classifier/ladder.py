@@ -82,7 +82,7 @@ WHITE_MIN_LUMINANCE = 132.0  # above p95 of the source: bright bare rock
                              # (p90≈118) stays GREY; snow/bright sand fire
 GREEN_MIN_EXCESS = 10.0
 
-# --- Rung 3: vetoes (identical physics to cook_classifier v1) ----------------
+# --- Rung 3: terrain-physics vetoes -----------------------------------------
 SLOPE_VEG_MAX = 0.35      # ~19 deg: no vegetation on steeper ground
 SLOPE_ROCK_MIN = 0.70     # ~35 deg: bare rock regardless of imagery color
 VEG_MIN_SOUTHNESS = 0.05  # north SLOPES never carry anything living...

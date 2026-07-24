@@ -7,6 +7,8 @@ behind ``SqliteSeamCache`` so repair remains usable without a database.
 import datetime
 import numpy as np
 
+from tile_address import require_tile_id as _tile_address
+
 
 SEAM_CACHE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS terrain_seam_cache (
@@ -187,16 +189,6 @@ def find_coarser_covering_tile(by_address, depth, col, row, direction):
     return None
 
 
-def resample_coarse_edge(fine_heightmap, fine_bbox, coarse_heightmap,
-                         coarse_bbox, direction):
-    """Overwrite one fine boundary with samples from a coarse heightmap."""
-    sample_count = _edge_sample_count(fine_heightmap, direction)
-    values = sample_coarse_edge(
-        fine_bbox, coarse_heightmap, coarse_bbox, direction, sample_count
-    )
-    _apply_edge(fine_heightmap, direction, values)
-
-
 def sample_coarse_edge(fine_bbox, coarse_heightmap, coarse_bbox, direction,
                        sample_count):
     """Return fine-resolution samples from one edge of a coarse heightmap."""
@@ -278,8 +270,3 @@ def _apply_edge(heightmap, direction, edge):
         heightmap[-1, :] = edge
     else:
         raise ValueError(f"unknown seam direction: {direction}")
-
-
-def _tile_address(tile_id):
-    depth, col, row = tile_id.split("-")
-    return int(depth), int(col), int(row)

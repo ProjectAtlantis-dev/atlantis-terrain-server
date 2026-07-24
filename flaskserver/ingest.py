@@ -21,6 +21,7 @@ from pyproj import Transformer
 
 from colored_log import get_logger
 from database import GRID_N
+from tile_address import require_tile_id
 
 log_cog = get_logger("terrain.cog")
 
@@ -430,8 +431,7 @@ def _resample_from_parent(db, tile_id, bbox, resolution=GRID_N):
     """
     from database import _decompress_float32, _decompress_uint8
 
-    parts = tile_id.split('-')
-    depth, col, row = int(parts[0]), int(parts[1]), int(parts[2])
+    depth, col, row = require_tile_id(tile_id)
 
     if depth == 0:
         log_cog.info(f"  Parent resample: depth=0, no parent")

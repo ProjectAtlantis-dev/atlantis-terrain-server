@@ -3,7 +3,8 @@ import { detailMaskUrl, tileDepthFromTileId } from './terrain-detail-layer.js';
 
 // Shared per-tile surface-channel store. One fetch of the server's surface
 // mask (/api/classifier/<id>.png?raw=1: R=rock/dark/shore markers,
-// G=vegetation, B=snow, exact black=water/lake, near-black=shadow) serves
+// G=vegetation, B=snow, exact black=water/lake, R=1 shadow, R=2 road/path)
+// serves
 // BOTH consumers:
 //  - the ground-detail shader wants a THREE.Texture,
 //  - the clutter scatter wants raw channel grids (procgen TileFields shape).
@@ -41,6 +42,7 @@ export function createSurfaceFieldStore({
     const snow = new Uint8Array(size * size);
     const water = new Uint8Array(size * size);
     const shore = new Uint8Array(size * size);
+    const road = new Uint8Array(size * size);
     // DARK lives inside the R/rock channel as a distinct value (grey=255,
     // dark=128, neither=0) — NOT the PNG alpha channel. Alpha was tried
     // first, but this decode goes through a 2D canvas drawImage/
@@ -53,18 +55,21 @@ export function createSurfaceFieldStore({
       const offset = index * 4;
       const shadowMarker = pixels[offset] === 1
         && pixels[offset + 1] === 0 && pixels[offset + 2] === 0;
+      const roadMarker = pixels[offset] === 2
+        && pixels[offset + 1] === 0 && pixels[offset + 2] === 0;
       const beachMarker = pixels[offset] === 64
         && pixels[offset + 1] === 0 && pixels[offset + 2] === 0;
       const shoreRockMarker = pixels[offset] === 192
         && pixels[offset + 1] === 0 && pixels[offset + 2] === 0;
-      rock[index] = shadowMarker || beachMarker ? 0
+      rock[index] = shadowMarker || roadMarker || beachMarker ? 0
         : shoreRockMarker ? 255 : pixels[offset];
       veg[index] = pixels[offset + 1];
       snow[index] = pixels[offset + 2];
       dark[index] = pixels[offset] === 128 ? 255 : 0;
       shore[index] = beachMarker || shoreRockMarker ? 255 : 0;
-      // surface_rgb_v4 reserves exact black for WATER/LAKE. SHADOW carries
-      // invisible R=1; SAND carries R=64; SHORE_ROCK carries R=192.
+      road[index] = roadMarker ? 255 : 0;
+      // surface_rgb_v5 reserves exact black for WATER/LAKE. SHADOW carries
+      // R=1; ROAD/PATH R=2; SAND R=64; SHORE_ROCK R=192.
       water[index] = pixels[offset] === 0
         && pixels[offset + 1] === 0 && pixels[offset + 2] === 0 ? 255 : 0;
     }
@@ -94,7 +99,10 @@ export function createSurfaceFieldStore({
       texture,
       // Mask rasters are image-oriented: row 0 = north — the procgen
       // TileFields contract.
-      fields: { res: size, chans: { rock, veg, snow, water, dark, shore } },
+      fields: {
+        res: size,
+        chans: { rock, veg, snow, water, dark, shore, road },
+      },
     };
   }
 

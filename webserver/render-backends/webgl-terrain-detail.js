@@ -87,7 +87,12 @@ const FRAGMENT_GRAFT = `
 
 const FRAGMENT_BLEND = `
 {
-  vec3 surfaceWeights = texture2D(detailMask, vMapUv).rgb;
+  vec3 encodedSurfaceWeights = texture2D(detailMask, vMapUv).rgb;
+  float encodedWeightTotal =
+    encodedSurfaceWeights.r + encodedSurfaceWeights.g + encodedSurfaceWeights.b;
+  // R=1 shadow and R=2 road/path are metadata markers, not materials.
+  vec3 surfaceWeights = encodedSurfaceWeights *
+    smoothstep(0.02, 0.03, encodedWeightTotal);
   float weightTotal = min(1.0, surfaceWeights.r + surfaceWeights.g + surfaceWeights.b);
   vec3 underlayColor = diffuseColor.rgb;
   if (detailUseUnderlying > 0.5) {

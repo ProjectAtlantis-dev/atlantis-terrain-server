@@ -1,5 +1,10 @@
 import * as THREE from 'three';
 import { WebGLWaterSimulation } from './webgl-water-sim.js';
+import { prepareTerrainTilesForBathymetry } from './terrain-bathymetry-tiles.js';
+import {
+  TERRAIN_BATHYMETRY_LAYER,
+  WATER_RENDER_CONTRACT,
+} from './terrain-render-contract.js';
 import {
   NORTH_CLIFF_REFLECTION_MAX_PADDING_M,
   NORTH_CLIFF_SLOPE_FULL,
@@ -41,29 +46,8 @@ const SKY_GLSL = /* glsl */ `
   }
 `;
 
-const BATHYMETRY_LAYER = 31;
-
 export function prepareBathymetryTerrainTiles(terrainRoot) {
-  const restore = [];
-  for (const tile of terrainRoot?.children ?? []) {
-    if (!tile.isMesh || !/^\d+-\d+-\d+$/.test(tile.userData?.tileId ?? '')) continue;
-    restore.push({
-      tile,
-      layerMask: tile.layers.mask,
-      renderOrder: tile.renderOrder,
-    });
-    tile.layers.set(BATHYMETRY_LAYER);
-    // The capture material does not depth-test: parents establish fallback
-    // coverage first, then finer tiles overwrite them regardless of whether
-    // the coarse shoreline happens to be geometrically higher.
-    tile.renderOrder = Number.parseInt(tile.userData.tileId, 10);
-  }
-  return () => {
-    for (const state of restore) {
-      state.tile.layers.mask = state.layerMask;
-      state.tile.renderOrder = state.renderOrder;
-    }
-  };
+  return prepareTerrainTilesForBathymetry(terrainRoot);
 }
 
 // Stochastic de-tiling: each FFT cascade repeats every uL metres, which
@@ -157,7 +141,11 @@ const BATHY_GLSL = /* glsl */ `
     vec2 u1 = vec2(u0.x * 0.970 - u0.y * 0.242, u0.x * 0.242 + u0.y * 0.970);
     vec2 u2 = vec2(u0.x * 0.970 + u0.y * 0.242, -u0.x * 0.242 + u0.y * 0.970);
     float f = fetchMarch(p, u0) + fetchMarch(p, u1) + fetchMarch(p, u2);
-    return clamp(f / (3.0 * uFetchRamp), 0.0, 1.0);
+    return clamp(
+      f / (${WATER_RENDER_CONTRACT.fetchFractionScale.toFixed(1)} * uFetchRamp),
+      0.0,
+      1.0
+    );
   }
 `;
 
@@ -467,7 +455,15 @@ const WATER_FRAGMENT = /* glsl */ `
     // wind-ripple field.  The fetch mask owns the swell amplitude; using it
     // as an on/off switch for capillary detail made the calm band lose its
     // moving normals and therefore read as matte water.
-    float microGate = mix(0.22, 1.0, smoothstep(0.02, 0.25, vFetch));
+    float microGate = mix(
+      ${WATER_RENDER_CONTRACT.microGateMinimum.toFixed(2)},
+      1.0,
+      smoothstep(
+        ${WATER_RENDER_CONTRACT.microGateStart.toFixed(2)},
+        ${WATER_RENDER_CONTRACT.microGateEnd.toFixed(2)},
+        vFetch
+      )
+    );
     float slopeVarFull = slopeVar
       + 0.5 * (0.35 * uWindFactor) * (0.35 * uWindFactor) * (1.0 - microFade);
     slope *= fetchAmp;
@@ -494,7 +490,15 @@ const WATER_FRAGMENT = /* glsl */ `
     // facet gain: mip filtering halves apparent slope contrast by mid-frame,
     // so re-steepen the shading normal with distance — crests keep their
     // lit-face/dark-edge wedge read instead of melting into mounds
-    float facetGain = mix(1.0, 1.35, smoothstep(300.0, 2500.0, d));
+    float facetGain = mix(
+      1.0,
+      ${WATER_RENDER_CONTRACT.facetGainMaximum.toFixed(2)},
+      smoothstep(
+        ${WATER_RENDER_CONTRACT.facetGainStartM.toFixed(1)},
+        ${WATER_RENDER_CONTRACT.facetGainEndM.toFixed(1)},
+        d
+      )
+    );
     Ns = normalize(vec3(Ns.xy * facetGain, Ns.z));
 
     // swell-phase elevation, used by the crest scatter term below.
@@ -599,7 +603,7 @@ const WATER_FRAGMENT = /* glsl */ `
     // Normalized narrow microfacet distribution. The previous unnormalized
     // pow(N.H, 48) * 4 never reached HDR after water's ~2.2% Fresnel term;
     // this carries the same Cook-Torrance normalization as the main glint.
-    const float crestExponent = 96.0;
+    const float crestExponent = ${WATER_RENDER_CONTRACT.crestExponent.toFixed(1)};
     float crestD = (crestExponent + 2.0) / (2.0 * 3.14159265)
                  * pow(max(dot(N, H), 0.0), crestExponent);
     vec3 resolvedCrestGlint = uSunColor * crestD * fresL
@@ -609,7 +613,11 @@ const WATER_FRAGMENT = /* glsl */ `
     // use the variance-filtered sun lobe already computed above and gate it
     // by the same crest physics. Otherwise sparkle exists only near camera.
     vec3 filteredCrestGlint = spec * crestSite * 3.0;
-    float crestFilterBlend = smoothstep(450.0, 2200.0, d);
+    float crestFilterBlend = smoothstep(
+      ${WATER_RENDER_CONTRACT.crestFilterStartM.toFixed(1)},
+      ${WATER_RENDER_CONTRACT.crestFilterEndM.toFixed(1)},
+      d
+    );
     spec += mix(resolvedCrestGlint, filteredCrestGlint, crestFilterBlend);
 
     float backlight = pow(clamp(dot(L, -V) * 0.5 + 0.5, 0.0, 1.0), 3.0);
@@ -775,7 +783,7 @@ export function createWebGLWater({
     bathyExtent / 2, -bathyExtent / 2,
     1, 30000,
   );
-  bathyCamera.layers.set(BATHYMETRY_LAYER);
+  bathyCamera.layers.set(TERRAIN_BATHYMETRY_LAYER);
   // Height override: the capture camera is a terrainRoot child looking down
   // -z, so view z recovers local height as uCamH + mvPosition.z regardless
   // of the ECEF model transforms.

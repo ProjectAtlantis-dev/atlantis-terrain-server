@@ -1,4 +1,5 @@
 import * as THREE from 'three';
+import { terrainTileDepth } from './terrain-tile-address.js';
 
 export function collectTerrainDebugMeshes(root, target = []) {
   target.length = 0;
@@ -110,8 +111,7 @@ const SEAM_COLORS = Object.freeze({
 });
 
 function tileDepth(tileId) {
-  const depth = Number.parseInt(String(tileId).split('-', 1)[0], 10);
-  return Number.isInteger(depth) ? depth : null;
+  return terrainTileDepth(tileId, null);
 }
 
 function gridResolution(mesh) {

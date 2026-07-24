@@ -129,35 +129,6 @@ function cardMaterial(atlas: DataTexture): ShaderMaterial {
   `, { atlas: { value: atlas } }, { doubleSide: true });
 }
 
-/** real mesh leaves (shrub/hero foliage): capture-material albedo math, lit */
-function leafMeshMaterial(sp: SpeciesParams): ShaderMaterial {
-  const c = sp.foliageColor;
-  const bl = sp.blossom;
-  return unlitMaterial(/* glsl */ `
-    uniform vec3 baseColor;
-    uniform float hueVar;
-    uniform vec3 blossomColor;
-    uniform float blossomThresh;
-    void main() {
-      float k = vData.x * hueVar;
-      vec3 albedo = baseColor
-        * mix(vec3(1.0), vec3(1.25, 1.05, 0.5), clamp(k, 0.0, 1.0))
-        * mix(vec3(1.0), vec3(0.72, 0.95, 1.2), clamp(-k, 0.0, 1.0));
-      albedo *= (smoothstep(0.0, 0.05, abs(vUvV.x - 0.5)) * 0.18 + 0.82)
-              * mix(0.92, 1.18, vUvV.y);
-      if (vData.x > blossomThresh) {
-        albedo = blossomColor * mix(0.75, 1.15, vUvV.y);
-      }
-      gl_FragColor = vec4(albedo * vData.w * lambert(vWorldN) * 2.4, 1.0);
-    }
-  `, {
-    baseColor: { value: [c.r, c.g, c.b] },
-    hueVar: { value: c.hueVar },
-    blossomColor: { value: bl ? [bl.r, bl.g, bl.b] : [0, 0, 0] },
-    blossomThresh: { value: bl ? 1 - bl.frac * 2 : 2 },
-  }, { doubleSide: true });
-}
-
 /** rock: grey base, strata banding (vdata.y), lichen tint on open faces
  * (vdata.z), cavity AO (vdata.w) */
 function rockMaterial(): ShaderMaterial {

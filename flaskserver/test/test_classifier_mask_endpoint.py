@@ -16,6 +16,7 @@ Regression coverage for two real bugs found live in this session:
 import sqlite3
 import unittest
 import zlib
+from pathlib import Path
 from unittest.mock import patch
 
 import numpy as np
@@ -54,6 +55,11 @@ class ClassifierRawMaskEndpointTest(unittest.TestCase):
             patch.object(serve_flask, "_terrain_unavailable_response", return_value=None),
             patch.object(serve_flask, "_get_db", return_value=self.db),
             patch.object(serve_flask, "_np", np),
+            patch.object(
+                serve_flask,
+                "ASSETS_DB_PATH",
+                Path("/nonexistent/atlantis-test-assets.db"),
+            ),
         ):
             return serve_flask.app.test_client().get(url)
 
@@ -91,7 +97,7 @@ class ClassifierRawMaskEndpointTest(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(
-            response.headers.get("X-Classifier-Mask"), "surface_rgb_v2",
+            response.headers.get("X-Classifier-Mask"), "surface_rgb_v5",
         )
         arr = np.asarray(Image.open(__import__("io").BytesIO(response.data)))
         np.testing.assert_array_equal(arr[0, 0], (1, 0, 0))  # shadow marker
@@ -111,7 +117,7 @@ class ClassifierRawMaskEndpointTest(unittest.TestCase):
         response = self._get("/api/classifier/5-1-1.png?raw=1&res=16")
 
         self.assertEqual(
-            response.headers.get("X-Classifier-Mask"), "surface_rgb_v3",
+            response.headers.get("X-Classifier-Mask"), "surface_rgb_v5",
         )
         arr = np.asarray(Image.open(__import__("io").BytesIO(response.data)))
         np.testing.assert_array_equal(arr[0, 0], (64, 0, 0))  # beach
@@ -131,13 +137,40 @@ class ClassifierRawMaskEndpointTest(unittest.TestCase):
         response = self._get("/api/classifier/5-1-1.png?raw=1&res=16")
 
         self.assertEqual(
-            response.headers.get("X-Classifier-Mask"), "surface_rgb_v4",
+            response.headers.get("X-Classifier-Mask"), "surface_rgb_v5",
         )
         arr = np.asarray(Image.open(__import__("io").BytesIO(response.data)))
         np.testing.assert_array_equal(arr[0, 0], (64, 0, 0))   # sand
         np.testing.assert_array_equal(arr[0, -1], (192, 0, 0)) # shore rock
         np.testing.assert_array_equal(arr[-1, 0], (0, 0, 0))   # lake
         np.testing.assert_array_equal(arr[-1, -1], (1, 0, 0))  # shadow
+
+    def test_road_corridor_overrides_vegetation_with_no_scatter_marker(self):
+        labels = np.ones((4, 4), dtype=np.uint8)  # all vegetation
+        self.db.execute(
+            "INSERT INTO classifier_tiles VALUES (?,?,?,?,?,?,?,?)",
+            ("5-1-1", COARSE_V4_SCHEMA, 4, 4, zlib.compress(labels.tobytes()),
+             None, "ladder", "now"),
+        )
+        self.db.commit()
+        corridor = Image.new("L", (16, 16), 0)
+        corridor.paste(255, (7, 0, 9, 16))
+
+        with patch(
+            "asset_catalog.road_corridor_mask",
+            return_value=(corridor, 1),
+        ):
+            response = self._get(
+                "/api/classifier/5-1-1.png?raw=1&res=16"
+            )
+
+        self.assertEqual(
+            response.headers.get("X-Classifier-Mask"), "surface_rgb_v5",
+        )
+        self.assertEqual(response.headers.get("X-Road-Overlay-Count"), "1")
+        arr = np.asarray(Image.open(__import__("io").BytesIO(response.data)))
+        np.testing.assert_array_equal(arr[8, 0], (0, 255, 0))
+        np.testing.assert_array_equal(arr[8, 7], (2, 0, 0))
 
     def test_pending_when_no_classification_exists_anywhere(self):
         # No classifier_tiles row for this tile or any ancestor, but a

@@ -6,6 +6,7 @@ import {
 } from './terrain-tile-fetch.js';
 import { priorityHeading } from './terrain-priority.js';
 import { mergeTerrainTilesAgainstCurrentTileSet } from './terrain-tile-quality.js';
+import { MAX_TERRAIN_AGL_M } from './terrain-agl.js';
 
 export function createTerrainFetchRuntime({
   state,
@@ -62,11 +63,12 @@ export function createTerrainFetchRuntime({
     const cameraSnapshot = getCameraSnapshot(cameraCoordinates);
     const measuredAgl = testOverrides.getCameraAGL?.()
       ?? view.getCameraAGL?.();
-    // Unknown clearance is not camera ASL. Request the ground-level ceiling
-    // until a rendered-terrain raycast supplies a real AGL measurement.
+    // Unknown clearance is not camera ASL. Bootstrap with the coarse safety
+    // ceiling so startup can only refine after terrain supplies a real AGL;
+    // starting at zero would over-refine and immediately request a downgrade.
     const lodAltitude = Number.isFinite(measuredAgl)
       ? Math.max(0, measuredAgl)
-      : 0;
+      : MAX_TERRAIN_AGL_M;
     const gridPosition = state.frameOffsetReady
       ? terrainCameraGridPosition({
           eastM: cameraCoordinates.eastM,
@@ -190,7 +192,6 @@ export function createTerrainFetchRuntime({
     logger.enqueue('info', 'fetchTiles.built', {
       meshesInScene: reconciliation.sceneMeshes,
       deferred: reconciliation.deferred,
-      staleRemoved: reconciliation.staleRemoved,
     });
 
     terrain.updateTextures(data.tiles);

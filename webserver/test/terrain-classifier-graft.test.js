@@ -29,10 +29,14 @@ test('classifier overlay preserves grafts and tints them from base imagery', () 
       this.children = this.children.filter(candidate => candidate !== child);
     },
   };
+  const tile = {
+    id: mesh.userData.tileId,
+    bbox: [0, 0, 1, 1],
+  };
   const tileSet = createTerrainTileSet({
     terrainRoot,
     textureStreamer: {
-      texCache: new Map(),
+      texCache: new Map([[tile.id, baseTexture]]),
       texSource: new Map(),
       pump() {},
     },
@@ -60,6 +64,14 @@ test('classifier overlay preserves grafts and tints them from base imagery', () 
     graftOnly: true,
     tintMap: baseTexture,
   });
+
+  // The once-per-second streaming maintenance pass sees the cached satellite
+  // texture while material.map holds the classifier overlay. That is not a
+  // texture change and must not repaint the material or graft node.
+  tileSet.updateTextures([tile]);
+  tileSet.updateTextures([tile]);
+  assert.equal(mesh.material.map, classifierTexture);
+  assert.equal(detailCalls.length, 1);
 
   tileSet.setTextureOverlay(null);
   assert.equal(mesh.material.map, baseTexture);

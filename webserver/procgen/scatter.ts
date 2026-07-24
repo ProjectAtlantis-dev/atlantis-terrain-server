@@ -100,7 +100,10 @@ export interface TileScatterInput {
 
 export interface TileFields {
   res: number;
-  chans: Partial<Record<'veg' | 'rock' | 'snow' | 'water' | 'moisture' | 'dark' | 'shore', Uint8Array>>;
+  chans: Partial<Record<
+    'veg' | 'rock' | 'snow' | 'water' | 'moisture' | 'dark' | 'shore' | 'road',
+    Uint8Array
+  >>;
 }
 
 /** smooth 0..1 taper, like GLSL smoothstep — used in place of hard
@@ -256,6 +259,7 @@ export function buildTileScatter(input: TileScatterInput): Group | null {
         fsample('water', x, y) > 0.45
         || fsample('shore', x, y) > 0.45
         || fsample('snow', x, y) > 0.45
+        || fsample('road', x, y) > 0.45
       )) continue;
       const kind = kinds[rng.int(kinds.length)] as AssetKind;
       // HARD RULE: nothing living on north slopes, ever

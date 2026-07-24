@@ -34,6 +34,8 @@ import { createClassifierOverlay } from './terrain-classifier-overlay.js';
 import { createTerrainGridlinesRuntime } from './terrain-gridlines-runtime.js';
 import { restoreTerrainCameraState, terrainCameraState } from './terrain-camera-state.js';
 import { createTerrainClientLogger } from './terrain-client-logging.js';
+import { createTerrainGpuProfileControl } from './terrain-gpu-profile-control.js';
+import { createTerrainCpuProfiler } from './terrain-cpu-profiler.js';
 import { createTerrainFpsCounter } from './terrain-fps-counter.js';
 import { loadTerrainStartupAssets } from './terrain-startup-assets.js';
 import { createTerrainAtmosphereTextureRuntime } from './terrain-atmosphere-textures.js';
@@ -50,11 +52,13 @@ import { createTerrainTileInspectorRuntime } from './terrain-tile-inspector-runt
 import { resolveTerrainViewToggle } from './terrain-view-mode.js';
 import { googleMaps3dUrl } from './terrain-google-maps.js';
 import { createTerrainFlyToTileRuntime } from './terrain-fly-to-tile.js';
+import { approximateLatLonToLocalMeters } from './terrain-local-coordinates.js';
 import { epsg3413DirectionBearing, epsg3413ToWgs84 } from './terrain-polar-stereo.js';
 import { createWaterRuntime, DEFAULT_WATER_PARAMS } from './water/water-runtime.js';
 import { FAST_TIME_SCALE, getFastTimeRange } from './terrain-game-clock.js';
 import { advanceRealtimeMovement, MAX_REALTIME_STEP_SECONDS } from './terrain-realtime-step.js';
 import { DETAIL_FADE_END_M, DETAIL_STRENGTH, setDetailTuning } from './terrain-detail-layer.js';
+import { terrainAglFromSurface, terrainSurfaceHeightAt } from './terrain-agl.js';
 
 export async function startTerrainApplication({
   backend = 'webgl',
@@ -261,7 +265,8 @@ const MIN_FLIGHT_ALT = paramNumber('minFlightAlt', -4);
 // AGL-based speed scaling: full speed at AGL_FULL_SPEED_M, minimum factor at ground level
 const AGL_FULL_SPEED_M = 500;
 const AGL_MIN_FACTOR = 0.05;
-const aglRaycaster = new THREE.Raycaster();
+const aglLocalPosition = new THREE.Vector3();
+const cpuProfiler = createTerrainCpuProfiler();
 const MOUSE_SENS = 0.003;
 const MAP_PAN_FACTOR = 1.2;
 
@@ -1403,7 +1408,12 @@ function openGoogleMapsView() {
     directionUp: googleMapsDirection.dot(googleMapsUp),
     fov: camera.fov,
   });
-  const latitudeRadians = exactPosition.lat * Math.PI / 180;
+  const linearMinusExact = approximateLatLonToLocalMeters({
+    lat: linearPosition.lat,
+    lon: linearPosition.lon,
+    anchorLat: exactPosition.lat,
+    anchorLon: exactPosition.lon,
+  });
   lastGoogleCoordinateComparison = {
     camera: renderedPosition,
     aim: aimPosition,
@@ -1415,8 +1425,8 @@ function openGoogleMapsView() {
     gridBearing,
     linearEnu: linearPosition,
     linearMinusExactMeters: {
-      east: (linearPosition.lon - exactPosition.lon) * 111320 * Math.cos(latitudeRadians),
-      north: (linearPosition.lat - exactPosition.lat) * 111320,
+      east: linearMinusExact.eastM,
+      north: linearMinusExact.northM,
     },
     agl: cameraRuntimeState.agl,
     url,
@@ -1743,6 +1753,14 @@ document.addEventListener('terrain-gpu-profile-request', () => {
   );
 });
 
+const gpuProfileControl = createTerrainGpuProfileControl({
+  profiler: renderBackend.gpuProfiler ?? null,
+  cpuProfiler,
+  backend,
+  log: (event, details) => enqueueClientLog('info', event, details),
+});
+gpuProfileControl.start();
+
 function applyCameraOrientation() {
   const cp = Math.cos(controls.pitch);
   const direction = new THREE.Vector3()
@@ -1797,19 +1815,30 @@ function isPressed(primary, secondary) {
 }
 
 function updateCameraAGL() {
+  const profileStartedAt = cpuProfiler.begin();
   const terrainMeshes = activeTerrainMeshes();
   if (terrainMeshes.length === 0) {
     cameraRuntimeState.aglValid = false;
+    cpuProfiler.end('agl-sample', profileStartedAt);
     return;
   }
-  aglRaycaster.set(camera.position, up.clone().negate());
-  const hits = aglRaycaster.intersectObjects(terrainMeshes);
-  if (hits.length > 0) {
-    cameraRuntimeState.agl = hits[0].distance;
+  aglLocalPosition.copy(camera.position).sub(anchorPosition);
+  const surfaceHeight = terrainSurfaceHeightAt(
+    terrainMeshes,
+    aglLocalPosition.dot(east),
+    aglLocalPosition.dot(north),
+  );
+  const measuredAgl = terrainAglFromSurface(
+    aglLocalPosition.dot(up),
+    surfaceHeight,
+  );
+  if (measuredAgl != null) {
+    cameraRuntimeState.agl = measuredAgl;
     cameraRuntimeState.aglValid = true;
   } else {
     cameraRuntimeState.aglValid = false;
   }
+  cpuProfiler.end('agl-sample', profileStartedAt);
 }
 
 function aglSpeedFactor() {
@@ -2499,11 +2528,14 @@ updateMapCamera();
 updateHud();
 
 function render() {
+  const frameStartedAt = cpuProfiler.begin();
   const elapsedDt = clock.getDelta();
   // Movement consumes the entire wall-clock interval. If rendering stalls,
   // intermediate simulation states are advanced without rendering and this
   // frame presents only the current camera/vehicle position.
+  const movementStartedAt = cpuProfiler.begin();
   advanceRealtimeMovement(elapsedDt, updateMovement);
+  cpuProfiler.end('movement-update', movementStartedAt);
   // Purely visual simulations may drop stale time to avoid a large unstable
   // water or suspension step after a delayed frame.
   const dt = Math.min(MAX_REALTIME_STEP_SECONDS, elapsedDt);
@@ -2599,6 +2631,7 @@ function render() {
     vehicleRuntime.vehicleMarker.scale.setScalar(markerScale * vehicleRuntime.VEHICLE_MARKER_MAP_SCALE);
     renderBackend.renderMap(scene, mapCam, _mapBg);
     renderBackend.stopRenderLoopIfIdle();
+    cpuProfiler.end('frame-cpu', frameStartedAt);
     return;
   }
   if (SCATTER_ENABLED && _scatterLib) updateScatterVisibility(terrainRoot, camera);
@@ -2618,6 +2651,7 @@ function render() {
     restoreCloudTemporalHistory = null;
   }
   renderBackend.stopRenderLoopIfIdle();
+  cpuProfiler.end('frame-cpu', frameStartedAt);
 }
 
 window.setInterval(runStreamingMaintenance, STREAMING_MAINTENANCE_MS);

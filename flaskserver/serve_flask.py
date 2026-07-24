@@ -23,10 +23,12 @@ from typing import Any, cast
 import asyncio
 
 from colored_log import get_logger
+from gpu_profile_control import GpuProfileControl
 from terrain_config import (
   BOOTSTRAP_SEED_DEPTH, MAX_TILE_DEPTH, WMS_CONTRACT_DEPTH,
   WMS_TEXTURE_PROBE_MAX_DEPTH,
 )
+from tile_address import parse_tile_id as _parse_tile_id
 
 log = get_logger("terrain")
 log_db = get_logger("terrain.db")
@@ -62,13 +64,7 @@ def _resolve_db_path() -> Path:
 DB_PATH = _resolve_db_path()
 
 app = Flask(__name__, static_folder=STATIC_DIR, static_url_path="")
-
-
-def _env_bool(name: str, default: bool = False) -> bool:
-  raw = os.environ.get(name)
-  if raw is None:
-    return default
-  return raw.strip().lower() in {"1", "true", "yes", "on"}
+_gpu_profile_control = GpuProfileControl()
 
 
 def _env_int(name: str, default: int) -> int:
@@ -964,17 +960,6 @@ def _arg_float(name: str, default: float) -> float:
 
 
 
-def _arg_int(name: str, default: int) -> int:
-  raw = request.args.get(name)
-  if raw is None:
-    return default
-  try:
-    return int(raw)
-  except (TypeError, ValueError):
-    return default
-
-
-
 OCEAN_MAX_ELEV_M = 0.5
 
 
@@ -1052,13 +1037,10 @@ def _resolve_no_coverage(db, tile_id: str, existing_jpeg, log_prefix: str) -> No
 
 
 def _nearest_ancestor_texture(tile_id: str, texture_ids: set[str]) -> str | None:
-  parts = tile_id.split("-")
-  if len(parts) != 3:
+  parsed = _parse_tile_id(tile_id)
+  if parsed is None:
     return None
-  try:
-    d, c, r = int(parts[0]), int(parts[1]), int(parts[2])
-  except ValueError:
-    return None
+  d, c, r = parsed
   while d > 0:
     d -= 1
     c //= 2
@@ -1163,17 +1145,6 @@ def _texture_flags(
     "ancestor_id": ancestor_id,
     "is_fetching": is_fetching,
   }
-
-
-
-def _parse_tile_id(tile_id: str) -> tuple[int, int, int] | None:
-  parts = tile_id.split("-")
-  if len(parts) != 3:
-    return None
-  try:
-    return int(parts[0]), int(parts[1]), int(parts[2])
-  except ValueError:
-    return None
 
 
 
@@ -1955,7 +1926,9 @@ def api_texture(tile_id: str):
   img = _Image.open(io.BytesIO(ancestor_tex))
   w, h = img.size
 
-  ancestor_depth = int(ancestor_id.split("-")[0])
+  ancestor_depth = cast(
+    tuple[int, int, int], _parse_tile_id(ancestor_id)
+  )[0]
   depth_diff = child_d - ancestor_depth
   sub_c = child_c % (1 << depth_diff)
   sub_r = child_r % (1 << depth_diff)
@@ -2440,8 +2413,16 @@ def api_classifier_tile(tile_id: str):
   from classifier.rendering import smooth_effective_water_mask
   from classifier.storage import colorize_class_map, decode_class_map
   from coastline import read_water_mask
+  from database import _tile_bbox as terrain_tile_bbox
 
   child_depth, child_col, child_row = parsed
+  child_bbox_values = terrain_tile_bbox(child_depth, child_col, child_row)
+  child_bbox = (
+    float(child_bbox_values[0]),
+    float(child_bbox_values[1]),
+    float(child_bbox_values[2]),
+    float(child_bbox_values[3]),
+  )
   depth, col, row = parsed
   found = None
   db = _get_db()
@@ -2542,6 +2523,16 @@ def api_classifier_tile(tile_id: str):
           # with strong exposed-rock grain without another texture fetch.
           mask[..., 0] = _np.where(label_array == 7, 64, mask[..., 0])
           mask[..., 0] = _np.where(label_array == 8, 192, mask[..., 0])
+      # Roads and paths are a derived land-use overlay, not a replacement
+      # semantic class. Reserve (2,0,0) as the road corridor marker: it is
+      # materially blank to the detail shaders and separately decoded by
+      # scatter so no vegetation or rocks can cover the baked surface.
+      from asset_catalog import road_corridor_mask
+      road_coverage, road_count = road_corridor_mask(
+        child_bbox, resolution, resolution, ASSETS_DB_PATH,
+      )
+      road_pixels = _np.asarray(road_coverage) > 8
+      mask[road_pixels] = (2, 0, 0)
       if effective_water is not None:
         mask[
           smooth_effective_water_mask(effective_water, resolution, resolution)
@@ -2567,7 +2558,10 @@ def api_classifier_tile(tile_id: str):
       # request. A real classification changing is rare and already event-
       # driven elsewhere; a few minutes of staleness is a fine trade for
       # not repeating a multi-level DB walk + PNG encode every frame.
-      cache_control = "public, max-age=300" if classifier_status == "ready" else "no-store"
+      cache_control = (
+        "no-cache" if road_count
+        else ("public, max-age=300" if classifier_status == "ready" else "no-store")
+      )
       return Response(
         buf.getvalue(), mimetype="image/png",
         headers={
@@ -2575,13 +2569,8 @@ def api_classifier_tile(tile_id: str):
           "X-Classifier-Status": classifier_status,
           "X-Classifier-Schema": str(class_schema),
           "X-Classifier-Source": str(source),
-          "X-Classifier-Mask": (
-            "surface_rgb_v4" if class_schema == "coarse_v4"
-            else (
-              "surface_rgb_v3" if class_schema == "coarse_v3"
-              else "surface_rgb_v2"
-            )
-          ),
+          "X-Classifier-Mask": "surface_rgb_v5",
+          "X-Road-Overlay-Count": str(road_count),
         },
       )
     if effective_water is not None:
@@ -2596,6 +2585,16 @@ def api_classifier_tile(tile_id: str):
       rgb[render_water] = (
         (255, 42, 161) if CLASSIFIER_PINK_WATER_ENABLED else (42, 42, 42)
       )
+    # Make the same corridor visible in the classifier debug view. This uses
+    # the classifier color below each segment as its local tint, while the raw
+    # response above carries the authoritative no-scatter marker.
+    from asset_catalog import paint_roads_image
+    road_image, road_count = paint_roads_image(
+      _Image.fromarray(rgb, mode="RGB"),
+      child_bbox,
+      ASSETS_DB_PATH,
+    )
+    rgb = _np.asarray(road_image).copy()
   except (TypeError, ValueError, zlib.error):
     return Response(
       b"", status=500,
@@ -2605,13 +2604,17 @@ def api_classifier_tile(tile_id: str):
   _Image.fromarray(rgb, mode="RGB").save(buf, format="PNG")
   debug_status = "ready" if found is not None else "pending"
   headers = {
-    "Cache-Control": "public, max-age=300" if debug_status == "ready" else "no-store",
+    "Cache-Control": (
+      "no-cache" if road_count
+      else ("public, max-age=300" if debug_status == "ready" else "no-store")
+    ),
     "X-Classifier-Status": debug_status,
     "X-Classifier-Schema": str(class_schema),
     "X-Classifier-Source": str(source),
     "X-Classifier-Pink-Water": (
       "enabled" if CLASSIFIER_PINK_WATER_ENABLED else "disabled"
     ),
+    "X-Road-Overlay-Count": str(road_count),
   }
   if effective_water is not None and water_source_row is not None:
     headers["X-Water-Mask-Source"] = str(water_source_row[0])
@@ -2955,6 +2958,74 @@ def api_client_log():
 def api_client_log_ring():
   """Raw JSON dump of the ring buffer for debugging."""
   return jsonify({"count": len(_client_log_ring), "entries": _client_log_ring[-50:]})
+
+
+@app.get("/api/gpu-profile")
+def api_gpu_profile():
+  response = jsonify(_gpu_profile_control.snapshot())
+  response.headers["Cache-Control"] = "no-store"
+  return response
+
+
+@app.post("/api/gpu-profile/start")
+def api_gpu_profile_start():
+  data = request.get_json(silent=True) or {}
+  raw_interval = data.get("sampleInterval", 10)
+  if isinstance(raw_interval, bool):
+    raw_interval = None
+  if not isinstance(raw_interval, (str, int, float)):
+    sample_interval = 0
+  else:
+    try:
+      sample_interval = int(raw_interval)
+    except ValueError:
+      sample_interval = 0
+  if sample_interval < 1 or sample_interval > 600:
+    return jsonify({
+      "ok": False,
+      "error": "sampleInterval must be an integer from 1 to 600",
+    }), 400
+  try:
+    state = _gpu_profile_control.start(sample_interval)
+  except RuntimeError as exc:
+    return jsonify({"ok": False, "error": str(exc)}), 409
+  log.info(
+    f"[gpu-profile] start id={state['profileId']} "
+    f"sample_interval={sample_interval}"
+  )
+  return jsonify(state), 202
+
+
+@app.post("/api/gpu-profile/stop")
+def api_gpu_profile_stop():
+  try:
+    state = _gpu_profile_control.stop()
+  except RuntimeError as exc:
+    return jsonify({"ok": False, "error": str(exc)}), 409
+  log.info(f"[gpu-profile] stop id={state['profileId']}")
+  return jsonify(state), 202
+
+
+@app.post("/api/gpu-profile/report")
+def api_gpu_profile_report():
+  data = request.get_json(silent=True) or {}
+  try:
+    state = _gpu_profile_control.report(
+      profile_id=str(data.get("profileId") or ""),
+      phase=str(data.get("phase") or ""),
+      client=data.get("client") if isinstance(data.get("client"), dict) else None,
+      result=data.get("result") if isinstance(data.get("result"), dict) else None,
+      error=str(data.get("error") or "") or None,
+    )
+  except LookupError as exc:
+    return jsonify({"ok": False, "error": str(exc)}), 409
+  except (RuntimeError, ValueError) as exc:
+    return jsonify({"ok": False, "error": str(exc)}), 400
+  log.info(
+    f"[gpu-profile] browser phase={data.get('phase')} "
+    f"id={state['profileId']} backend={state.get('client', {}).get('backend')}"
+  )
+  return jsonify(state)
 
 
 def _broadcast_client_log(payload: dict) -> None:

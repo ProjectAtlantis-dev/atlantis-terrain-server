@@ -1,3 +1,9 @@
+import {
+  approximateLatLonToLocalMeters,
+  localMetersToApproximateLatLon,
+} from './terrain-local-coordinates.js';
+import { retryableSyntheticDemCount } from './terrain-tile-quality.js';
+
 export function buildTerrainTilesRequest({
   lat,
   lon,
@@ -132,9 +138,15 @@ export function adoptTerrainOrigin({ data, cameraSnapshot }) {
 export function terrainCameraStereoPosition({
   latitude, longitude, anchorLatitude, anchorLongitude, originX, originY,
 }) {
+  const local = approximateLatLonToLocalMeters({
+    lat: latitude,
+    lon: longitude,
+    anchorLat: anchorLatitude,
+    anchorLon: anchorLongitude,
+  });
   return {
-    x: originX + (longitude - anchorLongitude) * 111320 * Math.cos(anchorLatitude * Math.PI / 180),
-    y: originY + (latitude - anchorLatitude) * 111320,
+    x: originX + local.eastM,
+    y: originY + local.northM,
   };
 }
 
@@ -176,8 +188,12 @@ export function terrainCameraCoordinates({
   const eastM = relative.dot(east);
   const northM = relative.dot(north);
   const upM = relative.dot(up);
-  const latitude = anchorLatitude + northM / 111320;
-  const longitude = anchorLongitude + eastM / (111320 * Math.cos(anchorLatitude * Math.PI / 180));
+  const { lat: latitude, lon: longitude } = localMetersToApproximateLatLon({
+    eastM,
+    northM,
+    anchorLat: anchorLatitude,
+    anchorLon: anchorLongitude,
+  });
   const stereo = terrainCameraStereoPosition({
     latitude, longitude, anchorLatitude, anchorLongitude, originX, originY,
   });
@@ -216,4 +232,3 @@ export function terrainPipelineStatus(data) {
       || syntheticHeightmaps > 0 ? 'poll' : 'idle',
   };
 }
-import { retryableSyntheticDemCount } from './terrain-tile-quality.js';

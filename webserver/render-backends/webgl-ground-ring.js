@@ -1,4 +1,5 @@
 import * as THREE from 'three';
+import { terrainTileDepth } from '../terrain-tile-address.js';
 
 // webgl-ground-ring — camera-following near-field grass carpet, the WebGL
 // translation of the fable5-world-demo / procedural-greenland GroundRing
@@ -258,7 +259,7 @@ function ringVertexShader(ring) {
 
     // Strict color-gated density: grass exists ONLY where the classifier
     // reads vegetation (green/yellow-green imagery — see the server-side
-    // GREEN proposal in cook_classifier.py) — never forced onto grey/white
+    // GREEN proposal in the classifier ladder) — never forced onto grey/white
     // ground by a density floor. Full coverage once meaningfully
     // classified green; nothing where it isn't, tapered by the falloffs.
     float density = clamp(mask.r * 3.0, 0.0, 1.0)
@@ -402,8 +403,8 @@ export function createWebGLGroundRing({
           && box[0] < maxX && box[2] > minX && box[1] < maxY && box[3] > minY;
       })
       .sort((a, b) =>
-        Number(a.userData.tileId.split('-')[0])
-        - Number(b.userData.tileId.split('-')[0]));
+        terrainTileDepth(a.userData.tileId)
+        - terrainTileDepth(b.userData.tileId));
   }
 
   function compose(centerX, centerY) {

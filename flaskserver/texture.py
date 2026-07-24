@@ -62,6 +62,7 @@ from rasterio.transform import from_bounds as transform_from_bounds
 from rasterio.warp import Resampling as WarpResampling, reproject, transform_bounds
 
 from colored_log import get_logger
+from tile_address import parse_tile_id, require_tile_id
 
 log_tex = get_logger("terrain.tex")
 
@@ -149,13 +150,6 @@ def repair_white_ocean(jpeg_bytes, heightmap, max_elev_m=0.5, min_frac=0.005):
     buf = io.BytesIO()
     Image.fromarray(arr).save(buf, format="JPEG", quality=85)
     return buf.getvalue()
-
-def _env_bool(name, default=False):
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    return raw.strip().lower() in {"1", "true", "yes", "on"}
-
 
 # ---------------------------------------------------------------------------
 # Dataforsyningen Greenland orthophoto WMS (SPOT 6/7 1.6m + aerial 0.2m)
@@ -417,12 +411,7 @@ def drop_procedural_children(db, tile_id):
     next demand re-runs the full pipeline (fetch → inspect → cook) level
     by level against the new parent.
     """
-    parts = tile_id.split("-")
-    if len(parts) != 3:
-        return []
-    try:
-        int(parts[0]), int(parts[1]), int(parts[2])
-    except ValueError:
+    if parse_tile_id(tile_id) is None:
         return []
 
     stale = []
@@ -430,7 +419,7 @@ def drop_procedural_children(db, tile_id):
     while frontier:
         child_ids = []
         for parent in frontier:
-            depth, column, row = (int(p) for p in parent.split("-"))
+            depth, column, row = require_tile_id(parent)
             child_ids.extend(
                 f"{depth + 1}-{column * 2 + column_bit}-{row * 2 + row_bit}"
                 for column_bit in (0, 1)

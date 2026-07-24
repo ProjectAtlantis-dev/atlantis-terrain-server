@@ -27,13 +27,13 @@ import numpy as np
 from PIL import Image
 
 from colored_log import get_logger
+from tile_address import parse_tile_id
 
 
 log_coast = get_logger("terrain.coastline")
 
 OFFICIAL_COASTLINE_VERSION = 1
 HYDROGRAPHY_SOURCE = "govmin_gl_aabent_land"
-OFFICIAL_COASTLINE_SOURCE = HYDROGRAPHY_SOURCE  # compatibility alias
 
 # Masked water is dropped below sea level at read time so a sea-level water
 # surface has volume above the seabed. Bump WATER_FLOOR_VERSION whenever the
@@ -219,13 +219,10 @@ def read_hydrography_mask(db, tile_id: str) -> np.ndarray | None:
     if exact is not None:
         return exact
 
-    parts = tile_id.split("-")
-    if len(parts) != 3:
+    parsed = parse_tile_id(tile_id)
+    if parsed is None:
         return None
-    try:
-        depth, column, row = (int(value) for value in parts)
-    except ValueError:
-        return None
+    depth, column, row = parsed
 
     max_depth_row = db.execute(
         "SELECT MAX(t.depth) FROM hydrography_masks m "

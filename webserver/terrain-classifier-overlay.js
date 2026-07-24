@@ -1,4 +1,5 @@
 import * as THREE from 'three';
+import { terrainTileDepth } from './terrain-tile-address.js';
 
 // Debug overlay: paint the server's full-resolution classifier decisions
 // straight onto the terrain meshes for inspection in the live 3D view.
@@ -11,7 +12,7 @@ import * as THREE from 'three';
 // underneath and restored the moment the overlay turns off.
 
 const ENDPOINTS = {
-  classifier: tileId => `/api/classifier/${tileId}.png?res=256&v=9`,
+  classifier: tileId => `/api/classifier/${tileId}.png?res=256&v=10`,
 };
 export const OVERLAY_MODES = ['off', ...Object.keys(ENDPOINTS)];
 
@@ -101,7 +102,7 @@ export function createClassifierOverlay({
   /** Texture-overlay hook for the tile set: overlay texture or null. */
   function resolve(tileId) {
     if (mode === 'off') return null;
-    const depth = Number.parseInt(String(tileId).split('-')[0], 10);
+    const depth = terrainTileDepth(tileId);
     if (!(depth >= MODE_MIN_DEPTH[mode])) return null;
     const key = `${mode}:${tileId}`;
     const cached = cache.get(key);

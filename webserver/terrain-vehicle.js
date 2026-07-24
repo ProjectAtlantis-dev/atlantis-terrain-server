@@ -1,4 +1,8 @@
 import { headingForward2D } from './terrain-priority.js';
+import {
+  approximateLatLonToLocalMeters,
+  localMetersToApproximateLatLon,
+} from './terrain-local-coordinates.js';
 
 export function terrainBboxIntersectsCircle(bbox, centerX, centerY, radius) {
   if (
@@ -23,17 +27,22 @@ export function terrainBboxIntersectsCircle(bbox, centerX, centerY, radius) {
 }
 
 export function vehicleLocalToLatLon(x, y, anchorLat, anchorLon) {
-  return {
-    lat: anchorLat + y / 111320,
-    lon: anchorLon + x / (111320 * Math.cos(anchorLat * Math.PI / 180)),
-  };
+  return localMetersToApproximateLatLon({
+    eastM: x,
+    northM: y,
+    anchorLat,
+    anchorLon,
+  });
 }
 
 export function vehicleLatLonToLocal(lat, lon, anchorLat, anchorLon) {
-  return {
-    x: (lon - anchorLon) * 111320 * Math.cos(anchorLat * Math.PI / 180),
-    y: (lat - anchorLat) * 111320,
-  };
+  const local = approximateLatLonToLocalMeters({
+    lat,
+    lon,
+    anchorLat,
+    anchorLon,
+  });
+  return { x: local.eastM, y: local.northM };
 }
 
 export function vehicleStateSnapshot({ loaded, position, headingRad, anchorLat, anchorLon }) {

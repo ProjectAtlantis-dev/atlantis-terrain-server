@@ -46,7 +46,14 @@ function buildColorNode({
     const underlayColor = tintMap && tintMap !== map
       ? texture(tintMap, baseUv).rgb
       : base.rgb;
-    const surfaceWeights = texture(maskTexture, baseUv).rgb;
+    const encodedSurfaceWeights = texture(maskTexture, baseUv).rgb;
+    const encodedWeightTotal = encodedSurfaceWeights.r
+      .add(encodedSurfaceWeights.g)
+      .add(encodedSurfaceWeights.b);
+    // R=1 shadow and R=2 road/path are metadata markers, not materials.
+    const surfaceWeights = encodedSurfaceWeights.mul(smoothstep(
+      float(0.02), float(0.03), encodedWeightTotal,
+    ));
     const weightTotal = surfaceWeights.r
       .add(surfaceWeights.g)
       .add(surfaceWeights.b)

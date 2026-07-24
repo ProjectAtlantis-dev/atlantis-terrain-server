@@ -11,8 +11,7 @@ from serve import (
     _UPGRADEABLE_SOURCES,
     _balance_lod_leaves, _coarse_lod_neighbors, _cook_cooked_dem_quad,
     _lod_complete_ancestors,
-    _lod_leaf_descendants_cover, _lod_target_depth,
-    _traverse, bbox_in_view_circle,
+    _lod_target_depth, _traverse, bbox_in_view_circle,
 )
 
 
@@ -27,9 +26,9 @@ class TestViewCoverageCircle(unittest.TestCase):
 
     def test_lod_history_requires_complete_descendant_coverage(self):
         complete = {'12-20-40', '12-21-40', '12-20-41', '12-21-41'}
-        self.assertTrue(_lod_leaf_descendants_cover(11, 10, 20, complete))
+        self.assertIn((11, 10, 20), _lod_complete_ancestors(complete))
         complete.remove('12-21-41')
-        self.assertFalse(_lod_leaf_descendants_cover(11, 10, 20, complete))
+        self.assertNotIn((11, 10, 20), _lod_complete_ancestors(complete))
 
     def test_traversal_uses_a_lower_threshold_to_coarsen(self):
         parent = {
