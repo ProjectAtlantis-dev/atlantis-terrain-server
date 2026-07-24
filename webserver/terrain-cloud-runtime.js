@@ -276,19 +276,26 @@ export function registerTerrainCloudTuning({
   // the geographic heading into the projection's local basis at the scene
   // anchor, then invert it because advancing the sample offset moves the
   // visible texture in the opposite direction.
-  let driftSpeed = 0.00004;
+  let driftSpeedKmh = 13;
   const updateDrift = () => {
     const compass = getWindDirection?.() ?? 90;
+    // Preserve the original, proven texture-animation scale exactly. At the
+    // default weather repeat around Nuuk, 0.00004 offset units/s is about
+    // 13 km/h, so the old 0–0.002 range maps to 0–650 km/h.
+    const textureOffsetSpeed = driftSpeedKmh * 0.002 / 650;
     const velocity = cloudWeatherUvVelocity({
       compassDegrees: compass,
-      speed: driftSpeed,
+      speed: textureOffsetSpeed,
       weatherUvBasis,
     });
     effect.localWeatherVelocity.set(velocity.x, velocity.y);
   };
-  slider('drift speed', {
-    min: 0, max: 0.002, step: 0.00005, value: driftSpeed, decimals: 6,
-    onChange: value => { driftSpeed = value; updateDrift(); },
+  // Use a new label/persistence key so legacy raw texture-offset values saved
+  // under "drift speed" cannot be mistaken for physical speeds.
+  slider('drift km/h', {
+    min: 0, max: 650, step: 5, value: driftSpeedKmh, decimals: 0,
+    format: value => `${value.toFixed(0)}km/h`,
+    onChange: value => { driftSpeedKmh = value; updateDrift(); },
   });
   updateDrift();
   return { syncDrift: updateDrift };

@@ -55,7 +55,12 @@ import { createTerrainFlyToTileRuntime } from './terrain-fly-to-tile.js';
 import { approximateLatLonToLocalMeters } from './terrain-local-coordinates.js';
 import { epsg3413DirectionBearing, epsg3413ToWgs84 } from './terrain-polar-stereo.js';
 import { createWaterRuntime, DEFAULT_WATER_PARAMS } from './water/water-runtime.js';
-import { FAST_TIME_SCALE, getFastTimeRange } from './terrain-game-clock.js';
+import {
+  FAST_TIME_SCALE,
+  getFastTimeRange,
+  parseGameClockSnapshot,
+  serializeGameClockSnapshot,
+} from './terrain-game-clock.js';
 import { advanceRealtimeMovement, MAX_REALTIME_STEP_SECONDS } from './terrain-realtime-step.js';
 import { DETAIL_FADE_END_M, DETAIL_STRENGTH, setDetailTuning } from './terrain-detail-layer.js';
 import { terrainAglFromSurface, terrainSurfaceHeightAt } from './terrain-agl.js';
@@ -140,15 +145,23 @@ flushClientLogQueue();
 const referenceDate = new Date('2025-07-01T12:00:00Z');
 const GAME_TIME_SCALE = 1;
 const SUN_DIRECTION_SYNC_INTERVAL_MS = 60 * 1000;
-const GAME_CLOCK_STORAGE_KEY = 'game-clock-ms';
-const savedGameClockMs = Number(localStorage.getItem(GAME_CLOCK_STORAGE_KEY));
+const GAME_CLOCK_STORAGE_KEY = 'game-clock-state';
+const LEGACY_GAME_CLOCK_STORAGE_KEY = 'game-clock-ms';
+const savedGameClock = parseGameClockSnapshot(
+  localStorage.getItem(GAME_CLOCK_STORAGE_KEY)
+    ?? localStorage.getItem(LEGACY_GAME_CLOCK_STORAGE_KEY),
+  {
+    fallbackGameTimeMs: referenceDate.getTime(),
+    defaultTimeScale: GAME_TIME_SCALE,
+  },
+);
 const gameClockState = {
-  anchorGameTimeMs: savedGameClockMs || referenceDate.getTime(),
+  anchorGameTimeMs: savedGameClock.gameTimeMs,
   anchorBrowserTimeMs: Date.now(),
   lastSavedAtMs: 0,
-  running: true,
-  timeScale: GAME_TIME_SCALE,
-  stopGameTimeMs: null,
+  running: savedGameClock.running,
+  timeScale: savedGameClock.timeScale,
+  stopGameTimeMs: savedGameClock.stopGameTimeMs,
   renderedDate: null,
   lastSunSyncTimeMs: NaN,
 };
@@ -324,6 +337,7 @@ const { hud, alt, gameClock: gameClockEl } = createTerrainHud({
     // beforeunload normally saves this too, but make the renderer transition
     // self-contained so a fast reload cannot race the camera/frame snapshot.
     savePosition();
+    saveGameClock();
     onToggleRenderBackend();
   },
   onToggleRoadDebug: () => toggleRoadDebug(),
@@ -333,6 +347,7 @@ const { hud, alt, gameClock: gameClockEl } = createTerrainHud({
     else if (action === 'stop') stopGameClock();
     else if (action === 'play') playGameClock();
     else if (action === 'ff') fastForwardGameClock();
+    saveGameClock();
     requestRender();
   },
 });
@@ -385,6 +400,7 @@ function startFastTime() {
   gameClockState.running = true;
   applyDate(currentDate);
   maybeLogWebGPUSun(currentDate, 'clock-fast-time', true);
+  saveGameClock();
   requestRender();
 }
 
@@ -504,14 +520,13 @@ if (tuningState.brightness == null && tuningState['webgpu exposure'] != null) {
 if (tuningState.haze == null && tuningState['fog strength'] != null) {
   tuningState.haze = tuningState['fog strength'];
 }
+// The persisted clock is authoritative. Keep the date slider synchronized
+// with it instead of replaying an older tuning value over the saved timestamp.
+tuningState.month = currentDate.getUTCMonth() + 1;
 localStorage.setItem(TUNING_STORAGE_KEY, JSON.stringify(tuningState));
 function saveTuning() {
   localStorage.setItem(TUNING_STORAGE_KEY, JSON.stringify(tuningState));
 }
-const hasSavedMonth = Object.prototype.hasOwnProperty.call(tuningState, 'month');
-const hasSavedHour = Object.prototype.hasOwnProperty.call(tuningState, 'hour (UTC)');
-gameClockState.running = !(hasSavedMonth || hasSavedHour);
-
 // Deferred binding: renderer-specific callbacks are wired after effects exist.
 const {
   reset: resetTuningUI,
@@ -526,6 +541,7 @@ const {
 
 // We'll call this after aerialPerspective + cloudsEffect are created.
 let cloudTuning = null;
+let restoringTuningControls = true;
 function buildTuningControls(ap, ce) {
   tuningSectionLabel('Date / Time');
   const monthNames = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
@@ -534,9 +550,11 @@ function buildTuningControls(ap, ce) {
     decimals: 0,
     format: v => monthNames[v - 1],
     onChange: v => {
+      if (restoringTuningControls) return;
       gameClockState.running = false;
       currentDate.setUTCMonth(v - 1);
       applyDate(currentDate);
+      saveGameClock();
     }
   });
 
@@ -1181,16 +1199,29 @@ function getGameDateFromBrowserTime(nowMs = Date.now()) {
   }
   return new Date(gameTimeMs);
 }
+function saveGameClock() {
+  if (gameClockState.running) {
+    currentDate.setTime(getGameDateFromBrowserTime().getTime());
+  }
+  localStorage.setItem(GAME_CLOCK_STORAGE_KEY, serializeGameClockSnapshot({
+    gameTimeMs: currentDate.getTime(),
+    running: gameClockState.running,
+    timeScale: gameClockState.timeScale,
+    stopGameTimeMs: gameClockState.stopGameTimeMs,
+  }));
+  localStorage.removeItem(LEGACY_GAME_CLOCK_STORAGE_KEY);
+  gameClockState.lastSavedAtMs = performance.now();
+}
 buildTuningControls(aerialPerspective, cloudsEffect);
+restoringTuningControls = false;
 // Control registration fills in defaults as well as restoring overrides, so
 // this is a complete bundle of the registered tuning controls instead of a
 // sparse record of only the sliders that have emitted an input event.
 saveTuning();
-// Only apply the default referenceDate if no saved tuning overrides month/hour.
-// buildTuningControls already calls applyDate() when restoring saved values.
 if (gameClockState.running) {
-  applyDate(getGameDateFromBrowserTime());
+  currentDate.setTime(getGameDateFromBrowserTime().getTime());
 }
+applyDate(currentDate);
 
 bindTerrainCloudComposition(cloudsEffect, aerialPerspective);
 
@@ -1656,6 +1687,7 @@ function savePosition() {
 }
 setInterval(savePosition, 250);
 window.addEventListener('beforeunload', savePosition);
+window.addEventListener('beforeunload', saveGameClock);
 
 // Restore saved camera position (lat/lon/alt are origin-independent)
 try {
@@ -2052,8 +2084,7 @@ function updateHud() {
   const gameDate = gameClockState.renderedDate;
   const now = performance.now();
   if (now - gameClockState.lastSavedAtMs > 5000) {
-    gameClockState.lastSavedAtMs = now;
-    localStorage.setItem(GAME_CLOCK_STORAGE_KEY, String(gameDate.getTime()));
+    saveGameClock();
   }
   renderGameClock(gameClockEl, gameDate, gameClockState.running, gameClockState.timeScale);
 
@@ -2124,6 +2155,7 @@ function resetView() {
   localStorage.removeItem('clouds-cam');
   localStorage.removeItem(TUNING_STORAGE_KEY);
   localStorage.removeItem(GAME_CLOCK_STORAGE_KEY);
+  localStorage.removeItem(LEGACY_GAME_CLOCK_STORAGE_KEY);
   for (const k of Object.keys(tuningState)) delete tuningState[k];
   controls.yaw = defaultYaw;
   controls.pitch = defaultPitch;
@@ -2149,6 +2181,14 @@ function resetView() {
   updateMapCamera();
   // Reset all tuning sliders/toggles to defaults (clouds, cirrus, fog, etc.)
   resetTuningUI();
+  currentDate.setTime(referenceDate.getTime());
+  gameClockState.anchorGameTimeMs = currentDate.getTime();
+  gameClockState.anchorBrowserTimeMs = Date.now();
+  gameClockState.running = true;
+  gameClockState.timeScale = GAME_TIME_SCALE;
+  gameClockState.stopGameTimeMs = null;
+  applyDate(currentDate);
+  saveGameClock();
   camera.far = MAX_VIEW_DIST;
   camera.updateProjectionMatrix();
   // Close atmosphere panel

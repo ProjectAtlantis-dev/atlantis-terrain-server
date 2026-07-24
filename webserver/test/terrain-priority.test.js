@@ -561,6 +561,7 @@ test('shared cloud tuning registers controls and applies altitude, cirrus, and d
     cloudLayers: [1550, 1800, 8300, 9100].map(altitude => ({
       altitude, densityScale: 0, weatherExponent: 1, shapeAmount: 0.3,
     })),
+    localWeatherRepeat: { x: 100, y: 100 },
     localWeatherVelocity: { values: [], set(...values) { this.values = values; } },
   };
   const controls = {};
@@ -579,11 +580,16 @@ test('shared cloud tuning registers controls and applies altitude, cirrus, and d
   assert.deepEqual(effect.cloudLayers.map(layer => layer.altitude), [0, 0, 6300, 7100]);
   definitions.get('cirrus').onChange(true);
   assert.equal(effect.cloudLayers[3].densityScale, 0.004);
+  const drift = definitions.get('drift km/h');
+  assert.equal(drift.min, 0);
+  assert.equal(drift.max, 650);
+  assert.equal(drift.step, 5);
+  assert.equal(drift.value, 13);
+  assert.equal(drift.format(325), '325km/h');
   // Drift heading is slaved to the water wind (compass "blows toward" 0 =
-  // north), so speed changes re-resolve the heading instead of a dedicated
-  // direction slider. Takram offsets texture sampling, so visible northward
-  // motion requires -y in the weather-uv frame.
-  definitions.get('drift speed').onChange(0.001);
+  // north). The km/h display maps onto the exact original 0–0.002 internal
+  // texture-offset range, so this midpoint must retain the old 0.001 speed.
+  drift.onChange(325);
   assert.ok(Math.abs(effect.localWeatherVelocity.values[0]) < 1e-12);
   assert.ok(Math.abs(effect.localWeatherVelocity.values[1] + 0.001) < 1e-12);
   assert.equal(typeof tuning.syncDrift, 'function');
@@ -636,6 +642,7 @@ test('shared cloud tuning puts the Takram rendering checkbox first in the Clouds
       cloudLayers: [1550, 1800, 8300, 9100].map(altitude => ({
         altitude, densityScale: 0, weatherExponent: 1, shapeAmount: 0.3,
       })),
+      localWeatherRepeat: { x: 100, y: 100 },
       localWeatherVelocity: { set() {} },
     },
     controls,
