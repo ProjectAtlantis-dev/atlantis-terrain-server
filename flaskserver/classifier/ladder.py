@@ -47,6 +47,7 @@ labels are deterministic and consistent across tile borders.
 from __future__ import annotations
 
 import math
+from typing import cast
 
 import numpy as np
 from PIL import Image
@@ -163,7 +164,10 @@ def _detect_lake_sheets(
 
     flat = slope < LAKE_SLOPE_MAX
     lake = np.zeros_like(flat)
-    components, count = ndimage.label(flat)
+    components, count = cast(
+        tuple[np.ndarray, int],
+        ndimage.label(flat),
+    )
     if min_component_pixels is None:
         min_component_pixels = LAKE_MIN_FRACTION * flat.size
     land_reference = float(np.median(luminance[~flat])) if np.any(
@@ -207,7 +211,10 @@ def _gate_inferred_lakes(lake_candidates, lake_prior):
     if prior.shape != candidates.shape:
         raise ValueError("lake prior must match classifier output")
     gated = np.zeros_like(candidates)
-    components, count = ndimage.label(candidates)
+    components, count = cast(
+        tuple[np.ndarray, int],
+        ndimage.label(candidates),
+    )
     for index in range(1, count + 1):
         component = components == index
         pixels = int(np.count_nonzero(component))
@@ -254,7 +261,8 @@ def _detect_beach(labels, waterish, slope, tile_size_m):
     if not np.any(waterish):
         return np.zeros_like(waterish)
     pixel_size_m = float(tile_size_m) / max(1, waterish.shape[0] - 1)
-    distance_m = ndimage.distance_transform_edt(~waterish) * pixel_size_m
+    distances = cast(np.ndarray, ndimage.distance_transform_edt(~waterish))
+    distance_m = distances * pixel_size_m
     flatness = 1.0 - _smoothstep(0.08, 0.35, np.maximum(slope, 0.0))
     reach_m = BEACH_MIN_BUFFER_M + (
         BEACH_BUFFER_M - BEACH_MIN_BUFFER_M

@@ -58,6 +58,26 @@ test('tile menu does not offer a download before a texture is available', () => 
   assert.equal(runtime.menu.children.some(child => child.tagName === 'a'), false);
 });
 
+test('tile menu opens classifier operations with the selected tile', () => {
+  const body = createElement('body');
+  const documentImpl = { body, createElement, addEventListener() {} };
+  const opened = [];
+  const runtime = createTerrainTileMenuRuntime({
+    tileInfoElement: { style: {} },
+    documentImpl,
+    windowImpl: { open(url) { opened.push(url); } },
+  });
+
+  runtime.show(20, 30, '14-5499-3176', 'fractal_upscale');
+  const action = runtime.menu.children.find(
+    child => child.textContent === 'Classifier operations',
+  );
+  assert.ok(action);
+  action.listeners.get('click')();
+
+  assert.deepEqual(opened, ['/classifier.html?tile=14-5499-3176']);
+});
+
 test('flagging a regression posts the tile and note, then opens the gallery', async () => {
   const body = createElement('body');
   const documentImpl = { body, createElement, addEventListener() {} };

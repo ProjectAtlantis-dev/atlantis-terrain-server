@@ -67,6 +67,10 @@ export function createTerrainTileMenuRuntime({
       hide();
       windowImpl.open(`/pipeline.html?tile=${tileId}`, '_blank');
     });
+    addAction('Classifier operations', () => {
+      hide();
+      windowImpl.open(`/classifier.html?tile=${tileId}`, '_blank');
+    });
     // The classifier regression loop: the USER curates the known-bad set
     // by flagging tiles live; the server bakes the full verification
     // panels (ladder steps, Google ref, Asiaq overlay) immediately and

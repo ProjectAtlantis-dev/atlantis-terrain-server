@@ -62,6 +62,7 @@ class ClassifierHierarchyTest(unittest.TestCase):
             prior = d12_lake_prior(self.db, "12-6-9")
 
         self.assertIsNotNone(prior)
+        assert prior is not None
         self.assertEqual(prior.shape, (256, 256))
         self.assertTrue(np.all(prior))
 

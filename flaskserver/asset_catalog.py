@@ -502,16 +502,19 @@ def paint_roads_image(
     bbox: tuple[float, float, float, float],
     db_path: Path = DEFAULT_ASSETS_DB_PATH,
     debug: bool = False,
+    *,
+    roads: list[dict[str, Any]] | None = None,
 ) -> tuple[Image.Image, int]:
     """Paint catalog roads onto an RGB image without changing its encoding."""
     image = image.convert("RGB")
-    if not db_path.exists():
-        return image, 0
-    db = connect(db_path)
-    try:
-        roads = query_roads(db, bbox)
-    finally:
-        db.close()
+    if roads is None:
+        if not db_path.exists():
+            return image, 0
+        db = connect(db_path)
+        try:
+            roads = query_roads(db, bbox)
+        finally:
+            db.close()
     if not roads:
         return image, 0
 
@@ -559,12 +562,18 @@ def paint_roads(
     bbox: tuple[float, float, float, float],
     db_path: Path = DEFAULT_ASSETS_DB_PATH,
     debug: bool = False,
+    *,
+    roads: list[dict[str, Any]] | None = None,
 ) -> tuple[bytes, int]:
     """Paint catalog roads onto a copy of a tile JPEG."""
     if not jpeg:
         return jpeg, 0
     image, painted = paint_roads_image(
-        Image.open(io.BytesIO(jpeg)), bbox, db_path, debug=debug
+        Image.open(io.BytesIO(jpeg)),
+        bbox,
+        db_path,
+        debug=debug,
+        roads=roads,
     )
     if not painted:
         return jpeg, 0

@@ -1,4 +1,5 @@
 import unittest
+from typing import cast
 
 import numpy as np
 from scipy import ndimage
@@ -73,7 +74,11 @@ class TerrainSegmentationTest(unittest.TestCase):
             rgb.shape[0] * rgb.shape[1],
         )
         for region_id in range(len(result.regions)):
-            self.assertEqual(ndimage.label(result.labels == region_id)[1], 1)
+            _, component_count = cast(
+                tuple[np.ndarray, int],
+                ndimage.label(result.labels == region_id),
+            )
+            self.assertEqual(component_count, 1)
         self.assertEqual(render_boundaries(rgb, result.labels).shape, rgb.shape)
 
     def test_sparse_dem_holes_are_filled_but_empty_dem_is_rejected(self):

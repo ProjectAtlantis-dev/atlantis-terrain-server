@@ -402,6 +402,9 @@ def open_db(path=None):
     from cliff_graft_cache import init_cliff_graft_assets
     init_cliff_graft_assets(db)
 
+    from road_texture_cache import init_road_texture_bakes
+    init_road_texture_bakes(db)
+
     from terrain_seams import init_seam_cache
     init_seam_cache(db)
     if "terrain_seam_cache" not in existing:

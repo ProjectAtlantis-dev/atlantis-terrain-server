@@ -22,6 +22,7 @@ class _ManualFuture:
 
     def complete(self, outcome="fetched"):
         self.outcome = outcome
+        assert self.callback is not None
         self.callback(self)
 
 

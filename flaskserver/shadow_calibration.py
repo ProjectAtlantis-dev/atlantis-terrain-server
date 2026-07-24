@@ -92,7 +92,10 @@ def collect_samples(db, tile_id):
     # Erode one step so shoreline mixed pixels don't pollute the albedo
     # assumption (a beach pixel inside the mask is not lake surface).
     from scipy import ndimage
-    lake = ndimage.binary_erosion(lake, iterations=2)
+    lake = np.asarray(
+        ndimage.binary_erosion(lake, iterations=2),
+        dtype=bool,
+    )
     if np.count_nonzero(lake) < 64:
         return None
 

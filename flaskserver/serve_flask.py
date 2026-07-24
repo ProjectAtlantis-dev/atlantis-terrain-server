@@ -23,6 +23,11 @@ from typing import Any, cast
 import asyncio
 
 from colored_log import get_logger
+from classifier_job_control import (
+  ClassifierJobControl,
+  classifier_inventory,
+  regression_case_summaries,
+)
 from gpu_profile_control import GpuProfileControl
 from terrain_config import (
   BOOTSTRAP_SEED_DEPTH, MAX_TILE_DEPTH, WMS_CONTRACT_DEPTH,
@@ -65,6 +70,7 @@ DB_PATH = _resolve_db_path()
 
 app = Flask(__name__, static_folder=STATIC_DIR, static_url_path="")
 _gpu_profile_control = GpuProfileControl()
+_classifier_job_control = ClassifierJobControl(DB_PATH)
 
 
 def _env_int(name: str, default: int) -> int:
@@ -1751,8 +1757,26 @@ def _painted_texture_response(
   hydro_debug: bool = False,
 ) -> Response:
   """Apply terrain-coupled catalog overlays to a clean cached texture copy."""
-  from asset_catalog import paint_roads
-  painted, road_count = paint_roads(jpeg, bbox, ASSETS_DB_PATH, debug=road_debug)
+  bake_asset = None
+  cacheable_bake = (
+    not road_debug
+    and not water_debug
+    and not hydro_debug
+    and headers.get("X-Tex-Temporary") == "0"
+  )
+  if cacheable_bake:
+    from road_texture_cache import get_or_create_road_texture
+    bake_asset = get_or_create_road_texture(
+      _get_db(), tile_id, bbox, ASSETS_DB_PATH,
+    )
+  if bake_asset is not None:
+    painted = bake_asset["texture"]
+    road_count = bake_asset["road_count"]
+  else:
+    from asset_catalog import paint_roads
+    painted, road_count = paint_roads(
+      jpeg, bbox, ASSETS_DB_PATH, debug=road_debug,
+    )
   if hydro_debug or water_debug:
     from classifier.rendering import smooth_effective_water_mask
     from coastline import read_hydrography_mask, read_water_mask
@@ -1782,11 +1806,28 @@ def _painted_texture_response(
   response_headers["X-Road-Debug"] = "1" if road_debug else "0"
   response_headers["X-Water-Debug"] = "1" if water_debug else "0"
   response_headers["X-Hydrography-Debug"] = "1" if hydro_debug else "0"
+  if bake_asset is not None:
+    response_headers["X-Road-Bake-Cache"] = (
+      "miss" if bake_asset["generated"] else "hit"
+    )
+    response_headers["X-Road-Bake-Recipe"] = str(
+      bake_asset["recipe_version"]
+    )
+  else:
+    response_headers["X-Road-Bake-Cache"] = (
+      "bypass" if road_debug or water_debug or hydro_debug else "temporary"
+    )
   if road_count:
     # Asset edits must be visible on the next texture request; the canonical
     # imagery remains cached in terrain.db and is never painted in place.
     response_headers["Cache-Control"] = "no-cache"
-  return Response(painted, mimetype="image/jpeg", headers=response_headers)
+  response = Response(
+    painted, mimetype="image/jpeg", headers=response_headers,
+  )
+  if bake_asset is not None:
+    response.set_etag(bake_asset["fingerprint"])
+    response.make_conditional(request)
+  return response
 
 
 @app.get("/api/d13/status")
@@ -2088,14 +2129,19 @@ def api_tile_package(tile_id: str):
   rendered_texture = canonical_texture
   roads = []
   if ASSETS_DB_PATH.exists():
-    from asset_catalog import connect as connect_assets, paint_roads, query_roads
+    from asset_catalog import connect as connect_assets, query_roads
     assets_db = connect_assets(ASSETS_DB_PATH)
     try:
       roads = query_roads(assets_db, bbox)
     finally:
       assets_db.close()
     if canonical_texture:
-      rendered_texture, _ = paint_roads(canonical_texture, bbox, ASSETS_DB_PATH)
+      from road_texture_cache import get_or_create_road_texture
+      road_bake = get_or_create_road_texture(
+        db, tile_id, bbox, ASSETS_DB_PATH,
+      )
+      if road_bake is not None:
+        rendered_texture = road_bake["texture"]
 
   from classifier.storage import decode_class_map
   from coastline import read_hydrography_mask, read_water_mask
@@ -2621,6 +2667,116 @@ def api_classifier_tile(tile_id: str):
   if found is not None and depth != child_depth:
     headers["X-Classifier-Ancestor"] = f"{depth}-{col}-{row}"
   return Response(buf.getvalue(), mimetype="image/png", headers=headers)
+
+
+def _classifier_ready_tile_ids(db: sqlite3.Connection) -> list[str]:
+  return [
+    str(row[0]) for row in db.execute(
+      "SELECT x.tile_id FROM textures x "
+      "JOIN tiles t ON t.tile_id=x.tile_id "
+      "WHERE x.tile_id LIKE '12-%' "
+      "AND x.source NOT LIKE '%procedural%' "
+      "AND x.source NOT IN ('ancestor_crop', 'placeholder') "
+      "AND t.heightmap IS NOT NULL "
+      "ORDER BY x.tile_id"
+    )
+  ]
+
+
+def _classifier_requested_tiles(
+  db: sqlite3.Connection,
+  payload: dict[str, Any],
+) -> tuple[str, list[str]]:
+  scope = str(payload.get("scope", "selected"))
+  if scope == "ready":
+    return scope, _classifier_ready_tile_ids(db)
+  if scope == "regressions":
+    import regression_cases
+
+    return scope, [
+      str(case.get("tile", "")) for case in regression_cases.load_cases()
+      if _parse_tile_id(str(case.get("tile", ""))) is not None
+    ]
+  if scope != "selected":
+    raise ValueError("scope must be selected, regressions, or ready")
+
+  raw_tiles = payload.get("tiles", [])
+  if isinstance(raw_tiles, str):
+    candidates = re.split(r"[\s,]+", raw_tiles.strip())
+  elif isinstance(raw_tiles, list):
+    candidates = [str(value).strip() for value in raw_tiles]
+  else:
+    raise ValueError("tiles must be a list or whitespace-separated string")
+  tiles = [tile for tile in candidates if tile]
+  invalid = [
+    tile for tile in tiles
+    if (parsed := _parse_tile_id(tile)) is None
+    or parsed[0] != WMS_CONTRACT_DEPTH
+  ]
+  if invalid:
+    raise ValueError(
+      "selected jobs require D12 tile ids; invalid: "
+      + ", ".join(invalid[:5])
+    )
+  return scope, list(dict.fromkeys(tiles))
+
+
+@app.get("/api/classifier/jobs")
+def api_classifier_jobs_status():
+  """Operations-page snapshot: job progress, coverage, regression cases."""
+  unavailable = _terrain_unavailable_response()
+  if unavailable is not None:
+    return unavailable
+  payload = {
+    "job": _classifier_job_control.snapshot(),
+    "inventory": classifier_inventory(_get_db()),
+    "regressions": regression_case_summaries(),
+    "links": {
+      "verificationGallery": "/api/classifier/verification/",
+      "regressionGallery": "/api/regression/",
+    },
+  }
+  response = jsonify(payload)
+  response.headers["Cache-Control"] = "no-store"
+  return response
+
+
+@app.post("/api/classifier/jobs")
+def api_classifier_jobs_start():
+  """Launch one asynchronous classifier verification job."""
+  unavailable = _terrain_unavailable_response()
+  if unavailable is not None:
+    return unavailable
+  payload = request.get_json(silent=True)
+  if not isinstance(payload, dict):
+    return jsonify({"error": "JSON object required"}), 400
+  try:
+    scope, tiles = _classifier_requested_tiles(_get_db(), payload)
+    if not tiles:
+      raise ValueError(f"{scope} job has no tiles")
+    job = _classifier_job_control.start(
+      scope=scope,
+      tiles=tiles,
+      use_google=bool(payload.get("useGoogle", False)),
+    )
+  except ValueError as exc:
+    return jsonify({"error": str(exc)}), 400
+  except RuntimeError as exc:
+    return jsonify({"error": str(exc)}), 409
+  return jsonify(job), 202
+
+
+@app.get("/api/classifier/verification/")
+@app.get("/api/classifier/verification/<path:subpath>")
+def api_classifier_verification_gallery(subpath="index.html"):
+  """Serve the latest ad-hoc/all-tiles verification job gallery."""
+  from classifier_verify import OUT_DIR, build_gallery
+
+  if subpath == "index.html" and not os.path.exists(
+    os.path.join(OUT_DIR, "index.html")
+  ):
+    build_gallery(OUT_DIR, [])
+  return send_from_directory(OUT_DIR, subpath)
 
 
 @app.post("/api/regression/cases")

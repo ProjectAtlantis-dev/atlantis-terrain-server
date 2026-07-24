@@ -70,6 +70,8 @@ class CliffGraftCacheTest(unittest.TestCase):
         first = get_or_create_cliff_graft_asset(self.db, "12-1-1")
         second = get_or_create_cliff_graft_asset(self.db, "12-1-1")
 
+        assert first is not None
+        assert second is not None
         self.assertTrue(first["generated"])
         self.assertFalse(second["generated"])
         self.assertEqual(first["texture"], second["texture"])
@@ -84,6 +86,7 @@ class CliffGraftCacheTest(unittest.TestCase):
             "FROM cliff_graft_assets WHERE donor_tile_id = ?",
             ("12-1-1",),
         ).fetchone()
+        assert stored is not None
         self.assertEqual(stored[0], CLIFF_GRAFT_ASSET_VERSION)
         self.assertEqual(stored[1], first["fingerprint"])
 
@@ -96,6 +99,7 @@ class CliffGraftCacheTest(unittest.TestCase):
         self.db.commit()
         refreshed = get_or_create_cliff_graft_asset(self.db, "12-1-1")
 
+        assert refreshed is not None
         self.assertTrue(refreshed["generated"])
         self.assertNotEqual(refreshed["fingerprint"], first["fingerprint"])
         self.assertEqual(refreshed["water_pixels"], 0)

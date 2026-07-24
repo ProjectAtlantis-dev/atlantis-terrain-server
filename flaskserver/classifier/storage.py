@@ -142,6 +142,7 @@ def write_classifier_tile(
     if array.size and int(array.max()) >= len(CLASS_SCHEMAS[class_schema]["names"]):
         raise ValueError(f"class map contains labels outside {class_schema}")
     array = array.copy()
+    official_water = None
     if enforce_official_water and class_schema in _WATER_ENFORCED_SCHEMAS:
         from classifier.official_water import classifier_water_mask_for_tile
 

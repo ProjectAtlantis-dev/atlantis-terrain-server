@@ -22,6 +22,7 @@ from pathlib import Path
 import numpy as np
 from PIL import Image, ImageDraw
 from pyproj import Transformer
+from shapely.geometry import MultiPolygon, Polygon
 from shapely import wkb as shapely_wkb
 from shapely.ops import transform as shapely_transform
 
@@ -110,9 +111,9 @@ def _load_block(block: str):
                     continue
                 geom = shapely_wkb.loads(_gpkg_wkb(blob))
                 geom = shapely_transform(_to_stereo.transform, geom)
-                if geom.geom_type == "MultiPolygon":
+                if isinstance(geom, MultiPolygon):
                     target.extend(geom.geoms)
-                elif geom.geom_type == "Polygon":
+                elif isinstance(geom, Polygon):
                     target.append(geom)
     finally:
         db.close()
@@ -134,6 +135,7 @@ def vector_water_mask(bbox, resolution: int) -> np.ndarray | None:
     blocks = [_load_block(b) for b in blocks_for_bbox(bbox)]
     if any(b is None for b in blocks):
         return None
+    available_blocks = [block for block in blocks if block is not None]
 
     x0, y0, x1, y1 = (float(v) for v in bbox)
     size = int(resolution) * _OVERSAMPLE
@@ -147,7 +149,7 @@ def vector_water_mask(bbox, resolution: int) -> np.ndarray | None:
     image = Image.new("L", (size, size), 0)
     draw = ImageDraw.Draw(image)
     pad = 2 * _OVERSAMPLE  # skip polygons safely outside the raster
-    for water, _ in blocks:
+    for water, _ in available_blocks:
         for poly in water:
             wx0, wy0, wx1, wy1 = poly.bounds
             if wx1 < x0 or wx0 > x1 or wy1 < y0 or wy0 > y1:
@@ -155,7 +157,7 @@ def vector_water_mask(bbox, resolution: int) -> np.ndarray | None:
             draw.polygon(px(poly.exterior), fill=1)
             for ring in poly.interiors:
                 draw.polygon(px(ring), fill=0)
-    for _, islands in blocks:
+    for _, islands in available_blocks:
         for poly in islands:
             ix0, iy0, ix1, iy1 = poly.bounds
             if ix1 < x0 or ix0 > x1 or iy1 < y0 or iy0 > y1:
