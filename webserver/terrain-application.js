@@ -1486,6 +1486,11 @@ const terrainFetchEvents = {
   onSkip: () => enqueueClientLog('debug', 'fetchTiles.coalesce', {
     reason: 'latest camera position queued', ...getCameraLogSnapshot(),
   }),
+  onCoalesceDrain: details => enqueueClientLog('info', 'fetchTiles.coalesce.drain', {
+    reason: 'in-flight response settled; loading latest queued camera position',
+    ...details,
+    ...getCameraLogSnapshot(),
+  }),
   onPreviewComplete(result) {
     bootLog('tiles.pass1-preview-done', result.previewDetails);
     requestRender();

@@ -34,6 +34,7 @@ export function createTerrainFetchRuntime({
     onBuildings = () => {},
     onAvailability = () => {},
     onSkip = () => {},
+    onCoalesceDrain = () => {},
     onError = () => {},
     onPreviewComplete = () => {},
     onPoll = () => {},
@@ -44,6 +45,12 @@ export function createTerrainFetchRuntime({
   let activeController = null;
   let queuedRequest = null;
   const heightmapCache = new Map();
+  logger.enqueue('info', 'fetchTiles.runtime', {
+    requestPolicy: 'authoritative-inflight+latest-queued',
+    passPolicy: 'preview-then-full',
+    previewMaxDepth,
+    manifestHeightmaps: useManifest,
+  });
 
   function getCameraCoordinates() {
     return testOverrides.getCameraCoordinates?.() ?? terrainCameraCoordinates({
@@ -263,8 +270,16 @@ export function createTerrainFetchRuntime({
       if (scheduleFullPass) {
         // Let the preview render before starting the full pass. A newer camera
         // request queued while preview was loading owns the full-pass focus.
+        const hadQueuedRequest = queuedRequest != null;
         const next = queuedRequest ?? { lat, lon };
         queuedRequest = null;
+        if (hadQueuedRequest) {
+          onCoalesceDrain({
+            pass: state.loadPass,
+            explicitCoordinates: Number.isFinite(next.lat) && Number.isFinite(next.lon),
+            handoff: 'preview-to-full',
+          });
+        }
         state.fetching = false;
         scheduleFrame(() => {
           if (requestGeneration === generation && !activeController) {
@@ -280,6 +295,10 @@ export function createTerrainFetchRuntime({
         // authoritative response that is already in flight.
         const next = queuedRequest;
         queuedRequest = null;
+        onCoalesceDrain({
+          pass: state.loadPass,
+          explicitCoordinates: Number.isFinite(next.lat) && Number.isFinite(next.lon),
+        });
         await runRequest(next);
         return;
       }
