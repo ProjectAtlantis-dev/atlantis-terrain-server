@@ -1483,8 +1483,8 @@ const terrainFetchEvents = {
   },
   onBuildings: buildings => buildingsRuntime?.reconcile(buildings),
   onAvailability: markMissing,
-  onSkip: () => enqueueClientLog('debug', 'fetchTiles.skip', {
-    reason: 'already fetching', ...getCameraLogSnapshot(),
+  onSkip: () => enqueueClientLog('debug', 'fetchTiles.coalesce', {
+    reason: 'latest camera position queued', ...getCameraLogSnapshot(),
   }),
   onPreviewComplete(result) {
     bootLog('tiles.pass1-preview-done', result.previewDetails);

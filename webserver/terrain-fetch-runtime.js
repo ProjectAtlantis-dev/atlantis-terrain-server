@@ -42,6 +42,7 @@ export function createTerrainFetchRuntime({
   let pollTimer = null;
   let generation = 0;
   let activeController = null;
+  let queuedRequest = null;
   const heightmapCache = new Map();
 
   function getCameraCoordinates() {
@@ -224,49 +225,93 @@ export function createTerrainFetchRuntime({
     };
   }
 
-  async function request(lat, lon) {
-    if (state.fetching) {
-      onSkip();
-      return;
-    }
+  async function runRequest({ lat, lon }) {
     state.fetching = true;
     const requestGeneration = generation;
-    activeController = new AbortController();
+    const controller = new AbortController();
+    activeController = controller;
+    let scheduleFullPass = false;
+    let schedulePollAfterSettled = false;
     try {
       const result = await execute({
-        lat, lon, pass: state.loadPass, signal: activeController.signal,
+        lat, lon, pass: state.loadPass, signal: controller.signal,
       });
-      if (requestGeneration !== generation) return;
-      activeController = null;
+      if (requestGeneration !== generation
+          || controller.signal.aborted
+          || activeController !== controller) return;
       if (pollTimer != null) {
         cancelPoll(pollTimer);
         pollTimer = null;
       }
       if (result.nextAction === 'full-pass') {
-        state.fetching = false;
         state.loadPass = 2;
         onPreviewComplete(result);
-        scheduleFrame(() => request());
+        scheduleFullPass = true;
+      } else if (result.nextAction === 'poll') {
+        schedulePollAfterSettled = true;
+      }
+    } catch (error) {
+      if (requestGeneration !== generation
+          || controller.signal.aborted
+          || error?.name === 'AbortError') return;
+      onError(error);
+    } finally {
+      if (activeController !== controller) return;
+      activeController = null;
+      if (requestGeneration !== generation) return;
+
+      if (scheduleFullPass) {
+        // Let the preview render before starting the full pass. A newer camera
+        // request queued while preview was loading owns the full-pass focus.
+        const next = queuedRequest ?? { lat, lon };
+        queuedRequest = null;
+        state.fetching = false;
+        scheduleFrame(() => {
+          if (requestGeneration === generation && !activeController) {
+            request(next.lat, next.lon);
+          }
+        });
         return;
       }
-      if (result.nextAction === 'poll') {
+
+      if (queuedRequest) {
+        // Coalesce all requests received while fetching into one follow-up at
+        // the latest requested camera position. Do not abort or demote the
+        // authoritative response that is already in flight.
+        const next = queuedRequest;
+        queuedRequest = null;
+        await runRequest(next);
+        return;
+      }
+
+      if (schedulePollAfterSettled) {
         pollTimer = schedulePoll(() => {
           pollTimer = null;
           onPoll();
           request();
         }, pollMs);
       }
-    } catch (error) {
-      if (requestGeneration !== generation || error?.name === 'AbortError') return;
-      onError(error);
+      state.fetching = false;
+      onSettled();
     }
-    activeController = null;
-    state.fetching = false;
-    onSettled();
+  }
+
+  function request(lat, lon) {
+    if (activeController) {
+      queuedRequest = { lat, lon };
+      onSkip();
+      return;
+    }
+    if (pollTimer != null) {
+      cancelPoll(pollTimer);
+      pollTimer = null;
+    }
+    return runRequest({ lat, lon });
   }
 
   function reset(nextPass = 1) {
     generation += 1;
+    queuedRequest = null;
     activeController?.abort();
     activeController = null;
     if (pollTimer != null) cancelPoll(pollTimer);
