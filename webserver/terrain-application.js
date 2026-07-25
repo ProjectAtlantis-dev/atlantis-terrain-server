@@ -85,6 +85,9 @@ const WEBGPU_SUN_ANGULAR_RADIUS = 0.02;
 const WEBGPU_ATMOSPHERE_DEFAULTS = Object.freeze({
   luminanceScale: WEBGPU_ATMOSPHERE_LUMINANCE_SCALE,
   toneMappingExposure: WEBGPU_TONE_MAPPING_EXPOSURE,
+  terrainNormalMode: 'ellipsoid',
+  aerialInscattering: true,
+  aerialTransmittance: true,
   sunAngularRadius: WEBGPU_SUN_ANGULAR_RADIUS,
   sunIntensity: 1,
   rayleighScale: 1,
@@ -461,6 +464,7 @@ gameClockState.running = !(hasSavedMonth || hasSavedHour);
 const {
   reset: resetTuningUI,
   section: tuningSectionLabel,
+  select: tuningSelect,
   slider: tuningSlider,
   toggle: tuningToggle,
 } = createTerrainTuningControls({
@@ -608,6 +612,29 @@ function buildTuningControls(ap, ce) {
       if (terrainPipelineState.ready) terrainFetchRuntime.request();
     }
   });
+  if (USE_WEBGPU_RENDER_BACKEND) {
+    tuningSelect('terrain lighting', {
+      value: WEBGPU_ATMOSPHERE_DEFAULTS.terrainNormalMode,
+      options: [
+        { value: 'ellipsoid', label: 'Smooth globe' },
+        { value: 'geometry', label: 'Terrain slopes' },
+      ],
+      onChange: value => {
+        const mode = value === 'geometry' ? 'geometry' : 'ellipsoid';
+        const changed = webgpuAtmosphereSettings.terrainNormalMode !== mode;
+        webgpuAtmosphereSettings.terrainNormalMode = mode;
+        const rebuild = changed && renderBackend.ready;
+        enqueueClientLog('info', 'webgpu.terrain.normal-mode', {
+          mode,
+          label: mode === 'geometry' ? 'Terrain slopes' : 'Smooth globe',
+          source: 'scene-settings',
+          rebuild,
+        });
+        if (rebuild) webgpuAtmosphere?.rebuild(currentDate);
+        requestRender();
+      },
+    });
+  }
   tuningSectionLabel('Atmosphere');
   if (USE_WEBGPU_RENDER_BACKEND) {
     tuningSlider('brightness', {
@@ -629,6 +656,30 @@ function buildTuningControls(ap, ce) {
       onChange: applyWebGPUHaze
     });
     applyWebGPUHaze(Number(tuningState.haze ?? WEBGPU_DEFAULT_HAZE));
+    const setAerialGraphSetting = (key, value, label) => {
+      const changed = webgpuAtmosphereSettings[key] !== value;
+      webgpuAtmosphereSettings[key] = value;
+      const rebuild = changed && renderBackend.ready;
+      enqueueClientLog('info', 'webgpu.atmosphere.component', {
+        component: label,
+        enabled: value,
+        rebuild,
+      });
+      if (rebuild) webgpuAtmosphere?.rebuild(currentDate);
+      requestRender();
+    };
+    tuningToggle('aerial inscatter', {
+      value: WEBGPU_ATMOSPHERE_DEFAULTS.aerialInscattering,
+      onChange: value => setAerialGraphSetting(
+        'aerialInscattering', value, 'inscattering',
+      ),
+    });
+    tuningToggle('aerial extinction', {
+      value: WEBGPU_ATMOSPHERE_DEFAULTS.aerialTransmittance,
+      onChange: value => setAerialGraphSetting(
+        'aerialTransmittance', value, 'transmittance',
+      ),
+    });
   } else {
   tuningSlider('fog strength', {
     min: 1, max: 10, step: 0.5, value: 4.5,

@@ -77,13 +77,48 @@ export function createTerrainTuningControls({
     return input;
   }
 
+  function select(label, options) {
+    const saved = state[label];
+    const allowed = new Set(options.options.map(option => option.value));
+    const initial = allowed.has(saved) ? saved : options.value;
+    const row = documentImpl.createElement('div');
+    row.style.cssText = 'display:flex;align-items:center;gap:6px;margin:5px 0';
+    const labelElement = documentImpl.createElement('span');
+    labelElement.style.cssText = 'flex:0 0 90px;font-size:11px;color:#9ab';
+    labelElement.textContent = label;
+    const input = documentImpl.createElement('select');
+    input.style.cssText = 'flex:1;min-width:0;background:#111827;color:#dbe5f1;border:1px solid #40516a;border-radius:3px;padding:2px 4px;font:11px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace';
+    for (const option of options.options) {
+      const element = documentImpl.createElement('option');
+      element.value = option.value;
+      element.textContent = option.label;
+      input.appendChild(element);
+    }
+    input.value = initial;
+    if (saved != null && allowed.has(saved)) options.onChange(initial);
+    input.onchange = () => {
+      state[label] = input.value;
+      save();
+      options.onChange(input.value);
+    };
+    row.append(labelElement, input);
+    body.appendChild(row);
+    definitions.push({
+      label, defaultValue: options.value, input,
+      onChange: options.onChange, type: 'select',
+    });
+    return input;
+  }
+
   function reset() {
     for (const definition of definitions) {
       if (definition.type === 'slider') {
         definition.input.value = definition.defaultValue;
         definition.valueElement.textContent = definition.format(definition.defaultValue);
-      } else {
+      } else if (definition.type === 'toggle') {
         definition.input.checked = definition.defaultValue;
+      } else {
+        definition.input.value = definition.defaultValue;
       }
       definition.onChange(definition.defaultValue);
     }
@@ -96,5 +131,5 @@ export function createTerrainTuningControls({
     definition.valueElement.textContent = definition.format(value);
   }
 
-  return { reset, section, setSliderValue, slider, toggle };
+  return { reset, section, select, setSliderValue, slider, toggle };
 }

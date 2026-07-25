@@ -46,10 +46,14 @@ export function normalizeVehiclePartDefinition(definition = {}) {
     : DEFAULT_WHEEL_CLUSTER_SPLIT_THRESHOLD;
   return {
     wheels: cleanNames(parts.wheels, DEFAULT_PARTS.wheels),
+    // null turret/gun means "no weapon" (do not fall back to Patria Object_* names)
     turret: optionalPart(parts.turret, DEFAULT_PARTS.turret),
     gun: optionalPart(parts.gun, DEFAULT_PARTS.gun),
     body: cleanNames(parts.body, DEFAULT_PARTS.body),
-    shield: cleanNames(parts.shield, DEFAULT_PARTS.shield),
+    // Explicit empty shield list is valid (procedural vehicles without shields)
+    shield: Array.isArray(parts.shield)
+      ? cleanNames(parts.shield, [])
+      : cleanNames(parts.shield, DEFAULT_PARTS.shield),
     turretPivot: cleanVector3(parts.turretPivot),
     gunPivot: cleanVector3(parts.gunPivot),
     muzzle: cleanVector3(parts.muzzle),

@@ -1,5 +1,12 @@
 import * as THREE from 'three';
-import { context as tslContext, mrt, output, pass, toneMapping, uniform } from 'three/tsl';
+import {
+  context as tslContext,
+  mrt,
+  normalView,
+  output,
+  pass,
+  renderOutput,
+} from 'three/tsl';
 import { PostProcessing } from 'three/webgpu';
 import {
   getECIToECEFRotationMatrix,
@@ -84,8 +91,6 @@ export function createWebGPUAtmosphereController({
   const csmVehiclePositions = new Map();
   const csmSunDirection = new THREE.Vector3();
   const csmRefreshStats = { count: [0, 0, 0], reasons: {}, deferred: 0 };
-  const toneMappingExposure = uniform(settings.toneMappingExposure);
-
   function createContext() {
     parameters = new AtmosphereParameters();
     parameters.luminanceScale *= settings.luminanceScale;
@@ -167,7 +172,6 @@ export function createWebGPUAtmosphereController({
 
   function applyLiveSettings() {
     renderer.toneMappingExposure = settings.toneMappingExposure;
-    toneMappingExposure.value = settings.toneMappingExposure;
     for (const sun of [skyNode?.sunNode, atmosphereNode?.skyNode?.sunNode]) {
       if (!sun) continue;
       sun.angularRadius.value = settings.sunAngularRadius;
@@ -262,10 +266,16 @@ export function createWebGPUAtmosphereController({
     scene.add(atmosphereLight.target);
     // Temporal AA replaces MSAA and stabilizes the epipolar shadow samples.
     const scenePass = pass(scene, camera, { samples: 0 });
-    scenePass.setMRT(mrt({ output, velocity: highpVelocity, viewZUnit }));
+    const useTerrainSlopes = settings.terrainNormalMode === 'geometry';
+    const sceneOutputs = { output, velocity: highpVelocity, viewZUnit };
+    if (useTerrainSlopes) sceneOutputs.normal = normalView;
+    scenePass.setMRT(mrt(sceneOutputs));
     const colorNode = scenePass.getTextureNode('output');
     const depthNode = scenePass.getTextureNode('depth');
     const velocityNode = scenePass.getTextureNode('velocity');
+    const lightingNormalNode = useTerrainSlopes
+      ? scenePass.getTextureNode('normal')
+      : null;
     const viewZUnitNode = scenePass.getTextureNode('viewZUnit');
     viewZUnitNode.value.format = THREE.RedFormat;
     if (csmShadowNode) {
@@ -318,27 +328,31 @@ export function createWebGPUAtmosphereController({
     atmosphereNode = cloudShadowAerialPerspective(
       grounding.node,
       depthNode,
-      // Terrain tiles compute normals independently. At cross-LOD boundaries
-      // the depth-11 and depth-12 edge normals differ even where the geometry
-      // meets exactly, and atmosphere relighting turns that into a dark seam.
-      // Use the continuous ellipsoid-normal fallback for direct sun and
-      // spectral sky/ambient illumination across all terrain LODs.
-      null,
+      // Smooth-globe mode preserves the old seam-hiding fallback. Terrain-
+      // slopes mode exposes the real view-space geometry normals so the two
+      // lighting models can be compared live from Scene settings.
+      lightingNormalNode,
       cloudShadows,
     );
+    atmosphereNode.inscattering = settings.aerialInscattering !== false;
+    atmosphereNode.transmittance = settings.aerialTransmittance !== false;
     atmosphereNode.shadowLengthNode = activeShadowLengthNode;
     atmosphereNode.skyNode = sky(activeShadowLengthNode);
     const lensFlareNode = lensFlare(atmosphereNode);
-    const toneMappedNode = toneMapping(
-      THREE.AgXToneMapping,
-      toneMappingExposure,
+    const antialiasedNode = temporalAntialias(
       lensFlareNode,
-    );
-    postProcessing.outputNode = temporalAntialias(
-      toneMappedNode,
       depthNode,
       velocityNode,
       camera,
+    );
+    // RenderPipeline normally appends its own renderer output transform. Keep
+    // that automation disabled here because dithering belongs after the one
+    // and only HDR -> AgX -> output-colour conversion, not before it.
+    postProcessing.outputColorTransform = false;
+    postProcessing.outputNode = renderOutput(
+      antialiasedNode,
+      THREE.AgXToneMapping,
+      renderer.outputColorSpace,
     ).add(dithering);
     setPostProcessing(postProcessing);
     applyLiveSettings();
@@ -352,6 +366,11 @@ export function createWebGPUAtmosphereController({
       antialiasing: 'temporal',
       lensFlare: true,
       cloudSurfaceShadows: cloudShadowSettings.enabled,
+      terrainNormalMode: settings.terrainNormalMode,
+      aerialInscattering: atmosphereNode.inscattering,
+      aerialTransmittance: atmosphereNode.transmittance,
+      outputPipeline: 'hdr-atmosphere>taa>agx>output-color>dither',
+      toneMappingPasses: 1,
     });
   }
 
@@ -534,6 +553,10 @@ export function createWebGPUAtmosphereController({
           cloudSurfaceShadows: Boolean(cloudShadows?.enabled?.value),
           gtaoStrength: grounding?.uniforms?.uAoStrength?.value ?? null,
           contactStrength: grounding?.uniforms?.uContactStrength?.value ?? null,
+          terrainNormalMode: settings.terrainNormalMode,
+          aerialInscattering: atmosphereNode?.inscattering ?? null,
+          aerialTransmittance: atmosphereNode?.transmittance ?? null,
+          outputPipeline: 'single-agx-after-taa',
         });
       }
     },
@@ -545,6 +568,9 @@ export function createWebGPUAtmosphereController({
         godRays: shadowLengthNode != null,
         cloudGodRays: cloudGodRays?.uniforms ?? null,
         beerShadowDispatches: beerShadowMap?.dispatchCount ?? 0,
+        terrainNormalMode: settings.terrainNormalMode,
+        aerialInscattering: atmosphereNode?.inscattering ?? null,
+        aerialTransmittance: atmosphereNode?.transmittance ?? null,
       };
     },
     maybeLogSun,

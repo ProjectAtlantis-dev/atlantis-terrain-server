@@ -27,8 +27,26 @@ import {
   summarizeVehicleTurretRig,
   summarizeVehicleWheelRig,
 } from './terrain-vehicle-parts.js';
+import { createArcticSnowcat } from './vehicles/createArcticSnowcat.js';
 
 const DEFAULT_VEHICLE_INSTANCE_ID = 'amv-01';
+
+function resolveProceduralVehicleModel(definition) {
+  const key = (typeof definition?.procedural === 'string' && definition.procedural.trim())
+    ? definition.procedural.trim()
+    : '';
+  const url = typeof definition?.url === 'string' ? definition.url.trim() : '';
+  const proceduralKey = key || (url.startsWith('procedural:') ? url.slice('procedural:'.length) : '');
+  if (proceduralKey === 'arctic-snowcat' || proceduralKey === 'at1-hrim') {
+    return createArcticSnowcat();
+  }
+  return null;
+}
+
+function isGroundVehicleDefinition(definition) {
+  if (definition == null) return true; // legacy rows without definitionId → ground (AMV)
+  return definition.vehicleType !== 'aircraft';
+}
 
 export function createTerrainVehicleRuntime({
   vehicleDefinition: VEHICLE_DEFINITION,
@@ -55,10 +73,31 @@ export function createTerrainVehicleRuntime({
   onMutated = () => {},
   windowImpl = globalThis.window,
 } = {}) {
-  // ── Patria AMV vehicle ──────────────────────────────────────────────────
-  const _vehicleSeedInstance = ASSET_VEHICLE_INSTANCES.find(instance => (
-    VEHICLE_DEFINITIONS?.[instance?.definitionId]?.vehicleType !== 'aircraft'
-  )) ?? {};
+  // ── Ground vehicle (Patria AMV, AT-1 Hrim snowcat, …) ───────────────────
+  // Prefer ?vehicle=at1-hrim|hrim-01|patria-amv, then AT-1 Hrim when present, else first ground.
+  const preferredVehicleKey = (() => {
+    try {
+      const raw = new URLSearchParams(windowImpl?.location?.search || '').get('vehicle');
+      return typeof raw === 'string' ? raw.trim() : '';
+    } catch {
+      return '';
+    }
+  })();
+  const groundCandidates = ASSET_VEHICLE_INSTANCES.filter(instance => {
+    const def = VEHICLE_DEFINITIONS?.[instance?.definitionId];
+    return isGroundVehicleDefinition(def);
+  });
+  const _vehicleSeedInstance = (
+    (preferredVehicleKey
+      ? groundCandidates.find(instance => (
+        instance.id === preferredVehicleKey
+        || instance.definitionId === preferredVehicleKey
+      ))
+      : null)
+    ?? groundCandidates.find(instance => instance.definitionId === 'at1-hrim')
+    ?? groundCandidates[0]
+    ?? {}
+  );
   const GROUND_VEHICLE_DEFINITION = (
     VEHICLE_DEFINITIONS?.[_vehicleSeedInstance.definitionId] ?? VEHICLE_DEFINITION
   );
@@ -94,7 +133,9 @@ export function createTerrainVehicleRuntime({
   );
   const VEHICLE_TERRAIN_LIFT_M = VEHICLE_MODEL.altOffsetM + VEHICLE_TIRE_RADIUS_M;
   const vehicleGroup = new THREE.Group();
-  vehicleGroup.name = 'patria-amv';
+  vehicleGroup.name = GROUND_VEHICLE_DEFINITION.displayName
+    || _vehicleSeedInstance.definitionId
+    || 'ground-vehicle';
   terrainRoot.add(vehicleGroup);
   const vehicleMarkerLayer = new THREE.Group();
   vehicleMarkerLayer.name = 'vehicle-markers';
@@ -147,7 +188,12 @@ export function createTerrainVehicleRuntime({
     );
     dot.position.z = HOUSE_MARKER_HEIGHT;
     dot.renderOrder = 1004;
-    const label = createHouseLabelSprite('AMV', vehicleMarkerColor);
+    const markerLabel = (
+      GROUND_VEHICLE_DEFINITION.displayName
+      || _vehicleSeedInstance.definitionId
+      || 'AMV'
+    ).slice(0, 12);
+    const label = createHouseLabelSprite(markerLabel, vehicleMarkerColor);
     label.position.set(0, 0, HOUSE_MARKER_HEIGHT + 900);
     label.renderOrder = 1005;
     marker.add(line, halo, dot, label);
@@ -933,7 +979,10 @@ export function createTerrainVehicleRuntime({
   }
   
   function loadVehicleState() {
-    const state = ASSET_VEHICLE_INSTANCES.length > 0 ? ASSET_VEHICLE_INSTANCES[0] : null;
+    // Prefer the selected ground vehicle seed (Hrim / AMV / ?vehicle=…), not DB order.
+    const state = Object.keys(_vehicleSeedInstance).length > 0
+      ? _vehicleSeedInstance
+      : (ASSET_VEHICLE_INSTANCES.length > 0 ? ASSET_VEHICLE_INSTANCES[0] : null);
     if (state == null) {
       bootLog('vehicle.state.load.empty');
       return null;
@@ -947,148 +996,172 @@ export function createTerrainVehicleRuntime({
     return vehicleSavedStatePending;
   }
   
+  function applyGroundVehicleModel(model) {
+    model.rotation.x = Math.PI * 0.5; // Y-up → Z-up
+    // Keep original PBR materials for proper lighting
+    model.traverse(obj => {
+      if (obj.isMesh) {
+        obj.castShadow = true;
+        obj.receiveShadow = true;
+        if (Array.isArray(obj.material)) {
+          for (const material of obj.material) {
+            applyVehicleMaterialSampling(material);
+          }
+        } else {
+          applyVehicleMaterialSampling(obj.material);
+        }
+      }
+    });
+    // Measure model bounding box to compute real-world scale
+    const bbox = new THREE.Box3().setFromObject(model);
+    const modelSize = new THREE.Vector3();
+    bbox.getSize(modelSize);
+    // longest axis = model's "length" — scale so it equals realLengthM
+    const modelLength = Math.max(modelSize.x, modelSize.y, modelSize.z);
+    const vehicleScale = modelLength > 0
+      ? VEHICLE_MODEL.realLengthM / modelLength
+      : 1;
+    const scaledDims = [
+      modelSize.x * vehicleScale,
+      modelSize.y * vehicleScale,
+      modelSize.z * vehicleScale,
+    ].sort((a, b) => b - a);
+    vehicleBodyLengthM = scaledDims[0];
+    vehicleBodyWidthM = scaledDims[1];
+    const scaledSpan = modelLength * vehicleScale;
+    vehicleShadowRadius = THREE.MathUtils.clamp(
+      scaledSpan * 12,
+      VEHICLE_SHADOW_MIN_RADIUS,
+      VEHICLE_SHADOW_MAX_RADIUS
+    );
+    // Shift model so its bottom (min z) sits at z=0 in vehicleGroup local space
+    model.position.z -= bbox.min.z;
+    vehicleConsoleLog(`model bbox: ${modelSize.x.toFixed(2)} x ${modelSize.y.toFixed(2)} x ${modelSize.z.toFixed(2)}, longest=${modelLength.toFixed(2)}, scale=${vehicleScale.toFixed(4)}, bottomOffset=${bbox.min.z.toFixed(2)}`);
+    vehicleGroup.add(model);
+    // ── Headlights ──────────────────────────────────────────────────
+    const groundHeadlights = GROUND_VEHICLE_DEFINITION.headlights || VEHICLE_HEADLIGHTS;
+    if (groundHeadlights != null && _vehicleSeedInstance.headlightsOn === true) {
+      const localScale = vehicleScale !== 0 ? vehicleScale : 1;
+      const hlColor = groundHeadlights.color;
+      const hlIntensity = groundHeadlights.intensity;
+      const hlAngle = THREE.MathUtils.degToRad(groundHeadlights.angleDeg);
+      const hlPenumbra = groundHeadlights.penumbra;
+      const hlDistance = groundHeadlights.distanceM;
+      const hlDecay = groundHeadlights.decay;
+      const hlFrontY = (vehicleBodyLengthM * groundHeadlights.mountFrontRatio) / localScale;
+      const hlHeight = groundHeadlights.mountHeightM / localScale;
+      const hlSpacing = groundHeadlights.mountSpacingM / localScale;
+      const hlTargetY = hlFrontY + (groundHeadlights.targetForwardM / localScale);
+      const hlTargetZ = groundHeadlights.targetHeightM / localScale;
+      vehicleHeadlightSpots = [];
+      for (const side of [-1, 1]) {
+        const hl = new THREE.SpotLight(hlColor, hlIntensity, hlDistance, hlAngle, hlPenumbra, hlDecay);
+        hl.position.set(side * hlSpacing, hlFrontY, hlHeight);
+        hl.castShadow = false;
+        const target = new THREE.Object3D();
+        target.position.set(side * hlSpacing * groundHeadlights.targetXScale, hlTargetY, hlTargetZ);
+        vehicleGroup.add(target);
+        hl.target = target;
+        vehicleGroup.add(hl);
+        vehicleHeadlightSpots.push(hl);
+      }
+    }
+    // Road-wheel / track roller spin via vertex clusters (8 wheels on Hrim).
+    // Grounding uses only static body meshes so animation cannot move the floor.
+    const vehicleParts = discoverVehicleParts(model, GROUND_VEHICLE_DEFINITION);
+    vehicleWheelRig = createVehicleWheelRig(THREE, vehicleParts);
+    const wheelSummary = summarizeVehicleWheelRig(vehicleWheelRig);
+    bootLog('vehicle.wheels.rigged', {
+      ...wheelSummary,
+      definitionId: _vehicleSeedInstance.definitionId || null,
+    },
+      wheelSummary.clusterCount > 0 && wheelSummary.skipped.length === 0
+        ? 'info'
+        : 'warn');
+    vehicleTurretRig = createVehicleTurretRig(THREE, vehicleParts);
+    const turretSummary = summarizeVehicleTurretRig(vehicleTurretRig);
+    bootLog('vehicle.turret.rigged', turretSummary,
+      turretSummary.warnings.length > 0 ? 'warn' : 'info');
+    const animatedWheelMeshes = new Set(vehicleParts.wheels);
+    vehicleCollisionMeshes = [];
+    model.traverse(obj => {
+      if (obj.isMesh && !animatedWheelMeshes.has(obj)) vehicleCollisionMeshes.push(obj);
+    });
+    // Keep all meshes selectable, including the animated wheels.
+    vehicleMeshes = [];
+    model.traverse(obj => { if (obj.isMesh) vehicleMeshes.push(obj); });
+    const savedState = vehicleSavedStatePending;
+    const startLat = Number.isFinite(savedState?.lat) ? savedState.lat : VEHICLE_MODEL.lat;
+    const startLon = Number.isFinite(savedState?.lon) ? savedState.lon : VEHICLE_MODEL.lon;
+    const startHeadingDeg = Number.isFinite(savedState?.headingDeg)
+      ? savedState.headingDeg
+      : VEHICLE_MODEL.headingDeg;
+    const startZ = Number.isFinite(savedState?.z) ? savedState.z : (VEHICLE_MODEL.z ?? 0);
+    const local = houseLocalFromLatLon(startLat, startLon);
+    vehicleHeadingRad = THREE.MathUtils.degToRad(startHeadingDeg);
+    vehicleGroundNormal.copy(up);
+    updateVehicleOrientationTargetFromGround();
+    vehicleGroup.position.set(local.x, local.y, startZ);
+    vehicleGroup.quaternion.copy(vehicleOrientationTargetQuat);
+    vehicleGroup.scale.setScalar(vehicleScale);
+    vehicleLoaded = true;
+    vehicleSnapPending = true;
+    vehicleAwaitingInitialSnap = true;
+    vehicleRestoreRequiresDepth = Boolean(savedState);
+    vehicleRestoreDepthTarget = Math.min(
+      Number.isFinite(savedState?.terrainDepth)
+        ? savedState.terrainDepth
+        : VEHICLE_RESTORE_MIN_DEPTH,
+      terrainDepthCeiling,
+    );
+    vehicleGroundZTarget = Number.isFinite(startZ) ? startZ : null;
+    vehicleVerticalVelocity = 0;
+    vehicleLastContactDepth = -1;
+    vehicleLastContactTileId = null;
+    vehicleGroup.visible = false;
+    vehicleMarker.position.set(local.x, local.y, HOUSE_MARKER_BASE_LIFT);
+    bootLog('vehicle.load.success', {
+      id: _vehicleSeedInstance.id || DEFAULT_VEHICLE_INSTANCE_ID,
+      definitionId: _vehicleSeedInstance.definitionId || null,
+      displayName: GROUND_VEHICLE_DEFINITION.displayName || null,
+      url: VEHICLE_MODEL.url,
+      procedural: GROUND_VEHICLE_DEFINITION.procedural || null,
+      modelLength: modelLength.toFixed(2),
+      scale: vehicleScale.toFixed(4),
+      shadowRadiusM: Number(vehicleShadowRadius.toFixed(1)),
+      terrainLiftM: Number(VEHICLE_TERRAIN_LIFT_M.toFixed(3)),
+      startLat: Number(startLat.toFixed(8)),
+      startLon: Number(startLon.toFixed(8)),
+      startHeadingDeg: Number(startHeadingDeg.toFixed(3)),
+      startZ: Number(startZ.toFixed(3)),
+      restoreDepthTarget: vehicleRestoreDepthTarget,
+    });
+  }
+
   function loadVehicleModel() {
-    // Keep the terrain/AMV first paint fast. Aircraft and its texture set are
-    // loaded after the initial vehicle request has had time to complete.
+    // Keep first paint fast. Aircraft and texture sets load after ground vehicle.
     const scheduleAircraftLoad = windowImpl.setTimeout ?? globalThis.setTimeout;
     scheduleAircraftLoad(loadAircraftModels, 1200);
+
+    try {
+      const proceduralModel = resolveProceduralVehicleModel(GROUND_VEHICLE_DEFINITION);
+      if (proceduralModel) {
+        applyGroundVehicleModel(proceduralModel);
+        return;
+      }
+    } catch (procErr) {
+      vehicleConsoleWarn('procedural model failed:', procErr);
+      bootLog('vehicle.load.error', {
+        message: procErr?.message ?? String(procErr),
+        procedural: GROUND_VEHICLE_DEFINITION.procedural || VEHICLE_MODEL.url,
+      });
+      return;
+    }
+
     vehicleLoader.load(
       VEHICLE_MODEL.url,
       gltf => {
-        const model = gltf.scene;
-        model.rotation.x = Math.PI * 0.5; // Y-up → Z-up
-        // Keep original PBR materials for proper lighting
-        model.traverse(obj => {
-          if (obj.isMesh) {
-            obj.castShadow = true;
-            obj.receiveShadow = true;
-            if (Array.isArray(obj.material)) {
-              for (const material of obj.material) {
-                applyVehicleMaterialSampling(material);
-              }
-            } else {
-              applyVehicleMaterialSampling(obj.material);
-            }
-          }
-        });
-        // Measure model bounding box to compute real-world scale
-        const bbox = new THREE.Box3().setFromObject(model);
-        const modelSize = new THREE.Vector3();
-        bbox.getSize(modelSize);
-        // longest axis = model's "length" — scale so it equals realLengthM
-        const modelLength = Math.max(modelSize.x, modelSize.y, modelSize.z);
-        const vehicleScale = modelLength > 0
-          ? VEHICLE_MODEL.realLengthM / modelLength
-          : 1;
-        const scaledDims = [
-          modelSize.x * vehicleScale,
-          modelSize.y * vehicleScale,
-          modelSize.z * vehicleScale,
-        ].sort((a, b) => b - a);
-        vehicleBodyLengthM = scaledDims[0];
-        vehicleBodyWidthM = scaledDims[1];
-        const scaledSpan = modelLength * vehicleScale;
-        vehicleShadowRadius = THREE.MathUtils.clamp(
-          scaledSpan * 12,
-          VEHICLE_SHADOW_MIN_RADIUS,
-          VEHICLE_SHADOW_MAX_RADIUS
-        );
-        // Shift model so its bottom (min z) sits at z=0 in vehicleGroup local space
-        model.position.z -= bbox.min.z;
-        vehicleConsoleLog(`model bbox: ${modelSize.x.toFixed(2)} x ${modelSize.y.toFixed(2)} x ${modelSize.z.toFixed(2)}, longest=${modelLength.toFixed(2)}, scale=${vehicleScale.toFixed(4)}, bottomOffset=${bbox.min.z.toFixed(2)}`);
-        vehicleGroup.add(model);
-        // ── Headlights ──────────────────────────────────────────────────
-        if (VEHICLE_HEADLIGHTS != null && _vehicleSeedInstance.headlightsOn === true) {
-          const localScale = vehicleScale !== 0 ? vehicleScale : 1;
-          const hlColor = VEHICLE_HEADLIGHTS.color;
-          const hlIntensity = VEHICLE_HEADLIGHTS.intensity;
-          const hlAngle = THREE.MathUtils.degToRad(VEHICLE_HEADLIGHTS.angleDeg);
-          const hlPenumbra = VEHICLE_HEADLIGHTS.penumbra;
-          const hlDistance = VEHICLE_HEADLIGHTS.distanceM;
-          const hlDecay = VEHICLE_HEADLIGHTS.decay;
-          const hlFrontY = (vehicleBodyLengthM * VEHICLE_HEADLIGHTS.mountFrontRatio) / localScale;
-          const hlHeight = VEHICLE_HEADLIGHTS.mountHeightM / localScale;
-          const hlSpacing = VEHICLE_HEADLIGHTS.mountSpacingM / localScale;
-          const hlTargetY = hlFrontY + (VEHICLE_HEADLIGHTS.targetForwardM / localScale);
-          const hlTargetZ = VEHICLE_HEADLIGHTS.targetHeightM / localScale;
-          vehicleHeadlightSpots = [];
-          for (const side of [-1, 1]) {
-            const hl = new THREE.SpotLight(hlColor, hlIntensity, hlDistance, hlAngle, hlPenumbra, hlDecay);
-            hl.position.set(side * hlSpacing, hlFrontY, hlHeight);
-            hl.castShadow = false;
-            const target = new THREE.Object3D();
-            target.position.set(side * hlSpacing * VEHICLE_HEADLIGHTS.targetXScale, hlTargetY, hlTargetZ);
-            vehicleGroup.add(target);
-            hl.target = target;
-            vehicleGroup.add(hl);
-            vehicleHeadlightSpots.push(hl);
-          }
-        }
-        // Use the live Patria wheel rig: the source meshes contain multiple
-        // wheels, so rotate eight vertex clusters around their own centres.
-        // Grounding uses only the static body meshes so wheel animation cannot
-        // move the collision floor underneath the vehicle.
-        const vehicleParts = discoverVehicleParts(model, GROUND_VEHICLE_DEFINITION);
-        vehicleWheelRig = createVehicleWheelRig(THREE, vehicleParts);
-        const wheelSummary = summarizeVehicleWheelRig(vehicleWheelRig);
-        bootLog('vehicle.wheels.rigged', wheelSummary,
-          wheelSummary.clusterCount === 8 && wheelSummary.skipped.length === 0
-            ? 'info'
-            : 'warn');
-        vehicleTurretRig = createVehicleTurretRig(THREE, vehicleParts);
-        const turretSummary = summarizeVehicleTurretRig(vehicleTurretRig);
-        bootLog('vehicle.turret.rigged', turretSummary,
-          turretSummary.warnings.length > 0 ? 'warn' : 'info');
-        const animatedWheelMeshes = new Set(vehicleParts.wheels);
-        vehicleCollisionMeshes = [];
-        model.traverse(obj => {
-          if (obj.isMesh && !animatedWheelMeshes.has(obj)) vehicleCollisionMeshes.push(obj);
-        });
-        // Keep all meshes selectable, including the animated wheels.
-        vehicleMeshes = [];
-        model.traverse(obj => { if (obj.isMesh) vehicleMeshes.push(obj); });
-        const savedState = vehicleSavedStatePending;
-        const startLat = Number.isFinite(savedState?.lat) ? savedState.lat : VEHICLE_MODEL.lat;
-        const startLon = Number.isFinite(savedState?.lon) ? savedState.lon : VEHICLE_MODEL.lon;
-        const startHeadingDeg = Number.isFinite(savedState?.headingDeg)
-          ? savedState.headingDeg
-          : VEHICLE_MODEL.headingDeg;
-        const startZ = Number.isFinite(savedState?.z) ? savedState.z : (VEHICLE_MODEL.z ?? 0);
-        const local = houseLocalFromLatLon(startLat, startLon);
-        vehicleHeadingRad = THREE.MathUtils.degToRad(startHeadingDeg);
-        vehicleGroundNormal.copy(up);
-        updateVehicleOrientationTargetFromGround();
-        vehicleGroup.position.set(local.x, local.y, startZ);
-        vehicleGroup.quaternion.copy(vehicleOrientationTargetQuat);
-        vehicleGroup.scale.setScalar(vehicleScale);
-        vehicleLoaded = true;
-        vehicleSnapPending = true;
-        vehicleAwaitingInitialSnap = true;
-        vehicleRestoreRequiresDepth = Boolean(savedState);
-        vehicleRestoreDepthTarget = Math.min(
-          Number.isFinite(savedState?.terrainDepth)
-            ? savedState.terrainDepth
-            : VEHICLE_RESTORE_MIN_DEPTH,
-          terrainDepthCeiling,
-        );
-        vehicleGroundZTarget = Number.isFinite(startZ) ? startZ : null;
-        vehicleVerticalVelocity = 0;
-        vehicleLastContactDepth = -1;
-        vehicleLastContactTileId = null;
-        vehicleGroup.visible = false;
-        vehicleMarker.position.set(local.x, local.y, HOUSE_MARKER_BASE_LIFT);
-        bootLog('vehicle.load.success', {
-          url: VEHICLE_MODEL.url,
-          modelLength: modelLength.toFixed(2),
-          scale: vehicleScale.toFixed(4),
-          shadowRadiusM: Number(vehicleShadowRadius.toFixed(1)),
-          terrainLiftM: Number(VEHICLE_TERRAIN_LIFT_M.toFixed(3)),
-          startLat: Number(startLat.toFixed(8)),
-          startLon: Number(startLon.toFixed(8)),
-          startHeadingDeg: Number(startHeadingDeg.toFixed(3)),
-          startZ: Number(startZ.toFixed(3)),
-          restoreDepthTarget: vehicleRestoreDepthTarget,
-        });
+        applyGroundVehicleModel(gltf.scene);
       },
       undefined,
       error => {
