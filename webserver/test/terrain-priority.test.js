@@ -11,7 +11,7 @@ import {
   viewHeadingChanged,
   terrainTilePriority,
 } from '../terrain-priority.js';
-import { compassHeading } from '../terrain-hud.js';
+import { cameraDriftIndicator, compassHeading } from '../terrain-hud.js';
 import { applyMapDrag } from '../terrain-controls.js';
 import { createVehiclePersistenceRuntime, normalizeSavedVehicleState, stepSuspension, stepVehicleDrive, terrainBboxIntersectsCircle, vehicleLatLonToLocal, vehicleLocalToLatLon, vehicleStateSnapshot } from '../terrain-vehicle.js';
 import { scoreTextureTiles, textureRetryDelay, tileDepthFromId } from '../terrain-tile-runtime.js';
@@ -565,12 +565,14 @@ test('shared cloud tuning registers controls and applies altitude, cirrus, and d
     localWeatherVelocity: { values: [], set(...values) { this.values = values; } },
   };
   const controls = {};
+  let appearanceChanges = 0;
   const tuning = registerTerrainCloudTuning({
     effect, controls,
     section: label => sections.push(label),
     slider: (label, options) => { definitions.set(label, options); return { label }; },
     toggle: (label, options) => { definitions.set(label, options); return { label }; },
     getWindDirection: () => windDirection,
+    onAppearanceChange: () => { appearanceChanges += 1; },
   });
   assert.deepEqual(sections, ['Clouds']);
   assert.equal(definitions.size, 7);
@@ -578,8 +580,23 @@ test('shared cloud tuning registers controls and applies altitude, cirrus, and d
 
   definitions.get('cloud altitude').onChange(-2000);
   assert.deepEqual(effect.cloudLayers.map(layer => layer.altitude), [0, 0, 6300, 7100]);
+  definitions.get('cirrus density').onChange(0.0016);
+  assert.equal(effect.cloudLayers[3].densityScale, 0);
   definitions.get('cirrus').onChange(true);
-  assert.equal(effect.cloudLayers[3].densityScale, 0.004);
+  assert.equal(effect.cloudLayers[3].densityScale, 0.0016);
+  definitions.get('cirrus density').onChange(0.0012);
+  assert.equal(effect.cloudLayers[3].densityScale, 0.0012);
+  definitions.get('cirrus coverage').onChange(2.65);
+  assert.equal(effect.cloudLayers[3].weatherExponent, 2.65);
+  definitions.get('cirrus shape').onChange(0.76);
+  assert.equal(effect.cloudLayers[3].shapeAmount, 0.76);
+  definitions.get('cirrus').onChange(false);
+  assert.equal(effect.cloudLayers[3].densityScale, 0);
+  definitions.get('cirrus density').onChange(0.0008);
+  assert.equal(effect.cloudLayers[3].densityScale, 0);
+  definitions.get('cirrus').onChange(true);
+  assert.equal(effect.cloudLayers[3].densityScale, 0.0008);
+  assert.equal(appearanceChanges, 7);
   const drift = definitions.get('drift km/h');
   assert.equal(drift.min, 0);
   assert.equal(drift.max, 650);
@@ -1945,6 +1962,14 @@ test('HUD compass uses the same heading convention', () => {
   assert.equal(compassHeading(0).compass, 'N');
   assert.equal(compassHeading(Math.PI / 2).compass, 'W');
   assert.equal(compassHeading(-Math.PI / 2).compass, 'E');
+});
+
+test('HUD renders a visible camera forward-lock indicator only while drifting', () => {
+  assert.equal(cameraDriftIndicator(false), '');
+  const active = cameraDriftIndicator(true);
+  assert.match(active, /cameraDriftIndicator/);
+  assert.match(active, /FORWARD LOCK/);
+  assert.match(active, /Double-tap W or ↑ to disable/);
 });
 
 test('shared map pan respects map yaw', () => {

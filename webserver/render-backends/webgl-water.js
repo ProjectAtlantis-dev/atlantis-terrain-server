@@ -221,6 +221,7 @@ const WATER_FRAGMENT = /* glsl */ `
   uniform vec3 uSunDir;        // terrainRoot-local, z up
   uniform vec3 uBakedSunDir;   // fixed southern light implied by the imagery
   uniform vec3 uSunColor;
+  uniform vec3 uGlintColor;
   uniform vec3 uZenithColor;
   uniform vec3 uHorizonColor;
   uniform vec3 uHorizonCool;
@@ -568,7 +569,7 @@ const WATER_FRAGMENT = /* glsl */ `
     vec3 H = normalize(L + V);
     float LdotH = max(dot(L, H), 0.0);
     float fresL = 0.022 + 0.978 * pow(1.0 - LdotH, 5.0);
-    vec3 spec = uSunColor * ggxAniso(H, N, Twind, Bwind, max(sqrt(ax2), 0.002), max(sqrt(ay2), 0.002))
+    vec3 spec = uGlintColor * ggxAniso(H, N, Twind, Bwind, max(sqrt(ax2), 0.002), max(sqrt(ay2), 0.002))
               * fresL * smoothstep(0.0, 0.06, L.z)
               / (4.0 * max(NdotV, 0.1) * max(dot(N, L), 0.1));
     // As filtering folds slope variance into the lobe, the glint stops being
@@ -606,7 +607,7 @@ const WATER_FRAGMENT = /* glsl */ `
     const float crestExponent = ${WATER_RENDER_CONTRACT.crestExponent.toFixed(1)};
     float crestD = (crestExponent + 2.0) / (2.0 * 3.14159265)
                  * pow(max(dot(N, H), 0.0), crestExponent);
-    vec3 resolvedCrestGlint = uSunColor * crestD * fresL
+    vec3 resolvedCrestGlint = uGlintColor * crestD * fresL
       * smoothstep(0.0, 0.06, L.z) * crestSite
       / (4.0 * max(NdotV, 0.1) * max(dot(N, L), 0.1));
     // Past the point where mip filtering can resolve individual N.H peaks,
@@ -729,6 +730,7 @@ export function createWebGLWater({
     // east/north/up, so negative y places this implied sun in the south.
     uBakedSunDir: { value: new THREE.Vector3(0.33, -0.5, 0.8).normalize() },
     uSunColor: { value: new THREE.Color() },
+    uGlintColor: { value: new THREE.Color() },
     uZenithColor: { value: new THREE.Color() },
     uHorizonColor: { value: new THREE.Color() },
     uHorizonCool: { value: new THREE.Color() },
@@ -865,6 +867,7 @@ export function createWebGLWater({
       uniforms.uCameraLocal.value.copy(cameraLocal);
       uniforms.uSunDir.value.copy(sunLocal);
       uniforms.uSunColor.value.copy(palette.sun);
+      uniforms.uGlintColor.value.copy(palette.glint);
       uniforms.uZenithColor.value.copy(palette.zenith);
       uniforms.uHorizonColor.value.copy(palette.horizon);
       uniforms.uHorizonCool.value.copy(palette.horizonCool);

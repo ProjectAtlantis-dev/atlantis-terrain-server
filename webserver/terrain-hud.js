@@ -10,6 +10,7 @@ function appendPanel(cssText) {
 }
 
 export function createTerrainHud({
+  onToggleCollapsed = () => {},
   onToggleMapMode,
   onToggleSeamMode,
   onToggleTileInspector,
@@ -42,6 +43,7 @@ export function createTerrainHud({
       event.target.id === 'renderBackendLink' ||
       event.target.id === 'roadDebugLink' ||
       event.target.id === 'resetViewLink' ||
+      event.target.id === 'hudToggleLink' ||
       TERRAIN_HUD_LINKS[event.target.id]
     );
     if (!isLink) hud.dataset.selecting = 'true';
@@ -123,6 +125,12 @@ export function createTerrainHud({
   window.addEventListener('contextmenu', clearSelecting);
   window.addEventListener('blur', clearSelecting);
   hud.addEventListener('click', event => {
+    if (event.target.id === 'hudToggleLink') {
+      event.stopPropagation();
+      event.preventDefault();
+      onToggleCollapsed();
+      return;
+    }
     if (
       event.target.id === 'mapModeLink' || event.target.id === 'seamModeLink' ||
       event.target.id === 'tileInspectorModeLink' ||
@@ -167,6 +175,27 @@ export function compassHeading(headingRad) {
   const degrees = (((-headingRad * 180) / Math.PI) % 360 + 360) % 360;
   const directions = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW'];
   return { degrees, compass: directions[Math.round(degrees / 45) % 8] };
+}
+
+export function cameraDriftIndicator(active) {
+  if (!active) return '';
+  return ' <span id="cameraDriftIndicator"'
+    + ' title="Camera keeps its forward velocity. Double-tap W or ↑ to disable."'
+    + ' style="display:inline-block;padding:0 5px;border:1px solid #ffb020;'
+    + 'border-radius:4px;background:#7a4300;color:#fff1bd;font-weight:700">'
+    + 'FORWARD LOCK</span>';
+}
+
+export function terrainHudHeader(collapsed) {
+  const action = collapsed ? 'Show HUD details' : 'Hide HUD details';
+  const arrow = collapsed ? '&#9660;' : '&#9650;';
+  return '<div style="display:flex;align-items:center;justify-content:space-between;gap:12px">'
+    + '<b>Clouds Terrain Managed Flask UX WIP</b>'
+    + `<button id="hudToggleLink" type="button" aria-expanded="${!collapsed}" `
+    + `aria-label="${action}" title="${action}" `
+    + 'style="border:0;padding:0 2px;background:none;color:#8fd0ff;'
+    + 'font:inherit;line-height:1;cursor:pointer">'
+    + `${arrow}</button></div>`;
 }
 
 export function renderGameClock(element, date, isPlaying, timeScale = 1) {

@@ -20,7 +20,13 @@ import { sharedSurfaceFieldStore } from './terrain-surface-fields.js';
 import { createWebGLGroundRing } from './render-backends/webgl-ground-ring.js';
 import { headingFromForward2D } from './terrain-priority.js';
 import { createTerrainHeadingDemandController } from './terrain-heading-demand.js';
-import { compassHeading, createTerrainHud, renderGameClock } from './terrain-hud.js';
+import {
+  cameraDriftIndicator,
+  compassHeading,
+  createTerrainHud,
+  renderGameClock,
+  terrainHudHeader,
+} from './terrain-hud.js';
 import { applyMapDrag, installTerrainKeyboardControls, installTerrainPointerControls } from './terrain-controls.js';
 import { stepVehicleDrive } from './terrain-vehicle.js';
 import { createTerrainVehicleRuntime } from './terrain-vehicle-runtime.js';
@@ -55,13 +61,18 @@ import { createTerrainFlyToTileRuntime } from './terrain-fly-to-tile.js';
 import { approximateLatLonToLocalMeters } from './terrain-local-coordinates.js';
 import { epsg3413DirectionBearing, epsg3413ToWgs84 } from './terrain-polar-stereo.js';
 import { createWaterRuntime, DEFAULT_WATER_PARAMS } from './water/water-runtime.js';
+import { waterCloudinessFromCoverage } from './water/water-sky.js';
 import {
   FAST_TIME_SCALE,
   getFastTimeRange,
   parseGameClockSnapshot,
   serializeGameClockSnapshot,
 } from './terrain-game-clock.js';
-import { advanceRealtimeMovement, MAX_REALTIME_STEP_SECONDS } from './terrain-realtime-step.js';
+import {
+  advanceRealtimeMovement,
+  MAX_REALTIME_STEP_SECONDS,
+  stepFreeFlightVelocity,
+} from './terrain-realtime-step.js';
 import { DETAIL_FADE_END_M, DETAIL_STRENGTH, setDetailTuning } from './terrain-detail-layer.js';
 import { terrainAglFromSurface, terrainSurfaceHeightAt } from './terrain-agl.js';
 
@@ -324,8 +335,14 @@ const renderer = renderBackend.renderer;
 document.body.appendChild(renderer.domElement);
 renderer.domElement.addEventListener('contextmenu', event => event.preventDefault());
 let tileInspectorRuntime = null;
+let hudCollapsed = false;
 
 const { hud, alt, gameClock: gameClockEl } = createTerrainHud({
+  onToggleCollapsed: () => {
+    hudCollapsed = !hudCollapsed;
+    updateHud();
+    requestRender();
+  },
   onToggleMapMode: () => toggleMapMode(),
   onToggleSeamMode: () => toggleSeamMode(),
   onToggleTileInspector: () => toggleTileInspector(),
@@ -615,6 +632,11 @@ function buildTuningControls(ap, ce) {
     renderingEnabled: renderBackend.takramCloudsEnabled,
     onRenderingEnabledChange: enabled => {
       renderBackend.setTakramCloudsEnabled(enabled);
+    },
+    onAppearanceChange: () => {
+      if (restoringTuningControls) return;
+      restoreCloudTemporalHistory = invalidateTerrainCloudHistory(cloudsEffect);
+      requestRender();
     },
   });
   }
@@ -1923,35 +1945,23 @@ function updateMovement(dt) {
   const MAX_SPEED = BASE_MAX_SPEED * sf;
   const STRAFE_SPEED = BASE_STRAFE_SPEED * sf;
 
-  // clamp existing speed to new AGL-scaled max
-  controls.speed = Math.max(-MAX_SPEED, Math.min(MAX_SPEED, controls.speed));
-  controls.strafeSpeed = Math.max(-STRAFE_SPEED, Math.min(STRAFE_SPEED, controls.strafeSpeed));
-
-  if (forwardPressed) {
-    controls.speed = Math.min(controls.speed + ACCEL * dt, MAX_SPEED);
-  } else if (backPressed) {
-    controls.speed = Math.max(controls.speed - ACCEL * dt, -MAX_SPEED);
-  } else if (!cameraRuntimeState.driftMode) {
-    if (controls.speed > 0) {
-      controls.speed = Math.max(controls.speed - BRAKE * dt, 0);
-    } else if (controls.speed < 0) {
-      controls.speed = Math.min(controls.speed + BRAKE * dt, 0);
-    }
-  }
-
-  if (controls.mapMode) {
-    controls.strafeSpeed = 0;
-  } else if (rightPressed) {
-    controls.strafeSpeed = Math.min(controls.strafeSpeed + ACCEL * dt, STRAFE_SPEED);
-  } else if (leftPressed) {
-    controls.strafeSpeed = Math.max(controls.strafeSpeed - ACCEL * dt, -STRAFE_SPEED);
-  } else if (!cameraRuntimeState.driftMode) {
-    if (controls.strafeSpeed > 0) {
-      controls.strafeSpeed = Math.max(controls.strafeSpeed - BRAKE * dt, 0);
-    } else if (controls.strafeSpeed < 0) {
-      controls.strafeSpeed = Math.min(controls.strafeSpeed + BRAKE * dt, 0);
-    }
-  }
+  const flightVelocity = stepFreeFlightVelocity({
+    speed: controls.speed,
+    strafeSpeed: controls.strafeSpeed,
+    forwardPressed,
+    backPressed,
+    leftPressed,
+    rightPressed,
+    forwardLock: cameraRuntimeState.driftMode,
+    mapMode: controls.mapMode,
+    acceleration: ACCEL,
+    brake: BRAKE,
+    maxSpeed: MAX_SPEED,
+    maxStrafeSpeed: STRAFE_SPEED,
+    dt,
+  });
+  controls.speed = flightVelocity.speed;
+  controls.strafeSpeed = flightVelocity.strafeSpeed;
 
   if (controls.mapMode) {
     updateMapCamera();
@@ -2088,8 +2098,8 @@ function updateHud() {
   }
   renderGameClock(gameClockEl, gameDate, gameClockState.running, gameClockState.timeScale);
 
-  const hudHtml = [
-    '<b>Clouds Terrain Managed Flask UX WIP</b>',
+  const hudRows = [
+    terrainHudHeader(hudCollapsed),
     `mode: <b>${modeHtml}</b>`,
     `renderer: <span id="renderBackendLink" title="Switch to ${nextRenderBackendLabel}" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">${renderBackendLabel}</span>`,
     `fps: <b>${fpsCounter.display}</b>`,
@@ -2101,7 +2111,7 @@ function updateHud() {
           : ' · aim: no terrain hit')
       : '',
     `enu: E ${eastM.toFixed(0)}m  N ${northM.toFixed(0)}m  U ${altM.toFixed(0)}m`,
-    `speed: ${speedKmh.toFixed(0)} km/h  heading: ${deg.toFixed(0)}° ${compass}`,
+    `speed: ${speedKmh.toFixed(0)} km/h${cameraDriftIndicator(cameraRuntimeState.driftMode)}  heading: ${deg.toFixed(0)}° ${compass}`,
     hmLine,
     texLine,
     gridlinesLine,
@@ -2120,7 +2130,8 @@ function updateHud() {
       ` · <span id="roadDebugLink" style="color:${roadDebugColor};text-decoration:underline;cursor:pointer;pointer-events:auto">${roadDebugLabel}</span>` +
       ' · <span id="resetViewLink" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">reset</span>' +
       ' · <span id="debugLogLink" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">debug log</span>'
-  ].join('<br>');
+  ];
+  const hudHtml = (hudCollapsed ? hudRows.slice(0, 1) : hudRows).join('<br>');
   // Rewriting innerHTML every rendered frame forces a DOM parse + relayout
   // even when nothing changed — only write when the content differs. The
   // selection guards pause writes while the user is selecting HUD text to
@@ -2195,6 +2206,7 @@ function resetView() {
   tuningPanelOpen = false;
   tuningBody.style.display = 'none';
   document.getElementById('tuning-toggle').innerHTML = '&#9660;';
+  hudCollapsed = false;
   updateHud();
   // Re-fetch tiles around the reset camera position.
   terrainPipelineState.firstLoad = true;
@@ -2351,6 +2363,8 @@ installTerrainKeyboardControls({
   onForwardDoubleTap: () => {
     cameraRuntimeState.driftMode = !cameraRuntimeState.driftMode;
     console.log(`[drift] ${cameraRuntimeState.driftMode ? 'ON' : 'OFF'}`);
+    updateHud();
+    requestRender();
   },
   onEscapeVehicle: () => {
     vehicleRuntime.saveVehicleState('escape', { snapToGround: true, requireGroundedZ: false, bypassSnapThrottle: true });
@@ -2596,6 +2610,21 @@ function render() {
   renderBackend.setFogDensity(fogStrength / getFogDistance());
   renderBackend.setMapMode(controls.mapMode);
 
+  // Water owns an analytic reflection sky because neither atmosphere backend
+  // is directly sampleable by the surface shader. Keep its overcast blend
+  // driven by the sky that is actually enabled; the old private parameter
+  // remained permanently zero, so cloud coverage changed the sky while the
+  // water kept reflecting a clear sunrise.
+  const cloudCoverage = USE_WEBGPU_RENDER_BACKEND
+    ? webgpuCloudShadowSettings.coverage
+    : cloudsEffect.coverage;
+  const cloudRenderingEnabled = USE_WEBGPU_RENDER_BACKEND
+    ? webgpuCloudShadowSettings.enabled
+    : renderBackend.takramCloudsEnabled;
+  waterParams.cloudiness = waterCloudinessFromCoverage(
+    cloudCoverage,
+    cloudRenderingEnabled,
+  );
   waterRuntime.update({
     dt, camera,
     visible: waterParams.enabled && !controls.mapMode

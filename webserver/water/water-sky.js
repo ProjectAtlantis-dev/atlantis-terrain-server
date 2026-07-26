@@ -27,16 +27,37 @@ const OVERCAST_DEEP = new THREE.Color(0.024, 0.035, 0.037);
 const CLEAR_SCATTER = new THREE.Color(0.020, 0.16, 0.18);
 const OVERCAST_SCATTER = new THREE.Color(0.05, 0.14, 0.14);
 const scratch = new THREE.Color();
+const GLINT_CHROMA_RETENTION = 0.2;
 
 export function createWaterPalette() {
   return {
     sun: new THREE.Color(),
+    glint: new THREE.Color(),
     zenith: new THREE.Color(),
     horizon: new THREE.Color(),      // sunward horizon (goes warm at dusk)
     horizonCool: new THREE.Color(),  // anti-sun horizon (stays cool, just dims)
     deep: new THREE.Color(),
     scatter: new THREE.Color(),
   };
+}
+
+export function computeWaterGlintColor(target, sunColor) {
+  // Direct glint is an HDR mirror highlight, not the body/horizon colour.
+  // Feeding the full dusk chroma into a Cook-Torrance peak and then exposure
+  // 10 produced a broad copper sheet that barely responded to palette edits:
+  // AgX was compressing tens of scene-linear units after the red-biased term
+  // had already been added. Preserve luminance while compressing only the
+  // highlight chroma, leaving the analytic horizon and sun disk warm.
+  const luminance =
+    sunColor.r * 0.2126 + sunColor.g * 0.7152 + sunColor.b * 0.0722;
+  return target
+    .setRGB(luminance, luminance, luminance)
+    .lerp(sunColor, GLINT_CHROMA_RETENTION);
+}
+
+export function waterCloudinessFromCoverage(coverage, renderingEnabled = true) {
+  if (!renderingEnabled || !Number.isFinite(coverage)) return 0;
+  return THREE.MathUtils.clamp(coverage, 0, 1);
 }
 
 export function computeWaterPalette(palette, { sunElevationDeg, cloudiness = 0 }) {
@@ -59,5 +80,6 @@ export function computeWaterPalette(palette, { sunElevationDeg, cloudiness = 0 }
   palette.horizonCool.lerp(scratch.setRGB(0.31, 0.33, 0.35).multiplyScalar(dayLevel), c);
   palette.deep.copy(CLEAR_DEEP).lerp(OVERCAST_DEEP, c);
   palette.scatter.copy(CLEAR_SCATTER).lerp(OVERCAST_SCATTER, c);
+  computeWaterGlintColor(palette.glint, palette.sun);
   return palette;
 }

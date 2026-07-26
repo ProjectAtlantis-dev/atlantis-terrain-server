@@ -236,6 +236,7 @@ export function createWebGPUWater({
   // east/north/up, so negative y places this implied sun in the south.
   const uBakedSunDir = uniform(new Vector3(0.33, -0.5, 0.8).normalize()).setName('waterBakedSunDir');
   const uSunColor = uniform(new Color()).setName('waterSunColor');
+  const uGlintColor = uniform(new Color()).setName('waterGlintColor');
   const uZenithColor = uniform(new Color()).setName('waterZenithColor');
   const uHorizonColor = uniform(new Color()).setName('waterHorizonColor');
   const uHorizonCool = uniform(new Color()).setName('waterHorizonCool');
@@ -706,7 +707,7 @@ export function createWebGPUWater({
     const H = normalize(L.add(V));
     const LdotH = L.dot(H).max(0.0);
     const fresL = LdotH.oneMinus().pow(5.0).mul(0.978).add(0.022);
-    let spec = uSunColor.mul(ggxAniso(
+    let spec = uGlintColor.mul(ggxAniso(
       H, N, Twind, Bwind, ax2.sqrt().max(0.002), ay2.sqrt().max(0.002),
     ))
       .mul(fresL)
@@ -746,7 +747,7 @@ export function createWebGPUWater({
     const crestExponent = WATER_RENDER_CONTRACT.crestExponent;
     const crestD = N.dot(H).max(0.0).pow(crestExponent)
       .mul((crestExponent + 2.0) / (2.0 * Math.PI));
-    const resolvedCrestGlint = uSunColor.mul(crestD).mul(fresL)
+    const resolvedCrestGlint = uGlintColor.mul(crestD).mul(fresL)
       .mul(smoothstep(0.0, 0.06, L.z)).mul(crestSite)
       .div(NdotV.max(0.1).mul(N.dot(L).max(0.1)).mul(4.0));
     // Past the point where mip filtering can resolve individual N.H peaks,
@@ -1041,6 +1042,7 @@ export function createWebGPUWater({
       uCameraLocal.value.copy(cameraLocal);
       uSunDir.value.copy(sunLocal);
       uSunColor.value.copy(palette.sun);
+      uGlintColor.value.copy(palette.glint);
       uZenithColor.value.copy(palette.zenith);
       uHorizonColor.value.copy(palette.horizon);
       uHorizonCool.value.copy(palette.horizonCool);
