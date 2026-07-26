@@ -1,6 +1,14 @@
 export const TERRAIN_HUD_LINKS = Object.freeze({
   debugLogLink: '/client_log.html',
+  classifierOpsLink: '/classifier.html',
 });
+
+// The HUD action list is one link per line: stacked keeps the panel narrow,
+// which matters because the HUD is anchored top-left over the terrain.
+export function hudActionLink(id, label, color = '#0af') {
+  return `<span id="${id}" style="color:${color};text-decoration:underline;`
+    + `cursor:pointer;pointer-events:auto">${label}</span>`;
+}
 
 function appendPanel(cssText) {
   const element = document.createElement('div');
@@ -20,6 +28,8 @@ export function createTerrainHud({
   onToggleHydrographyOverlay,
   onToggleRenderBackend,
   onToggleRoadDebug,
+  onOpenGoogleMaps,
+  onStartFastTime,
   onReset,
   onClockAction,
 }) {
@@ -42,6 +52,8 @@ export function createTerrainHud({
       event.target.id === 'hydrographyOverlayLink' ||
       event.target.id === 'renderBackendLink' ||
       event.target.id === 'roadDebugLink' ||
+      event.target.id === 'googleMaps3dLink' ||
+      event.target.id === 'fastTimeLink' ||
       event.target.id === 'resetViewLink' ||
       event.target.id === 'hudToggleLink' ||
       TERRAIN_HUD_LINKS[event.target.id]
@@ -101,6 +113,18 @@ export function createTerrainHud({
       onToggleRoadDebug();
       return;
     }
+    if (event.target.id === 'googleMaps3dLink') {
+      event.stopPropagation();
+      event.preventDefault();
+      onOpenGoogleMaps();
+      return;
+    }
+    if (event.target.id === 'fastTimeLink') {
+      event.stopPropagation();
+      event.preventDefault();
+      onStartFastTime();
+      return;
+    }
     if (event.target.id === 'resetViewLink') {
       event.stopPropagation();
       event.preventDefault();
@@ -139,7 +163,9 @@ export function createTerrainHud({
       event.target.id === 'waterOverlayLink' ||
       event.target.id === 'hydrographyOverlayLink' ||
       event.target.id === 'renderBackendLink' ||
-      event.target.id === 'roadDebugLink' || event.target.id === 'resetViewLink' ||
+      event.target.id === 'roadDebugLink' ||
+      event.target.id === 'googleMaps3dLink' ||
+      event.target.id === 'fastTimeLink' || event.target.id === 'resetViewLink' ||
       TERRAIN_HUD_LINKS[event.target.id]
     ) {
       event.stopPropagation();
@@ -190,7 +216,7 @@ export function terrainHudHeader(collapsed) {
   const action = collapsed ? 'Show HUD details' : 'Hide HUD details';
   const arrow = collapsed ? '&#9660;' : '&#9650;';
   return '<div style="display:flex;align-items:center;justify-content:space-between;gap:12px">'
-    + '<b>Clouds Terrain Managed Flask UX WIP</b>'
+    + '<b>Greenland HUD</b>'
     + `<button id="hudToggleLink" type="button" aria-expanded="${!collapsed}" `
     + `aria-label="${action}" title="${action}" `
     + 'style="border:0;padding:0 2px;background:none;color:#8fd0ff;'

@@ -24,6 +24,7 @@ import {
   cameraDriftIndicator,
   compassHeading,
   createTerrainHud,
+  hudActionLink,
   renderGameClock,
   terrainHudHeader,
 } from './terrain-hud.js';
@@ -358,6 +359,8 @@ const { hud, alt, gameClock: gameClockEl } = createTerrainHud({
     onToggleRenderBackend();
   },
   onToggleRoadDebug: () => toggleRoadDebug(),
+  onOpenGoogleMaps: () => openGoogleMapsView(),
+  onStartFastTime: () => startFastTime(),
   onReset: () => resetView(),
   onClockAction: action => {
     if (action === 'rw') rewindGameClock();
@@ -2122,14 +2125,15 @@ function updateHud() {
       ? 'W/S drive, A/D steer, mouse orbit camera, Esc exits vehicle control'
       : 'WASD or Arrows move, Q/Z altitude, drag look',
     'map: left-drag rotate, right-drag pan, wheel zoom',
-    `<span id="mapModeLink" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">${controls.mapMode && !controls.seamMode && !tileInspectorRuntime?.active ? '3D view' : 'map mode'}</span> (M)` +
-      ` · <span id="seamModeLink" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">${controls.seamMode ? '3D view' : 'seam view'}</span>` +
-      ` · <span id="tileInspectorModeLink" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">${tileInspectorRuntime?.active ? '3D view' : 'tile inspector'}</span>` +
-      ' · Google 3D (G)' +
-      ' · fast time 03:00–03:00 (P)' +
-      ` · <span id="roadDebugLink" style="color:${roadDebugColor};text-decoration:underline;cursor:pointer;pointer-events:auto">${roadDebugLabel}</span>` +
-      ' · <span id="resetViewLink" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">reset</span>' +
-      ' · <span id="debugLogLink" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">debug log</span>'
+    `${hudActionLink('mapModeLink', controls.mapMode && !controls.seamMode && !tileInspectorRuntime?.active ? '3D view' : 'map mode')} (M)`,
+    hudActionLink('seamModeLink', controls.seamMode ? '3D view' : 'seam view'),
+    hudActionLink('tileInspectorModeLink', tileInspectorRuntime?.active ? '3D view' : 'tile inspector'),
+    hudActionLink('googleMaps3dLink', 'Google 3D'),
+    hudActionLink('fastTimeLink', 'fast time 03:00–03:00'),
+    hudActionLink('roadDebugLink', roadDebugLabel, roadDebugColor),
+    hudActionLink('resetViewLink', 'reset'),
+    hudActionLink('debugLogLink', 'debug log'),
+    hudActionLink('classifierOpsLink', 'classifier ops'),
   ];
   const hudHtml = (hudCollapsed ? hudRows.slice(0, 1) : hudRows).join('<br>');
   // Rewriting innerHTML every rendered frame forces a DOM parse + relayout
@@ -2371,9 +2375,7 @@ installTerrainKeyboardControls({
     vehicleRuntime.setVehicleControlActive(false, 'escape', { skipExitSave: true });
   },
   onToggleMap: toggleMapMode,
-  onOpenGoogleMaps: openGoogleMapsView,
   onFlyToTile: promptFlyToTile,
-  onStartFastTime: startFastTime,
   onToggleHeadlights: () => {
     for (const light of vehicleRuntime.vehicleHeadlightSpots) light.visible = !light.visible;
   },

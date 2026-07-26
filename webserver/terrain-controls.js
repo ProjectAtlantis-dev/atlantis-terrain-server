@@ -79,9 +79,7 @@ export function installTerrainKeyboardControls({
   onForwardDoubleTap,
   onEscapeVehicle,
   onToggleMap,
-  onOpenGoogleMaps = () => {},
   onFlyToTile = () => {},
-  onStartFastTime = () => {},
   onToggleHeadlights,
   onChanged = () => {},
   doubleTapMs = 300,
@@ -109,8 +107,6 @@ export function installTerrainKeyboardControls({
       return;
     }
     if (event.code === 'KeyM') return onToggleMap();
-    if (event.code === 'KeyG') return onOpenGoogleMaps();
-    if (event.code === 'KeyP') return onStartFastTime();
     if (event.code === 'KeyT') {
       // Clear the key first — the prompt dialog swallows the keyup event,
       // which would leave KeyT stuck and force continuous rendering.
