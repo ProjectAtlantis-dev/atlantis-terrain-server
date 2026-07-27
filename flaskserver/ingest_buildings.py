@@ -252,7 +252,7 @@ def ingest(zip_path, db_path):
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    parser = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[0])
     parser.add_argument("zip", type=Path, help="TekniskGrundkort SHP zip from kortforsyning.asiaq.gl")
     parser.add_argument("--db", type=Path, default=Path(__file__).parent / "terrain.db")
     args = parser.parse_args()

@@ -14,6 +14,8 @@
     flex-wrap: wrap;
   }
   #bar b { color: #5af; }
+  #bar a { color: #8fb0cc; text-decoration: none; }
+  #bar a:hover { color: #5af; }
   input {
     background: rgba(255,255,255,0.07); border: 1px solid #2a3a4a; border-radius: 4px;
     color: #dbe5f1; padding: 4px 8px; font: inherit; outline: none; width: 150px;
@@ -28,26 +30,41 @@
     color: #dbe5f1; padding: 2px 4px; font: inherit; outline: none;
   }
   #meta { color: #6889a8; }
-  #flow { display: flex; gap: 4px; padding: 12px; justify-content: center; align-items: flex-start; }
-  .stage {
-    display: flex; flex-direction: column; gap: 5px; min-width: 0;
-    width: min(15vw, calc(100vh - 170px));
+  /* One shared grid: every stage contributes cells to the SAME rows
+     (1 title / 2 image / 3 legend / 4 status / 5 description), so the
+     images stay on one line no matter how long any description runs.
+     The stage wrapper uses display:contents; explicit grid-column comes
+     from the generated markup. */
+  #flow {
+    display: grid; gap: 5px 4px; padding: 12px;
+    justify-content: center; align-items: start;
   }
-  .stage .name { text-align: center; color: #dbe5f1; font-weight: bold; }
-  .stage .what { text-align: center; color: #44607c; font-size: 12px; line-height: 1.3; min-height: 3.9em; }
+  .stage { display: contents; }
+  .stage .name {
+    grid-row: 1; text-align: center; color: #dbe5f1; font-weight: bold;
+    align-self: end; white-space: nowrap;
+  }
+  .stage .what {
+    grid-row: 5; text-align: center; color: #44607c; font-size: 12px;
+    line-height: 1.3;
+  }
   .imgbox {
-    position: relative; background: #060a10; border: 1px solid #1e2d3a;
-    width: 100%; aspect-ratio: 1;
+    grid-row: 2; position: relative; background: #060a10;
+    border: 1px solid #1e2d3a;
+    width: min(15vw, calc(100vh - 230px)); aspect-ratio: 1;
   }
   .imgbox img { width: 100%; height: 100%; display: block; }
   .imgbox .status {
     position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
     color: #6889a8; text-align: center; padding: 8px; pointer-events: none;
   }
-  .stage .info { text-align: center; color: #8fb0cc; font-size: 12px; line-height: 1.35; word-break: break-word; }
+  .stage .info {
+    grid-row: 4; text-align: center; color: #8fb0cc; font-size: 12px;
+    line-height: 1.35; word-break: break-word;
+  }
   .legend {
-    display: flex; flex-wrap: wrap; gap: 3px 10px; justify-content: center;
-    color: #8fb0cc; font-size: 12px;
+    grid-row: 3; display: flex; flex-wrap: wrap; gap: 3px 10px;
+    justify-content: center; color: #8fb0cc; font-size: 12px;
   }
   .key-item { display: flex; align-items: center; gap: 5px; }
   .key-swatch {
@@ -56,7 +73,7 @@
   }
   .info .ok { color: #4cc38a; }
   .info .bad { color: #e5484d; }
-  .arrow { align-self: center; color: #2a5a8a; font-size: 22px; padding: 0 2px; margin-top: 14vh; }
+  .arrow { grid-row: 2; align-self: center; color: #2a5a8a; font-size: 22px; padding: 0 2px; }
   #help { padding: 4px 14px 14px; color: #44607c; text-align: center; }
   kbd {
     background: #16222e; border: 1px solid #2a3a4a; border-radius: 3px;
@@ -71,6 +88,7 @@
   <button id="go">Go</button>
   <button id="up" title="parent tile ([)">&minus; depth</button>
   <button id="down" title="child tile (])">+ depth</button>
+  <a href="/classifier.html">classifier operations &rarr;</a>
   <span id="meta"></span>
 </div>
 <div id="flow"></div>
@@ -79,8 +97,14 @@
 </div>
 <script>
 const RES = 512;
+const CLASSIFIER_VERSION = 9;
+const SURFACE_MASK_VERSION = 10;
 let depth = 0, col = 0, row = 0;
 const $ = id => document.getElementById(id);
+const escapeHtml = value => String(value ?? '?').replace(
+  /[&<>"']/g,
+  char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[char],
+);
 
 // The pipeline, in order. Each stage: what it is, where its image comes from,
 // and how to describe its status from /api/pipeline/<tid>.json.
@@ -94,24 +118,53 @@ const STAGES = [
       : '<span class="bad">missing — fly here to fetch</span>'
   },
   {
-    key: 'channels', name: '2 southness',
-    what: 'aspect from the heightmap (red = south-facing, blue = north) — combines slope + sun; nothing lives on the blue side',
-    img: tid => `/api/channel/${tid}/southness.png?res=${RES}`,
+    key: 'channels', name: '2 DEM channels',
+    what: 'derived straight from the heightmap, pixel-aligned with the texture. southness: red = south-facing, blue = north (nothing lives on the blue side). slope: steepness, brighter = steeper. sun: hillshade preview.',
+    select: ['southness', 'slope', 'sun'],
+    img: (tid, chan) => `/api/channel/${tid}/${chan || 'southness'}.png?res=${RES}`,
     info: m => m.heightmap.ok
       ? '<span class="ok">derived on the fly</span>'
       : '<span class="bad">needs the heightmap</span>'
   },
   {
     key: 'texture', name: '3 texture',
-    what: 'Dataforsyningen SPOT/aerial ortho — the real imagery, faithful through d12',
+    what: 'Dataforsyningen SPOT/aerial ortho — real imagery through d12 only. Deeper tiles show a derived enlarge of their parent (flagged red in the status line): synthetic, never mistake it for genuine coverage.',
     img: tid => `/api/texture/${tid}.jpg`,
-    info: m => m.texture.ok
-      ? `<span class="ok">cached</span> · ${m.texture.source} · ${(m.texture.bytes / 1024).toFixed(0)} kB`
-      : '<span class="bad">not fetched yet</span>'
+    info: m => {
+      if (!m.texture.ok) return '<span class="bad">not fetched yet</span>';
+      const synthetic = m.texture.source === 'fractal_upscale';
+      const src = synthetic
+        ? '<span class="bad">fractal_upscale — SYNTHETIC, not real imagery</span>'
+        : m.texture.source;
+      return `<span class="ok">cached</span> · ${src} · ${(m.texture.bytes / 1024).toFixed(0)} kB`;
+    }
   },
   {
-    key: 'procgen', name: '4 procgen',
-    what: 'below-d12 synthesis from classifier output + DEM + seed — deterministic',
+    key: 'classifier', name: '4 classifier',
+    what: 'hierarchical ladder (coarse_v4): DEM co-proposes with imagery — slope/aspect/sun/greenline gate green; dark flat sheets seed lakes, then DEM-only elevation/slope flood fill finds their edges. Every non-snow land pixel inside the terrain-shaped 6–15 m water reach becomes coherent sand or shore rock at full 256 px resolution, so vegetation cannot survive against water. Bright/flat banks lean sand, dark/steep banks lean rock, and world-anchored deterministic variation breaks up uniform rings without tile seams. "raw mask" is what detail/scatter read (R=rock, sand marker 64, dark 128, shore-rock marker 192; G=veg; B=snow; water/lake black).',
+    select: ['colorized', 'raw mask'],
+    img: (tid, mode) => mode === 'raw mask'
+      ? `/api/classifier/${tid}.png?raw=1&res=${RES}&v=${SURFACE_MASK_VERSION}`
+      : `/api/classifier/${tid}.png?res=${RES}&v=${CLASSIFIER_VERSION}`,
+    // Matches classifier/storage.py CLASS_SCHEMAS['coarse_v4'].palette
+    // EXACTLY — this is a deliberate high-contrast debug palette, not
+    // intuitive tones (grey reads as purple, dark as orange). A legend
+    // that doesn't match the real colors makes correct output look wrong.
+    legend: { grey: 'rgb(150,105,210)', green: 'rgb(150,225,60)', dark: 'rgb(255,140,0)', white: 'rgb(255,255,255)', water: 'rgb(255,42,161)', shadow: 'rgb(60,120,255)', lake: 'rgb(0,200,220)', sand: 'rgb(255,230,90)', 'shore rock': 'rgb(105,92,125)' },
+    info: () => `<span>requesting classifier v${CLASSIFIER_VERSION}…</span>`,
+    responseInfo: response => {
+      const status = response.headers.get('X-Classifier-Status') || '?';
+      const source = response.headers.get('X-Classifier-Source') || '?';
+      const schema = response.headers.get('X-Classifier-Schema') || '?';
+      const ancestor = response.headers.get('X-Classifier-Ancestor');
+      return `<span class="${status === 'ready' ? 'ok' : 'bad'}">${escapeHtml(status)}</span>` +
+        ` · source <b>${escapeHtml(source)}</b> · schema ${escapeHtml(schema)}` +
+        (ancestor ? ` · ancestor ${escapeHtml(ancestor)}` : ' · exact tile');
+    }
+  },
+  {
+    key: 'procgen', name: '5 procgen',
+    what: 'below-d12 clean DEM interpolation + full-resolution classifier fields — deterministic',
     img: null,
     info: () => '<span class="bad">not built yet</span> — this is the next thing'
   },
@@ -126,18 +179,24 @@ function parseTile(str) {
 }
 
 function buildFlow() {
-  $('flow').innerHTML = STAGES.map((s, i) => `
-    ${i ? '<div class="arrow">&rarr;</div>' : ''}
+  // display:contents stages: every cell carries its explicit grid column
+  // (odd columns = stages, even columns = arrows) so all cells of a stage
+  // stack in one column while rows stay shared across stages.
+  $('flow').innerHTML = STAGES.map((s, i) => {
+    const col = `style="grid-column:${2 * i + 1}"`;
+    return `
+    ${i ? `<div class="arrow" style="grid-column:${2 * i}">&rarr;</div>` : ''}
     <div class="stage">
-      <div class="name">${s.name}
+      <div class="name" ${col}>${s.name}
         ${s.select ? `<select id="sel-${s.key}">${s.select.map(o => `<option>${o}</option>`).join('')}</select>` : ''}
       </div>
-      <div class="what">${s.what}</div>
-      <div class="imgbox"><img id="img-${s.key}" alt=""><div class="status" id="st-${s.key}"></div></div>
-      ${s.legend ? `<div class="legend">${Object.entries(s.legend).map(([n, c]) =>
+      <div class="imgbox" ${col}><img id="img-${s.key}" alt=""><div class="status" id="st-${s.key}"></div></div>
+      ${s.legend ? `<div class="legend" ${col}>${Object.entries(s.legend).map(([n, c]) =>
         `<span class="key-item"><span class="key-swatch" style="background:${c}"></span>${n}</span>`).join('')}</div>` : ''}
-      <div class="info" id="info-${s.key}"></div>
-    </div>`).join('');
+      <div class="info" id="info-${s.key}" ${col}></div>
+      <div class="what" ${col}>${s.what}</div>
+    </div>`;
+  }).join('');
   for (const s of STAGES) {
     if (s.select) $(`sel-${s.key}`).addEventListener('change', () => loadStageImage(s));
   }
@@ -154,12 +213,15 @@ async function loadStageImage(s, refresh) {
   stEl.textContent = 'loading…';
   imgEl.style.opacity = 0.35;
   try {
-    const resp = await fetch(url);
+    const resp = await fetch(url, { cache: 'no-store' });
     if (!resp.ok || resp.status === 202) {
       imgEl.removeAttribute('src');
       stEl.textContent = resp.status === 202 ? 'fetching upstream — retry shortly'
         : `HTTP ${resp.status} ${resp.headers.get('X-Tex-Status') || ''}`;
       return;
+    }
+    if (s.responseInfo) {
+      $(`info-${s.key}`).innerHTML = s.responseInfo(resp);
     }
     const blob = await resp.blob();
     if (imgEl.dataset.blobUrl) URL.revokeObjectURL(imgEl.dataset.blobUrl);
@@ -181,7 +243,7 @@ async function load() {
   $('meta').textContent = `depth ${depth}`;
   let meta = null;
   try {
-    const r = await fetch(`/api/pipeline/${tid}.json`);
+    const r = await fetch(`/api/pipeline/${tid}.json`, { cache: 'no-store' });
     meta = r.ok ? await r.json() : null;
     if (meta) $('meta').textContent = `depth ${depth} · ${meta.size_m} m across`;
   } catch (e) { /* statuses degrade gracefully */ }

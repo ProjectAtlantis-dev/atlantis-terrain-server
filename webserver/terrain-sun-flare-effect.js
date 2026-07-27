@@ -17,9 +17,14 @@ const fragmentShader = /* glsl */ `
   }
 
   void mainImage(const vec4 inputColor, const vec2 uv, out vec4 outputColor) {
-    vec2 delta = uv - sunUv;
-    delta.x *= aspectRatio;
-    float radius = length(delta);
+    // sunVisible is uniform across the draw, so every fragment takes the same
+    // branch. Once the CPU has faded an offscreen sun to zero, avoid all flare
+    // texture reads and analytic glow work while the fused tone-map and dither
+    // effects continue normally.
+    if (sunVisible <= 1e-4) {
+      outputColor = inputColor;
+      return;
+    }
 
     // Use the already-resolved HDR sun pixel as a cheap cloud-visibility
     // signal. Every fragment reads the same texel, so this is cache-friendly
@@ -37,7 +42,14 @@ const fragmentShader = /* glsl */ `
       * smoothstep(-0.08, 0.04, 1.0 - sunUv.x)
       * smoothstep(-0.08, 0.04, 1.0 - sunUv.y);
     float visibility = sunVisible * sourceGate * terrainGate * edgeGate;
+    if (visibility <= 1e-4) {
+      outputColor = inputColor;
+      return;
+    }
 
+    vec2 delta = uv - sunUv;
+    delta.x *= aspectRatio;
+    float radius = length(delta);
     vec3 sourceTint = source / max(sourceLuminance, 1e-4);
     vec3 warmTint = mix(vec3(1.0, 0.62, 0.28), sourceTint, 0.3);
 
@@ -67,6 +79,7 @@ const fragmentShader = /* glsl */ `
 
 const viewDirection = new Vector3();
 const projectedDirection = new Vector3();
+const VISIBILITY_EPSILON = 1e-4;
 
 export function projectSunDirectionToUv(camera, sunDirection, target = new Vector2()) {
   if (camera == null || sunDirection == null) return false;
@@ -97,6 +110,15 @@ export function sunFlareElevationVisibility(
   // HDR tone mapping makes a linear half-strength flare still appear nearly
   // full-strength. Squaring the ramp produces a visible golden-hour fade.
   return smooth * smooth;
+}
+
+export function stepSunFlareVisibility(current, target, seconds, active = true) {
+  if (!active) return 0;
+  const safeSeconds = Number.isFinite(seconds) && seconds > 0 ? seconds : 1 / 60;
+  const timeConstant = target > current ? 0.25 : 0.75;
+  const blend = 1 - Math.exp(-safeSeconds / timeConstant);
+  const next = current + (target - current) * blend;
+  return target <= 0 && next <= VISIBILITY_EPSILON ? 0 : next;
 }
 
 export class TerrainSunFlareEffect extends Effect {
@@ -151,10 +173,12 @@ export class TerrainSunFlareEffect extends Effect {
       this.surfaceUp,
     );
     const target = this.edgeLatched ? elevationVisibility : 0;
-    const seconds = Number.isFinite(deltaTime) && deltaTime > 0 ? deltaTime : 1 / 60;
-    const timeConstant = target > this.edgeVisibility ? 0.25 : 0.75;
-    const blend = 1 - Math.exp(-seconds / timeConstant);
-    this.edgeVisibility += (target - this.edgeVisibility) * blend;
+    this.edgeVisibility = stepSunFlareVisibility(
+      this.edgeVisibility,
+      target,
+      deltaTime,
+      this.edgeLatched,
+    );
     this.uniforms.get('sunVisible').value = this.edgeVisibility;
   }
 

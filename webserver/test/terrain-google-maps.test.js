@@ -25,7 +25,9 @@ test('Google Maps URL uses camera coordinates and height above ground', () => {
   }), 'https://www.google.com/maps/@64.1800000,-51.7200000,240.0a,60.0y,90.00h,90.00t/data=!3m1!1e3');
 });
 
-test('G key opens Google Maps once and C remains unassigned', () => {
+// Google 3D and fast time are HUD links now, not shortcuts. Passing the old
+// handler names must stay inert so a stray G or P cannot fire them.
+test('G, P, and C are unassigned keys', () => {
   const previousWindow = globalThis.window;
   const listeners = new Map();
   globalThis.window = {
@@ -33,6 +35,7 @@ test('G key opens Google Maps once and C remains unassigned', () => {
     removeEventListener(type) { listeners.delete(type); },
   };
   let opens = 0;
+  let starts = 0;
   let gridlinesToggles = 0;
   const noop = () => {};
   const dispose = installTerrainKeyboardControls({
@@ -42,16 +45,18 @@ test('G key opens Google Maps once and C remains unassigned', () => {
     onEscapeVehicle: noop,
     onToggleMap: noop,
     onOpenGoogleMaps: () => { opens += 1; },
+    onStartFastTime: () => { starts += 1; },
     onToggleGridlines: () => { gridlinesToggles += 1; },
     onReset: noop,
     onToggleHeadlights: noop,
   });
   try {
-    listeners.get('keydown')({ code: 'KeyG', repeat: false });
-    listeners.get('keydown')({ code: 'KeyG', repeat: true });
-    listeners.get('keydown')({ code: 'KeyC', repeat: false });
-    listeners.get('keydown')({ code: 'KeyC', repeat: true });
-    assert.equal(opens, 1);
+    for (const code of ['KeyG', 'KeyP', 'KeyC']) {
+      listeners.get('keydown')({ code, repeat: false });
+      listeners.get('keydown')({ code, repeat: true });
+    }
+    assert.equal(opens, 0);
+    assert.equal(starts, 0);
     assert.equal(gridlinesToggles, 0);
   } finally {
     dispose();
@@ -92,30 +97,3 @@ test('H and R remain unassigned to tile inspector and road debug', () => {
   }
 });
 
-test('P starts fast time once per key press', () => {
-  const previousWindow = globalThis.window;
-  const listeners = new Map();
-  globalThis.window = {
-    addEventListener(type, callback) { listeners.set(type, callback); },
-    removeEventListener(type) { listeners.delete(type); },
-  };
-  let starts = 0;
-  const noop = () => {};
-  const dispose = installTerrainKeyboardControls({
-    controls: { keys: {} },
-    isVehicleActive: () => false,
-    onForwardDoubleTap: noop,
-    onEscapeVehicle: noop,
-    onToggleMap: noop,
-    onStartFastTime: () => { starts += 1; },
-    onToggleHeadlights: noop,
-  });
-  try {
-    listeners.get('keydown')({ code: 'KeyP', repeat: false });
-    listeners.get('keydown')({ code: 'KeyP', repeat: true });
-    assert.equal(starts, 1);
-  } finally {
-    dispose();
-    globalThis.window = previousWindow;
-  }
-});

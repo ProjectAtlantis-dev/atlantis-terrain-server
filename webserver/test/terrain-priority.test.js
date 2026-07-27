@@ -11,32 +11,36 @@ import {
   viewHeadingChanged,
   terrainTilePriority,
 } from '../terrain-priority.js';
-import { compassHeading } from '../terrain-hud.js';
+import { cameraDriftIndicator, compassHeading } from '../terrain-hud.js';
 import { applyMapDrag } from '../terrain-controls.js';
 import { createVehiclePersistenceRuntime, normalizeSavedVehicleState, stepSuspension, stepVehicleDrive, terrainBboxIntersectsCircle, vehicleLatLonToLocal, vehicleLocalToLatLon, vehicleStateSnapshot } from '../terrain-vehicle.js';
 import { scoreTextureTiles, textureRetryDelay, tileDepthFromId } from '../terrain-tile-runtime.js';
 import { createTextureStreamer, rendererTextureAnisotropy } from '../terrain-texture-streamer.js';
 import {
   createTerrainTextureController,
-  createTerrainTileReconciler,
   createTerrainTileSet,
   createTileLifecycle,
   reconcileTerrainTiles,
 } from '../terrain-tile-set.js';
 import { createTerrainMeshBuilder, decodeTerrainHeightmap } from '../terrain-mesh-builder.js';
-import { applyTerrainAvailabilityStatus } from '../terrain-status-controller.js';
 import { analyzeTerrainSeams, collectTerrainDebugMeshes, createTerrainHoverOutlineController, createTerrainMapGridController, formatTerrainSeamDiagnostic, summarizeTerrainMesh } from '../terrain-debug-runtime.js';
 import { createTerrainFetchRuntime } from '../terrain-fetch-runtime.js';
 import { restoreTerrainCameraState, terrainCameraState } from '../terrain-camera-state.js';
 import { createTerrainClientLogger } from '../terrain-client-logging.js';
 import { createTerrainFpsCounter } from '../terrain-fps-counter.js';
 import {
+  terrainAglFromIntersections,
+  terrainAglFromSurface,
+  terrainSurfaceHeightAt,
+} from '../terrain-agl.js';
+import {
   projectSunDirectionToUv,
+  stepSunFlareVisibility,
   sunFlareElevationVisibility,
 } from '../terrain-sun-flare-effect.js';
 import { loadTerrainStartupAssets, normalizeTerrainStartupAssets } from '../terrain-startup-assets.js';
 import { createTerrainAtmosphereTextureRuntime } from '../terrain-atmosphere-textures.js';
-import { createTerrainGridlinesController } from '../terrain-gridlines.js';
+import { GRIDLINES_COLOR, createTerrainGridlinesController } from '../terrain-gridlines.js';
 import { createTerrainTuningControls } from '../terrain-tuning-controls.js';
 import { waterCascadeUpdateDue, waterCascadeUpdateRate } from '../water/water-spectrum.js';
 import {
@@ -81,6 +85,9 @@ test('gridlines batch terrain-conforming tile edges without replacing textures',
   assert.equal(grid.lines.geometry.getAttribute('position').count, 24);
   assert.equal(grid.lines.isMesh, true);
   assert.equal(grid.lines.material.side, THREE.DoubleSide);
+  assert.equal(grid.lines.material.depthTest, true);
+  assert.equal(grid.lines.material.depthWrite, false);
+  assert.equal(grid.lines.material.color.getHex(), GRIDLINES_COLOR);
   assert.equal(grid.lines.visible, true);
   assert.equal(mesh.material, originalMaterial);
   assert.equal(mesh.material.map, originalTexture);
@@ -137,6 +144,14 @@ test('analytic sun flare fades gradually through golden hour', () => {
   assert.ok(midFade > 0.2 && midFade < 0.3);
   assert.ok(1 - sunFlareElevationVisibility(sunAtElevation(16), up) < 1e-12);
   assert.equal(sunFlareElevationVisibility(sunAtElevation(-2), up), 0);
+});
+
+test('analytic sun flare snaps negligible offscreen visibility to zero', () => {
+  const fading = stepSunFlareVisibility(1, 0, 0.75);
+  assert.ok(fading > 0 && fading < 1);
+  assert.equal(stepSunFlareVisibility(1, 0, 1 / 60, false), 0);
+  assert.equal(stepSunFlareVisibility(fading, 0, 10), 0);
+  assert.ok(stepSunFlareVisibility(0, 1, 1 / 60) > 0);
 });
 
 test('terrain camera persistence round-trips pose and frame state', () => {
@@ -233,6 +248,39 @@ test('shared FPS counter excludes idle time from its sample', () => {
   counter.start(10_000);
   counter.frame(10_016);
   assert.equal(counter.display, '--');
+});
+
+test('terrain AGL accepts local ground hits and rejects coordinate-frame spikes', () => {
+  assert.equal(terrainAglFromIntersections([{ distance: 396.97 }]), 396.97);
+  assert.equal(terrainAglFromIntersections([{ distance: 6_352_568 }]), null);
+  assert.equal(terrainAglFromIntersections([{ distance: -1 }]), null);
+  assert.equal(terrainAglFromIntersections([]), null);
+});
+
+test('terrain AGL samples the deepest resident surface without a triangle raycast', () => {
+  const mesh = (tileId, bbox, heights) => ({
+    userData: { tileId, bbox, resolution: 2 },
+    geometry: {
+      attributes: {
+        position: {
+          itemSize: 3,
+          array: new Float32Array([
+            0, 0, heights[0],
+            0, 0, heights[1],
+            0, 0, heights[2],
+            0, 0, heights[3],
+          ]),
+        },
+      },
+    },
+  });
+  const parent = mesh('8-1-1', [0, 0, 10, 10], [0, 0, 0, 0]);
+  const child = mesh('10-4-4', [0, 0, 5, 5], [10, 20, 30, 40]);
+
+  assert.equal(terrainSurfaceHeightAt([parent, child], 2.5, 2.5), 25);
+  assert.equal(terrainAglFromSurface(125, 25), 100);
+  assert.equal(terrainSurfaceHeightAt([parent, child], 8, 8), 0);
+  assert.equal(terrainSurfaceHeightAt([parent], 11, 8), null);
 });
 
 test('startup asset normalization clones valid records and rejects junk', () => {
@@ -513,15 +561,18 @@ test('shared cloud tuning registers controls and applies altitude, cirrus, and d
     cloudLayers: [1550, 1800, 8300, 9100].map(altitude => ({
       altitude, densityScale: 0, weatherExponent: 1, shapeAmount: 0.3,
     })),
+    localWeatherRepeat: { x: 100, y: 100 },
     localWeatherVelocity: { values: [], set(...values) { this.values = values; } },
   };
   const controls = {};
+  let appearanceChanges = 0;
   const tuning = registerTerrainCloudTuning({
     effect, controls,
     section: label => sections.push(label),
     slider: (label, options) => { definitions.set(label, options); return { label }; },
     toggle: (label, options) => { definitions.set(label, options); return { label }; },
     getWindDirection: () => windDirection,
+    onAppearanceChange: () => { appearanceChanges += 1; },
   });
   assert.deepEqual(sections, ['Clouds']);
   assert.equal(definitions.size, 7);
@@ -529,13 +580,33 @@ test('shared cloud tuning registers controls and applies altitude, cirrus, and d
 
   definitions.get('cloud altitude').onChange(-2000);
   assert.deepEqual(effect.cloudLayers.map(layer => layer.altitude), [0, 0, 6300, 7100]);
+  definitions.get('cirrus density').onChange(0.0016);
+  assert.equal(effect.cloudLayers[3].densityScale, 0);
   definitions.get('cirrus').onChange(true);
-  assert.equal(effect.cloudLayers[3].densityScale, 0.004);
+  assert.equal(effect.cloudLayers[3].densityScale, 0.0016);
+  definitions.get('cirrus density').onChange(0.0012);
+  assert.equal(effect.cloudLayers[3].densityScale, 0.0012);
+  definitions.get('cirrus coverage').onChange(2.65);
+  assert.equal(effect.cloudLayers[3].weatherExponent, 2.65);
+  definitions.get('cirrus shape').onChange(0.76);
+  assert.equal(effect.cloudLayers[3].shapeAmount, 0.76);
+  definitions.get('cirrus').onChange(false);
+  assert.equal(effect.cloudLayers[3].densityScale, 0);
+  definitions.get('cirrus density').onChange(0.0008);
+  assert.equal(effect.cloudLayers[3].densityScale, 0);
+  definitions.get('cirrus').onChange(true);
+  assert.equal(effect.cloudLayers[3].densityScale, 0.0008);
+  assert.equal(appearanceChanges, 7);
+  const drift = definitions.get('drift km/h');
+  assert.equal(drift.min, 0);
+  assert.equal(drift.max, 650);
+  assert.equal(drift.step, 5);
+  assert.equal(drift.value, 13);
+  assert.equal(drift.format(325), '325km/h');
   // Drift heading is slaved to the water wind (compass "blows toward" 0 =
-  // north), so speed changes re-resolve the heading instead of a dedicated
-  // direction slider. Takram offsets texture sampling, so visible northward
-  // motion requires -y in the weather-uv frame.
-  definitions.get('drift speed').onChange(0.001);
+  // north). The km/h display maps onto the exact original 0–0.002 internal
+  // texture-offset range, so this midpoint must retain the old 0.001 speed.
+  drift.onChange(325);
   assert.ok(Math.abs(effect.localWeatherVelocity.values[0]) < 1e-12);
   assert.ok(Math.abs(effect.localWeatherVelocity.values[1] + 0.001) < 1e-12);
   assert.equal(typeof tuning.syncDrift, 'function');
@@ -588,6 +659,7 @@ test('shared cloud tuning puts the Takram rendering checkbox first in the Clouds
       cloudLayers: [1550, 1800, 8300, 9100].map(altitude => ({
         altitude, densityScale: 0, weatherExponent: 1, shapeAmount: 0.3,
       })),
+      localWeatherRepeat: { x: 100, y: 100 },
       localWeatherVelocity: { set() {} },
     },
     controls,
@@ -613,10 +685,10 @@ test('terrain request preserves boot frame semantics without client LOD override
     frameOffsetReady: false, originX: 1, originY: 2,
     cameraSnapshot: { camEastM: 3 },
   });
-  assert.equal(request.url, '/api/tiles?lat=64.1&lon=-51.2&alt=120&heading=0.5&range=30000');
+  assert.equal(request.url, '/api/tiles?lat=64.1&lon=-51.2&agl=120&heading=0.5&range=30000');
   assert.deepEqual(request.logDetails, {
     isFirstLoad: true,
-    requestLat: 64.1, requestLon: -51.2, requestAltM: 120,
+    requestLat: 64.1, requestLon: -51.2, requestAglM: 120,
     requestGridX: null, requestGridY: null,
     headingRad: 0.5, camEastM: 3,
   });
@@ -629,7 +701,7 @@ test('terrain request reuses a restored frame', () => {
     frameOffsetReady: true, originX: -12.5, originY: 99.25,
     queryX: 123.5, queryY: -456.25,
   });
-  assert.equal(request.url, '/api/tiles?sx=123.5&sy=-456.25&alt=50&heading=0&range=40000&ox=-12.5&oy=99.25');
+  assert.equal(request.url, '/api/tiles?sx=123.5&sy=-456.25&agl=50&heading=0&range=40000&ox=-12.5&oy=99.25');
   assert.equal('maxDepth' in request.logDetails, false);
 });
 
@@ -686,13 +758,13 @@ test('shared reconciler spends dirty-paint budget in priority order', () => {
     add(mesh) { this.children.push(mesh); },
   };
   let diffDetails = null;
-  const reconcile = createTerrainTileReconciler({
+  const options = {
     terrainRoot,
     deferredTiles,
-    lifecycle: { sweepStaleParents: () => 0 },
+    lifecycle: {},
     priorityForTile: tile => tile.priority,
     textureCache: new Map(),
-    meshRuntime: { materialize: () => assert.fail('unexpected materialize') },
+    materialize: () => assert.fail('unexpected materialize'),
     buildMesh: tile => {
       built.push(tile.id);
       return {
@@ -702,11 +774,14 @@ test('shared reconciler spends dirty-paint budget in priority order', () => {
     },
     log: () => {},
     buildBudget: 1,
-  });
-  const result = reconcile([
+  };
+  const result = reconcileTerrainTiles({
+    ...options,
+    tiles: [
       { id: 'far', bbox: [10, 10, 11, 11], heightmap: 'hm', priority: 9 },
       { id: 'hot', bbox: [0, 0, 1, 1], heightmap: 'hm', priority: 1 },
-    ], new Set(), {
+    ],
+    currentTileIds: new Set(),
     onDiff: details => { diffDetails = details; },
   });
   assert.deepEqual(built, ['hot']);
@@ -724,13 +799,13 @@ test('initial reconciliation completes tile coverage beyond the build budget', (
     children: [],
     add(mesh) { this.children.push(mesh); },
   };
-  const reconcile = createTerrainTileReconciler({
+  const options = {
     terrainRoot,
     deferredTiles,
-    lifecycle: { sweepStaleParents: () => 0 },
+    lifecycle: {},
     priorityForTile: tile => tile.priority,
     textureCache: new Map(),
-    meshRuntime: { materialize: () => assert.fail('unexpected materialize') },
+    materialize: () => assert.fail('unexpected materialize'),
     buildMesh: tile => {
       built.push(tile.id);
       return {
@@ -741,11 +816,16 @@ test('initial reconciliation completes tile coverage beyond the build budget', (
     },
     log: () => {},
     buildBudget: 1,
+  };
+  reconcileTerrainTiles({
+    ...options,
+    tiles: [
+      { id: 'near', bbox: [0, 0, 1, 1], heightmap: 'hm', priority: 1 },
+      { id: 'far', bbox: [10, 10, 11, 11], heightmap: 'hm', priority: 2 },
+    ],
+    currentTileIds: new Set(),
+    completeCoverage: true,
   });
-  reconcile([
-    { id: 'near', bbox: [0, 0, 1, 1], heightmap: 'hm', priority: 1 },
-    { id: 'far', bbox: [10, 10, 11, 11], heightmap: 'hm', priority: 2 },
-  ], new Set(), { completeCoverage: true });
   assert.deepEqual(built, ['near', 'far']);
   assert.deepEqual([...deferredTiles.keys()], ['near', 'far']);
   assert.equal(terrainRoot.children.length, 2);
@@ -782,7 +862,6 @@ test('reconciliation rebuilds a resident tile when repaired seam geometry change
         sceneSizesAtEviction.push(terrainRoot.children.length);
         terrainRoot.remove(mesh);
       },
-      sweepStaleParents: () => 0,
     },
     priorityForTile: () => 0,
     textureCache: new Map(),
@@ -838,7 +917,6 @@ test('seam refresh keeps old geometry when the replacement is build-budget defer
     terrainRoot,
     lifecycle: {
       evict() { evictions += 1; },
-      sweepStaleParents: () => 0,
     },
     priorityForTile: () => 0,
     textureCache: new Map(),
@@ -885,7 +963,6 @@ test('reconciliation releases old browser-demand tiles but retains a complete fa
     terrainRoot,
     lifecycle: {
       evict(mesh) { evicted.push(mesh.userData.tileId); terrainRoot.remove(mesh); },
-      sweepStaleParents: () => 0,
     },
     priorityForTile: () => 0,
     textureCache: new Map(),
@@ -900,7 +977,42 @@ test('reconciliation releases old browser-demand tiles but retains a complete fa
   assert.equal(result.released, 1);
 });
 
-test('circular-boundary parent remains for partial demanded descendants', () => {
+test('reconciliation releases resident fine detail when demand coarsens', () => {
+  const fine = {
+    isMesh: true,
+    userData: { tileId: '10-40-40', bbox: [0, 0, 2, 2] },
+    material: { map: {} },
+  };
+  const terrainRoot = {
+    children: [fine],
+    remove(mesh) { this.children = this.children.filter(item => item !== mesh); },
+  };
+  const evicted = [];
+  const released = [];
+  const result = reconcileTerrainTiles({
+    tiles: [{ id: '8-10-10', bbox: [0, 0, 8, 8], heightmap: 'coarse' }],
+    currentTileIds: new Set([fine.userData.tileId]),
+    deferredTiles: new Map(),
+    terrainRoot,
+    lifecycle: {
+      evict(mesh) { evicted.push(mesh.userData.tileId); terrainRoot.remove(mesh); },
+    },
+    priorityForTile: () => 0,
+    textureCache: new Map(),
+    materialize() {},
+    buildMesh() {},
+    log() {},
+    onReleaseTile: tileId => released.push(tileId),
+  });
+
+  assert.equal(result.nextTileIds.has('8-10-10'), true);
+  assert.equal(result.nextTileIds.has(fine.userData.tileId), false);
+  assert.deepEqual(evicted, [fine.userData.tileId]);
+  assert.deepEqual(released, [fine.userData.tileId]);
+  assert.deepEqual(terrainRoot.children, []);
+});
+
+test('circular-boundary parent remains only until demanded descendants are materialized', () => {
   const parent = {
     isMesh: true,
     userData: { tileId: '10-351-206', bbox: [0, 0, 8, 8] },
@@ -936,7 +1048,6 @@ test('circular-boundary parent remains for partial demanded descendants', () => 
 
   assert.equal(result.released, 0);
   assert.deepEqual(terrainRoot.children, [parent]);
-  assert.equal(lifecycle.sweepStaleParents(demanded, new Set(demanded.map(tile => tile.id))), 0);
 
   for (const tile of demanded) {
     terrainRoot.add({
@@ -947,8 +1058,11 @@ test('circular-boundary parent remains for partial demanded descendants', () => 
       children: [],
     });
   }
-  assert.equal(lifecycle.sweepStaleParents(demanded, new Set(demanded.map(tile => tile.id))), 0);
-  assert.equal(terrainRoot.children.includes(parent), true);
+  lifecycle.evictCoveredAncestors(
+    demanded.at(-1).id,
+    new Set(demanded.map(tile => tile.id)),
+  );
+  assert.equal(terrainRoot.children.includes(parent), false);
 });
 
 test('textured parent remains while demanded children are untextured', () => {
@@ -1119,7 +1233,7 @@ test('shared terrain refetch decision enforces distance and trigger interval', (
   assert.deepEqual(evaluateTerrainRefetch({
     cameraX: 6000, cameraY: 0, lastFetchX: 0, lastFetchY: 0,
     nowMs: 1000, lastTriggerMs: 0, distanceThreshold: 5000, triggerIntervalMs: 500,
-  }), { distance: 6000, shouldFetch: true, nextTriggerMs: 1000 });
+  }), { distance: 6000, altitudeDelta: 0, shouldFetch: true, nextTriggerMs: 1000 });
   assert.equal(evaluateTerrainRefetch({
     cameraX: 7000, cameraY: 0, lastFetchX: 0, lastFetchY: 0,
     nowMs: 1200, lastTriggerMs: 1000, distanceThreshold: 5000, triggerIntervalMs: 500,
@@ -1127,6 +1241,24 @@ test('shared terrain refetch decision enforces distance and trigger interval', (
   assert.equal(evaluateTerrainRefetch({
     cameraX: 100, cameraY: 0, lastFetchX: 0, lastFetchY: 0,
     nowMs: 5000, lastTriggerMs: 0, distanceThreshold: 5000, triggerIntervalMs: 500,
+  }).shouldFetch, false);
+});
+
+test('shared terrain refetch decision reacts to a vertical descent', () => {
+  const descent = {
+    cameraX: 0, cameraY: 0, lastFetchX: 0, lastFetchY: 0,
+    cameraAltitude: 1190, lastFetchAltitude: 1400,
+    nowMs: 1000, lastTriggerMs: 0,
+    distanceThreshold: 1000, altitudeThreshold: 100, triggerIntervalMs: 500,
+  };
+  assert.deepEqual(evaluateTerrainRefetch(descent), {
+    distance: 0, altitudeDelta: 210, shouldFetch: true, nextTriggerMs: 1000,
+  });
+  assert.equal(evaluateTerrainRefetch({
+    ...descent, cameraAltitude: 1350,
+  }).shouldFetch, false);
+  assert.equal(evaluateTerrainRefetch({
+    ...descent, nowMs: 1200, lastTriggerMs: 1000,
   }).shouldFetch, false);
 });
 
@@ -1155,7 +1287,13 @@ test('shared camera coordinates and log summary use one ENU conversion', () => {
   assert.equal(summary.camStereoApproxY, 220);
 });
 
-function createTestFetchRuntime({ fetchImpl, onSkip, ...options } = {}) {
+function createTestFetchRuntime({
+  fetchImpl,
+  onSkip,
+  cameraCoordinates = { lat: 64, lon: -51, alt: 100 },
+  cameraAgl,
+  ...options
+} = {}) {
   const state = {
     fetching: false, firstLoad: true, frameOffsetReady: false,
     frameOffsetX: 0, frameOffsetY: 0, originX: 0, originY: 0,
@@ -1169,7 +1307,8 @@ function createTestFetchRuntime({ fetchImpl, onSkip, ...options } = {}) {
     view: { anchorLatitude: 64, anchorLongitude: -51 },
     vehicle: {},
     testOverrides: {
-      getCameraCoordinates: () => ({ lat: 64, lon: -51, alt: 100 }),
+      getCameraCoordinates: () => cameraCoordinates,
+      getCameraAGL: () => cameraAgl,
       getCameraSnapshot: () => ({ camEastM: 0, camNorthM: 0 }),
       getCameraLocalPosition: () => ({ x: 0, y: 0 }),
       getHeading: () => 0,
@@ -1178,7 +1317,7 @@ function createTestFetchRuntime({ fetchImpl, onSkip, ...options } = {}) {
     terrain: {
       reconcile: (tiles, { onDiff }) => reconcileTerrainTiles({
         tiles, currentTileIds: state.currentTileIds, terrainRoot, deferredTiles,
-        lifecycle: { sweepStaleParents: () => 0 },
+        lifecycle: {},
         priorityForTile: () => 0, textureCache: new Map(),
         materialize() {}, buildMesh() {}, log() {}, onDiff,
       }),
@@ -1192,6 +1331,54 @@ function createTestFetchRuntime({ fetchImpl, onSkip, ...options } = {}) {
   return { runtime, state };
 }
 
+test('shared fetch runtime sends AGL rather than ASL for mountainside LOD', async () => {
+  let requestedUrl = null;
+  const { runtime, state } = createTestFetchRuntime({
+    cameraCoordinates: { lat: 64, lon: -51, alt: 344 },
+    cameraAgl: 8,
+    fetchImpl: async url => {
+      requestedUrl = url;
+      return {
+        status: 200,
+        json: async () => ({
+          ox: 0, oy: 0, qx: 0, qy: 0, tiles: [],
+          missing: [], downloading: [], texFetching: 0,
+        }),
+      };
+    },
+  });
+
+  await runtime.request();
+
+  assert.match(requestedUrl, /[?&]agl=8(?:&|$)/);
+  assert.doesNotMatch(requestedUrl, /[?&](?:alt|agl)=344(?:&|$)/);
+  assert.equal(state.lastFetchAltitude, 8);
+});
+
+test('shared fetch runtime bootstraps coarse and never substitutes ASL when AGL is unknown', async () => {
+  let requestedUrl = null;
+  const { runtime, state } = createTestFetchRuntime({
+    cameraCoordinates: { lat: 64, lon: -51, alt: 934 },
+    cameraAgl: undefined,
+    fetchImpl: async url => {
+      requestedUrl = url;
+      return {
+        status: 200,
+        json: async () => ({
+          ox: 0, oy: 0, qx: 0, qy: 0, tiles: [],
+          missing: [], downloading: [], texFetching: 0,
+        }),
+      };
+    },
+  });
+
+  await runtime.request();
+
+  assert.match(requestedUrl, /[?&]agl=10000(?:&|$)/);
+  assert.doesNotMatch(requestedUrl, /[?&](?:alt|agl)=934(?:&|$)/);
+  assert.equal(state.lastFetchAltitude, 10_000);
+});
+
 test('shared fetch runtime polls pending terrain without a duplicate startup pass', async () => {
   let requests = 0;
   let pollCallback = null;
@@ -1199,7 +1386,7 @@ test('shared fetch runtime polls pending terrain without a duplicate startup pas
     ox: 0, oy: 0, qx: 0, qy: 0, tiles: [],
     missing: requests === 1 ? [{}] : [], downloading: [], texFetching: 0,
   });
-  const { runtime } = createTestFetchRuntime({
+  const { runtime, state } = createTestFetchRuntime({
     fetchImpl: async () => {
       requests += 1;
       return { status: 200, json: async () => responseData() };
@@ -1209,6 +1396,7 @@ test('shared fetch runtime polls pending terrain without a duplicate startup pas
   });
   await runtime.request();
   assert.equal(requests, 1);
+  assert.equal(state.lastFetchAltitude, 10_000);
   assert.equal(typeof pollCallback, 'function');
   await pollCallback();
   assert.equal(requests, 2);
@@ -1259,6 +1447,58 @@ test('shared fetch runtime coalesces movement without starving the latest reques
   assert.equal(state.cameraStereoX, 20);
   assert.equal(state.cameraStereoY, 30);
   assert.equal(state.fetching, false);
+});
+
+test('sustained movement pressure never starves topology updates (livelock regression)', async () => {
+  // The maintenance loop re-fires request() every 500ms while the camera sits
+  // far from lastFetchX/Y, and lastFetch only advances on a full apply. With
+  // fetches slower than 500ms, every fetch has a newer request land mid-flight
+  // — forever. Two earlier designs froze LOD topology here: aborting the
+  // in-flight fetch on the newer arrival, and version-demoting its response to
+  // the merge-only path. Each response below must fully own topology and
+  // advance lastFetch despite the runtime never going idle.
+  const releases = [];
+  const signals = [];
+  let fetches = 0;
+  const startWaiters = new Map();
+  const waitForFetch = n => new Promise(resolve => {
+    if (fetches >= n) resolve();
+    else startWaiters.set(n, resolve);
+  });
+  const { runtime, state } = createTestFetchRuntime({
+    fetchImpl: (_url, { signal }) => {
+      fetches += 1;
+      signals.push(signal);
+      startWaiters.get(fetches)?.();
+      return new Promise(resolve => { releases.push(resolve); });
+    },
+  });
+  const respond = (index, qx, tiles) => releases[index]({
+    status: 200,
+    json: async () => ({
+      ox: 0, oy: 0, qx, qy: 0, tiles, missing: [], downloading: [], texFetching: 0,
+    }),
+  });
+
+  const chain = runtime.request();
+  runtime.request();
+  respond(0, 1, [{ id: '9-0-0', heightmap: 'a' }]);
+  await waitForFetch(2);
+  assert.equal(state.lastFetchX, 1);
+  assert.deepEqual(state.lastTiles.map(tile => tile.id), ['9-0-0']);
+
+  runtime.request();
+  respond(1, 2, [{ id: '12-0-0', heightmap: 'b' }]);
+  await waitForFetch(3);
+  assert.equal(state.lastFetchX, 2);
+  assert.deepEqual(state.lastTiles.map(tile => tile.id), ['12-0-0']);
+
+  respond(2, 3, [{ id: '12-1-1', heightmap: 'c' }]);
+  await chain;
+  assert.equal(state.lastFetchX, 3);
+  assert.deepEqual(state.lastTiles.map(tile => tile.id), ['12-1-1']);
+  assert.equal(state.fetching, false);
+  assert.equal(signals.some(signal => signal.aborted), false);
 });
 
 test('shared fetch runtime rejects an HTTP error before terrain reconciliation', async () => {
@@ -1391,7 +1631,7 @@ test('shared texture controller budgets scene applications per frame', () => {
     meshRuntime: {
       materialize(id) { materialized.push(id); deferredTiles.delete(id); },
     },
-    lifecycle: { evictCoveredAncestors() {}, sweepStaleParents() {} },
+    lifecycle: { evictCoveredAncestors() {} },
     priorityForTile: () => 0, getVisibilityDistance: () => 1000,
     isCovered: () => false, applyMaterial() {},
     log() {}, applicationsPerFrame: 1,
@@ -1418,7 +1658,7 @@ test('shared texture controller discards late arrivals outside current browser d
       pump(_scored, nextCallbacks) { callbacks = nextCallbacks; },
     },
     meshRuntime: { materialize() {} },
-    lifecycle: { evictCoveredAncestors() {}, sweepStaleParents() {} },
+    lifecycle: { evictCoveredAncestors() {} },
     priorityForTile: () => 0, getVisibilityDistance: () => 1000,
     isCovered: () => false, applyMaterial() {}, log() {},
     scheduleFrame() {},
@@ -1462,7 +1702,6 @@ test('ancestor crops materialize deferred child slots and yield to exact texture
     },
     lifecycle: {
       evictCoveredAncestors() { ancestorEvictions += 1; },
-      sweepStaleParents() {},
     },
     priorityForTile: () => 0,
     getVisibilityDistance: () => 1000,
@@ -1475,12 +1714,12 @@ test('ancestor crops materialize deferred child slots and yield to exact texture
   callbacks.onPlaceholder({ tileId: tile.id, tile, texture: placeholder });
   assert.equal(deferredTiles.has(tile.id), false);
   assert.equal(terrainRoot.children[0].material.map, placeholder);
-  assert.equal(ancestorEvictions, 0);
+  assert.equal(ancestorEvictions, 1);
 
   textureCache.set(tile.id, exact);
   callbacks.onTexture({ tileId: tile.id, tile, texture: exact });
   frames.shift()();
-  assert.equal(ancestorEvictions, 1);
+  assert.equal(ancestorEvictions, 2);
   assert.equal(terrainRoot.children[0].material.map, exact);
   assert.equal(placeholder.disposed, true);
   assert.equal(terrainRoot.children[0].userData.terrainPlaceholderTexture, undefined);
@@ -1512,21 +1751,6 @@ test('shared terrain mesh builder preserves heightmap geometry and metadata', ()
   assert.equal(mesh.userData.tileId, '1-2-3');
   assert.equal(mesh.userData.resolution, 2);
   assert.deepEqual([...scatterHeightmap], [1, 2, 3, 4]);
-});
-
-test('shared availability status skips textured meshes and prioritizes downloading', () => {
-  const meshes = ['downloading', 'missing', 'textured'].map(tileId => ({
-    isMesh: true, userData: { tileId }, material: { map: tileId === 'textured' ? {} : null },
-  }));
-  const applied = [];
-  const changed = applyTerrainAvailabilityStatus({
-    terrainRoot: { children: meshes },
-    missing: [{ id: 'downloading' }, { id: 'missing' }, { id: 'textured' }],
-    downloading: ['downloading'],
-    applyStatus: (mesh, status) => applied.push([mesh.userData.tileId, status]),
-  });
-  assert.equal(changed, 2);
-  assert.deepEqual(applied, [['downloading', 'downloading'], ['missing', 'missing']]);
 });
 
 test('shared terrain debug metadata remains deterministic', () => {
@@ -1641,7 +1865,7 @@ test('shared fetch runtime preserves initial response transition ordering', asyn
     terrain: {
       reconcile: (tiles, { onDiff }) => reconcileTerrainTiles({
         tiles, currentTileIds: state.currentTileIds, terrainRoot, deferredTiles,
-        lifecycle: { sweepStaleParents: () => 0 },
+        lifecycle: {},
         priorityForTile: () => 0, textureCache: new Map(),
         materialize() {}, buildMesh() {}, log() {}, onDiff,
       }),
@@ -1738,6 +1962,14 @@ test('HUD compass uses the same heading convention', () => {
   assert.equal(compassHeading(0).compass, 'N');
   assert.equal(compassHeading(Math.PI / 2).compass, 'W');
   assert.equal(compassHeading(-Math.PI / 2).compass, 'E');
+});
+
+test('HUD renders a visible camera forward-lock indicator only while drifting', () => {
+  assert.equal(cameraDriftIndicator(false), '');
+  const active = cameraDriftIndicator(true);
+  assert.match(active, /cameraDriftIndicator/);
+  assert.match(active, /FORWARD LOCK/);
+  assert.match(active, /Double-tap W or ↑ to disable/);
 });
 
 test('shared map pan respects map yaw', () => {
@@ -2105,6 +2337,27 @@ test('texture anisotropy supports both renderer APIs and fails safely', () => {
   assert.equal(rendererTextureAnisotropy({ getMaxAnisotropy: () => { throw new Error('not ready'); } }), 1);
 });
 
+test('shared lifecycle materializes a tile without forcing a world-matrix walk', () => {
+  const terrainRoot = new THREE.Group();
+  const mesh = new THREE.Mesh(
+    new THREE.BufferGeometry(),
+    new THREE.MeshBasicMaterial(),
+  );
+  mesh.userData.tileId = '8-1-1';
+  let updateArguments = null;
+  mesh.updateWorldMatrix = (...args) => { updateArguments = args; };
+  const lifecycle = createTileLifecycle({
+    terrainRoot,
+    disposeScatter: () => {},
+    log: () => {},
+  });
+
+  lifecycle.replaceForMaterialized(mesh, new Set([mesh.userData.tileId]));
+
+  assert.equal(updateArguments, null);
+  assert.equal(terrainRoot.children.includes(mesh), true);
+});
+
 test('shared lifecycle retires parent when all demanded descendants are textured', () => {
   const parent = {
     isMesh: true,
@@ -2125,13 +2378,49 @@ test('shared lifecycle retires parent when all demanded descendants are textured
     terrainRoot: root, disposeScatter: () => {}, log: () => {},
   });
   const demandedIds = new Set(children.map(c => c.userData.tileId));
-  assert.equal(lifecycle.sweepStaleParents([], demandedIds), 0);
   root.children.push(...children.slice(1));
   lifecycle.evictCoveredAncestors(children.at(-1).userData.tileId, demandedIds);
   assert.deepEqual(root.children, children);
 });
 
-test('shared lifecycle excludes ancestor-crop placeholders from final coverage', () => {
+test('shared lifecycle discards a coarse source after demanded children are chopped from it', () => {
+  const parent = {
+    isMesh: true,
+    userData: { tileId: '11-719-386' },
+    material: { map: {}, dispose() {} },
+    geometry: { dispose() {} },
+  };
+  const children = ['12-1438-772', '12-1438-773'].map(tileId => {
+    const texture = {};
+    return {
+      isMesh: true,
+      userData: { tileId, terrainPlaceholderTexture: texture },
+      material: { map: texture, dispose() {} },
+      geometry: { dispose() {} },
+    };
+  });
+  const root = {
+    children: [parent, ...children],
+    remove(mesh) { this.children = this.children.filter(item => item !== mesh); },
+  };
+  const released = [];
+  const lifecycle = createTileLifecycle({
+    terrainRoot: root,
+    disposeScatter: () => {},
+    log: () => {},
+    onReleaseTile: tileId => released.push(tileId),
+  });
+
+  lifecycle.evictCoveredAncestors(
+    children.at(-1).userData.tileId,
+    new Set(children.map(child => child.userData.tileId)),
+  );
+
+  assert.equal(root.children.includes(parent), false);
+  assert.deepEqual(released, [parent.userData.tileId]);
+});
+
+test('shared lifecycle counts ancestor-crop children as replacement coverage', () => {
   const parent = {
     isMesh: true,
     userData: { tileId: '11-719-386' },
@@ -2154,10 +2443,6 @@ test('shared lifecycle excludes ancestor-crop placeholders from final coverage',
     terrainRoot: root, disposeScatter: () => {}, log: () => {},
   });
 
-  lifecycle.evictCoveredAncestors(children[3].userData.tileId);
-  assert.equal(root.children.includes(parent), true);
-
-  delete children[3].userData.terrainPlaceholderTexture;
   lifecycle.evictCoveredAncestors(children[3].userData.tileId);
   assert.equal(root.children.includes(parent), false);
 });

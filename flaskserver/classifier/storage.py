@@ -14,21 +14,73 @@ import numpy as np
 
 
 COARSE_SCHEMA = "coarse_v1"
+# coarse_v2 (classifier.ladder): indices 0-4 are IDENTICAL to coarse_v1 so
+# index-based consumers keep working; SHADOW (5) is purely additive — a
+# first-class "honestly unknown, geometrically unlit" bucket, never folded
+# into dark ground.
+COARSE_V2_SCHEMA = "coarse_v2"
+COARSE_V3_SCHEMA = "coarse_v3"
+COARSE_V4_SCHEMA = "coarse_v4"
+_COARSE_PALETTE = [
+    (150, 105, 210),
+    (150, 225, 60),
+    (255, 140, 0),
+    (255, 255, 255),
+    (255, 42, 161),
+]
 CLASS_SCHEMAS = {
     COARSE_SCHEMA: {
         "names": ("grey", "green", "dark", "white", "water"),
+        "palette": np.asarray(_COARSE_PALETTE, dtype=np.uint8),
+    },
+    COARSE_V2_SCHEMA: {
+        # shadow: geometrically unlit + dark — honestly unknown ground.
+        # lake: DEM flat-sheet water the official blue dataset is missing —
+        # distinct from authority water on purpose.
+        "names": ("grey", "green", "dark", "white", "water", "shadow", "lake"),
         "palette": np.asarray(
-            [
-                (150, 105, 210),
-                (150, 225, 60),
-                (255, 140, 0),
-                (255, 255, 255),
-                (255, 42, 161),
+            _COARSE_PALETTE + [(60, 120, 255), (0, 200, 220)],
+            dtype=np.uint8,
+        ),
+    },
+    COARSE_V3_SCHEMA: {
+        # v3 adds an explicit high-resolution beach class. It is derived
+        # only from vegetation evidence beside classified water, so the
+        # debug color follows the real bank instead of painting a coarse
+        # constant-width ring.
+        "names": (
+            "grey", "green", "dark", "white", "water", "shadow", "lake",
+            "beach",
+        ),
+        "palette": np.asarray(
+            _COARSE_PALETTE
+            + [(60, 120, 255), (0, 200, 220), (255, 230, 90)],
+            dtype=np.uint8,
+        ),
+    },
+    COARSE_V4_SCHEMA: {
+        # v4 splits the former monolithic beach class into full-resolution
+        # sand and shore-rock patches. Both remain shoreline/no-growth
+        # surfaces, but the renderer can now give the latter real rock grain
+        # instead of painting one uniform material around the water.
+        "names": (
+            "grey", "green", "dark", "white", "water", "shadow", "lake",
+            "sand", "shore_rock",
+        ),
+        "palette": np.asarray(
+            _COARSE_PALETTE
+            + [
+                (60, 120, 255), (0, 200, 220), (255, 230, 90),
+                (105, 92, 125),
             ],
             dtype=np.uint8,
         ),
     },
 }
+# Schemas whose "water" label the official coastline overrides on write.
+_WATER_ENFORCED_SCHEMAS = (
+    COARSE_SCHEMA, COARSE_V2_SCHEMA, COARSE_V3_SCHEMA, COARSE_V4_SCHEMA,
+)
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS classifier_tiles (
@@ -78,8 +130,9 @@ def write_classifier_tile(
 ):
     """Insert or replace a semantic tile. Primarily used by classifier jobs.
 
-    For ``coarse_v1``, mapped sea pixels are always forced to the schema's
-    ``water`` label. The model cannot override the official coastline.
+    For the coarse schemas, mapped sea pixels are always forced to the
+    schema's ``water`` label. The model cannot override the official
+    coastline.
     """
     if class_schema not in CLASS_SCHEMAS:
         raise ValueError(f"unknown classifier schema: {class_schema}")
@@ -89,7 +142,8 @@ def write_classifier_tile(
     if array.size and int(array.max()) >= len(CLASS_SCHEMAS[class_schema]["names"]):
         raise ValueError(f"class map contains labels outside {class_schema}")
     array = array.copy()
-    if enforce_official_water and class_schema == COARSE_SCHEMA:
+    official_water = None
+    if enforce_official_water and class_schema in _WATER_ENFORCED_SCHEMAS:
         from classifier.official_water import classifier_water_mask_for_tile
 
         official_water = classifier_water_mask_for_tile(
@@ -103,7 +157,7 @@ def write_classifier_tile(
         confidence_array = np.asarray(confidence, dtype=np.uint8)
         if confidence_array.shape != array.shape:
             raise ValueError("classifier confidence map must match the class map")
-        if enforce_official_water and class_schema == COARSE_SCHEMA:
+        if enforce_official_water and class_schema in _WATER_ENFORCED_SCHEMAS:
             if official_water is not None:
                 confidence_array = confidence_array.copy()
                 confidence_array[official_water] = np.uint8(255)

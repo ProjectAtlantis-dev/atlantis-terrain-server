@@ -114,7 +114,8 @@ def ingest_layer(db, archive, names, layer, kind, settlement, transformer, now):
         if not parts:
             continue
         attributes = attrs[index] if index < len(attrs) else {}
-        category = attributes.get(category_field) or None
+        raw_category = attributes.get(category_field)
+        category = str(raw_category) if raw_category else None
         for part_index, part in enumerate(parts):
             if len(part) < 2:
                 continue
@@ -134,7 +135,8 @@ def ingest_layer(db, archive, names, layer, kind, settlement, transformer, now):
                 (
                     road_id, settlement, kind, category,
                     attributes.get("vejnavn") or None,
-                    widths.get(category, default_width),
+                    widths.get(category, default_width)
+                    if category is not None else default_width,
                     sum(tx) / len(tx), sum(ty) / len(ty),
                     json.dumps(path), now,
                 ),
@@ -176,7 +178,7 @@ def ingest(zip_path, db_path):
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    parser = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[0])
     parser.add_argument("zip", type=Path, help="TekniskGrundkort SHP zip from kortforsyning.asiaq.gl")
     parser.add_argument("--db", type=Path, default=Path(__file__).parent / "terrain.db")
     args = parser.parse_args()

@@ -1,5 +1,7 @@
-import unittest
+import os
 import sqlite3
+import tempfile
+import unittest
 from contextlib import contextmanager
 from unittest.mock import patch
 
@@ -20,6 +22,7 @@ class _ManualFuture:
 
     def complete(self, outcome="fetched"):
         self.outcome = outcome
+        assert self.callback is not None
         self.callback(self)
 
 
@@ -66,6 +69,47 @@ class CogFetchSchedulerTests(unittest.TestCase):
                 ("cog_completed", "copernicus", "error"),
             ],
         )
+
+    def test_past_contract_demand_cooks_and_never_reads_cog(self):
+        # Regression: the cog-worker path fetched d13-d15 heightmaps straight
+        # from 10m/30m COGs (interpolation mush, edges ignoring every
+        # neighbor — raised square tile corners). Past-contract tiles must
+        # route to the DEM cook, exactly like serve._fetch_tile.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "t.db")
+            db = sqlite3.connect(path)
+            db.execute(
+                "CREATE TABLE tiles (tile_id TEXT PRIMARY KEY, "
+                "dem_requested_at TEXT, source TEXT)"
+            )
+            db.commit()
+            db.close()
+            bbox = (0.0, 0.0, 329.6, 329.6)
+            with (
+                patch.object(serve_flask, "DB_PATH", path),
+                patch("serve._cook_cooked_dem_quad", return_value=True) as cook,
+                patch.object(
+                    ingest, "_read_cog_heightmap",
+                    side_effect=AssertionError("COG read past the contract depth"),
+                ),
+            ):
+                self.assertEqual(
+                    serve_flask._fetch_one_cog_tile("13-2754-1568", bbox),
+                    "fetched",
+                )
+                cook.assert_called_once()
+
+            # A cook without a stable parent defers to the NEXT demand
+            # refresh (not the immediate-requeue path — that would hot-loop
+            # a worker on a millisecond-fast defer).
+            with (
+                patch.object(serve_flask, "DB_PATH", path),
+                patch("serve._cook_cooked_dem_quad", return_value=False),
+            ):
+                self.assertEqual(
+                    serve_flask._fetch_one_cog_tile("13-2754-1568", bbox),
+                    "cook_deferred",
+                )
 
     def test_request_timestamps_are_persisted_independently(self):
         db = sqlite3.connect(":memory:")

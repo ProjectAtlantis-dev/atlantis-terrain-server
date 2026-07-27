@@ -6,8 +6,8 @@ and caches it. Parent tiles are always available (aggregated), so the first rend
 shows coarse terrain and detail fills in progressively.
 
 On-demand flow:
-    1. query_tiles() returns best-available tiles + list of missing tile IDs
-    2. Caller fetches missing tiles in background (fetch_missing_tiles)
+    1. query_tiles_stereo() returns best-available tiles + missing tile IDs
+    2. The Flask scheduler materializes missing tiles in background workers
     3. Next query picks up the newly cached tiles at higher detail
 
 LOD edge stitching eliminates cross-depth seams at query time.
@@ -16,29 +16,43 @@ LOD edge stitching eliminates cross-depth seams at query time.
 import math
 import os
 import datetime
+import time
 import numpy as np
 
 from colored_log import get_logger
 
 log_trav = get_logger("terrain.trav")
+log_d13 = get_logger("terrain.d13")
 
-from coords import to_stereo
 from database import (
     open_db, read_tile, read_tile_metadata, write_tile, TileClobberError,
     GRID_N, CONFIDENCE, _tile_id, _tile_bbox, compute_geometric_error,
 )
-from terrain_config import MAX_TILE_DEPTH
+from terrain_config import MAX_TILE_DEPTH, WMS_CONTRACT_DEPTH
 from terrain_seams import SqliteSeamCache, repair_lod_seams as _stitch_lod_edges
+from tile_address import parse_tile_id, require_tile_id
 
 
 REAL_SOURCES = (
     'arcticdem', 'arcticdem_10m', 'copernicus', 'parent_resampled',
-    'official_coastline',
+    'official_coastline', 'cooked_dem',
     'unmasked_arcticdem', 'unmasked_arcticdem_10m',
     'unmasked_copernicus', 'unmasked_parent_resampled',
     'clobbered_arcticdem_10m', 'clobbered_copernicus',
     'clobbered_parent_resampled', 'clobbered_official_coastline',
 )
+
+# Past-contract DEMs are cooked from the parent heightmap, never read from
+# COG (ArcticDEM 10 m is exhausted at the depth-12 grid; deeper reads are
+# interpolation mush). Only parents in states the pipeline never refetches
+# may be cooked from — derived tiles therefore cannot go stale through the
+# normal flow, and depths <= WMS_CONTRACT_DEPTH are untouched by all of it.
+# cooked_dem itself is a valid parent: cooks recurse deterministically
+# (d14 cooks from cooked d13, ...), rooted in a measured depth-12 surface.
+COOKED_DEM_SOURCE = 'cooked_dem'
+_COOKED_DEM_PARENT_SOURCES = {
+    'arcticdem_10m', 'copernicus', 'official_coastline', COOKED_DEM_SOURCE,
+}
 
 # Sources that should be refetched at higher DEM resolution
 _UPGRADEABLE_SOURCES = {
@@ -63,50 +77,115 @@ LOD_COARSEN_RATIO = 0.75
 LOD_COARSE_FLOOR_DEPTH = 8
 LOD_FINE_PLATEAU_RATIO = 0.55
 # A depth-12 tile is about 659 m wide. Keep the full-detail response band to
-# roughly six tile widths around the camera.
-LOD_FINE_PLATEAU_MAX_M = 4000.0
+# roughly four and a half tile widths around the camera.
+LOD_FINE_PLATEAU_MAX_M = 3000.0
 # Keep the complete 12 -> 8 transition within a bounded distance so large
 # coverage requests retain a cheap depth-8 rim instead of expanding every
 # intermediate band without limit.
 LOD_TRANSITION_MAX_M = 12000.0
+# Depths past the WMS contract never widen the radial curve: the contract
+# depth keeps the full plateau it always had, and each deeper level only
+# claims an inner core of this many of its own tile widths (depth 13 disc
+# ≈ 989 m, depth 14 ≈ 494 m, ... depth 16 ≈ 124 m). A core of R tile
+# widths holds ~pi*R^2 tiles regardless of depth, so every past-contract
+# level adds the same bounded render cost (~28 tiles at 3.0).
+LOD_PAST_CONTRACT_CORE_TILE_WIDTHS = 3.0
+# Camera height above ground caps the radial LOD ceiling: a depth stops being
+# worth fetching once the camera is more than this many of its tile-widths up.
+# At 2.0, depth 13 (~330 m tiles) drops out above ~659 m altitude, depth 12
+# above ~1.3 km, and so on down to the depth-8 rim floor. Altitude is the
+# The API supplies measured AGL from the rendered terrain raycast.
+LOD_ALTITUDE_WIDTH_FACTOR = 2.0
+
+_tile_width_cache: dict[int, float] = {}
 
 
-def _lod_target_depth(distance, max_range, max_depth):
+def _tile_width_m(depth):
+    width = _tile_width_cache.get(depth)
+    if width is None:
+        bbox = _tile_bbox(depth, 0, 0)
+        width = float(bbox[2] - bbox[0])
+        _tile_width_cache[depth] = width
+    return width
+
+
+def _altitude_depth_cap(altitude, max_depth):
+    """Deepest LOD worth fetching from a camera this high up."""
+    depth = max_depth
+    while (
+        depth > LOD_COARSE_FLOOR_DEPTH
+        and altitude > LOD_ALTITUDE_WIDTH_FACTOR * _tile_width_m(depth)
+    ):
+        depth -= 1
+    return depth
+
+
+def _lod_target_depth(distance, max_range, max_depth, altitude=0.0):
     """Return the radial LOD ceiling for a horizontal camera distance.
 
-    Up to the smaller of the inner 55% of the requested range or 4 km is a
-    full-detail plateau (roughly six depth-12 tile widths).
+    Up to the smaller of the inner 55% of the requested range or 3 km is a
+    full-detail plateau (roughly four and a half depth-12 tile widths).
     Equal-width radial bands then step through every intermediate depth toward
     the outer rim. The full transition is capped at 12 km so very large
     coverage ranges cannot overwhelm the tile budget. For requests capable of
     reaching it, the outer floor is always depth 8 (``8-*`` tiles), never
     depth 7 or 6.
+
+    Altitude lowers the whole ceiling before the radial curve applies: a
+    camera above LOD_ALTITUDE_WIDTH_FACTOR tile-widths of a depth never
+    requests that depth anywhere, plateau included.
+
+    Depths past WMS_CONTRACT_DEPTH never occupy the plateau: the contract
+    depth keeps the exact curve it had before deeper levels existed, and
+    each deeper level only claims an inner core of
+    LOD_PAST_CONTRACT_CORE_TILE_WIDTHS of its own tile widths (capped at
+    the plateau). The core therefore holds a constant tile count per level,
+    keeping the expensive 4x-tile levels confined near the camera instead
+    of quadrupling the whole plateau.
     """
     max_depth = max(0, int(max_depth))
-    coarse_depth = min(max_depth, LOD_COARSE_FLOOR_DEPTH)
-    if max_range <= 0 or max_depth == coarse_depth:
+    if altitude > 0.0:
+        max_depth = min(max_depth, _altitude_depth_cap(altitude, max_depth))
+    if max_range <= 0:
         return max_depth
-
+    contract_ceiling = min(max_depth, WMS_CONTRACT_DEPTH)
+    coarse_depth = min(contract_ceiling, LOD_COARSE_FLOOR_DEPTH)
+    distance = max(0.0, distance)
     fine_plateau_end = min(
         max_range * LOD_FINE_PLATEAU_RATIO,
         LOD_FINE_PLATEAU_MAX_M,
     )
-    coarse_rim_start = min(max_range, fine_plateau_end + LOD_TRANSITION_MAX_M)
-    distance = max(0.0, distance)
-    if distance <= fine_plateau_end:
-        return max_depth
-    if distance >= coarse_rim_start:
-        return coarse_depth
 
-    transition = (
-        (distance - fine_plateau_end)
-        / (coarse_rim_start - fine_plateau_end)
-    )
-    depth_falloff = max_depth - coarse_depth
-    continuous_depth = max_depth - depth_falloff * transition
-    # This is a ceiling, so never round a fractional transition depth upward:
-    # doing so extends the full-detail band beyond fine_plateau_end.
-    return max(coarse_depth, min(max_depth, math.floor(continuous_depth)))
+    if contract_ceiling == coarse_depth:
+        depth = contract_ceiling
+    elif distance <= fine_plateau_end:
+        depth = contract_ceiling
+    else:
+        coarse_rim_start = min(max_range, fine_plateau_end + LOD_TRANSITION_MAX_M)
+        if distance >= coarse_rim_start:
+            depth = coarse_depth
+        else:
+            transition = (
+                (distance - fine_plateau_end)
+                / (coarse_rim_start - fine_plateau_end)
+            )
+            depth_falloff = contract_ceiling - coarse_depth
+            continuous_depth = contract_ceiling - depth_falloff * transition
+            # This is a ceiling, so never round a fractional transition depth
+            # upward: doing so extends the full-detail band beyond
+            # fine_plateau_end.
+            depth = max(
+                coarse_depth, min(contract_ceiling, math.floor(continuous_depth))
+            )
+
+    for deeper in range(WMS_CONTRACT_DEPTH + 1, max_depth + 1):
+        core = min(
+            fine_plateau_end,
+            LOD_PAST_CONTRACT_CORE_TILE_WIDTHS * _tile_width_m(deeper),
+        )
+        if distance <= core:
+            depth = deeper
+    return depth
 
 
 def _lod_complete_ancestors(leaf_ids):
@@ -114,10 +193,10 @@ def _lod_complete_ancestors(leaf_ids):
     covered = set()
     max_depth = 0
     for tile_id in leaf_ids or ():
-        try:
-            tile_depth, tile_col, tile_row = map(int, tile_id.split('-'))
-        except (AttributeError, TypeError, ValueError):
+        address = parse_tile_id(tile_id)
+        if address is None:
             continue
+        tile_depth, tile_col, tile_row = address
         covered.add((tile_depth, tile_col, tile_row))
         max_depth = max(max_depth, tile_depth)
 
@@ -139,19 +218,13 @@ def _lod_complete_ancestors(leaf_ids):
     return complete_ancestors
 
 
-def _lod_leaf_descendants_cover(depth, col, row, leaf_ids):
-    """Whether strict descendant leaves completely cover this tile."""
-    return (depth, col, row) in _lod_complete_ancestors(leaf_ids)
-
-
 def _coarse_lod_neighbors(leaf_ids):
     """Return leaves bordering another leaf more than one level finer."""
     addresses = set()
     for tile_id in leaf_ids:
-        try:
-            addresses.add(tuple(map(int, tile_id.split('-'))))
-        except (AttributeError, TypeError, ValueError):
-            continue
+        address = parse_tile_id(tile_id)
+        if address is not None:
+            addresses.add(address)
 
     coarse = set()
     for fine_depth, fine_col, fine_row in addresses:
@@ -227,38 +300,102 @@ def bbox_in_view_circle(qx, qy, bbox, max_range):
     if max_range <= 0:
         return True
     return _distance_to_bbox(qx, qy, bbox) <= max_range
-def _fetch_tile(db, tile_id, bbox, allow_overwrite=False):
-    """Fetch a single tile from COG, write to DB. Returns True if data found."""
-    if tile_id in _no_data_cache:
+
+
+def _cook_cooked_dem_quad(db, tile_id, allow_overwrite=False):
+    """Cook tile_id's parent quad of heightmaps with the procedural upscaler.
+
+    One upscale_heightmap call per parent produces the 129x129 surface whose
+    quadrants become all four 65x65 children — siblings share edge samples
+    from the same array, parent border rows are preserved exactly, and this
+    same surface is what the texture cook conditions on, so geometry and
+    imagery agree. Past WMS_CONTRACT_DEPTH this surface increasingly drives
+    content (rock vs vegetation), so it is the authoritative artifact.
+
+    Returns False (leaving the tile in missing, retried on later demand)
+    when the parent is not yet in a stable non-refetchable state.
+    """
+    from coastline import read_water_mask
+
+    depth, col, row = require_tile_id(tile_id)
+    if depth > MAX_TILE_DEPTH:
+        log_d13.info(
+            f"{tile_id}: DEM cook refused — depth {depth} beyond "
+            f"MAX_TILE_DEPTH={MAX_TILE_DEPTH} (upscaling disabled)"
+        )
+        return False
+    meta = read_tile_metadata(db, tile_id)
+    if meta is not None and meta['source'] in REAL_SOURCES:
+        return True
+
+    parent_col, parent_row = col // 2, row // 2
+    parent_id = _tile_id(depth - 1, parent_col, parent_row)
+    parent = read_tile(db, parent_id)
+    if (
+        parent is None
+        or parent['heightmap'] is None
+        or parent['source'] not in _COOKED_DEM_PARENT_SOURCES
+    ):
+        log_d13.info(
+            f"{tile_id}: DEM cook DEFERRED — parent {parent_id} not stable "
+            f"({parent['source'] if parent else 'missing'})"
+        )
         return False
 
-    from ingest import _read_cog_heightmap, _resample_from_parent
-
-    data, src_name = _read_cog_heightmap(bbox, GRID_N)
-
-    # Fallback: resample from parent tile if COG returned nothing
-    if data is None:
-        water = _cache_coastline(db, tile_id, bbox)
-        if water is not None and np.all(water):
-            _mark_official_ocean(db, tile_id)
-            return True
-        data, src_name = _resample_from_parent(db, tile_id, bbox, GRID_N)
-
-    if data is None:
-        mark_no_data(db, tile_id)
-        return False
-
-    source_name = src_name if isinstance(src_name, str) else 'arcticdem'
-    conf = CONFIDENCE.get(source_name, CONFIDENCE['arcticdem'])
-    cm = np.where(np.isnan(data), np.uint8(0), np.uint8(conf))
-    hm = np.where(np.isnan(data), 0.0, data).astype(np.float32)
     try:
-        write_tile(db, tile_id, hm, cm, source_name, reconcile=False,
-                   allow_overwrite=allow_overwrite)
-        _cache_coastline(db, tile_id, bbox)
-    except TileClobberError:
-        return False
-    return True
+        water_mask = read_water_mask(db, parent_id)
+        if water_mask is not None and water_mask.shape != parent['heightmap'].shape:
+            water_mask = None
+    except Exception:
+        water_mask = None
+
+    cook_started = time.perf_counter()
+    # Continue the measured DEM with clean bilinear interpolation.
+    from terrain_upscale import upscale_heightmap
+    upscaled = upscale_heightmap(
+        parent['heightmap'],
+        list(parent['bbox']),
+        factor=2,
+        amplitude_m=0.0,
+        water_mask=water_mask,
+    )
+    confidence = np.full(
+        (GRID_N, GRID_N), np.uint8(CONFIDENCE[COOKED_DEM_SOURCE])
+    )
+    _ensure_children(db, depth - 1, parent_col, parent_row)
+    base_col, base_row = parent_col * 2, parent_row * 2
+    written, kept = [], []
+    step = GRID_N - 1
+    for col_bit in (0, 1):
+        for row_bit in (0, 1):
+            child_id = _tile_id(depth, base_col + col_bit, base_row + row_bit)
+            child_meta = read_tile_metadata(db, child_id)
+            if child_meta is not None and child_meta['source'] in REAL_SOURCES:
+                kept.append(f"{child_id}({child_meta['source']})")
+                continue
+            # Heightmaps are south-first; child row bit increases northward.
+            quadrant = upscaled[
+                row_bit * step: row_bit * step + GRID_N,
+                col_bit * step: col_bit * step + GRID_N,
+            ].astype(np.float32).copy()
+            try:
+                write_tile(
+                    db, child_id, quadrant, confidence, COOKED_DEM_SOURCE,
+                    reconcile=False, allow_overwrite=allow_overwrite,
+                )
+                written.append(child_id)
+            except TileClobberError:
+                kept.append(f"{child_id}(clobber-guard)")
+    cook_ms = (time.perf_counter() - cook_started) * 1000.0
+    log_d13.info(
+        f"{tile_id}: DEM COOKED quad from {parent_id} "
+        f"({parent['source']}, water_mask={'yes' if water_mask is not None else 'no'}, "
+        "relief=bilinear) — "
+        f"wrote {len(written)} as {COOKED_DEM_SOURCE}"
+        + (f", kept {', '.join(kept)}" if kept else "")
+        + f" in {cook_ms:.0f}ms"
+    )
+    return bool(written) or bool(kept)
 
 
 def _ensure_children(db, depth, col, row):
@@ -371,7 +508,7 @@ def _traverse(db, depth, col, row, qx, qy, max_depth, error_threshold,
             # a 10 km-wide depth-8 tile remain terminal beside depth-12 tiles.
             lod_distance = dist_to_tile
             target_depth = _lod_target_depth(
-                lod_distance, max_range, max_depth
+                lod_distance, max_range, max_depth, altitude
             )
             wants_subdivision = depth < target_depth
         else:
@@ -558,38 +695,12 @@ def query_tiles_stereo(db, qx, qy, error_threshold=0.001, max_depth=None,
                        lod_history=None):
     """Query tiles using error-based LOD with stereo coords directly.
 
-    Same as query_tiles() but takes EPSG:3413 coords instead of lat/lon.
-        max_range: circular coverage radius in meters.
-    altitude: camera altitude in meters — increases effective distance to tiles below.
+    ``max_range`` is a circular coverage radius in meters.
+    altitude: camera height above ground in meters — increases effective
+        distance to tiles below.
     """
     return _query_tiles_impl(db, qx, qy, error_threshold, max_depth, max_range,
                              log, altitude, lod_history=lod_history)
-
-
-def query_tiles(db, lat, lon, error_threshold=0.001, max_depth=None,
-                max_range=0.0, log=print, altitude=0.0):
-    """Query tiles using error-based LOD.
-
-    Returns best-available tiles from the DB plus a list of missing tiles
-    that should be fetched in the background for the next frame.
-
-    Args:
-        db: sqlite3 connection to terrain database
-        lat, lon: camera position in WGS84 degrees
-        error_threshold: screen-space error threshold.
-            Lower = more detail. 0.001 is a reasonable default.
-        max_depth: maximum traversal depth (default: from DB metadata)
-        max_range: if > 0, skip tiles beyond this distance in meters.
-        log: logging function for clear source attribution
-        altitude: camera altitude in meters — increases effective distance to tiles below.
-
-    Returns:
-        (tiles, missing) where:
-            tiles: list of dicts with id, bbox, depth, heightmap, etc.
-            missing: list of (tile_id, bbox) that need COG fetching
-    """
-    qx, qy = to_stereo(lat, lon)
-    return _query_tiles_impl(db, qx, qy, error_threshold, max_depth, max_range, log, altitude)
 
 
 def _query_tiles_impl(db, qx, qy, error_threshold, max_depth, max_range, log,
@@ -629,9 +740,8 @@ def _query_tiles_impl(db, qx, qy, error_threshold, max_depth, max_range, log,
     if len(leaf_ids) > MAX_TILES:
         # Score each tile: (depth, distance) — drop highest scores first
         def _tile_score(tid):
-            parts = tid.split('-')
-            d = int(parts[0])
-            bbox = _tile_bbox(d, int(parts[1]), int(parts[2]))
+            d, col, row = require_tile_id(tid)
+            bbox = _tile_bbox(d, col, row)
             dist = _distance_to_bbox(qx, qy, bbox)
             return (d, dist)
         leaf_ids.sort(key=_tile_score)
@@ -709,7 +819,7 @@ def _query_tiles_impl(db, qx, qy, error_threshold, max_depth, max_range, log,
     # --- Clear logging: what came from where ---
     db_depths = Counter(t['depth'] for t in results)
     db_sources = Counter(t['source'] for t in results)
-    miss_depths = Counter(int(tid.split('-')[0]) for tid, _ in missing)
+    miss_depths = Counter(require_tile_id(tid)[0] for tid, _ in missing)
     skip_count = len(_no_data_cache)
 
     log(f"  [DB HIT] {len(results)} tiles from database: "
@@ -728,103 +838,3 @@ def _query_tiles_impl(db, qx, qy, error_threshold, max_depth, max_range, log,
         lod_history.update(tile['id'] for tile in results)
 
     return results, missing
-
-
-def fetch_missing_tiles(db, missing, max_workers=6, log=print):
-    """Fetch missing tiles from ArcticDEM/Copernicus COG on S3.
-
-    Each tile is read at native resolution from the COG, resampled via
-    world-coordinate bilinear interp (_read_cog_heightmap), and written
-    to the DB cache. After fetching, rebuilds affected parent tiles so
-    coarser LOD levels are immediately available.
-
-    Args:
-        db: sqlite3 connection
-        missing: list of (tile_id, bbox) from query_tiles()
-        max_workers: parallel fetch threads
-        log: logging function
-
-    Returns:
-        Number of tiles successfully fetched.
-    """
-    import time
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-    from ingest import _read_cog_heightmap, _resample_from_parent
-
-    if not missing:
-        return 0
-
-    log(f"  [COG FETCH] Starting {len(missing)} tile reads from S3 "
-        f"({max_workers} workers)...")
-
-    t0 = time.time()
-    fetched = 0
-    no_data = 0
-    clobbered = 0
-
-    # Check which tiles already exist with upgradeable sources
-    upgrade_tids = set()
-    bbox_by_id = {tid: bbox for tid, bbox in missing}
-    for tid, bbox in missing:
-        meta = read_tile_metadata(db, tid)
-        if meta and meta['source'] in _UPGRADEABLE_SOURCES:
-            upgrade_tids.add(tid)
-
-    def _worker(tile_id, bbox):
-        return tile_id, _read_cog_heightmap(bbox, GRID_N)
-
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {
-            executor.submit(_worker, tid, bbox): tid
-            for tid, bbox in missing
-        }
-        for future in as_completed(futures):
-            tid = futures[future]
-            try:
-                tile_id, (data, src_name) = future.result()
-
-                # Fallback: resample from parent if COG returned nothing
-                if data is None:
-                    water = _cache_coastline(db, tile_id, bbox_by_id[tile_id])
-                    if water is not None and np.all(water):
-                        _mark_official_ocean(db, tile_id)
-                        fetched += 1
-                        continue
-                    data, src_name = _resample_from_parent(db, tile_id, bbox=None, resolution=GRID_N)
-                    # bbox not needed — _resample_from_parent uses tile_id to find parent
-
-                if data is None:
-                    if tid not in upgrade_tids:
-                        mark_no_data(db, tile_id)
-                    no_data += 1
-                    continue
-
-                source_name = src_name if isinstance(src_name, str) else 'arcticdem'
-                conf = CONFIDENCE.get(source_name, CONFIDENCE['arcticdem'])
-                cm = np.where(np.isnan(data), np.uint8(0), np.uint8(conf))
-                hm = np.where(np.isnan(data), 0.0, data).astype(np.float32)
-                overwrite = tid in upgrade_tids
-                write_tile(db, tile_id, hm, cm, source_name, reconcile=False,
-                           allow_overwrite=overwrite)
-                _cache_coastline(db, tile_id, bbox_by_id[tile_id])
-                fetched += 1
-                if overwrite:
-                    log(f"  [DEM UPGRADE] {tid}: {source_name} replaced old 32m data")
-            except TileClobberError as exc:
-                clobbered += 1
-                log(
-                    f"  [CLOBBER] {exc.tile_id} already has payload "
-                    f"(existing={exc.existing_source}, incoming={exc.incoming_source}, "
-                    f"updated_at={exc.existing_updated_at})"
-                )
-            except Exception:
-                mark_no_data(db, futures[future])
-                no_data += 1
-
-    elapsed = time.time() - t0
-    log(f"  [COG FETCH] Done: {fetched} fetched from S3, "
-        f"{no_data} no data (ocean), {clobbered} clobber-detected, {elapsed:.1f}s")
-
-    # Rebuild affected parents so coarser LOD levels are available ? might be obsolete
-
-    return fetched

@@ -16,9 +16,18 @@ import { Ellipsoid, Geodetic, radians } from '@takram/three-geospatial';
 import { NormalPass } from 'postprocessing';
 import { buildAssetLibrary } from './procgen/library.ts';
 import { buildTileScatter, updateScatterVisibility, SCATTER_MIN_DEPTH } from './procgen/scatter.ts';
+import { sharedSurfaceFieldStore } from './terrain-surface-fields.js';
+import { createWebGLGroundRing } from './render-backends/webgl-ground-ring.js';
 import { headingFromForward2D } from './terrain-priority.js';
 import { createTerrainHeadingDemandController } from './terrain-heading-demand.js';
-import { compassHeading, createTerrainHud, renderGameClock } from './terrain-hud.js';
+import {
+  cameraDriftIndicator,
+  compassHeading,
+  createTerrainHud,
+  hudActionLink,
+  renderGameClock,
+  terrainHudHeader,
+} from './terrain-hud.js';
 import { applyMapDrag, installTerrainKeyboardControls, installTerrainPointerControls } from './terrain-controls.js';
 import { stepVehicleDrive } from './terrain-vehicle.js';
 import { createTerrainVehicleRuntime } from './terrain-vehicle-runtime.js';
@@ -28,9 +37,12 @@ import { evaluateTerrainRefetch, summarizeTerrainCamera, terrainCameraCoordinate
 import { collectTerrainDebugMeshes, createTerrainHoverOutlineController, createTerrainMapGridController, formatTerrainSeamDiagnostic, summarizeTerrainMesh } from './terrain-debug-runtime.js';
 import { createTerrainFetchRuntime } from './terrain-fetch-runtime.js';
 import { createTerrainTileSet } from './terrain-tile-set.js';
+import { createClassifierOverlay } from './terrain-classifier-overlay.js';
 import { createTerrainGridlinesRuntime } from './terrain-gridlines-runtime.js';
 import { restoreTerrainCameraState, terrainCameraState } from './terrain-camera-state.js';
 import { createTerrainClientLogger } from './terrain-client-logging.js';
+import { createTerrainGpuProfileControl } from './terrain-gpu-profile-control.js';
+import { createTerrainCpuProfiler } from './terrain-cpu-profiler.js';
 import { createTerrainFpsCounter } from './terrain-fps-counter.js';
 import { loadTerrainStartupAssets } from './terrain-startup-assets.js';
 import { createTerrainAtmosphereTextureRuntime } from './terrain-atmosphere-textures.js';
@@ -47,10 +59,23 @@ import { createTerrainTileInspectorRuntime } from './terrain-tile-inspector-runt
 import { resolveTerrainViewToggle } from './terrain-view-mode.js';
 import { googleMaps3dUrl } from './terrain-google-maps.js';
 import { createTerrainFlyToTileRuntime } from './terrain-fly-to-tile.js';
+import { approximateLatLonToLocalMeters } from './terrain-local-coordinates.js';
 import { epsg3413DirectionBearing, epsg3413ToWgs84 } from './terrain-polar-stereo.js';
 import { createWaterRuntime, DEFAULT_WATER_PARAMS } from './water/water-runtime.js';
-import { FAST_TIME_SCALE, getFastTimeRange } from './terrain-game-clock.js';
-import { advanceRealtimeMovement, MAX_REALTIME_STEP_SECONDS } from './terrain-realtime-step.js';
+import { waterCloudinessFromCoverage } from './water/water-sky.js';
+import {
+  FAST_TIME_SCALE,
+  getFastTimeRange,
+  parseGameClockSnapshot,
+  serializeGameClockSnapshot,
+} from './terrain-game-clock.js';
+import {
+  advanceRealtimeMovement,
+  MAX_REALTIME_STEP_SECONDS,
+  stepFreeFlightVelocity,
+} from './terrain-realtime-step.js';
+import { DETAIL_FADE_END_M, DETAIL_STRENGTH, setDetailTuning } from './terrain-detail-layer.js';
+import { terrainAglFromSurface, terrainSurfaceHeightAt } from './terrain-agl.js';
 
 export async function startTerrainApplication({
   backend = 'webgl',
@@ -132,15 +157,23 @@ flushClientLogQueue();
 const referenceDate = new Date('2025-07-01T12:00:00Z');
 const GAME_TIME_SCALE = 1;
 const SUN_DIRECTION_SYNC_INTERVAL_MS = 60 * 1000;
-const GAME_CLOCK_STORAGE_KEY = 'game-clock-ms';
-const savedGameClockMs = Number(localStorage.getItem(GAME_CLOCK_STORAGE_KEY));
+const GAME_CLOCK_STORAGE_KEY = 'game-clock-state';
+const LEGACY_GAME_CLOCK_STORAGE_KEY = 'game-clock-ms';
+const savedGameClock = parseGameClockSnapshot(
+  localStorage.getItem(GAME_CLOCK_STORAGE_KEY)
+    ?? localStorage.getItem(LEGACY_GAME_CLOCK_STORAGE_KEY),
+  {
+    fallbackGameTimeMs: referenceDate.getTime(),
+    defaultTimeScale: GAME_TIME_SCALE,
+  },
+);
 const gameClockState = {
-  anchorGameTimeMs: savedGameClockMs || referenceDate.getTime(),
+  anchorGameTimeMs: savedGameClock.gameTimeMs,
   anchorBrowserTimeMs: Date.now(),
   lastSavedAtMs: 0,
-  running: true,
-  timeScale: GAME_TIME_SCALE,
-  stopGameTimeMs: null,
+  running: savedGameClock.running,
+  timeScale: savedGameClock.timeScale,
+  stopGameTimeMs: savedGameClock.stopGameTimeMs,
   renderedDate: null,
   lastSunSyncTimeMs: NaN,
 };
@@ -250,17 +283,23 @@ const BASE_BRAKE = 800;
 const BASE_MAX_SPEED = 5000;
 const BASE_STRAFE_SPEED = 800;
 const TURN_SPEED = 1.5;
-const MIN_FLIGHT_ALT = paramNumber('minFlightAlt', 2);
+// The synthetic fjord floor sits at -5 m. Leave a metre of clearance while
+// still allowing the free-flight camera to cross the waterline and explore
+// the water column.
+const MIN_FLIGHT_ALT = paramNumber('minFlightAlt', -4);
 // AGL-based speed scaling: full speed at AGL_FULL_SPEED_M, minimum factor at ground level
 const AGL_FULL_SPEED_M = 500;
 const AGL_MIN_FACTOR = 0.05;
-const aglRaycaster = new THREE.Raycaster();
+const aglLocalPosition = new THREE.Vector3();
+const cpuProfiler = createTerrainCpuProfiler();
 const MOUSE_SENS = 0.003;
 const MAP_PAN_FACTOR = 1.2;
 
 const defaultCameraPosition = camera.position.clone();
 const cameraRuntimeState = {
-  agl: AGL_FULL_SPEED_M, // Assume high until the first terrain raycast.
+  // Placeholder drives movement speed only; aglValid keeps it out of LOD.
+  agl: AGL_FULL_SPEED_M,
+  aglValid: false,
   lastGoodPosition: camera.position.clone(),
   lastMoveTime: performance.now(),
   driftMode: false,
@@ -297,27 +336,38 @@ const renderer = renderBackend.renderer;
 document.body.appendChild(renderer.domElement);
 renderer.domElement.addEventListener('contextmenu', event => event.preventDefault());
 let tileInspectorRuntime = null;
+let hudCollapsed = false;
 
 const { hud, alt, gameClock: gameClockEl } = createTerrainHud({
+  onToggleCollapsed: () => {
+    hudCollapsed = !hudCollapsed;
+    updateHud();
+    requestRender();
+  },
   onToggleMapMode: () => toggleMapMode(),
   onToggleSeamMode: () => toggleSeamMode(),
   onToggleTileInspector: () => toggleTileInspector(),
   onToggleGridlines: () => toggleGridlines(),
+  onToggleClassifierOverlay: () => cycleClassifierOverlay(),
   onToggleWaterOverlay: () => toggleWaterOverlay(),
   onToggleHydrographyOverlay: () => toggleHydrographyOverlay(),
   onToggleRenderBackend: () => {
     // beforeunload normally saves this too, but make the renderer transition
     // self-contained so a fast reload cannot race the camera/frame snapshot.
     savePosition();
+    saveGameClock();
     onToggleRenderBackend();
   },
   onToggleRoadDebug: () => toggleRoadDebug(),
+  onOpenGoogleMaps: () => openGoogleMapsView(),
+  onStartFastTime: () => startFastTime(),
   onReset: () => resetView(),
   onClockAction: action => {
     if (action === 'rw') rewindGameClock();
     else if (action === 'stop') stopGameClock();
     else if (action === 'play') playGameClock();
     else if (action === 'ff') fastForwardGameClock();
+    saveGameClock();
     requestRender();
   },
 });
@@ -370,6 +420,7 @@ function startFastTime() {
   gameClockState.running = true;
   applyDate(currentDate);
   maybeLogWebGPUSun(currentDate, 'clock-fast-time', true);
+  saveGameClock();
   requestRender();
 }
 
@@ -489,14 +540,13 @@ if (tuningState.brightness == null && tuningState['webgpu exposure'] != null) {
 if (tuningState.haze == null && tuningState['fog strength'] != null) {
   tuningState.haze = tuningState['fog strength'];
 }
+// The persisted clock is authoritative. Keep the date slider synchronized
+// with it instead of replaying an older tuning value over the saved timestamp.
+tuningState.month = currentDate.getUTCMonth() + 1;
 localStorage.setItem(TUNING_STORAGE_KEY, JSON.stringify(tuningState));
 function saveTuning() {
   localStorage.setItem(TUNING_STORAGE_KEY, JSON.stringify(tuningState));
 }
-const hasSavedMonth = Object.prototype.hasOwnProperty.call(tuningState, 'month');
-const hasSavedHour = Object.prototype.hasOwnProperty.call(tuningState, 'hour (UTC)');
-gameClockState.running = !(hasSavedMonth || hasSavedHour);
-
 // Deferred binding: renderer-specific callbacks are wired after effects exist.
 const {
   reset: resetTuningUI,
@@ -511,6 +561,7 @@ const {
 
 // We'll call this after aerialPerspective + cloudsEffect are created.
 let cloudTuning = null;
+let restoringTuningControls = true;
 function buildTuningControls(ap, ce) {
   tuningSectionLabel('Date / Time');
   const monthNames = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
@@ -519,10 +570,23 @@ function buildTuningControls(ap, ce) {
     decimals: 0,
     format: v => monthNames[v - 1],
     onChange: v => {
+      if (restoringTuningControls) return;
       gameClockState.running = false;
       currentDate.setUTCMonth(v - 1);
       applyDate(currentDate);
+      saveGameClock();
     }
+  });
+
+  tuningSectionLabel('Ground Detail');
+  tuningSlider('detail str', {
+    min: 0, max: 1, step: 0.05, value: DETAIL_STRENGTH,
+    onChange: v => setDetailTuning({ strength: v }),
+  });
+  tuningSlider('detail fade m', {
+    min: 60, max: 3000, step: 20, value: DETAIL_FADE_END_M,
+    decimals: 0,
+    onChange: v => setDetailTuning({ fadeEnd: v }),
   });
 
   if (!USE_WEBGPU_RENDER_BACKEND) {
@@ -571,6 +635,11 @@ function buildTuningControls(ap, ce) {
     renderingEnabled: renderBackend.takramCloudsEnabled,
     onRenderingEnabledChange: enabled => {
       renderBackend.setTakramCloudsEnabled(enabled);
+    },
+    onAppearanceChange: () => {
+      if (restoringTuningControls) return;
+      restoreCloudTemporalHistory = invalidateTerrainCloudHistory(cloudsEffect);
+      requestRender();
     },
   });
   }
@@ -803,7 +872,7 @@ scene.add(terrainRoot);
 
 // --- Fjord water (ocean2 FFT port) ---
 // A camera-following FFT water surface at local z=0; masked water terrain is
-// dropped to -3 m server-side, so the surface has volume above the seabed
+// dropped to -5 m server-side, so the surface has volume above the seabed
 // and land occludes it naturally. Inert on backends without createWater.
 const waterParams = { ...DEFAULT_WATER_PARAMS };
 // Bumped whenever a tile's displayed texture actually changes; the water
@@ -873,10 +942,31 @@ const mapGridController = createTerrainMapGridController({ terrainRoot });
 // --- Terrain streaming state ---
 const EXAG = 1.0;
 
-// --- Procedural asset scatter (fable5-world-demo port, chain validation) ---
-// Temporarily disabled; keep the procedural vegetation pipeline intact for re-enabling.
-const SCATTER_ENABLED = false;
+// --- Procedural asset scatter (treeless tundra clutter) ---
+// The asset library is raw GLSL ShaderMaterial — WebGL only. WebGPU clutter
+// is the procedural-runtime port (see the procedural-greenland checkout),
+// a separate work item.
+const SCATTER_ENABLED = renderBackend.kind === 'webgl';
+// Only the deep LOD cores get clutter: their ~3-tile-width discs ARE the
+// camera-following near-field window the tundra densities are budgeted for.
+// d14 core ≈ 494 m — beyond that the frequency-split detail carries the eye.
+const SCATTER_ATTACH_MIN_DEPTH = 14;
 const SCATTER_SEED = 1337;
+// Camera-following grass carpet (WebGL clipmap ring): the layer that hides
+// bare terrain in the final ~50 m. Created lazily with the scatter library.
+let groundRing = null;
+if (SCATTER_ENABLED) {
+  try {
+    groundRing = createWebGLGroundRing({
+      terrainRoot,
+      surfaceFields: sharedSurfaceFieldStore({ log: () => {} }),
+      log: message => enqueueClientLog('info', 'ground-ring', { message }),
+    });
+  } catch (err) {
+    console.error('[ground-ring] init failed', err);
+    enqueueClientLog('error', 'ground-ring', { error: String(err) });
+  }
+}
 let _scatterLib = null;   // built lazily on the first deep tile
 let _scatterLibFailed = false;
 function scatterLibrary() {
@@ -893,31 +983,78 @@ function scatterLibrary() {
   return _scatterLib;
 }
 
+// Classification runs asynchronously server-side (baked from the tile's own
+// texture on first classifier demand) and is routinely still "pending" the
+// moment a freshly-loaded tile first asks for it. Scatter builds ONCE per
+// tile, unlike the ground ring which recomposes continuously — a build that
+// lands on a pending/blank mask would otherwise freeze that tile's rocks and
+// vegetation as if the ground were uniformly bare, forever. Retry a few
+// times with backoff until a real classification shows up.
+const SCATTER_RETRY_DELAYS_MS = [1500, 4000, 10000];
+
 function attachTileScatter(mesh, tile, hm) {
   if (!SCATTER_ENABLED || !mesh || !tile?.id) return;
   const depth = tileDepthFromId(tile.id);
-  if (depth < SCATTER_MIN_DEPTH) return;
+  if (depth < Math.max(SCATTER_MIN_DEPTH, SCATTER_ATTACH_MIN_DEPTH)) return;
   const lib = scatterLibrary();
   if (!lib) return;
-  try {
-    const group = buildTileScatter({
-      tileId: tile.id,
-      bbox: tile.bbox,
-      hm,
-      res: tile.resolution,
-      lib,
-      exag: EXAG
-    });
-    if (group) mesh.add(group);
-  } catch (err) {
-    enqueueClientLog('error', 'scatter.tile', { tileId: tile.id, error: String(err) });
+
+  let currentGroup = null;
+
+  function disposeGroup(group) {
+    if (!group) return;
+    mesh.remove(group);
+    for (const child of group.children) {
+      if (child.isInstancedMesh) child.dispose();
+    }
   }
+
+  function fetchAndBuild(attempt) {
+    // Tile evicted or its mesh recycled for a different tile since we
+    // scheduled this retry — nothing to attach to anymore.
+    if (mesh.userData?.tileId !== tile.id) return;
+    // Full-resolution classifier fields gate WHERE things go; the same
+    // store feeds the detail shader, so this is one shared fetch.
+    sharedSurfaceFieldStore({ log: () => {} }).get(tile.id).then(entry => {
+      if (mesh.userData?.tileId !== tile.id) return;
+      try {
+        const group = buildTileScatter({
+          tileId: tile.id,
+          bbox: tile.bbox,
+          hm,
+          res: tile.resolution,
+          lib,
+          exag: EXAG,
+          fields: entry?.fields,
+        });
+        disposeGroup(currentGroup);
+        currentGroup = group;
+        if (group) {
+          mesh.add(group);
+          requestRender();
+        }
+      } catch (err) {
+        enqueueClientLog('error', 'scatter.tile', { tileId: tile.id, error: String(err) });
+      }
+      if (entry?.pending && attempt < SCATTER_RETRY_DELAYS_MS.length) {
+        setTimeout(
+          () => fetchAndBuild(attempt + 1), SCATTER_RETRY_DELAYS_MS[attempt],
+        );
+      }
+    });
+  }
+
+  fetchAndBuild(0);
 }
 
 // Keep the camera comfortably inside the 4 km depth-12 plateau. A 5 km
 // threshold allowed the camera to leave that band before requesting a new
 // topology, making the entire fine-LOD region visibly trail behind it.
 const REFETCH_DIST = 1000;
+// Altitude directly caps the deepest server LOD. Refresh well within one
+// depth-12 tile width so a vertical descent reveals finer tiles promptly even
+// when the camera has not moved horizontally.
+const REFETCH_ALTITUDE_DELTA = 100;
 const terrainPipelineState = {
   ready: false,
   originX: 0,
@@ -926,6 +1063,7 @@ const terrainPipelineState = {
   cameraStereoY: 0,
   lastFetchX: 0,
   lastFetchY: 0,
+  lastFetchAltitude: null,
   frameOffsetX: 0,
   frameOffsetY: 0,
   frameOffsetReady: false,
@@ -1007,6 +1145,25 @@ const vehicleRuntime = createTerrainVehicleRuntime({
 });
 
 const normalPass = new NormalPass(scene, camera);
+// The ground ring's clipmap transform lives in its custom vertex shader;
+// the NormalPass override material would render its 124k instances as an
+// untransformed blob at the terrain origin, corrupting the normal buffer
+// (same failure class as the 2a092d9 black-sprite fix). Hide it during the
+// pass — grass pixels then inherit the terrain's normals in the relight,
+// which is the right lighting for ground-hugging vegetation anyway.
+{
+  const _originalNormalRender = normalPass.render.bind(normalPass);
+  normalPass.render = function (...args) {
+    const rings = groundRing?.meshes ?? [];
+    const visibility = rings.map(ring => ring.visible);
+    for (const ring of rings) ring.visible = false;
+    try {
+      return _originalNormalRender(...args);
+    } finally {
+      rings.forEach((ring, index) => { ring.visible = visibility[index]; });
+    }
+  };
+}
 
 const cloudsEffect = new CloudsEffect(camera, { resolutionScale: 1 });
 const cloudsDefaults = configureTerrainClouds({
@@ -1067,16 +1224,29 @@ function getGameDateFromBrowserTime(nowMs = Date.now()) {
   }
   return new Date(gameTimeMs);
 }
+function saveGameClock() {
+  if (gameClockState.running) {
+    currentDate.setTime(getGameDateFromBrowserTime().getTime());
+  }
+  localStorage.setItem(GAME_CLOCK_STORAGE_KEY, serializeGameClockSnapshot({
+    gameTimeMs: currentDate.getTime(),
+    running: gameClockState.running,
+    timeScale: gameClockState.timeScale,
+    stopGameTimeMs: gameClockState.stopGameTimeMs,
+  }));
+  localStorage.removeItem(LEGACY_GAME_CLOCK_STORAGE_KEY);
+  gameClockState.lastSavedAtMs = performance.now();
+}
 buildTuningControls(aerialPerspective, cloudsEffect);
+restoringTuningControls = false;
 // Control registration fills in defaults as well as restoring overrides, so
 // this is a complete bundle of the registered tuning controls instead of a
 // sparse record of only the sliders that have emitted an input event.
 saveTuning();
-// Only apply the default referenceDate if no saved tuning overrides month/hour.
-// buildTuningControls already calls applyDate() when restoring saved values.
 if (gameClockState.running) {
-  applyDate(getGameDateFromBrowserTime());
+  currentDate.setTime(getGameDateFromBrowserTime().getTime());
 }
+applyDate(currentDate);
 
 bindTerrainCloudComposition(cloudsEffect, aerialPerspective);
 
@@ -1164,6 +1334,31 @@ const terrainTileSet = createTerrainTileSet({
     },
   },
 });
+// Classifier decision colors painted straight onto the terrain. The HUD link
+// toggles the full-resolution class map without leaving the 3D view.
+const classifierOverlay = createClassifierOverlay({
+  tileSet: terrainTileSet,
+  requestRender,
+  log: tileLog,
+});
+let gridlinesActiveBeforeClassifier = null;
+function cycleClassifierOverlay() {
+  const previousMode = classifierOverlay.mode;
+  const nextMode = classifierOverlay.cycle();
+  if (previousMode === 'off' && nextMode !== 'off') {
+    gridlinesActiveBeforeClassifier = gridlinesRuntime.active;
+    gridlinesRuntime.setActive(true);
+  } else if (nextMode === 'off') {
+    gridlinesRuntime.setActive(gridlinesActiveBeforeClassifier ?? false);
+    gridlinesActiveBeforeClassifier = null;
+  } else if (!gridlinesRuntime.active) {
+    // The classifier view opens with terrain tile boundaries visible.
+    gridlinesRuntime.setActive(true);
+  }
+  console.log(`[overlay] ${nextMode}`);
+  updateHud();
+  requestRender();
+}
 const gridlinesRuntime = createTerrainGridlinesRuntime({
   terrainRoot,
   onChanged: () => {
@@ -1269,7 +1464,12 @@ function openGoogleMapsView() {
     directionUp: googleMapsDirection.dot(googleMapsUp),
     fov: camera.fov,
   });
-  const latitudeRadians = exactPosition.lat * Math.PI / 180;
+  const linearMinusExact = approximateLatLonToLocalMeters({
+    lat: linearPosition.lat,
+    lon: linearPosition.lon,
+    anchorLat: exactPosition.lat,
+    anchorLon: exactPosition.lon,
+  });
   lastGoogleCoordinateComparison = {
     camera: renderedPosition,
     aim: aimPosition,
@@ -1281,8 +1481,8 @@ function openGoogleMapsView() {
     gridBearing,
     linearEnu: linearPosition,
     linearMinusExactMeters: {
-      east: (linearPosition.lon - exactPosition.lon) * 111320 * Math.cos(latitudeRadians),
-      north: (linearPosition.lat - exactPosition.lat) * 111320,
+      east: linearMinusExact.eastM,
+      north: linearMinusExact.northM,
     },
     agl: cameraRuntimeState.agl,
     url,
@@ -1404,6 +1604,9 @@ const terrainFetchRuntime = createTerrainFetchRuntime({
     anchorLatitude: anchorLat,
     anchorLongitude: anchorLon,
     getHeading: getTerrainViewHeading,
+    getCameraAGL: () => (
+      cameraRuntimeState.aglValid ? cameraRuntimeState.agl : null
+    ),
   },
   vehicle: vehicleRuntime,
   terrain: terrainTileSet,
@@ -1509,6 +1712,7 @@ function savePosition() {
 }
 setInterval(savePosition, 250);
 window.addEventListener('beforeunload', savePosition);
+window.addEventListener('beforeunload', saveGameClock);
 
 // Restore saved camera position (lat/lon/alt are origin-independent)
 try {
@@ -1606,6 +1810,14 @@ document.addEventListener('terrain-gpu-profile-request', () => {
   );
 });
 
+const gpuProfileControl = createTerrainGpuProfileControl({
+  profiler: renderBackend.gpuProfiler ?? null,
+  cpuProfiler,
+  backend,
+  log: (event, details) => enqueueClientLog('info', event, details),
+});
+gpuProfileControl.start();
+
 function applyCameraOrientation() {
   const cp = Math.cos(controls.pitch);
   const direction = new THREE.Vector3()
@@ -1660,13 +1872,30 @@ function isPressed(primary, secondary) {
 }
 
 function updateCameraAGL() {
+  const profileStartedAt = cpuProfiler.begin();
   const terrainMeshes = activeTerrainMeshes();
-  if (terrainMeshes.length === 0) return;
-  aglRaycaster.set(camera.position, up.clone().negate());
-  const hits = aglRaycaster.intersectObjects(terrainMeshes);
-  if (hits.length > 0) {
-    cameraRuntimeState.agl = hits[0].distance;
+  if (terrainMeshes.length === 0) {
+    cameraRuntimeState.aglValid = false;
+    cpuProfiler.end('agl-sample', profileStartedAt);
+    return;
   }
+  aglLocalPosition.copy(camera.position).sub(anchorPosition);
+  const surfaceHeight = terrainSurfaceHeightAt(
+    terrainMeshes,
+    aglLocalPosition.dot(east),
+    aglLocalPosition.dot(north),
+  );
+  const measuredAgl = terrainAglFromSurface(
+    aglLocalPosition.dot(up),
+    surfaceHeight,
+  );
+  if (measuredAgl != null) {
+    cameraRuntimeState.agl = measuredAgl;
+    cameraRuntimeState.aglValid = true;
+  } else {
+    cameraRuntimeState.aglValid = false;
+  }
+  cpuProfiler.end('agl-sample', profileStartedAt);
 }
 
 function aglSpeedFactor() {
@@ -1675,6 +1904,10 @@ function aglSpeedFactor() {
 }
 
 function updateMovement(dt) {
+  // Terrain refinement and movement speed share one measured AGL. Update it
+  // before the vehicle branch too; returning early there previously froze
+  // the camera clearance used by D15/D16 demand.
+  updateCameraAGL();
   const forwardPressed = isPressed('KeyW', 'ArrowUp');
   const backPressed = isPressed('KeyS', 'ArrowDown');
   const leftPressed = isPressed('KeyA', 'ArrowLeft');
@@ -1709,42 +1942,29 @@ function updateMovement(dt) {
     return;
   }
 
-  updateCameraAGL();
   const sf = aglSpeedFactor();
   const ACCEL = BASE_ACCEL * sf;
   const BRAKE = BASE_BRAKE * sf;
   const MAX_SPEED = BASE_MAX_SPEED * sf;
   const STRAFE_SPEED = BASE_STRAFE_SPEED * sf;
 
-  // clamp existing speed to new AGL-scaled max
-  controls.speed = Math.max(-MAX_SPEED, Math.min(MAX_SPEED, controls.speed));
-  controls.strafeSpeed = Math.max(-STRAFE_SPEED, Math.min(STRAFE_SPEED, controls.strafeSpeed));
-
-  if (forwardPressed) {
-    controls.speed = Math.min(controls.speed + ACCEL * dt, MAX_SPEED);
-  } else if (backPressed) {
-    controls.speed = Math.max(controls.speed - ACCEL * dt, -MAX_SPEED);
-  } else if (!cameraRuntimeState.driftMode) {
-    if (controls.speed > 0) {
-      controls.speed = Math.max(controls.speed - BRAKE * dt, 0);
-    } else if (controls.speed < 0) {
-      controls.speed = Math.min(controls.speed + BRAKE * dt, 0);
-    }
-  }
-
-  if (controls.mapMode) {
-    controls.strafeSpeed = 0;
-  } else if (rightPressed) {
-    controls.strafeSpeed = Math.min(controls.strafeSpeed + ACCEL * dt, STRAFE_SPEED);
-  } else if (leftPressed) {
-    controls.strafeSpeed = Math.max(controls.strafeSpeed - ACCEL * dt, -STRAFE_SPEED);
-  } else if (!cameraRuntimeState.driftMode) {
-    if (controls.strafeSpeed > 0) {
-      controls.strafeSpeed = Math.max(controls.strafeSpeed - BRAKE * dt, 0);
-    } else if (controls.strafeSpeed < 0) {
-      controls.strafeSpeed = Math.min(controls.strafeSpeed + BRAKE * dt, 0);
-    }
-  }
+  const flightVelocity = stepFreeFlightVelocity({
+    speed: controls.speed,
+    strafeSpeed: controls.strafeSpeed,
+    forwardPressed,
+    backPressed,
+    leftPressed,
+    rightPressed,
+    forwardLock: cameraRuntimeState.driftMode,
+    mapMode: controls.mapMode,
+    acceleration: ACCEL,
+    brake: BRAKE,
+    maxSpeed: MAX_SPEED,
+    maxStrafeSpeed: STRAFE_SPEED,
+    dt,
+  });
+  controls.speed = flightVelocity.speed;
+  controls.strafeSpeed = flightVelocity.strafeSpeed;
 
   if (controls.mapMode) {
     updateMapCamera();
@@ -1855,6 +2075,13 @@ function updateHud() {
   const gridlinesLine = gridlinesRuntime.active
     ? 'gridlines: <span id="gridlinesModeLink" style="color:#8f8;text-decoration:underline;cursor:pointer;pointer-events:auto">ON</span>'
     : 'gridlines: <span id="gridlinesModeLink" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">off</span>';
+  const classifierOverlayColor = {
+    off: '#0af', classifier: '#6ecd3c',
+  }[classifierOverlay.mode] ?? '#0af';
+  const classifierOverlayLabel = {
+    off: 'off', classifier: 'CLASSES',
+  }[classifierOverlay.mode] ?? 'off';
+  const classifierOverlayLine = `classifier: <span id="classifierOverlayLink" title="Paint classifier decisions on the terrain" style="color:${classifierOverlayColor};text-decoration:underline;cursor:pointer;pointer-events:auto">${classifierOverlayLabel}</span>`;
   const waterOverlayLine = textureStreamer.waterDebug
     ? 'pink water: <span id="waterOverlayLink" style="color:#ff2aa1;text-decoration:underline;cursor:pointer;pointer-events:auto">ON</span>'
     : 'pink water: <span id="waterOverlayLink" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">off</span>';
@@ -1870,13 +2097,12 @@ function updateHud() {
   const gameDate = gameClockState.renderedDate;
   const now = performance.now();
   if (now - gameClockState.lastSavedAtMs > 5000) {
-    gameClockState.lastSavedAtMs = now;
-    localStorage.setItem(GAME_CLOCK_STORAGE_KEY, String(gameDate.getTime()));
+    saveGameClock();
   }
   renderGameClock(gameClockEl, gameDate, gameClockState.running, gameClockState.timeScale);
 
-  const hudHtml = [
-    '<b>Clouds Terrain Managed Flask UX WIP</b>',
+  const hudRows = [
+    terrainHudHeader(hudCollapsed),
     `mode: <b>${modeHtml}</b>`,
     `renderer: <span id="renderBackendLink" title="Switch to ${nextRenderBackendLabel}" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">${renderBackendLabel}</span>`,
     `fps: <b>${fpsCounter.display}</b>`,
@@ -1888,25 +2114,28 @@ function updateHud() {
           : ' · aim: no terrain hit')
       : '',
     `enu: E ${eastM.toFixed(0)}m  N ${northM.toFixed(0)}m  U ${altM.toFixed(0)}m`,
-    `speed: ${speedKmh.toFixed(0)} km/h  heading: ${deg.toFixed(0)}° ${compass}`,
+    `speed: ${speedKmh.toFixed(0)} km/h${cameraDriftIndicator(cameraRuntimeState.driftMode)}  heading: ${deg.toFixed(0)}° ${compass}`,
     hmLine,
     texLine,
     gridlinesLine,
+    classifierOverlayLine,
     waterOverlayLine,
     hydrographyOverlayLine,
     vehicleRuntime.vehicleControlActive
       ? 'W/S drive, A/D steer, mouse orbit camera, Esc exits vehicle control'
       : 'WASD or Arrows move, Q/Z altitude, drag look',
     'map: left-drag rotate, right-drag pan, wheel zoom',
-    `<span id="mapModeLink" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">${controls.mapMode && !controls.seamMode && !tileInspectorRuntime?.active ? '3D view' : 'map mode'}</span> (M)` +
-      ` · <span id="seamModeLink" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">${controls.seamMode ? '3D view' : 'seam view'}</span>` +
-      ` · <span id="tileInspectorModeLink" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">${tileInspectorRuntime?.active ? '3D view' : 'tile inspector'}</span>` +
-      ' · Google 3D (G)' +
-      ' · fast time 03:00–03:00 (P)' +
-      ` · <span id="roadDebugLink" style="color:${roadDebugColor};text-decoration:underline;cursor:pointer;pointer-events:auto">${roadDebugLabel}</span>` +
-      ' · <span id="resetViewLink" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">reset</span>' +
-      ' · <span id="debugLogLink" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">debug log</span>'
-  ].join('<br>');
+    `${hudActionLink('mapModeLink', controls.mapMode && !controls.seamMode && !tileInspectorRuntime?.active ? '3D view' : 'map mode')} (M)`,
+    hudActionLink('seamModeLink', controls.seamMode ? '3D view' : 'seam view'),
+    hudActionLink('tileInspectorModeLink', tileInspectorRuntime?.active ? '3D view' : 'tile inspector'),
+    hudActionLink('googleMaps3dLink', 'Google 3D'),
+    hudActionLink('fastTimeLink', 'fast time 03:00–03:00'),
+    hudActionLink('roadDebugLink', roadDebugLabel, roadDebugColor),
+    hudActionLink('resetViewLink', 'reset'),
+    hudActionLink('debugLogLink', 'debug log'),
+    hudActionLink('classifierOpsLink', 'classifier ops'),
+  ];
+  const hudHtml = (hudCollapsed ? hudRows.slice(0, 1) : hudRows).join('<br>');
   // Rewriting innerHTML every rendered frame forces a DOM parse + relayout
   // even when nothing changed — only write when the content differs. The
   // selection guards pause writes while the user is selecting HUD text to
@@ -1941,6 +2170,7 @@ function resetView() {
   localStorage.removeItem('clouds-cam');
   localStorage.removeItem(TUNING_STORAGE_KEY);
   localStorage.removeItem(GAME_CLOCK_STORAGE_KEY);
+  localStorage.removeItem(LEGACY_GAME_CLOCK_STORAGE_KEY);
   for (const k of Object.keys(tuningState)) delete tuningState[k];
   controls.yaw = defaultYaw;
   controls.pitch = defaultPitch;
@@ -1956,6 +2186,8 @@ function resetView() {
   controls.mapPanNorth = 0;
   controls.mapZoom = DEFAULT_MAP_ZOOM;
   camera.position.copy(defaultCameraPosition);
+  cameraRuntimeState.agl = AGL_FULL_SPEED_M;
+  cameraRuntimeState.aglValid = false;
   camera.fov = 60;
   camera.updateProjectionMatrix();
   syncMapModePresentation();
@@ -1964,12 +2196,21 @@ function resetView() {
   updateMapCamera();
   // Reset all tuning sliders/toggles to defaults (clouds, cirrus, fog, etc.)
   resetTuningUI();
+  currentDate.setTime(referenceDate.getTime());
+  gameClockState.anchorGameTimeMs = currentDate.getTime();
+  gameClockState.anchorBrowserTimeMs = Date.now();
+  gameClockState.running = true;
+  gameClockState.timeScale = GAME_TIME_SCALE;
+  gameClockState.stopGameTimeMs = null;
+  applyDate(currentDate);
+  saveGameClock();
   camera.far = MAX_VIEW_DIST;
   camera.updateProjectionMatrix();
   // Close atmosphere panel
   tuningPanelOpen = false;
   tuningBody.style.display = 'none';
   document.getElementById('tuning-toggle').innerHTML = '&#9660;';
+  hudCollapsed = false;
   updateHud();
   // Re-fetch tiles around the reset camera position.
   terrainPipelineState.firstLoad = true;
@@ -1979,6 +2220,7 @@ function resetView() {
   terrainPipelineState.originX = 0; terrainPipelineState.originY = 0;
   terrainPipelineState.cameraStereoX = 0; terrainPipelineState.cameraStereoY = 0;
   terrainPipelineState.lastFetchX = 0; terrainPipelineState.lastFetchY = 0;
+  terrainPipelineState.lastFetchAltitude = null;
   terrainPipelineState.frameOffsetX = 0; terrainPipelineState.frameOffsetY = 0;
   terrainPipelineState.frameOffsetReady = false;
   terrainFetchRuntime.request();
@@ -2125,15 +2367,15 @@ installTerrainKeyboardControls({
   onForwardDoubleTap: () => {
     cameraRuntimeState.driftMode = !cameraRuntimeState.driftMode;
     console.log(`[drift] ${cameraRuntimeState.driftMode ? 'ON' : 'OFF'}`);
+    updateHud();
+    requestRender();
   },
   onEscapeVehicle: () => {
     vehicleRuntime.saveVehicleState('escape', { snapToGround: true, requireGroundedZ: false, bypassSnapThrottle: true });
     vehicleRuntime.setVehicleControlActive(false, 'escape', { skipExitSave: true });
   },
   onToggleMap: toggleMapMode,
-  onOpenGoogleMaps: openGoogleMapsView,
   onFlyToTile: promptFlyToTile,
-  onStartFastTime: startFastTime,
   onToggleHeadlights: () => {
     for (const light of vehicleRuntime.vehicleHeadlightSpots) light.visible = !light.visible;
   },
@@ -2342,11 +2584,14 @@ updateMapCamera();
 updateHud();
 
 function render() {
+  const frameStartedAt = cpuProfiler.begin();
   const elapsedDt = clock.getDelta();
   // Movement consumes the entire wall-clock interval. If rendering stalls,
   // intermediate simulation states are advanced without rendering and this
   // frame presents only the current camera/vehicle position.
+  const movementStartedAt = cpuProfiler.begin();
   advanceRealtimeMovement(elapsedDt, updateMovement);
+  cpuProfiler.end('movement-update', movementStartedAt);
   // Purely visual simulations may drop stale time to avoid a large unstable
   // water or suspension step after a delayed frame.
   const dt = Math.min(MAX_REALTIME_STEP_SECONDS, elapsedDt);
@@ -2367,6 +2612,21 @@ function render() {
   renderBackend.setFogDensity(fogStrength / getFogDistance());
   renderBackend.setMapMode(controls.mapMode);
 
+  // Water owns an analytic reflection sky because neither atmosphere backend
+  // is directly sampleable by the surface shader. Keep its overcast blend
+  // driven by the sky that is actually enabled; the old private parameter
+  // remained permanently zero, so cloud coverage changed the sky while the
+  // water kept reflecting a clear sunrise.
+  const cloudCoverage = USE_WEBGPU_RENDER_BACKEND
+    ? webgpuCloudShadowSettings.coverage
+    : cloudsEffect.coverage;
+  const cloudRenderingEnabled = USE_WEBGPU_RENDER_BACKEND
+    ? webgpuCloudShadowSettings.enabled
+    : renderBackend.takramCloudsEnabled;
+  waterParams.cloudiness = waterCloudinessFromCoverage(
+    cloudCoverage,
+    cloudRenderingEnabled,
+  );
   waterRuntime.update({
     dt, camera,
     visible: waterParams.enabled && !controls.mapMode
@@ -2393,8 +2653,13 @@ function render() {
     const refetch = evaluateTerrainRefetch({
       cameraX: terrainPipelineState.cameraStereoX, cameraY: terrainPipelineState.cameraStereoY,
       lastFetchX: terrainPipelineState.lastFetchX, lastFetchY: terrainPipelineState.lastFetchY,
+      cameraAltitude: cameraRuntimeState.aglValid
+        ? cameraRuntimeState.agl
+        : 0,
+      lastFetchAltitude: terrainPipelineState.lastFetchAltitude,
       nowMs, lastTriggerMs: terrainPipelineState.lastFetchTriggerMs,
-      distanceThreshold: REFETCH_DIST, triggerIntervalMs: 500,
+      distanceThreshold: REFETCH_DIST, altitudeThreshold: REFETCH_ALTITUDE_DELTA,
+      triggerIntervalMs: 500,
     });
     terrainPipelineState.lastFetchTriggerMs = refetch.nextTriggerMs;
     if (refetch.shouldFetch) terrainFetchRuntime.request();
@@ -2437,9 +2702,18 @@ function render() {
     vehicleRuntime.vehicleMarker.scale.setScalar(markerScale * vehicleRuntime.VEHICLE_MARKER_MAP_SCALE);
     renderBackend.renderMap(scene, mapCam, _mapBg);
     renderBackend.stopRenderLoopIfIdle();
+    cpuProfiler.end('frame-cpu', frameStartedAt);
     return;
   }
   if (SCATTER_ENABLED && _scatterLib) updateScatterVisibility(terrainRoot, camera);
+  if (groundRing && terrainPipelineState.ready) {
+    groundRing.update({
+      camera,
+      worldOffsetX: terrainPipelineState.originX - terrainPipelineState.frameOffsetX,
+      worldOffsetY: terrainPipelineState.originY - terrainPipelineState.frameOffsetY,
+      timeMs: performance.now(),
+    });
+  }
   webgpuAtmosphere?.updateCloudShadows(clock.elapsedTime);
   try {
     renderBackend.renderScene(scene, camera);
@@ -2448,6 +2722,7 @@ function render() {
     restoreCloudTemporalHistory = null;
   }
   renderBackend.stopRenderLoopIfIdle();
+  cpuProfiler.end('frame-cpu', frameStartedAt);
 }
 
 window.setInterval(runStreamingMaintenance, STREAMING_MAINTENANCE_MS);

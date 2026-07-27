@@ -38,6 +38,12 @@ import {
   vec4,
 } from 'three/tsl';
 import { WebGPUWaterSimulation } from './webgpu-water-sim.js';
+import { prepareTerrainTilesForBathymetry } from './terrain-bathymetry-tiles.js';
+import {
+  TERRAIN_BATHYMETRY_LAYER,
+  WATER_RENDER_CONTRACT,
+} from './terrain-render-contract.js';
+import { sortedPercentile } from '../terrain-statistics.js';
 import {
   NORTH_CLIFF_REFLECTION_MAX_PADDING_M,
   NORTH_CLIFF_SLOPE_FULL,
@@ -70,7 +76,6 @@ import {
 //     where b says a real satellite texture was mapped, and vertex-colored
 //     tiles are exactly the not-yet-textured ones (b = 0, gate full open).
 
-const BATHYMETRY_LAYER = 31;
 const BATHY_CAM_H = 10000;
 
 // WebGPU variant of webgl-water.js's prepare: same layer/renderOrder handling,
@@ -79,33 +84,19 @@ const BATHY_CAM_H = 10000;
 // dummyMap so the per-object texture binding always resolves; bathyUseMap = 0
 // marks their brightness as meaningless.
 export function prepareBathymetryTerrainTiles(terrainRoot, { dummyMap, fallbackColor } = {}) {
-  const restore = [];
-  for (const tile of terrainRoot?.children ?? []) {
-    if (!tile.isMesh || !/^\d+-\d+-\d+$/.test(tile.userData?.tileId ?? '')) continue;
-    restore.push({
-      tile,
-      layerMask: tile.layers.mask,
-      renderOrder: tile.renderOrder,
-    });
-    tile.layers.set(BATHYMETRY_LAYER);
-    // The capture material does not depth-test: parents establish fallback
-    // coverage first, then finer tiles overwrite them regardless of whether
-    // the coarse shoreline happens to be geometrically higher.
-    tile.renderOrder = Number.parseInt(tile.userData.tileId, 10);
-    const source = tile.material;
-    tile.userData.bathyMap = source?.map ?? dummyMap;
-    tile.userData.bathyUseMap = source?.map ? 1 : 0;
-    tile.userData.bathyColor = source?.color ?? fallbackColor;
-  }
-  return () => {
-    for (const state of restore) {
-      state.tile.layers.mask = state.layerMask;
-      state.tile.renderOrder = state.renderOrder;
-      delete state.tile.userData.bathyMap;
-      delete state.tile.userData.bathyUseMap;
-      delete state.tile.userData.bathyColor;
-    }
-  };
+  return prepareTerrainTilesForBathymetry(terrainRoot, {
+    onPrepare(tile) {
+      const source = tile.material;
+      tile.userData.bathyMap = source?.map ?? dummyMap;
+      tile.userData.bathyUseMap = source?.map ? 1 : 0;
+      tile.userData.bathyColor = source?.color ?? fallbackColor;
+    },
+    onRestore(tile) {
+      delete tile.userData.bathyMap;
+      delete tile.userData.bathyUseMap;
+      delete tile.userData.bathyColor;
+    },
+  });
 }
 
 // --- shared node helpers ---------------------------------------------------
@@ -218,11 +209,6 @@ function decodeHalf(bits) {
   return sign * (1 + mantissa / 1024) * 2 ** (exponent - 15);
 }
 
-function percentile(sorted, q) {
-  if (sorted.length === 0) return null;
-  return sorted[Math.min(sorted.length - 1, Math.floor(q * sorted.length))];
-}
-
 export function createWebGPUWater({
   renderer,
   geometry,
@@ -250,6 +236,7 @@ export function createWebGPUWater({
   // east/north/up, so negative y places this implied sun in the south.
   const uBakedSunDir = uniform(new Vector3(0.33, -0.5, 0.8).normalize()).setName('waterBakedSunDir');
   const uSunColor = uniform(new Color()).setName('waterSunColor');
+  const uGlintColor = uniform(new Color()).setName('waterGlintColor');
   const uZenithColor = uniform(new Color()).setName('waterZenithColor');
   const uHorizonColor = uniform(new Color()).setName('waterHorizonColor');
   const uHorizonCool = uniform(new Color()).setName('waterHorizonCool');
@@ -304,7 +291,7 @@ export function createWebGPUWater({
 
   // --- bathymetry access + lee-shore fetch (shared vertex/fragment) ---------
 
-  // local terrain height under the water plane; -3 m (the synthetic fjord
+  // local terrain height under the water plane; -5 m (the synthetic fjord
   // floor) wherever the capture has no coverage
   // WebGPU stores the scene-rendered capture with V inverted relative to the
   // WebGL twin (quad-pass ping-pong is immune — its uv rides the flipped
@@ -319,7 +306,7 @@ export function createWebGPUWater({
     const inB = step(buv.x.sub(0.5).abs(), float(0.5))
       .mul(step(buv.y.sub(0.5).abs(), float(0.5)));
     const b = texBathy.sample(bathySampleUv(buv));
-    return mix(vec4(-3.0, 0.0, 0.0, 0.0), b, b.a.mul(inB));
+    return mix(vec4(-5.0, 0.0, 0.0, 0.0), b, b.a.mul(inB));
   }
 
   function seabedAt(p) {
@@ -363,7 +350,9 @@ export function createWebGPUWater({
       u0.y.mul(0.970).sub(u0.x.mul(0.242)),
     );
     const f = fetchMarch(p, u0).add(fetchMarch(p, u1)).add(fetchMarch(p, u2));
-    const fraction = f.div(uFetchRamp.mul(3.0)).clamp(0.0, 1.0);
+    const fraction = f.div(
+      uFetchRamp.mul(WATER_RENDER_CONTRACT.fetchFractionScale),
+    ).clamp(0.0, 1.0);
     return select(uFetchRamp.lessThanEqual(0.0), float(1.0), fraction);
   }
 
@@ -550,9 +539,9 @@ export function createWebGPUWater({
     // only calls a pixel black when all three are nearly absent.
     const bottomReflection = reflectionGateAt(pxy);
 
-    // Wall detection: the open fjord floor is a flat synthetic -3 m plane —
+    // Wall detection: the open fjord floor is a flat synthetic -5 m plane —
     // the only steep thing under the surface is the artificial mask-drop wall
-    // at the shoreline (3 m over a texel or two). The veil below must hide
+    // at the shoreline (5 m over a texel or two). The veil below must hide
     // exactly that band and nothing else, so measure seabed slope in world
     // metres (central differences one texel apart, resolution-independent).
     const h = float(uBathyTexel);
@@ -595,7 +584,15 @@ export function createWebGPUWater({
     // wind-ripple field. The fetch mask owns the swell amplitude; using it
     // as an on/off switch for capillary detail made the calm band lose its
     // moving normals and therefore read as matte water.
-    const microGate = mix(float(0.22), float(1.0), smoothstep(0.02, 0.25, vFetch));
+    const microGate = mix(
+      float(WATER_RENDER_CONTRACT.microGateMinimum),
+      float(1.0),
+      smoothstep(
+        WATER_RENDER_CONTRACT.microGateStart,
+        WATER_RENDER_CONTRACT.microGateEnd,
+        vFetch,
+      ),
+    );
     const windMicro = float(0.35).mul(uWindFactor);
     const slopeVarFull = slopeVarRaw
       .add(windMicro.mul(windMicro).mul(0.5).mul(microFade.oneMinus()));
@@ -632,7 +629,15 @@ export function createWebGPUWater({
     // facet gain: mip filtering halves apparent slope contrast by mid-frame,
     // so re-steepen the shading normal with distance — crests keep their
     // lit-face/dark-edge wedge read instead of melting into mounds
-    const facetGain = mix(float(1.0), float(1.35), smoothstep(300.0, 2500.0, d));
+    const facetGain = mix(
+      float(1.0),
+      float(WATER_RENDER_CONTRACT.facetGainMaximum),
+      smoothstep(
+        WATER_RENDER_CONTRACT.facetGainStartM,
+        WATER_RENDER_CONTRACT.facetGainEndM,
+        d,
+      ),
+    );
     const Ns = normalize(vec3(NsRelaxed.xy.mul(facetGain), NsRelaxed.z));
 
     // swell-phase elevation, used by the crest scatter term below.
@@ -702,7 +707,7 @@ export function createWebGPUWater({
     const H = normalize(L.add(V));
     const LdotH = L.dot(H).max(0.0);
     const fresL = LdotH.oneMinus().pow(5.0).mul(0.978).add(0.022);
-    let spec = uSunColor.mul(ggxAniso(
+    let spec = uGlintColor.mul(ggxAniso(
       H, N, Twind, Bwind, ax2.sqrt().max(0.002), ay2.sqrt().max(0.002),
     ))
       .mul(fresL)
@@ -739,17 +744,21 @@ export function createWebGPUWater({
     // Normalized narrow microfacet distribution. The previous unnormalized
     // pow(N.H, 48) * 4 never reached HDR after water's ~2.2% Fresnel term;
     // this carries the same Cook-Torrance normalization as the main glint.
-    const crestExponent = 96.0;
+    const crestExponent = WATER_RENDER_CONTRACT.crestExponent;
     const crestD = N.dot(H).max(0.0).pow(crestExponent)
       .mul((crestExponent + 2.0) / (2.0 * Math.PI));
-    const resolvedCrestGlint = uSunColor.mul(crestD).mul(fresL)
+    const resolvedCrestGlint = uGlintColor.mul(crestD).mul(fresL)
       .mul(smoothstep(0.0, 0.06, L.z)).mul(crestSite)
       .div(NdotV.max(0.1).mul(N.dot(L).max(0.1)).mul(4.0));
     // Past the point where mip filtering can resolve individual N.H peaks,
     // use the variance-filtered sun lobe already computed above and gate it
     // by the same crest physics. Otherwise sparkle exists only near camera.
     const filteredCrestGlint = spec.mul(crestSite).mul(3.0);
-    const crestFilterBlend = smoothstep(450.0, 2200.0, d);
+    const crestFilterBlend = smoothstep(
+      WATER_RENDER_CONTRACT.crestFilterStartM,
+      WATER_RENDER_CONTRACT.crestFilterEndM,
+      d,
+    );
     spec = spec.add(
       mix(resolvedCrestGlint, filteredCrestGlint, crestFilterBlend),
     );
@@ -867,7 +876,7 @@ export function createWebGPUWater({
     bathyExtent / 2, -bathyExtent / 2,
     1, 30000,
   );
-  bathyCamera.layers.set(BATHYMETRY_LAYER);
+  bathyCamera.layers.set(TERRAIN_BATHYMETRY_LAYER);
 
   // Mapless tiles get this stand-in so the per-object texture binding always
   // resolves; bathyUseMap = 0 marks their brightness as meaningless.
@@ -986,12 +995,12 @@ export function createWebGPUWater({
         const round = (v, digits) => (v == null ? null : Number(v.toFixed(digits)));
         log('water.bathymetry.capture.pixels', {
           sampled, covered, water, land, texturedWater,
-          rP05: round(percentile(rCovered, 0.05), 2),
-          rP50: round(percentile(rCovered, 0.50), 2),
-          rP95: round(percentile(rCovered, 0.95), 2),
-          gP05: round(percentile(gTexturedWater, 0.05), 5),
-          gP50: round(percentile(gTexturedWater, 0.50), 5),
-          gP95: round(percentile(gTexturedWater, 0.95), 5),
+          rP05: round(sortedPercentile(rCovered, 0.05), 2),
+          rP50: round(sortedPercentile(rCovered, 0.50), 2),
+          rP95: round(sortedPercentile(rCovered, 0.95), 2),
+          gP05: round(sortedPercentile(gTexturedWater, 0.05), 5),
+          gP50: round(sortedPercentile(gTexturedWater, 0.50), 5),
+          gP95: round(sortedPercentile(gTexturedWater, 0.95), 5),
         });
       })
       .catch(error => {
@@ -1033,6 +1042,7 @@ export function createWebGPUWater({
       uCameraLocal.value.copy(cameraLocal);
       uSunDir.value.copy(sunLocal);
       uSunColor.value.copy(palette.sun);
+      uGlintColor.value.copy(palette.glint);
       uZenithColor.value.copy(palette.zenith);
       uHorizonColor.value.copy(palette.horizon);
       uHorizonCool.value.copy(palette.horizonCool);

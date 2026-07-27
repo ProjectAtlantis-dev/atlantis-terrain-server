@@ -1,6 +1,14 @@
 export const TERRAIN_HUD_LINKS = Object.freeze({
   debugLogLink: '/client_log.html',
+  classifierOpsLink: '/classifier.html',
 });
+
+// The HUD action list is one link per line: stacked keeps the panel narrow,
+// which matters because the HUD is anchored top-left over the terrain.
+export function hudActionLink(id, label, color = '#0af') {
+  return `<span id="${id}" style="color:${color};text-decoration:underline;`
+    + `cursor:pointer;pointer-events:auto">${label}</span>`;
+}
 
 function appendPanel(cssText) {
   const element = document.createElement('div');
@@ -10,14 +18,18 @@ function appendPanel(cssText) {
 }
 
 export function createTerrainHud({
+  onToggleCollapsed = () => {},
   onToggleMapMode,
   onToggleSeamMode,
   onToggleTileInspector,
   onToggleGridlines,
+  onToggleClassifierOverlay,
   onToggleWaterOverlay,
   onToggleHydrographyOverlay,
   onToggleRenderBackend,
   onToggleRoadDebug,
+  onOpenGoogleMaps,
+  onStartFastTime,
   onReset,
   onClockAction,
 }) {
@@ -35,11 +47,15 @@ export function createTerrainHud({
       event.target.id === 'seamModeLink' ||
       event.target.id === 'tileInspectorModeLink' ||
       event.target.id === 'gridlinesModeLink' ||
+      event.target.id === 'classifierOverlayLink' ||
       event.target.id === 'waterOverlayLink' ||
       event.target.id === 'hydrographyOverlayLink' ||
       event.target.id === 'renderBackendLink' ||
       event.target.id === 'roadDebugLink' ||
+      event.target.id === 'googleMaps3dLink' ||
+      event.target.id === 'fastTimeLink' ||
       event.target.id === 'resetViewLink' ||
+      event.target.id === 'hudToggleLink' ||
       TERRAIN_HUD_LINKS[event.target.id]
     );
     if (!isLink) hud.dataset.selecting = 'true';
@@ -67,6 +83,12 @@ export function createTerrainHud({
       onToggleGridlines();
       return;
     }
+    if (event.target.id === 'classifierOverlayLink') {
+      event.stopPropagation();
+      event.preventDefault();
+      onToggleClassifierOverlay();
+      return;
+    }
     if (event.target.id === 'waterOverlayLink') {
       event.stopPropagation();
       event.preventDefault();
@@ -89,6 +111,18 @@ export function createTerrainHud({
       event.stopPropagation();
       event.preventDefault();
       onToggleRoadDebug();
+      return;
+    }
+    if (event.target.id === 'googleMaps3dLink') {
+      event.stopPropagation();
+      event.preventDefault();
+      onOpenGoogleMaps();
+      return;
+    }
+    if (event.target.id === 'fastTimeLink') {
+      event.stopPropagation();
+      event.preventDefault();
+      onStartFastTime();
       return;
     }
     if (event.target.id === 'resetViewLink') {
@@ -115,14 +149,23 @@ export function createTerrainHud({
   window.addEventListener('contextmenu', clearSelecting);
   window.addEventListener('blur', clearSelecting);
   hud.addEventListener('click', event => {
+    if (event.target.id === 'hudToggleLink') {
+      event.stopPropagation();
+      event.preventDefault();
+      onToggleCollapsed();
+      return;
+    }
     if (
       event.target.id === 'mapModeLink' || event.target.id === 'seamModeLink' ||
       event.target.id === 'tileInspectorModeLink' ||
       event.target.id === 'gridlinesModeLink' ||
+      event.target.id === 'classifierOverlayLink' ||
       event.target.id === 'waterOverlayLink' ||
       event.target.id === 'hydrographyOverlayLink' ||
       event.target.id === 'renderBackendLink' ||
-      event.target.id === 'roadDebugLink' || event.target.id === 'resetViewLink' ||
+      event.target.id === 'roadDebugLink' ||
+      event.target.id === 'googleMaps3dLink' ||
+      event.target.id === 'fastTimeLink' || event.target.id === 'resetViewLink' ||
       TERRAIN_HUD_LINKS[event.target.id]
     ) {
       event.stopPropagation();
@@ -158,6 +201,27 @@ export function compassHeading(headingRad) {
   const degrees = (((-headingRad * 180) / Math.PI) % 360 + 360) % 360;
   const directions = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW'];
   return { degrees, compass: directions[Math.round(degrees / 45) % 8] };
+}
+
+export function cameraDriftIndicator(active) {
+  if (!active) return '';
+  return ' <span id="cameraDriftIndicator"'
+    + ' title="Camera keeps its forward velocity. Double-tap W or ↑ to disable."'
+    + ' style="display:inline-block;padding:0 5px;border:1px solid #ffb020;'
+    + 'border-radius:4px;background:#7a4300;color:#fff1bd;font-weight:700">'
+    + 'FORWARD LOCK</span>';
+}
+
+export function terrainHudHeader(collapsed) {
+  const action = collapsed ? 'Show HUD details' : 'Hide HUD details';
+  const arrow = collapsed ? '&#9660;' : '&#9650;';
+  return '<div style="display:flex;align-items:center;justify-content:space-between;gap:12px">'
+    + '<b>Greenland HUD</b>'
+    + `<button id="hudToggleLink" type="button" aria-expanded="${!collapsed}" `
+    + `aria-label="${action}" title="${action}" `
+    + 'style="border:0;padding:0 2px;background:none;color:#8fd0ff;'
+    + 'font:inherit;line-height:1;cursor:pointer">'
+    + `${arrow}</button></div>`;
 }
 
 export function renderGameClock(element, date, isPlaying, timeScale = 1) {

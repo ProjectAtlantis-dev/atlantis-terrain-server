@@ -23,12 +23,26 @@ from typing import Any, cast
 import asyncio
 
 from colored_log import get_logger
-from terrain_config import BOOTSTRAP_SEED_DEPTH, MAX_TILE_DEPTH
+from classifier_job_control import (
+  ClassifierJobControl,
+  classifier_inventory,
+  regression_case_summaries,
+)
+from gpu_profile_control import GpuProfileControl
+from terrain_config import (
+  BOOTSTRAP_SEED_DEPTH, MAX_TILE_DEPTH, WMS_CONTRACT_DEPTH,
+  WMS_TEXTURE_PROBE_MAX_DEPTH,
+)
+from tile_address import parse_tile_id as _parse_tile_id
 
 log = get_logger("terrain")
 log_db = get_logger("terrain.db")
 log_tex = get_logger("terrain.tex")
 log_cog = get_logger("terrain.cog")
+# Everything past WMS_CONTRACT_DEPTH: blowup inspection verdicts, procedural
+# cooks, deferrals. Every line carries running totals so detector-floor and
+# rate-limit tuning can be read straight off a tail of this channel.
+log_d13 = get_logger("terrain.d13")
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -55,13 +69,8 @@ def _resolve_db_path() -> Path:
 DB_PATH = _resolve_db_path()
 
 app = Flask(__name__, static_folder=STATIC_DIR, static_url_path="")
-
-
-def _env_bool(name: str, default: bool = False) -> bool:
-  raw = os.environ.get(name)
-  if raw is None:
-    return default
-  return raw.strip().lower() in {"1", "true", "yes", "on"}
+_gpu_profile_control = GpuProfileControl()
+_classifier_job_control = ClassifierJobControl(DB_PATH)
 
 
 def _env_int(name: str, default: int) -> int:
@@ -178,6 +187,8 @@ _load_no_data_cache: Any = None
 _GRID_N: int = 65
 _tile_bbox: Any = None
 _texture_ids_in: Any = None
+_texture_sources_in: Any = None
+_metatile_is_upsampled: Any = None
 _read_texture: Any = None
 _write_texture: Any = None
 _fetch_sentinel2_texture: Any = None
@@ -190,6 +201,152 @@ _init_classifier_tiles: Any = None
 _tex_pool = ThreadPoolExecutor(max_workers=4)
 _tex_fetching: set[str] = set()
 _tex_fetching_lock = threading.Lock()
+
+# Cumulative past-contract-depth texture pipeline counters (process lifetime).
+_d13_stats = {
+  "inspected": 0,       # past-contract metatiles scored by the detector
+  "genuine": 0,         # verdict: real provider detail, stored as usual
+  "blowup": 0,          # verdict: provider upsample, routed to procedural cook
+  "cooked": 0,          # procedural cooks completed (parent quads)
+  "cook_children": 0,   # child textures written by cooks
+  "cook_skipped": 0,    # cook children skipped (terminal source already present)
+  "deferred": 0,        # cooks deferred because the parent texture is not final
+  "cook_failed": 0,     # cooks that raised (bad parent JPEG etc.)
+}
+_d13_stats_lock = threading.Lock()
+
+
+def _d13_count(**deltas) -> str:
+  """Apply counter deltas and return the totals string for log lines."""
+  with _d13_stats_lock:
+    for key, delta in deltas.items():
+      _d13_stats[key] += delta
+    return (
+      "totals: "
+      f"{_d13_stats['inspected']} inspected, "
+      f"{_d13_stats['genuine']} genuine, "
+      f"{_d13_stats['blowup']} blowups, "
+      f"{_d13_stats['cooked']} cooked "
+      f"({_d13_stats['cook_children']} children, {_d13_stats['cook_skipped']} skipped), "
+      f"{_d13_stats['deferred']} deferred, "
+      f"{_d13_stats['cook_failed']} failed"
+    )
+
+
+# A past-contract texture row still on a temporary source after this long,
+# with no worker on it and no retry queued, has fallen out of the workflow.
+_D13_STUCK_AFTER_S = 300.0
+_D13_WATCHDOG_INTERVAL_S = 120.0
+_D13_WATCHDOG_REQUEUE_CAP = 64
+_d13_watchdog_thread: threading.Thread | None = None
+_d13_last_distribution: dict[str, int] | None = None
+
+
+def _d13_texture_audit(db, now=None):
+  """Workflow-invariant audit of every past-contract texture row.
+
+  Returns the source distribution plus the rows that violate the pipeline's
+  liveness invariant: temporary source, older than _D13_STUCK_AFTER_S, and
+  not in the fetching set or the retry queue — i.e. nothing will ever
+  upscale them unless someone re-demands the tile. These are the
+  "forgot to upscale" bugs; the watchdog requeues them.
+  """
+  if now is None:
+    now = datetime.datetime.now(datetime.timezone.utc)
+  rows = db.execute(
+    "SELECT tile_id, source, updated_at FROM textures "
+    "WHERE CAST(substr(tile_id, 1, instr(tile_id, '-') - 1) AS INTEGER) > ?",
+    (WMS_CONTRACT_DEPTH,),
+  ).fetchall()
+  with _tex_fetching_lock:
+    fetching = set(_tex_fetching)
+  with _tex_retry_lock:
+    retrying = set(_tex_retry_tiles)
+
+  distribution: dict[str, int] = {}
+  stuck = []
+  for tile_id, source, updated_at in rows:
+    distribution[source] = distribution.get(source, 0) + 1
+    if source not in _TEX_TEMPORARY:
+      continue
+    if tile_id in fetching or tile_id in retrying:
+      continue
+    try:
+      age_s = (now - datetime.datetime.fromisoformat(updated_at)).total_seconds()
+    except (TypeError, ValueError):
+      age_s = float("inf")
+    if age_s >= _D13_STUCK_AFTER_S:
+      stuck.append((tile_id, source, age_s))
+  stuck.sort(key=lambda item: -item[2])
+  return {
+    "rows": len(rows),
+    "distribution": distribution,
+    "stuck": stuck,
+    "fetching": len(fetching),
+    "retrying": len(retrying),
+  }
+
+
+def _d13_watchdog_sweep(db) -> None:
+  global _d13_last_distribution
+  audit = _d13_texture_audit(db)
+  if audit["rows"] == 0:
+    return
+
+  if audit["stuck"]:
+    requeue = audit["stuck"][:_D13_WATCHDOG_REQUEUE_CAP]
+    for tile_id, _source, _age_s in requeue:
+      parsed = _parse_tile_id(tile_id)
+      if parsed is not None:
+        _queue_texture_fetch(tile_id, _tile_bbox(*parsed))
+    sample = ", ".join(
+      f"{tile_id}({source}, {age_s / 60.0:.0f}min)"
+      for tile_id, source, age_s in requeue[:8]
+    )
+    log_d13.warning(
+      f"[watchdog] {len(audit['stuck'])} past-contract tiles STUCK on temporary "
+      f"sources with no in-flight work — requeued {len(requeue)} "
+      f"(cap {_D13_WATCHDOG_REQUEUE_CAP}): {sample}"
+      + ("…" if len(requeue) > 8 else "")
+    )
+
+  if audit["distribution"] != _d13_last_distribution:
+    _d13_last_distribution = dict(audit["distribution"])
+    breakdown = ", ".join(
+      f"{source}={count}"
+      for source, count in sorted(audit["distribution"].items())
+    )
+    log_d13.info(
+      f"[watchdog] past-contract textures: {audit['rows']} rows ({breakdown}); "
+      f"{audit['fetching']} fetching, {audit['retrying']} in retry, "
+      f"{len(audit['stuck'])} stuck"
+    )
+
+
+def _d13_watchdog_worker() -> None:
+  while True:
+    time.sleep(_D13_WATCHDOG_INTERVAL_S)
+    db = None
+    try:
+      db = sqlite3.connect(str(DB_PATH), check_same_thread=False)
+      _d13_watchdog_sweep(db)
+    except Exception as exc:  # pragma: no cover - background sweep
+      log_d13.error(f"[watchdog] sweep FAILED: {type(exc).__name__}: {exc}")
+    finally:
+      if db is not None:
+        db.close()
+
+
+def _ensure_d13_watchdog() -> None:
+  global _d13_watchdog_thread
+  if _d13_watchdog_thread is not None and _d13_watchdog_thread.is_alive():
+    return
+  _d13_watchdog_thread = threading.Thread(target=_d13_watchdog_worker, daemon=True)
+  _d13_watchdog_thread.start()
+  log_d13.info(
+    f"[watchdog] started: sweep every {_D13_WATCHDOG_INTERVAL_S:.0f}s, "
+    f"stuck after {_D13_STUCK_AFTER_S:.0f}s, requeue cap {_D13_WATCHDOG_REQUEUE_CAP}"
+  )
 _tex_metatile_locks: dict[str, threading.Lock] = {}
 _tex_metatile_locks_guard = threading.Lock()
 
@@ -406,6 +563,31 @@ def _fetch_one_cog_tile(tile_id, bbox):
   db = sqlite3.connect(str(DB_PATH), check_same_thread=False)
   db.execute("PRAGMA journal_mode=WAL")
   try:
+    # Past-contract heightmaps are DERIVED, never read from COG — a raw
+    # 10m/30m read on a 41-165m tile is interpolation mush whose edges
+    # ignore every neighbor (visible as raised square tile corners). This
+    # gate mirrors serve._fetch_tile; the cook defers until the measured
+    # parent chain exists, riding the scheduler's normal retry path.
+    parsed = _parse_tile_id(tile_id)
+    if parsed is not None and parsed[0] > WMS_CONTRACT_DEPTH:
+      from serve import _cook_cooked_dem_quad
+
+      _record_dem_request(db, tile_id)
+      if _cook_cooked_dem_quad(
+        db, tile_id,
+      ):
+        log_cog.info(
+          f"[tile-audit] tile={tile_id} stage=dem_completed outcome=cooked"
+        )
+        return "fetched"
+      log_cog.info(
+        f"[tile-audit] tile={tile_id} stage=dem_completed "
+        "outcome=cook_deferred"
+      )
+      # NOT "defer": that requeues and redispatches immediately, and a
+      # cook-defer is millisecond-fast — it would hot-loop a worker until
+      # the parent lands. This outcome waits for the next demand refresh.
+      return "cook_deferred"
     row = db.execute(
       "SELECT source FROM tiles WHERE tile_id = ?", (tile_id,)
     ).fetchone()
@@ -520,6 +702,10 @@ def _finish_cog_tile(tile_id, bbox, future):
       _cog_already_fetched.discard(tile_id)
       if tile_id in _cog_demand_ids:
         _cog_pending_tiles[tile_id] = bbox
+    elif outcome == "cook_deferred":
+      # Eligible again, but only the next demand refresh re-queues it —
+      # by then the measured parent this cook was waiting on may exist.
+      _cog_already_fetched.discard(tile_id)
     elif outcome == "fetched":
       _cog_synthetic_retry_at.pop(tile_id, None)
       _cog_fetched_total += 1
@@ -570,6 +756,7 @@ def _bootstrap_backend() -> None:
   global _fetch_sentinel2_texture, _fetch_dataforsyningen_texture, _split_texture_metatile
   global _harmonize_texture_metatile
   global _init_textures, _init_classifier_tiles
+  global _texture_sources_in, _metatile_is_upsampled
 
   if _backend_ready or _backend_error is not None:
     return
@@ -587,9 +774,11 @@ def _bootstrap_backend() -> None:
       fetch_sentinel2_texture,
       harmonize_texture_metatile,
       init_textures,
+      metatile_is_upsampled,
       read_texture,
       split_texture_metatile,
       texture_ids_in,
+      texture_sources_in,
       write_texture,
     )
 
@@ -617,6 +806,68 @@ def _bootstrap_backend() -> None:
       db.commit()
       log_db.info(f"Updated max_depth metadata to {MAX_TILE_DEPTH}")
 
+    # Source-name migration (2026-07-23): the cook pipeline lost its noise
+    # painter, so the legacy 'fractal_*' provenance strings were renamed to
+    # 'cooked_*'. Rewrite old rows in place — idempotent, and it must run
+    # BEFORE the recipe-version gate below so its queries see one spelling.
+    db.execute(
+      "UPDATE tiles SET source = 'cooked_dem' WHERE source = 'fractal_dem'"
+    )
+    try:
+      db.execute(
+        "UPDATE textures SET source = 'cooked_upscale' "
+        "WHERE source = 'fractal_upscale'"
+      )
+    except sqlite3.OperationalError:
+      pass  # fresh database — textures table not created yet
+    db.commit()
+
+    # Cooked DEMs and cooked deep textures are derived artifacts: when the
+    # derived terrain / texture recipe changes, every cooked_dem tile
+    # and cooked_upscale texture is stale by definition. Reset DEMs to
+    # pending skeletons (payload dropped, seams invalidated) and drop the
+    # texture rows so normal demand recooks both with the current recipe —
+    # d13 recooks from the measured d12 surface, deeper depths re-cascade.
+    from terrain_upscale import MACRO_TERRAIN_VERSION
+    from terrain_seams import invalidate_tile_seams
+    macro_version = db.execute(
+      "SELECT value FROM metadata WHERE key = 'macro_terrain_version'"
+    ).fetchone()
+    if macro_version is None or int(macro_version[0]) != MACRO_TERRAIN_VERSION:
+      stale = [row[0] for row in db.execute(
+        "SELECT tile_id FROM tiles WHERE source = 'cooked_dem'"
+      ).fetchall()]
+      if stale:
+        now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        db.execute(
+          "UPDATE tiles SET source = 'pending', heightmap = NULL, "
+          "confidence_map = NULL, geometric_error = 0, updated_at = ? "
+          "WHERE source = 'cooked_dem'",
+          (now_iso,),
+        )
+        for stale_id in stale:
+          invalidate_tile_seams(db, stale_id)
+      stale_textures = 0
+      try:
+        stale_textures = db.execute(
+          "SELECT COUNT(*) FROM textures WHERE source = 'cooked_upscale'"
+        ).fetchone()[0]
+        if stale_textures:
+          db.execute("DELETE FROM textures WHERE source = 'cooked_upscale'")
+      except sqlite3.OperationalError:
+        pass  # fresh database — textures table not created yet
+      db.execute(
+        "INSERT OR REPLACE INTO metadata (key, value) "
+        "VALUES ('macro_terrain_version', ?)",
+        (str(MACRO_TERRAIN_VERSION),),
+      )
+      db.commit()
+      log_db.info(
+        f"Derived terrain recipe v{MACRO_TERRAIN_VERSION}: reset {len(stale)} "
+        f"cooked_dem tiles and dropped {stale_textures} "
+        f"cooked_upscale textures for recook"
+      )
+
     try:
       no_data_count = load_no_data_cache(db)
     except Exception:
@@ -632,6 +883,8 @@ def _bootstrap_backend() -> None:
     _query_tiles_stereo = query_tiles_stereo
     _load_no_data_cache = load_no_data_cache
     _texture_ids_in = texture_ids_in
+    _texture_sources_in = texture_sources_in
+    _metatile_is_upsampled = metatile_is_upsampled
     _read_texture = read_texture
     _write_texture = write_texture
     _fetch_sentinel2_texture = fetch_sentinel2_texture
@@ -644,6 +897,8 @@ def _bootstrap_backend() -> None:
     _backend_ready = True
     log.info(f"Terrain backend ready. DB={DB_PATH}")
     log_db.info(f"No-data cache: {no_data_count} tiles")
+
+    _ensure_d13_watchdog()
 
     import grundkort
     grundkort.ensure_grundkort_async()
@@ -706,17 +961,6 @@ def _arg_float(name: str, default: float) -> float:
     return default
   try:
     return float(raw)
-  except (TypeError, ValueError):
-    return default
-
-
-
-def _arg_int(name: str, default: int) -> int:
-  raw = request.args.get(name)
-  if raw is None:
-    return default
-  try:
-    return int(raw)
   except (TypeError, ValueError):
     return default
 
@@ -799,13 +1043,10 @@ def _resolve_no_coverage(db, tile_id: str, existing_jpeg, log_prefix: str) -> No
 
 
 def _nearest_ancestor_texture(tile_id: str, texture_ids: set[str]) -> str | None:
-  parts = tile_id.split("-")
-  if len(parts) != 3:
+  parsed = _parse_tile_id(tile_id)
+  if parsed is None:
     return None
-  try:
-    d, c, r = int(parts[0]), int(parts[1]), int(parts[2])
-  except ValueError:
-    return None
+  d, c, r = parsed
   while d > 0:
     d -= 1
     c //= 2
@@ -913,18 +1154,11 @@ def _texture_flags(
 
 
 
-def _parse_tile_id(tile_id: str) -> tuple[int, int, int] | None:
-  parts = tile_id.split("-")
-  if len(parts) != 3:
-    return None
-  try:
-    return int(parts[0]), int(parts[1]), int(parts[2])
-  except ValueError:
-    return None
-
-
-
 _METATILE_FINAL_SOURCE = "dataforsyningen_metatile4h2"
+# Past WMS_CONTRACT_DEPTH, tiles whose metatile came back as a provider
+# blowup are cooked from the parent's final texture instead. Terminal, same
+# standing as _METATILE_FINAL_SOURCE; the value itself records provenance.
+_COOKED_SOURCE = "cooked_upscale"
 _METATILE_UPGRADEABLE_SOURCES = {
   "sentinel2_crop",
   "ancestor_crop",
@@ -933,6 +1167,17 @@ _METATILE_UPGRADEABLE_SOURCES = {
   "dataforsyningen_metatile",
   "dataforsyningen_metatile4",
   "dataforsyningen_metatile4h",
+}
+
+# Sources that are temporary placeholders — serve them but let client re-fetch.
+_TEX_TEMPORARY = {
+  "sentinel2_crop",
+  "ancestor_crop",
+  "ancestor_crop_ratelimit",
+  "dataforsyningen",  # legacy independent fetch; upgrade to aligned metatile
+  "dataforsyningen_metatile",  # legacy 2x2 group; upgrade to aligned 4x4
+  "dataforsyningen_metatile4",  # legacy 4x4 group without harmonization
+  "dataforsyningen_metatile4h",  # legacy conservative harmonization
 }
 
 
@@ -978,6 +1223,42 @@ def _fetch_texture_metatile(tile_id: str) -> tuple[dict[str, bytes] | None, str 
   )
   if jpeg is None:
     return None, fail_reason
+
+  # Past the WMS contract depth the provider may fill the request with a
+  # blowup of the level above. Inspect the finest-octave energy before
+  # trusting it; a blowup routes the caller to the procedural cook instead.
+  parsed = _parse_tile_id(tile_id)
+  if parsed is not None and parsed[0] > WMS_CONTRACT_DEPTH:
+    from texture import METATILE_RECON_MIN, METATILE_SPECTRAL_MIN
+
+    inspect_started = time.perf_counter()
+    cheated, reconstruction, spectral = _metatile_is_upsampled(jpeg)
+    inspect_ms = (time.perf_counter() - inspect_started) * 1000.0
+    if cheated:
+      tripped = []
+      if reconstruction < METATILE_RECON_MIN:
+        tripped.append(
+          f"recon {reconstruction:.3f} < {METATILE_RECON_MIN} (reconstructible from half-res)"
+        )
+      if spectral < METATILE_SPECTRAL_MIN:
+        tripped.append(
+          f"spectral {spectral:.3f} < {METATILE_SPECTRAL_MIN} (outer frequency band empty)"
+        )
+      totals = _d13_count(inspected=1, blowup=1)
+      log_d13.info(
+        f"{tile_id}: BLOWUP metatile {bbox[2] - bbox[0]:.0f}m/{resolution}px "
+        f"({len(jpeg)}b, {inspect_ms:.0f}ms) — {'; '.join(tripped)} "
+        f"→ procedural cook | {totals}"
+      )
+      return None, "wms_upsampled"
+    totals = _d13_count(inspected=1, genuine=1)
+    log_d13.info(
+      f"{tile_id}: GENUINE metatile {bbox[2] - bbox[0]:.0f}m/{resolution}px "
+      f"({len(jpeg)}b, {inspect_ms:.0f}ms) recon={reconstruction:.3f} "
+      f"spectral={spectral:.3f} (floors {METATILE_RECON_MIN}/{METATILE_SPECTRAL_MIN}) "
+      f"→ storing provider detail | {totals}"
+    )
+
   if resolution == 256:
     return {tile_id: jpeg}, None
   jpeg = _harmonize_texture_metatile(
@@ -1016,6 +1297,111 @@ def _store_texture_metatile(db, children: dict[str, bytes]) -> tuple[set[str], s
     written.add(child_id)
   return written, no_coverage
 
+
+
+def _cook_texture_quad(db, tile_id: str) -> bool:
+  """Cook tile_id's parent quad from the parent's final texture.
+
+  Enlarges the depth-(d-1) parent texture (plain deterministic Lanczos — the
+  noise painter is REMOVED, it damaged tiles with dark shadow
+  artifacts) and writes all four depth-d children with source
+  "cooked_upscale" — the provenance record the client and DB keep. Returns
+  False when the parent texture is missing or still temporary; the parent
+  fetch is queued and the caller should retry this tile later.
+  """
+  from database import read_tile
+  from terrain_upscale import upscale_texture
+
+  parsed = _parse_tile_id(tile_id)
+  if parsed is None:
+    log_d13.warning(f"{tile_id}: procedural cook refused — unparseable tile id")
+    return False
+  depth, column, row = parsed
+  if depth == 0:
+    log_d13.warning(f"{tile_id}: procedural cook refused — root tile has no parent")
+    return False
+  if depth > MAX_TILE_DEPTH:
+    log_d13.info(
+      f"{tile_id}: procedural cook refused — depth {depth} beyond "
+      f"MAX_TILE_DEPTH={MAX_TILE_DEPTH} (upscaling disabled)"
+    )
+    return False
+  cook_started = time.perf_counter()
+  parent_column, parent_row = column // 2, row // 2
+  parent_id = f"{depth - 1}-{parent_column}-{parent_row}"
+  parent = db.execute(
+    "SELECT texture, source FROM textures WHERE tile_id = ?", (parent_id,)
+  ).fetchone()
+  parent_bbox = list(_tile_bbox(depth - 1, parent_column, parent_row))
+  if parent is None or parent[0] is None or parent[1] in _TEX_TEMPORARY:
+    reason = (
+      "no parent texture row"
+      if parent is None
+      else "parent texture blob is empty"
+      if parent[0] is None
+      else f"parent source '{parent[1]}' is temporary"
+    )
+    totals = _d13_count(deferred=1)
+    log_d13.info(
+      f"{tile_id}: cook DEFERRED — {reason}; queued parent {parent_id} fetch, "
+      f"child retries later | {totals}"
+    )
+    _queue_texture_fetch(parent_id, tuple(parent_bbox))
+    return False
+
+  upscale_started = time.perf_counter()
+  # Plain Lanczos enlarge of the parent photo. Procedural painters are absent
+  # because they quantized continuous source evidence into square decisions.
+  upscaled, _size = upscale_texture(parent[0], factor=2)
+
+  shading = "shade=none"
+
+  # Classification does NOT happen at every cook depth (user directive,
+  # 2026-07-22): there's no ground truth past the WMS contract depth, and
+  # d13-d16 imagery is procedurally upscaled — increasingly synthetic, with no
+  # new real information for a fresh classification to key off. The design
+  # is HIERARCHICAL: classify coarsely where imagery is real (d12, via
+  # _ensure_d12_class_map's live classification), and let every deeper
+  # depth INHERIT that label via the ancestor-walk already built into
+  # /api/classifier/<id>.png (crop + nearest-neighbor resize down from the
+  # nearest real ancestor). Writing a fresh classifier_tiles row at every
+  # cook depth — which this function used to do — defeats that walk before
+  # it starts: an exact-depth row always wins over an inherited one, so
+  # every deep tile was silently reclassifying itself from blurry
+  # synthetic imagery instead of inheriting the one classification that
+  # was ever backed by real ground truth.
+  upscale_ms = (time.perf_counter() - upscale_started) * 1000.0
+  quadrants = _split_texture_metatile(
+    upscaled, child_resolution=256, grid_size=2
+  )
+  written, skipped = [], []
+  for column_bit in range(2):
+    for row_bit in range(2):
+      child_id = f"{depth}-{parent_column * 2 + column_bit}-{parent_row * 2 + row_bit}"
+      existing = db.execute(
+        "SELECT source FROM textures WHERE tile_id = ?", (child_id,)
+      ).fetchone()
+      if existing and existing[0] not in _METATILE_UPGRADEABLE_SOURCES:
+        skipped.append(f"{child_id}({existing[0]})")
+        continue
+      _write_texture(db, child_id, quadrants[(column_bit, row_bit)], _COOKED_SOURCE)
+      written.append(child_id)
+      # No classifier_tiles write here — see the hierarchical-inheritance
+      # note above. Deep tiles read their classification through the
+      # ancestor walk in /api/classifier/<id>.png instead of storing their
+      # own.
+  cook_ms = (time.perf_counter() - cook_started) * 1000.0
+  totals = _d13_count(
+    cooked=1, cook_children=len(written), cook_skipped=len(skipped)
+  )
+  log_d13.info(
+    f"{tile_id}: COOKED quad from {parent_id} "
+    f"({parent[1]}, {len(parent[0])}b, lanczos {shading}) — "
+    f"wrote {len(written)} as {_COOKED_SOURCE}"
+    + (f", kept {', '.join(skipped)}" if skipped else "")
+    + f" in {cook_ms:.0f}ms (upscale {upscale_ms:.0f}ms) | {totals}"
+  )
+  return True
 
 
 def _queue_texture_fetch(
@@ -1062,14 +1448,29 @@ def _queue_texture_fetch(
         existing = db.execute(
           "SELECT source FROM textures WHERE tile_id = ?", (tile_id,)
         ).fetchone()
-        if existing and existing[0] == _METATILE_FINAL_SOURCE:
-          log_tex.debug(f"[tex-worker] {tile_id}: metatile sibling already filled it")
+        if existing and existing[0] not in _RE_FETCHABLE:
+          # A sibling holding this lock already finished the group — via
+          # metatile store or procedural cook. Without this check every queued
+          # sibling re-downloads the 2MB metatile and re-cooks for nothing.
+          log_tex.debug(
+            f"[tex-worker] {tile_id}: sibling already filled it ({existing[0]})"
+          )
           return
 
-        log_tex.debug(
-          f"[tex-worker] {tile_id}: fetching metatile {metatile_id} bbox={metatile_bbox}"
-        )
-        children, fail_reason = _fetch_texture_metatile(tile_id)
+        if parsed is not None and parsed[0] > WMS_TEXTURE_PROBE_MAX_DEPTH:
+          # Beyond the measured WMS ceiling every metatile comes back as a
+          # blowup; skip the provider round-trip and take the cook branch
+          # directly, same as an inspected blowup would.
+          log_tex.debug(
+            f"[tex-worker] {tile_id}: depth {parsed[0]} beyond WMS probe "
+            f"ceiling {WMS_TEXTURE_PROBE_MAX_DEPTH} — cooking directly"
+          )
+          children, fail_reason = None, "wms_upsampled"
+        else:
+          log_tex.debug(
+            f"[tex-worker] {tile_id}: fetching metatile {metatile_id} bbox={metatile_bbox}"
+          )
+          children, fail_reason = _fetch_texture_metatile(tile_id)
         if children is not None:
           written, no_coverage = _store_texture_metatile(db, children)
           log_tex.debug(
@@ -1089,6 +1490,22 @@ def _queue_texture_fetch(
             "SELECT texture FROM textures WHERE tile_id = ?", (tile_id,)
           ).fetchone()
           _resolve_no_coverage(db, tile_id, existing[0] if existing else None, "[tex-worker]")
+        elif fail_reason == 'wms_upsampled':
+          # Provider blowup past the contract depth — cook the parent quad
+          # with the procedural upscaler at the same finality as a real fetch.
+          # Every non-cooked outcome re-enters the retry queue: a tile must
+          # never leave this branch with no future work scheduled.
+          try:
+            cooked = _cook_texture_quad(db, tile_id)
+          except Exception as exc:
+            totals = _d13_count(cook_failed=1)
+            log_d13.error(
+              f"{tile_id}: procedural cook FAILED "
+              f"({type(exc).__name__}: {exc}) — queued for retry | {totals}"
+            )
+            cooked = False
+          if not cooked:
+            _tex_retry_enqueue(tile_id, bbox, attempt=0)
         else:
           # Transient (rate limit / timeout). Mark and enqueue for retry.
           existing = db.execute(
@@ -1149,7 +1566,9 @@ def api_tiles():
 
   ox = _arg_float("ox", qx)
   oy = _arg_float("oy", qy)
-  alt = _arg_float("alt", 0.0)
+  # LOD uses height above local terrain. ``alt`` is retained as a fallback
+  # for older clients, but current clients send the unambiguous ``agl``.
+  lod_altitude = _arg_float("agl", _arg_float("alt", 0.0))
   heading = _arg_float("heading", 0.0)
   try:
     tiles, missing = _query_tiles_stereo(
@@ -1159,7 +1578,7 @@ def api_tiles():
       error_threshold=error,
       max_depth=max_depth,
       max_range=max_range,
-      altitude=alt,
+      altitude=lod_altitude,
       lod_history=_terrain_lod_history,
       log=lambda msg: log.debug(f"[/api/tiles] {msg}"),
     )
@@ -1184,7 +1603,8 @@ def api_tiles():
       r //= 2
       check_ids.add(f"{d}-{c}-{r}")
 
-  texture_ids = _texture_ids_in(_get_db(), list(check_ids))
+  texture_sources = _texture_sources_in(_get_db(), list(check_ids))
+  texture_ids = set(texture_sources)
   with _tex_fetching_lock:
     tex_fetching = list(_tex_fetching)
   tex_fetching_set = set(tex_fetching)
@@ -1219,6 +1639,7 @@ def api_tiles():
         "hasTexture": bool(tex_flags["has_texture"]),
         "texAvailable": bool(tex_flags["available"]),
         "texStatus": tex_status,
+        "texSource": texture_sources.get(tid),
         "texIsPlaceholder": bool(tex_flags["is_placeholder"]),
         "texAncestorId": tex_flags["ancestor_id"],
         "texIsFetching": bool(tex_flags["is_fetching"]),
@@ -1336,8 +1757,26 @@ def _painted_texture_response(
   hydro_debug: bool = False,
 ) -> Response:
   """Apply terrain-coupled catalog overlays to a clean cached texture copy."""
-  from asset_catalog import paint_roads
-  painted, road_count = paint_roads(jpeg, bbox, ASSETS_DB_PATH, debug=road_debug)
+  bake_asset = None
+  cacheable_bake = (
+    not road_debug
+    and not water_debug
+    and not hydro_debug
+    and headers.get("X-Tex-Temporary") == "0"
+  )
+  if cacheable_bake:
+    from road_texture_cache import get_or_create_road_texture
+    bake_asset = get_or_create_road_texture(
+      _get_db(), tile_id, bbox, ASSETS_DB_PATH,
+    )
+  if bake_asset is not None:
+    painted = bake_asset["texture"]
+    road_count = bake_asset["road_count"]
+  else:
+    from asset_catalog import paint_roads
+    painted, road_count = paint_roads(
+      jpeg, bbox, ASSETS_DB_PATH, debug=road_debug,
+    )
   if hydro_debug or water_debug:
     from classifier.rendering import smooth_effective_water_mask
     from coastline import read_hydrography_mask, read_water_mask
@@ -1367,11 +1806,58 @@ def _painted_texture_response(
   response_headers["X-Road-Debug"] = "1" if road_debug else "0"
   response_headers["X-Water-Debug"] = "1" if water_debug else "0"
   response_headers["X-Hydrography-Debug"] = "1" if hydro_debug else "0"
+  if bake_asset is not None:
+    response_headers["X-Road-Bake-Cache"] = (
+      "miss" if bake_asset["generated"] else "hit"
+    )
+    response_headers["X-Road-Bake-Recipe"] = str(
+      bake_asset["recipe_version"]
+    )
+  else:
+    response_headers["X-Road-Bake-Cache"] = (
+      "bypass" if road_debug or water_debug or hydro_debug else "temporary"
+    )
   if road_count:
     # Asset edits must be visible on the next texture request; the canonical
     # imagery remains cached in terrain.db and is never painted in place.
     response_headers["Cache-Control"] = "no-cache"
-  return Response(painted, mimetype="image/jpeg", headers=response_headers)
+  response = Response(
+    painted, mimetype="image/jpeg", headers=response_headers,
+  )
+  if bake_asset is not None:
+    response.set_etag(bake_asset["fingerprint"])
+    response.make_conditional(request)
+  return response
+
+
+@app.get("/api/d13/status")
+def api_d13_status():
+  """Workflow-accuracy audit for everything past WMS_CONTRACT_DEPTH.
+
+  Live process counters (inspections, verdicts, cooks, deferrals) plus a DB
+  audit: texture source distribution, in-flight/retry sizes, and any rows
+  stuck outside the workflow (the watchdog requeues these on its own sweep).
+  """
+  unavailable = _terrain_unavailable_response()
+  if unavailable is not None:
+    return unavailable
+  with _d13_stats_lock:
+    counters = dict(_d13_stats)
+  audit = _d13_texture_audit(_get_db())
+  return jsonify({
+    "contractDepth": WMS_CONTRACT_DEPTH,
+    "maxDepth": MAX_TILE_DEPTH,
+    "counters": counters,
+    "textureRows": audit["rows"],
+    "sourceDistribution": audit["distribution"],
+    "fetching": audit["fetching"],
+    "retrying": audit["retrying"],
+    "stuck": [
+      {"id": tile_id, "source": source, "ageSeconds": round(age_s, 1)}
+      for tile_id, source, age_s in audit["stuck"][:50]
+    ],
+    "stuckTotal": len(audit["stuck"]),
+  })
 
 
 @app.get("/api/texture/<tile_id>.jpg")
@@ -1399,16 +1885,6 @@ def api_texture(tile_id: str):
   ).fetchone()
 
   cached_crop = None
-  # Sources that are temporary placeholders — serve them but let client re-fetch
-  _TEX_TEMPORARY = {
-    "sentinel2_crop",
-    "ancestor_crop",
-    "ancestor_crop_ratelimit",
-    "dataforsyningen",  # legacy independent fetch; upgrade to aligned metatile
-    "dataforsyningen_metatile",  # legacy 2x2 group; upgrade to aligned 4x4
-    "dataforsyningen_metatile4",  # legacy 4x4 group without harmonization
-    "dataforsyningen_metatile4h",  # legacy conservative harmonization
-  }
   if row is not None:
     cached, source = row[0], row[1]
     log_tex.debug(f"[/api/texture] {tile_id}: cache HIT source={source} size={len(cached)} bytes")
@@ -1491,7 +1967,9 @@ def api_texture(tile_id: str):
   img = _Image.open(io.BytesIO(ancestor_tex))
   w, h = img.size
 
-  ancestor_depth = int(ancestor_id.split("-")[0])
+  ancestor_depth = cast(
+    tuple[int, int, int], _parse_tile_id(ancestor_id)
+  )[0]
   depth_diff = child_d - ancestor_depth
   sub_c = child_c % (1 << depth_diff)
   sub_r = child_r % (1 << depth_diff)
@@ -1521,6 +1999,79 @@ def api_texture(tile_id: str):
       "X-Tex-Temporary": "1",
     },
   )
+
+
+@app.get("/api/cliff-graft/<tile_id>.png")
+def api_cliff_graft(tile_id: str):
+  """Serve one shared, persistently prepared cliff-graft donor.
+
+  The shader projects this asset across every eligible D13+ tile. Water
+  inpainting is deterministic and stored in SQLite, so browsers only decode
+  the finished PNG and never repeat the classifier/image preparation.
+  """
+  unavailable = _terrain_unavailable_response()
+  if unavailable is not None:
+    return unavailable
+  parsed = _parse_tile_id(tile_id)
+  if parsed is None:
+    return Response(b"", status=400)
+
+  depth, column, row = parsed
+  db = _get_db()
+  if depth >= WMS_CONTRACT_DEPTH:
+    shift = depth - WMS_CONTRACT_DEPTH
+    _ensure_d12_class_map(
+      db,
+      f"{WMS_CONTRACT_DEPTH}-{column >> shift}-{row >> shift}",
+    )
+
+  from cliff_graft_cache import (
+    CLIFF_GRAFT_ASSET_VERSION,
+    get_or_create_cliff_graft_asset,
+  )
+
+  try:
+    asset = get_or_create_cliff_graft_asset(db, tile_id)
+  except (TypeError, ValueError, zlib.error) as exc:
+    log_tex.warning(
+      f"[cliff-graft] {tile_id}: preparation failed "
+      f"({type(exc).__name__}: {exc})"
+    )
+    return Response(
+      b"", status=500,
+      headers={"Cache-Control": "no-store", "X-Cliff-Graft-Status": "invalid"},
+    )
+  if asset is None:
+    texture_row = db.execute(
+      "SELECT 1 FROM textures WHERE tile_id = ?", (tile_id,),
+    ).fetchone()
+    if texture_row is None:
+      _queue_texture_fetch(tile_id, tuple(_tile_bbox(*parsed)))
+    return Response(
+      b"", status=202,
+      headers={"Cache-Control": "no-store", "X-Cliff-Graft-Status": "pending"},
+    )
+
+  cache_status = "miss" if asset["generated"] else "hit"
+  if asset["generated"]:
+    log_tex.info(
+      f"[cliff-graft] {tile_id}: persisted recipe "
+      f"v{CLIFF_GRAFT_ASSET_VERSION} ({asset['width']}x{asset['height']}, "
+      f"{asset['water_pixels']} water pixels replaced)"
+    )
+  response = Response(
+    asset["texture"],
+    mimetype="image/png",
+    headers={
+      "Cache-Control": "public, max-age=300",
+      "X-Cliff-Graft-Status": "ready",
+      "X-Cliff-Graft-Cache": cache_status,
+      "X-Cliff-Graft-Recipe": str(CLIFF_GRAFT_ASSET_VERSION),
+      "X-Cliff-Graft-Water-Pixels": str(asset["water_pixels"]),
+    },
+  )
+  response.set_etag(asset["fingerprint"])
+  return response.make_conditional(request)
 
 
 def _tile_package_png(values, *, boolean: bool = False) -> bytes:
@@ -1578,14 +2129,19 @@ def api_tile_package(tile_id: str):
   rendered_texture = canonical_texture
   roads = []
   if ASSETS_DB_PATH.exists():
-    from asset_catalog import connect as connect_assets, paint_roads, query_roads
+    from asset_catalog import connect as connect_assets, query_roads
     assets_db = connect_assets(ASSETS_DB_PATH)
     try:
       roads = query_roads(assets_db, bbox)
     finally:
       assets_db.close()
     if canonical_texture:
-      rendered_texture, _ = paint_roads(canonical_texture, bbox, ASSETS_DB_PATH)
+      from road_texture_cache import get_or_create_road_texture
+      road_bake = get_or_create_road_texture(
+        db, tile_id, bbox, ASSETS_DB_PATH,
+      )
+      if road_bake is not None:
+        rendered_texture = road_bake["texture"]
 
   from classifier.storage import decode_class_map
   from coastline import read_hydrography_mask, read_water_mask
@@ -1771,6 +2327,105 @@ def api_terrain_channel(tile_id: str, chan: str):
 CLASSIFIER_PINK_WATER_ENABLED = False
 
 
+def _ensure_d12_class_map(db, tile_id: str) -> None:
+  """Classify D12 on demand from its evidence plus D10/D11 lake priors.
+
+  D12 supplies the authoritative texture and measured heightmap. D10 decides
+  whether inferred lake water may exist and D11 localizes that hypothesis;
+  neither parent supplies a final D12 boundary. Rows are stored only when all
+  inputs are final, so placeholder-derived labels are never persisted.
+  Deterministic given its inputs.
+  """
+  parsed = _parse_tile_id(tile_id)
+  if parsed is None or parsed[0] != WMS_CONTRACT_DEPTH:
+    return
+  from classifier.ladder import LADDER_SOURCE
+
+  existing = db.execute(
+    "SELECT source FROM classifier_tiles WHERE tile_id = ?", (tile_id,)
+  ).fetchone()
+  if existing and existing[0] == LADDER_SOURCE:
+    return
+  texture_row = db.execute(
+    "SELECT texture, source FROM textures WHERE tile_id = ?", (tile_id,)
+  ).fetchone()
+  if (
+    texture_row is None or texture_row[0] is None
+    or texture_row[1] in _TEX_TEMPORARY
+  ):
+    return
+  from database import read_tile
+  tile = read_tile(db, tile_id)
+  if tile is None or tile.get("heightmap") is None:
+    return
+  try:
+    import numpy as np
+    from PIL import Image
+
+    from classifier.hierarchy import d12_lake_prior, lake_prior_ancestor_ids
+    from classifier.ladder import classify_ladder, macro_grain
+    from classifier.storage import (
+      COARSE_V4_SCHEMA, init_classifier_tiles, write_classifier_tile,
+    )
+    from coastline import read_water_mask
+
+    try:
+      water_mask = read_water_mask(db, tile_id)
+      if water_mask is not None and water_mask.shape != tile["heightmap"].shape:
+        water_mask = None
+    except Exception:
+      water_mask = None
+    # d8 macro grain: the region's structural strike (NE-SW on the west
+    # coast) rides along as conditioning context for the ladder's stats.
+    grain = None
+    try:
+      depth, col, row = parsed
+      shift = depth - 8
+      if shift > 0:
+        ancestor = read_tile(db, f"8-{col >> shift}-{row >> shift}")
+        if ancestor is not None and ancestor.get("heightmap") is not None:
+          grain = macro_grain(
+            ancestor["heightmap"],
+            float(ancestor["bbox"][2]) - float(ancestor["bbox"][0]),
+          )
+    except Exception:
+      grain = None
+    rgb = np.asarray(Image.open(io.BytesIO(texture_row[0])).convert("RGB"))
+    # D10 answers whether inferred water exists at all; D11 localizes that
+    # support. If either parent is unavailable, leave this tile pending rather
+    # than persist a D12-only lake guess that can never repair itself.
+    lake_prior = d12_lake_prior(db, tile_id)
+    if lake_prior is None:
+      for ancestor_id in lake_prior_ancestor_ids(tile_id):
+        ancestor = _parse_tile_id(ancestor_id)
+        if ancestor is not None:
+          _queue_texture_fetch(ancestor_id, tuple(_tile_bbox(*ancestor)))
+      log.info(
+        f"[classifier] {tile_id}: waiting for d10/d11 lake priors"
+      )
+      return
+    labels, stats = classify_ladder(
+      rgb, tile["heightmap"], list(tile["bbox"]),
+      water_mask=water_mask, grain=grain, lake_prior=lake_prior,
+    )
+    init_classifier_tiles(db)
+    write_classifier_tile(
+      db, tile_id, labels, class_schema=COARSE_V4_SCHEMA, source=LADDER_SOURCE,
+    )
+    log.info(
+      f"[classifier] {tile_id}: ladder d12 classification stored "
+      f"({texture_row[1]} texture, {labels.shape[0]}px, "
+      f"shadow {stats['fractions']['shadow']:.1%}, "
+      f"lake candidates {stats['lake_candidate_fraction']:.1%} -> "
+      f"{stats['fractions']['lake']:.1%})"
+    )
+  except Exception as exc:
+    log.warning(
+      f"[classifier] {tile_id}: live d12 classification failed "
+      f"({type(exc).__name__}: {exc})"
+    )
+
+
 @app.get("/api/classifier/<tile_id>.png")
 def api_classifier_tile(tile_id: str):
   """Colorized semantic labels for a terrain tile.
@@ -1778,6 +2433,13 @@ def api_classifier_tile(tile_id: str):
   The database stores raw uint8 labels. Exact rows are preferred; descendants
   can reuse the nearest classified ancestor through a nearest-neighbor crop so
   class boundaries and label identities are never blended.
+
+  With ``?raw=1`` the response is a surface-channel mask for the renderer's
+  detail materials instead of the colorized debug view: uint8 channels
+  R=rock (grey=255, dark=128, sand=64, shore-rock=192), G=vegetation,
+  B=snow; water/lake are exact black and shadow uses the invisible marker
+  R=1. These values let the client recover exact CPU fields while the GPU
+  still filters meaningful surface weights linearly across boundaries.
   """
   unavailable = _terrain_unavailable_response()
   if unavailable is not None:
@@ -1785,6 +2447,7 @@ def api_classifier_tile(tile_id: str):
   parsed = _parse_tile_id(tile_id)
   if parsed is None:
     return Response(b"", status=400)
+  raw_mask = request.args.get("raw") == "1"
   try:
     resolution = max(16, min(2048, int(request.args.get("res", "512"))))
   except ValueError:
@@ -1796,11 +2459,27 @@ def api_classifier_tile(tile_id: str):
   from classifier.rendering import smooth_effective_water_mask
   from classifier.storage import colorize_class_map, decode_class_map
   from coastline import read_water_mask
+  from database import _tile_bbox as terrain_tile_bbox
 
   child_depth, child_col, child_row = parsed
+  child_bbox_values = terrain_tile_bbox(child_depth, child_col, child_row)
+  child_bbox = (
+    float(child_bbox_values[0]),
+    float(child_bbox_values[1]),
+    float(child_bbox_values[2]),
+    float(child_bbox_values[3]),
+  )
   depth, col, row = parsed
   found = None
   db = _get_db()
+  if child_depth >= WMS_CONTRACT_DEPTH:
+    # Contract-depth ground classifies itself on first demand, so surface
+    # masks exist everywhere walkable without waiting for deep cooks.
+    shift = child_depth - WMS_CONTRACT_DEPTH
+    _ensure_d12_class_map(
+      db,
+      f"{WMS_CONTRACT_DEPTH}-{child_col >> shift}-{child_row >> shift}",
+    )
   effective_water = read_water_mask(db, tile_id)
   water_source_row = db.execute(
     "SELECT source FROM coastline_masks WHERE tile_id = ?", (tile_id,)
@@ -1825,6 +2504,7 @@ def api_classifier_tile(tile_id: str):
       row //= 2
 
   try:
+    label_array = None
     if found is None:
       class_schema, source = "effective_water_only", "coastline_masks"
       rgb = _np.full((resolution, resolution, 3), 42, dtype=_np.uint8)
@@ -1846,9 +2526,98 @@ def api_classifier_tile(tile_id: str):
       label_image = label_image.resize(
         (resolution, resolution), _Image.Resampling.NEAREST,
       )
+      label_array = _np.asarray(label_image)
       rgb = colorize_class_map(
-        _np.asarray(label_image), class_schema,
+        label_array, class_schema,
         highlight_water=CLASSIFIER_PINK_WATER_ENABLED,
+      )
+    if raw_mask:
+      # coarse_v1 indices: grey 0, green 1, dark 2, white 3, water 4.
+      # RGB only — NOT RGBA. An alpha channel here previously carried DARK,
+      # but the client decodes via a 2D canvas drawImage/getImageData round
+      # trip, which premultiplies alpha by default: wherever alpha (dark)
+      # was 0, the browser zeroed R/G/B too, corrupting rock/veg/snow
+      # everywhere except on dark patches ("only rocks on black patches").
+      # DARK now lives inside R itself as a distinct value: grey (light
+      # rock) = 255, dark = 128, neither = 0. Consumers that only care
+      # "is this rock at all" (R > 0, e.g. the ground-detail shader) are
+      # unaffected; consumers that need light-vs-dark test the exact value.
+      # coarse_v2 adds SHADOW (5). It gets the near-black RGB marker
+      # (1, 0, 0), visually and materially indistinguishable from black,
+      # but enough for CPU consumers to distinguish unknown shadow from
+      # exact black WATER/LAKE. (Previously shadow-dark pixels were DARK,
+      # which scatter reads as "something grows here" — bushes in terrain
+      # shadows.)
+      mask = _np.zeros((resolution, resolution, 3), dtype=_np.uint8)
+      if label_array is not None and class_schema in (
+        "coarse_v1", "coarse_v2", "coarse_v3", "coarse_v4",
+      ):
+        mask[..., 0] = _np.select(
+          [label_array == 0, label_array == 2], [255, 128], default=0,
+        )
+        mask[..., 1] = _np.where(label_array == 1, 255, 0)
+        mask[..., 2] = _np.where(label_array == 3, 255, 0)
+        if class_schema in ("coarse_v2", "coarse_v3", "coarse_v4"):
+          mask[..., 0] = _np.where(label_array == 5, 1, mask[..., 0])
+        if class_schema == "coarse_v3":
+          # BEACH (7): a distinct CPU marker and a subtle 25% rock-detail
+          # weight in the shared RGB texture. It is never vegetation.
+          mask[..., 0] = _np.where(label_array == 7, 64, mask[..., 0])
+        elif class_schema == "coarse_v4":
+          # SAND (7) and SHORE_ROCK (8) are both no-growth shoreline.
+          # Their distinct weights let the GPU alternate weak sand grain
+          # with strong exposed-rock grain without another texture fetch.
+          mask[..., 0] = _np.where(label_array == 7, 64, mask[..., 0])
+          mask[..., 0] = _np.where(label_array == 8, 192, mask[..., 0])
+      # Roads and paths are a derived land-use overlay, not a replacement
+      # semantic class. Reserve (2,0,0) as the road corridor marker: it is
+      # materially blank to the detail shaders and separately decoded by
+      # scatter so no vegetation or rocks can cover the baked surface.
+      from asset_catalog import road_corridor_mask
+      road_coverage, road_count = road_corridor_mask(
+        child_bbox, resolution, resolution, ASSETS_DB_PATH,
+      )
+      road_pixels = _np.asarray(road_coverage) > 8
+      mask[road_pixels] = (2, 0, 0)
+      if effective_water is not None:
+        mask[
+          smooth_effective_water_mask(effective_water, resolution, resolution)
+        ] = 0
+      buf = _io.BytesIO()
+      _Image.fromarray(mask, mode="RGB").save(buf, format="PNG")
+      # "pending" (no real classifier row anywhere in the ancestor chain,
+      # this is the all-black water-only fallback) MUST be distinguished
+      # from "ready" (a real classification, even an inherited coarse one):
+      # the client's surface-field store caches every 200 permanently, and
+      # a d12 tile is routinely still mid-fetch/mid-cook on its first
+      # request. Caching that transient blank as if it were final left
+      # most of the map permanently grass-less — the client now treats
+      # "pending" as retryable instead of caching it.
+      classifier_status = "ready" if found is not None else "pending"
+      # "pending" must stay no-store (it's a transient blank, retried on
+      # purpose). "ready" is safe to actually cache in the browser: with
+      # per-depth classifier rows removed (deep tiles now walk the
+      # ancestor chain every request — several sequential DB queries
+      # instead of one direct lookup), repeat requests for the same tile
+      # got measurably more expensive right as every response was also
+      # marked no-store, forcing that walk to redo on every single
+      # request. A real classification changing is rare and already event-
+      # driven elsewhere; a few minutes of staleness is a fine trade for
+      # not repeating a multi-level DB walk + PNG encode every frame.
+      cache_control = (
+        "no-cache" if road_count
+        else ("public, max-age=300" if classifier_status == "ready" else "no-store")
+      )
+      return Response(
+        buf.getvalue(), mimetype="image/png",
+        headers={
+          "Cache-Control": cache_control,
+          "X-Classifier-Status": classifier_status,
+          "X-Classifier-Schema": str(class_schema),
+          "X-Classifier-Source": str(source),
+          "X-Classifier-Mask": "surface_rgb_v5",
+          "X-Road-Overlay-Count": str(road_count),
+        },
       )
     if effective_water is not None:
       # Reconstruct the terrain-grid boundary at the output resolution before
@@ -1862,6 +2631,16 @@ def api_classifier_tile(tile_id: str):
       rgb[render_water] = (
         (255, 42, 161) if CLASSIFIER_PINK_WATER_ENABLED else (42, 42, 42)
       )
+    # Make the same corridor visible in the classifier debug view. This uses
+    # the classifier color below each segment as its local tint, while the raw
+    # response above carries the authoritative no-scatter marker.
+    from asset_catalog import paint_roads_image
+    road_image, road_count = paint_roads_image(
+      _Image.fromarray(rgb, mode="RGB"),
+      child_bbox,
+      ASSETS_DB_PATH,
+    )
+    rgb = _np.asarray(road_image).copy()
   except (TypeError, ValueError, zlib.error):
     return Response(
       b"", status=500,
@@ -1869,20 +2648,186 @@ def api_classifier_tile(tile_id: str):
     )
   buf = _io.BytesIO()
   _Image.fromarray(rgb, mode="RGB").save(buf, format="PNG")
+  debug_status = "ready" if found is not None else "pending"
   headers = {
-    "Cache-Control": "no-store",
-    "X-Classifier-Status": "ready",
+    "Cache-Control": (
+      "no-cache" if road_count
+      else ("public, max-age=300" if debug_status == "ready" else "no-store")
+    ),
+    "X-Classifier-Status": debug_status,
     "X-Classifier-Schema": str(class_schema),
     "X-Classifier-Source": str(source),
     "X-Classifier-Pink-Water": (
       "enabled" if CLASSIFIER_PINK_WATER_ENABLED else "disabled"
     ),
+    "X-Road-Overlay-Count": str(road_count),
   }
   if effective_water is not None and water_source_row is not None:
     headers["X-Water-Mask-Source"] = str(water_source_row[0])
   if found is not None and depth != child_depth:
     headers["X-Classifier-Ancestor"] = f"{depth}-{col}-{row}"
   return Response(buf.getvalue(), mimetype="image/png", headers=headers)
+
+
+def _classifier_ready_tile_ids(db: sqlite3.Connection) -> list[str]:
+  return [
+    str(row[0]) for row in db.execute(
+      "SELECT x.tile_id FROM textures x "
+      "JOIN tiles t ON t.tile_id=x.tile_id "
+      "WHERE x.tile_id LIKE '12-%' "
+      "AND x.source NOT LIKE '%procedural%' "
+      "AND x.source NOT IN ('ancestor_crop', 'placeholder') "
+      "AND t.heightmap IS NOT NULL "
+      "ORDER BY x.tile_id"
+    )
+  ]
+
+
+def _classifier_requested_tiles(
+  db: sqlite3.Connection,
+  payload: dict[str, Any],
+) -> tuple[str, list[str]]:
+  scope = str(payload.get("scope", "selected"))
+  if scope == "ready":
+    return scope, _classifier_ready_tile_ids(db)
+  if scope == "regressions":
+    import regression_cases
+
+    return scope, [
+      str(case.get("tile", "")) for case in regression_cases.load_cases()
+      if _parse_tile_id(str(case.get("tile", ""))) is not None
+    ]
+  if scope != "selected":
+    raise ValueError("scope must be selected, regressions, or ready")
+
+  raw_tiles = payload.get("tiles", [])
+  if isinstance(raw_tiles, str):
+    candidates = re.split(r"[\s,]+", raw_tiles.strip())
+  elif isinstance(raw_tiles, list):
+    candidates = [str(value).strip() for value in raw_tiles]
+  else:
+    raise ValueError("tiles must be a list or whitespace-separated string")
+  tiles = [tile for tile in candidates if tile]
+  invalid = [
+    tile for tile in tiles
+    if (parsed := _parse_tile_id(tile)) is None
+    or parsed[0] != WMS_CONTRACT_DEPTH
+  ]
+  if invalid:
+    raise ValueError(
+      "selected jobs require D12 tile ids; invalid: "
+      + ", ".join(invalid[:5])
+    )
+  return scope, list(dict.fromkeys(tiles))
+
+
+@app.get("/api/classifier/jobs")
+def api_classifier_jobs_status():
+  """Operations-page snapshot: job progress, coverage, regression cases."""
+  unavailable = _terrain_unavailable_response()
+  if unavailable is not None:
+    return unavailable
+  payload = {
+    "job": _classifier_job_control.snapshot(),
+    "inventory": classifier_inventory(_get_db()),
+    "regressions": regression_case_summaries(),
+    "links": {
+      "verificationGallery": "/api/classifier/verification/",
+      "regressionGallery": "/api/regression/",
+    },
+  }
+  response = jsonify(payload)
+  response.headers["Cache-Control"] = "no-store"
+  return response
+
+
+@app.post("/api/classifier/jobs")
+def api_classifier_jobs_start():
+  """Launch one asynchronous classifier verification job."""
+  unavailable = _terrain_unavailable_response()
+  if unavailable is not None:
+    return unavailable
+  payload = request.get_json(silent=True)
+  if not isinstance(payload, dict):
+    return jsonify({"error": "JSON object required"}), 400
+  try:
+    scope, tiles = _classifier_requested_tiles(_get_db(), payload)
+    if not tiles:
+      raise ValueError(f"{scope} job has no tiles")
+    job = _classifier_job_control.start(
+      scope=scope,
+      tiles=tiles,
+      use_google=bool(payload.get("useGoogle", False)),
+    )
+  except ValueError as exc:
+    return jsonify({"error": str(exc)}), 400
+  except RuntimeError as exc:
+    return jsonify({"error": str(exc)}), 409
+  return jsonify(job), 202
+
+
+@app.get("/api/classifier/verification/")
+@app.get("/api/classifier/verification/<path:subpath>")
+def api_classifier_verification_gallery(subpath="index.html"):
+  """Serve the latest ad-hoc/all-tiles verification job gallery."""
+  from classifier_verify import OUT_DIR, build_gallery
+
+  if subpath == "index.html" and not os.path.exists(
+    os.path.join(OUT_DIR, "index.html")
+  ):
+    build_gallery(OUT_DIR, [])
+  return send_from_directory(OUT_DIR, subpath)
+
+
+@app.post("/api/regression/cases")
+def api_regression_flag():
+  """Flag a tile as a classifier regression case (⚑ in the 3D client).
+
+  The case list is user-curated regression_cases.json (committed); baking
+  runs the full verification pipeline for the flagged tile immediately so
+  the gallery at /api/regression/ shows it without a manual rebake.
+  """
+  unavailable = _terrain_unavailable_response()
+  if unavailable is not None:
+    return unavailable
+  payload = request.get_json(silent=True) or {}
+  tile_id = str(payload.get("tile", ""))
+  if _parse_tile_id(tile_id) is None:
+    return Response(b"bad tile id", status=400)
+  note = str(payload.get("note", ""))[:400]
+
+  import regression_cases
+
+  regression_cases.add_case(tile_id, note)
+  try:
+    regression_cases.bake_and_rebuild(_get_db(), tile_id)
+    baked = True
+  except Exception as exc:
+    log.warning(
+      f"[regression] {tile_id}: flagged but bake failed "
+      f"({type(exc).__name__}: {exc})"
+    )
+    baked = False
+  return {
+    "ok": True,
+    "baked": baked,
+    "cases": [case["tile"] for case in regression_cases.load_cases()],
+  }
+
+
+@app.get("/api/regression/")
+@app.get("/api/regression/<path:subpath>")
+def api_regression_gallery(subpath="index.html"):
+  """Serve the baked regression gallery (sample/regression, gitignored)."""
+  from flask import send_from_directory
+
+  import regression_cases
+
+  if subpath == "index.html" and not os.path.exists(
+    os.path.join(regression_cases.OUT_DIR, "index.html")
+  ):
+    regression_cases.build_gallery([])
+  return send_from_directory(regression_cases.OUT_DIR, subpath)
 
 
 @app.get("/api/pipeline/at.json")
@@ -2169,6 +3114,74 @@ def api_client_log():
 def api_client_log_ring():
   """Raw JSON dump of the ring buffer for debugging."""
   return jsonify({"count": len(_client_log_ring), "entries": _client_log_ring[-50:]})
+
+
+@app.get("/api/gpu-profile")
+def api_gpu_profile():
+  response = jsonify(_gpu_profile_control.snapshot())
+  response.headers["Cache-Control"] = "no-store"
+  return response
+
+
+@app.post("/api/gpu-profile/start")
+def api_gpu_profile_start():
+  data = request.get_json(silent=True) or {}
+  raw_interval = data.get("sampleInterval", 10)
+  if isinstance(raw_interval, bool):
+    raw_interval = None
+  if not isinstance(raw_interval, (str, int, float)):
+    sample_interval = 0
+  else:
+    try:
+      sample_interval = int(raw_interval)
+    except ValueError:
+      sample_interval = 0
+  if sample_interval < 1 or sample_interval > 600:
+    return jsonify({
+      "ok": False,
+      "error": "sampleInterval must be an integer from 1 to 600",
+    }), 400
+  try:
+    state = _gpu_profile_control.start(sample_interval)
+  except RuntimeError as exc:
+    return jsonify({"ok": False, "error": str(exc)}), 409
+  log.info(
+    f"[gpu-profile] start id={state['profileId']} "
+    f"sample_interval={sample_interval}"
+  )
+  return jsonify(state), 202
+
+
+@app.post("/api/gpu-profile/stop")
+def api_gpu_profile_stop():
+  try:
+    state = _gpu_profile_control.stop()
+  except RuntimeError as exc:
+    return jsonify({"ok": False, "error": str(exc)}), 409
+  log.info(f"[gpu-profile] stop id={state['profileId']}")
+  return jsonify(state), 202
+
+
+@app.post("/api/gpu-profile/report")
+def api_gpu_profile_report():
+  data = request.get_json(silent=True) or {}
+  try:
+    state = _gpu_profile_control.report(
+      profile_id=str(data.get("profileId") or ""),
+      phase=str(data.get("phase") or ""),
+      client=data.get("client") if isinstance(data.get("client"), dict) else None,
+      result=data.get("result") if isinstance(data.get("result"), dict) else None,
+      error=str(data.get("error") or "") or None,
+    )
+  except LookupError as exc:
+    return jsonify({"ok": False, "error": str(exc)}), 409
+  except (RuntimeError, ValueError) as exc:
+    return jsonify({"ok": False, "error": str(exc)}), 400
+  log.info(
+    f"[gpu-profile] browser phase={data.get('phase')} "
+    f"id={state['profileId']} backend={state.get('client', {}).get('backend')}"
+  )
+  return jsonify(state)
 
 
 def _broadcast_client_log(payload: dict) -> None:

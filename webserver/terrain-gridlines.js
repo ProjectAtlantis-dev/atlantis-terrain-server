@@ -32,10 +32,12 @@ function appendEdge(positions, attribute, resolution, indexAt, matrix, halfWidth
 export function createTerrainGridlinesController({
   terrainRoot,
   renderOrder = 997,
-  width = 12,
+  width = 6,
 } = {}) {
   const material = new THREE.MeshBasicMaterial({
     color: GRIDLINES_COLOR,
+    // Keep lines visible on the sampled surface without drawing them through
+    // foreground ridges or the back side of the terrain.
     depthTest: true,
     depthWrite: false,
     toneMapped: false,

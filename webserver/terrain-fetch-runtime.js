@@ -6,6 +6,7 @@ import {
 } from './terrain-tile-fetch.js';
 import { priorityHeading } from './terrain-priority.js';
 import { mergeTerrainTilesAgainstCurrentTileSet } from './terrain-tile-quality.js';
+import { MAX_TERRAIN_AGL_M } from './terrain-agl.js';
 
 export function createTerrainFetchRuntime({
   state,
@@ -60,6 +61,14 @@ export function createTerrainFetchRuntime({
   async function execute({ lat, lon, signal }) {
     const cameraCoordinates = getCameraCoordinates();
     const cameraSnapshot = getCameraSnapshot(cameraCoordinates);
+    const measuredAgl = testOverrides.getCameraAGL?.()
+      ?? view.getCameraAGL?.();
+    // Unknown clearance is not camera ASL. Bootstrap with the coarse safety
+    // ceiling so startup can only refine after terrain supplies a real AGL;
+    // starting at zero would over-refine and immediately request a downgrade.
+    const lodAltitude = Number.isFinite(measuredAgl)
+      ? Math.max(0, measuredAgl)
+      : MAX_TERRAIN_AGL_M;
     const gridPosition = state.frameOffsetReady
       ? terrainCameraGridPosition({
           eastM: cameraCoordinates.eastM,
@@ -73,7 +82,7 @@ export function createTerrainFetchRuntime({
     const request = buildTerrainTilesRequest({
       lat: lat ?? cameraCoordinates.lat,
       lon: lon ?? cameraCoordinates.lon,
-      altitude: cameraCoordinates.alt,
+      altitude: lodAltitude,
       heading: testOverrides.getHeading?.()
         ?? view.getHeading?.()
         ?? priorityHeading(
@@ -183,7 +192,6 @@ export function createTerrainFetchRuntime({
     logger.enqueue('info', 'fetchTiles.built', {
       meshesInScene: reconciliation.sceneMeshes,
       deferred: reconciliation.deferred,
-      staleRemoved: reconciliation.staleRemoved,
     });
 
     terrain.updateTextures(data.tiles);
@@ -193,6 +201,11 @@ export function createTerrainFetchRuntime({
 
     state.cameraStereoX = state.lastFetchX = data.qx;
     state.cameraStereoY = state.lastFetchY = data.qy;
+    // Altitude affects the server-side LOD ceiling just as horizontal
+    // position affects its radial bands. Advance this only when an
+    // authoritative response applies so a descent can keep requesting until
+    // the response topology catches up with the live camera height.
+    state.lastFetchAltitude = lodAltitude;
     const pipeline = terrainPipelineStatus(data);
     state.heightmapsMissing = pipeline.missing;
     state.heightmapsDownloading = pipeline.downloading;
@@ -238,6 +251,17 @@ export function createTerrainFetchRuntime({
   function request(lat, lon) {
     // Coalesce, never abort: the in-flight request stays authoritative and
     // the newest coordinates run immediately after it settles.
+    //
+    // LIVELOCK WARNING — the movement-refetch trigger re-fires every 500ms
+    // for as long as the camera sits farther than REFETCH_DIST from
+    // state.lastFetchX/Y/Altitude, and lastFetch only advances when a response fully
+    // applies. A radial fetch usually takes longer than 500ms, so under
+    // movement a newer request() always lands mid-flight. Any scheme that
+    // lets that newer arrival cancel or demote the in-flight work (aborting
+    // it, or version-checking its response into the merge-only path) means
+    // no response ever fully applies, lastFetch never advances, the trigger
+    // never clears, and LOD topology freezes until a reset — even after the
+    // camera stops. Both previous designs failed exactly this way.
     if (activeController) {
       onSkip();
       queuedRequest = { lat, lon };

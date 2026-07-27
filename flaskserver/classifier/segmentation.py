@@ -12,6 +12,7 @@ Input orientation matters: ``heightmap`` uses the database/mesh convention
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import cast
 
 import numpy as np
 from PIL import Image
@@ -67,8 +68,11 @@ def _fill_heightmap(heightmap):
         return heightmap.astype(np.float32, copy=False)
     if not valid.any():
         raise ValueError("heightmap contains no finite samples")
-    nearest = ndimage.distance_transform_edt(
-        ~valid, return_distances=False, return_indices=True
+    nearest = cast(
+        np.ndarray,
+        ndimage.distance_transform_edt(
+            ~valid, return_distances=False, return_indices=True
+        ),
     )
     return heightmap[tuple(nearest)].astype(np.float32)
 
@@ -223,7 +227,10 @@ def _enforce_connectivity(labels, minimum_size):
     next_id = 0
     structure = ndimage.generate_binary_structure(2, 1)
     for old_id in range(int(labels.max()) + 1):
-        components, count = ndimage.label(labels == old_id, structure=structure)
+        components, count = cast(
+            tuple[np.ndarray, int],
+            ndimage.label(labels == old_id, structure=structure),
+        )
         for component_id in range(1, count + 1):
             mask = components == component_id
             if int(mask.sum()) >= minimum_size:
@@ -234,8 +241,11 @@ def _enforce_connectivity(labels, minimum_size):
     if next_id == 0:
         # Possible only for very small images/configurations.
         return np.zeros(labels.shape, dtype=np.int32)
-    nearest = ndimage.distance_transform_edt(
-        connected < 0, return_distances=False, return_indices=True
+    nearest = cast(
+        np.ndarray,
+        ndimage.distance_transform_edt(
+            connected < 0, return_distances=False, return_indices=True
+        ),
     )
     for mask in tiny_masks:
         connected[mask] = connected[tuple(axis[mask] for axis in nearest)]

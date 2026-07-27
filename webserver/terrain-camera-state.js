@@ -1,4 +1,4 @@
-const METRES_PER_DEGREE = 111320;
+import { approximateLatLonToLocalMeters } from './terrain-local-coordinates.js';
 
 function finiteOrNull(value) {
   return Number.isFinite(value) ? value : null;
@@ -50,9 +50,12 @@ export function restoreTerrainCameraState(saved, { anchorLat, anchorLon, default
     : null;
 
   return {
-    eastM: (saved.lon - anchorLon) * METRES_PER_DEGREE
-      * Math.cos(anchorLat * Math.PI / 180),
-    northM: (saved.lat - anchorLat) * METRES_PER_DEGREE,
+    ...approximateLatLonToLocalMeters({
+      lat: saved.lat,
+      lon: saved.lon,
+      anchorLat,
+      anchorLon,
+    }),
     alt: Number.isFinite(saved.alt) ? saved.alt : defaultAlt,
     yaw: finiteOrNull(saved.yaw),
     pitch: finiteOrNull(saved.pitch),

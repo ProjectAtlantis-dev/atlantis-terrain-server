@@ -64,6 +64,28 @@ Open <http://localhost:5173/>. Vite proxies browser API requests to Flask on por
 
 The first backend start creates `flaskserver/terrain.db`, seeds the terrain hierarchy, and begins downloading configured Asiaq settlement data in the background. Tile content continues to populate on demand as you move around the world.
 
+## GPU profiling
+
+Leave the WebGL terrain page open, then control its asynchronous GPU pass
+profiler through Flask:
+
+```bash
+curl -X POST -H 'Content-Type: application/json' \
+  --data '{"sampleInterval":5}' \
+  http://127.0.0.1:5180/api/gpu-profile/start
+
+curl http://127.0.0.1:5180/api/gpu-profile
+
+curl -X POST http://127.0.0.1:5180/api/gpu-profile/stop
+
+curl http://127.0.0.1:5180/api/gpu-profile
+```
+
+The browser polls Flask for commands. On stop it drains outstanding timer
+queries and posts the pass summary back to the same status endpoint. The
+profiler currently requires the WebGL backend and
+`EXT_disjoint_timer_query_webgl2`.
+
 ## Repository map
 
 - `webserver/` — the Vite/Three.js application and browser-side tests

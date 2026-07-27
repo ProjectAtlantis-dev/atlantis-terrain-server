@@ -3,6 +3,61 @@ export const GAME_CLOCK_TIME_ZONE = 'America/Nuuk';
 
 const dateTimeFormatters = new Map();
 
+export function parseGameClockSnapshot(
+  rawValue,
+  { fallbackGameTimeMs, defaultTimeScale = 1 } = {},
+) {
+  const fallback = {
+    gameTimeMs: fallbackGameTimeMs,
+    running: true,
+    timeScale: defaultTimeScale,
+    stopGameTimeMs: null,
+  };
+  if (rawValue == null || rawValue === '') return fallback;
+
+  let saved;
+  try {
+    saved = JSON.parse(rawValue);
+  } catch {
+    return fallback;
+  }
+
+  // Older builds stored only the timestamp under game-clock-ms. Treat those
+  // snapshots as running because they predate persisted transport state.
+  if (Number.isFinite(saved)) {
+    return { ...fallback, gameTimeMs: saved };
+  }
+  if (!saved || typeof saved !== 'object' || !Number.isFinite(saved.gameTimeMs)) {
+    return fallback;
+  }
+
+  return {
+    gameTimeMs: saved.gameTimeMs,
+    running: typeof saved.running === 'boolean' ? saved.running : true,
+    timeScale: Number.isFinite(saved.timeScale) && saved.timeScale > 0
+      ? saved.timeScale
+      : defaultTimeScale,
+    stopGameTimeMs: Number.isFinite(saved.stopGameTimeMs)
+      ? saved.stopGameTimeMs
+      : null,
+  };
+}
+
+export function serializeGameClockSnapshot({
+  gameTimeMs,
+  running,
+  timeScale,
+  stopGameTimeMs,
+}) {
+  return JSON.stringify({
+    version: 1,
+    gameTimeMs,
+    running: Boolean(running),
+    timeScale,
+    stopGameTimeMs: Number.isFinite(stopGameTimeMs) ? stopGameTimeMs : null,
+  });
+}
+
 function formatterFor(timeZone) {
   let formatter = dateTimeFormatters.get(timeZone);
   if (!formatter) {

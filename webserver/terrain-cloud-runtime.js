@@ -224,7 +224,9 @@ export function registerTerrainCloudTuning({
   weatherUvBasis,
   renderingEnabled,
   onRenderingEnabledChange,
+  onAppearanceChange,
 } = {}) {
+  const appearanceChanged = () => onAppearanceChange?.();
   section('Clouds');
   if (typeof onRenderingEnabledChange === 'function') {
     controls._takramCloudsCheckbox = toggle('Takram clouds', {
@@ -240,33 +242,59 @@ export function registerTerrainCloudTuning({
       for (let index = 0; index < effect.cloudLayers.length; index += 1) {
         effect.cloudLayers[index].altitude = Math.max(0, defaultAltitudes[index] + value);
       }
+      appearanceChanged();
     },
   });
   slider('coverage', {
     min: 0, max: 1, step: 0.01, value: effect.coverage,
-    onChange: value => { effect.coverage = value; },
+    onChange: value => {
+      effect.coverage = value;
+      appearanceChanged();
+    },
   });
+  // Keep the density slider authoritative. The old checkbox wrote a separate
+  // hard-coded 0.004/0 into the same CloudLayer field, so a refresh replayed
+  // the controls in registration order and silently replaced the persisted
+  // slider value. While disabled, retain slider changes for the next enable.
+  let cirrusEnabled = effect.cloudLayers[3].densityScale > 0;
+  let cirrusDensity = cirrusEnabled
+    ? effect.cloudLayers[3].densityScale
+    : 0.001;
   slider('cirrus density', {
     min: 0, max: 0.002, step: 0.0001,
-    value: effect.cloudLayers[3].densityScale, decimals: 4,
-    onChange: value => { effect.cloudLayers[3].densityScale = value; },
+    value: cirrusDensity, decimals: 4,
+    onChange: value => {
+      cirrusDensity = value;
+      if (cirrusEnabled) {
+        effect.cloudLayers[3].densityScale = value;
+        appearanceChanged();
+      }
+    },
   });
   slider('cirrus coverage', {
     min: 0.1, max: 3, step: 0.05,
     value: effect.cloudLayers[3].weatherExponent, decimals: 2,
     format: value => value <= 0.1 ? 'full' : value >= 3 ? 'sparse' : value.toFixed(2),
-    onChange: value => { effect.cloudLayers[3].weatherExponent = value; },
+    onChange: value => {
+      effect.cloudLayers[3].weatherExponent = value;
+      appearanceChanged();
+    },
   });
   controls._cirrusCheckbox = toggle('cirrus', {
-    value: false,
+    value: cirrusEnabled,
     onChange: enabled => {
-      effect.cloudLayers[3].densityScale = enabled ? 0.004 : 0;
+      cirrusEnabled = enabled;
+      effect.cloudLayers[3].densityScale = enabled ? cirrusDensity : 0;
+      appearanceChanged();
     },
   });
   slider('cirrus shape', {
     min: 0, max: 1, step: 0.01,
     value: effect.cloudLayers[3].shapeAmount,
-    onChange: value => { effect.cloudLayers[3].shapeAmount = value; },
+    onChange: value => {
+      effect.cloudLayers[3].shapeAmount = value;
+      appearanceChanged();
+    },
   });
 
   // One wind: cloud drift heading is slaved to the water wind direction
@@ -276,19 +304,26 @@ export function registerTerrainCloudTuning({
   // the geographic heading into the projection's local basis at the scene
   // anchor, then invert it because advancing the sample offset moves the
   // visible texture in the opposite direction.
-  let driftSpeed = 0.00004;
+  let driftSpeedKmh = 13;
   const updateDrift = () => {
     const compass = getWindDirection?.() ?? 90;
+    // Preserve the original, proven texture-animation scale exactly. At the
+    // default weather repeat around Nuuk, 0.00004 offset units/s is about
+    // 13 km/h, so the old 0–0.002 range maps to 0–650 km/h.
+    const textureOffsetSpeed = driftSpeedKmh * 0.002 / 650;
     const velocity = cloudWeatherUvVelocity({
       compassDegrees: compass,
-      speed: driftSpeed,
+      speed: textureOffsetSpeed,
       weatherUvBasis,
     });
     effect.localWeatherVelocity.set(velocity.x, velocity.y);
   };
-  slider('drift speed', {
-    min: 0, max: 0.002, step: 0.00005, value: driftSpeed, decimals: 6,
-    onChange: value => { driftSpeed = value; updateDrift(); },
+  // Use a new label/persistence key so legacy raw texture-offset values saved
+  // under "drift speed" cannot be mistaken for physical speeds.
+  slider('drift km/h', {
+    min: 0, max: 650, step: 5, value: driftSpeedKmh, decimals: 0,
+    format: value => `${value.toFixed(0)}km/h`,
+    onChange: value => { driftSpeedKmh = value; updateDrift(); },
   });
   updateDrift();
   return { syncDrift: updateDrift };

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { renderGameClock } from '../terrain-hud.js';
+import { renderGameClock, terrainHudHeader } from '../terrain-hud.js';
 
 test('renderGameClock only rewrites the DOM when the display changes', () => {
   const element = { innerHTML: '', dataset: {} };
@@ -23,4 +23,17 @@ test('renderGameClock only rewrites the DOM when the display changes', () => {
 
   renderGameClock(element, date, true, 600);
   assert.ok(element.innerHTML.includes('×600'));
+});
+
+test('terrain HUD header exposes its expanded state and dropdown direction', () => {
+  const expanded = terrainHudHeader(false);
+  assert.match(expanded, /id="hudToggleLink"/);
+  assert.match(expanded, /aria-expanded="true"/);
+  assert.match(expanded, /Hide HUD details/);
+  assert.match(expanded, /&#9650;/);
+
+  const collapsed = terrainHudHeader(true);
+  assert.match(collapsed, /aria-expanded="false"/);
+  assert.match(collapsed, /Show HUD details/);
+  assert.match(collapsed, /&#9660;/);
 });

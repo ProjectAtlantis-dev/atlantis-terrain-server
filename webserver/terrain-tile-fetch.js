@@ -1,3 +1,9 @@
+import {
+  approximateLatLonToLocalMeters,
+  localMetersToApproximateLatLon,
+} from './terrain-local-coordinates.js';
+import { retryableSyntheticDemCount } from './terrain-tile-quality.js';
+
 export function buildTerrainTilesRequest({
   lat,
   lon,
@@ -16,7 +22,10 @@ export function buildTerrainTilesRequest({
   const positionQuery = hasGridPosition
     ? `sx=${queryX}&sy=${queryY}`
     : `lat=${lat}&lon=${lon}`;
-  let url = `/api/tiles?${positionQuery}&alt=${altitude}&heading=${heading}&range=${range}`;
+  // LOD altitude is height above the rendered ground, not geodetic/ASL
+  // camera height. Keep the parameter name explicit so a mountainside
+  // camera at 344 m ASL and 8 m AGL is not incorrectly capped at D13.
+  let url = `/api/tiles?${positionQuery}&agl=${altitude}&heading=${heading}&range=${range}`;
   if (!isFirstLoad || frameOffsetReady) url += `&ox=${originX}&oy=${originY}`;
   return {
     url,
@@ -26,7 +35,7 @@ export function buildTerrainTilesRequest({
       requestLon: lon,
       requestGridX: hasGridPosition ? queryX : null,
       requestGridY: hasGridPosition ? queryY : null,
-      requestAltM: altitude,
+      requestAglM: altitude,
       headingRad: heading,
       ...cameraSnapshot,
     },
@@ -129,9 +138,15 @@ export function adoptTerrainOrigin({ data, cameraSnapshot }) {
 export function terrainCameraStereoPosition({
   latitude, longitude, anchorLatitude, anchorLongitude, originX, originY,
 }) {
+  const local = approximateLatLonToLocalMeters({
+    lat: latitude,
+    lon: longitude,
+    anchorLat: anchorLatitude,
+    anchorLon: anchorLongitude,
+  });
   return {
-    x: originX + (longitude - anchorLongitude) * 111320 * Math.cos(anchorLatitude * Math.PI / 180),
-    y: originY + (latitude - anchorLatitude) * 111320,
+    x: originX + local.eastM,
+    y: originY + local.northM,
   };
 }
 
@@ -147,12 +162,19 @@ export function terrainCameraGridPosition({
 
 export function evaluateTerrainRefetch({
   cameraX, cameraY, lastFetchX, lastFetchY,
-  nowMs, lastTriggerMs, distanceThreshold, triggerIntervalMs,
+  cameraAltitude, lastFetchAltitude,
+  nowMs, lastTriggerMs, distanceThreshold, altitudeThreshold = Infinity,
+  triggerIntervalMs,
 }) {
   const distance = Math.hypot(cameraX - lastFetchX, cameraY - lastFetchY);
-  const shouldFetch = distance > distanceThreshold && nowMs - lastTriggerMs > triggerIntervalMs;
+  const altitudeDelta = Number.isFinite(cameraAltitude) && Number.isFinite(lastFetchAltitude)
+    ? Math.abs(cameraAltitude - lastFetchAltitude)
+    : 0;
+  const demandChanged = distance > distanceThreshold || altitudeDelta > altitudeThreshold;
+  const shouldFetch = demandChanged && nowMs - lastTriggerMs > triggerIntervalMs;
   return {
     distance,
+    altitudeDelta,
     shouldFetch,
     nextTriggerMs: shouldFetch ? nowMs : lastTriggerMs,
   };
@@ -166,8 +188,12 @@ export function terrainCameraCoordinates({
   const eastM = relative.dot(east);
   const northM = relative.dot(north);
   const upM = relative.dot(up);
-  const latitude = anchorLatitude + northM / 111320;
-  const longitude = anchorLongitude + eastM / (111320 * Math.cos(anchorLatitude * Math.PI / 180));
+  const { lat: latitude, lon: longitude } = localMetersToApproximateLatLon({
+    eastM,
+    northM,
+    anchorLat: anchorLatitude,
+    anchorLon: anchorLongitude,
+  });
   const stereo = terrainCameraStereoPosition({
     latitude, longitude, anchorLatitude, anchorLongitude, originX, originY,
   });
@@ -206,4 +232,3 @@ export function terrainPipelineStatus(data) {
       || syntheticHeightmaps > 0 ? 'poll' : 'idle',
   };
 }
-import { retryableSyntheticDemCount } from './terrain-tile-quality.js';

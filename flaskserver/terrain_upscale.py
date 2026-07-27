@@ -1,9 +1,9 @@
-"""Deterministic, seam-safe procedural terrain super-resolution.
+"""Deterministic procedural terrain super-resolution.
 
-The measured DEM is never replaced.  It is bilinearly resampled and a
-world-coordinate fractal *residual* is added between measured samples.  The
-residual is constrained to zero at every source sample and along the complete
-tile border, so processing a tile cannot invalidate its repaired seams.
+The measured DEM is bilinearly resampled and, when requested, a
+world-coordinate procedural residual is added between measured samples. The
+residual is constrained to zero at every source sample and along the tile
+border, so processing a tile cannot invalidate repaired seams.
 """
 
 from __future__ import annotations
@@ -12,14 +12,24 @@ import argparse
 import io
 import json
 from pathlib import Path
+from time import perf_counter
 import zipfile
 
 import numpy as np
-from PIL import Image, ImageFilter
+from PIL import Image
+
+from colored_log import get_logger
 
 
 DEFAULT_SEED = 0x41544C41  # "ATLA"
+log_upscale = get_logger("terrain.upscale")
 
+# Bump when the derived DEM/texture recipe changes shape.
+# serve_flask compares this against the 'macro_terrain_version' metadata row
+# on startup, resets every cooked_dem tile back to pending, and drops
+# cooked_upscale textures, so exploration recooks both with the current
+# recipe.
+MACRO_TERRAIN_VERSION = 5
 
 def _smoothstep(value):
     return value * value * (3.0 - 2.0 * value)
@@ -208,21 +218,6 @@ def upscale_heightmap(
         (bbox[2] - bbox[0]) / (source.shape[1] - 1)
         + (bbox[3] - bbox[1]) / (source.shape[0] - 1)
     )
-    noise = _fbm(x, y, source_spacing * 2.0, int(octaves), int(seed))
-
-    # A fractal bridge: subtract the interpolation of fBm at the measured DEM
-    # lattice.  The residual is therefore exactly zero at every source sample.
-    measured_noise = noise[::factor, ::factor]
-    residual = noise - _bilinear(measured_noise, output_resolution)
-
-    # Incise a deterministic drainage hierarchy into the same constrained
-    # residual. Flow follows the measured landform plus fBm, so the generated
-    # channels reinforce real downhill structure instead of floating over it.
-    provisional = base + float(amplitude_m) * residual
-    slope, _, flow = _flow_features(provisional, bbox)
-    incision = -(flow ** 1.6) * np.sqrt(slope)
-    incision -= _bilinear(incision[::factor, ::factor], output_resolution)
-    residual = residual * 0.72 + incision * 0.55
 
     # Smoothly reach zero at every outer border. This keeps the exact repaired
     # seam curve even if a neighboring tile has not been upscaled yet.
@@ -234,7 +229,13 @@ def upscale_heightmap(
     edge_window_1d = _smoothstep(np.clip(distance / fade_width, 0.0, 1.0))
     edge_window = np.minimum(edge_window_1d[:, None], edge_window_1d[None, :])
 
-    result = base + float(amplitude_m) * residual * edge_window
+    result = base
+    if amplitude_m != 0:
+        result = base + float(amplitude_m) * _lattice_residual(
+            source, base, x, y, source_spacing, bbox, factor,
+            output_resolution, int(octaves), int(seed), float(amplitude_m),
+        ) * edge_window
+
     if water_mask is not None:
         mask = np.asarray(water_mask, dtype=bool)
         if mask.shape != source.shape:
@@ -253,24 +254,49 @@ def upscale_heightmap(
     return result.astype(np.float32)
 
 
+def _lattice_residual(source, base, x, y, source_spacing, bbox, factor,
+                      output_resolution, octaves, seed, amplitude_m):
+    """The original lattice-bridged procedural residual (zero at every measured
+    sample and at the border), including the drainage incision pass."""
+    noise = _fbm(x, y, source_spacing * 2.0, int(octaves), int(seed))
+    # Slow world-scale amplitude modulation keeps the synthetic relief from
+    # reading as uniform stucco: some areas get rough, others stay calm,
+    # coherently across tile borders. Applied before the lattice bridge so
+    # measured samples remain exactly preserved.
+    noise = noise * (0.35 + 0.65 * _smoothstep(np.clip(
+        0.5 + 0.75 * _fbm(x, y, 900.0, 4, int(seed) ^ 0x414D50),
+        0.0, 1.0,
+    )))
+
+    # A lattice bridge: subtract the interpolation of fBm at the measured DEM
+    # lattice.  The residual is therefore exactly zero at every source sample.
+    measured_noise = noise[::factor, ::factor]
+    residual = noise - _bilinear(measured_noise, output_resolution)
+
+    # Incise a deterministic drainage hierarchy into the same constrained
+    # residual. Flow follows the measured landform plus fBm, so the generated
+    # channels reinforce real downhill structure instead of floating over it.
+    provisional = base + float(amplitude_m) * residual
+    slope, _, flow = _flow_features(provisional, bbox)
+    incision = -(flow ** 1.6) * np.sqrt(slope)
+    incision -= _bilinear(incision[::factor, ::factor], output_resolution)
+    return residual * 0.72 + incision * 0.55
+
+
 def _read_south_first_mask(data):
     with Image.open(io.BytesIO(data)) as image:
         # Package PNG rasters are north-first; numerical terrain is south-first.
         return np.asarray(image.convert("L"), dtype=np.uint8)[::-1] != 0
 
 
-def upscale_texture(
-    texture_bytes,
-    bbox,
-    *,
-    factor=4,
-    seed=DEFAULT_SEED,
-    detail_strength=26.0,
-    octaves=3,
-    terrain_heightmap=None,
-    water_mask=None,
-):
-    """Enlarge imagery and add deterministic world-space fractal microdetail."""
+def upscale_texture(texture_bytes, *, factor=4):
+    """Deterministic Lanczos enlarge of tile imagery.
+
+    The noise painter that used to live here is REMOVED (2026-07-22
+    "dark shadow" artifacts, confirmed 2026-07-23): it repainted synthetic
+    shading and grain over evenly-lit imagery and damaged tiles. Imagery now
+    stays an honest enlarge of the parent photo.
+    """
     if factor < 1 or int(factor) != factor:
         raise ValueError("texture factor must be a positive integer")
     factor = int(factor)
@@ -278,80 +304,6 @@ def upscale_texture(
         source = source_image.convert("RGB")
         size = (source.width * factor, source.height * factor)
         resized = source.resize(size, Image.Resampling.LANCZOS)
-    if factor > 1 and detail_strength != 0:
-        if len(bbox) != 4 or bbox[2] <= bbox[0] or bbox[3] <= bbox[1]:
-            raise ValueError("bbox must be an increasing metric extent")
-        base = np.asarray(resized, dtype=np.float32)
-        x = np.linspace(bbox[0], bbox[2], size[0], dtype=np.float64)[None, :]
-        y = np.linspace(bbox[1], bbox[3], size[1], dtype=np.float64)[:, None]
-        source_spacing = 0.5 * (
-            (bbox[2] - bbox[0]) / source.width
-            + (bbox[3] - bbox[1]) / source.height
-        )
-        fractal = _fbm(
-            x, y, source_spacing * 2.0, int(octaves), int(seed) ^ 0x544558,
-        )
-        ridged = 1.0 - 2.0 * np.abs(_fbm(
-            x,
-            y,
-            source_spacing * 1.5,
-            int(octaves),
-            int(seed) ^ 0x52494447,
-        ))
-        ridged -= np.mean(ridged)
-        fractal_detail = fractal * 0.65 + ridged * 0.35
-
-        # Recover the source's real high-frequency structure first, then add
-        # only sub-pixel fractal bands. This makes the result read as an actual
-        # upscale instead of a softly resized image with faint noise.
-        sharpened = np.asarray(
-            resized.filter(ImageFilter.UnsharpMask(radius=2.0, percent=150, threshold=2)),
-            dtype=np.float32,
-        )
-        structural_detail = (sharpened - base) * 0.85
-        luminance = (
-            base[..., 0] * 0.2126 + base[..., 1] * 0.7152 + base[..., 2] * 0.0722
-        )
-        visibility = 0.35 + 0.65 * luminance / 255.0
-        distance = np.minimum(
-            np.minimum(np.arange(size[1]), np.arange(size[1] - 1, -1, -1))[:, None],
-            np.minimum(np.arange(size[0]), np.arange(size[0] - 1, -1, -1))[None, :],
-        )
-        # A full source-pixel fade makes the synthesized residual exactly zero
-        # on every outer border while avoiding a hard derivative transition.
-        window = _smoothstep(np.clip(distance / factor, 0.0, 1.0))[..., None]
-        detail = structural_detail + (
-            fractal_detail[..., None]
-            * visibility[..., None]
-            * float(detail_strength)
-        )
-        if terrain_heightmap is not None:
-            terrain = np.asarray(terrain_heightmap, dtype=np.float64)
-            if terrain.ndim != 2:
-                raise ValueError("terrain heightmap must be a 2D array")
-            # Heightmaps are south-first; imagery is north-first.
-            slope, curvature, flow = _flow_features(terrain, bbox)
-            slope = _resize_bilinear(np.flipud(slope), size[1], size[0])
-            curvature = _resize_bilinear(np.flipud(curvature), size[1], size[0])
-            flow = _resize_bilinear(np.flipud(flow), size[1], size[0])
-            channels = (flow ** 1.5) * np.sqrt(np.clip(slope, 0.0, 1.0))
-            exposed_ridges = np.clip(-curvature, 0.0, 1.0) * np.sqrt(
-                np.clip(slope, 0.0, 1.0)
-            )
-            terrain_tone = (
-                channels[..., None] * np.array([-28.0, -23.0, -17.0])
-                + exposed_ridges[..., None] * np.array([13.0, 11.0, 8.0])
-            )
-            detail += terrain_tone
-        if water_mask is not None:
-            image_water = _resize_bilinear(
-                np.flipud(np.asarray(water_mask, dtype=np.float64)),
-                size[1],
-                size[0],
-            ) >= 0.5
-            detail[image_water] = 0.0
-        output_values = np.clip(base + detail * window, 0, 255).astype(np.uint8)
-        resized = Image.fromarray(output_values, mode="RGB")
     output = io.BytesIO()
     resized.save(output, format="JPEG", quality=95, subsampling=0, optimize=True)
     return output.getvalue(), resized.size
@@ -369,6 +321,19 @@ def upscale_tile_package(
     """Write a minimal replacement bundle containing only changed files."""
     input_path = Path(input_path)
     output_path = Path(output_path)
+    total_started = perf_counter()
+    log_upscale.info(
+        "Upscale started: input=%s output=%s factor=%dx seed=%d "
+        "amplitude=%.3fm octaves=%d",
+        input_path,
+        output_path,
+        factor,
+        seed,
+        amplitude_m,
+        octaves,
+    )
+
+    read_started = perf_counter()
     with zipfile.ZipFile(input_path, "r") as source_archive:
         manifest = json.loads(source_archive.read("manifest.json"))
         heightmap = np.load(
@@ -381,6 +346,20 @@ def upscale_tile_package(
                 source_archive.read("effective-water-mask.png")
             )
         bbox = manifest["bbox"]["values"]
+        texture_file = manifest.get("texture", {}).get("file", "texture-final.jpg")
+        texture_bytes = source_archive.read(texture_file)
+        read_seconds = perf_counter() - read_started
+        tile_id = manifest.get("tileId") or input_path.stem
+        log_upscale.info(
+            "Read tile %s package in %.1fms (heightmap=%dx%d, texture=%s)",
+            tile_id,
+            read_seconds * 1000.0,
+            heightmap.shape[1],
+            heightmap.shape[0],
+            texture_file,
+        )
+
+        heightmap_started = perf_counter()
         upscaled = upscale_heightmap(
             heightmap,
             bbox,
@@ -390,16 +369,28 @@ def upscale_tile_package(
             octaves=octaves,
             water_mask=water_mask,
         )
-        texture_file = manifest.get("texture", {}).get("file", "texture-final.jpg")
-        texture_bytes = source_archive.read(texture_file)
+        heightmap_seconds = perf_counter() - heightmap_started
+        log_upscale.info(
+            "Upscaled tile %s heightmap %dx%d -> %dx%d in %.1fms",
+            tile_id,
+            heightmap.shape[1],
+            heightmap.shape[0],
+            upscaled.shape[1],
+            upscaled.shape[0],
+            heightmap_seconds * 1000.0,
+        )
+
+        texture_started = perf_counter()
         upscaled_texture, texture_size = upscale_texture(
-            texture_bytes,
-            bbox,
-            factor=factor,
-            seed=seed,
-            octaves=octaves,
-            terrain_heightmap=upscaled,
-            water_mask=water_mask,
+            texture_bytes, factor=factor,
+        )
+        texture_seconds = perf_counter() - texture_started
+        log_upscale.info(
+            "Upscaled tile %s texture to %dx%d in %.1fms",
+            tile_id,
+            texture_size[0],
+            texture_size[1],
+            texture_seconds * 1000.0,
         )
 
         output_manifest = {
@@ -425,17 +416,13 @@ def upscale_tile_package(
                 "file": "texture-upscaled.jpg",
                 "format": "jpeg",
                 "shape": [texture_size[1], texture_size[0]],
-                "method": "lanczos_world_fbm_height_erosion_v2",
+                "method": "lanczos",
                 "factor": int(factor),
-                "seed": int(seed),
-                "detailStrength": 26.0,
-                "octaves": int(octaves),
                 "geographicLayoutPreserved": True,
-                "fractalDetailZeroAtBorders": True,
-                "heightGuidedErosion": True,
             },
         }
 
+        write_started = perf_counter()
         output_path.parent.mkdir(parents=True, exist_ok=True)
         with zipfile.ZipFile(output_path, "w", zipfile.ZIP_DEFLATED) as output_archive:
             output_archive.writestr(
@@ -446,6 +433,19 @@ def upscale_tile_package(
             output_archive.writestr("heightmap-upscaled.npy", buffer.getvalue())
             output_archive.writestr("heightmap-upscaled.f32", upscaled.tobytes())
             output_archive.writestr("texture-upscaled.jpg", upscaled_texture)
+    write_seconds = perf_counter() - write_started
+    total_seconds = perf_counter() - total_started
+    log_upscale.info(
+        "Upscale complete: tile=%s total=%.1fms read=%.1fms heightmap=%.1fms "
+        "texture=%.1fms write=%.1fms output=%.1fKiB",
+        tile_id,
+        total_seconds * 1000.0,
+        read_seconds * 1000.0,
+        heightmap_seconds * 1000.0,
+        texture_seconds * 1000.0,
+        write_seconds * 1000.0,
+        output_path.stat().st_size / 1024.0,
+    )
     return upscaled
 
 

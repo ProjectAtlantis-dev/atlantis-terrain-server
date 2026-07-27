@@ -19,9 +19,9 @@ import zlib
 import datetime
 import numpy as np
 
-from tiles import GREENLAND_BBOX
 from colored_log import get_logger
-from terrain_config import MAX_TILE_DEPTH
+from terrain_config import GREENLAND_BBOX, MAX_TILE_DEPTH
+from tile_address import format_tile_id as _tile_id, require_tile_id
 
 log_db = get_logger("terrain.db")
 
@@ -37,6 +37,7 @@ CONFIDENCE = {
     'copernicus': 4,
     'external':   4,
     'arcticdem':  5,
+    'cooked_dem': 5,  # derived from a stable parent; below the 10m measured rank
     'arcticdem_10m': 6,
     'official_coastline': 6,
 }
@@ -398,6 +399,12 @@ def open_db(path=None):
     from classifier.storage import init_classifier_tiles
     init_classifier_tiles(db)
 
+    from cliff_graft_cache import init_cliff_graft_assets
+    init_cliff_graft_assets(db)
+
+    from road_texture_cache import init_road_texture_bakes
+    init_road_texture_bakes(db)
+
     from terrain_seams import init_seam_cache
     init_seam_cache(db)
     if "terrain_seam_cache" not in existing:
@@ -412,10 +419,6 @@ def open_db(path=None):
 # ---------------------------------------------------------------------------
 # Tile addressing helpers
 # ---------------------------------------------------------------------------
-
-def _tile_id(depth, col, row):
-    return f"{depth}-{col}-{row}"
-
 
 def _parent_id(depth, col, row):
     if depth == 0:
@@ -576,8 +579,7 @@ def _reconcile_edges(db, tile_id, heightmap, confidence_map):
         heightmap: float32 (N, N) — modified in-place
         confidence_map: uint8 (N, N) — modified in-place
     """
-    parts = tile_id.split('-')
-    depth, col, row = int(parts[0]), int(parts[1]), int(parts[2])
+    depth, col, row = require_tile_id(tile_id)
     neighbors = _neighbor_ids(depth, col, row)
 
     for direction, nbr_id in neighbors.items():

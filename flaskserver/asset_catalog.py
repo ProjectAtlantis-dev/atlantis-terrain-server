@@ -23,17 +23,6 @@ ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_ASSETS_DB_PATH = ROOT / "assetserver" / "assets.db"
 DEFAULT_METADATA_PATH = ROOT / "assetserver" / "assets_metadata.json"
 
-ROAD_COLORS = {
-    "road:Hovedvej": (66, 65, 64),
-    "road:Lokalvej": (72, 71, 70),
-    "road:Adgangsvej": (79, 77, 74),
-    "road:Kørespor": (105, 98, 87),
-    "road:Under anlæg": (112, 105, 92),
-    "road:Tunnel": (48, 48, 49),
-    "path:Anlagt": (112, 105, 91),
-    "path:Natursti": (128, 112, 88),
-}
-DEFAULT_ROAD_COLOR = (82, 80, 77)
 ROAD_WIDTH_SCALE = {
     "road:Hovedvej": 1.35,
     "road:Lokalvej": 1.25,
@@ -149,10 +138,25 @@ def _roof_color(pixels: list[tuple[int, int, int]]) -> tuple[int, int, int] | No
     if not weighted:
         return None
     total = sum(weight for _, weight in weighted)
-    return tuple(
-        int(round(sum(pixel[channel] * weight for pixel, weight in weighted) / total))
-        for channel in range(3)
+    channel = lambda index: int(round(
+        sum(pixel[index] * weight for pixel, weight in weighted) / total
+    ))
+    return (
+        channel(0),
+        channel(1),
+        channel(2),
     )
+
+
+def _rgb_pixel(image: Image.Image, x: int, y: int) -> tuple[int, int, int]:
+    """Read a statically typed RGB triple from any Pillow image mode."""
+    pixel = image.getpixel((x, y))
+    if isinstance(pixel, tuple):
+        return int(pixel[0]), int(pixel[1]), int(pixel[2])
+    if pixel is None:
+        return 0, 0, 0
+    value = int(pixel)
+    return value, value, value
 
 
 def _sample_footprint_color(
@@ -172,8 +176,8 @@ def _sample_footprint_color(
     right = min(width - 1, int(math.ceil(max(point[0] for point in polygon))))
     top = max(0, int(math.floor(min(point[1] for point in polygon))))
     bottom = min(height - 1, int(math.ceil(max(point[1] for point in polygon))))
-    pixels = [
-        image.getpixel((x, y))[:3]
+    pixels: list[tuple[int, int, int]] = [
+        _rgb_pixel(image, x, y)
         for y in range(top, bottom + 1)
         for x in range(left, right + 1)
         if _point_in_polygon(x + 0.5, y + 0.5, polygon)
@@ -181,7 +185,7 @@ def _sample_footprint_color(
     if not pixels:
         center_x = max(0, min(width - 1, int(round(sum(p[0] for p in polygon) / len(polygon)))))
         center_y = max(0, min(height - 1, int(round(sum(p[1] for p in polygon) / len(polygon)))))
-        pixels = [image.getpixel((center_x, center_y))[:3]]
+        pixels = [_rgb_pixel(image, center_x, center_y)]
     return _roof_color(pixels)
 
 
@@ -315,6 +319,84 @@ def _draw_round_line(draw: ImageDraw.ImageDraw, points, fill, width: int) -> Non
         draw.ellipse((x - radius, y - radius, x + radius, y + radius), fill=fill)
 
 
+def _road_raster_specs(
+    roads: list[dict[str, Any]],
+    bbox: tuple[float, float, float, float],
+    width: int,
+    height: int,
+    scale: int,
+):
+    """Yield the shared geometry used by color and classifier road paints."""
+    x_min, y_min, x_max, y_max = bbox
+    span_x = x_max - x_min
+    span_y = y_max - y_min
+    if span_x <= 0 or span_y <= 0:
+        return
+    for road in roads:
+        points = []
+        for point in road.get("path", []):
+            if not isinstance(point, list) or len(point) < 2:
+                continue
+            points.append((
+                (float(point[0]) - x_min) / span_x * width * scale,
+                (y_max - float(point[1])) / span_y * height * scale,
+            ))
+        if len(points) < 2:
+            continue
+        points = _smooth_points(points)
+        width_m = float(road.get("widthM", 4.0))
+        key = f"{road.get('kind', 'road')}:{road.get('category', '')}"
+        profile_scale = ROAD_WIDTH_SCALE.get(
+            key, 1.25 if road.get("kind") == "road" else 1.1
+        )
+        width_px = width_m * profile_scale / span_x * width * scale
+        if road.get("kind") == "road":
+            minimum_screen_px = 1.5
+        elif road.get("category") == "Anlagt":
+            minimum_screen_px = 2.0
+        else:
+            minimum_screen_px = 1.5
+        fill_width = max(
+            1, int(round(max(width_px, minimum_screen_px * scale)))
+        )
+        yield road, points, fill_width
+
+
+def road_corridor_mask(
+    bbox: tuple[float, float, float, float],
+    width: int,
+    height: int,
+    db_path: Path = DEFAULT_ASSETS_DB_PATH,
+) -> tuple[Image.Image, int]:
+    """Rasterize road/path coverage for classifier and scatter exclusion."""
+    empty = Image.new("L", (width, height), 0)
+    if width <= 0 or height <= 0 or not db_path.exists():
+        return empty, 0
+    db = connect(db_path)
+    try:
+        roads = query_roads(db, bbox)
+    finally:
+        db.close()
+    if not roads:
+        return empty, 0
+
+    scale = ROAD_SUPERSAMPLE
+    coverage = Image.new("L", (width * scale, height * scale), 0)
+    draw = ImageDraw.Draw(coverage)
+    painted = 0
+    for _, points, fill_width in _road_raster_specs(
+        roads, bbox, width, height, scale
+    ):
+        _draw_round_line(draw, points, 255, fill_width)
+        painted += 1
+    if not painted:
+        return empty, 0
+    return (
+        coverage.resize((width, height), Image.Resampling.LANCZOS),
+        painted,
+    )
+
+
 def _sample_underlying_color(
     image: Image.Image,
     points: list[tuple[float, float]],
@@ -349,10 +431,14 @@ def _sample_underlying_color(
                 x = int(round(center_x + normal_x * offset))
                 y = int(round(center_y + normal_y * offset))
                 if 0 <= x < width and 0 <= y < height:
-                    samples.append(image.getpixel((x, y))[:3])
+                    samples.append(_rgb_pixel(image, x, y))
     if not samples:
         return None
-    return tuple(int(statistics.median(pixel[channel] for pixel in samples)) for channel in range(3))
+    return (
+        int(statistics.median(pixel[0] for pixel in samples)),
+        int(statistics.median(pixel[1] for pixel in samples)),
+        int(statistics.median(pixel[2] for pixel in samples)),
+    )
 
 
 def _local_segments(
@@ -380,79 +466,66 @@ def _pavement_color(sampled: tuple[int, int, int]) -> tuple[int, int, int]:
     """Keep local brightness/hue while gently muting orthophoto noise."""
     red, green, blue = sampled
     luminance = red * 0.2126 + green * 0.7152 + blue * 0.0722
-    return tuple(
-        max(0, min(255, int(round((channel * 0.58 + luminance * 0.42) * 0.88))))
-        for channel in (red, green, blue)
+    muted = lambda channel: max(
+        0, min(255, int(round((channel * 0.58 + luminance * 0.42) * 0.88)))
+    )
+    return (
+        muted(red),
+        muted(green),
+        muted(blue),
     )
 
 
 def _trail_color(
     sampled: tuple[int, int, int], natural: bool
 ) -> tuple[int, int, int]:
-    """Preserve the sampled terrain hue; only lower brightness for contrast."""
+    """Keep the local terrain color, with only enough darkening to read as a path."""
     red, green, blue = (channel / 255 for channel in sampled)
     hue, saturation, value = colorsys.rgb_to_hsv(red, green, blue)
-    value *= 0.72 if natural else 0.80
-    saturation = min(1.0, saturation * 1.05)
-    return tuple(
-        int(round(channel * 255))
-        for channel in colorsys.hsv_to_rgb(hue, saturation, value)
+    # Natural trails should nearly disappear into their actual ground cover;
+    # constructed paths get a little more contrast without becoming a fixed
+    # tan stripe. The overlay alpha supplies the remaining edge definition.
+    value *= 0.88 if natural else 0.84
+    saturation *= 0.98
+    out_red, out_green, out_blue = colorsys.hsv_to_rgb(
+        hue, saturation, value
+    )
+    return (
+        int(round(out_red * 255)),
+        int(round(out_green * 255)),
+        int(round(out_blue * 255)),
     )
 
 
-def paint_roads(
-    jpeg: bytes,
+def paint_roads_image(
+    image: Image.Image,
     bbox: tuple[float, float, float, float],
     db_path: Path = DEFAULT_ASSETS_DB_PATH,
     debug: bool = False,
-) -> tuple[bytes, int]:
-    """Paint catalog roads onto a copy of a tile JPEG."""
-    if not jpeg or not db_path.exists():
-        return jpeg, 0
-    db = connect(db_path)
-    try:
-        roads = query_roads(db, bbox)
-    finally:
-        db.close()
+    *,
+    roads: list[dict[str, Any]] | None = None,
+) -> tuple[Image.Image, int]:
+    """Paint catalog roads onto an RGB image without changing its encoding."""
+    image = image.convert("RGB")
+    if roads is None:
+        if not db_path.exists():
+            return image, 0
+        db = connect(db_path)
+        try:
+            roads = query_roads(db, bbox)
+        finally:
+            db.close()
     if not roads:
-        return jpeg, 0
+        return image, 0
 
-    image = Image.open(io.BytesIO(jpeg)).convert("RGB")
     width, height = image.size
-    x_min, y_min, x_max, y_max = bbox
-    span_x = x_max - x_min
-    span_y = y_max - y_min
-    if span_x <= 0 or span_y <= 0:
-        return jpeg, 0
-
     scale = ROAD_SUPERSAMPLE
     overlay = Image.new("RGBA", (width * scale, height * scale), (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay)
     painted = 0
-    for road in roads:
-        points = []
-        for point in road.get("path", []):
-            if not isinstance(point, list) or len(point) < 2:
-                continue
-            points.append((
-                (float(point[0]) - x_min) / span_x * width * scale,
-                (y_max - float(point[1])) / span_y * height * scale,
-            ))
-        if len(points) < 2:
-            continue
-        points = _smooth_points(points)
-        width_m = float(road.get("widthM", 4.0))
-        key = f"{road.get('kind', 'road')}:{road.get('category', '')}"
-        profile_scale = ROAD_WIDTH_SCALE.get(key, 1.25 if road.get("kind") == "road" else 1.1)
-        width_px = width_m * profile_scale / span_x * width * scale
-        if road.get("kind") == "road":
-            minimum_screen_px = 1.5
-        elif road.get("category") == "Anlagt":
-            minimum_screen_px = 2.0
-        else:
-            minimum_screen_px = 1.5
-        minimum_px = minimum_screen_px * scale
-        fill_width = max(1, int(round(max(width_px, minimum_px))))
+    for road, points, fill_width in _road_raster_specs(
+        roads, bbox, width, height, scale
+    ):
         # One continuous two-lane surface. Supersampling supplies the edge
         # transition; extra casing/crown strokes incorrectly imply separate
         # carriageways and a median.
@@ -478,9 +551,32 @@ def paint_roads(
             painted += 1
 
     if not painted:
-        return jpeg, 0
+        return image, 0
     overlay = overlay.resize((width, height), Image.Resampling.LANCZOS)
     image = Image.alpha_composite(image.convert("RGBA"), overlay).convert("RGB")
+    return image, painted
+
+
+def paint_roads(
+    jpeg: bytes,
+    bbox: tuple[float, float, float, float],
+    db_path: Path = DEFAULT_ASSETS_DB_PATH,
+    debug: bool = False,
+    *,
+    roads: list[dict[str, Any]] | None = None,
+) -> tuple[bytes, int]:
+    """Paint catalog roads onto a copy of a tile JPEG."""
+    if not jpeg:
+        return jpeg, 0
+    image, painted = paint_roads_image(
+        Image.open(io.BytesIO(jpeg)),
+        bbox,
+        db_path,
+        debug=debug,
+        roads=roads,
+    )
+    if not painted:
+        return jpeg, 0
     output = io.BytesIO()
     image.save(output, format="JPEG", quality=92, optimize=True)
     return output.getvalue(), painted

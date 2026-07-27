@@ -195,6 +195,8 @@ def main() -> None:
         parser.error("give block ids or --lat/--lon")
 
     creds = _credentials()
+    if creds is None:
+        raise RuntimeError("FTP credentials are required")
     available = _remote_listing(creds)
     BLOCK_DIR.mkdir(exist_ok=True)
 

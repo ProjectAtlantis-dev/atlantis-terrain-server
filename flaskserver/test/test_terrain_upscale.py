@@ -111,32 +111,17 @@ class TerrainUpscaleTest(unittest.TestCase):
             np.testing.assert_array_equal(second[::2, ::2], result)
 
     def test_texture_upscale_is_deterministic_and_has_expected_size(self):
+        # A plain Lanczos enlarge — the noise painter is removed
+        # (it damaged tiles with dark shadow artifacts), so there is no seed
+        # and no terrain conditioning to vary.
         source = io.BytesIO()
         values = np.arange(4 * 5 * 3, dtype=np.uint8).reshape((4, 5, 3))
         Image.fromarray(values, mode="RGB").save(source, format="JPEG")
-        bbox = (10.0, 20.0, 15.0, 24.0)
-        first, first_size = upscale_texture(source.getvalue(), bbox, factor=4)
-        second, second_size = upscale_texture(source.getvalue(), bbox, factor=4)
-        different, _ = upscale_texture(source.getvalue(), bbox, factor=4, seed=9)
+        first, first_size = upscale_texture(source.getvalue(), factor=4)
+        second, second_size = upscale_texture(source.getvalue(), factor=4)
         self.assertEqual(first, second)
-        self.assertNotEqual(first, different)
         self.assertEqual(first_size, (20, 16))
         self.assertEqual(second_size, first_size)
-
-    def test_texture_erosion_responds_to_heightmap(self):
-        source = io.BytesIO()
-        Image.new("RGB", (8, 8), (120, 115, 100)).save(source, format="JPEG")
-        bbox = (0.0, 0.0, 80.0, 80.0)
-        flat = np.zeros((17, 17), dtype=np.float32)
-        rows, columns = np.mgrid[0:17, 0:17]
-        dissected = (rows * 2 + columns + np.sin(columns * 0.8) * 4).astype(np.float32)
-        flat_texture, _ = upscale_texture(
-            source.getvalue(), bbox, factor=4, terrain_heightmap=flat,
-        )
-        terrain_texture, _ = upscale_texture(
-            source.getvalue(), bbox, factor=4, terrain_heightmap=dissected,
-        )
-        self.assertNotEqual(flat_texture, terrain_texture)
 
 
 if __name__ == "__main__":

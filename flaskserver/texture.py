@@ -22,6 +22,16 @@ TEXTURE SOURCE STATES:
 - dataforsyningen_metatile4h2: Primary source (SPOT 6/7, 1.6m/0.2m via
                                EPSG:3184), fetched/reprojected as an aligned
                                4x4 group with edge-driven color harmonization.
+- cooked_upscale:          Past WMS_CONTRACT_DEPTH only: the fetched metatile
+                            carried no real detail beyond the level above
+                            (provider blowup), so the tile was cooked from its
+                            parent's final texture by terrain_upscale. Terminal
+                            against lateral writes (same standing as
+                            dataforsyningen_metatile4h2; the source value is
+                            the provenance record) but DERIVED data: any real
+                            (non-placeholder) write to the parent texture
+                            drops the cooked children so the next demand
+                            re-cooks against the new parent.
 - write_texture() has an expected_upgrades whitelist. If you add a new source,
   update that whitelist or you'll get TEX CLOBBER warnings.
 
@@ -52,6 +62,7 @@ from rasterio.transform import from_bounds as transform_from_bounds
 from rasterio.warp import Resampling as WarpResampling, reproject, transform_bounds
 
 from colored_log import get_logger
+from tile_address import parse_tile_id, require_tile_id
 
 log_tex = get_logger("terrain.tex")
 
@@ -139,13 +150,6 @@ def repair_white_ocean(jpeg_bytes, heightmap, max_elev_m=0.5, min_frac=0.005):
     buf = io.BytesIO()
     Image.fromarray(arr).save(buf, format="JPEG", quality=85)
     return buf.getvalue()
-
-def _env_bool(name, default=False):
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    return raw.strip().lower() in {"1", "true", "yes", "on"}
-
 
 # ---------------------------------------------------------------------------
 # Dataforsyningen Greenland orthophoto WMS (SPOT 6/7 1.6m + aerial 0.2m)
@@ -373,6 +377,80 @@ def init_textures(db):
         log_tex.info("Created table: textures")
 
 
+# Workflow endpoints: sources the pipeline must never replace. Overwriting
+# one is logged as an error by write_texture (see TEX CLOBBER-TERMINAL).
+TERMINAL_SOURCES = {
+    "dataforsyningen_metatile4h2",
+    "cooked_upscale",
+    "ancestor_crop_nodata",
+    "ocean_nodata",
+}
+
+# Placeholder sources the pipeline may still replace (mirrored by the
+# server's temporary set). A parent write in one of these states is not a
+# real content change and must not invalidate cooked children.
+TEMPORARY_SOURCES = {
+    "sentinel2_crop",
+    "ancestor_crop",
+    "ancestor_crop_ratelimit",
+    "dataforsyningen",
+    "dataforsyningen_metatile",
+    "dataforsyningen_metatile4",
+    "dataforsyningen_metatile4h",
+}
+
+
+def drop_procedural_children(db, tile_id):
+    """Delete the cooked_upscale subtree under tile_id; returns its ids.
+
+    Cooked tiles are derived data: when the real parent texture changes,
+    the derivation is stale. Cooks recurse (a depth-14 tile is cooked from
+    a depth-13 cook), so the staleness cascades — every procedural descendant
+    of a dropped procedural tile was derived, transitively, from the changed
+    parent. Dropping the rows returns them to the missing state, so the
+    next demand re-runs the full pipeline (fetch → inspect → cook) level
+    by level against the new parent.
+    """
+    if parse_tile_id(tile_id) is None:
+        return []
+
+    stale = []
+    frontier = [tile_id]
+    while frontier:
+        child_ids = []
+        for parent in frontier:
+            depth, column, row = require_tile_id(parent)
+            child_ids.extend(
+                f"{depth + 1}-{column * 2 + column_bit}-{row * 2 + row_bit}"
+                for column_bit in (0, 1)
+                for row_bit in (0, 1)
+            )
+        placeholders = ",".join("?" for _ in child_ids)
+        frontier = [
+            r[0] for r in db.execute(
+                f"SELECT tile_id FROM textures WHERE tile_id IN ({placeholders}) "
+                "AND source = 'cooked_upscale'",
+                child_ids,
+            ).fetchall()
+        ]
+        stale.extend(frontier)
+
+    if stale:
+        marks = ",".join("?" for _ in stale)
+        db.execute(f"DELETE FROM textures WHERE tile_id IN ({marks})", stale)
+        try:
+            # Cook-derived class maps are stale with their textures.
+            db.execute(
+                f"DELETE FROM classifier_tiles WHERE tile_id IN ({marks}) "
+                "AND source = 'procedural_cook_v1'",
+                stale,
+            )
+        except Exception:
+            pass  # classifier storage not initialized in this database
+        db.commit()
+    return stale
+
+
 def write_texture(db, tile_id, jpeg_bytes, source):
     """Store a JPEG texture blob in the database."""
     existing = db.execute(
@@ -425,13 +503,28 @@ def write_texture(db, tile_id, jpeg_bytes, source):
             ("dataforsyningen_metatile", "dataforsyningen_metatile4h2"),
             ("dataforsyningen_metatile4", "dataforsyningen_metatile4h2"),
             ("dataforsyningen_metatile4h", "dataforsyningen_metatile4h2"),
+            ("sentinel2_crop", "cooked_upscale"),
+            ("ancestor_crop", "cooked_upscale"),
+            ("ancestor_crop_ratelimit", "cooked_upscale"),
+            ("sentinel2", "cooked_upscale"),
+            ("dataforsyningen", "cooked_upscale"),
+            ("dataforsyningen_metatile", "cooked_upscale"),
+            ("dataforsyningen_metatile4", "cooked_upscale"),
+            ("dataforsyningen_metatile4h", "cooked_upscale"),
         }
         msg = (
             f"{tile_id}: replacing {ex_source} "
             f"({ex_updated}, {ex_size}b) with {source} ({len(jpeg_bytes)}b)"
         )
         if ex_source != source and (ex_source, source) not in expected_upgrades:
-            log_tex.warning(f"[TEX CLOBBER] {msg}")
+            if ex_source in TERMINAL_SOURCES:
+                # Terminal rows are workflow endpoints (finished provider
+                # detail, procedural cooks, confirmed no-coverage). Nothing in
+                # the normal pipeline replaces them — this is either a manual
+                # reset or a bug losing finished work.
+                log_tex.error(f"[TEX CLOBBER-TERMINAL] {msg}")
+            else:
+                log_tex.warning(f"[TEX CLOBBER] {msg}")
     now = datetime.datetime.now(datetime.timezone.utc).isoformat()
     db.execute(
         "INSERT OR REPLACE INTO textures (tile_id, source, texture, updated_at) "
@@ -439,6 +532,20 @@ def write_texture(db, tile_id, jpeg_bytes, source):
         (tile_id, source, jpeg_bytes, now)
     )
     db.commit()
+
+    # Cooked descendants are derived from this tile's texture: any real
+    # (non-placeholder) change to it makes the whole procedural subtree stale
+    # (drop cascades — deep cooks recurse on cooked parents). Cook writes
+    # themselves can't invalidate anything: a cook only runs after the
+    # parent-change drop already cleared the subtree, so its children
+    # don't exist yet.
+    if source not in TEMPORARY_SOURCES and source != "cooked_upscale":
+        stale = drop_procedural_children(db, tile_id)
+        if stale:
+            log_tex.info(
+                f"[TEX] {tile_id}: parent changed to {source} — dropped stale "
+                f"procedural children for re-cook: {', '.join(stale)}"
+            )
 
 
 def read_texture(db, tile_id):
@@ -460,6 +567,88 @@ def texture_ids_in(db, tile_ids):
         list(tile_ids)
     ).fetchall()
     return {r[0] for r in rows}
+
+
+def texture_sources_in(db, tile_ids):
+    """Return {tile_id: source} for the cached subset of tile_ids."""
+    if not tile_ids:
+        return {}
+    placeholders = ",".join("?" for _ in tile_ids)
+    rows = db.execute(
+        f"SELECT tile_id, source FROM textures WHERE tile_id IN ({placeholders})",
+        list(tile_ids)
+    ).fetchall()
+    return {r[0]: r[1] for r in rows}
+
+
+# A past-contract-depth metatile is a provider blowup when EITHER statistic
+# falls below its floor. Floors are empirical (synthetic real imagery scores
+# recon≈0.86 / spectral≈2.1; blowups ≤0.21 / ≤0.05, nearest-neighbour carve
+# 0.0 / 0.53); tune from the pair logged on every past-contract fetch.
+METATILE_RECON_MIN = 0.35
+METATILE_SPECTRAL_MIN = 0.15
+
+
+def metatile_upsample_scores(image_bytes):
+    """(reconstruction, spectral) evidence of detail beyond half resolution.
+
+    Reconstruction: rebuild the image from its own half-res reduction with
+    several kernels and take the best fit, normalized by the image's overall
+    high-frequency content. A carve/blowup is reconstructible (→ 0); genuine
+    imagery is not. Catches nearest-neighbour quad duplication exactly.
+
+    Spectral: power beyond radial frequency 0.30 cycles/px relative to the
+    0.125–0.25 band. Any smooth upsampling kernel is a lowpass at 0.25, so
+    blowups have near-empty outer bands regardless of kernel choice.
+
+    Both are contrast-invariant, so faint-but-genuine tundra detail scores
+    like high-contrast terrain.
+    """
+    with Image.open(io.BytesIO(image_bytes)) as image:
+        gray = np.asarray(image.convert("L"), dtype=np.float32)
+    height, width = gray.shape
+    if min(height, width) < 8:
+        return 1.0, 1.0
+    full = Image.fromarray(gray, mode="F")
+
+    best_residual = None
+    for down_kernel in (Image.Resampling.LANCZOS, Image.Resampling.BOX):
+        down = full.resize((width // 2, height // 2), down_kernel)
+        for up_kernel in (
+            Image.Resampling.LANCZOS,
+            Image.Resampling.BICUBIC,
+            Image.Resampling.BILINEAR,
+            Image.Resampling.NEAREST,
+        ):
+            up = np.asarray(down.resize((width, height), up_kernel), dtype=np.float32)
+            residual = float(np.sqrt(np.mean((gray - up) ** 2)))
+            best_residual = (
+                residual if best_residual is None else min(best_residual, residual)
+            )
+    quarter = full.resize((width // 4, height // 4), Image.Resampling.LANCZOS)
+    smooth = np.asarray(
+        quarter.resize((width, height), Image.Resampling.LANCZOS), dtype=np.float32
+    )
+    high_frequency_rms = float(np.sqrt(np.mean((gray - smooth) ** 2)))
+    reconstruction = best_residual / (high_frequency_rms + 1e-6)
+
+    spectrum = np.abs(np.fft.rfft2(gray - gray.mean())) ** 2
+    frequency_y = np.fft.fftfreq(height)[:, None]
+    frequency_x = np.fft.rfftfreq(width)[None, :]
+    radial = np.sqrt(frequency_x * frequency_x + frequency_y * frequency_y)
+    outer = spectrum[(radial > 0.30) & (radial <= 0.5)].sum()
+    mid = spectrum[(radial > 0.125) & (radial <= 0.25)].sum()
+    spectral = float(outer / (mid + 1e-9))
+    return reconstruction, spectral
+
+
+def metatile_is_upsampled(image_bytes):
+    """Return (is_upsampled, reconstruction_score, spectral_score)."""
+    reconstruction, spectral = metatile_upsample_scores(image_bytes)
+    cheated = (
+        reconstruction < METATILE_RECON_MIN or spectral < METATILE_SPECTRAL_MIN
+    )
+    return cheated, reconstruction, spectral
 
 
 # ---------------------------------------------------------------------------
