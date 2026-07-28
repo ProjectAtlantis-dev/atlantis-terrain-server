@@ -65,15 +65,25 @@ class OfficialCoastlineTest(unittest.TestCase):
         )
 
     def test_drops_water_floor_only_on_water(self):
-        heightmap = np.array([[100.0, 20.0], [50.0, np.nan]], dtype=np.float32)
+        heightmap = np.array([[100.0, 20.0], [-10.0, np.nan]], dtype=np.float32)
         water = np.array([[True, False], [False, True]])
         original = heightmap.copy()
         result = apply_water_mask(heightmap, water)
         floor = -WATER_FLOOR_DROP_M
         np.testing.assert_array_equal(
-            result, np.array([[floor, 20.0], [50.0, floor]], dtype=np.float32)
+            result, np.array([[floor, 20.0], [-10.0, floor]], dtype=np.float32)
         )
         np.testing.assert_array_equal(heightmap, original)
+
+    def test_water_floor_replaces_retired_deeper_synthetic_values(self):
+        heightmap = np.array([[-10.0, -3.0]], dtype=np.float32)
+        result = apply_water_mask(
+            heightmap, np.array([[True, True]], dtype=bool),
+        )
+        np.testing.assert_array_equal(
+            result,
+            np.full(heightmap.shape, -WATER_FLOOR_DROP_M, dtype=np.float32),
+        )
 
     def test_database_preserves_raw_dem_and_masks_only_the_read_view(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -177,7 +187,7 @@ class OfficialCoastlineTest(unittest.TestCase):
                 db.execute(
                     "SELECT value FROM metadata WHERE key = 'schema_version'"
                 ).fetchone()[0],
-                "5",
+                "6",
             )
             db.close()
 

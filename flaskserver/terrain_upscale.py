@@ -241,9 +241,22 @@ def upscale_heightmap(
         if mask.shape != source.shape:
             raise ValueError("water mask shape must match heightmap")
         high_resolution_water = _nearest_mask(mask, output_resolution)
-        # effective_heightmap defines water as sea level. Preserve that
-        # contract instead of interpolating nearby land into masked water.
-        result[high_resolution_water] = 0.0
+        # Flatten water only where the parent really is flat water. The old
+        # unconditional `= 0.0` predates bathymetry: it existed to stop nearby
+        # land being interpolated into masked water, which is still worth
+        # preventing. But the parent heightmap now arrives from
+        # effective_heightmap already carrying a carved seafloor, and zeroing
+        # it threw that away on every cooked tile -- and worse, the measured
+        # samples are restored below, so a mixed tile came out combed: carved
+        # depth at every other vertex, sea level in between.
+        #
+        # Where the parent's water is already below sea level, the bilinear
+        # surface between those samples IS the bathymetry and must be kept.
+        parent_water = source[mask]
+        if parent_water.size and np.nanmin(parent_water) < -0.5:
+            pass                       # carved seafloor: interpolate it
+        else:
+            result[high_resolution_water] = 0.0
 
     # Assignment avoids any floating-point roundoff at measured vertices.
     result[::factor, ::factor] = source

@@ -39,7 +39,7 @@ HYDROGRAPHY_SOURCE = "govmin_gl_aabent_land"
 # surface has volume above the seabed. Bump WATER_FLOOR_VERSION whenever the
 # derived geometry changes: open_db() flushes every cached seam on mismatch.
 WATER_FLOOR_DROP_M = 5.0
-WATER_FLOOR_VERSION = 5
+WATER_FLOOR_VERSION = 7
 SEA_SEED_MAX_ELEV_M = 0.5
 _WMS_URL = "https://gis.govmin.gl/geoserver/wms"
 _WMS_LAYER = "Greenland:gl_aabent_land"
@@ -131,9 +131,11 @@ def apply_water_mask(heightmap, water):
             f"water mask shape {water.shape} does not match DEM {result.shape}"
         )
     floor = np.float32(-WATER_FLOOR_DROP_M)
-    finite_water = water & np.isfinite(result)
-    result[finite_water] = np.minimum(result[finite_water], floor)
-    result[water & ~np.isfinite(result)] = floor
+    # This is a fallback seabed, not a maximum-elevation clamp. Assigning the
+    # exact floor also erases any retired -3/-10 m synthetic values that may
+    # survive in derived child DEMs. Real depths are applied separately after
+    # this step from the bathymetry table.
+    result[water] = floor
     return result
 
 
@@ -520,7 +522,7 @@ def ensure_water_floor_version(db) -> None:
 
 
 def effective_heightmap(db, tile_id: str, raw_heightmap):
-    """Apply a cached mask at read time while preserving stored raw samples.
+    """Apply water fallback and real bathymetry without changing stored DEMs.
 
     Recomputed on every read. Caching the repaired arrays (or the
     decompressed masks) is a possible perf win, deliberately deferred
@@ -529,19 +531,59 @@ def effective_heightmap(db, tile_id: str, raw_heightmap):
     water = read_water_mask(db, tile_id)
     if raw_heightmap is None:
         if water is not None and np.all(water):
-            return np.full(water.shape, -WATER_FLOOR_DROP_M, dtype=np.float32)
-        return None
-    if water is None:
-        return raw_heightmap
-    result = apply_water_mask(raw_heightmap, water)
+            result = np.full(
+                water.shape, -WATER_FLOOR_DROP_M, dtype=np.float32,
+            )
+        else:
+            return None
+    elif water is None:
+        # No vector mask for this tile -- but bathymetry is keyed on position,
+        # not on mask coverage, and read_bathymetry resamples from whatever
+        # ancestor has a row. Returning here skipped it entirely, so every
+        # tile without a mask rendered its stored water plate at -5 m while
+        # the carved level beneath it sat hundreds of metres lower. At depth
+        # 13 only 144 of 3959 tiles carry a mask, which is why that level came
+        # out as a field of rectangular mesas while depth 12 looked correct.
+        #
+        # Fall back to the DEM's own water convention: a sample at or below
+        # sea level is water. That is the same convention the stored plate is
+        # written with, so it recovers exactly the samples bathymetry is
+        # entitled to replace and touches nothing above the waterline.
+        result = np.array(raw_heightmap, dtype=np.float32, copy=True)
+        water = result <= 0.0
+        if not np.any(water):
+            return raw_heightmap
+    else:
+        result = apply_water_mask(raw_heightmap, water)
+    from bathymetry import read_bathymetry
+
+    bathymetry = read_bathymetry(db, tile_id, result.shape)
+    bathymetry_vertices = 0
+    if bathymetry is not None:
+        if bathymetry.shape != result.shape:
+            raise ValueError(
+                f"bathymetry shape {bathymetry.shape} does not match DEM "
+                f"{result.shape} for {tile_id}"
+            )
+        # The supplied depth-8 rasters retain positive land elevations around
+        # their carved water. A finer official shoreline can classify a sample
+        # as water where that coarse raster still says land; positive values
+        # are therefore non-applicable bathymetry and retain the -5 m fallback.
+        bathymetry_mask = water & np.isfinite(bathymetry) & (bathymetry < 0.0)
+        bathymetry_vertices = int(np.sum(bathymetry_mask))
+        result[bathymetry_mask] = bathymetry[bathymetry_mask]
     with _logged_effective_tiles_lock:
         should_log = tile_id not in _logged_effective_tiles
         if should_log:
             _logged_effective_tiles.add(tile_id)
     if should_log:
-        raw = np.asarray(raw_heightmap, dtype=np.float32)
+        raw = (
+            np.asarray(raw_heightmap, dtype=np.float32)
+            if raw_heightmap is not None
+            else np.full(water.shape, np.nan, dtype=np.float32)
+        )
         finite_water = water & np.isfinite(raw)
-        clamped_water = finite_water & (raw > -WATER_FLOOR_DROP_M)
+        clamped_water = finite_water & (raw != -WATER_FLOOR_DROP_M)
         source_row = db.execute(
             "SELECT source FROM coastline_masks WHERE tile_id = ?", (tile_id,)
         ).fetchone()
@@ -553,6 +595,7 @@ def effective_heightmap(db, tile_id: str, raw_heightmap):
             f"[coastline-apply] tile={tile_id} source={mask_source} "
             f"water_vertices={int(np.sum(water))} "
             f"clamped_vertices={int(np.sum(clamped_water))} "
+            f"bathymetry_vertices={bathymetry_vertices} "
             f"raw_water_max_m={raw_water_max:.3f}"
         )
     return result

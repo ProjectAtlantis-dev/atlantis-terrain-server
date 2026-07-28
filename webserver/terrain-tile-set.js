@@ -76,23 +76,19 @@ export function createTileLifecycle({
     return true;
   }
 
-  function evictCoveredAncestors(childTileId, desiredTileIds = null) {
+  function evictCoveredAncestors(childTileId) {
     const resident = new Map();
     for (const mesh of terrainRoot.children) {
       if (!mesh.isMesh || !mesh.userData.tileId) continue;
       resident.set(mesh.userData.tileId, hasTerrainCoverage(mesh));
     }
-    const evictable = new Set(findCoveredTileAncestors(
-      childTileId,
-      resident,
-      desiredTileIds,
-    ));
+    const evictable = new Set(findCoveredTileAncestors(childTileId, resident));
     for (const ancestorId of evictable) {
       const mesh = terrainRoot.children.find(
         child => child.isMesh && child.userData.tileId === ancestorId,
       );
       if (!mesh) continue;
-      evict(mesh, `complete demanded child coverage (triggered by ${childTileId})`);
+      evict(mesh, `complete four-quadrant child coverage (triggered by ${childTileId})`);
       onReleaseTile(ancestorId);
       resident.delete(ancestorId);
     }
@@ -231,7 +227,7 @@ export function createTerrainTextureController({
     }
     mesh.userData.terrainPlaceholderTexture = texture;
     onMaterialApplied(mesh);
-    lifecycle.evictCoveredAncestors(tile.id, desiredTileIds);
+    lifecycle.evictCoveredAncestors(tile.id);
   }
 
   function drainApplications() {
@@ -259,7 +255,7 @@ export function createTerrainTextureController({
           log(tileId, 'cached but NO mesh in scene');
         }
       }
-      lifecycle.evictCoveredAncestors(tileId, desiredTileIds);
+      lifecycle.evictCoveredAncestors(tileId);
     }
     if (pendingApplications.size > 0) scheduleApplicationFrame();
   }
@@ -315,7 +311,7 @@ export function createTerrainTextureController({
       if (!textureChanged) continue;
       log(tile.id, `apply cached tex (src=${textureStreamer.texSource.get(tile.id) || '?'})`);
       meshById.set(tile.id, applyTexture(mesh, tile, texture));
-      lifecycle.evictCoveredAncestors(tile.id, desiredTileIds);
+      lifecycle.evictCoveredAncestors(tile.id);
     }
 
     textureStreamer.pump(scored, {
@@ -403,8 +399,8 @@ export function reconcileTerrainTiles({
   }
 
   // Keep a coarse tile whenever the new demand contains descendants inside
-  // it. Only demanded descendants matter: quadrants outside the demand
-  // circle are intentionally absent and must not force a boundary hole.
+  // it. At a circular-demand boundary, that parent remains the fallback for
+  // omitted quadrants until resident descendants cover its entire footprint.
   let released = 0;
   const retainedFallbackIds = new Set(
     removed.filter(id => desiredDescendantIds(id, nextTileIds).length > 0),

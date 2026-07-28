@@ -9,8 +9,9 @@ boundary. When a tile is written, shared edges are reconciled with neighbors
 so there are never seams.
 
 Schema:
-    tiles    — one row per quadtree tile at every depth level
-    metadata — database-level config (grid_resolution, max_depth, bbox)
+    tiles      — one row per quadtree tile at every depth level
+    bathymetry — independently supplied underwater elevation rasters
+    metadata   — database-level config (grid_resolution, max_depth, bbox)
 """
 
 import os
@@ -43,7 +44,7 @@ CONFIDENCE = {
 }
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 _SCHEMA_VERSION_KEY = "schema_version"
 
 
@@ -135,6 +136,21 @@ CREATE TABLE IF NOT EXISTS hydrography_masks (
     version    INTEGER NOT NULL,
     updated_at TEXT NOT NULL,
     FOREIGN KEY (tile_id) REFERENCES tiles(tile_id) ON DELETE CASCADE
+);
+
+-- Real underwater elevations are independent of the canonical land DEM.
+-- Rows normally arrive at depth 8; the read path crops/resamples them to the
+-- visible terrain LOD and applies negative finite samples after the synthetic
+-- -5 m water floor.
+CREATE TABLE IF NOT EXISTS bathymetry (
+    tile_id    TEXT PRIMARY KEY,
+    heightmap  BLOB NOT NULL,
+    water_px   INTEGER NOT NULL,
+    min_z      REAL NOT NULL,
+    max_z      REAL NOT NULL,
+    source     TEXT NOT NULL,
+    version    INTEGER NOT NULL,
+    updated_at TEXT NOT NULL
 );
 """
 
@@ -320,6 +336,26 @@ def _migrate_to_v5(db):
         db.execute("ALTER TABLE tiles ADD COLUMN cog_requested_at TEXT")
 
 
+def _migrate_to_v6(db):
+    """Register the separately stored, read-time bathymetry overlay."""
+    # ``_SCHEMA`` creates a missing table before migrations run. An underwater
+    # producer may already have created and populated it, so validate the
+    # shared contract without rebuilding or touching those rows.
+    required = {
+        "tile_id", "heightmap", "water_px", "min_z", "max_z",
+        "source", "version", "updated_at",
+    }
+    columns = {
+        row[1] for row in db.execute("PRAGMA table_info(bathymetry)")
+    }
+    missing = required - columns
+    if missing:
+        raise RuntimeError(
+            "bathymetry table is missing required columns: "
+            + ", ".join(sorted(missing))
+        )
+
+
 def _migrate_schema(db):
     row = db.execute(
         "SELECT value FROM metadata WHERE key = ?", (_SCHEMA_VERSION_KEY,)
@@ -363,6 +399,13 @@ def _migrate_schema(db):
         db.execute(
             "INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)",
             (_SCHEMA_VERSION_KEY, "5"),
+        )
+        version = 5
+    if version < 6:
+        _migrate_to_v6(db)
+        db.execute(
+            "INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)",
+            (_SCHEMA_VERSION_KEY, "6"),
         )
 
 
@@ -409,6 +452,12 @@ def open_db(path=None):
     init_seam_cache(db)
     if "terrain_seam_cache" not in existing:
         log_db.info("Created table: terrain_seam_cache")
+
+    # Install invalidation triggers after the seam table exists. Bathymetry is
+    # intentionally written by a separate team, possibly through raw SQL, so
+    # correctness cannot depend on callers using a Python helper.
+    from bathymetry import init_bathymetry
+    init_bathymetry(db)
 
     from coastline import ensure_water_floor_version
     ensure_water_floor_version(db)

@@ -1,23 +1,17 @@
 import {
   formatTerrainTileId,
-  isTerrainTileAncestor,
   parseTerrainTileId,
 } from './terrain-tile-address.js';
 
 /**
  * Return resident ancestors that can be removed because textured resident
- * descendants cover every currently demanded descendant inside them. When
- * demand is omitted, require complete four-quadrant coverage.
+ * descendants completely cover their footprint.
  *
  * residentTextures maps tile IDs to whether their scene mesh is textured.
  * Selected ancestors are removed from the working set before higher ancestors
  * are checked, so a fallback selected for eviction cannot count as coverage.
  */
-export function findCoveredTileAncestors(
-  triggerTileId,
-  residentTextures,
-  desiredTileIds = null,
-) {
+export function findCoveredTileAncestors(triggerTileId, residentTextures) {
   const trigger = parseTerrainTileId(triggerTileId);
   if (!trigger || trigger.depth <= 0) return [];
 
@@ -54,26 +48,14 @@ export function findCoveredTileAncestors(
     if (!resident.has(ancestorId)) continue;
 
     const memo = new Map();
-    let fullyCovered;
-    if (desiredTileIds == null) {
-      fullyCovered = true;
-      for (let dx = 0; dx < 2 && fullyCovered; dx++) {
-        for (let dy = 0; dy < 2; dy++) {
-          if (!covered(depth + 1, col * 2 + dx, row * 2 + dy, memo)) {
-            fullyCovered = false;
-            break;
-          }
+    let fullyCovered = true;
+    for (let dx = 0; dx < 2 && fullyCovered; dx++) {
+      for (let dy = 0; dy < 2; dy++) {
+        if (!covered(depth + 1, col * 2 + dx, row * 2 + dy, memo)) {
+          fullyCovered = false;
+          break;
         }
       }
-    } else {
-      const demandedDescendants = [...desiredTileIds]
-        .filter(id => isTerrainTileAncestor(ancestorId, id))
-        .map(id => parseTerrainTileId(id))
-        .filter(Boolean);
-      fullyCovered = demandedDescendants.length > 0
-        && demandedDescendants.every(address => (
-          covered(address.depth, address.col, address.row, memo)
-        ));
     }
     if (!fullyCovered) continue;
     evictable.push(ancestorId);

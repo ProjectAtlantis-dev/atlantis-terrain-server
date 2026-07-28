@@ -1012,7 +1012,7 @@ test('reconciliation releases resident fine detail when demand coarsens', () => 
   assert.deepEqual(terrainRoot.children, []);
 });
 
-test('circular-boundary parent remains only until demanded descendants are materialized', () => {
+test('circular-boundary parent remains when demanded descendants cover only part of it', () => {
   const parent = {
     isMesh: true,
     userData: { tileId: '10-351-206', bbox: [0, 0, 8, 8] },
@@ -1058,11 +1058,8 @@ test('circular-boundary parent remains only until demanded descendants are mater
       children: [],
     });
   }
-  lifecycle.evictCoveredAncestors(
-    demanded.at(-1).id,
-    new Set(demanded.map(tile => tile.id)),
-  );
-  assert.equal(terrainRoot.children.includes(parent), false);
+  lifecycle.evictCoveredAncestors(demanded.at(-1).id);
+  assert.equal(terrainRoot.children.includes(parent), true);
 });
 
 test('textured parent remains while demanded children are untextured', () => {
@@ -2358,7 +2355,7 @@ test('shared lifecycle materializes a tile without forcing a world-matrix walk',
   assert.equal(terrainRoot.children.includes(mesh), true);
 });
 
-test('shared lifecycle retires parent when all demanded descendants are textured', () => {
+test('shared lifecycle retires parent when all four quadrants are textured', () => {
   const parent = {
     isMesh: true,
     userData: { tileId: '10-1-1', bbox: [0, 0, 10, 10] },
@@ -2377,13 +2374,12 @@ test('shared lifecycle retires parent when all demanded descendants are textured
   const lifecycle = createTileLifecycle({
     terrainRoot: root, disposeScatter: () => {}, log: () => {},
   });
-  const demandedIds = new Set(children.map(c => c.userData.tileId));
   root.children.push(...children.slice(1));
-  lifecycle.evictCoveredAncestors(children.at(-1).userData.tileId, demandedIds);
+  lifecycle.evictCoveredAncestors(children.at(-1).userData.tileId);
   assert.deepEqual(root.children, children);
 });
 
-test('shared lifecycle discards a coarse source after demanded children are chopped from it', () => {
+test('shared lifecycle retains a coarse source under partial chopped child coverage', () => {
   const parent = {
     isMesh: true,
     userData: { tileId: '11-719-386' },
@@ -2411,13 +2407,10 @@ test('shared lifecycle discards a coarse source after demanded children are chop
     onReleaseTile: tileId => released.push(tileId),
   });
 
-  lifecycle.evictCoveredAncestors(
-    children.at(-1).userData.tileId,
-    new Set(children.map(child => child.userData.tileId)),
-  );
+  lifecycle.evictCoveredAncestors(children.at(-1).userData.tileId);
 
-  assert.equal(root.children.includes(parent), false);
-  assert.deepEqual(released, [parent.userData.tileId]);
+  assert.equal(root.children.includes(parent), true);
+  assert.deepEqual(released, []);
 });
 
 test('shared lifecycle counts ancestor-crop children as replacement coverage', () => {
