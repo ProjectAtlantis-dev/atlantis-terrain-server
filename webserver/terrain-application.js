@@ -2634,6 +2634,12 @@ function render() {
     dt, camera,
     visible: waterParams.enabled && !controls.mapMode
       && !textureStreamer.waterDebug && !textureStreamer.hydroDebug,
+    // Gridlines are a terrain inspection mode. Hide the cosmetic satellite
+    // water proxy so the real bathymetry remains visible beneath the dynamic
+    // water while the grid is active.
+    opticalVisible: waterParams.enabled && !controls.mapMode
+      && !textureStreamer.waterDebug && !textureStreamer.hydroDebug
+      && !gridlinesRuntime.active,
   });
 
   // Terrain streaming: check if camera moved far enough to re-fetch

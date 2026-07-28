@@ -409,9 +409,17 @@ def _ensure_children(db, depth, col, row):
     c2, r2 = col * 2, row * 2
     children = [(c2, r2), (c2+1, r2), (c2, r2+1), (c2+1, r2+1)]
 
-    # Check if first child exists — if so, all 4 were created together
-    first_id = _tile_id(cd, c2, r2)
-    if read_tile_metadata(db, first_id) is not None:
+    # Old databases can contain a partial quad (for example one fetched child
+    # beside a no-data child). Never infer all four rows from the first one.
+    # The cooker always writes a complete sibling surface, so ensure every
+    # child skeleton exists before entering its write loop.
+    child_ids = [_tile_id(cd, cc, cr) for cc, cr in children]
+    marks = ",".join("?" for _ in child_ids)
+    existing_count = db.execute(
+        f"SELECT COUNT(*) FROM tiles WHERE tile_id IN ({marks})",
+        child_ids,
+    ).fetchone()[0]
+    if existing_count == len(child_ids):
         return
 
     now = datetime.datetime.now(datetime.timezone.utc).isoformat()

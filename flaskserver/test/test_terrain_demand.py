@@ -1,15 +1,19 @@
 """Terrain demand coverage and LOD-history behavior."""
 
+import datetime
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 import numpy as np
 
-from database import GRID_N
+from database import GRID_N, _tile_bbox, open_db
 from terrain_config import MAX_TILE_DEPTH, WMS_CONTRACT_DEPTH
 from serve import (
     _UPGRADEABLE_SOURCES,
     _balance_lod_leaves, _coarse_lod_neighbors, _cook_cooked_dem_quad,
+    _ensure_children,
     _lod_complete_ancestors,
     _lod_target_depth, _traverse, bbox_in_view_circle,
 )
@@ -21,6 +25,46 @@ def _bbox_at(cx, cy, size=100.0):
 
 
 class TestViewCoverageCircle(unittest.TestCase):
+    def test_ensure_children_repairs_a_partial_sibling_quad(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db = open_db(str(Path(directory) / "terrain.db"))
+            now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            parent_id = "12-1373-784"
+            parent_bbox = _tile_bbox(12, 1373, 784)
+            child_bbox = _tile_bbox(13, 2746, 1568)
+            db.execute(
+                "INSERT INTO tiles "
+                "(tile_id,depth,col,row,x_min,y_min,x_max,y_max,parent_id,"
+                "geometric_error,source,updated_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,0,'arcticdem_10m',?)",
+                (parent_id, 12, 1373, 784, *parent_bbox, "11-686-392", now),
+            )
+            db.execute(
+                "INSERT INTO tiles "
+                "(tile_id,depth,col,row,x_min,y_min,x_max,y_max,parent_id,"
+                "geometric_error,source,updated_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,0,'pending',?)",
+                ("13-2746-1568", 13, 2746, 1568, *child_bbox, parent_id, now),
+            )
+            db.commit()
+
+            _ensure_children(db, 12, 1373, 784)
+
+            children = db.execute(
+                "SELECT tile_id FROM tiles WHERE parent_id = ? ORDER BY tile_id",
+                (parent_id,),
+            ).fetchall()
+            self.assertEqual(
+                [row[0] for row in children],
+                [
+                    "13-2746-1568",
+                    "13-2746-1569",
+                    "13-2747-1568",
+                    "13-2747-1569",
+                ],
+            )
+            db.close()
+
     def test_parent_resampled_tiles_remain_visible_upgrade_candidates(self):
         self.assertIn('parent_resampled', _UPGRADEABLE_SOURCES)
 

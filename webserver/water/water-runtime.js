@@ -113,10 +113,15 @@ export function createWaterRuntime({
   }
   applyWind();
 
-  function update({ dt, camera, visible }) {
+  function update({
+    dt,
+    camera,
+    visible,
+    opticalVisible = visible,
+  }) {
     water.mesh.visible = visible;
     opticalSurface.sync({
-      visible,
+      visible: opticalVisible,
       waterline: params.waterline ?? 0,
     });
     if (!visible) return;

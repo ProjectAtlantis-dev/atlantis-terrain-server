@@ -126,3 +126,36 @@ test('bathymetry recaptures on movement, settled texture changes, and the lazy b
     performance.now = originalNow;
   }
 });
+
+test('optical surface visibility can be gated without hiding dynamic water', () => {
+  const water = {
+    mesh: new THREE.Mesh(),
+    setWind() {},
+    update() {},
+    bathyExtent: 30000,
+    dispose() {},
+  };
+  const terrainRoot = new THREE.Group();
+  const runtime = createWaterRuntime({
+    backend: { createWater: () => water },
+    scene: new THREE.Scene(),
+    terrainRoot,
+    anchorPosition: new THREE.Vector3(),
+    east: new THREE.Vector3(1, 0, 0),
+    north: new THREE.Vector3(0, 1, 0),
+    up: new THREE.Vector3(0, 0, 1),
+    getSunDirection: () => new THREE.Vector3(0, 0, 1),
+  });
+  const camera = { position: new THREE.Vector3(0, 0, 100) };
+
+  runtime.update({
+    dt: 0.016,
+    camera,
+    visible: true,
+    opticalVisible: false,
+  });
+
+  assert.equal(water.mesh.visible, true);
+  assert.equal(runtime.opticalSurface.visible, false);
+  runtime.dispose();
+});
