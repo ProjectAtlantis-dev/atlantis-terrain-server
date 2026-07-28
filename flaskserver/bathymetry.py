@@ -13,11 +13,13 @@ import datetime
 import zlib
 
 import numpy as np
+from scipy.ndimage import binary_dilation, distance_transform_edt, label
 
 from tile_address import format_tile_id, require_tile_id
 
 
 BATHYMETRY_CONTRACT_DEPTH = 8
+MAX_SHORE_SLOPE = 1.5
 
 _SEAM_INVALIDATION_TRIGGERS = """
 CREATE TRIGGER IF NOT EXISTS bathymetry_invalidate_seams_insert
@@ -94,6 +96,79 @@ def write_bathymetry(
         ),
     )
     db.commit()
+
+
+def complete_bathymetry_for_water(
+    values,
+    water,
+    *,
+    cell_size_m: float,
+    max_shore_slope: float = MAX_SHORE_SLOPE,
+) -> np.ndarray:
+    """Complete a coarse bathymetry sample over a finer water mask.
+
+    Stored rasters deliberately retain positive land around carved water.
+    After ancestor resampling, a finer DEM can classify some of that land as
+    water.  Leaving those samples untouched exposes the derived flat water
+    plate as a shelf.  Fill every such gap from the nearest strictly submarine
+    sample, pin the finer shoreline to zero, and cap its drop by physical
+    distance from that pin.
+
+    Zero-valued ancestor samples are not fill evidence: they describe the
+    ancestor shoreline and may lie inside the finer water polygon.
+    """
+    result = np.asarray(values, dtype=np.float32).copy()
+    water = np.asarray(water, dtype=bool)
+    if result.shape != water.shape:
+        raise ValueError(
+            f"bathymetry shape {result.shape} does not match water mask "
+            f"{water.shape}"
+        )
+    if not np.isfinite(cell_size_m) or cell_size_m <= 0.0:
+        raise ValueError("cell_size_m must be positive and finite")
+    if not np.isfinite(max_shore_slope) or max_shore_slope <= 0.0:
+        raise ValueError("max_shore_slope must be positive and finite")
+
+    submarine = water & np.isfinite(result) & (result < 0.0)
+    if not np.any(submarine):
+        return result
+
+    # NaN is an explicit no-coverage value (not merely retained land), so it
+    # must keep the synthetic fallback.  Only finite ancestor land/waterline
+    # samples are repaired.
+    labels, component_count = label(
+        water, structure=np.ones((3, 3), dtype=np.uint8),
+    )
+    supported_water = np.zeros_like(water)
+    for component_id in range(1, component_count + 1):
+        component = labels == component_id
+        evidence = component & submarine
+        if not np.any(evidence):
+            continue
+        supported_water |= component
+        incomplete = component & np.isfinite(result) & ~submarine
+        if np.any(incomplete):
+            _, nearest = distance_transform_edt(
+                ~evidence, return_distances=True, return_indices=True,
+            )
+            result[incomplete] = result[
+                nearest[0][incomplete], nearest[1][incomplete]
+            ]
+
+    # A water sample touching land is the fine-grid shoreline.  The full 3x3
+    # neighborhood also pins diagonal coast contacts, avoiding corner spikes.
+    shore = supported_water & binary_dilation(
+        ~water, structure=np.ones((3, 3), dtype=bool),
+    )
+    if np.any(shore):
+        result[shore] = 0.0
+        distance_m = distance_transform_edt(~shore) * float(cell_size_m)
+        shallow_limit = -float(max_shore_slope) * distance_m
+        result[supported_water] = np.maximum(
+            result[supported_water], shallow_limit[supported_water],
+        )
+        result[shore] = 0.0
+    return result
 
 
 def _decode_row(tile_id: str, blob) -> np.ndarray:

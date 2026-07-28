@@ -1,3 +1,14 @@
+// Free flight has no terrain/land collision pass. Bathymetry is not
+// range-limited and can sit far below the retired synthetic -5 m seabed, so
+// imposing a global lower altitude clamp prevents underwater exploration.
+export const MAX_FREE_FLIGHT_ALTITUDE_M = 6000;
+
+export function clampFreeFlightAltitude(altitude, {
+  maxAltitude = MAX_FREE_FLIGHT_ALTITUDE_M,
+} = {}) {
+  return Math.min(maxAltitude, altitude);
+}
+
 export function applyMapDrag(controls, event, mouseSensitivity, panFactor) {
   if (controls.dragButton === 2) {
     const panStep = controls.mapZoom * mouseSensitivity * panFactor;

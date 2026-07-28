@@ -97,6 +97,7 @@ const BATHY_GLSL = /* glsl */ `
   uniform sampler2D uBathy;    // top-down capture: R = local z, G = image brightness
   uniform vec2 uBathyCenter;
   uniform float uBathyExtent;
+  uniform float uWaterline;
   uniform vec2 uWindDir;       // local xy, direction the wind blows toward
   uniform float uFetchRamp;    // metres of open water upwind for a full sea
                                // state; 0 disables the lee-shore calm zone
@@ -107,6 +108,7 @@ const BATHY_GLSL = /* glsl */ `
     vec2 uv = (p - uBathyCenter) / uBathyExtent + 0.5;
     float inB = step(abs(uv.x - 0.5), 0.5) * step(abs(uv.y - 0.5), 0.5);
     vec4 b = texture2D(uBathy, uv);
+    b.r -= uWaterline;
     return mix(vec4(-5.0, 0.0, 0.0, 0.0), b, b.a * inB);
   }
 
@@ -748,6 +750,7 @@ export function createWebGLWater({
     uBathyCenter: { value: new THREE.Vector2() },
     uBathyExtent: { value: bathyExtent },
     uBathyTexel: { value: bathyExtent / bathySize },
+    uWaterline: { value: 0 },
     uAbsorb: { value: 0.25 },
     uFetchRamp: { value: 3000 },
     uNorthCliffReflectionPadding: { value: NORTH_CLIFF_REFLECTION_MAX_PADDING_M },
@@ -879,6 +882,7 @@ export function createWebGLWater({
       uniforms.uReflect.value = params.reflectivity;
       uniforms.uGlintStrength.value = Math.max(0, params.glintStrength ?? 1);
       uniforms.uAbsorb.value = params.absorption;
+      uniforms.uWaterline.value = params.waterline ?? 0;
       uniforms.uFetchRamp.value = Math.max(0, params.shoreFetchRamp ?? 3000);
       uniforms.uNorthCliffReflectionPadding.value = Math.max(
         0,

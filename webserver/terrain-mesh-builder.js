@@ -130,6 +130,13 @@ export function createTerrainMeshBuilder({ exaggeration, attachScatter }) {
       bbox: tile.bbox,
       resolution,
       skirtDepth,
+      // The server's effective terrain contract puts tidal-water samples at
+      // or below local sea level. Retain that footprint independently of the
+      // rendered z values so the water renderer can place satellite colour on
+      // a shallow optical-only surface while true bathymetry stays untouched.
+      terrainWaterMask: Uint8Array.from(heightmap, elevation => (
+        Number.isFinite(elevation) && elevation <= 0 ? 1 : 0
+      )),
       // Seam repair is response-dependent: the same physical tile can get a
       // different boundary when the rendered LOD of its neighbor changes.
       // Keep the exact payload that produced this mesh so reconciliation can

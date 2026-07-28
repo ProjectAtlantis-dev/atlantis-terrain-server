@@ -253,6 +253,7 @@ export function createWebGPUWater({
   const uBathyCenter = uniform(new Vector2()).setName('waterBathyCenter');
   const uBathyExtent = uniform(bathyExtent).setName('waterBathyExtent');
   const uBathyTexel = uniform(bathyExtent / bathySize).setName('waterBathyTexel');
+  const uWaterline = uniform(0).setName('waterline');
   const uAbsorb = uniform(0.25).setName('waterAbsorb');
   const uFetchRamp = uniform(3000).setName('waterFetchRamp');
   const uNorthCliffReflectionPadding =
@@ -306,7 +307,8 @@ export function createWebGPUWater({
     const inB = step(buv.x.sub(0.5).abs(), float(0.5))
       .mul(step(buv.y.sub(0.5).abs(), float(0.5)));
     const b = texBathy.sample(bathySampleUv(buv));
-    return mix(vec4(-5.0, 0.0, 0.0, 0.0), b, b.a.mul(inB));
+    const relative = b.sub(vec4(uWaterline, 0.0, 0.0, 0.0));
+    return mix(vec4(-5.0, 0.0, 0.0, 0.0), relative, b.a.mul(inB));
   }
 
   function seabedAt(p) {
@@ -1054,6 +1056,7 @@ export function createWebGPUWater({
       uReflect.value = params.reflectivity;
       uGlintStrength.value = Math.max(0, params.glintStrength ?? 1);
       uAbsorb.value = params.absorption;
+      uWaterline.value = params.waterline ?? 0;
       uFetchRamp.value = Math.max(0, params.shoreFetchRamp ?? 3000);
       uNorthCliffReflectionPadding.value = Math.max(
         0,

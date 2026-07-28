@@ -77,8 +77,8 @@ row per covered tile:
 
 The raster spans the corresponding tile's EPSG:3413 bounding box, including
 shared edge samples. Use `NaN` for missing samples. At render time, valid
-negative bathymetry inside the effective official-water mask overrides the
-synthetic −5 m seabed. Missing or non-negative samples remain exactly −5 m,
+non-positive bathymetry inside the effective official-water mask overrides the
+synthetic −5 m seabed. Missing or positive samples remain exactly −5 m,
 land continues to use `tiles.heightmap`, and detailed terrain tiles
 crop/resample their depth-8 bathymetry ancestor automatically.
 

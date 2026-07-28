@@ -5,8 +5,14 @@ import zlib
 from pathlib import Path
 
 import numpy as np
+from scipy.ndimage import binary_dilation
 
-from bathymetry import read_bathymetry, write_bathymetry
+from bathymetry import (
+    MAX_SHORE_SLOPE,
+    complete_bathymetry_for_water,
+    read_bathymetry,
+    write_bathymetry,
+)
 from coastline import WATER_FLOOR_DROP_M, write_water_mask
 from database import (
     GRID_N,
@@ -57,6 +63,11 @@ class BathymetryTest(unittest.TestCase):
             raw = _insert_raw_tile(db, tile_id)
             water = np.zeros(raw.shape, dtype=bool)
             water[:, : GRID_N // 2] = True
+            raw[10, GRID_N // 2 + 2] = -5.0
+            write_tile(
+                db, tile_id, raw, np.full(raw.shape, 6, dtype=np.uint8),
+                "arcticdem_10m", reconcile=False, allow_overwrite=True,
+            )
             write_water_mask(db, tile_id, water)
 
             db.execute(
@@ -70,6 +81,7 @@ class BathymetryTest(unittest.TestCase):
             depths = np.full(raw.shape, -120.0, dtype=np.float32)
             depths[5, 5] = np.nan
             depths[6, 6] = 12.0
+            depths[7, 7] = 0.0
             write_bathymetry(
                 db, tile_id, depths, source="underwater_team", version=1,
             )
@@ -87,10 +99,11 @@ class BathymetryTest(unittest.TestCase):
             self.assertEqual(
                 float(effective[5, 5]), -WATER_FLOOR_DROP_M,
             )
-            self.assertEqual(
-                float(effective[6, 6]), -WATER_FLOOR_DROP_M,
-            )
+            self.assertEqual(float(effective[6, 6]), -120.0)
+            self.assertEqual(float(effective[7, 7]), -120.0)
+            self.assertEqual(float(effective[7, GRID_N // 2 - 1]), 0.0)
             self.assertEqual(float(effective[0, -1]), 100.0)
+            self.assertEqual(float(effective[10, GRID_N // 2 + 2]), 0.0)
 
             blob = db.execute(
                 "SELECT heightmap FROM tiles WHERE tile_id = ?", (tile_id,)
@@ -100,6 +113,47 @@ class BathymetryTest(unittest.TestCase):
             ).reshape(raw.shape)
             np.testing.assert_array_equal(stored, raw)
             db.close()
+
+    def test_fine_water_gaps_are_filled_and_fine_shoreline_is_pinned(self):
+        values = np.full((9, 9), -40.0, dtype=np.float32)
+        values[:, 6:] = 12.0
+        values[4, 4] = 0.0
+        values[3, 3] = np.nan
+        water = np.zeros(values.shape, dtype=bool)
+        water[:, :8] = True
+
+        completed = complete_bathymetry_for_water(
+            values, water, cell_size_m=10.0,
+        )
+
+        shore = water & binary_dilation(
+            ~water, structure=np.ones((3, 3), dtype=bool),
+        )
+        self.assertTrue(np.all(completed[shore] == 0.0))
+        finite_interior = water & ~shore & np.isfinite(completed)
+        self.assertTrue(np.all(completed[finite_interior] < 0.0))
+        self.assertTrue(np.isnan(completed[3, 3]))
+        self.assertTrue(np.all(completed[~water] == values[~water]))
+        distance_steps = np.arange(7, 0, -1, dtype=np.float32)
+        self.assertTrue(
+            np.all(
+                -completed[4, :7]
+                <= MAX_SHORE_SLOPE * distance_steps * 10.0 + 1e-5
+            )
+        )
+
+    def test_completion_does_not_cross_land_into_unsupported_water(self):
+        values = np.full((9, 9), 20.0, dtype=np.float32)
+        water = np.zeros(values.shape, dtype=bool)
+        water[1:4, 1:4] = True
+        water[5:8, 5:8] = True
+        values[2, 2] = -30.0
+
+        completed = complete_bathymetry_for_water(
+            values, water, cell_size_m=10.0,
+        )
+
+        self.assertTrue(np.all(completed[5:8, 5:8] == 20.0))
 
     def test_depth_8_bathymetry_is_cropped_and_resampled_for_descendants(self):
         with tempfile.TemporaryDirectory() as directory:

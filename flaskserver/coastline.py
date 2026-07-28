@@ -39,7 +39,7 @@ HYDROGRAPHY_SOURCE = "govmin_gl_aabent_land"
 # surface has volume above the seabed. Bump WATER_FLOOR_VERSION whenever the
 # derived geometry changes: open_db() flushes every cached seam on mismatch.
 WATER_FLOOR_DROP_M = 5.0
-WATER_FLOOR_VERSION = 7
+WATER_FLOOR_VERSION = 8
 SEA_SEED_MAX_ELEV_M = 0.5
 _WMS_URL = "https://gis.govmin.gl/geoserver/wms"
 _WMS_LAYER = "Greenland:gl_aabent_land"
@@ -553,9 +553,22 @@ def effective_heightmap(db, tile_id: str, raw_heightmap):
         water = result <= 0.0
         if not np.any(water):
             return raw_heightmap
+        result = apply_water_mask(result, water)
     else:
         result = apply_water_mask(raw_heightmap, water)
-    from bathymetry import read_bathymetry
+        # A cooked descendant can inherit coarse water geometry on the land
+        # side of a finer authoritative vector coastline. Keep that obsolete
+        # negative corner from protruding through the fine polygon. This is a
+        # render-time clip only; the canonical derived DEM remains untouched.
+        exact_mask = db.execute(
+            "SELECT 1 FROM coastline_masks WHERE tile_id = ?",
+            (tile_id,),
+        ).fetchone()
+        if exact_mask is not None:
+            raw = np.asarray(raw_heightmap, dtype=np.float32)
+            stale_water_on_land = ~water & np.isfinite(raw) & (raw <= 0.0)
+            result[stale_water_on_land] = 0.0
+    from bathymetry import complete_bathymetry_for_water, read_bathymetry
 
     bathymetry = read_bathymetry(db, tile_id, result.shape)
     bathymetry_vertices = 0
@@ -565,11 +578,20 @@ def effective_heightmap(db, tile_id: str, raw_heightmap):
                 f"bathymetry shape {bathymetry.shape} does not match DEM "
                 f"{result.shape} for {tile_id}"
             )
-        # The supplied depth-8 rasters retain positive land elevations around
-        # their carved water. A finer official shoreline can classify a sample
-        # as water where that coarse raster still says land; positive values
-        # are therefore non-applicable bathymetry and retain the -5 m fallback.
-        bathymetry_mask = water & np.isfinite(bathymetry) & (bathymetry < 0.0)
+        bbox_row = db.execute(
+            "SELECT x_min, y_min, x_max, y_max FROM tiles WHERE tile_id = ?",
+            (tile_id,),
+        ).fetchone()
+        if bbox_row is None:
+            raise ValueError(f"missing tile metadata for {tile_id}")
+        cell_size_m = max(
+            (float(bbox_row[2]) - float(bbox_row[0])) / (result.shape[1] - 1),
+            (float(bbox_row[3]) - float(bbox_row[1])) / (result.shape[0] - 1),
+        )
+        bathymetry = complete_bathymetry_for_water(
+            bathymetry, water, cell_size_m=cell_size_m,
+        )
+        bathymetry_mask = water & np.isfinite(bathymetry) & (bathymetry <= 0.0)
         bathymetry_vertices = int(np.sum(bathymetry_mask))
         result[bathymetry_mask] = bathymetry[bathymetry_mask]
     with _logged_effective_tiles_lock:

@@ -2,14 +2,20 @@ import * as THREE from 'three';
 import { buildRadialGridGeometry } from './water-grid.js';
 import { createWaterPalette, computeWaterPalette } from './water-sky.js';
 import { NORTH_CLIFF_REFLECTION_MAX_PADDING_M } from './water-reflection-mask.js';
+import {
+  createOpticalWaterSurfaceRuntime,
+  DEFAULT_OPTICAL_WATER_DEPTH_M,
+  WATER_SURFACE_RENDER_ORDER,
+} from './water-optical-surface.js';
 
 // Backend-neutral fjord water orchestration: owns parameters, the camera-
 // local/sun-local frame math, and sim pacing. The backend supplies the
 // actual renderer work via createWater() (WebGL today; a WGSL/TSL port plugs
 // in behind the same interface). Backends without water simply don't
-// implement createWater and this runtime is inert. Colour inheritance needs
-// no orchestration: the surface is translucent and the seabed imagery —
-// which is satellite photography OF the water — shows through per-pixel.
+// implement createWater and this runtime is inert. Colour inheritance
+// orchestration now lives in the optical surface runtime: true bathymetry
+// remains at its measured depth while a color-only copy of the satellite
+// water footprint sits just below the dynamic surface.
 
 // Fjords are NOT fetch-limited: they are long enough to channel the east-west
 // winds, so the default sea state stays ocean-grade — wind along the fjord
@@ -19,6 +25,9 @@ import { NORTH_CLIFF_REFLECTION_MAX_PADDING_M } from './water-reflection-mask.js
 export const DEFAULT_WATER_PARAMS = {
   enabled: true,           // hide/pause the dynamic surface when disabled;
                           // the underlying fjord imagery remains visible
+  waterline: 0,            // terrainRoot-local metres
+  opticalDepth: DEFAULT_OPTICAL_WATER_DEPTH_M,
+                          // satellite-water colour plane below waterline
   windSpeed: 13,          // m/s
   windDirection: 90,      // degrees the wind blows toward (90 = east)
   fetchKm: 100,           // wave-growth fetch: sets the JONSWAP peak so a
@@ -70,11 +79,16 @@ export function createWaterRuntime({
   const water = backend.createWater?.({ geometry: buildRadialGridGeometry(), log }) ?? null;
   if (!water?.mesh) {
     return {
-      enabled: false, params,
+      enabled: false, params, opticalSurface: null,
       applyWind() {}, update() {}, dispose() {}, setDebugMode() {},
     };
   }
+  water.mesh.renderOrder = WATER_SURFACE_RENDER_ORDER;
   terrainRoot.add(water.mesh);
+  const opticalSurface = createOpticalWaterSurfaceRuntime({
+    terrainRoot,
+    opticalDepth: params.opticalDepth,
+  });
 
   const palette = createWaterPalette();
   const rel = new THREE.Vector3();
@@ -101,12 +115,22 @@ export function createWaterRuntime({
 
   function update({ dt, camera, visible }) {
     water.mesh.visible = visible;
+    opticalSurface.sync({
+      visible,
+      waterline: params.waterline ?? 0,
+    });
     if (!visible) return;
 
     rel.copy(camera.position).sub(anchorPosition);
     cameraLocal.set(rel.dot(east), rel.dot(north), rel.dot(up));
     meshOffset.set(cameraLocal.x, cameraLocal.y);
-    water.mesh.position.set(meshOffset.x, meshOffset.y, 0);
+    const waterline = params.waterline ?? 0;
+    cameraLocal.z -= waterline;
+    water.mesh.position.set(
+      meshOffset.x,
+      meshOffset.y,
+      waterline,
+    );
 
     const sunEcef = getSunDirection();
     sunLocal.set(sunEcef.dot(east), sunEcef.dot(north), sunEcef.dot(up)).normalize();
@@ -125,8 +149,6 @@ export function createWaterRuntime({
       palette, params, simParams,
     });
 
-    // The seabed is a static -5 m floor — water terrain effectively never
-    // changes; at most the shoreline sharpens as higher-LOD tiles stream in.
     // Re-capture when movement re-centres the window, when tile textures have
     // changed since the last capture (debounced — streaming arrives in
     // bursts), plus a lazy periodic refresh as a backstop. The texture
@@ -167,10 +189,12 @@ export function createWaterRuntime({
   return {
     enabled: true,
     params,
+    opticalSurface: opticalSurface.group,
     applyWind,
     update,
     setDebugMode(mode) { water.setDebugMode?.(mode); },
     dispose() {
+      opticalSurface.dispose();
       terrainRoot.remove(water.mesh);
       water.dispose();
     },

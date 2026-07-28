@@ -28,7 +28,12 @@ import {
   renderGameClock,
   terrainHudHeader,
 } from './terrain-hud.js';
-import { applyMapDrag, installTerrainKeyboardControls, installTerrainPointerControls } from './terrain-controls.js';
+import {
+  applyMapDrag,
+  clampFreeFlightAltitude,
+  installTerrainKeyboardControls,
+  installTerrainPointerControls,
+} from './terrain-controls.js';
 import { stepVehicleDrive } from './terrain-vehicle.js';
 import { createTerrainVehicleRuntime } from './terrain-vehicle-runtime.js';
 import { createTileHistory, terrainFogDistance, tileDepthFromId } from './terrain-tile-runtime.js';
@@ -283,10 +288,6 @@ const BASE_BRAKE = 800;
 const BASE_MAX_SPEED = 5000;
 const BASE_STRAFE_SPEED = 800;
 const TURN_SPEED = 1.5;
-// The synthetic fjord floor sits at -5 m. Leave a metre of clearance while
-// still allowing the free-flight camera to cross the waterline and explore
-// the water column.
-const MIN_FLIGHT_ALT = paramNumber('minFlightAlt', -4);
 // AGL-based speed scaling: full speed at AGL_FULL_SPEED_M, minimum factor at ground level
 const AGL_FULL_SPEED_M = 500;
 const AGL_MIN_FACTOR = 0.05;
@@ -1150,7 +1151,9 @@ const normalPass = new NormalPass(scene, camera);
 // untransformed blob at the terrain origin, corrupting the normal buffer
 // (same failure class as the 2a092d9 black-sprite fix). Hide it during the
 // pass — grass pixels then inherit the terrain's normals in the relight,
-// which is the right lighting for ground-hugging vegetation anyway.
+// which is the right lighting for ground-hugging vegetation anyway. Optical
+// water deliberately remains present: its flat normal and shallow visual
+// depth are what make atmosphere lighting and cloud shadows land on it.
 {
   const _originalNormalRender = normalPass.render.bind(normalPass);
   normalPass.render = function (...args) {
@@ -1860,7 +1863,7 @@ function hideTileInfo() {
 function clampAltitude() {
   const rel = camera.position.clone().sub(anchorPosition);
   const altitude = rel.dot(up);
-  const clamped = Math.max(MIN_FLIGHT_ALT, Math.min(6000, altitude));
+  const clamped = clampFreeFlightAltitude(altitude);
   const delta = clamped - altitude;
   if (Math.abs(delta) > 1e-6) {
     camera.position.addScaledVector(up, delta);
