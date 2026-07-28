@@ -30,6 +30,91 @@ function elevationColor(elevation) {
   return stops.at(-1);
 }
 
+function terrainEdgeIndices(resolution) {
+  return [
+    Array.from({ length: resolution }, (_, column) => column),
+    Array.from(
+      { length: resolution },
+      (_, column) => (resolution - 1) * resolution + column,
+    ),
+    Array.from({ length: resolution }, (_, row) => row * resolution),
+    Array.from(
+      { length: resolution },
+      (_, row) => row * resolution + resolution - 1,
+    ),
+  ];
+}
+
+export function updateTerrainMeshHeightmap(mesh, tile) {
+  const resolution = Number(mesh?.userData?.resolution);
+  if (
+    !mesh?.geometry
+    || !tile?.heightmap
+    || !Number.isInteger(resolution)
+    || resolution < 2
+    || Number(tile.resolution) !== resolution
+  ) return false;
+
+  const heightmap = decodeTerrainHeightmap(tile.heightmap);
+  if (heightmap.length !== resolution * resolution) return false;
+  const position = mesh.geometry.getAttribute?.('position');
+  const color = mesh.geometry.getAttribute?.('color');
+  const expectedVertices = resolution * resolution + resolution * 2 * 4;
+  if (!position || position.count !== expectedVertices) return false;
+
+  const exaggeration = Number.isFinite(Number(mesh.userData.terrainExaggeration))
+    ? Number(mesh.userData.terrainExaggeration)
+    : 1;
+  const skirtDepth = Number(mesh.userData.skirtDepth) || 0;
+  const surfaceVertexCount = resolution * resolution;
+  for (let index = 0; index < surfaceVertexCount; index += 1) {
+    const elevation = heightmap[index];
+    position.setZ(index, elevation * exaggeration);
+    if (color) {
+      const nextColor = elevationColor(elevation);
+      color.setXYZ(index, nextColor.r, nextColor.g, nextColor.b);
+    }
+  }
+
+  let skirtVertex = surfaceVertexCount;
+  for (const surfaceIndices of terrainEdgeIndices(resolution)) {
+    for (const surfaceIndex of surfaceIndices) {
+      const top = skirtVertex++;
+      const bottom = skirtVertex++;
+      const topZ = position.getZ(surfaceIndex);
+      position.setZ(top, topZ);
+      position.setZ(bottom, topZ - skirtDepth);
+      if (color) {
+        color.setXYZ(
+          top,
+          color.getX(surfaceIndex),
+          color.getY(surfaceIndex),
+          color.getZ(surfaceIndex),
+        );
+        color.setXYZ(
+          bottom,
+          color.getX(surfaceIndex),
+          color.getY(surfaceIndex),
+          color.getZ(surfaceIndex),
+        );
+      }
+    }
+  }
+
+  position.needsUpdate = true;
+  if (color) color.needsUpdate = true;
+  mesh.geometry.computeVertexNormals?.();
+  mesh.geometry.computeBoundingBox?.();
+  mesh.geometry.computeBoundingSphere?.();
+  Object.assign(mesh.userData, {
+    heightmapPayload: tile.heightmap,
+    terrainWaterMask: Uint8Array.from(heightmap, elevation => (
+      Number.isFinite(elevation) && elevation <= 0 ? 1 : 0
+    )),
+  });
+  return true;
+}
+
 export function createTerrainMeshBuilder({ exaggeration, attachScatter }) {
   return function buildTerrainMesh(tile) {
     const resolution = tile.resolution;
@@ -98,16 +183,7 @@ export function createTerrainMeshBuilder({ exaggeration, attachScatter }) {
         }
       }
     }
-    const south = Array.from({ length: resolution }, (_, column) => column);
-    const north = Array.from(
-      { length: resolution },
-      (_, column) => (resolution - 1) * resolution + column,
-    );
-    const west = Array.from({ length: resolution }, (_, row) => row * resolution);
-    const east = Array.from(
-      { length: resolution },
-      (_, row) => row * resolution + resolution - 1,
-    );
+    const [south, north, west, east] = terrainEdgeIndices(resolution);
     appendSkirt(south, true);
     appendSkirt(north, false);
     appendSkirt(west, false);
@@ -130,6 +206,7 @@ export function createTerrainMeshBuilder({ exaggeration, attachScatter }) {
       bbox: tile.bbox,
       resolution,
       skirtDepth,
+      terrainExaggeration: exaggeration,
       // The server's effective terrain contract puts tidal-water samples at
       // or below local sea level. Retain that footprint independently of the
       // rendered z values so the water renderer can place satellite colour on

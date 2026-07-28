@@ -4,7 +4,10 @@ import {
   parseTerrainTileId,
   terrainTileDepth,
 } from './terrain-tile-address.js';
-import { createTerrainMeshBuilder } from './terrain-mesh-builder.js';
+import {
+  createTerrainMeshBuilder,
+  updateTerrainMeshHeightmap,
+} from './terrain-mesh-builder.js';
 import { priorityHeading, terrainTilePriority } from './terrain-priority.js';
 import {
   diffTerrainTileIds,
@@ -368,14 +371,17 @@ export function reconcileTerrainTiles({
   depthOffsetEnabled = true,
   completeCoverage = false,
   onReleaseTile = () => {},
+  refreshMesh = updateTerrainMeshHeightmap,
 }) {
   const tileById = new Map(tiles.map(tile => [tile.id, tile]));
   const refreshedIds = new Set();
+  const refreshedInPlaceIds = new Set();
 
   // A tile ID alone does not identify its rendered geometry. The server
   // repairs edges against the neighbors in each response, so an unchanged ID
-  // may carry a new heightmap after a nearby LOD transition. Treat those
-  // payload changes like additions so the stale mesh is rebuilt in place.
+  // may carry a new heightmap after a nearby LOD transition. Update ordinary
+  // resident grids in place: rebuilding them used to send unchanged topology
+  // through defer -> ancestor placeholder -> exact texture on every response.
   for (const mesh of [...terrainRoot.children]) {
     const tileId = mesh.userData?.tileId;
     const nextTile = tileById.get(tileId);
@@ -386,6 +392,12 @@ export function reconcileTerrainTiles({
       || typeof previousPayload !== 'string'
       || previousPayload === nextTile.heightmap
     ) continue;
+    if (refreshMesh(mesh, nextTile)) {
+      log(tileId, 'refreshed in place — repaired heightmap changed');
+      refreshedInPlaceIds.add(tileId);
+      onMeshAdded(mesh);
+      continue;
+    }
     log(tileId, 'refresh queued — repaired heightmap changed');
     refreshedIds.add(tileId);
   }
@@ -448,6 +460,8 @@ export function reconcileTerrainTiles({
     removed: removed.length,
     purgedDeferred: purged,
     released,
+    refreshedInPlace: refreshedInPlaceIds.size,
+    refreshRebuilds: refreshedIds.size,
     sceneMeshes: terrainRoot.children.filter(mesh => mesh.isMesh).length,
   });
 
@@ -519,6 +533,8 @@ export function reconcileTerrainTiles({
     removed,
     purged,
     released,
+    refreshedInPlace: refreshedInPlaceIds.size,
+    refreshRebuilds: refreshedIds.size,
     sceneMeshes: terrainRoot.children.filter(mesh => mesh.isMesh).length,
     deferred: deferredTiles.size,
   };

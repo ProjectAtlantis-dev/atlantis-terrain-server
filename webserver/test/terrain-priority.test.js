@@ -788,7 +788,13 @@ test('shared reconciler spends dirty-paint budget in priority order', () => {
   assert.deepEqual([...deferredTiles.keys()], ['hot', 'far']);
   assert.equal(result.sceneMeshes, 1);
   assert.deepEqual(diffDetails, {
-    added: 2, removed: 0, purgedDeferred: 0, released: 0, sceneMeshes: 0,
+    added: 2,
+    removed: 0,
+    purgedDeferred: 0,
+    released: 0,
+    refreshedInPlace: 0,
+    refreshRebuilds: 0,
+    sceneMeshes: 0,
   });
 });
 
@@ -886,6 +892,76 @@ test('reconciliation rebuilds a resident tile when repaired seam geometry change
   assert.equal(terrainRoot.children[0].userData.heightmapPayload, 'new-repair');
   assert.deepEqual(result.added, [nextTile.id]);
   assert.deepEqual(result.removed, []);
+});
+
+test('seam repair updates resident geometry in place without texture churn', () => {
+  const encode = values => (
+    Buffer.from(new Float32Array(values).buffer).toString('base64')
+  );
+  const build = createTerrainMeshBuilder({
+    exaggeration: 2,
+    attachScatter() {},
+  });
+  const original = {
+    id: '12-20-40',
+    resolution: 2,
+    bbox: [0, 0, 4, 4],
+    heightmap: encode([1, 2, 3, 4]),
+  };
+  const mesh = build(original);
+  const exactTexture = {};
+  mesh.material.map = exactTexture;
+  const terrainRoot = {
+    children: [mesh],
+    add() { assert.fail('unexpected mesh add'); },
+  };
+  let mutations = 0;
+  let diffDetails = null;
+  const nextTile = {
+    ...original,
+    heightmap: encode([1, 20, -3, 4]),
+  };
+
+  const result = reconcileTerrainTiles({
+    tiles: [nextTile],
+    currentTileIds: new Set([nextTile.id]),
+    deferredTiles: new Map(),
+    terrainRoot,
+    lifecycle: {
+      evict() { assert.fail('unexpected mesh eviction'); },
+    },
+    priorityForTile: () => 0,
+    textureCache: new Map(),
+    materialize() { assert.fail('unexpected texture materialization'); },
+    buildMesh() { assert.fail('unexpected mesh rebuild'); },
+    log() {},
+    onMeshAdded: () => { mutations += 1; },
+    onDiff: details => { diffDetails = details; },
+  });
+
+  assert.deepEqual(terrainRoot.children, [mesh]);
+  assert.equal(mesh.material.map, exactTexture);
+  assert.equal(mesh.userData.heightmapPayload, nextTile.heightmap);
+  assert.deepEqual(
+    Array.from(mesh.geometry.getAttribute('position').array.slice(2, 12))
+      .filter((_value, index) => index % 3 === 0),
+    [2, 40, -6, 8],
+  );
+  assert.deepEqual(Array.from(mesh.userData.terrainWaterMask), [0, 0, 1, 0]);
+  assert.equal(mutations, 1);
+  assert.deepEqual(result.added, []);
+  assert.deepEqual(result.removed, []);
+  assert.equal(result.refreshedInPlace, 1);
+  assert.equal(result.refreshRebuilds, 0);
+  assert.deepEqual(diffDetails, {
+    added: 0,
+    removed: 0,
+    purgedDeferred: 0,
+    released: 0,
+    refreshedInPlace: 1,
+    refreshRebuilds: 0,
+    sceneMeshes: 1,
+  });
 });
 
 test('seam refresh keeps old geometry when the replacement is build-budget deferred', () => {
