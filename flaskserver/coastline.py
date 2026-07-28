@@ -39,7 +39,8 @@ HYDROGRAPHY_SOURCE = "govmin_gl_aabent_land"
 # surface has volume above the seabed. Bump WATER_FLOOR_VERSION whenever the
 # derived geometry changes: open_db() flushes every cached seam on mismatch.
 WATER_FLOOR_DROP_M = 5.0
-WATER_FLOOR_VERSION = 8
+SHORELINE_SEAFLOOR_DROP_M = 1.0
+WATER_FLOOR_VERSION = 10
 SEA_SEED_MAX_ELEV_M = 0.5
 _WMS_URL = "https://gis.govmin.gl/geoserver/wms"
 _WMS_LAYER = "Greenland:gl_aabent_land"
@@ -594,6 +595,11 @@ def effective_heightmap(db, tile_id: str, raw_heightmap):
         bathymetry_mask = water & np.isfinite(bathymetry) & (bathymetry <= 0.0)
         bathymetry_vertices = int(np.sum(bathymetry_mask))
         result[bathymetry_mask] = bathymetry[bathymetry_mask]
+    # Keep stored bathymetry in its source datum, but lower the rendered
+    # seafloor everywhere selected by the shoreline mask. This also lowers
+    # the synthetic fallback floor without touching adjacent land.
+    submerged_at_shoreline = water & np.isfinite(result) & (result <= 0.0)
+    result[submerged_at_shoreline] -= np.float32(SHORELINE_SEAFLOOR_DROP_M)
     with _logged_effective_tiles_lock:
         should_log = tile_id not in _logged_effective_tiles
         if should_log:

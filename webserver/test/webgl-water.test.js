@@ -17,6 +17,10 @@ test('direct sun glint has an independent full-strength control', () => {
   assert.ok(DEFAULT_WATER_PARAMS.glintStrength > DEFAULT_WATER_PARAMS.reflectivity);
 });
 
+test('dynamic waterline defaults half a metre above terrain-root zero', () => {
+  assert.equal(DEFAULT_WATER_PARAMS.waterline, 0.5);
+});
+
 test('shore sparkle defaults to a narrow, moderate-strength bathymetry band', () => {
   assert.equal(DEFAULT_WATER_PARAMS.shoreFoamDepth, 3.5);
   assert.equal(DEFAULT_WATER_PARAMS.shoreFoamStrength, 0.7);

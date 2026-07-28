@@ -12,6 +12,7 @@ from PIL import Image
 import coastline
 from coastline import (
     _OVERSAMPLE,
+    SHORELINE_SEAFLOOR_DROP_M,
     WATER_FLOOR_DROP_M,
     apply_water_mask,
     cache_official_water_mask,
@@ -119,7 +120,10 @@ class OfficialCoastlineTest(unittest.TestCase):
             tile = read_tile(db, "0-0-0")
             assert tile is not None
             effective = tile["heightmap"]
-            np.testing.assert_array_equal(effective[:, :10], -WATER_FLOOR_DROP_M)
+            np.testing.assert_array_equal(
+                effective[:, :10],
+                -WATER_FLOOR_DROP_M - SHORELINE_SEAFLOOR_DROP_M,
+            )
             np.testing.assert_array_equal(effective[:, 10:], 120.0)
             db.close()
 
@@ -231,7 +235,8 @@ class OfficialCoastlineTest(unittest.TestCase):
             assert tile is not None
             effective = tile["heightmap"]
             np.testing.assert_array_equal(
-                effective[hydro], -WATER_FLOOR_DROP_M,
+                effective[hydro],
+                -WATER_FLOOR_DROP_M - SHORELINE_SEAFLOOR_DROP_M,
             )
             np.testing.assert_array_equal(effective[~hydro], raw[~hydro])
             db.close()

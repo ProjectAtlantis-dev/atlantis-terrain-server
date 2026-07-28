@@ -26,7 +26,7 @@ import {
 export const DEFAULT_WATER_PARAMS = {
   enabled: true,           // hide/pause the dynamic surface when disabled;
                           // the underlying fjord imagery remains visible
-  waterline: 0,            // terrainRoot-local metres
+  waterline: 0.5,          // terrainRoot-local metres
   opticalDepth: DEFAULT_OPTICAL_WATER_DEPTH_M,
                           // satellite-water colour plane below waterline
   windSpeed: 13,          // m/s

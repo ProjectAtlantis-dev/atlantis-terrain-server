@@ -1722,6 +1722,61 @@ test('ancestor crops materialize deferred child slots and yield to exact texture
   assert.equal(terrainRoot.children[0].userData.terrainPlaceholderTexture, undefined);
 });
 
+test('ancestor crop cannot downgrade a retained exact same-ID tile', () => {
+  const tile = { id: '13-2765-1552', bbox: [0, 0, 1, 1] };
+  const exactOld = {};
+  const retained = {
+    userData: { tileId: tile.id, terrainBaseTexture: exactOld },
+    material: { map: exactOld },
+  };
+  const terrainRoot = { children: [retained] };
+  const deferredTiles = new Map([[tile.id, tile]]);
+  const textureCache = new Map();
+  const frames = [];
+  const materialized = [];
+  let callbacks;
+  let placeholderDisposals = 0;
+  const placeholder = {
+    dispose() { placeholderDisposals += 1; },
+  };
+  const exactNew = {};
+  const controller = createTerrainTextureController({
+    terrainRoot,
+    deferredTiles,
+    textureStreamer: {
+      texCache: textureCache,
+      texSource: new Map(),
+      pump(_scored, nextCallbacks) { callbacks = nextCallbacks; },
+    },
+    meshRuntime: {
+      materialize(tileId, texture) {
+        materialized.push([tileId, texture]);
+        deferredTiles.delete(tileId);
+        return retained;
+      },
+    },
+    lifecycle: { evictCoveredAncestors() {} },
+    priorityForTile: () => 0,
+    getVisibilityDistance: () => 1000,
+    applyMaterial() {},
+    log() {},
+    scheduleFrame: callback => frames.push(callback),
+  });
+
+  controller([tile]);
+  callbacks.onPlaceholder({ tileId: tile.id, tile, texture: placeholder });
+  assert.equal(placeholderDisposals, 1);
+  assert.equal(retained.material.map, exactOld);
+  assert.equal(deferredTiles.has(tile.id), true);
+  assert.deepEqual(materialized, []);
+
+  textureCache.set(tile.id, exactNew);
+  callbacks.onTexture({ tileId: tile.id, tile, texture: exactNew });
+  frames.shift()();
+  assert.deepEqual(materialized, [[tile.id, exactNew]]);
+  assert.equal(deferredTiles.has(tile.id), false);
+});
+
 test('shared terrain mesh builder preserves heightmap geometry and metadata', () => {
   const source = new Float32Array([1, 2, 3, 4]);
   const encoded = Buffer.from(source.buffer).toString('base64');

@@ -210,11 +210,25 @@ export function createTerrainTextureController({
       texture.dispose?.();
       return;
     }
+    const existing = findMesh(tile.id);
+    if (
+      deferredTiles.has(tile.id)
+      && existing?.material?.map
+      && !existing.userData?.terrainPlaceholderTexture
+    ) {
+      // A retained same-ID mesh already has exact imagery. This happens when
+      // movement re-adds a tile that survived as descendant fallback. Keep
+      // that good mesh until the exact replacement geometry/texture arrives;
+      // materializing an ancestor crop here causes the visible coarse flash.
+      log(tile.id, 'placeholder ignored — textured self retained');
+      texture.dispose?.();
+      return;
+    }
     let mesh;
     if (deferredTiles.has(tile.id)) {
       mesh = meshRuntime.materialize(tile.id, texture);
     } else {
-      mesh = findMesh(tile.id);
+      mesh = existing;
       if (mesh) {
         const previousPlaceholder = mesh.userData?.terrainPlaceholderTexture;
         applyMaterial(mesh, texture);

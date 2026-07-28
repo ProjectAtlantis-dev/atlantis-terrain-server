@@ -13,7 +13,11 @@ from bathymetry import (
     read_bathymetry,
     write_bathymetry,
 )
-from coastline import WATER_FLOOR_DROP_M, write_water_mask
+from coastline import (
+    SHORELINE_SEAFLOOR_DROP_M,
+    WATER_FLOOR_DROP_M,
+    write_water_mask,
+)
 from database import (
     GRID_N,
     _tile_bbox,
@@ -95,13 +99,26 @@ class BathymetryTest(unittest.TestCase):
             tile = read_tile(db, tile_id)
             assert tile is not None
             effective = tile["heightmap"]
-            self.assertEqual(float(effective[0, 0]), -120.0)
             self.assertEqual(
-                float(effective[5, 5]), -WATER_FLOOR_DROP_M,
+                float(effective[0, 0]),
+                -120.0 - SHORELINE_SEAFLOOR_DROP_M,
             )
-            self.assertEqual(float(effective[6, 6]), -120.0)
-            self.assertEqual(float(effective[7, 7]), -120.0)
-            self.assertEqual(float(effective[7, GRID_N // 2 - 1]), 0.0)
+            self.assertEqual(
+                float(effective[5, 5]),
+                -WATER_FLOOR_DROP_M - SHORELINE_SEAFLOOR_DROP_M,
+            )
+            self.assertEqual(
+                float(effective[6, 6]),
+                -120.0 - SHORELINE_SEAFLOOR_DROP_M,
+            )
+            self.assertEqual(
+                float(effective[7, 7]),
+                -120.0 - SHORELINE_SEAFLOOR_DROP_M,
+            )
+            self.assertEqual(
+                float(effective[7, GRID_N // 2 - 1]),
+                -SHORELINE_SEAFLOOR_DROP_M,
+            )
             self.assertEqual(float(effective[0, -1]), 100.0)
             self.assertEqual(float(effective[10, GRID_N // 2 + 2]), 0.0)
 
@@ -184,7 +201,9 @@ class BathymetryTest(unittest.TestCase):
             tile = read_tile(db, target_id)
             assert tile is not None
             np.testing.assert_allclose(
-                tile["heightmap"], expected, atol=1e-5,
+                tile["heightmap"],
+                expected - SHORELINE_SEAFLOOR_DROP_M,
+                atol=1e-5,
             )
             db.close()
 
@@ -212,7 +231,9 @@ class BathymetryTest(unittest.TestCase):
 
             tile = read_tile(db, tile_id)
             assert tile is not None
-            np.testing.assert_array_equal(tile["heightmap"], -40.0)
+            np.testing.assert_array_equal(
+                tile["heightmap"], -40.0 - SHORELINE_SEAFLOOR_DROP_M,
+            )
             db.close()
 
     def test_coarse_tile_uses_available_descendant_bathymetry_and_floor_elsewhere(self):
@@ -236,8 +257,14 @@ class BathymetryTest(unittest.TestCase):
             tile = read_tile(db, target_id)
             assert tile is not None
             effective = tile["heightmap"]
-            self.assertEqual(float(effective[0, 0]), -80.0)
-            self.assertEqual(float(effective[-1, -1]), -WATER_FLOOR_DROP_M)
+            self.assertEqual(
+                float(effective[0, 0]),
+                -80.0 - SHORELINE_SEAFLOOR_DROP_M,
+            )
+            self.assertEqual(
+                float(effective[-1, -1]),
+                -WATER_FLOOR_DROP_M - SHORELINE_SEAFLOOR_DROP_M,
+            )
             db.close()
 
     def test_schema_exposes_the_underwater_team_contract(self):
