@@ -677,6 +677,16 @@ function buildTuningControls(ap, ce) {
     format: v => `${v.toFixed(0)}m`,
     onChange: v => { waterParams.shoreFetchRamp = v; }
   });
+  tuningSlider('shore sparkle depth', {
+    min: 0, max: 12, step: 0.25, value: waterParams.shoreFoamDepth,
+    decimals: 2,
+    format: v => `${v.toFixed(2)}m`,
+    onChange: v => { waterParams.shoreFoamDepth = v; }
+  });
+  tuningSlider('shore sparkle', {
+    min: 0, max: 1.5, step: 0.05, value: waterParams.shoreFoamStrength,
+    onChange: v => { waterParams.shoreFoamStrength = v; }
+  });
   tuningSlider('swell scale', {
     min: 0.3, max: 2, step: 0.01, value: waterParams.amplitude,
     onChange: v => { waterParams.amplitude = v; waterRuntime.applyWind(); }

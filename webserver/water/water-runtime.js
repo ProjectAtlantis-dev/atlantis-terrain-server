@@ -20,8 +20,9 @@ import {
 // Fjords are NOT fetch-limited: they are long enough to channel the east-west
 // winds, so the default sea state stays ocean-grade — wind along the fjord
 // axis. Do not pre-calm; the sliders exist for that.
-// (No foam/whitecap params: the foam system was removed — every presentation
-// read as garbage from altitude. Waves + light only.)
+// Shore sparkle is deliberately analytic and close-range only. The old foam
+// persistence simulation read as garbage from altitude; this version reuses
+// bathymetry and crest signals already sampled by the surface shader.
 export const DEFAULT_WATER_PARAMS = {
   enabled: true,           // hide/pause the dynamic surface when disabled;
                           // the underlying fjord imagery remains visible
@@ -38,6 +39,8 @@ export const DEFAULT_WATER_PARAMS = {
                           // counterpart of fetchKm (which stays global). This
                           // calms only wind-FROM-land shorelines, not the
                           // fjord as a whole — see the note above.
+  shoreFoamDepth: 3.5,    // metres: shallow sparkle fades out by here
+  shoreFoamStrength: 0.7,
   alignment: 1.0,         // directional spreading of the spectrum
   choppiness: 1.38,       // horizontal displacement scale
   amplitude: 1.0,

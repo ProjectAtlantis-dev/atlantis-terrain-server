@@ -9,9 +9,13 @@ boundary. When a tile is written, shared edges are reconciled with neighbors
 so there are never seams.
 
 Schema:
-    tiles      — one row per quadtree tile at every depth level
-    bathymetry — independently supplied underwater elevation rasters
-    metadata   — database-level config (grid_resolution, max_depth, bbox)
+    tiles              — one row per quadtree tile at every depth level
+    bathymetry         — derived underwater elevation rasters
+    depth_sources      — immutable provenance for measured depth evidence
+    depth_observations — normalized point depths and lower-bound constraints
+    depth_assets       — original sounding/chart/raster source payloads
+    depth_imports      — reproducible import audit records
+    metadata           — database-level config (grid_resolution, max_depth, bbox)
 """
 
 import os
@@ -44,7 +48,7 @@ CONFIDENCE = {
 }
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 _SCHEMA_VERSION_KEY = "schema_version"
 
 
@@ -151,6 +155,137 @@ CREATE TABLE IF NOT EXISTS bathymetry (
     source     TEXT NOT NULL,
     version    INTEGER NOT NULL,
     updated_at TEXT NOT NULL
+);
+
+-- Source observations are evidence, not generated terrain. Keep their
+-- provenance and original payloads independent from the derived bathymetry
+-- table so an algorithm can be rebuilt or scored without circular validation.
+CREATE TABLE IF NOT EXISTS depth_sources (
+    source_id            TEXT PRIMARY KEY,
+    title                TEXT NOT NULL,
+    citation             TEXT NOT NULL,
+    source_url           TEXT NOT NULL,
+    doi                  TEXT,
+    provider             TEXT NOT NULL,
+    license              TEXT,
+    data_kind            TEXT NOT NULL CHECK (
+        data_kind IN (
+            'point_observations',
+            'gridded_bathymetry',
+            'nautical_chart',
+            'mixed'
+        )
+    ),
+    original_filename    TEXT,
+    content_sha256       TEXT CHECK (
+        content_sha256 IS NULL OR length(content_sha256) = 64
+    ),
+    source_metadata_json TEXT NOT NULL DEFAULT '{}'
+        CHECK (json_valid(source_metadata_json)),
+    retrieved_at         TEXT NOT NULL,
+    updated_at           TEXT NOT NULL
+);
+
+-- ``seafloor_depth`` is a measured/charted bottom depth. ``minimum_depth`` is
+-- only proof that the water column reaches at least this depth, for example a
+-- CTD cast endpoint. The CHECK makes it impossible to silently conflate them.
+CREATE TABLE IF NOT EXISTS depth_observations (
+    observation_id       TEXT PRIMARY KEY,
+    source_id            TEXT NOT NULL,
+    source_record_id     TEXT NOT NULL,
+    longitude_deg        REAL NOT NULL CHECK (
+        longitude_deg >= -180.0 AND longitude_deg <= 180.0
+    ),
+    latitude_deg         REAL NOT NULL CHECK (
+        latitude_deg >= -90.0 AND latitude_deg <= 90.0
+    ),
+    depth_m              REAL NOT NULL CHECK (depth_m >= 0.0),
+    evidence_kind        TEXT NOT NULL CHECK (
+        evidence_kind IN ('seafloor_depth', 'minimum_depth')
+    ),
+    measurement_method   TEXT NOT NULL,
+    observed_at          TEXT,
+    horizontal_datum     TEXT NOT NULL,
+    vertical_datum       TEXT NOT NULL,
+    horizontal_accuracy_m REAL CHECK (
+        horizontal_accuracy_m IS NULL OR horizontal_accuracy_m >= 0.0
+    ),
+    vertical_accuracy_m  REAL CHECK (
+        vertical_accuracy_m IS NULL OR vertical_accuracy_m >= 0.0
+    ),
+    properties_json      TEXT NOT NULL DEFAULT '{}'
+        CHECK (json_valid(properties_json)),
+    imported_at          TEXT NOT NULL,
+    FOREIGN KEY (source_id) REFERENCES depth_sources(source_id)
+        ON DELETE RESTRICT,
+    UNIQUE (source_id, source_record_id)
+);
+CREATE INDEX IF NOT EXISTS depth_observations_location
+    ON depth_observations(longitude_deg, latitude_deg);
+CREATE INDEX IF NOT EXISTS depth_observations_evidence
+    ON depth_observations(evidence_kind, measurement_method);
+
+-- Preserve original source files in the DB as auditable evidence. A GeoTIFF
+-- or XYZ grid can remain an asset instead of expanding millions of grid cells
+-- into point rows; point datasets may retain both the raw asset and normalized
+-- observations.
+CREATE TABLE IF NOT EXISTS depth_assets (
+    asset_id             TEXT PRIMARY KEY,
+    source_id            TEXT NOT NULL,
+    filename             TEXT NOT NULL,
+    media_type           TEXT NOT NULL,
+    payload              BLOB NOT NULL,
+    byte_length          INTEGER NOT NULL CHECK (
+        byte_length >= 0 AND byte_length = length(payload)
+    ),
+    content_sha256       TEXT NOT NULL CHECK (length(content_sha256) = 64),
+    evidence_kind        TEXT NOT NULL CHECK (
+        evidence_kind IN ('seafloor_depth', 'minimum_depth', 'mixed')
+    ),
+    measurement_method   TEXT NOT NULL,
+    horizontal_crs       TEXT NOT NULL,
+    vertical_datum       TEXT NOT NULL,
+    resolution_m         REAL CHECK (
+        resolution_m IS NULL OR resolution_m > 0.0
+    ),
+    west_deg             REAL,
+    south_deg            REAL,
+    east_deg             REAL,
+    north_deg            REAL,
+    metadata_json        TEXT NOT NULL DEFAULT '{}'
+        CHECK (json_valid(metadata_json)),
+    imported_at          TEXT NOT NULL,
+    FOREIGN KEY (source_id) REFERENCES depth_sources(source_id)
+        ON DELETE RESTRICT,
+    UNIQUE (source_id, filename, content_sha256),
+    CHECK (
+        (west_deg IS NULL AND south_deg IS NULL
+         AND east_deg IS NULL AND north_deg IS NULL)
+        OR
+        (west_deg >= -180.0 AND west_deg <= 180.0
+         AND east_deg >= -180.0 AND east_deg <= 180.0
+         AND south_deg >= -90.0 AND south_deg <= 90.0
+         AND north_deg >= -90.0 AND north_deg <= 90.0
+         AND west_deg <= east_deg AND south_deg <= north_deg)
+    )
+);
+CREATE INDEX IF NOT EXISTS depth_assets_evidence
+    ON depth_assets(evidence_kind, measurement_method);
+
+CREATE TABLE IF NOT EXISTS depth_imports (
+    import_id          TEXT PRIMARY KEY,
+    source_id          TEXT NOT NULL,
+    importer           TEXT NOT NULL,
+    importer_version   INTEGER NOT NULL CHECK (importer_version > 0),
+    input_sha256       TEXT NOT NULL CHECK (length(input_sha256) = 64),
+    source_row_count   INTEGER NOT NULL CHECK (source_row_count >= 0),
+    observation_count  INTEGER NOT NULL CHECK (observation_count >= 0),
+    asset_count        INTEGER NOT NULL CHECK (asset_count >= 0),
+    started_at         TEXT NOT NULL,
+    completed_at       TEXT NOT NULL,
+    notes              TEXT,
+    FOREIGN KEY (source_id) REFERENCES depth_sources(source_id)
+        ON DELETE RESTRICT
 );
 """
 
@@ -356,6 +491,47 @@ def _migrate_to_v6(db):
         )
 
 
+def _migrate_to_v7(db):
+    """Register measured depth evidence separately from derived bathymetry."""
+    required = {
+        "depth_sources": {
+            "source_id", "title", "citation", "source_url", "doi",
+            "provider", "license", "data_kind", "original_filename",
+            "content_sha256", "source_metadata_json", "retrieved_at",
+            "updated_at",
+        },
+        "depth_observations": {
+            "observation_id", "source_id", "source_record_id",
+            "longitude_deg", "latitude_deg", "depth_m", "evidence_kind",
+            "measurement_method", "observed_at", "horizontal_datum",
+            "vertical_datum", "horizontal_accuracy_m",
+            "vertical_accuracy_m", "properties_json", "imported_at",
+        },
+        "depth_assets": {
+            "asset_id", "source_id", "filename", "media_type", "payload",
+            "byte_length", "content_sha256", "evidence_kind",
+            "measurement_method", "horizontal_crs", "vertical_datum",
+            "resolution_m", "west_deg", "south_deg", "east_deg",
+            "north_deg", "metadata_json", "imported_at",
+        },
+        "depth_imports": {
+            "import_id", "source_id", "importer", "importer_version",
+            "input_sha256", "source_row_count", "observation_count",
+            "asset_count", "started_at", "completed_at", "notes",
+        },
+    }
+    for table, expected in required.items():
+        columns = {
+            row[1] for row in db.execute(f"PRAGMA table_info({table})")
+        }
+        missing = expected - columns
+        if missing:
+            raise RuntimeError(
+                f"{table} table is missing required columns: "
+                + ", ".join(sorted(missing))
+            )
+
+
 def _migrate_schema(db):
     row = db.execute(
         "SELECT value FROM metadata WHERE key = ?", (_SCHEMA_VERSION_KEY,)
@@ -406,6 +582,13 @@ def _migrate_schema(db):
         db.execute(
             "INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)",
             (_SCHEMA_VERSION_KEY, "6"),
+        )
+        version = 6
+    if version < 7:
+        _migrate_to_v7(db)
+        db.execute(
+            "INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)",
+            (_SCHEMA_VERSION_KEY, "7"),
         )
 
 

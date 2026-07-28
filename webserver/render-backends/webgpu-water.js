@@ -250,6 +250,8 @@ export function createWebGPUWater({
   const uOpacity = uniform(0).setName('waterOpacity');
   const uReflect = uniform(0.4).setName('waterReflect');
   const uGlintStrength = uniform(1).setName('waterGlintStrength');
+  const uShoreFoamDepth = uniform(3.5).setName('waterShoreFoamDepth');
+  const uShoreFoamStrength = uniform(0.7).setName('waterShoreFoamStrength');
   const uBathyCenter = uniform(new Vector2()).setName('waterBathyCenter');
   const uBathyExtent = uniform(bathyExtent).setName('waterBathyExtent');
   const uBathyTexel = uniform(bathyExtent / bathySize).setName('waterBathyTexel');
@@ -260,7 +262,8 @@ export function createWebGPUWater({
     uniform(NORTH_CLIFF_REFLECTION_MAX_PADDING_M).setName('waterNorthCliffPad');
   // Port-validation bisect switch (takramDebug.setWaterDebugMode):
   //   0 normal | 1 fetch forced open | 2 fetch open + de-tile bypassed |
-  //   3 diagnostic paint (r = fetch, g = |wave height|/2m, b = reflection gate)
+  //   3 diagnostic paint (r = local wave amplitude, g = |wave height|/2m,
+  //                       b = reflection gate)
   const uDebugMode = uniform(0).setName('waterDebugMode');
 
   // --- sim texture slots ----------------------------------------------------
@@ -290,7 +293,7 @@ export function createWebGPUWater({
   });
   const texBathy = texture(bathyTarget.texture);
 
-  // --- bathymetry access + lee-shore fetch (shared vertex/fragment) ---------
+  // --- bathymetry access + local wave damping (shared vertex/fragment) ------
 
   // local terrain height under the water plane; -5 m (the synthetic fjord
   // floor) wherever the capture has no coverage
@@ -362,7 +365,7 @@ export function createWebGPUWater({
   const vPlanePos = varyingProperty('vec3', 'vWaterPlanePos'); // terrainRoot-local, z up
   const vHeight = varyingProperty('float', 'vWaterHeight');
   const vDist = varyingProperty('float', 'vWaterDist');
-  const vFetch = varyingProperty('float', 'vWaterFetch');      // 0 at an upwind shoreline -> 1 at full fetch
+  const vFetch = varyingProperty('float', 'vWaterFetch'); // 0 at an upwind shoreline -> 1 at full fetch
 
   // --- vertex: cascade displacement ------------------------------------------
 
@@ -391,13 +394,11 @@ export function createWebGPUWater({
     disp = disp.add(dispSample(texDisp[1], gridXY.div(uL.y)).mul(f1));
     disp = disp.add(dispSample(texDisp[2], gridXY.div(uL.z)).mul(f2));
 
-    // lee-shore fetch scales the whole displacement field. LINEAR in the
-    // open-water fraction: the physical sqrt growth curve kept ~70% wave
-    // amplitude across most of the band and the calm zone never read as
-    // calm — flat presentation beats fidelity here.
+    // Lee-shore fetch scales the displacement field.
     const fetch = select(
       uDebugMode.greaterThanEqual(1.0), float(1.0), fetchFractionAt(gridXY),
     );
+    // Shallow column depth deliberately does not flatten the waves.
     vFetch.assign(fetch);
     disp = disp.mul(fetch);
 
@@ -568,8 +569,8 @@ export function createWebGPUWater({
       .add(D1.w.sub(D1.xy.dot(D1.xy)).max(0.0).mul(f1).mul(f1))
       .add(D2.w.sub(D2.xy.dot(D2.xy)).max(0.0).mul(f2).mul(f2));
 
-    // lee-shore fetch: slopes scale like amplitude (the vertex stage scaled
-    // the geometry by the same linear factor), variance like amplitude
+    // Lee-shore fetch damping: slopes scale like amplitude (the vertex stage
+    // scaled geometry by the same linear factor), variance like amplitude
     // squared. The micro-ripples get their own faster ramp: wind re-textures
     // a lee shore within the first stretch of open water, long before swell.
     // slopeVarFull keeps the FULL-fetch variance (including the micro energy
@@ -581,11 +582,11 @@ export function createWebGPUWater({
     // pixel-scale temporal glitter, and killing them by ~150 m left nothing
     // but smooth sheen from altitude.
     const microFade = float(1.0).div(d.mul(0.004).add(1.0));
-    const fetchAmp = float(vFetch);
+    const waveAmp = float(vFetch);
     // Calm is not flat: even directly behind a lee shore, retain a small
-    // wind-ripple field. The fetch mask owns the swell amplitude; using it
-    // as an on/off switch for capillary detail made the calm band lose its
-    // moving normals and therefore read as matte water.
+    // wind-ripple field. The fetch gate owns the swell; using it as
+    // an on/off switch for capillary detail made calm water lose its moving
+    // normals and therefore read as matte water.
     const microGate = mix(
       float(WATER_RENDER_CONTRACT.microGateMinimum),
       float(1.0),
@@ -600,7 +601,7 @@ export function createWebGPUWater({
       .add(windMicro.mul(windMicro).mul(0.5).mul(microFade.oneMinus()));
 
     const slope = D0.xy.add(D1.xy.mul(f1)).add(D2.xy.mul(f2))
-      .mul(fetchAmp).toVar('waterSlope');
+      .mul(waveAmp).toVar('waterSlope');
     let slopeVar = slopeVarRaw.mul(vFetch).mul(vFetch);
 
     // micro-ripple detail for near/mid-field sparkle; its slope energy
@@ -727,16 +728,14 @@ export function createWebGPUWater({
     // the open sea.
     spec = spec.mul(float(0.06).div(slopeVarFull.add(0.06)));
 
-    // Crest sparkle, not foam. Reuse the three physical signals that made
-    // plausible whitecap *locations*—high swell phase, a steep advancing
-    // face, and horizontal compression—but emit only reflected sun. There
-    // is no persistence buffer, breakup texture, white albedo, or residue.
-    // The narrow N.H term breaks crest rows into momentary facet flashes.
+    // Crest sparkle. Reuse high swell phase, a steep advancing face, and
+    // horizontal compression. The narrow N.H term breaks crest rows into
+    // momentary facet flashes.
     const J = D0.z.sub(1.0)
       .add(D1.z.sub(1.0).mul(mix(f1, float(1.0), 0.6)))
       .add(D2.z.sub(1.0).mul(f2).mul(0.5))
-      .mul(fetchAmp).add(1.0);
-    const crestSlope = D0.xy.add(D1.xy.mul(0.6)).mul(fetchAmp);
+      .mul(waveAmp).add(1.0);
+    const crestSlope = D0.xy.add(D1.xy.mul(0.6)).mul(waveAmp);
     const faceSteep = crestSlope.dot(uWindDir).negate().max(0.0);
     const crestTop = smoothstep(0.05, 0.55, hN);
     const advancingFace = smoothstep(0.025, 0.11, faceSteep);
@@ -772,7 +771,7 @@ export function createWebGPUWater({
     // facet lighting from the SWELL slope (cascades 0+1, chop excluded):
     // sunward ridge faces brighten, leeward faces darken. Using the full
     // normal here let metre-scale chop bury the dominant ridge trains.
-    const swellSlope = D0.xy.add(D1.xy.mul(f1).mul(0.5)).mul(facetGain).mul(fetchAmp);
+    const swellSlope = D0.xy.add(D1.xy.mul(f1).mul(0.5)).mul(facetGain).mul(waveAmp);
     const Nsw = normalize(vec3(swellSlope.negate(), 1.0));
     const facet = Nsw.dot(L).max(0.0).sub(L.z.max(0.0)).mul(uCloud.mul(0.65).oneMinus());
 
@@ -816,8 +815,8 @@ export function createWebGPUWater({
     const reflectionGain = 0.333333;
     const refl = fresnel.mul(uReflect).mul(bottomReflection).mul(ambientReflection)
       .mul(bakedCliffVisibility).mul(reflectionGain);
-    // Fetch changes surface roughness, not how reflective water is. The
-    // retained micro-ripple normals keep the lee band from becoming a flat
+    // Fetch damping changes surface roughness, not how reflective water is.
+    // Retained micro-ripple normals keep calm regions from becoming a flat
     // oblique mirror, while Fresnel still makes calm water properly shiny.
     const alpha = bodyW.add(refl.mul(bodyW.oneMinus()));
     // Only the explicit surface opacity emits body colour. The extra wall
@@ -837,6 +836,66 @@ export function createWebGPUWater({
     // darkness as the cheap local occlusion proxy for direct sun glint.
     accum = accum.add(
       spec.mul(bottomReflection).mul(northCliffReflection).mul(uGlintStrength),
+    );
+
+    // Shore-break sparkle. Shoreline proximity is the only hard gate; wave
+    // direction and face activity are soft biases because coarse bathymetry
+    // and directional spreading make exact alignment too brittle.
+    const safeFoamDepth = uShoreFoamDepth.max(1e-4);
+    const shallowFoamRaw = smoothstep(
+      safeFoamDepth.mul(0.25), safeFoamDepth, colDepth,
+    ).oneMinus();
+    const shallowFoam = select(
+      uShoreFoamDepth.lessThanEqual(0.0), float(0.0), shallowFoamRaw,
+    );
+    const waterCoverage = bathySample.a.mul(
+      smoothstep(-0.05, 0.15, seabed).oneMinus(),
+    );
+    const shoreNormal = normalize(sgrad.add(vec2(1e-5, 0.0)));
+    const shoreline = smoothstep(0.012, 0.070, sgrad.length());
+    const shoreExposure = mix(
+      float(0.35),
+      float(1.0),
+      smoothstep(-0.25, 0.50, uWindDir.dot(shoreNormal)),
+    );
+    const impactFace = mix(
+      float(0.30),
+      float(1.0),
+      smoothstep(0.006, 0.045, faceSteep),
+    ).mul(mix(float(0.55), float(1.0), crestTop));
+    const shoreWaveAction = shoreline.mul(shoreExposure).mul(impactFace);
+    const foamCrossWind = vec2(uWindDir.y, uWindDir.x.negate());
+    const sparkleFlecks = smoothstep(
+      0.64,
+      0.86,
+      vnoise(pxy.mul(0.29).add(foamCrossWind.mul(uTime.mul(0.75)))),
+    );
+    const foamDistance = smoothstep(
+      WATER_RENDER_CONTRACT.shoreFoamDistanceStartM,
+      WATER_RENDER_CONTRACT.shoreFoamDistanceEndM,
+      d,
+    ).oneMinus();
+    const shoreSparkle = uShoreFoamStrength.max(0.0)
+      .mul(waterCoverage).mul(shallowFoam)
+      .mul(shoreWaveAction).mul(sparkleFlecks).mul(foamDistance)
+      .min(WATER_RENDER_CONTRACT.shoreFoamAlphaMaximum);
+    // The flecks only describe where broken shoreline water can contribute.
+    // Their brightness has no procedural pulse or minimum floor: use a
+    // broader GGX distribution for the unresolved facets in broken water,
+    // while the moving water normal, sun/view half-vector, and Fresnel term
+    // still determine whether each patch can reflect the sun.
+    const shoreAx = ax2.sqrt().max(0.18);
+    const shoreAy = ay2.sqrt().max(0.28);
+    const shoreSunGlint = uGlintColor.mul(
+      ggxAniso(H, N, Twind, Bwind, shoreAx, shoreAy),
+    )
+      .mul(fresL).mul(smoothstep(0.0, 0.06, L.z))
+      .div(NdotV.max(0.1).mul(N.dot(L).max(0.1)).mul(4.0));
+    // The background/reflection occlusion masks collapse at the land-water
+    // boundary and incorrectly erased this path. A breaker facet sits on the
+    // optical surface, so shoreline coverage already supplies its mask.
+    accum = accum.add(
+      shoreSunGlint.mul(shoreSparkle).mul(uGlintStrength).mul(2.4),
     );
 
     // no in-shader haze: scene fogNode + the aerial perspective pass own that
@@ -1055,6 +1114,8 @@ export function createWebGPUWater({
       uOpacity.value = params.opacity;
       uReflect.value = params.reflectivity;
       uGlintStrength.value = Math.max(0, params.glintStrength ?? 1);
+      uShoreFoamDepth.value = Math.max(0, params.shoreFoamDepth ?? 3.5);
+      uShoreFoamStrength.value = Math.max(0, params.shoreFoamStrength ?? 0.7);
       uAbsorb.value = params.absorption;
       uWaterline.value = params.waterline ?? 0;
       uFetchRamp.value = Math.max(0, params.shoreFetchRamp ?? 3000);

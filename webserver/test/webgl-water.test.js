@@ -17,6 +17,11 @@ test('direct sun glint has an independent full-strength control', () => {
   assert.ok(DEFAULT_WATER_PARAMS.glintStrength > DEFAULT_WATER_PARAMS.reflectivity);
 });
 
+test('shore sparkle defaults to a narrow, moderate-strength bathymetry band', () => {
+  assert.equal(DEFAULT_WATER_PARAMS.shoreFoamDepth, 3.5);
+  assert.equal(DEFAULT_WATER_PARAMS.shoreFoamStrength, 0.7);
+});
+
 test('north-cliff reflection padding is negligible on flat shores and proportional to slope', () => {
   assert.equal(northCliffReflectionPaddingForSlope(0), 0);
   assert.equal(northCliffReflectionPaddingForSlope(0.12), 0);

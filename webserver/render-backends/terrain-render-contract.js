@@ -5,6 +5,9 @@ export const TERRAIN_BATHYMETRY_LAYER = 31;
 
 export const WATER_RENDER_CONTRACT = Object.freeze({
   fetchFractionScale: 3,
+  shoreFoamDistanceStartM: 700,
+  shoreFoamDistanceEndM: 2800,
+  shoreFoamAlphaMaximum: 0.75,
   microGateMinimum: 0.22,
   microGateStart: 0.02,
   microGateEnd: 0.25,
@@ -15,4 +18,3 @@ export const WATER_RENDER_CONTRACT = Object.freeze({
   crestFilterStartM: 450,
   crestFilterEndM: 2200,
 });
-
