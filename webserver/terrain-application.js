@@ -885,6 +885,15 @@ Ellipsoid.WGS84
   .getEastNorthUpFrame(anchorPosition)
   .decompose(terrainRoot.position, terrainRoot.quaternion, terrainRoot.scale);
 scene.add(terrainRoot);
+// Diagnostic colors must bypass atmosphere relighting. Keep their geometry in
+// the same tangent frame as terrain, but render it into the composited frame
+// only after the atmosphere pass has finished.
+const diagnosticOverlayScene = new THREE.Scene();
+const diagnosticOverlayRoot = new THREE.Group();
+diagnosticOverlayRoot.position.copy(terrainRoot.position);
+diagnosticOverlayRoot.quaternion.copy(terrainRoot.quaternion);
+diagnosticOverlayRoot.scale.copy(terrainRoot.scale);
+diagnosticOverlayScene.add(diagnosticOverlayRoot);
 
 // --- Fjord water (ocean2 FFT port) ---
 // A camera-following FFT water surface at local z=0; masked water terrain is
@@ -1382,7 +1391,7 @@ buildingsRuntime = createTerrainBuildingsRuntime({
   requestRender,
 });
 bathymetryMapRuntime = createTerrainBathymetryMapRuntime({
-  terrainRoot,
+  terrainRoot: diagnosticOverlayRoot,
   pipelineState: terrainPipelineState,
   exaggeration: EXAG,
   onChanged: () => {
@@ -2100,8 +2109,8 @@ function updateHud() {
     coverage: 0, soundings: 0,
   };
   const bathymetryMapLine = bathymetryMapRuntime?.active
-    ? `bathymetry map: <span id="bathymetryMapLink" title="Cyan mapped areas; yellow actual and orange lower-bound soundings" style="color:#00d8ff;text-decoration:underline;cursor:pointer;pointer-events:auto">ON</span>  ${bathymetryCounts.coverage} areas / ${bathymetryCounts.soundings} soundings`
-    : 'bathymetry map: <span id="bathymetryMapLink" title="Show mapped areas and soundings" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">off</span>';
+    ? `bathymetry map: <span id="bathymetryMapLink" title="Cyan = carved bathymetry; yellow circles = actual-depth samples; white squares and lines = lower-bound soundings; red is reserved for large model deviations" style="color:#00d8ff;text-decoration:underline;cursor:pointer;pointer-events:auto">ON</span>  ${bathymetryCounts.coverage} carved areas / ${bathymetryCounts.soundings} evidence soundings`
+    : 'bathymetry map: <span id="bathymetryMapLink" title="Show carved bathymetry and source sounding evidence" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">off</span>';
   const classifierOverlayColor = {
     off: '#0af', classifier: '#6ecd3c',
   }[classifierOverlay.mode] ?? '#0af';
@@ -2742,7 +2751,7 @@ function render() {
     const markerScale = controls.mapZoom / DEFAULT_MAP_ZOOM;
     camMarker.scale.setScalar(markerScale);
     vehicleRuntime.vehicleMarker.scale.setScalar(markerScale * vehicleRuntime.VEHICLE_MARKER_MAP_SCALE);
-    renderBackend.renderMap(scene, mapCam, _mapBg);
+    renderBackend.renderMap(scene, mapCam, _mapBg, diagnosticOverlayScene);
     renderBackend.stopRenderLoopIfIdle();
     cpuProfiler.end('frame-cpu', frameStartedAt);
     return;
@@ -2758,7 +2767,7 @@ function render() {
   }
   webgpuAtmosphere?.updateCloudShadows(clock.elapsedTime);
   try {
-    renderBackend.renderScene(scene, camera);
+    renderBackend.renderScene(scene, camera, diagnosticOverlayScene);
   } finally {
     restoreCloudTemporalHistory?.();
     restoreCloudTemporalHistory = null;

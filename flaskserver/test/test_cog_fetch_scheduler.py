@@ -31,9 +31,9 @@ class _ManualPool:
         self.submissions = []
         self.futures = []
 
-    def submit(self, function, tile_id, bbox):
+    def submit(self, function, tile_id, bbox, origin):
         future = _ManualFuture()
-        self.submissions.append((function, tile_id, bbox))
+        self.submissions.append((function, tile_id, bbox, origin))
         self.futures.append(future)
         return future
 
@@ -175,10 +175,19 @@ class CogFetchSchedulerTests(unittest.TestCase):
             patch.object(serve_flask, "_cog_already_fetched", set()),
             patch.object(serve_flask, "_cog_synthetic_retry_at", {}),
         ):
-            self.assertEqual(serve_flask._schedule_cog_demand(initial), (2, 2))
+            self.assertEqual(
+                serve_flask._schedule_cog_demand(
+                    initial, origin="bathymetry"
+                ),
+                (2, 2),
+            )
             self.assertEqual(
                 [submission[1] for submission in pool.submissions],
                 ["12-0-0", "12-1-0"],
+            )
+            self.assertEqual(
+                [submission[3] for submission in pool.submissions],
+                ["bathymetry", "bathymetry"],
             )
 
             # A new camera request replaces only the two unstarted tiles.

@@ -3,13 +3,17 @@ import tempfile
 import unittest
 import zlib
 from pathlib import Path
+from typing import Any, Callable
 
 import numpy as np
 
 from bathymetry_demand import (
+    BATHYMETRY_DEMAND_PAUSED_KEY,
     BATHYMETRY_JOB_DEPTH,
     BathymetryDemandScheduler,
     eligible_fjord_jobs,
+    terrain_request_max_depth,
+    terrain_request_origin,
 )
 from database import GRID_N
 from tile_address import format_tile_id
@@ -32,6 +36,7 @@ def _db():
             mask BLOB NOT NULL
         );
         CREATE TABLE bathymetry (tile_id TEXT PRIMARY KEY);
+        CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT);
         """
     )
     return db
@@ -110,10 +115,10 @@ class BathymetryEligibilityTests(unittest.TestCase):
 
 class _Future:
     def __init__(self):
-        self.callback = None
+        self.callback: Callable[[Any], Any] | None = None
         self.result_value = None
 
-    def add_done_callback(self, callback):
+    def add_done_callback(self, callback: Callable[[Any], Any]):
         self.callback = callback
 
     def result(self):
@@ -121,7 +126,10 @@ class _Future:
 
     def complete(self, result):
         self.result_value = result
-        self.callback(self)
+        callback = self.callback
+        if callback is None:
+            raise AssertionError("future completed before callback registration")
+        callback(self)
 
 
 class _Pool:
@@ -137,6 +145,41 @@ class _Pool:
 
 
 class BathymetrySchedulerTests(unittest.TestCase):
+    def test_only_real_viewer_demand_can_descend_below_depth_12(self):
+        self.assertEqual(terrain_request_max_depth({}, 16), 16)
+        self.assertEqual(terrain_request_origin({}), "viewer")
+        self.assertEqual(
+            terrain_request_max_depth({"demand": "bathymetry"}, 16), 12
+        )
+        self.assertEqual(
+            terrain_request_origin({"demand": "bathymetry"}), "bathymetry"
+        )
+        self.assertEqual(
+            terrain_request_max_depth({"bathymetry": "0"}, 16), 12
+        )
+
+    def test_durable_pause_prevents_worker_submission(self):
+        db = _db()
+        self.addCleanup(db.close)
+        coast = np.zeros((GRID_N, GRID_N), dtype=bool)
+        coast[:, : GRID_N // 2] = True
+        tile_id = _mask(db, 1600, 900, coast)
+        db.execute(
+            "INSERT INTO metadata (key, value) VALUES (?, '1')",
+            (BATHYMETRY_DEMAND_PAUSED_KEY,),
+        )
+        pool = _Pool()
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "runOnDemand").touch()
+            scheduler = BathymetryDemandScheduler(
+                "/tmp/terrain.db", glacier_root=root, pool=pool
+            )
+            self.assertEqual(scheduler.schedule(db, [tile_id]), [])
+            self.assertEqual(pool.calls, [])
+            self.assertTrue(scheduler.status()["paused"])
+
     def test_scheduler_deduplicates_active_and_completed_jobs(self):
         db = _db()
         self.addCleanup(db.close)

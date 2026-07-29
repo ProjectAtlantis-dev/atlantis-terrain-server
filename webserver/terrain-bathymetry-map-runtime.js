@@ -5,12 +5,142 @@ const DEFAULT_POLL_MS = 5000;
 
 const COVERAGE_COLOR = 0x00d8ff;
 const ACTUAL_COLOR = new THREE.Color(0xfff06a);
-const LOWER_BOUND_COLOR = new THREE.Color(0xff8a3d);
+const SOUNDING_COLOR = new THREE.Color(0xf4f4f5);
+const COVERAGE_CLIP_SEGMENTS = 128;
+const CIRCLE_MARKER_TEXTURE_SIZE = 32;
+
+function createCircleMarkerTexture() {
+  const size = CIRCLE_MARKER_TEXTURE_SIZE;
+  const data = new Uint8Array(size * size * 4);
+  const center = size / 2;
+  const radius = size * 0.43;
+  const feather = 1.25;
+  for (let y = 0; y < size; y += 1) {
+    for (let x = 0; x < size; x += 1) {
+      const distance = Math.hypot(x + 0.5 - center, y + 0.5 - center);
+      const alpha = Math.max(0, Math.min(1, (radius + feather - distance) / feather));
+      const index = (y * size + x) * 4;
+      data[index] = 255;
+      data[index + 1] = 255;
+      data[index + 2] = 255;
+      data[index + 3] = Math.round(alpha * 255);
+    }
+  }
+  const texture = new THREE.DataTexture(data, size, size, THREE.RGBAFormat);
+  texture.magFilter = THREE.LinearFilter;
+  texture.minFilter = THREE.LinearFilter;
+  texture.generateMipmaps = false;
+  texture.needsUpdate = true;
+  return texture;
+}
+
+function addPointMarkers(group, positions, colors, {
+  shape,
+  renderOrder,
+} = {}) {
+  if (positions.length === 0) return;
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute(
+    'position', new THREE.BufferAttribute(new Float32Array(positions), 3),
+  );
+  geometry.setAttribute(
+    'color', new THREE.BufferAttribute(new Float32Array(colors), 3),
+  );
+  const materialOptions = {
+    size: 8,
+    sizeAttenuation: false,
+    vertexColors: true,
+    transparent: true,
+    depthTest: false,
+    toneMapped: false,
+    blending: THREE.AdditiveBlending,
+  };
+  if (shape === 'circle') {
+    materialOptions.map = createCircleMarkerTexture();
+    materialOptions.alphaTest = 0.01;
+  }
+  const points = new THREE.Points(
+    geometry,
+    new THREE.PointsMaterial(materialOptions),
+  );
+  points.userData.isBathymetrySoundings = true;
+  points.userData.bathymetryMarkerShape = shape;
+  points.renderOrder = renderOrder;
+  group.add(points);
+}
+
+function clipPolygonAgainstEdge(polygon, edgeStart, edgeEnd) {
+  const result = [];
+  const edgeX = edgeEnd[0] - edgeStart[0];
+  const edgeY = edgeEnd[1] - edgeStart[1];
+  const side = point => (
+    edgeX * (point[1] - edgeStart[1])
+    - edgeY * (point[0] - edgeStart[0])
+  );
+  for (let i = 0; i < polygon.length; i += 1) {
+    const current = polygon[i];
+    const previous = polygon[(i + polygon.length - 1) % polygon.length];
+    const currentSide = side(current);
+    const previousSide = side(previous);
+    const currentInside = currentSide >= 0;
+    const previousInside = previousSide >= 0;
+    if (currentInside !== previousInside) {
+      const denominator = previousSide - currentSide;
+      const t = denominator === 0 ? 0 : previousSide / denominator;
+      result.push([
+        previous[0] + (current[0] - previous[0]) * t,
+        previous[1] + (current[1] - previous[1]) * t,
+      ]);
+    }
+    if (currentInside) result.push(current);
+  }
+  return result;
+}
+
+function coveragePolygon(bbox, clipCircle) {
+  const [rawX0, rawY0, rawX1, rawY1] = bbox.map(Number);
+  if (![rawX0, rawY0, rawX1, rawY1].every(Number.isFinite)) return [];
+  const x0 = Math.min(rawX0, rawX1);
+  const y0 = Math.min(rawY0, rawY1);
+  const x1 = Math.max(rawX0, rawX1);
+  const y1 = Math.max(rawY0, rawY1);
+  let polygon = [[x0, y0], [x1, y0], [x1, y1], [x0, y1]];
+  if (!clipCircle) return polygon;
+
+  const centerX = Number(clipCircle.x);
+  const centerY = Number(clipCircle.y);
+  const radius = Number(clipCircle.radius);
+  if (![centerX, centerY, radius].every(Number.isFinite) || radius <= 0) return [];
+  const radiusSquared = radius * radius;
+  const nearestX = Math.max(x0, Math.min(x1, centerX));
+  const nearestY = Math.max(y0, Math.min(y1, centerY));
+  if ((nearestX - centerX) ** 2 + (nearestY - centerY) ** 2 > radiusSquared) {
+    return [];
+  }
+  const entirelyInside = polygon.every(([x, y]) => (
+    (x - centerX) ** 2 + (y - centerY) ** 2 <= radiusSquared
+  ));
+  if (entirelyInside) return polygon;
+
+  // Only boundary footprints pay for clipping. The inscribed polygon keeps
+  // every generated fragment strictly within the requested circular map.
+  for (let i = 0; i < COVERAGE_CLIP_SEGMENTS && polygon.length; i += 1) {
+    const angle0 = 2 * Math.PI * i / COVERAGE_CLIP_SEGMENTS;
+    const angle1 = 2 * Math.PI * (i + 1) / COVERAGE_CLIP_SEGMENTS;
+    polygon = clipPolygonAgainstEdge(
+      polygon,
+      [centerX + radius * Math.cos(angle0), centerY + radius * Math.sin(angle0)],
+      [centerX + radius * Math.cos(angle1), centerY + radius * Math.sin(angle1)],
+    );
+  }
+  return polygon;
+}
 
 export function buildBathymetryMapGroup(payload, {
   offsetX = 0,
   offsetY = 0,
   exaggeration = 1,
+  clipCircle = null,
 } = {}) {
   const group = new THREE.Group();
   group.userData.isBathymetryMap = true;
@@ -20,16 +150,16 @@ export function buildBathymetryMapGroup(payload, {
   const coverageIndices = [];
   for (const item of coverage) {
     if (!Array.isArray(item.bbox) || item.bbox.length !== 4) continue;
-    const [x0, y0, x1, y1] = item.bbox;
+    const polygon = coveragePolygon(item.bbox, clipCircle);
+    if (polygon.length < 3) continue;
     const start = coveragePositions.length / 3;
     const z = 2 * exaggeration;
-    coveragePositions.push(
-      x0 + offsetX, y0 + offsetY, z,
-      x1 + offsetX, y0 + offsetY, z,
-      x1 + offsetX, y1 + offsetY, z,
-      x0 + offsetX, y1 + offsetY, z,
-    );
-    coverageIndices.push(start, start + 1, start + 2, start, start + 2, start + 3);
+    for (const [x, y] of polygon) {
+      coveragePositions.push(x + offsetX, y + offsetY, z);
+    }
+    for (let i = 1; i < polygon.length - 1; i += 1) {
+      coverageIndices.push(start, start + i, start + i + 1);
+    }
   }
   if (coverageIndices.length) {
     const geometry = new THREE.BufferGeometry();
@@ -44,6 +174,8 @@ export function buildBathymetryMapGroup(payload, {
       opacity: 0.22,
       depthWrite: false,
       depthTest: false,
+      toneMapped: false,
+      blending: THREE.AdditiveBlending,
       side: THREE.DoubleSide,
     });
     const mesh = new THREE.Mesh(geometry, material);
@@ -55,18 +187,23 @@ export function buildBathymetryMapGroup(payload, {
   const soundings = Array.isArray(payload?.soundings) ? payload.soundings : [];
   const linePositions = [];
   const lineColors = [];
-  const pointPositions = [];
-  const pointColors = [];
+  const actualPointPositions = [];
+  const actualPointColors = [];
+  const soundingPointPositions = [];
+  const soundingPointColors = [];
   for (const sounding of soundings) {
     const x = Number(sounding.x) + offsetX;
     const y = Number(sounding.y) + offsetY;
     const depth = Math.max(0, Number(sounding.depthM)) * exaggeration;
     if (![x, y, depth].every(Number.isFinite)) continue;
-    const color = sounding.kind === 'actual' ? ACTUAL_COLOR : LOWER_BOUND_COLOR;
+    const isActual = sounding.kind === 'actual';
+    const color = isActual ? ACTUAL_COLOR : SOUNDING_COLOR;
     linePositions.push(x, y, 3 * exaggeration, x, y, -depth);
     lineColors.push(color.r, color.g, color.b, color.r, color.g, color.b);
-    pointPositions.push(x, y, -depth);
-    pointColors.push(color.r, color.g, color.b);
+    const positions = isActual ? actualPointPositions : soundingPointPositions;
+    const colors = isActual ? actualPointColors : soundingPointColors;
+    positions.push(x, y, -depth);
+    colors.push(color.r, color.g, color.b);
   }
   if (linePositions.length) {
     const lineGeometry = new THREE.BufferGeometry();
@@ -79,32 +216,26 @@ export function buildBathymetryMapGroup(payload, {
     const lines = new THREE.LineSegments(
       lineGeometry,
       new THREE.LineBasicMaterial({
-        vertexColors: true, transparent: true, opacity: 0.9, depthTest: false,
+        vertexColors: true,
+        transparent: true,
+        opacity: 0.9,
+        depthTest: false,
+        toneMapped: false,
+        blending: THREE.AdditiveBlending,
       }),
     );
     lines.userData.isBathymetrySoundings = true;
     lines.renderOrder = 91;
     group.add(lines);
 
-    const pointGeometry = new THREE.BufferGeometry();
-    pointGeometry.setAttribute(
-      'position', new THREE.BufferAttribute(new Float32Array(pointPositions), 3),
-    );
-    pointGeometry.setAttribute(
-      'color', new THREE.BufferAttribute(new Float32Array(pointColors), 3),
-    );
-    const points = new THREE.Points(
-      pointGeometry,
-      new THREE.PointsMaterial({
-        size: 8,
-        sizeAttenuation: false,
-        vertexColors: true,
-        depthTest: false,
-      }),
-    );
-    points.userData.isBathymetrySoundings = true;
-    points.renderOrder = 92;
-    group.add(points);
+    addPointMarkers(group, actualPointPositions, actualPointColors, {
+      shape: 'circle',
+      renderOrder: 92,
+    });
+    addPointMarkers(group, soundingPointPositions, soundingPointColors, {
+      shape: 'square',
+      renderOrder: 93,
+    });
   }
   return group;
 }
@@ -113,6 +244,7 @@ function disposeGroup(group) {
   if (!group) return;
   group.traverse(child => {
     child.geometry?.dispose?.();
+    child.material?.map?.dispose?.();
     child.material?.dispose?.();
   });
 }
@@ -171,6 +303,11 @@ export function createTerrainBathymetryMapRuntime({
         offsetX: pipelineState.frameOffsetX,
         offsetY: pipelineState.frameOffsetY,
         exaggeration,
+        clipCircle: {
+          x: pipelineState.lastFetchX - pipelineState.originX,
+          y: pipelineState.lastFetchY - pipelineState.originY,
+          radius: rangeM,
+        },
       }));
       log('bathymetry-map', `coverage=${counts.coverage} soundings=${counts.soundings}`);
     } catch (error) {

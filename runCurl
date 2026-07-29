@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+exec curl \
+    --fail \
+    --location \
+    --retry 4 \
+    --retry-all-errors \
+    --retry-delay 5 \
+    --connect-timeout 20 \
+    "$@"

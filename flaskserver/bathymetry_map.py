@@ -13,6 +13,19 @@ from coords import to_stereo
 MAP_COVERAGE_DEPTH = 12
 
 
+def _bbox_intersects_circle(
+    bbox: tuple[float, float, float, float],
+    qx: float,
+    qy: float,
+    radius: float,
+) -> bool:
+    """Return whether an axis-aligned footprint touches the map radius."""
+    x_min, y_min, x_max, y_max = bbox
+    nearest_x = min(max(qx, x_min), x_max)
+    nearest_y = min(max(qy, y_min), y_max)
+    return (nearest_x - qx) ** 2 + (nearest_y - qy) ** 2 <= radius ** 2
+
+
 def query_bathymetry_map(
     db,
     qx: float,
@@ -34,20 +47,8 @@ def query_bathymetry_map(
         "ORDER BY b.tile_id",
         (MAP_COVERAGE_DEPTH, bbox[0], bbox[2], bbox[1], bbox[3]),
     ).fetchall()
-    coverage = [
-        {
-            "tileId": tile_id,
-            "bbox": [
-                float(x_min) - ox,
-                float(y_min) - oy,
-                float(x_max) - ox,
-                float(y_max) - oy,
-            ],
-            "source": source,
-            "version": int(version),
-            "updatedAt": updated_at,
-        }
-        for (
+    coverage = []
+    for (
             tile_id,
             x_min,
             y_min,
@@ -56,8 +57,29 @@ def query_bathymetry_map(
             source,
             version,
             updated_at,
-        ) in coverage_rows
-    ]
+    ) in coverage_rows:
+        absolute_bbox = (
+            float(x_min),
+            float(y_min),
+            float(x_max),
+            float(y_max),
+        )
+        if not _bbox_intersects_circle(absolute_bbox, qx, qy, radius):
+            continue
+        coverage.append(
+            {
+                "tileId": tile_id,
+                "bbox": [
+                    absolute_bbox[0] - ox,
+                    absolute_bbox[1] - oy,
+                    absolute_bbox[2] - ox,
+                    absolute_bbox[3] - oy,
+                ],
+                "source": source,
+                "version": int(version),
+                "updatedAt": updated_at,
+            }
+        )
 
     sounding_rows = db.execute(
         "SELECT source_url, record_id, latitude, longitude, depth_m, depth_kind "
@@ -73,7 +95,7 @@ def query_bathymetry_map(
     soundings = []
     for row, x, y in zip(sounding_rows, xs, ys):
         x, y = float(x), float(y)
-        if not (bbox[0] <= x <= bbox[2] and bbox[1] <= y <= bbox[3]):
+        if (x - qx) ** 2 + (y - qy) ** 2 > radius ** 2:
             continue
         soundings.append(
             {

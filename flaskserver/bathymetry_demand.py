@@ -24,7 +24,7 @@ import time
 import zlib
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
-from typing import Callable, Iterable
+from typing import Callable, Iterable, Mapping
 
 import numpy as np
 
@@ -34,6 +34,52 @@ from tile_address import format_tile_id, parse_tile_id
 
 BATHYMETRY_JOB_DEPTH = 8
 OFFSHORE_LIMIT_M = 2_000.0
+BATHYMETRY_DEM_MAX_DEPTH = WMS_CONTRACT_DEPTH
+BATHYMETRY_DEMAND_PAUSED_KEY = "bathymetry_demand_paused"
+
+
+def terrain_request_max_depth(
+    request_args: Mapping[str, str],
+    default_max_depth: int,
+) -> int:
+    """Keep non-viewer bathymetry acquisition at the depth-12 contract.
+
+    ``demand=bathymetry`` is the explicit contract. ``bathymetry=0`` remains
+    recognized for the existing Glacier client while it is upgraded; no
+    browser request uses that scheduler-suppression parameter.
+    """
+    if (
+        request_args.get("demand") == "bathymetry"
+        or request_args.get("bathymetry") == "0"
+    ):
+        return min(int(default_max_depth), BATHYMETRY_DEM_MAX_DEPTH)
+    return int(default_max_depth)
+
+
+def terrain_request_origin(request_args: Mapping[str, str]) -> str:
+    """Classify terrain demand for audit logs and scheduling provenance."""
+    if (
+        request_args.get("demand") == "bathymetry"
+        or request_args.get("bathymetry") == "0"
+    ):
+        return "bathymetry"
+    return "viewer"
+
+
+def bathymetry_demand_paused(db) -> bool:
+    """Read the durable operator pause from terrain metadata."""
+    try:
+        row = db.execute(
+            "SELECT value FROM metadata WHERE key = ?",
+            (BATHYMETRY_DEMAND_PAUSED_KEY,),
+        ).fetchone()
+    except Exception:
+        # Small unit-test/legacy databases may predate the metadata table.
+        return False
+    return bool(
+        row
+        and str(row[0]).strip().lower() in {"1", "true", "yes", "on"}
+    )
 
 
 def _ancestor_at_depth(tile_id: str, depth: int) -> tuple[int, int] | None:
@@ -182,13 +228,17 @@ class BathymetryDemandScheduler:
         self._completed: set[str] = set()
         self._failed_at: dict[str, float] = {}
         self._last_error: dict[str, str] = {}
+        self._paused = False
 
     @property
     def enabled(self) -> bool:
         return self.command.is_file()
 
     def schedule(self, db, visible_tile_ids: Iterable[str]) -> list[str]:
-        if not self.enabled:
+        paused = bathymetry_demand_paused(db)
+        with self._lock:
+            self._paused = paused
+        if not self.enabled or paused:
             return []
         jobs = sorted(eligible_fjord_jobs(db, visible_tile_ids))
         submitted = []
@@ -269,6 +319,7 @@ class BathymetryDemandScheduler:
         with self._lock:
             return {
                 "enabled": self.enabled,
+                "paused": self._paused,
                 "active": sorted(self._active),
                 "completed": len(self._completed),
                 "cooldown": sorted(self._failed_at),

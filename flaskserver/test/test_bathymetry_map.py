@@ -35,6 +35,15 @@ class BathymetryMapTests(unittest.TestCase):
             "('12-1-2', 'carve_v1', 1, 'now')"
         )
         db.execute(
+            "INSERT INTO tiles VALUES "
+            "('12-1-3', 12, ?, ?, ?, ?)",
+            (qx + 800, qy + 800, qx + 900, qy + 900),
+        )
+        db.execute(
+            "INSERT INTO bathymetry VALUES "
+            "('12-1-3', 'outside_circle', 1, 'now')"
+        )
+        db.execute(
             "INSERT INTO soundings VALUES "
             "('source', 'near', 64.175, -51.7388, 120, 'actual')"
         )

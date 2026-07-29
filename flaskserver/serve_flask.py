@@ -34,7 +34,11 @@ from terrain_config import (
   WMS_TEXTURE_PROBE_MAX_DEPTH,
 )
 from tile_address import parse_tile_id as _parse_tile_id
-from bathymetry_demand import BathymetryDemandScheduler
+from bathymetry_demand import (
+  BathymetryDemandScheduler,
+  terrain_request_max_depth,
+  terrain_request_origin,
+)
 
 log = get_logger("terrain")
 log_db = get_logger("terrain.db")
@@ -467,7 +471,9 @@ def _tex_retry_worker() -> None:
 
 _cog_scheduler_lock = threading.RLock()
 _cog_fetching_tiles: set[str] = set()
-_cog_pending_tiles: dict[str, tuple[float, float, float, float]] = {}
+_cog_pending_tiles: dict[
+  str, tuple[tuple[float, float, float, float], str]
+] = {}
 _cog_demand_ids: set[str] = set()
 _cog_fetched_total = 0      # lifetime count of COG tiles fetched from S3
 _cog_skipped_total = 0      # lifetime count of tiles skipped (already had data)
@@ -485,7 +491,9 @@ def _request_timestamp() -> str:
   return datetime.datetime.now(datetime.timezone.utc).isoformat()
 
 
-def _record_dem_requests(db, missing, requested_at: str | None = None) -> int:
+def _record_dem_requests(
+  db, missing, requested_at: str | None = None, *, origin: str = "viewer"
+) -> int:
   """Record that the terrain algorithm demanded these tile heightmaps."""
   tile_ids = list(dict.fromkeys(tile_id for tile_id, _ in missing))
   if not tile_ids:
@@ -498,12 +506,15 @@ def _record_dem_requests(db, missing, requested_at: str | None = None) -> int:
   db.commit()
   for tile_id in tile_ids:
     log_cog.info(
-      f"[tile-audit] tile={tile_id} stage=dem_demanded at={timestamp}"
+      f"[tile-audit] tile={tile_id} stage=dem_demanded "
+      f"origin={origin} at={timestamp}"
     )
   return len(tile_ids)
 
 
-def _record_dem_request(db, tile_id: str, requested_at: str | None = None) -> str:
+def _record_dem_request(
+  db, tile_id: str, requested_at: str | None = None, *, origin: str = "viewer"
+) -> str:
   """Persist proof that a DEM worker began processing this tile."""
   timestamp = requested_at or _request_timestamp()
   db.execute(
@@ -512,12 +523,15 @@ def _record_dem_request(db, tile_id: str, requested_at: str | None = None) -> st
   )
   db.commit()
   log_cog.info(
-    f"[tile-audit] tile={tile_id} stage=dem_requested at={timestamp}"
+    f"[tile-audit] tile={tile_id} stage=dem_requested "
+    f"origin={origin} at={timestamp}"
   )
   return timestamp
 
 
-def _record_cog_request(tile_id: str, event: dict) -> None:
+def _record_cog_request(
+  tile_id: str, event: dict, *, origin: str = "viewer"
+) -> None:
   """Record every concrete provider COG attempt in the existing server log."""
   timestamp = event.get("at") or _request_timestamp()
   stage = event.get("stage", "cog_event")
@@ -526,7 +540,7 @@ def _record_cog_request(tile_id: str, event: dict) -> None:
   detail = event.get("detail")
   parts = [
     f"tile={tile_id}", f"stage={stage}", f"provider={provider}",
-    f"at={timestamp}",
+    f"origin={origin}", f"at={timestamp}",
   ]
   if outcome is not None:
     parts.append(f"outcome={outcome}")
@@ -561,7 +575,7 @@ def _tile_ancestor_ids(tile_id: str):
     yield f"{depth}-{column}-{row}"
 
 
-def _fetch_one_cog_tile(tile_id, bbox):
+def _fetch_one_cog_tile(tile_id, bbox, origin="viewer"):
   """Fetch and persist one tile; completion never waits for sibling tiles."""
   from ingest import _read_cog_heightmap, _resample_from_parent
   from database import CONFIDENCE, TileClobberError, write_tile
@@ -582,17 +596,18 @@ def _fetch_one_cog_tile(tile_id, bbox):
     if parsed is not None and parsed[0] > WMS_CONTRACT_DEPTH:
       from serve import _cook_cooked_dem_quad
 
-      _record_dem_request(db, tile_id)
+      _record_dem_request(db, tile_id, origin=origin)
       if _cook_cooked_dem_quad(
         db, tile_id,
       ):
         log_cog.info(
-          f"[tile-audit] tile={tile_id} stage=dem_completed outcome=cooked"
+          f"[tile-audit] tile={tile_id} stage=dem_completed "
+          f"origin={origin} outcome=cooked"
         )
         return "fetched"
       log_cog.info(
         f"[tile-audit] tile={tile_id} stage=dem_completed "
-        "outcome=cook_deferred"
+        f"origin={origin} outcome=cook_deferred"
       )
       # NOT "defer": that requeues and redispatches immediately, and a
       # cook-defer is millisecond-fast — it would hot-loop a worker until
@@ -606,9 +621,13 @@ def _fetch_one_cog_tile(tile_id, bbox):
       f"[cog-worker] {tile_id}: reading "
       f"bbox=[{bbox[0]:.0f},{bbox[1]:.0f},{bbox[2]:.0f},{bbox[3]:.0f}]"
     )
-    _record_dem_request(db, tile_id)
+    _record_dem_request(db, tile_id, origin=origin)
     data, src_name = _read_cog_heightmap(
-      bbox, _GRID_N, audit=lambda event: _record_cog_request(tile_id, event)
+      bbox,
+      _GRID_N,
+      audit=lambda event: _record_cog_request(
+        tile_id, event, origin=origin
+      ),
     )
 
     if data is None:
@@ -616,7 +635,7 @@ def _fetch_one_cog_tile(tile_id, bbox):
       if water is not None and _np.all(water):
         log_cog.info(
           f"[tile-audit] tile={tile_id} stage=dem_completed "
-          "outcome=official_ocean"
+          f"origin={origin} outcome=official_ocean"
         )
         _mark_official_ocean(db, tile_id)
         return "fetched"
@@ -631,7 +650,8 @@ def _fetch_one_cog_tile(tile_id, bbox):
         )
       if ancestor_work:
         log_cog.info(
-          f"[tile-audit] tile={tile_id} stage=dem_completed outcome=deferred"
+          f"[tile-audit] tile={tile_id} stage=dem_completed "
+          f"origin={origin} outcome=deferred"
         )
         return "defer"
 
@@ -640,7 +660,8 @@ def _fetch_one_cog_tile(tile_id, bbox):
       )
       if data is None:
         log_cog.info(
-          f"[tile-audit] tile={tile_id} stage=dem_completed outcome=no_data"
+          f"[tile-audit] tile={tile_id} stage=dem_completed "
+          f"origin={origin} outcome=no_data"
         )
         mark_no_data(db, tile_id)
         return "no_data"
@@ -659,12 +680,13 @@ def _fetch_one_cog_tile(tile_id, bbox):
         log_cog.info(f"[PARENT RESAMPLE] {tile_id}: filled from parent")
       log_cog.info(
         f"[tile-audit] tile={tile_id} stage=dem_completed "
-        f"outcome=stored source={source_name}"
+        f"origin={origin} outcome=stored source={source_name}"
       )
       return "synthetic" if source_name == "parent_resampled" else "fetched"
     except TileClobberError:
       log_cog.info(
-        f"[tile-audit] tile={tile_id} stage=dem_completed outcome=clobber_skipped"
+        f"[tile-audit] tile={tile_id} stage=dem_completed "
+        f"origin={origin} outcome=clobber_skipped"
       )
       return "skipped"
   except Exception as exc:
@@ -674,7 +696,7 @@ def _fetch_one_cog_tile(tile_id, bbox):
     try:
       log_cog.info(
         f"[tile-audit] tile={tile_id} stage=dem_completed "
-        f"outcome=error error={type(exc).__name__}"
+        f"origin={origin} outcome=error error={type(exc).__name__}"
       )
       mark_no_data(db, tile_id)
     except Exception:
@@ -687,18 +709,20 @@ def _fetch_one_cog_tile(tile_id, bbox):
 def _fill_cog_workers_locked():
   while _cog_pending_tiles and len(_cog_fetching_tiles) < _COG_TILE_WORKERS:
     tile_id = next(iter(_cog_pending_tiles))
-    bbox = _cog_pending_tiles.pop(tile_id)
+    bbox, origin = _cog_pending_tiles.pop(tile_id)
     _cog_fetching_tiles.add(tile_id)
     _cog_already_fetched.add(tile_id)
-    log_cog.info(f"[tile-audit] tile={tile_id} stage=dem_dispatched")
-    future = _cog_pool.submit(_fetch_one_cog_tile, tile_id, bbox)
+    log_cog.info(
+      f"[tile-audit] tile={tile_id} stage=dem_dispatched origin={origin}"
+    )
+    future = _cog_pool.submit(_fetch_one_cog_tile, tile_id, bbox, origin)
     future.add_done_callback(
-      lambda completed, tid=tile_id, tile_bbox=bbox:
-        _finish_cog_tile(tid, tile_bbox, completed)
+      lambda completed, tid=tile_id, tile_bbox=bbox, demand_origin=origin:
+        _finish_cog_tile(tid, tile_bbox, demand_origin, completed)
     )
 
 
-def _finish_cog_tile(tile_id, bbox, future):
+def _finish_cog_tile(tile_id, bbox, origin, future):
   global _cog_fetched_total, _cog_skipped_total
   try:
     outcome = future.result()
@@ -711,7 +735,7 @@ def _finish_cog_tile(tile_id, bbox, future):
     if outcome == "defer":
       _cog_already_fetched.discard(tile_id)
       if tile_id in _cog_demand_ids:
-        _cog_pending_tiles[tile_id] = bbox
+        _cog_pending_tiles[tile_id] = (bbox, origin)
     elif outcome == "cook_deferred":
       # Eligible again, but only the next demand refresh re-queues it —
       # by then the measured parent this cook was waiting on may exist.
@@ -726,14 +750,16 @@ def _finish_cog_tile(tile_id, bbox, future):
       )
       log_cog.info(
         f"[tile-audit] tile={tile_id} stage=dem_retry_scheduled "
-        f"delay_s={_COG_SYNTHETIC_RETRY_SECONDS}"
+        f"origin={origin} delay_s={_COG_SYNTHETIC_RETRY_SECONDS}"
       )
     elif outcome == "skipped":
       _cog_skipped_total += 1
     _fill_cog_workers_locked()
 
 
-def _schedule_cog_demand(missing, visible_synthetic=()):
+def _schedule_cog_demand(
+  missing, visible_synthetic=(), *, origin="viewer"
+):
   """Replace unstarted work with the latest camera-priority ordering."""
   global _cog_pending_tiles, _cog_demand_ids
   with _cog_scheduler_lock:
@@ -747,12 +773,12 @@ def _schedule_cog_demand(missing, visible_synthetic=()):
       _cog_already_fetched.discard(tile_id)
       due_retries.append((tile_id, visible_retry_bboxes[tile_id]))
       log_cog.info(
-        f"[tile-audit] tile={tile_id} stage=dem_retry_due"
+        f"[tile-audit] tile={tile_id} stage=dem_retry_due origin={origin}"
       )
     demand = list(missing) + due_retries
     _cog_demand_ids = {tile_id for tile_id, _ in demand}
     _cog_pending_tiles = {
-      tile_id: bbox for tile_id, bbox in demand
+      tile_id: (bbox, origin) for tile_id, bbox in demand
       if tile_id not in _cog_already_fetched
       and tile_id not in _cog_fetching_tiles
     }
@@ -1560,7 +1586,11 @@ def api_tiles():
     return unavailable
 
   error = _arg_float("error", 0.0005)
-  max_depth = MAX_TILE_DEPTH
+  # Only an untagged viewer request may drive terrain/coastline below the
+  # depth-12 data contract. Bathymetry's synthetic camera sweep exists solely
+  # to acquire solve/carve prerequisites and must never populate d13+ tiles.
+  max_depth = terrain_request_max_depth(request.args, MAX_TILE_DEPTH)
+  demand_origin = terrain_request_origin(request.args)
   max_range = _arg_float("range", 16000.0)
 
   if "sx" in request.args and "sy" in request.args:
@@ -1665,14 +1695,14 @@ def api_tiles():
 
   # Continuously feed free workers. Unstarted work is replaced by every new
   # camera-priority list, so there is neither a wave barrier nor a stale queue.
-  _record_dem_requests(_get_db(), missing)
+  _record_dem_requests(_get_db(), missing, origin=demand_origin)
   visible_synthetic = [
     (tile["id"], tile["bbox"])
     for tile in tiles
     if tile.get("source") == "parent_resampled"
   ]
   active_cog, pending_cog = _schedule_cog_demand(
-    missing, visible_synthetic
+    missing, visible_synthetic, origin=demand_origin
   )
   if missing:
     log_cog.debug(

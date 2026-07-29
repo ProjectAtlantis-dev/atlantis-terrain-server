@@ -48,6 +48,17 @@ export function createTerrainBackend({
   const sceneFog = new THREE.FogExp2(0x000000, 0.00009);
   scene.fog = sceneFog;
 
+  function renderDiagnosticOverlay(overlayScene, camera) {
+    if (overlayScene == null) return;
+    const previousAutoClear = renderer.autoClear;
+    renderer.autoClear = false;
+    try {
+      renderer.render(overlayScene, camera);
+    } finally {
+      renderer.autoClear = previousAutoClear;
+    }
+  }
+
   bootLog('renderer.ready', {
     backend: 'webgl', width, height, pixelRatio,
     shadowMap: renderer.shadowMap.type,
@@ -147,19 +158,21 @@ export function createTerrainBackend({
       renderer.setSize(nextWidth, nextHeight);
       composer?.setSize(nextWidth, nextHeight);
     },
-    renderMap(scene, camera, background) {
+    renderMap(scene, camera, background, overlayScene = null) {
       const previousBackground = scene.background;
       scene.background = background;
       try {
         renderer.render(scene, camera);
+        renderDiagnosticOverlay(overlayScene, camera);
       } finally {
         scene.background = previousBackground;
       }
     },
-    renderScene() {
+    renderScene(scene, camera, overlayScene = null) {
       gpuProfiler.beginFrame();
       try {
         composer?.render();
+        renderDiagnosticOverlay(overlayScene, camera);
       } finally {
         gpuProfiler.endFrame();
       }
