@@ -34,6 +34,7 @@ from terrain_config import (
   WMS_TEXTURE_PROBE_MAX_DEPTH,
 )
 from tile_address import parse_tile_id as _parse_tile_id
+from bathymetry_demand import BathymetryDemandScheduler
 
 log = get_logger("terrain")
 log_db = get_logger("terrain.db")
@@ -81,6 +82,15 @@ def _env_int(name: str, default: int) -> int:
     return int(raw)
   except (TypeError, ValueError):
     return default
+
+
+_bathymetry_demand = BathymetryDemandScheduler(
+  DB_PATH,
+  glacier_root=os.environ.get("GLACIER_ROOT") or None,
+  workers=max(1, _env_int("BATHYMETRY_WORKERS", 1)),
+  retry_seconds=max(1, _env_int("BATHYMETRY_RETRY_SECONDS", 60)),
+  logger=log,
+)
 
 
 def _require_available_port(host: str, port: int) -> None:
@@ -1671,6 +1681,16 @@ def api_tiles():
   with _cog_scheduler_lock:
     downloading = list(_cog_fetching_tiles)
 
+  # Bathymetry follows the same visible-demand loop, but only after a real
+  # depth-12 DEM and authoritative coastline mask exist. The scheduler
+  # coalesces eligible fjord/coastal tiles at depth 8 and ignores open ocean.
+  bathymetry_submitted = []
+  if request.args.get("bathymetry", "1") != "0":
+    bathymetry_submitted = _bathymetry_demand.schedule(
+      _get_db(), all_tile_ids
+    )
+  bathymetry_status = _bathymetry_demand.status()
+
   try:
     buildings = _buildings_for_tile_query(qx, qy, ox, oy)
   except Exception as exc:
@@ -1695,6 +1715,8 @@ def api_tiles():
       "texQueued": len(tex_fetching),
       "texRetryQueue": len(_tex_retry_queue),
       "texStatusCounts": tex_status_counts,
+      "bathymetryQueued": bathymetry_submitted,
+      "bathymetryStatus": bathymetry_status,
       "buildings": buildings,
       "buildingCount": len(buildings) if buildings is not None else None,
     }
@@ -1706,6 +1728,30 @@ def api_assets():
   """Viewer-facing startup assets, read by Flask from the shared catalog."""
   from asset_catalog import get_assets_response
   return jsonify(get_assets_response(_get_assets_db()))
+
+
+@app.get("/api/bathymetry-map")
+def api_bathymetry_map():
+  """Mapped bathymetry footprints and sounding markers near the camera."""
+  unavailable = _terrain_unavailable_response()
+  if unavailable is not None:
+    return unavailable
+  if "sx" in request.args and "sy" in request.args:
+    qx = _arg_float("sx", 0.0)
+    qy = _arg_float("sy", 0.0)
+  else:
+    lat = _arg_float("lat", 64.175)
+    lon = _arg_float("lon", -51.7388)
+    qx, qy = _to_stereo(lat, lon)
+  max_range = _arg_float("range", 50000.0)
+  ox = _arg_float("ox", qx)
+  oy = _arg_float("oy", qy)
+  from bathymetry_map import query_bathymetry_map
+  return jsonify(
+    query_bathymetry_map(
+      _get_db(), qx, qy, max_range, ox=ox, oy=oy,
+    )
+  )
 
 
 @app.post("/api/vehicle_state")

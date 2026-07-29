@@ -1,55 +1,45 @@
 #!/usr/bin/env python3
-"""Import measured depth evidence into terrain.db.
-
-This command never writes ``bathymetry``. Source observations and their
-original payloads live in the depth-evidence tables so generated terrain can
-be evaluated against evidence without making the evidence circular.
-
-Dry-run is the default.
-"""
+"""Import sourced point depths into terrain.db. Dry-run is the default."""
 
 import argparse
 import csv
-import hashlib
 import io
-import json
 import sqlite3
+import tempfile
 import urllib.request
-from datetime import datetime, timezone
 from pathlib import Path
 
+import numpy as np
+import rasterio
+from rasterio.transform import xy
+from rasterio.warp import transform
+
 from database import open_db
+from terrain_config import GREENLAND_BBOX
 
 
 DEFAULT_DB = Path(__file__).with_name("terrain.db")
 PANGAEA_933610_URL = (
     "https://doi.pangaea.de/10.1594/PANGAEA.933610?format=textfile"
 )
-PANGAEA_933610_SOURCE_ID = "pangaea_933610"
-IMPORTER_VERSION = 1
-
-
-def utc_now():
-    return datetime.now(timezone.utc).isoformat()
+PANGAEA_992416_URL = "https://doi.org/10.1594/PANGAEA.992416"
+PANGAEA_992416_FILE_URL = (
+    "https://download.pangaea.de/dataset/992416/files/"
+    "Multibeam_backscatter_50m_32622_NaN.tif"
+)
+VALIDATION_TILE_DEPTH = 12
 
 
 def read_input(location):
     if location.startswith(("https://", "http://")):
         with urllib.request.urlopen(location, timeout=60) as response:
-            return response.read(), location.rsplit("/", 1)[-1] or "download"
-    path = Path(location)
-    return path.read_bytes(), path.name
+            return response.read()
+    return Path(location).read_bytes()
 
 
 def parse_pangaea_ctd_endpoints(payload):
-    """Reduce each CTD profile to its deepest recorded sample.
-
-    The result is a lower-bound constraint, not a seafloor observation. A
-    profile is identified by event, date, station and position so repeated
-    visits to a station remain separate evidence records.
-    """
-    text = payload.decode("utf-8-sig")
-    lines = text.splitlines()
+    """Reduce each CTD profile to its deepest recorded sample."""
+    lines = payload.decode("utf-8-sig").splitlines()
     try:
         header = next(i for i, line in enumerate(lines) if line.startswith("Event\t"))
     except StopIteration as exc:
@@ -80,252 +70,176 @@ def parse_pangaea_ctd_endpoints(payload):
             row["Longitude"],
         )
         depth_m = float(row["Depth water [m]"])
-        previous = profiles.get(key)
-        if previous is None or depth_m > previous:
+        if key not in profiles or depth_m > profiles[key]:
             profiles[key] = depth_m
 
-    observations = []
+    soundings = []
     for key, depth_m in sorted(profiles.items()):
         event, observed_at, station, latitude, longitude = key
-        source_record_id = "|".join(key)
-        digest = hashlib.sha256(source_record_id.encode("utf-8")).hexdigest()[:24]
-        observations.append(
+        soundings.append(
             {
-                "observation_id": f"{PANGAEA_933610_SOURCE_ID}:{digest}",
-                "source_record_id": source_record_id,
-                "longitude_deg": float(longitude),
-                "latitude_deg": float(latitude),
+                "record_id": "|".join((event, observed_at, station)),
+                "latitude": float(latitude),
+                "longitude": float(longitude),
                 "depth_m": depth_m,
-                "observed_at": observed_at,
-                "properties_json": json.dumps(
-                    {
-                        "event": event,
-                        "station": station,
-                        "aggregation": "maximum recorded CTD sample depth",
-                        "semantic_note": (
-                            "Lower bound on water depth; CTD did not necessarily "
-                            "contact the seafloor."
-                        ),
-                    },
-                    sort_keys=True,
-                    separators=(",", ":"),
-                ),
             }
         )
-    return source_rows, observations
+    return source_rows, soundings
 
 
-def register_source(db, source):
-    existing = db.execute(
-        "SELECT content_sha256 FROM depth_sources WHERE source_id = ?",
-        (source["source_id"],),
-    ).fetchone()
-    incoming_hash = source["content_sha256"]
-    if (
-        existing is not None
-        and existing[0] is not None
-        and incoming_hash is not None
-        and existing[0] != incoming_hash
-    ):
-        raise ValueError(
-            f"source {source['source_id']} already has a different content hash; "
-            "use a new source_id for a revised dataset"
-        )
+def tile_address(x, y):
+    x_min, y_min, x_max, y_max = GREENLAND_BBOX
+    tiles_per_axis = 1 << VALIDATION_TILE_DEPTH
+    col = int(np.floor((x - x_min) / ((x_max - x_min) / tiles_per_axis)))
+    row = int(np.floor((y - y_min) / ((y_max - y_min) / tiles_per_axis)))
+    if not (0 <= col < tiles_per_axis and 0 <= row < tiles_per_axis):
+        return None
+    return f"{VALIDATION_TILE_DEPTH}-{col}-{row}"
+
+
+def aggregate_ctd_endpoints(soundings):
+    """Keep the strongest lower-bound check in each depth-12 tile."""
+    longitudes = [row["longitude"] for row in soundings]
+    latitudes = [row["latitude"] for row in soundings]
+    xs, ys = transform("EPSG:4326", "EPSG:3413", longitudes, latitudes)
+    by_tile = {}
+    for sounding, x, y in zip(soundings, xs, ys):
+        record_id = tile_address(x, y)
+        if record_id is None:
+            continue
+        previous = by_tile.get(record_id)
+        if previous is None or sounding["depth_m"] > previous["depth_m"]:
+            by_tile[record_id] = {**sounding, "record_id": record_id}
+    return [by_tile[key] for key in sorted(by_tile)]
+
+
+def import_pangaea_933610(db, payload):
+    source_rows, endpoints = parse_pangaea_ctd_endpoints(payload)
+    soundings = aggregate_ctd_endpoints(endpoints)
     db.execute(
-        """
-        INSERT INTO depth_sources (
-            source_id, title, citation, source_url, doi, provider, license,
-            data_kind, original_filename, content_sha256,
-            source_metadata_json, retrieved_at, updated_at
-        ) VALUES (
-            :source_id, :title, :citation, :source_url, :doi, :provider,
-            :license, :data_kind, :original_filename, :content_sha256,
-            :source_metadata_json, :retrieved_at, :updated_at
-        )
-        ON CONFLICT(source_id) DO UPDATE SET
-            retrieved_at = excluded.retrieved_at,
-            updated_at = excluded.updated_at
-        """,
-        source,
+        "DELETE FROM soundings WHERE source_url = ?",
+        (PANGAEA_933610_URL,),
     )
-
-
-def import_pangaea_933610(db, payload, filename, source_url, now=None):
-    now = now or utc_now()
-    sha256 = hashlib.sha256(payload).hexdigest()
-    source_rows, observations = parse_pangaea_ctd_endpoints(payload)
-    source = {
-        "source_id": PANGAEA_933610_SOURCE_ID,
-        "title": (
-            "Seasonal temperature and salinity depth measurements from "
-            "southwest Greenland fjords in 2019"
-        ),
-        "citation": (
-            "Stuart-Lee, Alice; Meire, Lorenz; Mortensen, John (2021): "
-            "Seasonal temperature and salinity depth measurements from "
-            "southwest Greenland fjords in 2019. PANGAEA, "
-            "https://doi.org/10.1594/PANGAEA.933610"
-        ),
-        "source_url": source_url,
-        "doi": "10.1594/PANGAEA.933610",
-        "provider": "PANGAEA",
-        "license": "CC-BY-4.0",
-        "data_kind": "point_observations",
-        "original_filename": filename,
-        "content_sha256": sha256,
-        "source_metadata_json": json.dumps(
-            {
-                "regions": ["Ameralik", "Godthåbsfjord"],
-                "instrument": "Sea-Bird SBE19plus CTD",
-                "normalization": (
-                    "one endpoint per Event/Date/Station/Latitude/Longitude "
-                    "profile, using the maximum sampled water depth"
-                ),
-                "evidence_kind": "minimum_depth",
-            },
-            sort_keys=True,
-            separators=(",", ":"),
-        ),
-        "retrieved_at": now,
-        "updated_at": now,
-    }
-    register_source(db, source)
-
-    asset_id = f"{PANGAEA_933610_SOURCE_ID}:raw:{sha256[:16]}"
-    db.execute(
+    db.executemany(
         """
-        INSERT INTO depth_assets (
-            asset_id, source_id, filename, media_type, payload, byte_length,
-            content_sha256, evidence_kind, measurement_method, horizontal_crs,
-            vertical_datum, resolution_m, west_deg, south_deg, east_deg,
-            north_deg, metadata_json, imported_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(asset_id) DO NOTHING
+        INSERT INTO soundings (
+            source_url, record_id, latitude, longitude, depth_m, depth_kind
+        ) VALUES (?, ?, ?, ?, ?, 'at_least')
+        ON CONFLICT(source_url, record_id) DO UPDATE SET
+            latitude = excluded.latitude,
+            longitude = excluded.longitude,
+            depth_m = excluded.depth_m,
+            depth_kind = excluded.depth_kind
         """,
         (
-            asset_id,
-            PANGAEA_933610_SOURCE_ID,
-            filename,
-            "text/tab-separated-values",
-            payload,
-            len(payload),
-            sha256,
-            "minimum_depth",
-            "ctd_profile",
-            "EPSG:4326",
-            "instantaneous_water_surface",
-            -52.182400,
-            64.050567,
-            -50.013450,
-            64.717000,
-            json.dumps(
-                {
-                    "raw_data_rows": source_rows,
-                    "normalized_profile_endpoints": len(observations),
-                },
-                sort_keys=True,
-                separators=(",", ":"),
-            ),
-            now,
-        ),
-    )
-
-    for observation in observations:
-        db.execute(
-            """
-            INSERT INTO depth_observations (
-                observation_id, source_id, source_record_id, longitude_deg,
-                latitude_deg, depth_m, evidence_kind, measurement_method,
-                observed_at, horizontal_datum, vertical_datum,
-                horizontal_accuracy_m, vertical_accuracy_m, properties_json,
-                imported_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)
-            ON CONFLICT(observation_id) DO UPDATE SET
-                depth_m = excluded.depth_m,
-                properties_json = excluded.properties_json,
-                imported_at = excluded.imported_at
-            """,
             (
-                observation["observation_id"],
-                PANGAEA_933610_SOURCE_ID,
-                observation["source_record_id"],
-                observation["longitude_deg"],
-                observation["latitude_deg"],
-                observation["depth_m"],
-                "minimum_depth",
-                "ctd_cast_endpoint",
-                observation["observed_at"],
-                "EPSG:4326",
-                "instantaneous_water_surface",
-                observation["properties_json"],
-                now,
-            ),
-        )
-
-    import_id = (
-        f"{PANGAEA_933610_SOURCE_ID}:ctd_endpoints_v{IMPORTER_VERSION}:"
-        f"{sha256[:16]}"
-    )
-    db.execute(
-        """
-        INSERT INTO depth_imports (
-            import_id, source_id, importer, importer_version, input_sha256,
-            source_row_count, observation_count, asset_count, started_at,
-            completed_at, notes
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
-        ON CONFLICT(import_id) DO UPDATE SET
-            completed_at = excluded.completed_at,
-            source_row_count = excluded.source_row_count,
-            observation_count = excluded.observation_count
-        """,
-        (
-            import_id,
-            PANGAEA_933610_SOURCE_ID,
-            "ingest_depth_evidence:pangaea-933610",
-            IMPORTER_VERSION,
-            sha256,
-            source_rows,
-            len(observations),
-            now,
-            now,
-            "CTD profile endpoints imported as minimum-depth constraints.",
+                PANGAEA_933610_URL,
+                row["record_id"],
+                row["latitude"],
+                row["longitude"],
+                row["depth_m"],
+            )
+            for row in soundings
         ),
     )
-    return {
-        "source_rows": source_rows,
-        "observations": len(observations),
-        "assets": 1,
-        "sha256": sha256,
-    }
+    return source_rows, len(soundings)
+
+
+def aggregate_pangaea_992416(path):
+    """Average the multibeam cells within each depth-12 terrain tile."""
+    cells = 0
+    by_tile = {}
+    with rasterio.open(path) as raster:
+        for row_start in range(0, raster.height, 256):
+            row_stop = min(row_start + 256, raster.height)
+            data = raster.read(
+                1,
+                window=((row_start, row_stop), (0, raster.width)),
+                masked=True,
+            )
+            valid = (~np.ma.getmaskarray(data)) & np.isfinite(data.data)
+            valid &= data.data < 0.0
+            local_rows, cols = np.nonzero(valid)
+            rows = local_rows + row_start
+            eastings, northings = xy(raster.transform, rows, cols)
+            xs, ys = transform(raster.crs, "EPSG:3413", eastings, northings)
+            depths = -data.data[local_rows, cols]
+            cells += len(depths)
+            for x, y, depth in zip(xs, ys, depths):
+                record_id = tile_address(x, y)
+                if record_id is None:
+                    continue
+                totals = by_tile.setdefault(record_id, [0.0, 0.0, 0.0, 0])
+                totals[0] += x
+                totals[1] += y
+                totals[2] += float(depth)
+                totals[3] += 1
+
+    keys = sorted(by_tile)
+    mean_xs = [by_tile[key][0] / by_tile[key][3] for key in keys]
+    mean_ys = [by_tile[key][1] / by_tile[key][3] for key in keys]
+    longitudes, latitudes = transform(
+        "EPSG:3413", "EPSG:4326", mean_xs, mean_ys
+    )
+    soundings = [
+        {
+            "record_id": key,
+            "latitude": float(latitude),
+            "longitude": float(longitude),
+            "depth_m": by_tile[key][2] / by_tile[key][3],
+        }
+        for key, latitude, longitude in zip(keys, latitudes, longitudes)
+    ]
+    return cells, soundings
+
+
+def import_pangaea_992416(db, path):
+    cells, soundings = aggregate_pangaea_992416(path)
+    db.execute(
+        "DELETE FROM soundings WHERE source_url = ?",
+        (PANGAEA_992416_URL,),
+    )
+    db.executemany(
+        """
+        INSERT INTO soundings (
+            source_url, record_id, latitude, longitude, depth_m, depth_kind
+        ) VALUES (?, ?, ?, ?, ?, 'actual')
+        """,
+        (
+            (
+                PANGAEA_992416_URL,
+                row["record_id"],
+                row["latitude"],
+                row["longitude"],
+                row["depth_m"],
+            )
+            for row in soundings
+        ),
+    )
+    return cells, len(soundings)
+
+
+def local_raster(location):
+    if not location.startswith(("https://", "http://")):
+        return Path(location), None
+    temporary = tempfile.NamedTemporaryFile(suffix=".tif", delete=False)
+    temporary.close()
+    urllib.request.urlretrieve(location, temporary.name)
+    return Path(temporary.name), Path(temporary.name)
 
 
 def print_status(db):
     rows = db.execute(
         """
-        SELECT s.source_id, s.data_kind,
-               COALESCE(o.observations, 0),
-               COALESCE(a.assets, 0),
-               COALESCE(a.bytes, 0),
-               COALESCE(o.bottom_depths, 0),
-               COALESCE(o.minimum_depths, 0)
-        FROM depth_sources s
-        LEFT JOIN (
-            SELECT source_id, COUNT(*) observations,
-                   SUM(evidence_kind = 'seafloor_depth') bottom_depths,
-                   SUM(evidence_kind = 'minimum_depth') minimum_depths
-            FROM depth_observations GROUP BY source_id
-        ) o USING (source_id)
-        LEFT JOIN (
-            SELECT source_id, COUNT(*) assets, SUM(byte_length) bytes
-            FROM depth_assets GROUP BY source_id
-        ) a USING (source_id)
-        ORDER BY s.source_id
+        SELECT source_url, COUNT(*),
+               SUM(depth_kind = 'actual'),
+               SUM(depth_kind = 'at_least')
+        FROM soundings
+        GROUP BY source_url
+        ORDER BY source_url
         """
     ).fetchall()
-    print(
-        "source_id\tdata_kind\tobservations\tassets\tbytes\t"
-        "seafloor_depth\tminimum_depth"
-    )
+    print("source_url\trows\tactual\tat_least")
     for row in rows:
         print("\t".join(str(value) for value in row))
 
@@ -337,12 +251,18 @@ def main(argv=None):
 
     pangaea = subparsers.add_parser(
         "pangaea-933610",
-        help="import Ameralik/Godthåbsfjord CTD endpoints as minimum depths",
+        help="import Ameralik/Godthåbsfjord CTD endpoints as lower bounds",
     )
     pangaea.add_argument("--input", default=PANGAEA_933610_URL)
     pangaea.add_argument("--commit", action="store_true")
 
-    subparsers.add_parser("status", help="summarize stored depth evidence")
+    multibeam = subparsers.add_parser(
+        "pangaea-992416",
+        help="import the 50 m Nuup Kangerlua multibeam grid as actual depths",
+    )
+    multibeam.add_argument("--input", default=PANGAEA_992416_FILE_URL)
+    multibeam.add_argument("--commit", action="store_true")
+    subparsers.add_parser("status", help="summarize stored depth rows")
     args = parser.parse_args(argv)
 
     if args.command == "status":
@@ -353,39 +273,51 @@ def main(argv=None):
             db.close()
         return 0
 
-    payload, filename = read_input(args.input)
-    source_rows, observations = parse_pangaea_ctd_endpoints(payload)
-    sha256 = hashlib.sha256(payload).hexdigest()
-    print(
-        f"PANGAEA 933610: {source_rows:,} CTD samples -> "
-        f"{len(observations):,} profile endpoints; sha256={sha256}"
-    )
-    print(
-        "Evidence semantics: minimum_depth "
-        "(the CTD endpoint is not a measured seafloor depth)."
-    )
-    if not args.commit:
-        print("DRY RUN — nothing changed. Re-run with --commit.")
+    if args.command == "pangaea-933610":
+        payload = read_input(args.input)
+        source_rows, endpoints = parse_pangaea_ctd_endpoints(payload)
+        soundings = aggregate_ctd_endpoints(endpoints)
+        print(
+            f"PANGAEA 933610: {source_rows:,} CTD samples -> "
+            f"{len(endpoints):,} profile endpoints -> "
+            f"{len(soundings):,} depth-12 tile checks"
+        )
+        print("Depth kind: at_least (a CTD endpoint is not a bottom sounding).")
+        if not args.commit:
+            print("DRY RUN — nothing changed. Re-run with --commit.")
+            return 0
+        db = open_db(str(args.db))
+        try:
+            _, count = import_pangaea_933610(db, payload)
+            db.commit()
+            print(f"Stored {count:,} rows in soundings.")
+            print_status(db)
+        finally:
+            db.close()
         return 0
 
-    db = open_db(str(args.db))
+    raster_path, temporary_path = local_raster(args.input)
     try:
-        result = import_pangaea_933610(
-            db,
-            payload,
-            filename,
-            PANGAEA_933610_URL
-            if args.input == PANGAEA_933610_URL
-            else str(Path(args.input).resolve()),
-        )
-        db.commit()
+        cells, soundings = aggregate_pangaea_992416(raster_path)
         print(
-            f"Stored {result['observations']:,} observations and the original "
-            f"{result['assets']:,} source asset in {args.db}."
+            f"PANGAEA 992416: {cells:,} underwater 50 m cells -> "
+            f"{len(soundings):,} depth-12 tile checks"
         )
-        print_status(db)
+        print("Depth kind: actual.")
+        if not args.commit:
+            print("DRY RUN — nothing changed. Re-run with --commit.")
+            return 0
+        db = open_db(str(args.db))
+        try:
+            _, stored = import_pangaea_992416(db, raster_path)
+            db.commit()
+            print(f"Stored {stored:,} rows in soundings.")
+            print_status(db)
+        finally:
+            db.close()
     finally:
-        db.close()
+        if temporary_path is not None:
+            temporary_path.unlink()
     return 0
 
 

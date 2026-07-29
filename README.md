@@ -82,6 +82,18 @@ synthetic −5 m seabed. Missing or positive samples remain exactly −5 m,
 land continues to use `tiles.heightmap`, and detailed terrain tiles
 crop/resample their depth-8 bathymetry ancestor automatically.
 
+When `~/work/glacier/runOnDemand` is present, flying close enough to load a
+depth-12 coastline mask also queues its uncovered depth-8 fjord section.
+Mixed land/water masks trigger directly; all-water tiles trigger only within
+2 km of that coast. Glacier requests the remaining DEM/mask coverage through
+Flask, solves a stable regional bed, writes depth 12, and derives depths 11–8.
+This intentionally excludes offshore banks such as Fylla until a separate
+bank model exists. Set `GLACIER_ROOT` if the Glacier checkout lives elsewhere.
+
+The HUD's **bathymetry map** toggle displays cyan depth-12 mapped footprints,
+yellow actual-bottom soundings, and orange lower-bound observations. It
+refreshes while enabled, so newly completed coverage appears during flight.
+
 ## GPU profiling
 
 Leave the WebGL terrain page open, then control its asynchronous GPU pass

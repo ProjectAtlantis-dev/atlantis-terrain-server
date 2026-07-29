@@ -44,6 +44,9 @@ import { createTerrainFetchRuntime } from './terrain-fetch-runtime.js';
 import { createTerrainTileSet } from './terrain-tile-set.js';
 import { createClassifierOverlay } from './terrain-classifier-overlay.js';
 import { createTerrainGridlinesRuntime } from './terrain-gridlines-runtime.js';
+import {
+  createTerrainBathymetryMapRuntime,
+} from './terrain-bathymetry-map-runtime.js';
 import { restoreTerrainCameraState, terrainCameraState } from './terrain-camera-state.js';
 import { createTerrainClientLogger } from './terrain-client-logging.js';
 import { createTerrainGpuProfileControl } from './terrain-gpu-profile-control.js';
@@ -337,6 +340,7 @@ const renderer = renderBackend.renderer;
 document.body.appendChild(renderer.domElement);
 renderer.domElement.addEventListener('contextmenu', event => event.preventDefault());
 let tileInspectorRuntime = null;
+let bathymetryMapRuntime = null;
 let hudCollapsed = false;
 
 const { hud, alt, gameClock: gameClockEl } = createTerrainHud({
@@ -349,6 +353,7 @@ const { hud, alt, gameClock: gameClockEl } = createTerrainHud({
   onToggleSeamMode: () => toggleSeamMode(),
   onToggleTileInspector: () => toggleTileInspector(),
   onToggleGridlines: () => toggleGridlines(),
+  onToggleBathymetryMap: () => toggleBathymetryMap(),
   onToggleClassifierOverlay: () => cycleClassifierOverlay(),
   onToggleWaterOverlay: () => toggleWaterOverlay(),
   onToggleHydrographyOverlay: () => toggleHydrographyOverlay(),
@@ -1376,6 +1381,17 @@ buildingsRuntime = createTerrainBuildingsRuntime({
   onMutated: markSceneMutated,
   requestRender,
 });
+bathymetryMapRuntime = createTerrainBathymetryMapRuntime({
+  terrainRoot,
+  pipelineState: terrainPipelineState,
+  exaggeration: EXAG,
+  onChanged: () => {
+    updateHud();
+    markSceneMutated();
+  },
+  requestRender,
+  log: tileLog,
+});
 
 function getFogDistance() {
   return terrainFogDistance(getCameraLatLon().alt);
@@ -1782,6 +1798,8 @@ window.takramDebug = {
   fetchTiles: terrainFetchRuntime.request,
   setBuildingsVisible: visible => buildingsRuntime.setVisible(visible),
   getBuildingsMesh: () => buildingsRuntime.getMesh(),
+  setBathymetryMapVisible: visible => bathymetryMapRuntime.setActive(visible),
+  getBathymetryMapGroup: () => bathymetryMapRuntime.group,
   saveVehicleState: reason => vehicleRuntime.saveVehicleState(reason ?? 'debug-api'),
   loadVehicleState: vehicleRuntime.loadVehicleState,
   setVehicleControlActive: active => vehicleRuntime.setVehicleControlActive(Boolean(active), 'debug-api'),
@@ -2078,6 +2096,12 @@ function updateHud() {
   const gridlinesLine = gridlinesRuntime.active
     ? 'gridlines: <span id="gridlinesModeLink" style="color:#8f8;text-decoration:underline;cursor:pointer;pointer-events:auto">ON</span>'
     : 'gridlines: <span id="gridlinesModeLink" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">off</span>';
+  const bathymetryCounts = bathymetryMapRuntime?.counts ?? {
+    coverage: 0, soundings: 0,
+  };
+  const bathymetryMapLine = bathymetryMapRuntime?.active
+    ? `bathymetry map: <span id="bathymetryMapLink" title="Cyan mapped areas; yellow actual and orange lower-bound soundings" style="color:#00d8ff;text-decoration:underline;cursor:pointer;pointer-events:auto">ON</span>  ${bathymetryCounts.coverage} areas / ${bathymetryCounts.soundings} soundings`
+    : 'bathymetry map: <span id="bathymetryMapLink" title="Show mapped areas and soundings" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">off</span>';
   const classifierOverlayColor = {
     off: '#0af', classifier: '#6ecd3c',
   }[classifierOverlay.mode] ?? '#0af';
@@ -2121,6 +2145,7 @@ function updateHud() {
     hmLine,
     texLine,
     gridlinesLine,
+    bathymetryMapLine,
     classifierOverlayLine,
     waterOverlayLine,
     hydrographyOverlayLine,
@@ -2340,6 +2365,14 @@ function toggleSeamMode() {
 function toggleGridlines() {
   if (controls.mapMode) return;
   gridlinesRuntime.toggle();
+}
+
+function toggleBathymetryMap() {
+  const active = bathymetryMapRuntime?.toggle() ?? false;
+  enqueueClientLog('info', 'bathymetry.map.toggle', { active });
+  updateHud();
+  requestRender();
+  return active;
 }
 
 function toggleWaterOverlay() {

@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SERVER_DIR="$SCRIPT_DIR/flaskserver"
+PYTHON_BIN="${PYTHON_BIN:-$SERVER_DIR/venv/bin/python}"
+DB="${DB:-$SERVER_DIR/terrain.db}"
+
+if [[ -f "$SERVER_DIR/.env" ]]; then
+    set -a
+    source "$SERVER_DIR/.env"
+    set +a
+fi
+
+exec "$PYTHON_BIN" "$SERVER_DIR/ingest_depth_evidence.py" --db "$DB" "$@"
