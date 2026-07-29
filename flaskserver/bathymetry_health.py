@@ -194,7 +194,12 @@ def refresh_sounding_health(
         ).fetchone()
         if tile is None:
             return 0
-        bounds = tuple(float(value) for value in tile)
+        bounds = (
+            float(tile[0]),
+            float(tile[1]),
+            float(tile[2]),
+            float(tile[3]),
+        )
 
     clauses = ["evidence_status = 'accepted'"]
     params: list[object] = []
