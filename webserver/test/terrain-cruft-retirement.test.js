@@ -28,6 +28,11 @@ test('stale-parent no-op lifecycle plumbing stays retired', () => {
     assert.doesNotMatch(source, /\bsweepStaleParents\b/);
     assert.doesNotMatch(source, /\bstaleRemoved\b/);
   }
+  const tileSetSource = readFileSync(
+    new URL('../terrain-tile-set.js', import.meta.url),
+    'utf8',
+  );
+  assert.doesNotMatch(tileSetSource, /\bevictCoveredAncestors\b/);
 });
 
 test('unused procgen debris and leaf material stay retired', () => {

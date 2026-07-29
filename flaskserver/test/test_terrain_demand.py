@@ -1,4 +1,4 @@
-"""Terrain demand coverage and LOD-history behavior."""
+"""Terrain demand and coverage behavior."""
 
 import datetime
 import tempfile
@@ -13,9 +13,7 @@ from terrain_config import MAX_TILE_DEPTH, WMS_CONTRACT_DEPTH
 from serve import (
     _UPGRADEABLE_SOURCES,
     _balance_lod_leaves, _coarse_lod_neighbors, _cook_cooked_dem_quad,
-    _ensure_children,
-    _lod_complete_ancestors,
-    _lod_target_depth, _traverse, bbox_in_view_circle,
+    _ensure_children, _lod_target_depth, _traverse, bbox_in_view_circle,
 )
 
 
@@ -67,40 +65,6 @@ class TestViewCoverageCircle(unittest.TestCase):
 
     def test_parent_resampled_tiles_remain_visible_upgrade_candidates(self):
         self.assertIn('parent_resampled', _UPGRADEABLE_SOURCES)
-
-    def test_lod_history_requires_complete_descendant_coverage(self):
-        complete = {'12-20-40', '12-21-40', '12-20-41', '12-21-41'}
-        self.assertIn((11, 10, 20), _lod_complete_ancestors(complete))
-        complete.remove('12-21-41')
-        self.assertNotIn((11, 10, 20), _lod_complete_ancestors(complete))
-
-    def test_traversal_uses_a_lower_threshold_to_coarsen(self):
-        parent = {
-            'source': 'arcticdem', 'bbox': [100, 0, 200, 100],
-            'geometric_error': 0.08,
-        }
-        child = {
-            'source': 'arcticdem', 'bbox': [100, 0, 150, 50],
-            'geometric_error': 0.01,
-        }
-        previous = {'12-20-40', '12-21-40', '12-20-41', '12-21-41'}
-
-        def metadata(_db, tile_id):
-            return parent if tile_id == '11-10-20' else child
-
-        without_history, with_history = [], []
-        with patch('serve.read_tile_metadata', side_effect=metadata):
-            _traverse(
-                None, 11, 10, 20, 0, 0, 12, 0.001,
-                without_history, [], max_range=0,
-            )
-            _traverse(
-                None, 11, 10, 20, 0, 0, 12, 0.001,
-                with_history, [], max_range=0,
-                previous_subdivided=_lod_complete_ancestors(previous),
-            )
-        self.assertEqual(without_history, ['11-10-20'])
-        self.assertEqual(set(with_history), previous)
 
     def test_radial_lod_curve_uses_every_depth_before_the_rim(self):
         max_range = 16000
@@ -253,7 +217,7 @@ class TestViewCoverageCircle(unittest.TestCase):
             patch('serve._tile_bbox', return_value=child['bbox']),
         ):
             refined = _balance_lod_leaves(
-                None, leaves, [], 0, 0, 12, 1.0, 1000, 0.0, set(),
+                None, leaves, [], 0, 0, 12, 1.0, 1000, 0.0,
             )
 
         self.assertEqual(refined, 1)

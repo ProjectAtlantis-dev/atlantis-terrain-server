@@ -17,6 +17,7 @@ export function rendererTextureAnisotropy(renderer) {
 export function createTextureStreamer({
   log,
   maxInflight = 120,
+  maxDormant = 256,
   repollBatch = 8,
   retryBaseMs = 2000,
   retryMaxMs = 30000,
@@ -26,6 +27,8 @@ export function createTextureStreamer({
   getTextureAnisotropy = () => 1,
   now = () => performance.now(),
   queueMicrotaskImpl = callback => queueMicrotask(callback),
+  scheduleRetryWake = (callback, delay) => setTimeout(callback, delay),
+  cancelRetryWake = timer => clearTimeout(timer),
 }) {
   const texCache = new Map();
   const texSource = new Map();
@@ -33,7 +36,7 @@ export function createTextureStreamer({
   const texFetching = new Set();
   const texRetryAtMs = new Map();
   const texRetryCount = new Map();
-  const ancestorLogged = new Set();
+  const dormantTextures = new Map();
   const staleTextures = new Set();
   let version = Date.now();
   let roadDebug = false;
@@ -41,6 +44,8 @@ export function createTextureStreamer({
   let hydroDebug = false;
   let activeDemand = null;
   let refillPending = false;
+  let retryWakeTimer = null;
+  let retryWakeAtMs = Infinity;
 
   function advanceVersion() {
     version = Math.max(version + 1, Date.now());
@@ -60,6 +65,31 @@ export function createTextureStreamer({
       : 1;
   }
 
+  function claimTile(tileId) {
+    dormantTextures.delete(tileId);
+  }
+
+  function evictDormantOverflow() {
+    while (dormantTextures.size > maxDormant) {
+      const tileId = dormantTextures.keys().next().value;
+      const texture = dormantTextures.get(tileId);
+      dormantTextures.delete(tileId);
+      if (texCache.get(tileId) !== texture) continue;
+      texCache.delete(tileId);
+      texSource.delete(tileId);
+      texture?.dispose?.();
+    }
+  }
+
+  function retainDormantTexture(tileId) {
+    const texture = texCache.get(tileId);
+    if (!texture) return false;
+    dormantTextures.delete(tileId);
+    dormantTextures.set(tileId, texture);
+    evictDormantOverflow();
+    return true;
+  }
+
   function scheduleRefill() {
     if (refillPending || activeDemand == null) return;
     refillPending = true;
@@ -67,6 +97,38 @@ export function createTextureStreamer({
       refillPending = false;
       if (activeDemand != null) fillAvailableSlots();
     });
+  }
+
+  function clearRetryWake() {
+    if (retryWakeTimer != null) cancelRetryWake(retryWakeTimer);
+    retryWakeTimer = null;
+    retryWakeAtMs = Infinity;
+  }
+
+  function scheduleNextRetryWake() {
+    if (activeDemand == null) {
+      clearRetryWake();
+      return;
+    }
+    let nextAt = Infinity;
+    for (const { tile } of activeDemand.scored) {
+      if (texCache.has(tile.id) || texInflight.has(tile.id)) continue;
+      const retryAt = texRetryAtMs.get(tile.id);
+      if (Number.isFinite(retryAt)) nextAt = Math.min(nextAt, retryAt);
+    }
+    if (!Number.isFinite(nextAt)) {
+      clearRetryWake();
+      return;
+    }
+    if (retryWakeTimer != null && retryWakeAtMs <= nextAt) return;
+    clearRetryWake();
+    retryWakeAtMs = nextAt;
+    retryWakeTimer = scheduleRetryWake(() => {
+      retryWakeTimer = null;
+      retryWakeAtMs = Infinity;
+      fillAvailableSlots();
+    }, Math.max(0, nextAt - now()));
+    retryWakeTimer?.unref?.();
   }
 
   function fillAvailableSlots() {
@@ -131,14 +193,13 @@ export function createTextureStreamer({
             texRetryCount.set(tileId, attempt);
             const delay = textureRetryDelay(attempt, retryBaseMs, retryMaxMs);
             log(tileId, `ancestor crop from ${ancestorId} — placeholder applied, retry #${attempt} in ${(delay / 1000).toFixed(1)}s)`);
-            ancestorLogged.add(tileId);
             texFetching.add(tileId);
             texRetryAtMs.set(tileId, now() + delay);
             onPlaceholder({ tileId, tile, texture, ancestorId });
             return;
           }
-          ancestorLogged.delete(tileId);
           texRetryCount.delete(tileId);
+          claimTile(tileId);
           texCache.set(tileId, texture);
           texSource.set(tileId, source);
           onTexture({ tileId, tile, texture, source });
@@ -153,6 +214,7 @@ export function createTextureStreamer({
         })
         .finally(scheduleRefill);
     }
+    scheduleNextRetryWake();
   }
 
   function pump(scored, handlers) {
@@ -166,27 +228,28 @@ export function createTextureStreamer({
     texFetching.delete(tileId);
     texRetryAtMs.delete(tileId);
     texRetryCount.delete(tileId);
-    ancestorLogged.delete(tileId);
   }
 
   function takeCachedTexture(tileId) {
     const texture = texCache.get(tileId);
     texCache.delete(tileId);
     texSource.delete(tileId);
+    dormantTextures.delete(tileId);
     return texture;
   }
 
-  function invalidate(tileId) {
-    clearTileRequestState(tileId);
-    takeCachedTexture(tileId);
-    return advanceVersion();
-  }
-
-  function releaseTile(tileId) {
-    clearTileRequestState(tileId);
-    const texture = takeCachedTexture(tileId);
-    texture?.dispose?.();
-    return Boolean(texture);
+  function discardTexture(tileId, expectedTexture = null) {
+    const cached = texCache.get(tileId);
+    if (cached && (!expectedTexture || cached === expectedTexture)) {
+      const texture = takeCachedTexture(tileId);
+      staleTextures.delete(texture);
+      texture?.dispose?.();
+      return true;
+    }
+    if (!expectedTexture) return false;
+    const wasStale = staleTextures.delete(expectedTexture);
+    expectedTexture.dispose?.();
+    return wasStale;
   }
 
   function releaseTileDemand(tileId) {
@@ -194,24 +257,29 @@ export function createTextureStreamer({
     // Retaining the decoded texture makes a heading reversal an immediate
     // materialization instead of a grey fetch/decode/repaint cycle.
     clearTileRequestState(tileId);
+    retainDormantTexture(tileId);
   }
 
   function abortAll() {
     activeDemand = null;
+    clearRetryWake();
     for (const controller of texInflight.values()) controller.abort();
     texInflight.clear();
     texFetching.clear();
     texRetryAtMs.clear();
     texRetryCount.clear();
-    ancestorLogged.clear();
     advanceVersion();
   }
 
   function invalidateDebugVariants() {
     abortAll();
-    for (const texture of texCache.values()) staleTextures.add(texture);
+    for (const [tileId, texture] of texCache) {
+      if (dormantTextures.has(tileId)) texture.dispose?.();
+      else staleTextures.add(texture);
+    }
     texCache.clear();
     texSource.clear();
+    dormantTextures.clear();
   }
 
   function setDebugVariant(kind, enabled) {
@@ -249,7 +317,7 @@ export function createTextureStreamer({
 
   return {
     texCache, texSource, texInflight, texFetching, texRetryAtMs, texRetryCount,
-    ancestorLogged, pump, invalidate, releaseTile, releaseTileDemand,
+    dormantTextures, pump, claimTile, discardTexture, releaseTileDemand,
     abortAll, setRoadDebug, setWaterDebug, setHydroDebug,
     releaseStaleTexture,
     get roadDebug() { return roadDebug; },

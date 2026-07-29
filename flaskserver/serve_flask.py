@@ -1529,7 +1529,6 @@ def _queue_texture_fetch(
 
 
 _api_tiles_state: dict[str, str | None] = {"last_result": None}
-_terrain_lod_history: set[str] = set()
 _BUILDING_QUERY_RANGE_M = 25000.0
 
 
@@ -1579,7 +1578,6 @@ def api_tiles():
       max_depth=max_depth,
       max_range=max_range,
       altitude=lod_altitude,
-      lod_history=_terrain_lod_history,
       log=lambda msg: log.debug(f"[/api/tiles] {msg}"),
     )
   except Exception as exc:

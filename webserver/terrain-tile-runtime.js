@@ -28,11 +28,9 @@ export function textureRetryDelay(attempt, baseMs = 2000, maxMs = 30000) {
 }
 
 export function scoreTextureTiles(tiles, priorityForTile, maxPriority, refinementBias = 0.12) {
-  const tileIds = new Set();
   const scored = [];
   for (const tile of tiles) {
     if (!tile?.id || !tile?.bbox) continue;
-    tileIds.add(tile.id);
     const priority = priorityForTile(tile);
     if (priority <= maxPriority) {
       scored.push({
@@ -45,7 +43,7 @@ export function scoreTextureTiles(tiles, priorityForTile, maxPriority, refinemen
   // Refine within a nearby tile band before spending capacity on another
   // coarse covering tile. Spatial priority remains dominant over large gaps.
   scored.sort((a, b) => a.score - b.score || a.prio - b.prio);
-  return { tileIds, scored };
+  return { scored };
 }
 
 export function createTileHistory({ emit, maxTiles = 1000, maxEvents = 40 }) {

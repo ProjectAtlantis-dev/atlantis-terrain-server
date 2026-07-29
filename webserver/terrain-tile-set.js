@@ -1,6 +1,7 @@
 import * as THREE from 'three';
-import { findCoveredTileAncestors } from './tile-coverage.js';
+import { hasCompleteTerrainTileCoverage } from './tile-coverage.js';
 import {
+  isTerrainTileAncestor,
   parseTerrainTileId,
   terrainTileDepth,
 } from './terrain-tile-address.js';
@@ -60,13 +61,23 @@ export function createTileLifecycle({
   log,
   onSceneMutated = () => {},
   onReleaseTile = () => {},
+  releaseStaleTexture = () => false,
+  residentById = null,
 }) {
-  function evict(mesh, reason = 'unspecified lifecycle eviction') {
+  const residentMeshes = () => (
+    residentById
+      ? [...residentById.values()]
+      : terrainRoot.children.filter(mesh => mesh.isMesh && mesh.userData?.tileId)
+  );
+
+  function retire(mesh, reason = 'unspecified lifecycle retirement') {
     if (!mesh) return;
     const tileId = mesh.userData?.tileId || '?';
     log(tileId, `evicted — ${reason}`);
     terrainRoot.remove(mesh);
+    if (residentById?.get(tileId) === mesh) residentById.delete(tileId);
     disposeScatter(mesh);
+    releaseStaleTexture(mesh.userData?.terrainBaseTexture ?? mesh.material?.map);
     mesh.userData?.terrainPlaceholderTexture?.dispose?.();
     if (mesh.userData) delete mesh.userData.terrainPlaceholderTexture;
     mesh.geometry?.dispose();
@@ -79,48 +90,67 @@ export function createTileLifecycle({
     return true;
   }
 
-  function evictCoveredAncestors(childTileId) {
-    const resident = new Map();
-    for (const mesh of terrainRoot.children) {
-      if (!mesh.isMesh || !mesh.userData.tileId) continue;
-      resident.set(mesh.userData.tileId, hasTerrainCoverage(mesh));
-    }
-    const evictable = new Set(findCoveredTileAncestors(childTileId, resident));
-    for (const ancestorId of evictable) {
-      const mesh = terrainRoot.children.find(
-        child => child.isMesh && child.userData.tileId === ancestorId,
+  function sweepResidency(desiredTileIds) {
+    const desired = desiredTileIds instanceof Set
+      ? desiredTileIds
+      : new Set(desiredTileIds ?? []);
+    const residents = residentMeshes();
+    const residentTextures = new Map(
+      residents.map(mesh => [mesh.userData.tileId, hasTerrainCoverage(mesh)]),
+    );
+    const retired = [];
+    const retainedFallbacks = [];
+
+    for (const mesh of residents) {
+      const tileId = mesh.userData?.tileId;
+      if (!tileId || desired.has(tileId)) continue;
+      const desiredDescendants = desiredDescendantIds(tileId, desired);
+      const desiredAncestors = [...desired].filter(
+        desiredId => isTerrainTileAncestor(desiredId, tileId),
       );
-      if (!mesh) continue;
-      evict(mesh, `complete four-quadrant child coverage (triggered by ${childTileId})`);
-      onReleaseTile(ancestorId);
-      resident.delete(ancestorId);
+
+      let replacementCoverage = true;
+      if (desiredDescendants.length > 0) {
+        replacementCoverage = hasCompleteTerrainTileCoverage(
+          tileId,
+          residentTextures,
+          { excludeTileIds: [tileId] },
+        );
+      } else if (desiredAncestors.length > 0) {
+        replacementCoverage = desiredAncestors.every(ancestorId => (
+          hasCompleteTerrainTileCoverage(
+            ancestorId,
+            residentTextures,
+            { excludeTileIds: [tileId] },
+          )
+        ));
+      }
+
+      if (!replacementCoverage) {
+        retainedFallbacks.push(tileId);
+        continue;
+      }
+      retire(mesh, 'absent from current browser heatmap with replacement coverage');
+      onReleaseTile(tileId);
+      residentTextures.delete(tileId);
+      retired.push(tileId);
     }
+    return { retired, retainedFallbacks };
   }
 
   function replaceForMaterialized(mesh, currentTileIds) {
     const tileId = mesh.userData.tileId;
-    const bbox = mesh.userData.bbox;
-    for (const existing of [...terrainRoot.children]) {
-      if (!existing.isMesh) continue;
-      const existingId = existing.userData.tileId;
-      let reason = null;
-      if (existingId === tileId) {
-        reason = 'replaced by textured self';
-      } else if (bbox && !currentTileIds.has(existingId)) {
-        const existingBox = existing.userData.bbox;
-        if (existingBox && bbox[0] <= existingBox[0] && bbox[2] >= existingBox[2]
-            && bbox[1] <= existingBox[1] && bbox[3] >= existingBox[3]) {
-          reason = `contained by ${tileId}`;
-        }
-      }
-      if (!reason) continue;
-      evict(existing, reason);
-    }
+    const existing = residentById?.get(tileId) ?? residentMeshes().find(
+      resident => resident.userData.tileId === tileId,
+    );
+    if (existing) retire(existing, 'atomically replaced by textured self');
     addTerrainMesh(terrainRoot, mesh);
+    residentById?.set(tileId, mesh);
     onSceneMutated();
+    sweepResidency(currentTileIds);
   }
 
-  return { evict, evictCoveredAncestors, replaceForMaterialized };
+  return { retire, sweepResidency, replaceForMaterialized };
 }
 
 function applyDepthOffset(mesh, depth, enabled = true) {
@@ -146,7 +176,7 @@ export function createTerrainMeshRuntime({
   log,
   getCurrentTileIds,
   tileDepth,
-  onMeshAdded = () => {},
+  onMaterialApplied = () => {},
   vehicleNearTile = () => false,
   getVehicleDepth = () => -1,
   requestVehicleResnap = () => {},
@@ -160,6 +190,7 @@ export function createTerrainMeshRuntime({
     const mesh = buildMesh(tile, texture);
     if (!mesh) return null;
     applyMaterial(mesh, texture);
+    onMaterialApplied(mesh);
     const depth = tileDepth(tileId);
     applyDepthOffset(mesh, depth, depthOffsetEnabled);
     lifecycle.replaceForMaterialized(mesh, getCurrentTileIds());
@@ -189,15 +220,29 @@ export function createTerrainTextureController({
   onMaterialApplied = () => {},
   scheduleFrame = callback => requestAnimationFrame(callback),
   applicationsPerFrame = 4,
+  residentById = null,
 }) {
-  const findMesh = tileId => terrainRoot.children.find(child => child.userData.tileId === tileId);
+  const findMesh = tileId => (
+    residentById?.get(tileId)
+    ?? terrainRoot.children.find(child => child.userData.tileId === tileId)
+  );
   const pendingApplications = new Map();
   let applicationFramePending = false;
   let desiredTileIds = new Set();
 
-  function applyTexture(mesh, tile, texture) {
+  function discardApplication(tileId, texture) {
+    if (textureStreamer.discardTexture?.(tileId, texture)) return;
+    if (textureStreamer.texCache.get(tileId) === texture) {
+      textureStreamer.texCache.delete(tileId);
+      textureStreamer.texSource.delete(tileId);
+    }
+    texture.dispose?.();
+  }
+
+  function applyTexture(mesh, texture) {
     const placeholderTexture = mesh.userData?.terrainPlaceholderTexture;
     const previousTexture = mesh.material?.map;
+    const hadCoverage = Boolean(previousTexture);
     if (mesh.userData) delete mesh.userData.terrainPlaceholderTexture;
     applyMaterial(mesh, texture);
     if (placeholderTexture && placeholderTexture !== texture) placeholderTexture.dispose?.();
@@ -205,6 +250,7 @@ export function createTerrainTextureController({
       textureStreamer.releaseStaleTexture?.(previousTexture);
     }
     onMaterialApplied(mesh);
+    if (!hadCoverage) lifecycle.sweepResidency(desiredTileIds);
     return mesh;
   }
 
@@ -233,9 +279,12 @@ export function createTerrainTextureController({
     } else {
       mesh = existing;
       if (mesh) {
+        const hadCoverage = Boolean(mesh.material?.map);
         const previousPlaceholder = mesh.userData?.terrainPlaceholderTexture;
         applyMaterial(mesh, texture);
         if (previousPlaceholder && previousPlaceholder !== texture) previousPlaceholder.dispose?.();
+        onMaterialApplied(mesh);
+        if (!hadCoverage) lifecycle.sweepResidency(desiredTileIds);
       }
     }
     if (!mesh) {
@@ -243,8 +292,6 @@ export function createTerrainTextureController({
       return;
     }
     mesh.userData.terrainPlaceholderTexture = texture;
-    onMaterialApplied(mesh);
-    lifecycle.evictCoveredAncestors(tile.id);
   }
 
   function drainApplications() {
@@ -255,9 +302,7 @@ export function createTerrainTextureController({
       pendingApplications.delete(tileId);
       const { tile, texture, logArrival } = pending;
       if (!desiredTileIds.has(tileId)) {
-        if (textureStreamer.texCache.get(tileId) === texture) textureStreamer.texCache.delete(tileId);
-        textureStreamer.texSource.delete(tileId);
-        texture.dispose?.();
+        discardApplication(tileId, texture);
         continue;
       }
       if (deferredTiles.has(tileId)) {
@@ -267,12 +312,11 @@ export function createTerrainTextureController({
         const mesh = findMesh(tileId);
         if (mesh) {
           if (logArrival) log(tileId, 'cached + applied to existing mesh');
-          applyTexture(mesh, tile, texture);
+          applyTexture(mesh, texture);
         } else if (logArrival) {
           log(tileId, 'cached but NO mesh in scene');
         }
       }
-      lifecycle.evictCoveredAncestors(tileId);
     }
     if (pendingApplications.size > 0) scheduleApplicationFrame();
   }
@@ -285,9 +329,7 @@ export function createTerrainTextureController({
 
   function enqueueApplication(tile, texture, logArrival = false) {
     if (!desiredTileIds.has(tile.id)) {
-      if (textureStreamer.texCache.get(tile.id) === texture) textureStreamer.texCache.delete(tile.id);
-      textureStreamer.texSource.delete(tile.id);
-      texture.dispose?.();
+      discardApplication(tile.id, texture);
       return;
     }
     pendingApplications.set(tile.id, { tile, texture, logArrival });
@@ -295,14 +337,11 @@ export function createTerrainTextureController({
   }
 
   function updateTerrainTextures(tiles) {
-    const meshById = new Map();
-    for (const child of terrainRoot.children) {
-      if (child.userData.tileId) meshById.set(child.userData.tileId, child);
-    }
     const { scored } = scoreTextureTiles(
       tiles, priorityForTile, Math.log(getVisibilityDistance()),
     );
     desiredTileIds = new Set(scored.map(item => item.tile.id));
+    for (const tileId of desiredTileIds) textureStreamer.claimTile?.(tileId);
 
     for (const id of [...deferredTiles.keys()]) {
       const texture = textureStreamer.texCache.get(id);
@@ -316,7 +355,7 @@ export function createTerrainTextureController({
       const texture = textureStreamer.texCache.get(tile.id);
       if (!texture) continue;
       if (deferredTiles.has(tile.id) || pendingApplications.has(tile.id)) continue;
-      const mesh = meshById.get(tile.id);
+      const mesh = findMesh(tile.id);
       if (!mesh) continue;
       // In classifier mode material.map is the overlay, not the cached
       // satellite texture. Compare against the remembered base texture so
@@ -327,8 +366,7 @@ export function createTerrainTextureController({
       const textureChanged = appliedBaseTexture !== texture;
       if (!textureChanged) continue;
       log(tile.id, `apply cached tex (src=${textureStreamer.texSource.get(tile.id) || '?'})`);
-      meshById.set(tile.id, applyTexture(mesh, tile, texture));
-      lifecycle.evictCoveredAncestors(tile.id);
+      applyTexture(mesh, texture);
     }
 
     textureStreamer.pump(scored, {
@@ -340,7 +378,11 @@ export function createTerrainTextureController({
 
   updateTerrainTextures.reset = () => {
     desiredTileIds.clear();
-    for (const { texture } of pendingApplications.values()) texture.dispose?.();
+    for (const [tileId, { texture }] of pendingApplications) {
+      if (textureStreamer.texCache.get(tileId) === texture) continue;
+      if (textureStreamer.releaseStaleTexture?.(texture)) continue;
+      texture.dispose?.();
+    }
     pendingApplications.clear();
     applicationFramePending = false;
   };
@@ -361,6 +403,8 @@ export function reconcileTerrainTiles({
   lifecycle,
   priorityForTile,
   textureCache,
+  claimTile = () => {},
+  residentById = null,
   materialize,
   buildMesh,
   log,
@@ -370,9 +414,13 @@ export function reconcileTerrainTiles({
   onDiff = () => {},
   depthOffsetEnabled = true,
   completeCoverage = false,
-  onReleaseTile = () => {},
   refreshMesh = updateTerrainMeshHeightmap,
 }) {
+  const meshesById = residentById ?? new Map(
+    terrainRoot.children
+      .filter(mesh => mesh.isMesh && mesh.userData?.tileId)
+      .map(mesh => [mesh.userData.tileId, mesh]),
+  );
   const tileById = new Map(tiles.map(tile => [tile.id, tile]));
   const refreshedIds = new Set();
   const refreshedInPlaceIds = new Set();
@@ -382,7 +430,7 @@ export function reconcileTerrainTiles({
   // may carry a new heightmap after a nearby LOD transition. Update ordinary
   // resident grids in place: rebuilding them used to send unchanged topology
   // through defer -> ancestor placeholder -> exact texture on every response.
-  for (const mesh of [...terrainRoot.children]) {
+  for (const mesh of [...meshesById.values()]) {
     const tileId = mesh.userData?.tileId;
     const nextTile = tileById.get(tileId);
     const previousPayload = mesh.userData?.heightmapPayload;
@@ -424,26 +472,18 @@ export function reconcileTerrainTiles({
     }
   }
 
-  // Keep a coarse tile whenever the new demand contains descendants inside
-  // it. At a circular-demand boundary, that parent remains the fallback for
-  // omitted quadrants until resident descendants cover its entire footprint.
-  let released = 0;
-  const retainedFallbackIds = new Set(
-    removed.filter(id => desiredDescendantIds(id, nextTileIds).length > 0),
-  );
-  const removedIds = new Set(removed);
-  for (const tileId of removedIds) {
-    if (!retainedFallbackIds.has(tileId)) onReleaseTile(tileId);
-  }
-  for (const mesh of [...terrainRoot.children]) {
-    const tileId = mesh.userData?.tileId;
-    if (!mesh.isMesh || !removedIds.has(tileId)) continue;
-    if (retainedFallbackIds.has(tileId)) continue;
-    lifecycle.evict(mesh, 'outside current terrain demand');
-    released += 1;
-  }
+  // The Flask response is only the newest heatmap snapshot. Browser
+  // residency has one owner: sweep the live meshes against that snapshot.
+  // Material arrivals may request another sweep as coverage improves, but
+  // they never make an independent ancestor-eviction decision.
+  const sweep = lifecycle.sweepResidency?.(nextTileIds) ?? {
+    retired: [],
+    retainedFallbacks: [],
+  };
+  const released = sweep.retired.length;
+  for (const tileId of sweep.retired) meshesById.delete(tileId);
 
-  for (const mesh of terrainRoot.children) {
+  for (const mesh of meshesById.values()) {
     const tileId = mesh.userData?.tileId;
     if (!mesh.isMesh || !tileId) continue;
     if (
@@ -466,15 +506,14 @@ export function reconcileTerrainTiles({
   });
 
   if (added.length > 0) {
-    const existingIds = new Set(
-      terrainRoot.children.map(mesh => mesh.userData?.tileId).filter(Boolean),
-    );
+    const existingIds = new Set(meshesById.keys());
     const candidates = prioritizeTerrainBuildCandidates(tiles, new Set(added), priorityForTile);
     let built = 0;
     for (const { tile } of candidates) {
       if (existingIds.has(tile.id) && !refreshedIds.has(tile.id)) continue;
       const cachedTexture = textureCache.get(tile.id);
       if (cachedTexture) {
+        claimTile(tile.id);
         deferredTiles.set(tile.id, tile);
         if (completeCoverage || built < buildBudget) {
           log(tile.id, 'added — immediate build (cached tex)');
@@ -488,7 +527,7 @@ export function reconcileTerrainTiles({
 
       deferredTiles.set(tile.id, tile);
       const existingRefreshMesh = refreshedIds.has(tile.id)
-        ? terrainRoot.children.find(mesh => mesh.isMesh && mesh.userData?.tileId === tile.id)
+        ? meshesById.get(tile.id)
         : null;
       if (existingRefreshMesh) {
         if (existingRefreshMesh.material?.map) {
@@ -499,8 +538,9 @@ export function reconcileTerrainTiles({
             applyTileDepthOffset(mesh, tile.id, depthOffsetEnabled);
             prepareUntexturedMesh(mesh);
             addTerrainMesh(terrainRoot, mesh);
+            meshesById.set(tile.id, mesh);
             onMeshAdded(mesh);
-            lifecycle.evict(existingRefreshMesh, 'atomically replaced by repaired geometry');
+            lifecycle.retire(existingRefreshMesh, 'atomically replaced by repaired geometry');
           }
           built += 1;
         } else {
@@ -508,7 +548,7 @@ export function reconcileTerrainTiles({
         }
         continue;
       }
-      const hasStaleCoverage = terrainRoot.children.some(mesh => (
+      const hasStaleCoverage = [...meshesById.values()].some(mesh => (
         mesh.isMesh && mesh.material?.map && mesh.userData?.bbox && overlaps(mesh.userData.bbox, tile.bbox)
       ));
       if (hasStaleCoverage) {
@@ -520,6 +560,7 @@ export function reconcileTerrainTiles({
           applyTileDepthOffset(mesh, tile.id, depthOffsetEnabled);
           prepareUntexturedMesh(mesh);
           addTerrainMesh(terrainRoot, mesh);
+          meshesById.set(tile.id, mesh);
           onMeshAdded(mesh);
         }
         built += 1;
@@ -586,14 +627,10 @@ export function createTerrainTileSet({
   // diagnosing the visible WebGPU seams.
   const depthOffsetEnabled = renderBackend.kind !== 'webgpu';
   const deferredTiles = new Map();
+  const residentById = new Map();
   let currentTileIds = new Set();
   let lastTiles = null;
-  const releaseTileDemand = tileId => {
-    if (typeof textureStreamer.releaseTileDemand === 'function') {
-      return textureStreamer.releaseTileDemand(tileId);
-    }
-    return textureStreamer.releaseTile?.(tileId);
-  };
+  const releaseTileDemand = tileId => textureStreamer.releaseTileDemand?.(tileId);
 
   function selectVertexColors(mesh, attribute) {
     if (!mesh?.geometry || !attribute) return false;
@@ -692,6 +729,8 @@ export function createTerrainTileSet({
     log,
     onSceneMutated: onMutated,
     onReleaseTile: releaseTileDemand,
+    releaseStaleTexture: textureStreamer.releaseStaleTexture,
+    residentById,
   });
   const meshRuntime = createTerrainMeshRuntime({
     terrainRoot,
@@ -702,7 +741,7 @@ export function createTerrainTileSet({
     log,
     getCurrentTileIds: () => currentTileIds,
     tileDepth: tileDepthFromId,
-    onMeshAdded: onMutated,
+    onMaterialApplied,
     vehicleNearTile: vehicle.vehicleNearTileBbox,
     getVehicleDepth: () => vehicle.vehicleLastContactDepth,
     requestVehicleResnap: vehicle.requestVehicleTerrainResnap,
@@ -719,6 +758,7 @@ export function createTerrainTileSet({
     applyMaterial,
     log,
     onMaterialApplied,
+    residentById,
     ...(testOverrides.scheduleFrame == null ? {} : { scheduleFrame: testOverrides.scheduleFrame }),
     ...(testOverrides.applicationsPerFrame == null
       ? {}
@@ -728,26 +768,38 @@ export function createTerrainTileSet({
     onDiff = () => {},
     completeCoverage = false,
   } = {}) {
-    const result = reconcileTerrainTiles({
-      tiles,
-      currentTileIds,
-      deferredTiles,
-      terrainRoot,
-      lifecycle,
-      priorityForTile,
-      textureCache: textureStreamer.texCache,
-      materialize: meshRuntime.materialize,
-      buildMesh,
-      log,
-      buildBudget,
-      prepareUntexturedMesh,
-      onMeshAdded: onMutated,
-      onDiff,
-      depthOffsetEnabled,
-      completeCoverage,
-      onReleaseTile: releaseTileDemand,
-    });
-    currentTileIds = result.nextTileIds;
+    const previousTileIds = currentTileIds;
+    // Publish the newest heatmap before any cached texture can materialize
+    // synchronously. Every lifecycle sweep during this transaction must see
+    // this response, never the preceding camera position.
+    currentTileIds = new Set(tiles.map(tile => tile.id));
+    let result;
+    try {
+      result = reconcileTerrainTiles({
+        tiles,
+        currentTileIds: previousTileIds,
+        deferredTiles,
+        terrainRoot,
+        lifecycle,
+        priorityForTile,
+        textureCache: textureStreamer.texCache,
+        claimTile: textureStreamer.claimTile,
+        residentById,
+        materialize: meshRuntime.materialize,
+        buildMesh,
+        log,
+        buildBudget,
+        prepareUntexturedMesh,
+        onMeshAdded: onMutated,
+        onDiff,
+        depthOffsetEnabled,
+        completeCoverage,
+      });
+      currentTileIds = result.nextTileIds;
+    } catch (error) {
+      currentTileIds = previousTileIds;
+      throw error;
+    }
     lastTiles = tiles;
     return result;
   }

@@ -71,7 +71,6 @@ _UPGRADEABLE_SOURCES = {
 # Tiles we've already tried to fetch and found no COG data (ocean, etc).
 # Seeded from DB on startup, updated as new tiles are discovered.
 _no_data_cache = set()
-LOD_COARSEN_RATIO = 0.75
 # Shape the radial LOD ceiling as equal-width rings outside the full-detail
 # center. The rim must never become coarser than depth 8.
 LOD_COARSE_FLOOR_DEPTH = 8
@@ -186,36 +185,6 @@ def _lod_target_depth(distance, max_range, max_depth, altitude=0.0):
         if distance <= core:
             depth = deeper
     return depth
-
-
-def _lod_complete_ancestors(leaf_ids):
-    """Index previously subdivided tiles in O(leaves * tree depth)."""
-    covered = set()
-    max_depth = 0
-    for tile_id in leaf_ids or ():
-        address = parse_tile_id(tile_id)
-        if address is None:
-            continue
-        tile_depth, tile_col, tile_row = address
-        covered.add((tile_depth, tile_col, tile_row))
-        max_depth = max(max_depth, tile_depth)
-
-    complete_ancestors = set()
-    for tile_depth in range(max_depth, 0, -1):
-        quadrants_by_parent = {}
-        for depth, col, row in covered:
-            if depth != tile_depth:
-                continue
-            parent = (depth - 1, col // 2, row // 2)
-            quadrants_by_parent.setdefault(parent, set()).add(
-                (col & 1) * 2 + (row & 1)
-            )
-        for parent, quadrants in quadrants_by_parent.items():
-            if len(quadrants) != 4:
-                continue
-            complete_ancestors.add(parent)
-            covered.add(parent)
-    return complete_ancestors
 
 
 def _coarse_lod_neighbors(leaf_ids):
@@ -442,8 +411,7 @@ def _ensure_children(db, depth, col, row):
 
 
 def _traverse(db, depth, col, row, qx, qy, max_depth, error_threshold,
-              results, missing, max_range=0.0, altitude=0.0,
-              previous_subdivided=None):
+              results, missing, max_range=0.0, altitude=0.0):
     """Recursive quadtree traversal with error-based LOD.
 
     A tile subdivides if geometric_error / distance > threshold, depth < max_depth,
@@ -522,12 +490,8 @@ def _traverse(db, depth, col, row, qx, qy, max_depth, error_threshold,
         else:
             # Preserve error-based traversal for callers that explicitly ask
             # for unlimited coverage and therefore provide no radial curve.
-            was_subdivided = (depth, col, row) in (previous_subdivided or ())
-            active_threshold = error_threshold * (
-                LOD_COARSEN_RATIO if was_subdivided else 1.0
-            )
             target_depth = max_depth
-            wants_subdivision = screen_error > active_threshold
+            wants_subdivision = screen_error > error_threshold
 
         if wants_subdivision:
             # Hard subdivision ceiling for the current terrain dataset.
@@ -610,7 +574,6 @@ def _traverse(db, depth, col, row, qx, qy, max_depth, error_threshold,
                 _traverse(
                     db, depth+1, cc, cr, qx, qy, max_depth,
                     error_threshold, results, missing, max_range, altitude,
-                    previous_subdivided,
                 )
     else:
         if _debug:
@@ -623,7 +586,7 @@ def _traverse(db, depth, col, row, qx, qy, max_depth, error_threshold,
 
 def _balance_lod_leaves(
     db, leaf_ids, missing, qx, qy, max_depth, error_threshold,
-    max_range, altitude, previous_subdivided,
+    max_range, altitude,
 ):
     """Enforce a 2:1 quadtree transition between adjacent returned leaves.
 
@@ -682,7 +645,7 @@ def _balance_lod_leaves(
                 _traverse(
                     db, depth + 1, child_col, child_row, qx, qy, max_depth,
                     error_threshold, replacements, replacement_missing,
-                    max_range, altitude, previous_subdivided,
+                    max_range, altitude,
                 )
 
             leaves.remove(tile_id)
@@ -699,20 +662,20 @@ def _balance_lod_leaves(
 
 
 def query_tiles_stereo(db, qx, qy, error_threshold=0.001, max_depth=None,
-                       max_range=0.0, log=print, altitude=0.0,
-                       lod_history=None):
+                       max_range=0.0, log=print, altitude=0.0):
     """Query tiles using error-based LOD with stereo coords directly.
 
     ``max_range`` is a circular coverage radius in meters.
     altitude: camera height above ground in meters — increases effective
         distance to tiles below.
     """
-    return _query_tiles_impl(db, qx, qy, error_threshold, max_depth, max_range,
-                             log, altitude, lod_history=lod_history)
+    return _query_tiles_impl(
+        db, qx, qy, error_threshold, max_depth, max_range, log, altitude
+    )
 
 
 def _query_tiles_impl(db, qx, qy, error_threshold, max_depth, max_range, log,
-                      altitude=0.0, lod_history=None):
+                      altitude=0.0):
     from database import get_metadata
     from collections import Counter
 
@@ -728,16 +691,14 @@ def _query_tiles_impl(db, qx, qy, error_threshold, max_depth, max_range, log,
 
     leaf_ids = []
     missing_raw = []
-    previous_subdivided = _lod_complete_ancestors(lod_history)
     _traverse(
         db, 0, 0, 0, qx, qy, max_depth, error_threshold,
         leaf_ids, missing_raw, max_range, altitude,
-        previous_subdivided,
     )
 
     balanced = _balance_lod_leaves(
         db, leaf_ids, missing_raw, qx, qy, max_depth, error_threshold,
-        max_range, altitude, previous_subdivided,
+        max_range, altitude,
     )
     if balanced:
         log(f"  [LOD BALANCE] refined {balanced} coarse neighbor tiles")
@@ -840,9 +801,5 @@ def _query_tiles_impl(db, qx, qy, error_threshold, max_depth, max_range, log,
             f"depths {dict(sorted(miss_depths.items()))}")
     if skip_count:
         log(f"  [NO DATA] {skip_count} tiles known to have no COG data (ocean/cached skip)")
-
-    if lod_history is not None:
-        lod_history.clear()
-        lod_history.update(tile['id'] for tile in results)
 
     return results, missing

@@ -863,7 +863,10 @@ test('reconciliation rebuilds a resident tile when repaired seam geometry change
     deferredTiles: new Map(),
     terrainRoot,
     lifecycle: {
-      evict(mesh) {
+      sweepResidency() {
+        return { retired: [], retainedFallbacks: [] };
+      },
+      retire(mesh) {
         evicted.push(mesh.userData.tileId);
         sceneSizesAtEviction.push(terrainRoot.children.length);
         terrainRoot.remove(mesh);
@@ -928,7 +931,10 @@ test('seam repair updates resident geometry in place without texture churn', () 
     deferredTiles: new Map(),
     terrainRoot,
     lifecycle: {
-      evict() { assert.fail('unexpected mesh eviction'); },
+      sweepResidency() {
+        return { retired: [], retainedFallbacks: [] };
+      },
+      retire() { assert.fail('unexpected mesh eviction'); },
     },
     priorityForTile: () => 0,
     textureCache: new Map(),
@@ -992,7 +998,10 @@ test('seam refresh keeps old geometry when the replacement is build-budget defer
     deferredTiles,
     terrainRoot,
     lifecycle: {
-      evict() { evictions += 1; },
+      sweepResidency() {
+        return { retired: [], retainedFallbacks: [] };
+      },
+      retire() { evictions += 1; },
     },
     priorityForTile: () => 0,
     textureCache: new Map(),
@@ -1009,23 +1018,32 @@ test('seam refresh keeps old geometry when the replacement is build-budget defer
 });
 
 test('reconciliation releases old browser-demand tiles but retains a complete fallback parent', () => {
-  const evicted = [];
   const releasedTextures = [];
   const outside = {
     isMesh: true,
     userData: { tileId: '8-10-10', bbox: [100, 100, 110, 110] },
-    material: { map: {} },
+    material: { map: {}, dispose() {} },
+    geometry: { dispose() {} },
+    children: [],
   };
   const parent = {
     isMesh: true,
     userData: { tileId: '8-20-20', bbox: [0, 0, 8, 8] },
-    material: { map: {} },
+    material: { map: {}, dispose() {} },
+    geometry: { dispose() {} },
+    children: [],
   };
   const terrainRoot = {
     children: [outside, parent],
     add(mesh) { this.children.push(mesh); },
     remove(mesh) { this.children = this.children.filter(item => item !== mesh); },
   };
+  const lifecycle = createTileLifecycle({
+    terrainRoot,
+    disposeScatter: () => {},
+    log: () => {},
+    onReleaseTile: tileId => releasedTextures.push(tileId),
+  });
   const children = [
     { id: '9-40-40', bbox: [0, 0, 4, 4], heightmap: null },
     { id: '9-41-40', bbox: [4, 0, 8, 4], heightmap: null },
@@ -1037,55 +1055,70 @@ test('reconciliation releases old browser-demand tiles but retains a complete fa
     currentTileIds: new Set(['8-10-10', '8-20-20']),
     deferredTiles: new Map(),
     terrainRoot,
-    lifecycle: {
-      evict(mesh) { evicted.push(mesh.userData.tileId); terrainRoot.remove(mesh); },
-    },
+    lifecycle,
     priorityForTile: () => 0,
     textureCache: new Map(),
     materialize() {},
     buildMesh() {},
     log() {},
-    onReleaseTile: tileId => releasedTextures.push(tileId),
   });
-  assert.deepEqual(evicted, ['8-10-10']);
   assert.deepEqual(releasedTextures, ['8-10-10']);
   assert.deepEqual(terrainRoot.children, [parent]);
   assert.equal(result.released, 1);
 });
 
-test('reconciliation releases resident fine detail when demand coarsens', () => {
+test('heatmap sweep retains fine detail until demanded coarse replacement is textured', () => {
   const fine = {
     isMesh: true,
     userData: { tileId: '10-40-40', bbox: [0, 0, 2, 2] },
-    material: { map: {} },
+    material: { map: {}, dispose() {} },
+    geometry: { dispose() {} },
+    children: [],
   };
   const terrainRoot = {
     children: [fine],
+    add(mesh) { this.children.push(mesh); },
     remove(mesh) { this.children = this.children.filter(item => item !== mesh); },
   };
-  const evicted = [];
   const released = [];
+  const lifecycle = createTileLifecycle({
+    terrainRoot,
+    disposeScatter: () => {},
+    log: () => {},
+    onReleaseTile: tileId => released.push(tileId),
+  });
   const result = reconcileTerrainTiles({
     tiles: [{ id: '8-10-10', bbox: [0, 0, 8, 8], heightmap: 'coarse' }],
     currentTileIds: new Set([fine.userData.tileId]),
     deferredTiles: new Map(),
     terrainRoot,
-    lifecycle: {
-      evict(mesh) { evicted.push(mesh.userData.tileId); terrainRoot.remove(mesh); },
-    },
+    lifecycle,
     priorityForTile: () => 0,
     textureCache: new Map(),
     materialize() {},
     buildMesh() {},
     log() {},
-    onReleaseTile: tileId => released.push(tileId),
   });
 
   assert.equal(result.nextTileIds.has('8-10-10'), true);
   assert.equal(result.nextTileIds.has(fine.userData.tileId), false);
-  assert.deepEqual(evicted, [fine.userData.tileId]);
+  assert.equal(result.released, 0);
+  assert.deepEqual(released, []);
+  assert.deepEqual(terrainRoot.children, [fine]);
+
+  const coarse = {
+    isMesh: true,
+    userData: { tileId: '8-10-10', bbox: [0, 0, 8, 8] },
+    material: { map: {}, dispose() {} },
+    geometry: { dispose() {} },
+    children: [],
+  };
+  terrainRoot.add(coarse);
+  const sweep = lifecycle.sweepResidency(new Set([coarse.userData.tileId]));
+
+  assert.deepEqual(sweep.retired, [fine.userData.tileId]);
   assert.deepEqual(released, [fine.userData.tileId]);
-  assert.deepEqual(terrainRoot.children, []);
+  assert.deepEqual(terrainRoot.children, [coarse]);
 });
 
 test('circular-boundary parent remains when demanded descendants cover only part of it', () => {
@@ -1134,7 +1167,7 @@ test('circular-boundary parent remains when demanded descendants cover only part
       children: [],
     });
   }
-  lifecycle.evictCoveredAncestors(demanded.at(-1).id);
+  lifecycle.sweepResidency(new Set(demanded.map(tile => tile.id)));
   assert.equal(terrainRoot.children.includes(parent), true);
 });
 
@@ -1246,7 +1279,7 @@ test('terrain tile set retains cached paint when a resident tile leaves demand',
     remove(mesh) { this.children = this.children.filter(child => child !== mesh); },
   };
   const retained = [];
-  const destroyed = [];
+  const applied = [];
   const texture = {
     image: { width: 256, height: 256 },
     dispose() { assert.fail('demand eviction must retain cached paint'); },
@@ -1256,7 +1289,6 @@ test('terrain tile set retains cached paint when a resident tile leaves demand',
     texSource: new Map([['8-10-10', 'test']]),
     pump() {},
     releaseTileDemand(tileId) { retained.push(tileId); },
-    releaseTile(tileId) { destroyed.push(tileId); },
   };
   const tileSet = createTerrainTileSet({
     terrainRoot,
@@ -1265,6 +1297,9 @@ test('terrain tile set retains cached paint when a resident tile leaves demand',
     renderBackend: { kind: 'webgpu', prepareUntexturedTerrain() {} },
     view: { controls: { mapMode: false } },
     log() {},
+    events: {
+      onMaterialApplied(mesh) { applied.push(mesh.userData.tileId); },
+    },
     testOverrides: {
       terrainDetail: { apply() {} },
       buildMesh: tile => ({
@@ -1290,11 +1325,11 @@ test('terrain tile set retains cached paint when a resident tile leaves demand',
 
   tileSet.reconcile([tile], { completeCoverage: true });
   assert.equal(terrainRoot.children[0].material.map, texture);
+  assert.deepEqual(applied, [tile.id]);
 
   tileSet.reconcile([]);
 
   assert.deepEqual(retained, [tile.id]);
-  assert.deepEqual(destroyed, []);
   assert.equal(textureStreamer.texCache.get(tile.id), texture);
 });
 
@@ -1306,7 +1341,6 @@ test('terrain tile set retains parent paint after complete child coverage', () =
   };
   const frames = [];
   const retained = [];
-  const destroyed = [];
   const parentId = '8-10-10';
   const texture = id => ({
     image: { width: 256, height: 256 },
@@ -1318,7 +1352,6 @@ test('terrain tile set retains parent paint after complete child coverage', () =
     texCache: new Map([[parentId, parentTexture]]),
     texSource: new Map([[parentId, 'test']]),
     releaseTileDemand(tileId) { retained.push(tileId); },
-    releaseTile(tileId) { destroyed.push(tileId); },
     pump(scored, handlers) {
       for (const { tile } of scored) {
         if (this.texCache.has(tile.id)) continue;
@@ -1372,7 +1405,6 @@ test('terrain tile set retains parent paint after complete child coverage', () =
   while (frames.length > 0) frames.shift()();
 
   assert.deepEqual(retained, [parentId]);
-  assert.deepEqual(destroyed, []);
   assert.equal(textureStreamer.texCache.get(parentId), parentTexture);
   assert.deepEqual(
     terrainRoot.children.map(mesh => mesh.userData.tileId).sort(),
@@ -1390,7 +1422,7 @@ test('terrain tile set does not queue excess geometry on animation frames', () =
   const tileSet = createTerrainTileSet({
     terrainRoot,
     textureStreamer: {
-      texCache: new Map(), texSource: new Map(), pump() {}, releaseTile() {},
+      texCache: new Map(), texSource: new Map(), pump() {}, releaseTileDemand() {},
     },
     terrain: {},
     renderBackend: { kind: 'webgl', prepareUntexturedTerrain() {} },
@@ -1845,7 +1877,7 @@ test('shared texture controller budgets scene applications per frame', () => {
     meshRuntime: {
       materialize(id) { materialized.push(id); deferredTiles.delete(id); },
     },
-    lifecycle: { evictCoveredAncestors() {} },
+    lifecycle: { sweepResidency() {} },
     priorityForTile: () => 0, getVisibilityDistance: () => 1000,
     isCovered: () => false, applyMaterial() {},
     log() {}, applicationsPerFrame: 1,
@@ -1857,6 +1889,42 @@ test('shared texture controller budgets scene applications per frame', () => {
   assert.deepEqual(materialized, ['a']);
   frames.shift()();
   assert.deepEqual(materialized, ['a', 'b']);
+});
+
+test('resetting pending texture applications preserves cache-owned paint', () => {
+  const tile = { id: 'a', bbox: [0, 0, 1, 1] };
+  let disposals = 0;
+  let materializations = 0;
+  const texture = {
+    image: { width: 1, height: 1 },
+    dispose() { disposals += 1; },
+  };
+  const frames = [];
+  const textureCache = new Map([[tile.id, texture]]);
+  const controller = createTerrainTextureController({
+    terrainRoot: { children: [] },
+    deferredTiles: new Map([[tile.id, tile]]),
+    textureStreamer: {
+      texCache: textureCache,
+      texSource: new Map(),
+      pump() {},
+    },
+    meshRuntime: { materialize() { materializations += 1; } },
+    lifecycle: { sweepResidency() {} },
+    priorityForTile: () => 0,
+    getVisibilityDistance: () => 1000,
+    applyMaterial() {},
+    log() {},
+    scheduleFrame: callback => frames.push(callback),
+  });
+
+  controller([tile]);
+  controller.reset();
+  frames.shift()();
+
+  assert.equal(textureCache.get(tile.id), texture);
+  assert.equal(disposals, 0);
+  assert.equal(materializations, 0);
 });
 
 test('shared texture controller discards late arrivals outside current browser demand', () => {
@@ -1872,7 +1940,7 @@ test('shared texture controller discards late arrivals outside current browser d
       pump(_scored, nextCallbacks) { callbacks = nextCallbacks; },
     },
     meshRuntime: { materialize() {} },
-    lifecycle: { evictCoveredAncestors() {} },
+    lifecycle: { sweepResidency() {} },
     priorityForTile: () => 0, getVisibilityDistance: () => 1000,
     isCovered: () => false, applyMaterial() {}, log() {},
     scheduleFrame() {},
@@ -1911,11 +1979,12 @@ test('ancestor crops materialize deferred child slots and yield to exact texture
         const mesh = { userData: { tileId }, material: { map: texture } };
         deferredTiles.delete(tileId);
         terrainRoot.children.push(mesh);
+        ancestorEvictions += 1;
         return mesh;
       },
     },
     lifecycle: {
-      evictCoveredAncestors() { ancestorEvictions += 1; },
+      sweepResidency() { ancestorEvictions += 1; },
     },
     priorityForTile: () => 0,
     getVisibilityDistance: () => 1000,
@@ -1933,7 +2002,7 @@ test('ancestor crops materialize deferred child slots and yield to exact texture
   textureCache.set(tile.id, exact);
   callbacks.onTexture({ tileId: tile.id, tile, texture: exact });
   frames.shift()();
-  assert.equal(ancestorEvictions, 2);
+  assert.equal(ancestorEvictions, 1);
   assert.equal(terrainRoot.children[0].material.map, exact);
   assert.equal(placeholder.disposed, true);
   assert.equal(terrainRoot.children[0].userData.terrainPlaceholderTexture, undefined);
@@ -1972,7 +2041,7 @@ test('ancestor crop cannot downgrade a retained exact same-ID tile', () => {
         return retained;
       },
     },
-    lifecycle: { evictCoveredAncestors() {} },
+    lifecycle: { sweepResidency() {} },
     priorityForTile: () => 0,
     getVisibilityDistance: () => 1000,
     applyMaterial() {},
@@ -2379,7 +2448,6 @@ test('texture candidates are filtered and priority sorted', () => {
   ];
   const result = scoreTextureTiles(tiles, tile => tile.priority, 10);
   assert.deepEqual(result.scored.map(item => item.tile.id), ['hot', 'far']);
-  assert.deepEqual([...result.tileIds], ['far', 'hot', 'cold']);
 });
 
 test('texture demand refines equivalent coverage before coarse parents', () => {
@@ -2486,10 +2554,23 @@ test('Åbent Land hydrography debug is independently requested in blue mode', as
 });
 
 test('shared texture pump records HTTP 202 retry state', async () => {
+  let nowMs = 100;
+  let retryWake = null;
+  let retryDelay = null;
+  let requests = 0;
   const streamer = createTextureStreamer({
     log: () => {},
-    fetchImpl: async () => ({ status: 202, ok: false }),
-    now: () => 100,
+    fetchImpl: async () => {
+      requests += 1;
+      return { status: 202, ok: false };
+    },
+    now: () => nowMs,
+    scheduleRetryWake(callback, delay) {
+      retryWake = callback;
+      retryDelay = delay;
+      return { unref() {} };
+    },
+    cancelRetryWake() {},
   });
   streamer.pump([{ tile: { id: '12-1-2', bbox: [0, 0, 1, 1] } }], {
     isCovered: () => false,
@@ -2500,6 +2581,12 @@ test('shared texture pump records HTTP 202 retry state', async () => {
   assert.equal(streamer.texFetching.has('12-1-2'), true);
   assert.equal(streamer.texRetryCount.get('12-1-2'), 1);
   assert.equal(streamer.texRetryAtMs.get('12-1-2'), 2100);
+  assert.equal(retryDelay, 2000);
+
+  nowMs = 2100;
+  retryWake();
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(requests, 2);
 });
 
 test('shared texture pump caches successful exact texture', async () => {
@@ -2627,6 +2714,36 @@ test('shared lifecycle materializes a tile without forcing a world-matrix walk',
   assert.equal(terrainRoot.children.includes(mesh), true);
 });
 
+test('shared lifecycle releases an invalidated texture when its mesh retires', () => {
+  let disposals = 0;
+  const texture = { dispose() { disposals += 1; } };
+  const streamer = createTextureStreamer({ log() {} });
+  streamer.texCache.set('10-1-1', texture);
+  streamer.setRoadDebug(true);
+  const mesh = {
+    isMesh: true,
+    children: [],
+    userData: { tileId: '10-1-1', terrainBaseTexture: texture },
+    material: { map: texture, dispose() {} },
+    geometry: { dispose() {} },
+  };
+  const root = {
+    children: [mesh],
+    remove(item) { this.children = this.children.filter(child => child !== item); },
+  };
+  const lifecycle = createTileLifecycle({
+    terrainRoot: root,
+    disposeScatter() {},
+    log() {},
+    releaseStaleTexture: streamer.releaseStaleTexture,
+  });
+
+  lifecycle.retire(mesh);
+
+  assert.equal(disposals, 1);
+  assert.equal(streamer.releaseStaleTexture(texture), false);
+});
+
 test('shared lifecycle retires parent when all four quadrants are textured', () => {
   const parent = {
     isMesh: true,
@@ -2647,7 +2764,7 @@ test('shared lifecycle retires parent when all four quadrants are textured', () 
     terrainRoot: root, disposeScatter: () => {}, log: () => {},
   });
   root.children.push(...children.slice(1));
-  lifecycle.evictCoveredAncestors(children.at(-1).userData.tileId);
+  lifecycle.sweepResidency(new Set(children.map(child => child.userData.tileId)));
   assert.deepEqual(root.children, children);
 });
 
@@ -2679,7 +2796,7 @@ test('shared lifecycle retains a coarse source under partial chopped child cover
     onReleaseTile: tileId => released.push(tileId),
   });
 
-  lifecycle.evictCoveredAncestors(children.at(-1).userData.tileId);
+  lifecycle.sweepResidency(new Set(children.map(child => child.userData.tileId)));
 
   assert.equal(root.children.includes(parent), true);
   assert.deepEqual(released, []);
@@ -2708,6 +2825,47 @@ test('shared lifecycle counts ancestor-crop children as replacement coverage', (
     terrainRoot: root, disposeScatter: () => {}, log: () => {},
   });
 
-  lifecycle.evictCoveredAncestors(children[3].userData.tileId);
+  lifecycle.sweepResidency(new Set(children.map(child => child.userData.tileId)));
   assert.equal(root.children.includes(parent), false);
+});
+
+test('browser heatmap sweep never retires hot 12-1398-779 when its old children remain', () => {
+  const hotTileId = '12-1398-779';
+  const hot = {
+    isMesh: true,
+    userData: { tileId: hotTileId },
+    material: { map: {}, dispose() {} },
+    geometry: { dispose() {} },
+    children: [],
+  };
+  const oldChildren = [
+    '13-2796-1558',
+    '13-2796-1559',
+    '13-2797-1558',
+    '13-2797-1559',
+  ].map(tileId => ({
+    isMesh: true,
+    userData: { tileId },
+    material: { map: {}, dispose() {} },
+    geometry: { dispose() {} },
+    children: [],
+  }));
+  const root = {
+    children: [hot, ...oldChildren],
+    remove(mesh) { this.children = this.children.filter(item => item !== mesh); },
+  };
+  const released = [];
+  const lifecycle = createTileLifecycle({
+    terrainRoot: root,
+    disposeScatter: () => {},
+    log: () => {},
+    onReleaseTile: tileId => released.push(tileId),
+  });
+
+  const sweep = lifecycle.sweepResidency(new Set([hotTileId]));
+
+  assert.equal(root.children.includes(hot), true);
+  assert.deepEqual(root.children, [hot]);
+  assert.deepEqual(sweep.retired, oldChildren.map(child => child.userData.tileId));
+  assert.equal(released.includes(hotTileId), false);
 });

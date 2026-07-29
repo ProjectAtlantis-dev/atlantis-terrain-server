@@ -1280,16 +1280,6 @@ renderBackend.configureScenePipeline({
 
 // --- Heightmap decode + mesh building (adapted for ENU frame) ---
 
-// --- Tile priority colors ---
-
-function priorityColor(priority, minP, maxP) {
-  if (maxP <= minP) return new THREE.Color(1, 0, 0);
-  const t = Math.min(1, Math.max(0, (priority - minP) / (maxP - minP)));
-  if (t < 0.33) return new THREE.Color(1, t / 0.33, 0);
-  if (t < 0.66) return new THREE.Color(1 - (t - 0.33) / 0.33, 1, 0);
-  return new THREE.Color(0, 1 - (t - 0.66) / 0.34, (t - 0.66) / 0.34);
-}
-
 // --- Deferred tile system ---
 const { history: tileHistory, log: tileLog } = createTileHistory({
   emit: (details, level) => enqueueClientLog(level, 'tile', details),
@@ -1313,7 +1303,7 @@ const textureStreamer = createTextureStreamer({
   getTextureAnisotropy: () => rendererTextureAnisotropy(renderer),
 });
 const {
-  texCache, texSource, texInflight, texFetching,
+  texCache, texSource, texInflight, texFetching, dormantTextures,
 } = textureStreamer;
 let buildingsRuntime = null;
 const terrainTileSet = createTerrainTileSet({
@@ -1578,7 +1568,6 @@ function runStreamingMaintenance() {
     dateChanged = applyDate(currentDate, { force: false });
   }
   if (terrainPipelineState.lastTiles) {
-    terrainTileSet.updateTextures(terrainPipelineState.lastTiles);
     gridlinesRuntime.update();
   }
   if (dateChanged || renderBackend.sceneMutationVersion !== before) {
@@ -2064,6 +2053,7 @@ function updateHud() {
   const srvMissing = terrainPipelineState.serverTextureStatus.missing || 0;
   const srvAncestor = terrainPipelineState.serverTextureStatus.ancestor_fallback || 0;
   let texLine = `tex: ${texCache.size} cached`;
+  if (dormantTextures.size > 0) texLine += `  ${dormantTextures.size} dormant`;
   // Client fetch pipeline
   if (texInflight.size > 0 || texFetching.size > 0) {
     texLine += `  <span style="color:#8cf">http: ${texInflight.size}</span>`;
