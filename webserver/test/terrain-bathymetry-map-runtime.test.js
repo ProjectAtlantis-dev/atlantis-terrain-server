@@ -3,16 +3,42 @@ import test from 'node:test';
 import * as THREE from 'three';
 
 import {
+  bathymetrySoundingTooltipHtml,
   buildBathymetryMapGroup,
   createTerrainBathymetryMapRuntime,
+  nearestBathymetrySounding,
+  soundingHealthColor,
 } from '../terrain-bathymetry-map-runtime.js';
 
 const payload = {
   coverage: [{ tileId: '8-1-2', bbox: [0, 10, 20, 30] }],
   coverageCount: 1,
   soundings: [
-    { id: 'actual', x: 5, y: 6, depthM: 120, kind: 'actual' },
-    { id: 'bound', x: 7, y: 8, depthM: 80, kind: 'at_least' },
+    {
+      id: 'source|12-1-2',
+      sourceUrl: 'https://example.test/grid',
+      recordId: '12-1-2',
+      sourceAsset: 'bathymetry.tif',
+      evidenceFormat: 'raster',
+      latitude: 64.1,
+      longitude: -51.2,
+      x: 5,
+      y: 6,
+      depthM: 120,
+      kind: 'actual',
+      health: 'yellow',
+      modeledDepthM: 100,
+      modelDeltaM: -20,
+      modelErrorM: 24.5,
+      modelTileId: '12-1-2',
+      comparisonMethod: 'corner_rms',
+      modelSampleCount: 4,
+      evidenceCornersM: [110, 120, 130, 140],
+      modeledCornersM: [90, 100, 105, 115],
+    },
+    {
+      id: 'bound', x: 7, y: 8, depthM: 80, kind: 'at_least', health: 'red',
+    },
   ],
   soundingCount: 2,
 };
@@ -44,9 +70,77 @@ test('bathymetry map builds coverage quads and vertical sounding markers', () =>
   assert.equal(actualPoints.material.toneMapped, false);
   assert.equal(soundingPoints.material.toneMapped, false);
   assert.equal(coverage.material.blending, THREE.AdditiveBlending);
-  assert.equal(lines.material.blending, THREE.AdditiveBlending);
-  assert.equal(actualPoints.material.blending, THREE.AdditiveBlending);
-  assert.equal(soundingPoints.material.blending, THREE.AdditiveBlending);
+  assert.equal(lines.material.blending, THREE.NormalBlending);
+  assert.equal(actualPoints.material.blending, THREE.NormalBlending);
+  assert.equal(soundingPoints.material.blending, THREE.NormalBlending);
+  const actualColor = new THREE.Color().fromBufferAttribute(
+    actualPoints.geometry.getAttribute('color'), 0,
+  );
+  const soundingColor = new THREE.Color().fromBufferAttribute(
+    soundingPoints.geometry.getAttribute('color'), 0,
+  );
+  assert.equal(actualColor.getHex(), 0xffe45c);
+  assert.equal(soundingColor.getHex(), 0xff1800);
+  assert.equal(group.userData.bathymetrySoundingHits.length, 2);
+});
+
+test('map hover finds a nearby sounding in screen space', () => {
+  const group = buildBathymetryMapGroup(payload);
+  const camera = new THREE.OrthographicCamera(-100, 100, 100, -100, 0.1, 2000);
+  camera.position.set(0, 0, 1000);
+  camera.lookAt(0, 0, 0);
+  camera.updateProjectionMatrix();
+  camera.updateMatrixWorld();
+
+  const hit = nearestBathymetrySounding(group, camera, {
+    clientX: 532,
+    clientY: 476,
+    width: 1000,
+    height: 1000,
+  });
+  assert.equal(hit.sounding.recordId, '12-1-2');
+  assert.ok(hit.distancePx < 16);
+  assert.equal(nearestBathymetrySounding(group, camera, {
+    clientX: 700,
+    clientY: 700,
+    width: 1000,
+    height: 1000,
+  }), null);
+});
+
+test('hover details show only observed and modeled depth', () => {
+  const html = bathymetrySoundingTooltipHtml(payload.soundings[0]);
+  assert.equal(
+    html,
+    'Observed: <b>125.0 m</b><br>Model: <b>102.5 m</b>',
+  );
+  assert.equal(
+    bathymetrySoundingTooltipHtml(payload.soundings[1]),
+    'Observed ≥: <b>80.0 m</b><br>Model: <b>—</b>',
+  );
+});
+
+test('sounding health is white unless explicitly yellow or red', () => {
+  assert.equal(soundingHealthColor(undefined).getHex(), 0xf4f4f5);
+  assert.equal(soundingHealthColor('white').getHex(), 0xf4f4f5);
+  assert.equal(soundingHealthColor('yellow').getHex(), 0xffe45c);
+  assert.equal(soundingHealthColor('red').getHex(), 0xff1800);
+});
+
+test('red markers render over nearby white markers regardless of shape', () => {
+  const group = buildBathymetryMapGroup({
+    soundings: [
+      { x: 0, y: 0, depthM: 40, kind: 'actual', health: 'red' },
+      { x: 1, y: 1, depthM: 700, kind: 'at_least', health: 'white' },
+    ],
+  });
+  const circle = group.children.find(
+    child => child.userData.bathymetryMarkerShape === 'circle',
+  );
+  const square = group.children.find(
+    child => child.userData.bathymetryMarkerShape === 'square',
+  );
+  assert.ok(circle.renderOrder > square.renderOrder);
 });
 
 test('bathymetry coverage is clipped to the requested circle', () => {

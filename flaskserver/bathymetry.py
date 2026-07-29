@@ -96,6 +96,15 @@ def write_bathymetry(
         ),
     )
     db.commit()
+    has_soundings = db.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+        "AND name = 'soundings'"
+    ).fetchone()
+    if has_soundings:
+        from bathymetry_health import refresh_sounding_health
+
+        if refresh_sounding_health(db, tile_id=tile_id):
+            db.commit()
 
 
 def complete_bathymetry_for_water(

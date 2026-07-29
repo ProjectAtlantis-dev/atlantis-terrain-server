@@ -290,7 +290,7 @@ class BathymetryTest(unittest.TestCase):
                 db.execute(
                     "SELECT value FROM metadata WHERE key = 'schema_version'"
                 ).fetchone(),
-                ("9",),
+                ("17",),
             )
             db.close()
 

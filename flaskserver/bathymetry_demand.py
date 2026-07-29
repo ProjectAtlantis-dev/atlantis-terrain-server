@@ -17,7 +17,9 @@ this rule.
 
 from __future__ import annotations
 
+import json
 import math
+import sqlite3
 import subprocess
 import threading
 import time
@@ -36,6 +38,8 @@ BATHYMETRY_JOB_DEPTH = 8
 OFFSHORE_LIMIT_M = 2_000.0
 BATHYMETRY_DEM_MAX_DEPTH = WMS_CONTRACT_DEPTH
 BATHYMETRY_DEMAND_PAUSED_KEY = "bathymetry_demand_paused"
+BATHYMETRY_FAILURE_KEY_PREFIX = "bathymetry_demand_failure:"
+BATHYMETRY_RETRY_MAX_SECONDS = 3_600.0
 
 
 def terrain_request_max_depth(
@@ -80,6 +84,30 @@ def bathymetry_demand_paused(db) -> bool:
         row
         and str(row[0]).strip().lower() in {"1", "true", "yes", "on"}
     )
+
+
+def _failure_key(job_id: str) -> str:
+    return f"{BATHYMETRY_FAILURE_KEY_PREFIX}{job_id}"
+
+
+def _read_failure(db, job_id: str) -> dict | None:
+    """Read one durable failed-job cooldown from existing metadata."""
+    try:
+        row = db.execute(
+            "SELECT value FROM metadata WHERE key = ?",
+            (_failure_key(job_id),),
+        ).fetchone()
+        value = json.loads(row[0]) if row else None
+        if not isinstance(value, dict):
+            return None
+        return {
+            "attempts": max(1, int(value["attempts"])),
+            "failed_at": float(value["failed_at"]),
+            "retry_at": float(value["retry_at"]),
+            "error": str(value.get("error") or ""),
+        }
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError, sqlite3.Error):
+        return None
 
 
 def _ancestor_at_depth(tile_id: str, depth: int) -> tuple[int, int] | None:
@@ -210,6 +238,7 @@ class BathymetryDemandScheduler:
         glacier_root: str | Path | None = None,
         workers: int = 1,
         retry_seconds: float = 60.0,
+        retry_max_seconds: float = BATHYMETRY_RETRY_MAX_SECONDS,
         logger=None,
         pool=None,
         runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
@@ -220,6 +249,9 @@ class BathymetryDemandScheduler:
         ).expanduser().resolve()
         self.command = self.glacier_root / "runOnDemand"
         self.retry_seconds = max(float(retry_seconds), 0.0)
+        self.retry_max_seconds = max(
+            float(retry_max_seconds), self.retry_seconds
+        )
         self.log = logger
         self._runner = runner
         self._pool = pool or ThreadPoolExecutor(max_workers=max(1, workers))
@@ -241,17 +273,21 @@ class BathymetryDemandScheduler:
         if not self.enabled or paused:
             return []
         jobs = sorted(eligible_fjord_jobs(db, visible_tile_ids))
+        failures = {job_id: _read_failure(db, job_id) for job_id in jobs}
         submitted = []
-        now = time.monotonic()
+        now = time.time()
         with self._lock:
             for job_id in jobs:
-                failed_at = self._failed_at.get(job_id)
+                failure = failures[job_id]
+                if failure is not None:
+                    self._failed_at[job_id] = failure["failed_at"]
+                    self._last_error[job_id] = failure["error"]
                 if (
                     job_id in self._active
                     or job_id in self._completed
                     or (
-                        failed_at is not None
-                        and now - failed_at < self.retry_seconds
+                        failure is not None
+                        and now < failure["retry_at"]
                     )
                 ):
                     continue
@@ -282,6 +318,69 @@ class BathymetryDemandScheduler:
             check=False,
         )
 
+    def _record_failure(self, job_id: str, error: str) -> dict:
+        """Persist exponential retry state so a restart cannot reset it."""
+        now = time.time()
+        state = None
+        if self.db_path.is_file():
+            db = None
+            try:
+                db = sqlite3.connect(self.db_path, timeout=5)
+                previous = _read_failure(db, job_id)
+                attempts = int(previous["attempts"]) + 1 if previous else 1
+                delay = min(
+                    self.retry_seconds * (2 ** min(attempts - 1, 20)),
+                    self.retry_max_seconds,
+                )
+                state = {
+                    "attempts": attempts,
+                    "failed_at": now,
+                    "retry_at": now + delay,
+                    "error": error,
+                }
+                db.execute(
+                    "INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)",
+                    (_failure_key(job_id), json.dumps(state, sort_keys=True)),
+                )
+                db.commit()
+            except sqlite3.Error as exc:
+                if self.log is not None:
+                    self.log.warning(
+                        f"[bathymetry-demand] job={job_id} "
+                        f"stage=cooldown_persist_failed error={exc}"
+                    )
+            finally:
+                if db is not None:
+                    db.close()
+        if state is None:
+            state = {
+                "attempts": 1,
+                "failed_at": now,
+                "retry_at": now + self.retry_seconds,
+                "error": error,
+            }
+        return state
+
+    def _clear_failure(self, job_id: str) -> None:
+        if not self.db_path.is_file():
+            return
+        db = None
+        try:
+            db = sqlite3.connect(self.db_path, timeout=5)
+            db.execute(
+                "DELETE FROM metadata WHERE key = ?", (_failure_key(job_id),)
+            )
+            db.commit()
+        except sqlite3.Error as exc:
+            if self.log is not None:
+                self.log.warning(
+                    f"[bathymetry-demand] job={job_id} "
+                    f"stage=cooldown_clear_failed error={exc}"
+                )
+        finally:
+            if db is not None:
+                db.close()
+
     def _finish(self, job_id: str, future: Future) -> None:
         error = None
         try:
@@ -294,6 +393,12 @@ class BathymetryDemandScheduler:
         except Exception as exc:  # pragma: no cover - executor boundary
             error = f"{type(exc).__name__}: {exc}"
 
+        failure = (
+            self._record_failure(job_id, error) if error is not None else None
+        )
+        if failure is None:
+            self._clear_failure(job_id)
+
         with self._lock:
             self._active.discard(job_id)
             if error is None:
@@ -301,8 +406,31 @@ class BathymetryDemandScheduler:
                 self._failed_at.pop(job_id, None)
                 self._last_error.pop(job_id, None)
             else:
-                self._failed_at[job_id] = time.monotonic()
+                self._failed_at[job_id] = failure["failed_at"]
                 self._last_error[job_id] = error
+
+        if error is None and self.db_path.is_file():
+            try:
+                from bathymetry_health import refresh_sounding_health
+
+                db = sqlite3.connect(self.db_path, timeout=30)
+                try:
+                    refreshed = refresh_sounding_health(db, tile_id=job_id)
+                    db.commit()
+                finally:
+                    db.close()
+                if self.log is not None and refreshed:
+                    self.log.info(
+                        f"[bathymetry-demand] job={job_id} "
+                        f"stage=soundings_compared count={refreshed}"
+                    )
+            except Exception as exc:  # pragma: no cover - worker integration
+                if self.log is not None:
+                    self.log.warning(
+                        f"[bathymetry-demand] job={job_id} "
+                        f"stage=soundings_compare_failed "
+                        f"error={type(exc).__name__}: {exc}"
+                    )
 
         if self.log is not None:
             if error is None:

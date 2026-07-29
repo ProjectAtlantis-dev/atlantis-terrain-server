@@ -4,10 +4,17 @@ const DEFAULT_RANGE_M = 50000;
 const DEFAULT_POLL_MS = 5000;
 
 const COVERAGE_COLOR = 0x00d8ff;
-const ACTUAL_COLOR = new THREE.Color(0xfff06a);
-const SOUNDING_COLOR = new THREE.Color(0xf4f4f5);
+const HEALTH_COLORS = {
+  white: new THREE.Color(0xf4f4f5),
+  yellow: new THREE.Color(0xffe45c),
+  red: new THREE.Color(0xff1800),
+};
+const HEALTH_ORDER = ['white', 'yellow', 'red'];
 const COVERAGE_CLIP_SEGMENTS = 128;
 const CIRCLE_MARKER_TEXTURE_SIZE = 32;
+const DEFAULT_HOVER_RADIUS_PX = 16;
+const hoverLocal = new THREE.Vector3();
+const hoverProjected = new THREE.Vector3();
 
 function createCircleMarkerTexture() {
   const size = CIRCLE_MARKER_TEXTURE_SIZE;
@@ -53,7 +60,7 @@ function addPointMarkers(group, positions, colors, {
     transparent: true,
     depthTest: false,
     toneMapped: false,
-    blending: THREE.AdditiveBlending,
+    blending: THREE.NormalBlending,
   };
   if (shape === 'circle') {
     materialOptions.map = createCircleMarkerTexture();
@@ -67,6 +74,110 @@ function addPointMarkers(group, positions, colors, {
   points.userData.bathymetryMarkerShape = shape;
   points.renderOrder = renderOrder;
   group.add(points);
+}
+
+export function soundingHealthColor(health) {
+  return HEALTH_COLORS[health] || HEALTH_COLORS.white;
+}
+
+function soundingHealth(health) {
+  return Object.hasOwn(HEALTH_COLORS, health) ? health : 'white';
+}
+
+function finiteNumber(value) {
+  if (value == null || value === '') return null;
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
+}
+
+function meters(value) {
+  const number = finiteNumber(value);
+  if (number == null) return '—';
+  return `${number.toFixed(1)} m`;
+}
+
+function comparableDepths(sounding) {
+  if (sounding?.comparisonMethod !== 'corner_rms') {
+    return [sounding?.depthM, sounding?.modeledDepthM];
+  }
+  const observedCorners = Array.isArray(sounding?.evidenceCornersM)
+    ? sounding.evidenceCornersM
+    : [];
+  const modeledCorners = Array.isArray(sounding?.modeledCornersM)
+    ? sounding.modeledCornersM
+    : [];
+  const pairs = observedCorners
+    .map((observed, index) => [
+      finiteNumber(observed),
+      finiteNumber(modeledCorners[index]),
+    ])
+    .filter(([observed, modeled]) => observed != null && modeled != null);
+  if (!pairs.length) {
+    return [sounding?.depthM, sounding?.modeledDepthM];
+  }
+  return [
+    pairs.reduce((sum, pair) => sum + pair[0], 0) / pairs.length,
+    pairs.reduce((sum, pair) => sum + pair[1], 0) / pairs.length,
+  ];
+}
+
+export function bathymetrySoundingTooltipHtml(sounding) {
+  const observedLabel = sounding?.kind === 'at_least'
+    ? 'Observed ≥'
+    : 'Observed';
+  const [observedDepth, modeledDepth] = comparableDepths(sounding);
+  return [
+    `${observedLabel}: <b>${meters(observedDepth)}</b>`,
+    `Model: <b>${meters(modeledDepth)}</b>`,
+  ].join('<br>');
+}
+
+export function nearestBathymetrySounding(
+  group,
+  camera,
+  {
+    clientX,
+    clientY,
+    left = 0,
+    top = 0,
+    width,
+    height,
+    maxDistancePx = DEFAULT_HOVER_RADIUS_PX,
+  },
+) {
+  const entries = group?.userData?.bathymetrySoundingHits;
+  if (
+    !group?.visible
+    || !Array.isArray(entries)
+    || entries.length === 0
+    || !camera
+    || !Number.isFinite(width)
+    || !Number.isFinite(height)
+    || width <= 0
+    || height <= 0
+  ) return null;
+  group.updateWorldMatrix?.(true, false);
+  camera.updateMatrixWorld?.();
+  let nearest = null;
+  let nearestDistance = Math.max(0, Number(maxDistancePx) || 0);
+  for (const entry of entries) {
+    hoverLocal.fromArray(entry.position).applyMatrix4(group.matrixWorld);
+    hoverProjected.copy(hoverLocal).project(camera);
+    if (hoverProjected.z < -1 || hoverProjected.z > 1) continue;
+    const screenX = left + (hoverProjected.x + 1) * width / 2;
+    const screenY = top + (1 - hoverProjected.y) * height / 2;
+    const distancePx = Math.hypot(screenX - clientX, screenY - clientY);
+    if (distancePx > nearestDistance) continue;
+    if (
+      nearest
+      && Math.abs(distancePx - nearestDistance) < 1e-6
+      && HEALTH_ORDER.indexOf(soundingHealth(entry.sounding.health))
+        < HEALTH_ORDER.indexOf(soundingHealth(nearest.sounding.health))
+    ) continue;
+    nearest = { sounding: entry.sounding, distancePx, screenX, screenY };
+    nearestDistance = distancePx;
+  }
+  return nearest;
 }
 
 function clipPolygonAgainstEdge(polygon, edgeStart, edgeEnd) {
@@ -185,25 +296,34 @@ export function buildBathymetryMapGroup(payload, {
   }
 
   const soundings = Array.isArray(payload?.soundings) ? payload.soundings : [];
+  const soundingHits = [];
   const linePositions = [];
   const lineColors = [];
-  const actualPointPositions = [];
-  const actualPointColors = [];
-  const soundingPointPositions = [];
-  const soundingPointColors = [];
+  const markerBatches = {
+    actual: Object.fromEntries(
+      HEALTH_ORDER.map(health => [health, { positions: [], colors: [] }]),
+    ),
+    sounding: Object.fromEntries(
+      HEALTH_ORDER.map(health => [health, { positions: [], colors: [] }]),
+    ),
+  };
   for (const sounding of soundings) {
     const x = Number(sounding.x) + offsetX;
     const y = Number(sounding.y) + offsetY;
     const depth = Math.max(0, Number(sounding.depthM)) * exaggeration;
     if (![x, y, depth].every(Number.isFinite)) continue;
     const isActual = sounding.kind === 'actual';
-    const color = isActual ? ACTUAL_COLOR : SOUNDING_COLOR;
+    const health = soundingHealth(sounding.health);
+    const color = soundingHealthColor(health);
+    soundingHits.push({
+      sounding,
+      position: [x, y, 3 * exaggeration],
+    });
     linePositions.push(x, y, 3 * exaggeration, x, y, -depth);
     lineColors.push(color.r, color.g, color.b, color.r, color.g, color.b);
-    const positions = isActual ? actualPointPositions : soundingPointPositions;
-    const colors = isActual ? actualPointColors : soundingPointColors;
-    positions.push(x, y, -depth);
-    colors.push(color.r, color.g, color.b);
+    const batch = markerBatches[isActual ? 'actual' : 'sounding'][health];
+    batch.positions.push(x, y, -depth);
+    batch.colors.push(color.r, color.g, color.b);
   }
   if (linePositions.length) {
     const lineGeometry = new THREE.BufferGeometry();
@@ -221,22 +341,28 @@ export function buildBathymetryMapGroup(payload, {
         opacity: 0.9,
         depthTest: false,
         toneMapped: false,
-        blending: THREE.AdditiveBlending,
+        blending: THREE.NormalBlending,
       }),
     );
     lines.userData.isBathymetrySoundings = true;
     lines.renderOrder = 91;
     group.add(lines);
 
-    addPointMarkers(group, actualPointPositions, actualPointColors, {
-      shape: 'circle',
-      renderOrder: 92,
-    });
-    addPointMarkers(group, soundingPointPositions, soundingPointColors, {
-      shape: 'square',
-      renderOrder: 93,
-    });
+    for (let index = 0; index < HEALTH_ORDER.length; index += 1) {
+      const health = HEALTH_ORDER[index];
+      const actual = markerBatches.actual[health];
+      const sounding = markerBatches.sounding[health];
+      addPointMarkers(group, actual.positions, actual.colors, {
+        shape: 'circle',
+        renderOrder: 92 + index * 2,
+      });
+      addPointMarkers(group, sounding.positions, sounding.colors, {
+        shape: 'square',
+        renderOrder: 93 + index * 2,
+      });
+    }
   }
+  group.userData.bathymetrySoundingHits = soundingHits;
   return group;
 }
 

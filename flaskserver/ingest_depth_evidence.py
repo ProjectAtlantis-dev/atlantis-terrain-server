@@ -3,6 +3,7 @@
 
 import argparse
 import csv
+import hashlib
 import io
 import re
 import sqlite3
@@ -18,8 +19,10 @@ import rasterio
 from rasterio.transform import xy
 from rasterio.warp import transform
 
+from coords import to_stereo
 from database import open_db
 from terrain_config import GREENLAND_BBOX
+from tile_address import inset_tile_corners
 
 
 DEFAULT_DB = Path(__file__).with_name("terrain.db")
@@ -27,9 +30,19 @@ PANGAEA_933610_URL = (
     "https://doi.pangaea.de/10.1594/PANGAEA.933610?format=textfile"
 )
 PANGAEA_992416_URL = "https://doi.org/10.1594/PANGAEA.992416"
+PANGAEA_992416_FILENAME = "Multibeam_bathymetry_50m_32622_NaN.tif"
+PANGAEA_992416_SHA256 = (
+    "3ce13a40f67299a96003b17d416ad2b6df1c1f60bd9aab118c038777954a67e4"
+)
 PANGAEA_992416_FILE_URL = (
     "https://download.pangaea.de/dataset/992416/files/"
-    "Multibeam_backscatter_50m_32622_NaN.tif"
+    f"{PANGAEA_992416_FILENAME}"
+)
+PANGAEA_992416_NOTE = (
+    "Qualified actual: PANGAEA manifest swaps bathymetry/backscatter Content "
+    f"labels. Imported checksum-pinned {PANGAEA_992416_FILENAME} after "
+    "value-range and Ameralik CTD checks; public grid is 50 m, vertical datum "
+    "is listed as none, and the source is not suitable for navigation."
 )
 PANGAEA_770247_URL = "https://doi.org/10.1594/PANGAEA.770247"
 PANGAEA_770247_FILE_URL = (
@@ -45,6 +58,60 @@ PANGAEA_921991_FILE_URL = (
     "?format=zip&charset=UTF-8"
 )
 VALIDATION_TILE_DEPTH = 12
+CORNER_FIELDS = (
+    "evidence_sw_m",
+    "evidence_se_m",
+    "evidence_nw_m",
+    "evidence_ne_m",
+)
+
+
+def evidence_kind_for_source(
+    source_url,
+    requested_kind,
+    *,
+    evidence_format="point",
+    source_asset=None,
+    source_sha256=None,
+):
+    """Apply repository-level trust policy before evidence reaches SQLite."""
+    normalized = str(source_url).casefold()
+    if "pangaea." not in normalized:
+        return requested_kind
+    asset = str(source_asset or "").casefold()
+    if (
+        evidence_format == "raster"
+        and asset.endswith((".tif", ".tiff"))
+        and source_sha256 is not None
+    ):
+        return requested_kind
+    return "at_least"
+
+
+def _sha256_file(path):
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as source:
+        while chunk := source.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _raster_provenance(paths):
+    paths = [Path(path) for path in paths]
+    hashes = [_sha256_file(path) for path in paths]
+    if len(hashes) == 1:
+        bundle_hash = hashes[0]
+    else:
+        digest = hashlib.sha256()
+        for path, asset_hash in sorted(
+            zip(paths, hashes), key=lambda item: item[0].name
+        ):
+            digest.update(path.name.encode("utf-8"))
+            digest.update(b"\0")
+            digest.update(asset_hash.encode("ascii"))
+            digest.update(b"\n")
+        bundle_hash = digest.hexdigest()
+    return ",".join(path.name for path in paths), bundle_hash
 
 
 def read_input(location):
@@ -226,13 +293,41 @@ def finish_actual_points(by_tile):
     ]
 
 
-def replace_soundings(db, source_url, depth_kind, soundings):
+def replace_soundings(
+    db,
+    source_url,
+    depth_kind,
+    soundings,
+    *,
+    evidence_note=None,
+    evidence_format="point",
+    source_asset=None,
+    source_sha256=None,
+):
+    depth_kind = evidence_kind_for_source(
+        source_url,
+        depth_kind,
+        evidence_format=evidence_format,
+        source_asset=source_asset,
+        source_sha256=source_sha256,
+    )
+    rows = list(soundings)
+    if rows:
+        stereo_xs, stereo_ys = to_stereo(
+            np.asarray([row["latitude"] for row in rows], dtype=np.float64),
+            np.asarray([row["longitude"] for row in rows], dtype=np.float64),
+        )
+    else:
+        stereo_xs, stereo_ys = np.asarray([]), np.asarray([])
     db.execute("DELETE FROM soundings WHERE source_url = ?", (source_url,))
     db.executemany(
         """
         INSERT INTO soundings (
-            source_url, record_id, latitude, longitude, depth_m, depth_kind
-        ) VALUES (?, ?, ?, ?, ?, ?)
+            source_url, record_id, latitude, longitude, stereo_x, stereo_y,
+            depth_m, depth_kind, evidence_note, evidence_format, source_asset,
+            source_sha256, evidence_sw_m, evidence_se_m, evidence_nw_m,
+            evidence_ne_m, comparison_method
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             (
@@ -240,12 +335,32 @@ def replace_soundings(db, source_url, depth_kind, soundings):
                 row["record_id"],
                 row["latitude"],
                 row["longitude"],
+                float(stereo_x),
+                float(stereo_y),
                 row["depth_m"],
                 depth_kind,
+                evidence_note,
+                evidence_format,
+                source_asset,
+                source_sha256,
+                row.get("evidence_sw_m"),
+                row.get("evidence_se_m"),
+                row.get("evidence_nw_m"),
+                row.get("evidence_ne_m"),
+                (
+                    "corner_rms"
+                    if evidence_format == "raster"
+                    else "point"
+                ),
             )
-            for row in soundings
+            for row, stereo_x, stereo_y in zip(rows, stereo_xs, stereo_ys)
         ),
     )
+    # Imports that land inside already-generated coverage are compared in the
+    # same transaction. A later bathymetry generation refreshes its own tile.
+    from bathymetry_health import refresh_sounding_health
+
+    refresh_sounding_health(db, source_url=source_url)
 
 
 def import_pangaea_933610(db, payload):
@@ -255,7 +370,9 @@ def import_pangaea_933610(db, payload):
 def import_pangaea_ctd(db, payload, source_url):
     source_rows, endpoints = parse_pangaea_ctd_endpoints(payload)
     soundings = aggregate_ctd_endpoints(endpoints)
-    replace_soundings(db, source_url, "at_least", soundings)
+    replace_soundings(
+        db, source_url, "at_least", soundings, evidence_format="ctd"
+    )
     return source_rows, len(soundings)
 
 
@@ -319,7 +436,9 @@ def import_pangaea_bathymetry(
     source_rows, soundings = aggregate_pangaea_bathymetry(
         payload, depth_column_index
     )
-    replace_soundings(db, source_url, "actual", soundings)
+    replace_soundings(
+        db, source_url, "actual", soundings, evidence_format="table"
+    )
     return source_rows, len(soundings)
 
 
@@ -385,7 +504,13 @@ def parse_pangaea_ctd_bundle(payload):
 def import_pangaea_921991(db, payload):
     endpoints = parse_pangaea_ctd_bundle(payload)
     soundings = aggregate_ctd_endpoints(endpoints)
-    replace_soundings(db, PANGAEA_921991_URL, "at_least", soundings)
+    replace_soundings(
+        db,
+        PANGAEA_921991_URL,
+        "at_least",
+        soundings,
+        evidence_format="ctd",
+    )
     return len(endpoints), len(soundings)
 
 
@@ -406,9 +531,10 @@ def _raster_source_crs(raster):
 
 
 def aggregate_rasters(paths, depth_sign):
-    """Average measured raster cells within each depth-12 terrain tile."""
+    """Keep tile means plus matched corner evidence for RMS validation."""
     if depth_sign not in {"negative", "positive"}:
         raise ValueError("depth_sign must be 'negative' or 'positive'")
+    paths = [Path(path) for path in paths]
 
     cells = 0
     by_tile = {}
@@ -448,16 +574,91 @@ def aggregate_rasters(paths, depth_sign):
                     totals[2] += float(depth)
                     totals[3] += 1
 
-    return cells, finish_actual_points(by_tile)
+    soundings = finish_actual_points(by_tile)
+    _attach_raster_corner_evidence(paths, soundings, depth_sign)
+    return cells, soundings
+
+
+def _attach_raster_corner_evidence(paths, soundings, depth_sign):
+    """Sample every source at matching validation-tile corner coordinates."""
+    if not soundings:
+        return
+    points = [
+        point
+        for row in soundings
+        for point in inset_tile_corners(row["record_id"], GREENLAND_BBOX)
+    ]
+    sums = np.zeros((len(soundings), len(CORNER_FIELDS)), dtype=np.float64)
+    counts = np.zeros((len(soundings), len(CORNER_FIELDS)), dtype=np.int32)
+    xs = [point[0] for point in points]
+    ys = [point[1] for point in points]
+    for path in paths:
+        with rasterio.open(path) as raster:
+            source_crs = _raster_source_crs(raster)
+            source_xs, source_ys = transform(
+                "EPSG:3413", source_crs, xs, ys
+            )
+            for index, sample in enumerate(
+                raster.sample(zip(source_xs, source_ys), masked=True)
+            ):
+                value = sample[0]
+                if np.ma.is_masked(value):
+                    continue
+                value = float(value)
+                if not np.isfinite(value):
+                    continue
+                if depth_sign == "negative":
+                    if value >= 0.0:
+                        continue
+                    depth = -value
+                else:
+                    if value <= 0.0:
+                        continue
+                    depth = value
+                row_index, corner_index = divmod(index, len(CORNER_FIELDS))
+                sums[row_index, corner_index] += depth
+                counts[row_index, corner_index] += 1
+    for row_index, row in enumerate(soundings):
+        for corner_index, field in enumerate(CORNER_FIELDS):
+            count = int(counts[row_index, corner_index])
+            row[field] = (
+                float(sums[row_index, corner_index] / count)
+                if count
+                else None
+            )
 
 
 def aggregate_pangaea_992416(path):
+    minimum = np.inf
+    maximum = -np.inf
+    with rasterio.open(path) as raster:
+        for _, window in raster.block_windows(1):
+            values = raster.read(1, window=window, masked=True).compressed()
+            if values.size:
+                minimum = min(minimum, float(np.min(values)))
+                maximum = max(maximum, float(np.max(values)))
+    if not np.isfinite(minimum) or maximum >= 0.0 or minimum > -100.0:
+        raise ValueError(
+            "PANGAEA 992416 raster does not look like bathymetry: expected "
+            "only negative elevations extending below -100 m, got "
+            f"{minimum:g}..{maximum:g}"
+        )
     return aggregate_rasters([path], "negative")
 
 
 def import_rasters(db, paths, source_url, depth_sign):
+    paths = [Path(path) for path in paths]
     cells, soundings = aggregate_rasters(paths, depth_sign)
-    replace_soundings(db, source_url, "actual", soundings)
+    source_asset, source_sha256 = _raster_provenance(paths)
+    replace_soundings(
+        db,
+        source_url,
+        "actual",
+        soundings,
+        evidence_format="raster",
+        source_asset=source_asset,
+        source_sha256=source_sha256,
+    )
     return cells, len(soundings)
 
 
@@ -486,6 +687,13 @@ def parse_pangaea_bathymetry_files(payload, dataset_id):
         content = (row.get("Content") or "").casefold()
         if not filename or not filename.casefold().endswith((".tif", ".tiff")):
             continue
+        if dataset_id == "992416":
+            # This manifest's filename and Content labels are cross-wired.
+            # File distributions and Ameralik CTD checks confirm that the
+            # bathymetry-named raster is the actual negative-elevation grid.
+            if filename != PANGAEA_992416_FILENAME:
+                continue
+            content = "bathymetry"
         if not ("bathymetr" in content or "seafloor depth" in content):
             continue
         if any(
@@ -554,9 +762,29 @@ def fetch_pangaea_bathymetry_files(
 
 
 def import_pangaea_992416(db, path):
-    return import_rasters(
-        db, [path], PANGAEA_992416_URL, depth_sign="negative"
+    raster_path = Path(path)
+    if "backscatter" in raster_path.name.casefold():
+        raise ValueError(
+            "refusing to import PANGAEA 992416 backscatter as bathymetry"
+        )
+    source_sha256 = _sha256_file(raster_path)
+    if source_sha256 != PANGAEA_992416_SHA256:
+        raise ValueError(
+            "refusing to import PANGAEA 992416: TIFF checksum does not match "
+            "the independently validated official bathymetry asset"
+        )
+    cells, soundings = aggregate_pangaea_992416(raster_path)
+    replace_soundings(
+        db,
+        PANGAEA_992416_URL,
+        "actual",
+        soundings,
+        evidence_note=PANGAEA_992416_NOTE,
+        evidence_format="raster",
+        source_asset=PANGAEA_992416_FILENAME,
+        source_sha256=source_sha256,
     )
+    return cells, len(soundings)
 
 
 def local_raster(location):
@@ -575,6 +803,7 @@ def print_status(db):
                SUM(depth_kind = 'actual'),
                SUM(depth_kind = 'at_least')
         FROM soundings
+        WHERE evidence_status = 'accepted'
         GROUP BY source_url
         ORDER BY source_url
         """

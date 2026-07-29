@@ -45,7 +45,7 @@ CONFIDENCE = {
 }
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 17
 _SCHEMA_VERSION_KEY = "schema_version"
 
 
@@ -162,13 +162,81 @@ CREATE TABLE IF NOT EXISTS soundings (
     record_id   TEXT NOT NULL,
     latitude    REAL NOT NULL CHECK (latitude BETWEEN -90.0 AND 90.0),
     longitude   REAL NOT NULL CHECK (longitude BETWEEN -180.0 AND 180.0),
+    stereo_x    REAL,
+    stereo_y    REAL,
     depth_m     REAL NOT NULL CHECK (depth_m >= 0.0),
     depth_kind  TEXT NOT NULL CHECK (depth_kind IN ('actual', 'at_least')),
+    evidence_status TEXT NOT NULL DEFAULT 'accepted' CHECK (
+        evidence_status IN ('accepted', 'rejected')
+    ),
+    evidence_note TEXT,
+    evidence_format TEXT NOT NULL DEFAULT 'point' CHECK (
+        evidence_format IN ('point', 'table', 'ctd', 'raster')
+    ),
+    source_asset TEXT,
+    source_sha256 TEXT CHECK (
+        source_sha256 IS NULL OR length(source_sha256) = 64
+    ),
+    evidence_sw_m REAL CHECK (
+        evidence_sw_m IS NULL OR evidence_sw_m >= 0.0
+    ),
+    evidence_se_m REAL CHECK (
+        evidence_se_m IS NULL OR evidence_se_m >= 0.0
+    ),
+    evidence_nw_m REAL CHECK (
+        evidence_nw_m IS NULL OR evidence_nw_m >= 0.0
+    ),
+    evidence_ne_m REAL CHECK (
+        evidence_ne_m IS NULL OR evidence_ne_m >= 0.0
+    ),
     created_at  TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    modeled_depth_m REAL,
+    model_delta_m REAL,
+    model_error_m REAL,
+    model_health TEXT CHECK (
+        model_health IS NULL OR model_health IN ('white', 'yellow', 'red')
+    ),
+    model_tile_id TEXT,
+    model_source TEXT,
+    model_version INTEGER,
+    model_updated_at TEXT,
+    modeled_sw_m REAL,
+    modeled_se_m REAL,
+    modeled_nw_m REAL,
+    modeled_ne_m REAL,
+    comparison_method TEXT NOT NULL DEFAULT 'point' CHECK (
+        comparison_method IN ('point', 'corner_rms')
+    ),
+    model_sample_count INTEGER CHECK (
+        model_sample_count IS NULL OR model_sample_count BETWEEN 0 AND 4
+    ),
+    model_signature TEXT,
+    comparison_revision INTEGER NOT NULL DEFAULT 0,
+    compared_at TEXT,
     PRIMARY KEY (source_url, record_id)
 );
 CREATE INDEX IF NOT EXISTS soundings_location
     ON soundings(longitude, latitude);
+CREATE TRIGGER IF NOT EXISTS soundings_pangaea_lower_bound_insert
+AFTER INSERT ON soundings
+WHEN instr(lower(NEW.source_url), 'pangaea.') > 0
+     AND lower(NEW.source_url) <>
+         'https://doi.org/10.1594/pangaea.992416'
+     AND NEW.depth_kind <> 'at_least'
+BEGIN
+    UPDATE soundings SET depth_kind = 'at_least'
+    WHERE source_url = NEW.source_url AND record_id = NEW.record_id;
+END;
+CREATE TRIGGER IF NOT EXISTS soundings_pangaea_lower_bound_update
+AFTER UPDATE OF source_url, depth_kind ON soundings
+WHEN instr(lower(NEW.source_url), 'pangaea.') > 0
+     AND lower(NEW.source_url) <>
+         'https://doi.org/10.1594/pangaea.992416'
+     AND NEW.depth_kind <> 'at_least'
+BEGIN
+    UPDATE soundings SET depth_kind = 'at_least'
+    WHERE source_url = NEW.source_url AND record_id = NEW.record_id;
+END;
 """
 
 # see texture.py for the texture table
@@ -460,6 +528,350 @@ def _migrate_to_v9(db):
         db.execute(f"DROP TABLE IF EXISTS {table}")
 
 
+def _migrate_to_v10(db):
+    """Store generated-model health beside each sounding."""
+    additions = {
+        "stereo_x": "REAL",
+        "stereo_y": "REAL",
+        "modeled_depth_m": "REAL",
+        "model_delta_m": "REAL",
+        "model_error_m": "REAL",
+        "model_health": "TEXT",
+        "model_tile_id": "TEXT",
+        "model_source": "TEXT",
+        "model_version": "INTEGER",
+        "model_updated_at": "TEXT",
+        "compared_at": "TEXT",
+    }
+    columns = {
+        row[1] for row in db.execute("PRAGMA table_info(soundings)")
+    }
+    for name, sql_type in additions.items():
+        if name not in columns:
+            db.execute(
+                f"ALTER TABLE soundings ADD COLUMN {name} {sql_type}"
+            )
+
+    rows = db.execute(
+        "SELECT source_url, record_id, latitude, longitude FROM soundings "
+        "WHERE stereo_x IS NULL OR stereo_y IS NULL"
+    ).fetchall()
+    if rows:
+        from coords import to_stereo
+
+        xs, ys = to_stereo(
+            np.asarray([row[2] for row in rows], dtype=np.float64),
+            np.asarray([row[3] for row in rows], dtype=np.float64),
+        )
+        db.executemany(
+            "UPDATE soundings SET stereo_x = ?, stereo_y = ? "
+            "WHERE source_url = ? AND record_id = ?",
+            (
+                (float(x), float(y), row[0], row[1])
+                for row, x, y in zip(rows, xs, ys)
+            ),
+        )
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS soundings_stereo "
+        "ON soundings(stereo_x, stereo_y)"
+    )
+
+
+def _migrate_to_v11(db):
+    """Quarantine known non-depth evidence without deleting provenance."""
+    columns = {
+        row[1] for row in db.execute("PRAGMA table_info(soundings)")
+    }
+    if "evidence_status" not in columns:
+        db.execute(
+            "ALTER TABLE soundings ADD COLUMN evidence_status TEXT "
+            "NOT NULL DEFAULT 'accepted'"
+        )
+    if "evidence_note" not in columns:
+        db.execute("ALTER TABLE soundings ADD COLUMN evidence_note TEXT")
+    db.execute(
+        "UPDATE soundings SET evidence_status = 'rejected', "
+        "evidence_note = ? WHERE source_url = ?",
+        (
+            "PANGAEA 992416 filename/content labels are cross-wired; "
+            "imported 1-62 values conflict with adjacent 707 m CTD casts "
+            "and match multibeam backscatter intensity, not depth",
+            "https://doi.org/10.1594/PANGAEA.992416",
+        ),
+    )
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS soundings_evidence_status "
+        "ON soundings(evidence_status)"
+    )
+
+
+def _migrate_to_v12(db):
+    """Treat every PANGAEA observation as a depth lower bound."""
+    note = (
+        "PANGAEA evidence is treated as a minimum observed water depth "
+        "pending validation against an independent bathymetry source"
+    )
+    db.execute(
+        "UPDATE soundings SET depth_kind = 'at_least', "
+        "model_error_m = NULL, model_health = 'white', compared_at = NULL, "
+        "evidence_note = CASE "
+        "WHEN evidence_status = 'accepted' "
+        "THEN COALESCE(NULLIF(evidence_note, ''), ?) "
+        "ELSE evidence_note END "
+        "WHERE instr(lower(source_url), 'pangaea.') > 0",
+        (note,),
+    )
+    db.executescript(
+        """
+        CREATE TRIGGER IF NOT EXISTS soundings_pangaea_lower_bound_insert
+        AFTER INSERT ON soundings
+        WHEN instr(lower(NEW.source_url), 'pangaea.') > 0
+             AND NEW.depth_kind <> 'at_least'
+        BEGIN
+            UPDATE soundings SET depth_kind = 'at_least'
+            WHERE source_url = NEW.source_url AND record_id = NEW.record_id;
+        END;
+        CREATE TRIGGER IF NOT EXISTS soundings_pangaea_lower_bound_update
+        AFTER UPDATE OF source_url, depth_kind ON soundings
+        WHEN instr(lower(NEW.source_url), 'pangaea.') > 0
+             AND NEW.depth_kind <> 'at_least'
+        BEGIN
+            UPDATE soundings SET depth_kind = 'at_least'
+            WHERE source_url = NEW.source_url AND record_id = NEW.record_id;
+        END;
+        """
+    )
+
+
+def _migrate_to_v13(db):
+    """Allow independently checked PANGAEA bottom measurements as actual."""
+    db.executescript(
+        """
+        DROP TRIGGER IF EXISTS soundings_pangaea_lower_bound_insert;
+        DROP TRIGGER IF EXISTS soundings_pangaea_lower_bound_update;
+        CREATE TRIGGER soundings_pangaea_lower_bound_insert
+        AFTER INSERT ON soundings
+        WHEN instr(lower(NEW.source_url), 'pangaea.') > 0
+             AND lower(NEW.source_url) <>
+                 'https://doi.org/10.1594/pangaea.992416'
+             AND NEW.depth_kind <> 'at_least'
+        BEGIN
+            UPDATE soundings SET depth_kind = 'at_least'
+            WHERE source_url = NEW.source_url AND record_id = NEW.record_id;
+        END;
+        CREATE TRIGGER soundings_pangaea_lower_bound_update
+        AFTER UPDATE OF source_url, depth_kind ON soundings
+        WHEN instr(lower(NEW.source_url), 'pangaea.') > 0
+             AND lower(NEW.source_url) <>
+                 'https://doi.org/10.1594/pangaea.992416'
+             AND NEW.depth_kind <> 'at_least'
+        BEGIN
+            UPDATE soundings SET depth_kind = 'at_least'
+            WHERE source_url = NEW.source_url AND record_id = NEW.record_id;
+        END;
+        """
+    )
+
+
+def _migrate_to_v14(db):
+    """Tie PANGAEA actual-depth trust to verifiable raster provenance."""
+    columns = {
+        row[1] for row in db.execute("PRAGMA table_info(soundings)")
+    }
+    additions = {
+        "evidence_format": "TEXT NOT NULL DEFAULT 'point'",
+        "source_asset": "TEXT",
+        "source_sha256": "TEXT",
+    }
+    for name, sql_type in additions.items():
+        if name not in columns:
+            db.execute(
+                f"ALTER TABLE soundings ADD COLUMN {name} {sql_type}"
+            )
+    db.execute(
+        "UPDATE soundings SET source_url = ? "
+        "WHERE source_url = ? AND evidence_status = 'rejected'",
+        (
+            "https://doi.org/10.1594/PANGAEA.992416"
+            "#misidentified-backscatter",
+            "https://doi.org/10.1594/PANGAEA.992416",
+        ),
+    )
+    db.execute(
+        "UPDATE soundings SET depth_kind = 'at_least', "
+        "model_error_m = NULL, model_health = 'white', compared_at = NULL "
+        "WHERE instr(lower(source_url), 'pangaea.') > 0 "
+        "AND depth_kind = 'actual' "
+        "AND NOT (evidence_format = 'raster' "
+        "AND (lower(source_asset) LIKE '%.tif' "
+        "OR lower(source_asset) LIKE '%.tiff') "
+        "AND source_sha256 IS NOT NULL "
+        "AND length(source_sha256) = 64)"
+    )
+    db.executescript(
+        """
+        DROP TRIGGER IF EXISTS soundings_pangaea_lower_bound_insert;
+        DROP TRIGGER IF EXISTS soundings_pangaea_lower_bound_update;
+        CREATE TRIGGER soundings_pangaea_lower_bound_insert
+        AFTER INSERT ON soundings
+        WHEN instr(lower(NEW.source_url), 'pangaea.') > 0
+             AND NOT (
+                 NEW.evidence_format = 'raster'
+                 AND (
+                     lower(NEW.source_asset) LIKE '%.tif'
+                     OR lower(NEW.source_asset) LIKE '%.tiff'
+                 )
+                 AND NEW.source_sha256 IS NOT NULL
+                 AND length(NEW.source_sha256) = 64
+             )
+             AND NEW.depth_kind <> 'at_least'
+        BEGIN
+            UPDATE soundings SET depth_kind = 'at_least'
+            WHERE source_url = NEW.source_url AND record_id = NEW.record_id;
+        END;
+        CREATE TRIGGER soundings_pangaea_lower_bound_update
+        AFTER UPDATE OF source_url, depth_kind, evidence_format,
+                        source_asset, source_sha256 ON soundings
+        WHEN instr(lower(NEW.source_url), 'pangaea.') > 0
+             AND NOT (
+                 NEW.evidence_format = 'raster'
+                 AND (
+                     lower(NEW.source_asset) LIKE '%.tif'
+                     OR lower(NEW.source_asset) LIKE '%.tiff'
+                 )
+                 AND NEW.source_sha256 IS NOT NULL
+                 AND length(NEW.source_sha256) = 64
+             )
+             AND NEW.depth_kind <> 'at_least'
+        BEGIN
+            UPDATE soundings SET depth_kind = 'at_least'
+            WHERE source_url = NEW.source_url AND record_id = NEW.record_id;
+        END;
+        """
+    )
+
+
+def _migrate_to_v15(db):
+    """Require explicit TIFF provenance for PANGAEA actual-depth rows."""
+    db.execute(
+        "UPDATE soundings SET depth_kind = 'at_least', "
+        "model_error_m = NULL, model_health = 'white', compared_at = NULL "
+        "WHERE instr(lower(source_url), 'pangaea.') > 0 "
+        "AND depth_kind = 'actual' "
+        "AND NOT (evidence_format = 'raster' "
+        "AND (lower(source_asset) LIKE '%.tif' "
+        "OR lower(source_asset) LIKE '%.tiff') "
+        "AND source_sha256 IS NOT NULL "
+        "AND length(source_sha256) = 64)"
+    )
+    db.executescript(
+        """
+        DROP TRIGGER IF EXISTS soundings_pangaea_lower_bound_insert;
+        DROP TRIGGER IF EXISTS soundings_pangaea_lower_bound_update;
+        CREATE TRIGGER soundings_pangaea_lower_bound_insert
+        AFTER INSERT ON soundings
+        WHEN instr(lower(NEW.source_url), 'pangaea.') > 0
+             AND NOT (
+                 NEW.evidence_format = 'raster'
+                 AND (
+                     lower(NEW.source_asset) LIKE '%.tif'
+                     OR lower(NEW.source_asset) LIKE '%.tiff'
+                 )
+                 AND NEW.source_sha256 IS NOT NULL
+                 AND length(NEW.source_sha256) = 64
+             )
+             AND NEW.depth_kind <> 'at_least'
+        BEGIN
+            UPDATE soundings SET depth_kind = 'at_least'
+            WHERE source_url = NEW.source_url AND record_id = NEW.record_id;
+        END;
+        CREATE TRIGGER soundings_pangaea_lower_bound_update
+        AFTER UPDATE OF source_url, depth_kind, evidence_format,
+                        source_asset, source_sha256 ON soundings
+        WHEN instr(lower(NEW.source_url), 'pangaea.') > 0
+             AND NOT (
+                 NEW.evidence_format = 'raster'
+                 AND (
+                     lower(NEW.source_asset) LIKE '%.tif'
+                     OR lower(NEW.source_asset) LIKE '%.tiff'
+                 )
+                 AND NEW.source_sha256 IS NOT NULL
+                 AND length(NEW.source_sha256) = 64
+             )
+             AND NEW.depth_kind <> 'at_least'
+        BEGIN
+            UPDATE soundings SET depth_kind = 'at_least'
+            WHERE source_url = NEW.source_url AND record_id = NEW.record_id;
+        END;
+        """
+    )
+
+
+def _migrate_to_v16(db):
+    """Persist raster corner evidence and its matched model RMS."""
+    additions = {
+        "evidence_sw_m": "REAL",
+        "evidence_se_m": "REAL",
+        "evidence_nw_m": "REAL",
+        "evidence_ne_m": "REAL",
+        "modeled_sw_m": "REAL",
+        "modeled_se_m": "REAL",
+        "modeled_nw_m": "REAL",
+        "modeled_ne_m": "REAL",
+        "comparison_method": "TEXT NOT NULL DEFAULT 'point'",
+        "model_sample_count": "INTEGER",
+        "model_signature": "TEXT",
+    }
+    columns = {
+        row[1] for row in db.execute("PRAGMA table_info(soundings)")
+    }
+    for name, sql_type in additions.items():
+        if name not in columns:
+            db.execute(
+                f"ALTER TABLE soundings ADD COLUMN {name} {sql_type}"
+            )
+    # The old raster rows contain only a centroid/mean comparison. Do not let
+    # those values masquerade as the restored corner RMS; a source re-import
+    # will populate the evidence corners and immediately recompute health.
+    db.execute(
+        "UPDATE soundings SET comparison_method = 'corner_rms', "
+        "modeled_depth_m = NULL, model_delta_m = NULL, model_error_m = NULL, "
+        "model_health = 'white', model_tile_id = NULL, model_source = NULL, "
+        "model_version = NULL, model_updated_at = NULL, modeled_sw_m = NULL, "
+        "modeled_se_m = NULL, modeled_nw_m = NULL, modeled_ne_m = NULL, "
+        "model_sample_count = 0, model_signature = NULL, compared_at = NULL "
+        "WHERE evidence_format = 'raster'"
+    )
+
+
+def _migrate_to_v17(db):
+    """Reject legacy centroid writers for persisted corner-RMS rows."""
+    columns = {
+        row[1] for row in db.execute("PRAGMA table_info(soundings)")
+    }
+    if "comparison_revision" not in columns:
+        db.execute(
+            "ALTER TABLE soundings ADD COLUMN comparison_revision "
+            "INTEGER NOT NULL DEFAULT 0"
+        )
+    db.executescript(
+        """
+        DROP TRIGGER IF EXISTS soundings_corner_rms_guard;
+        CREATE TRIGGER soundings_corner_rms_guard
+        BEFORE UPDATE OF modeled_depth_m, model_delta_m, model_error_m,
+                         model_health, model_tile_id, model_source,
+                         model_version, model_updated_at, compared_at
+        ON soundings
+        WHEN OLD.comparison_method = 'corner_rms'
+             AND NEW.comparison_method = 'corner_rms'
+             AND NEW.comparison_revision = OLD.comparison_revision
+        BEGIN
+            SELECT RAISE(IGNORE);
+        END;
+        """
+    )
+
+
 def _migrate_schema(db):
     row = db.execute(
         "SELECT value FROM metadata WHERE key = ?", (_SCHEMA_VERSION_KEY,)
@@ -531,6 +943,62 @@ def _migrate_schema(db):
         db.execute(
             "INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)",
             (_SCHEMA_VERSION_KEY, "9"),
+        )
+        version = 9
+    if version < 10:
+        _migrate_to_v10(db)
+        db.execute(
+            "INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)",
+            (_SCHEMA_VERSION_KEY, "10"),
+        )
+        version = 10
+    if version < 11:
+        _migrate_to_v11(db)
+        db.execute(
+            "INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)",
+            (_SCHEMA_VERSION_KEY, "11"),
+        )
+        version = 11
+    if version < 12:
+        _migrate_to_v12(db)
+        db.execute(
+            "INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)",
+            (_SCHEMA_VERSION_KEY, "12"),
+        )
+        version = 12
+    if version < 13:
+        _migrate_to_v13(db)
+        db.execute(
+            "INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)",
+            (_SCHEMA_VERSION_KEY, "13"),
+        )
+        version = 13
+    if version < 14:
+        _migrate_to_v14(db)
+        db.execute(
+            "INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)",
+            (_SCHEMA_VERSION_KEY, "14"),
+        )
+        version = 14
+    if version < 15:
+        _migrate_to_v15(db)
+        db.execute(
+            "INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)",
+            (_SCHEMA_VERSION_KEY, "15"),
+        )
+        version = 15
+    if version < 16:
+        _migrate_to_v16(db)
+        db.execute(
+            "INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)",
+            (_SCHEMA_VERSION_KEY, "16"),
+        )
+        version = 16
+    if version < 17:
+        _migrate_to_v17(db)
+        db.execute(
+            "INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)",
+            (_SCHEMA_VERSION_KEY, "17"),
         )
 
 

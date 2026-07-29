@@ -1,6 +1,12 @@
 import unittest
 
-from tile_address import format_tile_id, parse_tile_id, require_tile_id
+from tile_address import (
+    format_tile_id,
+    inset_tile_corners,
+    parse_tile_id,
+    require_tile_id,
+    tile_bounds,
+)
 
 
 class TileAddressTest(unittest.TestCase):
@@ -31,6 +37,21 @@ class TileAddressTest(unittest.TestCase):
         self.assertEqual(require_tile_id(tile_id), (12, 1409, 827))
         with self.assertRaisesRegex(ValueError, "must be non-negative"):
             format_tile_id(1, -1, 0)
+
+    def test_bounds_and_inset_corners_share_the_canonical_address(self):
+        root = (0.0, 0.0, 16.0, 16.0)
+        self.assertEqual(tile_bounds("2-1-2", root), (4.0, 8.0, 8.0, 12.0))
+        sw, se, nw, ne = inset_tile_corners("2-1-2", root)
+        self.assertGreater(sw[0], 4.0)
+        self.assertGreater(sw[1], 8.0)
+        self.assertLess(se[0], 8.0)
+        self.assertLess(nw[1], 12.0)
+        self.assertLess(ne[0], 8.0)
+        self.assertLess(ne[1], 12.0)
+
+    def test_bounds_reject_an_address_outside_its_depth(self):
+        with self.assertRaises(ValueError):
+            tile_bounds("2-4-0", (0.0, 0.0, 16.0, 16.0))
 
 
 if __name__ == "__main__":

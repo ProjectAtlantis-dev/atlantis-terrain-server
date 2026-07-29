@@ -1,3 +1,4 @@
+import json
 import sqlite3
 import tempfile
 import unittest
@@ -9,6 +10,7 @@ import numpy as np
 
 from bathymetry_demand import (
     BATHYMETRY_DEMAND_PAUSED_KEY,
+    BATHYMETRY_FAILURE_KEY_PREFIX,
     BATHYMETRY_JOB_DEPTH,
     BathymetryDemandScheduler,
     eligible_fjord_jobs,
@@ -19,8 +21,8 @@ from database import GRID_N
 from tile_address import format_tile_id
 
 
-def _db():
-    db = sqlite3.connect(":memory:")
+def _db(path=":memory:"):
+    db = sqlite3.connect(path)
     db.executescript(
         """
         CREATE TABLE tiles (
@@ -203,6 +205,77 @@ class BathymetrySchedulerTests(unittest.TestCase):
             )
             self.assertEqual(scheduler.schedule(db, [tile_id]), [])
             self.assertEqual(scheduler.status()["completed"], 1)
+
+    def test_failed_job_cooldown_survives_scheduler_restart(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            db_path = root / "terrain.db"
+            db = _db(db_path)
+            self.addCleanup(db.close)
+            coast = np.zeros((GRID_N, GRID_N), dtype=bool)
+            coast[:, : GRID_N // 2] = True
+            tile_id = _mask(db, 1600, 900, coast)
+            db.commit()
+            (root / "runOnDemand").touch()
+
+            first_pool = _Pool()
+            first = BathymetryDemandScheduler(
+                db_path,
+                glacier_root=root,
+                pool=first_pool,
+                retry_seconds=300,
+            )
+            [job_id] = first.schedule(db, [tile_id])
+            first_pool.futures[0].complete(
+                type(
+                    "Result",
+                    (),
+                    {"returncode": 1, "stdout": "", "stderr": "coverage pending"},
+                )()
+            )
+
+            row = db.execute(
+                "SELECT value FROM metadata WHERE key = ?",
+                (f"{BATHYMETRY_FAILURE_KEY_PREFIX}{job_id}",),
+            ).fetchone()
+            failure = json.loads(row[0])
+            self.assertEqual(failure["attempts"], 1)
+            self.assertGreater(failure["retry_at"], failure["failed_at"])
+
+            restarted_pool = _Pool()
+            restarted = BathymetryDemandScheduler(
+                db_path,
+                glacier_root=root,
+                pool=restarted_pool,
+                retry_seconds=300,
+            )
+            self.assertEqual(restarted.schedule(db, [tile_id]), [])
+            self.assertEqual(restarted_pool.calls, [])
+            self.assertEqual(restarted.status()["cooldown"], [job_id])
+
+            failure["retry_at"] = 0
+            db.execute(
+                "UPDATE metadata SET value = ? WHERE key = ?",
+                (
+                    json.dumps(failure),
+                    f"{BATHYMETRY_FAILURE_KEY_PREFIX}{job_id}",
+                ),
+            )
+            db.commit()
+            self.assertEqual(restarted.schedule(db, [tile_id]), [job_id])
+            restarted_pool.futures[0].complete(
+                type(
+                    "Result",
+                    (),
+                    {"returncode": 0, "stdout": "", "stderr": ""},
+                )()
+            )
+            self.assertIsNone(
+                db.execute(
+                    "SELECT 1 FROM metadata WHERE key = ?",
+                    (f"{BATHYMETRY_FAILURE_KEY_PREFIX}{job_id}",),
+                ).fetchone()
+            )
 
 
 if __name__ == "__main__":

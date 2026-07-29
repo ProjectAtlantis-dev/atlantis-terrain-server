@@ -45,7 +45,9 @@ import { createTerrainTileSet } from './terrain-tile-set.js';
 import { createClassifierOverlay } from './terrain-classifier-overlay.js';
 import { createTerrainGridlinesRuntime } from './terrain-gridlines-runtime.js';
 import {
+  bathymetrySoundingTooltipHtml,
   createTerrainBathymetryMapRuntime,
+  nearestBathymetrySounding,
 } from './terrain-bathymetry-map-runtime.js';
 import { restoreTerrainCameraState, terrainCameraState } from './terrain-camera-state.js';
 import { createTerrainClientLogger } from './terrain-client-logging.js';
@@ -1886,6 +1888,24 @@ function hideTileInfo() {
   hoverOutlineController.show(null);
 }
 
+function showBathymetrySoundingInfo(event, sounding) {
+  hoverOutlineController.show(null);
+  tileInfoEl.innerHTML = bathymetrySoundingTooltipHtml(sounding);
+  tileInfoEl.style.left = `${event.clientX + 16}px`;
+  tileInfoEl.style.top = `${event.clientY + 16}px`;
+  tileInfoEl.style.right = 'auto';
+  tileInfoEl.style.maxWidth = '460px';
+  tileInfoEl.style.border = '1px solid #526778';
+  tileInfoEl.style.display = 'block';
+  const bounds = tileInfoEl.getBoundingClientRect();
+  if (bounds.right > window.innerWidth - 8) {
+    tileInfoEl.style.left = `${Math.max(8, event.clientX - bounds.width - 16)}px`;
+  }
+  if (bounds.bottom > window.innerHeight - 8) {
+    tileInfoEl.style.top = `${Math.max(8, event.clientY - bounds.height - 16)}px`;
+  }
+}
+
 function clampAltitude() {
   const rel = camera.position.clone().sub(anchorPosition);
   const altitude = rel.dot(up);
@@ -2105,11 +2125,8 @@ function updateHud() {
   const gridlinesLine = gridlinesRuntime.active
     ? 'gridlines: <span id="gridlinesModeLink" style="color:#8f8;text-decoration:underline;cursor:pointer;pointer-events:auto">ON</span>'
     : 'gridlines: <span id="gridlinesModeLink" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">off</span>';
-  const bathymetryCounts = bathymetryMapRuntime?.counts ?? {
-    coverage: 0, soundings: 0,
-  };
   const bathymetryMapLine = bathymetryMapRuntime?.active
-    ? `bathymetry map: <span id="bathymetryMapLink" title="Cyan = carved bathymetry; yellow circles = actual-depth samples; white squares and lines = lower-bound soundings; red is reserved for large model deviations" style="color:#00d8ff;text-decoration:underline;cursor:pointer;pointer-events:auto">ON</span>  ${bathymetryCounts.coverage} carved areas / ${bathymetryCounts.soundings} evidence soundings`
+    ? 'bathymetry map: <span id="bathymetryMapLink" title="Cyan = carved bathymetry; circles = actual-bottom checks (raster markers are depth-12 aggregates); squares = lower-bound observations; hover near a marker for details; red = large model deviation" style="color:#00d8ff;text-decoration:underline;cursor:pointer;pointer-events:auto">ON</span>'
     : 'bathymetry map: <span id="bathymetryMapLink" title="Show carved bathymetry and source sounding evidence" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">off</span>';
   const classifierOverlayColor = {
     off: '#0af', classifier: '#6ecd3c',
@@ -2501,6 +2518,25 @@ renderer.domElement.addEventListener('mousemove', event => {
     hideTileInfo();
     return;
   }
+  if (controls.mapMode && bathymetryMapRuntime?.active) {
+    const rect = renderer.domElement.getBoundingClientRect();
+    const soundingHit = nearestBathymetrySounding(
+      bathymetryMapRuntime.group,
+      mapCam,
+      {
+        clientX: event.clientX,
+        clientY: event.clientY,
+        left: rect.left,
+        top: rect.top,
+        width: rect.width,
+        height: rect.height,
+      },
+    );
+    if (soundingHit) {
+      showBathymetrySoundingInfo(event, soundingHit.sounding);
+      return;
+    }
+  }
   const targets = collectTerrainDebugMeshes(terrainRoot, debugIntersectables);
   if (targets.length === 0) {
     hideTileInfo();
@@ -2518,6 +2554,8 @@ renderer.domElement.addEventListener('mousemove', event => {
   const mesh = hits[0].object;
   if (gridlines3dHover) {
     hoverOutlineController.show(null);
+    tileInfoEl.style.maxWidth = '';
+    tileInfoEl.style.border = 'none';
     tileInfoEl.textContent = `tile: ${mesh.userData.tileId}`;
     tileInfoEl.style.left = `${Math.max(8, Math.min(event.clientX + 14, window.innerWidth - 180))}px`;
     tileInfoEl.style.top = `${Math.max(8, Math.min(event.clientY + 14, window.innerHeight - 42))}px`;
@@ -2526,6 +2564,8 @@ renderer.domElement.addEventListener('mousemove', event => {
     return;
   }
   hoverOutlineController.show(mesh, 'outline');
+  tileInfoEl.style.maxWidth = '';
+  tileInfoEl.style.border = 'none';
   tileInfoEl.style.left = 'auto';
   tileInfoEl.style.top = '12px';
   tileInfoEl.style.right = '12px';
