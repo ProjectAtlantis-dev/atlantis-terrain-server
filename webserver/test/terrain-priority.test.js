@@ -1239,6 +1239,147 @@ test('terrain tile set owns reconciliation, scene residency, and texture demand'
   assert.equal(terrainRoot.children[0].material.map, baseTexture);
 });
 
+test('terrain tile set retains cached paint when a resident tile leaves demand', () => {
+  const terrainRoot = {
+    children: [],
+    add(mesh) { this.children.push(mesh); },
+    remove(mesh) { this.children = this.children.filter(child => child !== mesh); },
+  };
+  const retained = [];
+  const destroyed = [];
+  const texture = {
+    image: { width: 256, height: 256 },
+    dispose() { assert.fail('demand eviction must retain cached paint'); },
+  };
+  const textureStreamer = {
+    texCache: new Map([['8-10-10', texture]]),
+    texSource: new Map([['8-10-10', 'test']]),
+    pump() {},
+    releaseTileDemand(tileId) { retained.push(tileId); },
+    releaseTile(tileId) { destroyed.push(tileId); },
+  };
+  const tileSet = createTerrainTileSet({
+    terrainRoot,
+    textureStreamer,
+    terrain: {},
+    renderBackend: { kind: 'webgpu', prepareUntexturedTerrain() {} },
+    view: { controls: { mapMode: false } },
+    log() {},
+    testOverrides: {
+      terrainDetail: { apply() {} },
+      buildMesh: tile => ({
+        isMesh: true,
+        children: [],
+        userData: { tileId: tile.id, bbox: tile.bbox },
+        material: {
+          map: null,
+          color: { set() {} },
+          dispose() {},
+        },
+        geometry: { dispose() {} },
+      }),
+      priorityForTile: () => 0,
+      getVisibilityDistance: () => 1000,
+    },
+  });
+  const tile = {
+    id: '8-10-10',
+    bbox: [0, 0, 8, 8],
+    heightmap: 'hm',
+  };
+
+  tileSet.reconcile([tile], { completeCoverage: true });
+  assert.equal(terrainRoot.children[0].material.map, texture);
+
+  tileSet.reconcile([]);
+
+  assert.deepEqual(retained, [tile.id]);
+  assert.deepEqual(destroyed, []);
+  assert.equal(textureStreamer.texCache.get(tile.id), texture);
+});
+
+test('terrain tile set retains parent paint after complete child coverage', () => {
+  const terrainRoot = {
+    children: [],
+    add(mesh) { this.children.push(mesh); },
+    remove(mesh) { this.children = this.children.filter(child => child !== mesh); },
+  };
+  const frames = [];
+  const retained = [];
+  const destroyed = [];
+  const parentId = '8-10-10';
+  const texture = id => ({
+    image: { width: 256, height: 256 },
+    id,
+    dispose() {},
+  });
+  const parentTexture = texture(parentId);
+  const textureStreamer = {
+    texCache: new Map([[parentId, parentTexture]]),
+    texSource: new Map([[parentId, 'test']]),
+    releaseTileDemand(tileId) { retained.push(tileId); },
+    releaseTile(tileId) { destroyed.push(tileId); },
+    pump(scored, handlers) {
+      for (const { tile } of scored) {
+        if (this.texCache.has(tile.id)) continue;
+        const exactTexture = texture(tile.id);
+        this.texCache.set(tile.id, exactTexture);
+        handlers.onTexture({ tile, texture: exactTexture });
+      }
+    },
+  };
+  const tileSet = createTerrainTileSet({
+    terrainRoot,
+    textureStreamer,
+    terrain: {},
+    renderBackend: { kind: 'webgpu', prepareUntexturedTerrain() {} },
+    view: { controls: { mapMode: false } },
+    log() {},
+    testOverrides: {
+      terrainDetail: { apply() {} },
+      scheduleFrame: callback => frames.push(callback),
+      applicationsPerFrame: 4,
+      buildMesh: tile => ({
+        isMesh: true,
+        children: [],
+        userData: { tileId: tile.id, bbox: tile.bbox },
+        material: {
+          map: null,
+          color: { set() {} },
+          dispose() {},
+        },
+        geometry: { dispose() {} },
+      }),
+      priorityForTile: () => 0,
+      getVisibilityDistance: () => 1000,
+    },
+  });
+  const parent = {
+    id: parentId,
+    bbox: [0, 0, 8, 8],
+    heightmap: 'parent',
+  };
+  const children = [
+    { id: '9-20-20', bbox: [0, 0, 4, 4], heightmap: 'child' },
+    { id: '9-21-20', bbox: [4, 0, 8, 4], heightmap: 'child' },
+    { id: '9-20-21', bbox: [0, 4, 4, 8], heightmap: 'child' },
+    { id: '9-21-21', bbox: [4, 4, 8, 8], heightmap: 'child' },
+  ];
+
+  tileSet.reconcile([parent], { completeCoverage: true });
+  tileSet.reconcile(children);
+  tileSet.updateTextures(children);
+  while (frames.length > 0) frames.shift()();
+
+  assert.deepEqual(retained, [parentId]);
+  assert.deepEqual(destroyed, []);
+  assert.equal(textureStreamer.texCache.get(parentId), parentTexture);
+  assert.deepEqual(
+    terrainRoot.children.map(mesh => mesh.userData.tileId).sort(),
+    children.map(tile => tile.id).sort(),
+  );
+});
+
 test('terrain tile set does not queue excess geometry on animation frames', () => {
   const frames = [];
   const terrainRoot = {

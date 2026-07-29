@@ -588,6 +588,12 @@ export function createTerrainTileSet({
   const deferredTiles = new Map();
   let currentTileIds = new Set();
   let lastTiles = null;
+  const releaseTileDemand = tileId => {
+    if (typeof textureStreamer.releaseTileDemand === 'function') {
+      return textureStreamer.releaseTileDemand(tileId);
+    }
+    return textureStreamer.releaseTile?.(tileId);
+  };
 
   function selectVertexColors(mesh, attribute) {
     if (!mesh?.geometry || !attribute) return false;
@@ -685,7 +691,7 @@ export function createTerrainTileSet({
     disposeScatter: disposeTileScatter,
     log,
     onSceneMutated: onMutated,
-    onReleaseTile: tileId => textureStreamer.releaseTile?.(tileId),
+    onReleaseTile: releaseTileDemand,
   });
   const meshRuntime = createTerrainMeshRuntime({
     terrainRoot,
@@ -739,7 +745,7 @@ export function createTerrainTileSet({
       onDiff,
       depthOffsetEnabled,
       completeCoverage,
-      onReleaseTile: textureStreamer.releaseTile,
+      onReleaseTile: releaseTileDemand,
     });
     currentTileIds = result.nextTileIds;
     lastTiles = tiles;
