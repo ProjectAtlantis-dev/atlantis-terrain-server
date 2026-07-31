@@ -1,0 +1,179 @@
+#!/bin/zsh
+set -eu
+
+repo=${0:A:h}
+report_dir=${ATLANTIS_RUN_DIFF_DIR:-/tmp/atlantis-run-diff}
+python=$repo/flaskserver/venv/bin/python
+
+if [[ ! -x $python ]]; then
+    python=python3
+fi
+
+usage() {
+    cat >&2 <<'EOF'
+usage:
+  ./runDiff snapshot BASELINE_DB [CANDIDATE_DB]
+  ./runDiff capture LABEL COMMAND [ARG...]
+  ./runDiff latest
+  ./runDiff apply tools/relative-path /tmp/prepared-replacement
+
+snapshot compares accepted PANGAEA TIFF evidence in two terrain databases.
+capture runs an experimental audit and persists its complete output.
+latest prints the most recent persisted report.
+EOF
+    exit 2
+}
+
+safe_label() {
+    print -r -- "$1" | tr -cs 'A-Za-z0-9._-' '-'
+}
+
+new_report() {
+    local label=$1
+    local stamp
+    stamp=$(date -u '+%Y%m%dT%H%M%SZ')
+    mkdir -p "$report_dir"
+    print -r -- "$report_dir/${stamp}-$(safe_label "$label")"
+}
+
+publish_latest() {
+    local report=$1
+    cp "$report" "$report_dir/latest.txt"
+    if [[ -f $report.json ]]; then
+        cp "$report.json" "$report_dir/latest.json"
+    else
+        rm -f "$report_dir/latest.json"
+    fi
+    print -r -- "runDiff report: $report"
+}
+
+snapshot() {
+    [[ $# -ge 1 && $# -le 2 ]] || usage
+    local baseline=$1
+    local candidate=${2:-$repo/flaskserver/terrain.db}
+    [[ -f $baseline ]] || {
+        print -u2 -r -- "runDiff: baseline database not found: $baseline"
+        exit 2
+    }
+    [[ -f $candidate ]] || {
+        print -u2 -r -- "runDiff: candidate database not found: $candidate"
+        exit 2
+    }
+
+    local report
+    report=$(new_report snapshot)
+    if "$python" "$repo/flaskserver/ameralik_diff.py" \
+        "$baseline" "$candidate" --json-output "$report.json" \
+        >"$report" 2>&1; then
+        cat "$report"
+        publish_latest "$report"
+    else
+        local status=$?
+        cat "$report" >&2
+        print -u2 -r -- "runDiff: snapshot evaluation failed ($status)"
+        exit "$status"
+    fi
+}
+
+capture() {
+    [[ $# -ge 2 ]] || usage
+    local label=$1
+    shift
+    local report
+    report=$(new_report "$label")
+    if "$@" >"$report" 2>&1; then
+        cat "$report"
+        publish_latest "$report"
+    else
+        local status=$?
+        cat "$report" >&2
+        print -u2 -r -- "runDiff: captured command failed ($status)"
+        print -u2 -r -- "runDiff failed report: $report"
+        exit "$status"
+    fi
+}
+
+apply_replacement() {
+    [[ $# -eq 2 ]] || usage
+    local glacier_repo=/Users/reinman/work/glacier
+    local target=$1
+    local replacement=$2
+
+    case "$target" in
+        tools/*) ;;
+        *)
+            print -u2 -r -- "runDiff: target must be inside Glacier tools/"
+            exit 2
+            ;;
+    esac
+    case "$target" in
+        *..*)
+            print -u2 -r -- "runDiff: parent path components are not allowed"
+            exit 2
+            ;;
+    esac
+    case "$replacement" in
+        /tmp/*|/private/tmp/*) ;;
+        *)
+            print -u2 -r -- \
+                "runDiff: replacement must be a prepared file under /tmp"
+            exit 2
+            ;;
+    esac
+
+    local original=$glacier_repo/$target
+    [[ -f $original ]] || {
+        print -u2 -r -- "runDiff: target does not exist: $target"
+        exit 2
+    }
+    [[ -f $replacement ]] || {
+        print -u2 -r -- "runDiff: replacement does not exist: $replacement"
+        exit 2
+    }
+
+    local patch_file
+    patch_file=$(mktemp "${TMPDIR:-/tmp}/runDiff.XXXXXX")
+    trap 'rm -f "$patch_file"' EXIT HUP INT TERM
+
+    local diff_status=0
+    diff -u \
+        --label "a/$target" \
+        --label "b/$target" \
+        "$original" \
+        "$replacement" >"$patch_file" || diff_status=$?
+    case "$diff_status" in
+        0)
+            print -r -- "runDiff: no changes for $target"
+            exit 0
+            ;;
+        1) ;;
+        *)
+            print -u2 -r -- "runDiff: diff failed with status $diff_status"
+            exit "$diff_status"
+            ;;
+    esac
+
+    git -C "$glacier_repo" apply --check "$patch_file"
+    git -C "$glacier_repo" apply "$patch_file"
+    print -r -- "runDiff: applied $target"
+}
+
+[[ $# -ge 1 ]] || usage
+mode=$1
+shift
+case "$mode" in
+    snapshot) snapshot "$@" ;;
+    capture) capture "$@" ;;
+    latest)
+        [[ $# -eq 0 ]] || usage
+        [[ -f $report_dir/latest.txt ]] || {
+            print -u2 -r -- "runDiff: no report has been recorded yet"
+            exit 1
+        }
+        cat "$report_dir/latest.txt"
+        ;;
+    apply) apply_replacement "$@" ;;
+    # Preserve the original two-argument patch-application interface.
+    tools/*) apply_replacement "$mode" "$@" ;;
+    *) usage ;;
+esac

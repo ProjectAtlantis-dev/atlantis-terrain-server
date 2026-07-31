@@ -343,7 +343,7 @@ document.body.appendChild(renderer.domElement);
 renderer.domElement.addEventListener('contextmenu', event => event.preventDefault());
 let tileInspectorRuntime = null;
 let bathymetryMapRuntime = null;
-let hudCollapsed = false;
+let hudCollapsed = true;
 
 const { hud, alt, gameClock: gameClockEl } = createTerrainHud({
   onToggleCollapsed: () => {
