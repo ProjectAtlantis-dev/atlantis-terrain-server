@@ -8,6 +8,10 @@ import { priorityHeading } from './terrain-priority.js';
 import { mergeTerrainTilesAgainstCurrentTileSet } from './terrain-tile-quality.js';
 import { MAX_TERRAIN_AGL_M } from './terrain-agl.js';
 import { createLodAltitudeStabilizer } from './terrain-lod-altitude.js';
+import {
+  decodeTerrainBinaryPayload,
+  isTerrainBinaryResponse,
+} from './terrain-binary-payload.js';
 
 export function createTerrainFetchRuntime({
   state,
@@ -96,6 +100,7 @@ export function createTerrainFetchRuntime({
           view.controls.yaw,
         ),
       range: testOverrides.getRange?.() ?? view.controls.terrainRange,
+      buildingsHash: state.buildingsHash,
       isFirstLoad: state.firstLoad,
       frameOffsetReady: state.frameOffsetReady,
       originX: state.originX, originY: state.originY,
@@ -116,7 +121,9 @@ export function createTerrainFetchRuntime({
     // it. Time it separately from reconcile so a stall can be blamed on the
     // payload or on mesh building rather than on "somewhere in the callback".
     const parseStartedAt = performance.now();
-    const data = await response.json();
+    const data = isTerrainBinaryResponse(response)
+      ? decodeTerrainBinaryPayload(await response.arrayBuffer())
+      : await response.json();
     const parseMs = performance.now() - parseStartedAt;
     if (response.ok === false || response.status >= 400) {
       const detail = typeof data?.error === 'string' ? `: ${data.error}` : '';
@@ -201,6 +208,10 @@ export function createTerrainFetchRuntime({
       logger.enqueue('info', 'fetchTiles.origin.set', origin.logDetails);
     }
 
+    // An unchanged set arrives as a bare digest; the existing meshes stand.
+    if (typeof data.buildingsHash === 'string') {
+      state.buildingsHash = data.buildingsHash;
+    }
     if (Array.isArray(data.buildings)) onBuildings(data.buildings);
 
     const reconcileStartedAt = performance.now();

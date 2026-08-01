@@ -5,6 +5,7 @@ import binascii
 import datetime
 import io
 import json
+import struct
 import logging
 import math
 import os
@@ -1650,6 +1651,12 @@ def api_tiles():
     tex_fetching = list(_tex_fetching)
   tex_fetching_set = set(tex_fetching)
 
+  # Base64 inflates float32 elevations by a third and forces the browser to
+  # parse megabytes of JSON on its main thread before a frame can render.
+  # Binary clients get a length-prefixed header plus one concatenated block of
+  # float32 samples, which they can view without copying.
+  binary_heightmaps = request.args.get("format") == "binary"
+  heightmap_blobs = []
   tile_data = []
   tex_status_counts = {
     "ready": 0,
@@ -1669,6 +1676,18 @@ def api_tiles():
     if tex_status in tex_status_counts:
       tex_status_counts[tex_status] += 1
 
+    hm_bytes = hm.astype(_np.float32).tobytes()
+    if binary_heightmaps:
+      # The client keys geometry reuse and seam-repair detection off heightmap
+      # identity. Base64 gave that for free as a string compare; binary needs
+      # an explicit digest, and it must cover the repaired bytes actually sent
+      # rather than any stored revision — edge repair depends on which
+      # neighbours are in *this* response.
+      heightmap_field = f"{zlib.crc32(hm_bytes) & 0xFFFFFFFF:08x}"
+      heightmap_blobs.append(hm_bytes)
+    else:
+      heightmap_field = base64.b64encode(hm_bytes).decode("ascii")
+
     tile_data.append(
       {
         "id": tid,
@@ -1676,7 +1695,8 @@ def api_tiles():
         "depth": tile["depth"],
         "source": tile["source"],
         "resolution": _GRID_N,
-        "heightmap": base64.b64encode(hm.astype(_np.float32).tobytes()).decode("ascii"),
+        "heightmap": heightmap_field,
+        "heightmapBytes": len(hm_bytes) if binary_heightmaps else None,
         "hasTexture": bool(tex_flags["has_texture"]),
         "texAvailable": bool(tex_flags["available"]),
         "texStatus": tex_status,
@@ -1734,8 +1754,23 @@ def api_tiles():
       f"[/api/tiles] building query FAILED: {type(exc).__name__}: {exc}"
     )
 
-  return jsonify(
-    {
+  # Building footprints dominate the response once heightmaps move to binary —
+  # thousands of polygon rings, re-serialized on every poll even when the
+  # camera has not moved far enough to change the set. The client echoes back
+  # the digest it already holds, so an unchanged set costs one field instead
+  # of megabytes of JSON it would only parse and discard.
+  buildings_hash = None
+  if buildings is not None:
+    buildings_hash = f"{zlib.crc32(json.dumps(buildings, separators=(',', ':'), sort_keys=True).encode('utf-8')) & 0xFFFFFFFF:08x}"
+    if buildings_hash == request.args.get("buildingsHash"):
+      buildings = None
+      buildings_unchanged = True
+    else:
+      buildings_unchanged = False
+  else:
+    buildings_unchanged = False
+
+  payload = {
       "tiles": tile_data,
       "missing": missing_data,
       "downloading": downloading,
@@ -1752,7 +1787,25 @@ def api_tiles():
       "bathymetryStatus": bathymetry_status,
       "buildings": buildings,
       "buildingCount": len(buildings) if buildings is not None else None,
-    }
+      "buildingsHash": buildings_hash,
+      "buildingsUnchanged": buildings_unchanged,
+  }
+  if not binary_heightmaps:
+    return jsonify(payload)
+
+  # [uint32 LE header length][header JSON + pad][float32 samples, tile order]
+  #
+  # The header is padded to a 4-byte boundary so the sample block starts
+  # aligned: a browser cannot create a Float32Array view over an unaligned
+  # offset, and copying to realign would give back the win. Trailing spaces
+  # are insignificant whitespace to any JSON parser.
+  header = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+  header += b" " * (-(len(header) + 4) % 4)
+  body = b"".join([struct.pack("<I", len(header)), header, *heightmap_blobs])
+  return app.response_class(
+    body,
+    mimetype="application/octet-stream",
+    headers={"X-Terrain-Format": "binary-v1"},
   )
 
 

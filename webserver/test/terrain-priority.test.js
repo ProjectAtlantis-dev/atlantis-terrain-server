@@ -685,7 +685,7 @@ test('terrain request preserves boot frame semantics without client LOD override
     frameOffsetReady: false, originX: 1, originY: 2,
     cameraSnapshot: { camEastM: 3 },
   });
-  assert.equal(request.url, '/api/tiles?lat=64.1&lon=-51.2&agl=120&heading=0.5&range=30000');
+  assert.equal(request.url, '/api/tiles?lat=64.1&lon=-51.2&agl=120&heading=0.5&range=30000&format=binary');
   assert.deepEqual(request.logDetails, {
     isFirstLoad: true,
     requestLat: 64.1, requestLon: -51.2, requestAglM: 120,
@@ -701,7 +701,7 @@ test('terrain request reuses a restored frame', () => {
     frameOffsetReady: true, originX: -12.5, originY: 99.25,
     queryX: 123.5, queryY: -456.25,
   });
-  assert.equal(request.url, '/api/tiles?sx=123.5&sy=-456.25&agl=50&heading=0&range=40000&ox=-12.5&oy=99.25');
+  assert.equal(request.url, '/api/tiles?sx=123.5&sy=-456.25&agl=50&heading=0&range=40000&format=binary&ox=-12.5&oy=99.25');
   assert.equal('maxDepth' in request.logDetails, false);
 });
 

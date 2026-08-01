@@ -1,5 +1,17 @@
 import * as THREE from 'three';
 
+/**
+ * Elevation samples for a tile, from whichever transport delivered it.
+ *
+ * The binary payload hands back a Float32Array view over the response buffer
+ * and keeps `heightmap` as a digest, so decoding is a no-op there. The JSON
+ * transport still carries base64 and is decoded on demand.
+ */
+export function terrainTileSamples(tile) {
+  if (tile?.samples instanceof Float32Array) return tile.samples;
+  return decodeTerrainHeightmap(tile?.heightmap);
+}
+
 export function decodeTerrainHeightmap(base64, decodeBase64 = value => atob(value)) {
   const raw = decodeBase64(base64);
   const bytes = new Uint8Array(raw.length);
@@ -55,7 +67,7 @@ export function updateTerrainMeshHeightmap(mesh, tile) {
     || Number(tile.resolution) !== resolution
   ) return false;
 
-  const heightmap = decodeTerrainHeightmap(tile.heightmap);
+  const heightmap = terrainTileSamples(tile);
   if (heightmap.length !== resolution * resolution) return false;
   const position = mesh.geometry.getAttribute?.('position');
   const color = mesh.geometry.getAttribute?.('color');
@@ -169,7 +181,7 @@ export function createTerrainMeshBuilder({
 
   return function buildTerrainMesh(tile) {
     const resolution = tile.resolution;
-    const heightmap = decodeTerrainHeightmap(tile.heightmap);
+    const heightmap = terrainTileSamples(tile);
     const parked = geometryCache?.take(tile) ?? null;
     if (parked) {
       return finishMesh({
