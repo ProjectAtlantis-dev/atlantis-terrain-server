@@ -91,6 +91,18 @@ export function buildOpticalWaterGeometry(sourceMesh, {
     return null;
   }
 
+  // Most tiles inland are entirely dry, and clipping every triangle only to
+  // discover that costs the same as clipping a full fjord. One pass over the
+  // mask answers it before any geometry work starts.
+  let hasWaterSample = false;
+  for (let index = 0; index < waterMask.length; index += 1) {
+    if (waterMask[index]) {
+      hasWaterSample = true;
+      break;
+    }
+  }
+  if (!hasWaterSample) return null;
+
   const target = { positions: [], uvs: [] };
   for (let row = 0; row < resolution - 1; row += 1) {
     for (let column = 0; column < resolution - 1; column += 1) {
@@ -157,9 +169,17 @@ function createOpticalMesh(source) {
   return mesh;
 }
 
+// A LOD expansion admits a few hundred tiles at once, and building every
+// optical twin in the frame that notices them is what turned a streaming burst
+// into a half-second freeze. The surface is a visual proxy, so spreading the
+// work over the next few frames is invisible.
+const DEFAULT_OPTICAL_BUILD_BUDGET = 4;
+const TERRAIN_TILE_ID = /^\d+-\d+-\d+$/;
+
 export function createOpticalWaterSurfaceRuntime({
   terrainRoot,
   opticalDepth = DEFAULT_OPTICAL_WATER_DEPTH_M,
+  buildBudget = DEFAULT_OPTICAL_BUILD_BUDGET,
 } = {}) {
   const group = new THREE.Group();
   group.name = 'WaterOpticalSurface';
@@ -167,57 +187,107 @@ export function createOpticalWaterSurfaceRuntime({
   group.userData.visualDepthProxy = true;
   terrainRoot.add(group);
 
-  const opticalBySource = new Map();
+  // Keyed by tile identity, not by source mesh: reconciliation builds a fresh
+  // THREE.Mesh for a tile whose grid was revived unchanged, and keying on the
+  // object threw away a still-valid optical twin on every LOD swap. Payload and
+  // bbox decide reuse for the same reasons the geometry cache does — seam
+  // repair rewrites elevations, and a re-centred frame offset moves the tile.
+  const opticalByTile = new Map();
+  // Tiles with no water produce no mesh, so opticalByTile can never remember
+  // them. Without this they were re-clipped on every single frame for as long
+  // as they stayed resident.
+  const waterlessTiles = new Map();
+  let deferredBuilds = 0;
 
-  function remove(source, optical) {
-    group.remove(optical);
-    optical.geometry?.dispose?.();
-    optical.material?.dispose?.();
-    opticalBySource.delete(source);
+  function sameBbox(a, b) {
+    // Two absent bboxes describe the same (unknown) placement; treating them
+    // as different rebuilt the twin on every frame.
+    if (a === b) return true;
+    if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return false;
+    for (let index = 0; index < a.length; index += 1) {
+      if (a[index] !== b[index]) return false;
+    }
+    return true;
+  }
+
+  function remove(tileId, entry) {
+    group.remove(entry.optical);
+    entry.optical.geometry?.dispose?.();
+    entry.optical.material?.dispose?.();
+    opticalByTile.delete(tileId);
   }
 
   function sync({ visible = true, waterline = 0 } = {}) {
     group.visible = visible;
     group.position.z = Number(waterline) - Number(opticalDepth);
 
-    const liveSources = new Set();
+    const liveTiles = new Set();
+    let built = 0;
+    deferredBuilds = 0;
     for (const source of terrainRoot.children) {
-      if (
-        !source.isMesh
-        || !/^\d+-\d+-\d+$/.test(source.userData?.tileId ?? '')
-      ) {
-        continue;
+      const tileId = source.userData?.tileId;
+      if (!source.isMesh || !TERRAIN_TILE_ID.test(tileId ?? '')) continue;
+      liveTiles.add(tileId);
+      const payload = source.userData?.heightmapPayload ?? null;
+      const bbox = source.userData?.bbox ?? null;
+
+      let entry = opticalByTile.get(tileId);
+      if (entry != null && (entry.payload !== payload || !sameBbox(entry.bbox, bbox))) {
+        remove(tileId, entry);
+        entry = null;
       }
-      liveSources.add(source);
-      let optical = opticalBySource.get(source);
-      if (optical == null) {
-        optical = createOpticalMesh(source);
-        if (optical == null) continue;
-        opticalBySource.set(source, optical);
+      if (entry == null) {
+        const waterless = waterlessTiles.get(tileId);
+        if (waterless !== undefined
+          && waterless.payload === payload
+          && sameBbox(waterless.bbox, bbox)) {
+          continue;
+        }
+        if (built >= buildBudget) {
+          deferredBuilds += 1;
+          continue;
+        }
+        built += 1;
+        const optical = createOpticalMesh(source);
+        if (optical == null) {
+          waterlessTiles.set(tileId, { payload, bbox });
+          continue;
+        }
+        waterlessTiles.delete(tileId);
+        entry = { optical, payload, bbox };
+        opticalByTile.set(tileId, entry);
         group.add(optical);
       }
+      // A revived tile is a different mesh object carrying the same grid.
+      entry.optical.userData.sourceTerrainMesh = source;
 
       const texture = tileTexture(source);
-      if (optical.material.map !== texture) {
-        optical.material.map = texture;
-        optical.material.needsUpdate = true;
+      if (entry.optical.material.map !== texture) {
+        entry.optical.material.map = texture;
+        entry.optical.material.needsUpdate = true;
       }
-      optical.visible = texture != null;
+      entry.optical.visible = texture != null;
     }
 
-    for (const [source, optical] of opticalBySource) {
-      if (!liveSources.has(source)) remove(source, optical);
+    for (const [tileId, entry] of opticalByTile) {
+      if (!liveTiles.has(tileId)) remove(tileId, entry);
+    }
+    for (const tileId of waterlessTiles.keys()) {
+      if (!liveTiles.has(tileId)) waterlessTiles.delete(tileId);
     }
   }
 
   return {
     group,
     sync,
-    get size() { return opticalBySource.size; },
+    get size() { return opticalByTile.size; },
+    get waterlessSize() { return waterlessTiles.size; },
+    get pendingBuilds() { return deferredBuilds; },
     dispose() {
-      for (const [source, optical] of [...opticalBySource]) {
-        remove(source, optical);
+      for (const [tileId, entry] of [...opticalByTile]) {
+        remove(tileId, entry);
       }
+      waterlessTiles.clear();
       terrainRoot.remove(group);
     },
   };

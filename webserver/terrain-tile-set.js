@@ -417,6 +417,15 @@ export function reconcileTerrainTiles({
   buildMesh,
   log,
   buildBudget = 200,
+  // A tile count says nothing about time: 200 grids cost whatever they cost,
+  // and one response was measured spending 127ms uninterrupted. The deadline
+  // is what actually protects the frame; the count stays as a coarse ceiling.
+  buildBudgetMs = 8,
+  // Refreshing is seam repair, so it gets its own slightly larger allowance
+  // than building: a stale grid still renders, it just keeps last response's
+  // edge until its turn comes.
+  refreshBudgetMs = 6,
+  now = () => performance.now(),
   prepareUntexturedMesh = () => {},
   onMeshAdded = () => {},
   onDiff = () => {},
@@ -438,7 +447,9 @@ export function reconcileTerrainTiles({
   // may carry a new heightmap after a nearby LOD transition. Update ordinary
   // resident grids in place: rebuilding them used to send unchanged topology
   // through defer -> ancestor placeholder -> exact texture on every response.
-  for (const mesh of [...meshesById.values()]) {
+  const refreshStartedAt = now();
+  const refreshCandidates = [];
+  for (const mesh of meshesById.values()) {
     const tileId = mesh.userData?.tileId;
     const nextTile = tileById.get(tileId);
     const previousPayload = mesh.userData?.heightmapPayload;
@@ -448,6 +459,28 @@ export function reconcileTerrainTiles({
       || typeof previousPayload !== 'string'
       || previousPayload === nextTile.heightmap
     ) continue;
+    refreshCandidates.push({ mesh, tileId, nextTile });
+  }
+  // A refresh costs about what a rebuild costs, and seam repair changes the
+  // payload of nearly every resident tile on nearly every response — so this
+  // loop could pay for a few hundred full grids in one uninterrupted block.
+  // Nearest-first, then stop at a deadline: a deferred tile keeps its previous
+  // grid and its skirt, which is what hides the seam in the meantime, and it
+  // stays a candidate on the next response.
+  if (refreshCandidates.length > 1) {
+    refreshCandidates.sort(
+      (a, b) => priorityForTile(a.nextTile) - priorityForTile(b.nextTile),
+    );
+  }
+  const refreshDeadline = refreshStartedAt + refreshBudgetMs;
+  let refreshed = 0;
+  let refreshDeferred = 0;
+  for (const { mesh, tileId, nextTile } of refreshCandidates) {
+    if (!completeCoverage && refreshed > 0 && now() >= refreshDeadline) {
+      refreshDeferred += 1;
+      continue;
+    }
+    refreshed += 1;
     if (refreshMesh(mesh, nextTile)) {
       log(tileId, 'refreshed in place — repaired heightmap changed');
       refreshedInPlaceIds.add(tileId);
@@ -457,6 +490,7 @@ export function reconcileTerrainTiles({
     log(tileId, 'refresh queued — repaired heightmap changed');
     refreshedIds.add(tileId);
   }
+  const refreshMs = now() - refreshStartedAt;
 
   // Deferred tiles have no resident mesh to inspect, but must still use the
   // newest repaired payload when their texture eventually arrives.
@@ -523,6 +557,16 @@ export function reconcileTerrainTiles({
     const existingIds = new Set(meshesById.keys());
     const candidates = prioritizeTerrainBuildCandidates(tiles, new Set(added), priorityForTile);
     let built = 0;
+    // Candidates arrive ranked by camera distance, heading, pitch, and FOV, so
+    // stopping at a deadline drops the tail — tiles behind the camera or
+    // outside the frustum — rather than an arbitrary slice. Always allow the
+    // first build: a deadline already passed on entry must not starve the
+    // highest-priority tile forever.
+    const buildDeadline = now() + buildBudgetMs;
+    const canBuild = () => (
+      completeCoverage
+      || (built < buildBudget && (built === 0 || now() < buildDeadline))
+    );
     // Stale coverage only ever comes from meshes that were already resident
     // and textured when this reconcile began. Nothing built below can join the
     // set: the cached-texture branch materializes without touching meshesById,
@@ -542,12 +586,12 @@ export function reconcileTerrainTiles({
       if (cachedTexture) {
         claimTile(tile.id);
         deferredTiles.set(tile.id, tile);
-        if (completeCoverage || built < buildBudget) {
+        if (canBuild()) {
           log(tile.id, 'added — immediate build (cached tex)');
           materialize(tile.id, cachedTexture);
           built += 1;
         } else {
-          log(tile.id, `added — deferred (build budget exceeded, built=${built}/${buildBudget})`);
+          log(tile.id, `added — deferred (build budget spent, built=${built})`);
         }
         continue;
       }
@@ -559,7 +603,7 @@ export function reconcileTerrainTiles({
       if (existingRefreshMesh) {
         if (existingRefreshMesh.material?.map) {
           log(tile.id, 'refresh deferred — textured geometry remains until atomic replacement');
-        } else if (completeCoverage || built < buildBudget) {
+        } else if (canBuild()) {
           const mesh = buildMesh(tile);
           if (mesh) {
             applyTileDepthOffset(mesh, tile.id, depthOffsetEnabled);
@@ -571,7 +615,7 @@ export function reconcileTerrainTiles({
           }
           built += 1;
         } else {
-          log(tile.id, `refresh deferred — build budget exceeded, built=${built}/${buildBudget}`);
+          log(tile.id, `refresh deferred — build budget spent, built=${built}`);
         }
         continue;
       }
@@ -580,7 +624,7 @@ export function reconcileTerrainTiles({
       );
       if (hasStaleCoverage) {
         log(tile.id, 'added — deferred (stale coverage exists)');
-      } else if (completeCoverage || built < buildBudget) {
+      } else if (canBuild()) {
         log(tile.id, 'added — untextured fallback (no stale coverage)');
         const mesh = buildMesh(tile);
         if (mesh) {
@@ -607,6 +651,9 @@ export function reconcileTerrainTiles({
     deferred: deferredTiles.size,
     evictMs: Number(evictMs.toFixed(1)),
     buildMs: Number((performance.now() - buildStartedAt).toFixed(1)),
+    refreshMs: Number(refreshMs.toFixed(1)),
+    refreshed,
+    refreshDeferred,
   };
 }
 

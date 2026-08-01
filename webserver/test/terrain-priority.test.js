@@ -2869,3 +2869,193 @@ test('browser heatmap sweep never retires hot 12-1398-779 when its old children 
   assert.deepEqual(sweep.retired, oldChildren.map(child => child.userData.tileId));
   assert.equal(released.includes(hotTileId), false);
 });
+
+test('shared reconciler stops building at the time budget, dropping lowest priority first', () => {
+  const built = [];
+  const deferredTiles = new Map();
+  const terrainRoot = { children: [], add(mesh) { this.children.push(mesh); } };
+  // Each build costs 3ms of simulated wall clock; an 8ms budget affords three.
+  let clock = 0;
+  const tiles = [];
+  for (let index = 0; index < 10; index += 1) {
+    tiles.push({
+      id: `t${index}`, bbox: [index, index, index + 1, index + 1],
+      heightmap: 'hm', priority: index,
+    });
+  }
+
+  reconcileTerrainTiles({
+    terrainRoot,
+    deferredTiles,
+    lifecycle: {},
+    priorityForTile: tile => tile.priority,
+    textureCache: new Map(),
+    materialize: () => assert.fail('unexpected materialize'),
+    buildMesh: tile => {
+      built.push(tile.id);
+      clock += 3;
+      return {
+        isMesh: true, userData: { tileId: tile.id, bbox: tile.bbox },
+        material: { map: null },
+      };
+    },
+    log: () => {},
+    buildBudget: 200,
+    buildBudgetMs: 8,
+    now: () => clock,
+    tiles,
+    currentTileIds: new Set(),
+    onDiff: () => {},
+  });
+
+  // Builds 0ms, 3ms, 6ms; the fourth check sees 9ms and stops.
+  assert.deepEqual(built, ['t0', 't1', 't2']);
+  // Dropped work is the low-priority tail, and it stays queued for later.
+  assert.equal(deferredTiles.size, 10);
+});
+
+test('shared reconciler always builds one tile even if the budget is already spent', () => {
+  const built = [];
+  const terrainRoot = { children: [], add(mesh) { this.children.push(mesh); } };
+
+  reconcileTerrainTiles({
+    terrainRoot,
+    deferredTiles: new Map(),
+    lifecycle: {},
+    priorityForTile: tile => tile.priority,
+    textureCache: new Map(),
+    materialize: () => assert.fail('unexpected materialize'),
+    buildMesh: tile => {
+      built.push(tile.id);
+      return {
+        isMesh: true, userData: { tileId: tile.id, bbox: tile.bbox },
+        material: { map: null },
+      };
+    },
+    log: () => {},
+    buildBudgetMs: 0,
+    // A clock that has already blown the deadline must not starve the
+    // highest-priority tile forever.
+    now: () => 1e6,
+    tiles: [
+      { id: 'hot', bbox: [0, 0, 1, 1], heightmap: 'hm', priority: 1 },
+      { id: 'cold', bbox: [9, 9, 10, 10], heightmap: 'hm', priority: 9 },
+    ],
+    currentTileIds: new Set(),
+    onDiff: () => {},
+  });
+
+  assert.deepEqual(built, ['hot']);
+});
+
+test('complete coverage ignores the time budget so a first load is never partial', () => {
+  const built = [];
+  const terrainRoot = { children: [], add(mesh) { this.children.push(mesh); } };
+
+  reconcileTerrainTiles({
+    terrainRoot,
+    deferredTiles: new Map(),
+    lifecycle: {},
+    priorityForTile: tile => tile.priority,
+    textureCache: new Map(),
+    materialize: () => assert.fail('unexpected materialize'),
+    buildMesh: tile => {
+      built.push(tile.id);
+      return {
+        isMesh: true, userData: { tileId: tile.id, bbox: tile.bbox },
+        material: { map: null },
+      };
+    },
+    log: () => {},
+    completeCoverage: true,
+    buildBudgetMs: 0,
+    now: () => 1e6,
+    tiles: [
+      { id: 'a', bbox: [0, 0, 1, 1], heightmap: 'hm', priority: 1 },
+      { id: 'b', bbox: [1, 1, 2, 2], heightmap: 'hm', priority: 2 },
+      { id: 'c', bbox: [2, 2, 3, 3], heightmap: 'hm', priority: 3 },
+    ],
+    currentTileIds: new Set(),
+    onDiff: () => {},
+  });
+
+  assert.deepEqual(built, ['a', 'b', 'c']);
+});
+
+test('in-place refresh stops at its deadline, nearest tiles first', () => {
+  const refreshed = [];
+  let clock = 0;
+  const meshFor = (tileId, payload) => ({
+    isMesh: true,
+    userData: { tileId, heightmapPayload: payload, bbox: [0, 0, 1, 1] },
+    material: { map: {} },
+  });
+  const residentById = new Map([
+    ['far', meshFor('far', 'old')],
+    ['hot', meshFor('hot', 'old')],
+    ['mid', meshFor('mid', 'old')],
+  ]);
+  const terrainRoot = { children: [...residentById.values()], add() {} };
+
+  const result = reconcileTerrainTiles({
+    terrainRoot,
+    deferredTiles: new Map(),
+    lifecycle: {},
+    residentById,
+    priorityForTile: tile => tile.priority,
+    textureCache: new Map(),
+    materialize: () => {},
+    buildMesh: () => null,
+    log: () => {},
+    // Each refresh burns the whole 5ms allowance, so only the first survives.
+    refreshMesh: (mesh, tile) => { refreshed.push(tile.id); clock += 5; return true; },
+    refreshBudgetMs: 5,
+    now: () => clock,
+    tiles: [
+      { id: 'far', bbox: [0, 0, 1, 1], heightmap: 'new', priority: 9 },
+      { id: 'hot', bbox: [0, 0, 1, 1], heightmap: 'new', priority: 1 },
+      { id: 'mid', bbox: [0, 0, 1, 1], heightmap: 'new', priority: 5 },
+    ],
+    currentTileIds: new Set(['far', 'hot', 'mid']),
+    onDiff: () => {},
+  });
+
+  assert.deepEqual(refreshed, ['hot'], 'nearest tile must win the budget');
+  assert.equal(result.refreshed, 1);
+  assert.equal(result.refreshDeferred, 2);
+});
+
+test('one refresh always runs even when the deadline is already blown', () => {
+  const refreshed = [];
+  const meshFor = (tileId) => ({
+    isMesh: true,
+    userData: { tileId, heightmapPayload: 'old', bbox: [0, 0, 1, 1] },
+    material: { map: {} },
+  });
+  const residentById = new Map([['far', meshFor('far')], ['hot', meshFor('hot')]]);
+
+  const result = reconcileTerrainTiles({
+    terrainRoot: { children: [...residentById.values()], add() {} },
+    deferredTiles: new Map(),
+    lifecycle: {},
+    residentById,
+    priorityForTile: tile => tile.priority,
+    textureCache: new Map(),
+    materialize: () => {},
+    buildMesh: () => null,
+    log: () => {},
+    refreshMesh: (mesh, tile) => { refreshed.push(tile.id); return true; },
+    refreshBudgetMs: 0,
+    now: () => 1e6,
+    tiles: [
+      { id: 'far', bbox: [0, 0, 1, 1], heightmap: 'new', priority: 9 },
+      { id: 'hot', bbox: [0, 0, 1, 1], heightmap: 'new', priority: 1 },
+    ],
+    currentTileIds: new Set(['far', 'hot']),
+    onDiff: () => {},
+  });
+
+  // Starvation guard: seam repair must make progress every response.
+  assert.deepEqual(refreshed, ['hot']);
+  assert.equal(result.refreshDeferred, 1);
+});

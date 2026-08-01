@@ -2832,7 +2832,8 @@ function render() {
     cloudCoverage,
     cloudRenderingEnabled,
   );
-  waterRuntime.update({
+  const markPreWater = performance.now();
+  const waterTimings = waterRuntime.update({
     dt, camera,
     visible: waterParams.enabled && !controls.mapMode
       && !textureStreamer.waterDebug && !textureStreamer.hydroDebug,
@@ -2939,7 +2940,11 @@ function render() {
   frameSections.movement = markMovement - markT0;
   frameSections.demand = markDemand - markMovement;
   frameSections.hud = markHud - markDemand;
-  frameSections.water = markWater - markHud;
+  frameSections.preWater = markPreWater - markHud;
+  frameSections.water = markWater - markPreWater;
+  frameSections.waterOpticalSync = waterTimings?.opticalSync ?? 0;
+  frameSections.waterSim = waterTimings?.sim ?? 0;
+  frameSections.waterCapture = waterTimings?.capture ?? 0;
   frameSections.vehicle = markVehicle - markWater;
   frameSections.renderScene = markRender - markVehicle;
   renderBackend.stopRenderLoopIfIdle();

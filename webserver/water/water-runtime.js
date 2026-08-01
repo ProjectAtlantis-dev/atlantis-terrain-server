@@ -122,12 +122,17 @@ export function createWaterRuntime({
     visible,
     opticalVisible = visible,
   }) {
+    // The water block is the largest remaining in-frame stall and the depth
+    // capture was measured out of it, so time the rest of the phases here.
+    const timings = {};
+    const syncStartedAt = performance.now();
     water.mesh.visible = visible;
     opticalSurface.sync({
       visible: opticalVisible,
       waterline: params.waterline ?? 0,
     });
-    if (!visible) return;
+    timings.opticalSync = performance.now() - syncStartedAt;
+    if (!visible) return timings;
 
     rel.copy(camera.position).sub(anchorPosition);
     cameraLocal.set(rel.dot(east), rel.dot(north), rel.dot(up));
@@ -152,10 +157,13 @@ export function createWaterRuntime({
     simParams.choppiness = params.choppiness;
     simParams.cameraAltitude = Math.max(0, cameraLocal.z);
 
+    const simStartedAt = performance.now();
     water.update({
       simTime, dt: scaledDt, meshOffset, cameraLocal, sunLocal,
       palette, params, simParams,
     });
+    timings.sim = performance.now() - simStartedAt;
+    const captureStartedAt = performance.now();
 
     // Re-capture when movement re-centres the window, when tile textures have
     // changed since the last capture (debounced — streaming arrives in
@@ -192,6 +200,8 @@ export function createWaterRuntime({
         });
       }
     }
+    timings.capture = performance.now() - captureStartedAt;
+    return timings;
   }
 
   return {

@@ -217,6 +217,9 @@ export function createTerrainFetchRuntime({
       reconcileMs: Number(reconcileMs.toFixed(1)),
       evictMs: reconciliation.evictMs,
       buildMs: reconciliation.buildMs,
+      refreshMs: reconciliation.refreshMs,
+      refreshed: reconciliation.refreshed,
+      refreshDeferred: reconciliation.refreshDeferred,
       released: reconciliation.released,
       geometryCache: reconciliation.geometryCache,
     });

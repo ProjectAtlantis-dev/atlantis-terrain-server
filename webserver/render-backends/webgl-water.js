@@ -955,6 +955,11 @@ export function createWebGLWater({
       const prevSortObjects = renderer.sortObjects;
       renderer.getClearColor(prevClearColor);
       const prevVisible = mesh.visible;
+      // This capture is the largest remaining in-frame stall, and its three
+      // phases fail for different reasons: preparation walks the tile list,
+      // the draw can stall on the GPU, and restoration touches every tile
+      // again. Time them apart so the next capture names its own cost.
+      const captureStartedAt = performance.now();
       const restoreTerrainTiles = prepareBathymetryTerrainTiles(terrainRoot);
       const renderCallbacks = [];
       const stats = { tiles: 0, textured: 0, untexturedIds: [] };
@@ -979,11 +984,14 @@ export function createWebGLWater({
       mesh.visible = false;
       renderer.sortObjects = true;
       renderer.setClearColor(0x000000, 0);
+      const prepareMs = performance.now() - captureStartedAt;
+      const drawStartedAt = performance.now();
       try {
         renderer.setRenderTarget(bathyTarget);
         renderer.clear();
         renderer.render(scene, bathyCamera);
       } finally {
+        stats.drawMs = Number((performance.now() - drawStartedAt).toFixed(1));
         renderer.setRenderTarget(prevTarget);
         renderer.setClearColor(prevClearColor, prevAlpha);
         scene.overrideMaterial = prevOverride;
@@ -995,6 +1003,11 @@ export function createWebGLWater({
       }
       uniforms.uBathyCenter.value.set(centerXY.x, centerXY.y);
       uniforms.uBathyExtent.value = bathyExtent;
+      stats.prepareMs = Number(prepareMs.toFixed(1));
+      stats.totalMs = Number((performance.now() - captureStartedAt).toFixed(1));
+      stats.restoreMs = Number(
+        (stats.totalMs - stats.prepareMs - stats.drawMs).toFixed(1),
+      );
       return stats;
     },
 
