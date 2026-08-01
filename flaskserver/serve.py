@@ -95,6 +95,10 @@ LOD_PAST_CONTRACT_CORE_TILE_WIDTHS = 3.0
 # above ~1.3 km, and so on down to the depth-8 rim floor. Altitude is the
 # The API supplies measured AGL from the rendered terrain raycast.
 LOD_ALTITUDE_WIDTH_FACTOR = 2.0
+# Fraction of a boundary the camera must clear before the LOD cap follows it.
+# At depth 12 (boundary 1318 m AGL) this holds the cap anywhere in 989-1648 m,
+# which covers ordinary fjord and ridge relief on a level cruise.
+LOD_ALTITUDE_HYSTERESIS = 0.25
 
 _tile_width_cache: dict[int, float] = {}
 
@@ -108,14 +112,43 @@ def _tile_width_m(depth):
     return width
 
 
-def _altitude_depth_cap(altitude, max_depth):
-    """Deepest LOD worth fetching from a camera this high up."""
+def _altitude_depth_cap(altitude, max_depth, previous_depth=None):
+    """Deepest LOD worth fetching from a camera this high up.
+
+    The bare rule is a step, which was harmless while the input was camera
+    altitude — flat during level flight. The input is now height above
+    terrain, so a camera holding altitude over undulating ground sweeps back
+    and forth across a boundary every few seconds, and each crossing swaps the
+    entire resident tile set (measured at +233/-227 tiles in consecutive
+    responses).
+
+    Given the cap the client is already on, require the altitude to clear the
+    boundary by a margin before changing it. The deadband is wide enough that
+    routine terrain relief cannot re-trigger a swap, while a real climb or
+    descent still crosses it immediately.
+    """
     depth = max_depth
     while (
         depth > LOD_COARSE_FLOOR_DEPTH
         and altitude > LOD_ALTITUDE_WIDTH_FACTOR * _tile_width_m(depth)
     ):
         depth -= 1
+    if previous_depth is None:
+        return depth
+
+    previous = max(LOD_COARSE_FLOOR_DEPTH, min(int(max_depth), int(previous_depth)))
+    if depth < previous:
+        # Coarsening: the boundary being left is the one below the held depth.
+        boundary = LOD_ALTITUDE_WIDTH_FACTOR * _tile_width_m(previous)
+        if altitude <= boundary * (1.0 + LOD_ALTITUDE_HYSTERESIS):
+            return previous
+    elif depth > previous:
+        # Refining: the boundary being crossed belongs to the depth regained.
+        boundary = LOD_ALTITUDE_WIDTH_FACTOR * _tile_width_m(
+            min(int(max_depth), previous + 1)
+        )
+        if altitude >= boundary * (1.0 - LOD_ALTITUDE_HYSTERESIS):
+            return previous
     return depth
 
 
@@ -144,7 +177,12 @@ def _lod_target_depth(distance, max_range, max_depth, altitude=0.0):
     """
     max_depth = max(0, int(max_depth))
     if altitude > 0.0:
-        max_depth = min(max_depth, _altitude_depth_cap(altitude, max_depth))
+        max_depth = min(
+            max_depth,
+            # max_depth is already the settled ceiling from _query_tiles_impl;
+            # holding it here keeps the radial curve from undoing hysteresis.
+            _altitude_depth_cap(altitude, max_depth, previous_depth=max_depth),
+        )
     if max_range <= 0:
         return max_depth
     contract_ceiling = min(max_depth, WMS_CONTRACT_DEPTH)
@@ -662,7 +700,8 @@ def _balance_lod_leaves(
 
 
 def query_tiles_stereo(db, qx, qy, error_threshold=0.001, max_depth=None,
-                       max_range=0.0, log=print, altitude=0.0):
+                       max_range=0.0, log=print, altitude=0.0,
+                       previous_depth=None):
     """Query tiles using error-based LOD with stereo coords directly.
 
     ``max_range`` is a circular coverage radius in meters.
@@ -670,17 +709,27 @@ def query_tiles_stereo(db, qx, qy, error_threshold=0.001, max_depth=None,
         distance to tiles below.
     """
     return _query_tiles_impl(
-        db, qx, qy, error_threshold, max_depth, max_range, log, altitude
+        db, qx, qy, error_threshold, max_depth, max_range, log, altitude,
+        previous_depth,
     )
 
 
 def _query_tiles_impl(db, qx, qy, error_threshold, max_depth, max_range, log,
-                      altitude=0.0):
+                      altitude=0.0, previous_depth=None):
     from database import get_metadata
     from collections import Counter
 
     if max_depth is None:
         max_depth = int(get_metadata(db, 'max_depth') or 14)
+
+    # Decide the altitude ceiling once, with hysteresis against the cap the
+    # client already holds. Everything downstream treats max_depth as the
+    # settled ceiling, so the radial curve cannot re-derive a different one
+    # mid-response and reintroduce the flip-flop.
+    if altitude > 0.0:
+        max_depth = min(
+            max_depth, _altitude_depth_cap(altitude, max_depth, previous_depth)
+        )
 
     # Mild altitude scaling — sqrt instead of linear so mountain peaks
     # aren't over-penalized.  At 2000m this is ~4.5x (was 20x linear).

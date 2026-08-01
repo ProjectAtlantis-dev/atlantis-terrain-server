@@ -179,6 +179,9 @@ function createOpticalMesh(source) {
 // threshold, but well over a 60fps frame, which read as continuous judder.
 const DEFAULT_OPTICAL_BUILD_BUDGET_MS = 3;
 const DEFAULT_OPTICAL_BUILD_BUDGET = 64;
+// A footprint is a few hundred twins and oscillation swaps most of them, so
+// hold several footprints' worth before discarding any.
+const DEFAULT_OPTICAL_DORMANT_TWINS = 1500;
 const TERRAIN_TILE_ID = /^\d+-\d+-\d+$/;
 
 export function createOpticalWaterSurfaceRuntime({
@@ -186,6 +189,7 @@ export function createOpticalWaterSurfaceRuntime({
   opticalDepth = DEFAULT_OPTICAL_WATER_DEPTH_M,
   buildBudget = DEFAULT_OPTICAL_BUILD_BUDGET,
   buildBudgetMs = DEFAULT_OPTICAL_BUILD_BUDGET_MS,
+  maxDormantTwins = DEFAULT_OPTICAL_DORMANT_TWINS,
   now = () => performance.now(),
 } = {}) {
   const group = new THREE.Group();
@@ -204,7 +208,20 @@ export function createOpticalWaterSurfaceRuntime({
   // them. Without this they were re-clipped on every single frame for as long
   // as they stayed resident.
   const waterlessTiles = new Map();
+  // LOD oscillation evicts and re-admits the same tiles continuously, and a
+  // twin destroyed on eviction has to be re-clipped from scratch when the tile
+  // returns moments later — measured at ~25 destroy/rebuild cycles per second,
+  // which is visible as the water repainting. Park them instead; a twin is
+  // just geometry plus a material reference, so holding a few hundred is
+  // cheaper than re-clipping one.
+  const dormantTwins = new Map();
   let deferredBuilds = 0;
+  // Rebuild churn is invisible on screen except as a repaint, so count it.
+  let totalBuilds = 0;
+  let totalRebuilds = 0;
+  let totalEvictions = 0;
+  let totalRevivals = 0;
+  let totalDormantDrops = 0;
 
   function sameBbox(a, b) {
     // Two absent bboxes describe the same (unknown) placement; treating them
@@ -239,13 +256,32 @@ export function createOpticalWaterSurfaceRuntime({
       const tileId = source.userData?.tileId;
       if (!source.isMesh || !TERRAIN_TILE_ID.test(tileId ?? '')) continue;
       liveTiles.add(tileId);
-      const payload = source.userData?.heightmapPayload ?? null;
+      // Keyed on the water footprint, not the heightmap. Seam repair rewrites
+      // the payload on nearly every response while leaving the shoreline
+      // untouched, and rebuilding on that churn made the surface visibly
+      // repaint. Falls back to the payload when no mask key is present.
+      const payload = source.userData?.terrainWaterMaskKey
+        ?? source.userData?.heightmapPayload
+        ?? null;
       const bbox = source.userData?.bbox ?? null;
 
       let entry = opticalByTile.get(tileId);
       if (entry != null && (entry.payload !== payload || !sameBbox(entry.bbox, bbox))) {
         remove(tileId, entry);
+        totalRebuilds += 1;
         entry = null;
+      }
+      if (entry == null) {
+        const parked = dormantTwins.get(tileId);
+        if (parked != null
+          && parked.payload === payload
+          && sameBbox(parked.bbox, bbox)) {
+          dormantTwins.delete(tileId);
+          group.add(parked.optical);
+          opticalByTile.set(tileId, parked);
+          totalRevivals += 1;
+          entry = parked;
+        }
       }
       if (entry == null) {
         const waterless = waterlessTiles.get(tileId);
@@ -265,6 +301,7 @@ export function createOpticalWaterSurfaceRuntime({
           continue;
         }
         waterlessTiles.delete(tileId);
+        totalBuilds += 1;
         entry = { optical, payload, bbox };
         opticalByTile.set(tileId, entry);
         group.add(optical);
@@ -281,7 +318,20 @@ export function createOpticalWaterSurfaceRuntime({
     }
 
     for (const [tileId, entry] of opticalByTile) {
-      if (!liveTiles.has(tileId)) remove(tileId, entry);
+      if (liveTiles.has(tileId)) continue;
+      group.remove(entry.optical);
+      opticalByTile.delete(tileId);
+      dormantTwins.delete(tileId);
+      dormantTwins.set(tileId, entry);
+      totalEvictions += 1;
+      while (dormantTwins.size > maxDormantTwins) {
+        const oldest = dormantTwins.keys().next().value;
+        const stale = dormantTwins.get(oldest);
+        dormantTwins.delete(oldest);
+        stale.optical.geometry?.dispose?.();
+        stale.optical.material?.dispose?.();
+        totalDormantDrops += 1;
+      }
     }
     for (const tileId of waterlessTiles.keys()) {
       if (!liveTiles.has(tileId)) waterlessTiles.delete(tileId);
@@ -294,10 +344,28 @@ export function createOpticalWaterSurfaceRuntime({
     get size() { return opticalByTile.size; },
     get waterlessSize() { return waterlessTiles.size; },
     get pendingBuilds() { return deferredBuilds; },
+    stats() {
+      return {
+        size: opticalByTile.size,
+        waterless: waterlessTiles.size,
+        pendingBuilds: deferredBuilds,
+        builds: totalBuilds,
+        rebuilds: totalRebuilds,
+        evictions: totalEvictions,
+        revivals: totalRevivals,
+        dormant: dormantTwins.size,
+        dormantDrops: totalDormantDrops,
+      };
+    },
     dispose() {
       for (const [tileId, entry] of [...opticalByTile]) {
         remove(tileId, entry);
       }
+      for (const entry of dormantTwins.values()) {
+        entry.optical.geometry?.dispose?.();
+        entry.optical.material?.dispose?.();
+      }
+      dormantTwins.clear();
       waterlessTiles.clear();
       terrainRoot.remove(group);
     },

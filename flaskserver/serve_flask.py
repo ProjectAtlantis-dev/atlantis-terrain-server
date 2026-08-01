@@ -1584,6 +1584,7 @@ def _buildings_for_tile_query(qx: float, qy: float, ox: float, oy: float):
 
 
 @app.get("/api/tiles")
+@app.post("/api/tiles")
 def api_tiles():
   unavailable = _terrain_unavailable_response()
   if unavailable is not None:
@@ -1613,6 +1614,21 @@ def api_tiles():
   # for older clients, but current clients send the unambiguous ``agl``.
   lod_altitude = _arg_float("agl", _arg_float("alt", 0.0))
   heading = _arg_float("heading", 0.0)
+  binary_heightmaps = request.args.get("format") == "binary"
+  # Residency map: tile id -> digest the client already holds and can rebuild
+  # from. Matching tiles ship as metadata only. Measured at 80% of transferred
+  # elevation bytes on a real flight, all of it re-decoded and re-allocated by
+  # the browser once a second.
+  known_digests = {}
+  previous_depth_cap = None
+  if request.method == "POST":
+    body = request.get_json(silent=True) or {}
+    candidate = body.get("known")
+    if isinstance(candidate, dict):
+      known_digests = candidate
+    held = body.get("depthCap")
+    if isinstance(held, int):
+      previous_depth_cap = held
   try:
     tiles, missing = _query_tiles_stereo(
       _get_db(),
@@ -1622,6 +1638,7 @@ def api_tiles():
       max_depth=max_depth,
       max_range=max_range,
       altitude=lod_altitude,
+      previous_depth=previous_depth_cap,
       log=lambda msg: log.debug(f"[/api/tiles] {msg}"),
     )
   except Exception as exc:
@@ -1655,8 +1672,8 @@ def api_tiles():
   # parse megabytes of JSON on its main thread before a frame can render.
   # Binary clients get a length-prefixed header plus one concatenated block of
   # float32 samples, which they can view without copying.
-  binary_heightmaps = request.args.get("format") == "binary"
   heightmap_blobs = []
+  tile_reused = 0
   tile_data = []
   tex_status_counts = {
     "ready": 0,
@@ -1684,9 +1701,18 @@ def api_tiles():
       # rather than any stored revision — edge repair depends on which
       # neighbours are in *this* response.
       heightmap_field = f"{zlib.crc32(hm_bytes) & 0xFFFFFFFF:08x}"
-      heightmap_blobs.append(hm_bytes)
+      # The digest must cover the repaired bytes for *this* response, so the
+      # work above still happens; what is saved is the transfer and the
+      # browser-side allocation, not the server-side read.
+      if known_digests.get(tid) == heightmap_field:
+        heightmap_bytes_field = 0
+        tile_reused += 1
+      else:
+        heightmap_bytes_field = len(hm_bytes)
+        heightmap_blobs.append(hm_bytes)
     else:
       heightmap_field = base64.b64encode(hm_bytes).decode("ascii")
+      heightmap_bytes_field = None
 
     tile_data.append(
       {
@@ -1696,7 +1722,7 @@ def api_tiles():
         "source": tile["source"],
         "resolution": _GRID_N,
         "heightmap": heightmap_field,
-        "heightmapBytes": len(hm_bytes) if binary_heightmaps else None,
+        "heightmapBytes": heightmap_bytes_field if binary_heightmaps else None,
         "hasTexture": bool(tex_flags["has_texture"]),
         "texAvailable": bool(tex_flags["available"]),
         "texStatus": tex_status,
@@ -1788,6 +1814,10 @@ def api_tiles():
       "buildings": buildings,
       "buildingCount": len(buildings) if buildings is not None else None,
       "buildingsHash": buildings_hash,
+      "tilesReused": tile_reused,
+      # Echoed back next request so the altitude cap has something to be
+      # hysteretic against; without it every response re-decides from scratch.
+      "depthCap": max((t["depth"] for t in tile_data), default=None),
       "buildingsUnchanged": buildings_unchanged,
   }
   if not binary_heightmaps:

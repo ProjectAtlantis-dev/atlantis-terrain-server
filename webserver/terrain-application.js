@@ -1699,6 +1699,13 @@ function runStreamingMaintenance() {
   if (dateChanged || renderBackend.sceneMutationVersion !== before) {
     requestRender();
   }
+  // Optical twins are torn down and rebuilt silently; on screen that reads as
+  // the water repainting. Counters are cumulative, so a rising rebuild delta
+  // between samples is the signal.
+  const optical = waterRuntime.opticalStats?.();
+  if (optical != null) {
+    enqueueClientLog('info', 'water.optical.stats', optical);
+  }
 }
 
 const terrainFetchEvents = {

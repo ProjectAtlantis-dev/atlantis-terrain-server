@@ -7,6 +7,25 @@ import * as THREE from 'three';
  * and keeps `heightmap` as a digest, so decoding is a no-op there. The JSON
  * transport still carries base64 and is decoded on demand.
  */
+/**
+ * Cheap identity for a tile's water footprint.
+ *
+ * Consumers that only care about where water is — the optical surface, for one
+ * — must not rebuild when seam repair nudges elevations. Repair rewrites edge
+ * samples on nearly every response, but almost never moves one across sea
+ * level, so keying on the mask instead of the heightmap keeps derived meshes
+ * alive through routine repair.
+ */
+export function terrainWaterMaskKey(waterMask) {
+  if (!(waterMask instanceof Uint8Array)) return null;
+  let hash = 0x811c9dc5;
+  for (let index = 0; index < waterMask.length; index += 1) {
+    hash ^= waterMask[index];
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return `${waterMask.length}:${(hash >>> 0).toString(16)}`;
+}
+
 export function terrainTileSamples(tile) {
   if (tile?.samples instanceof Float32Array) return tile.samples;
   return decodeTerrainHeightmap(tile?.heightmap);
@@ -118,11 +137,13 @@ export function updateTerrainMeshHeightmap(mesh, tile) {
   mesh.geometry.computeVertexNormals?.();
   mesh.geometry.computeBoundingBox?.();
   mesh.geometry.computeBoundingSphere?.();
+  const terrainWaterMask = Uint8Array.from(heightmap, elevation => (
+    Number.isFinite(elevation) && elevation <= 0 ? 1 : 0
+  ));
   Object.assign(mesh.userData, {
     heightmapPayload: tile.heightmap,
-    terrainWaterMask: Uint8Array.from(heightmap, elevation => (
-      Number.isFinite(elevation) && elevation <= 0 ? 1 : 0
-    )),
+    terrainWaterMask,
+    terrainWaterMaskKey: terrainWaterMaskKey(terrainWaterMask),
   });
   return true;
 }
@@ -161,9 +182,15 @@ export function createTerrainMeshBuilder({
       // or below local sea level. Retain that footprint independently of the
       // rendered z values so the water renderer can place satellite colour on
       // a shallow optical-only surface while true bathymetry stays untouched.
-      terrainWaterMask: Uint8Array.from(heightmap, elevation => (
-        Number.isFinite(elevation) && elevation <= 0 ? 1 : 0
-      )),
+      ...(() => {
+        const terrainWaterMask = Uint8Array.from(heightmap, elevation => (
+          Number.isFinite(elevation) && elevation <= 0 ? 1 : 0
+        ));
+        return {
+          terrainWaterMask,
+          terrainWaterMaskKey: terrainWaterMaskKey(terrainWaterMask),
+        };
+      })(),
       // Seam repair is response-dependent: the same physical tile can get a
       // different boundary when the rendered LOD of its neighbor changes.
       // Keep the exact payload that produced this mesh so reconciliation can

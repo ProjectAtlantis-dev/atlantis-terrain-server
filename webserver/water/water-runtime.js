@@ -208,6 +208,7 @@ export function createWaterRuntime({
     enabled: true,
     params,
     opticalSurface: opticalSurface.group,
+    opticalStats: () => opticalSurface.stats(),
     applyWind,
     update,
     setDebugMode(mode) { water.setDebugMode?.(mode); },

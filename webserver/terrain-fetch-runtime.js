@@ -12,6 +12,7 @@ import {
   decodeTerrainBinaryPayload,
   isTerrainBinaryResponse,
 } from './terrain-binary-payload.js';
+import { createTerrainSampleCache } from './terrain-sample-cache.js';
 
 export function createTerrainFetchRuntime({
   state,
@@ -25,6 +26,7 @@ export function createTerrainFetchRuntime({
   cancelPoll = timer => clearTimeout(timer),
   events = {},
   lodAltitudeStabilizer = createLodAltitudeStabilizer(),
+  sampleCache = createTerrainSampleCache(),
   testOverrides = {},
 }) {
   const {
@@ -115,7 +117,20 @@ export function createTerrainFetchRuntime({
         ? Number(measuredAgl.toFixed(1))
         : null,
     });
-    const response = await fetchImpl(request.url, { signal });
+    const response = await fetchImpl(request.url, {
+      signal,
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      // Residency travels in a body because a footprint's worth of digests is
+      // far past a safe query-string length and grows with view range.
+      // depthCap is the ceiling this client is currently rendering. Echoing
+      // it lets the server hold that ceiling through ordinary terrain relief
+      // instead of re-deciding from scratch and swapping the whole tile set.
+      body: JSON.stringify({
+        known: sampleCache.residency(),
+        depthCap: state.depthCap ?? null,
+      }),
+    });
     // Deserializing the response is synchronous main-thread work despite the
     // await, and lands between frames where a frame-time profiler cannot see
     // it. Time it separately from reconcile so a stall can be blamed on the
@@ -125,6 +140,32 @@ export function createTerrainFetchRuntime({
       ? decodeTerrainBinaryPayload(await response.arrayBuffer())
       : await response.json();
     const parseMs = performance.now() - parseStartedAt;
+    // Tiles the server withheld carry a digest but no samples; restore them
+    // from what we told it we held. A miss here means the two sides disagree
+    // about residency, which would render the tile with no elevation data, so
+    // it is surfaced rather than silently tolerated.
+    let reusedSamples = 0;
+    const unresolved = [];
+    for (const tile of Array.isArray(data?.tiles) ? data.tiles : []) {
+      if (tile.samples instanceof Float32Array) {
+        sampleCache.store(tile.id, tile.heightmap, tile.samples);
+        continue;
+      }
+      if (typeof tile.heightmap !== 'string' || tile.heightmapBytes !== 0) continue;
+      const held = sampleCache.take(tile.id, tile.heightmap);
+      if (held == null) {
+        unresolved.push(tile.id);
+        continue;
+      }
+      tile.samples = held;
+      reusedSamples += 1;
+    }
+    if (unresolved.length > 0) {
+      logger.enqueue('warn', 'fetchTiles.residency.miss', {
+        count: unresolved.length,
+        tileIds: unresolved.slice(0, 8),
+      });
+    }
     if (response.ok === false || response.status >= 400) {
       const detail = typeof data?.error === 'string' ? `: ${data.error}` : '';
       throw new Error(`terrain tile request failed (${response.status})${detail}`);
@@ -212,6 +253,7 @@ export function createTerrainFetchRuntime({
     if (typeof data.buildingsHash === 'string') {
       state.buildingsHash = data.buildingsHash;
     }
+    if (Number.isInteger(data.depthCap)) state.depthCap = data.depthCap;
     if (Array.isArray(data.buildings)) onBuildings(data.buildings);
 
     const reconcileStartedAt = performance.now();
@@ -231,6 +273,8 @@ export function createTerrainFetchRuntime({
       refreshMs: reconciliation.refreshMs,
       refreshed: reconciliation.refreshed,
       refreshDeferred: reconciliation.refreshDeferred,
+      reusedSamples,
+      sampleCache: sampleCache.stats(),
       released: reconciliation.released,
       geometryCache: reconciliation.geometryCache,
     });

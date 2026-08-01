@@ -260,3 +260,112 @@ test('one optical twin is always built even past the deadline', () => {
   assert.equal(runtime.size, 1, 'starvation guard must let the surface progress');
   assert.equal(runtime.pendingBuilds, 2);
 });
+
+test('seam repair that leaves the shoreline alone keeps the existing twin', () => {
+  const terrainRoot = new THREE.Group();
+  const source = terrainTile();
+  source.userData.bbox = [0, 0, 10, 10];
+  source.userData.heightmapPayload = 'payload-a';
+  source.userData.terrainWaterMaskKey = '4:abc123';
+  terrainRoot.add(source);
+  const runtime = createOpticalWaterSurfaceRuntime({ terrainRoot });
+
+  runtime.sync({});
+  const twin = runtime.group.children[0];
+
+  // Repair rewrote elevations; the water footprint is unchanged.
+  source.userData.heightmapPayload = 'payload-b-repaired';
+  runtime.sync({});
+  assert.equal(runtime.group.children[0], twin, 'twin repainted on elevation-only change');
+});
+
+test('a shoreline change does rebuild the twin', () => {
+  const terrainRoot = new THREE.Group();
+  const source = terrainTile();
+  source.userData.bbox = [0, 0, 10, 10];
+  source.userData.terrainWaterMaskKey = '4:abc123';
+  terrainRoot.add(source);
+  const runtime = createOpticalWaterSurfaceRuntime({ terrainRoot });
+
+  runtime.sync({});
+  const twin = runtime.group.children[0];
+
+  source.userData.terrainWaterMaskKey = '4:def456';
+  runtime.sync({});
+  assert.notEqual(runtime.group.children[0], twin, 'stale shoreline kept');
+});
+
+test('an evicted twin is parked and revived when its tile returns', () => {
+  const terrainRoot = new THREE.Group();
+  const source = terrainTile();
+  source.userData.bbox = [0, 0, 10, 10];
+  source.userData.terrainWaterMaskKey = '4:abc';
+  terrainRoot.add(source);
+  const runtime = createOpticalWaterSurfaceRuntime({ terrainRoot });
+
+  runtime.sync({});
+  const twin = runtime.group.children[0];
+  assert.equal(runtime.stats().builds, 1);
+
+  // LOD contraction drops the tile.
+  terrainRoot.remove(source);
+  runtime.sync({});
+  assert.equal(runtime.size, 0);
+  assert.equal(runtime.stats().dormant, 1);
+
+  // ...and expansion brings it straight back on a fresh mesh object.
+  const revived = terrainTile();
+  revived.userData.bbox = [0, 0, 10, 10];
+  revived.userData.terrainWaterMaskKey = '4:abc';
+  terrainRoot.add(revived);
+  runtime.sync({});
+
+  assert.equal(runtime.group.children[0], twin, 're-clipped instead of revived');
+  assert.equal(runtime.stats().builds, 1, 'revival must not count as a build');
+  assert.equal(runtime.stats().revivals, 1);
+});
+
+test('a parked twin whose shoreline changed is not revived', () => {
+  const terrainRoot = new THREE.Group();
+  const source = terrainTile();
+  source.userData.bbox = [0, 0, 10, 10];
+  source.userData.terrainWaterMaskKey = '4:abc';
+  terrainRoot.add(source);
+  const runtime = createOpticalWaterSurfaceRuntime({ terrainRoot });
+  runtime.sync({});
+  const twin = runtime.group.children[0];
+
+  terrainRoot.remove(source);
+  runtime.sync({});
+
+  const changed = terrainTile();
+  changed.userData.bbox = [0, 0, 10, 10];
+  changed.userData.terrainWaterMaskKey = '4:different';
+  terrainRoot.add(changed);
+  runtime.sync({});
+
+  assert.notEqual(runtime.group.children[0], twin, 'stale shoreline revived');
+});
+
+test('dormant twins are bounded and disposed on overflow', () => {
+  const terrainRoot = new THREE.Group();
+  const sources = [];
+  for (let index = 0; index < 3; index += 1) {
+    const source = terrainTile();
+    source.userData.tileId = `12-7-${index}`;
+    source.userData.bbox = [index, index, index + 1, index + 1];
+    terrainRoot.add(source);
+    sources.push(source);
+  }
+  const runtime = createOpticalWaterSurfaceRuntime({ terrainRoot, maxDormantTwins: 2 });
+  runtime.sync({});
+  runtime.sync({});
+  runtime.sync({});
+  assert.equal(runtime.size, 3);
+
+  for (const source of sources) terrainRoot.remove(source);
+  runtime.sync({});
+
+  assert.equal(runtime.stats().dormant, 2);
+  assert.equal(runtime.stats().dormantDrops, 1);
+});
