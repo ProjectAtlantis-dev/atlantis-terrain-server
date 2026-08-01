@@ -22,7 +22,7 @@ TEXTURE SOURCE STATES:
 - dataforsyningen_metatile4h2: Primary source (SPOT 6/7, 1.6m/0.2m via
                                EPSG:3184), fetched/reprojected as an aligned
                                4x4 group with edge-driven color harmonization.
-- cooked_upscale:          Past WMS_CONTRACT_DEPTH only: the fetched metatile
+- cooked_upscale:          At D11+: the fetched metatile
                             carried no real detail beyond the level above
                             (provider blowup), so the tile was cooked from its
                             parent's final texture by terrain_upscale. Terminal
@@ -618,10 +618,10 @@ def texture_sources_in(db, tile_ids):
     return {r[0]: r[1] for r in rows}
 
 
-# A past-contract-depth metatile is a provider blowup when EITHER statistic
+# A D11+ metatile is a provider blowup when EITHER statistic
 # falls below its floor. Floors are empirical (synthetic real imagery scores
 # recon≈0.86 / spectral≈2.1; blowups ≤0.21 / ≤0.05, nearest-neighbour carve
-# 0.0 / 0.53); tune from the pair logged on every past-contract fetch.
+# 0.0 / 0.53); tune from the pair logged on every inspected fetch.
 METATILE_RECON_MIN = 0.35
 METATILE_SPECTRAL_MIN = 0.15
 

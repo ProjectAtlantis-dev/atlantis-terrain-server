@@ -108,6 +108,12 @@ CREATE TABLE IF NOT EXISTS tiles (
     confidence_map  BLOB
 );
 
+-- Depth-scoped coastline connectivity and rectangular descendant lookups run
+-- on every terrain response. Without this address index SQLite scans the
+-- entire quadtree once per connectivity signature query and once per tile.
+CREATE INDEX IF NOT EXISTS tiles_depth_col_row
+    ON tiles(depth, col, row);
+
 CREATE TABLE IF NOT EXISTS metadata (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL

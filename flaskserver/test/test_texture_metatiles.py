@@ -21,7 +21,9 @@ from texture import (
     write_texture,
 )
 import serve_flask
-from terrain_config import MAX_TILE_DEPTH, WMS_CONTRACT_DEPTH
+from terrain_config import (
+    MAX_TILE_DEPTH, WMS_CONTRACT_DEPTH, WMS_TEXTURE_INSPECT_MIN_DEPTH,
+)
 
 
 def _encoded_image(array, image_format="PNG"):
@@ -105,6 +107,8 @@ class TextureMetatileFetchTest(unittest.TestCase):
         self.old_fetch = serve_flask._fetch_dataforsyningen_texture
         self.old_split = serve_flask._split_texture_metatile
         self.old_harmonize = serve_flask._harmonize_texture_metatile
+        self.old_detector = serve_flask._metatile_is_upsampled
+        serve_flask._metatile_is_upsampled = lambda _jpeg: (False, 0.8, 0.8)
         serve_flask._tile_bbox = lambda depth, column, row: (
             depth, column, row, depth + column + row
         )
@@ -114,6 +118,7 @@ class TextureMetatileFetchTest(unittest.TestCase):
         serve_flask._fetch_dataforsyningen_texture = self.old_fetch
         serve_flask._split_texture_metatile = self.old_split
         serve_flask._harmonize_texture_metatile = self.old_harmonize
+        serve_flask._metatile_is_upsampled = self.old_detector
 
     def test_spec_groups_sixteen_quadtree_tiles_under_grandparent(self):
         metatile_id, bbox, resolution, children = serve_flask._texture_metatile_spec(
@@ -154,6 +159,40 @@ class TextureMetatileFetchTest(unittest.TestCase):
         self.assertEqual(len(children), 16)
         self.assertEqual(children["12-1404-764"], b"0-0")
         self.assertEqual(children["12-1407-765"], b"3-1")
+
+    def test_fetch_inspects_provider_detail_at_d11_but_not_d10(self):
+        detector = Mock(return_value=(False, 0.56, 0.28))
+        serve_flask._metatile_is_upsampled = detector
+        serve_flask._fetch_dataforsyningen_texture = (
+            lambda bbox, resolution, lossless=False: (b"meta", None)
+        )
+        serve_flask._harmonize_texture_metatile = (
+            lambda jpeg, child_resolution, grid_size: jpeg
+        )
+        serve_flask._split_texture_metatile = (
+            lambda jpeg, child_resolution, grid_size: {
+                (column, row): b"child"
+                for column in range(grid_size)
+                for row in range(grid_size)
+            }
+        )
+
+        serve_flask._fetch_texture_metatile("10-337-205")
+        detector.assert_not_called()
+        serve_flask._fetch_texture_metatile("11-674-411")
+        detector.assert_called_once_with(b"meta")
+        self.assertEqual(WMS_TEXTURE_INSPECT_MIN_DEPTH, 11)
+
+    def test_d11_provider_blowup_is_flagged_for_explicit_upscale_provenance(self):
+        serve_flask._metatile_is_upsampled = lambda _jpeg: (True, 0.2, 0.04)
+        serve_flask._fetch_dataforsyningen_texture = (
+            lambda bbox, resolution, lossless=False: (b"meta", None)
+        )
+
+        children, error = serve_flask._fetch_texture_metatile("11-674-411")
+
+        self.assertIsNone(children)
+        self.assertEqual(error, "wms_upsampled")
 
     def test_store_upgrades_legacy_children_without_clobbering_terminal_rows(self):
         db = sqlite3.connect(":memory:")

@@ -34,6 +34,27 @@ def _png_bytes(rgb):
 
 
 class OfficialCoastlineTest(unittest.TestCase):
+    def test_connectivity_signature_is_reused_until_database_changes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db = open_db(str(Path(directory) / "terrain.db"))
+            seed_tiles(db, max_depth=0)
+            coastline._connectivity_signature_cache.clear()
+            with patch(
+                "coastline._connectivity_signature",
+                wraps=coastline._connectivity_signature,
+            ) as signature:
+                coastline._cached_connectivity_signature(db, 0)
+                coastline._cached_connectivity_signature(db, 0)
+                self.assertEqual(signature.call_count, 1)
+
+                db.execute(
+                    "INSERT OR REPLACE INTO metadata (key, value) "
+                    "VALUES ('signature-test', 'changed')"
+                )
+                coastline._cached_connectivity_signature(db, 0)
+                self.assertEqual(signature.call_count, 2)
+            db.close()
+
     def test_hydrography_source_has_no_retired_coastline_alias(self):
         self.assertEqual(
             coastline.HYDROGRAPHY_SOURCE,

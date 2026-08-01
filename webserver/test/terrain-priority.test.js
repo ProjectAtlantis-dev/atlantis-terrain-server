@@ -2148,6 +2148,7 @@ test('shared terrain mesh builder preserves heightmap geometry and metadata', ()
   });
   const mesh = build({
     id: '1-2-3', resolution: 2, bbox: [10, 20, 12, 22], heightmap: encoded,
+    source: 'parent_resampled',
   });
   assert.deepEqual([...mesh.geometry.attributes.position.array.slice(0, 12)], [
     10, 20, 2, 12, 20, 4, 10, 22, 6, 12, 22, 8,
@@ -2162,13 +2163,16 @@ test('shared terrain mesh builder preserves heightmap geometry and metadata', ()
   ]);
   assert.equal(mesh.userData.tileId, '1-2-3');
   assert.equal(mesh.userData.resolution, 2);
+  assert.equal(mesh.userData.terrainSource, 'parent_resampled');
   assert.deepEqual([...scatterHeightmap], [1, 2, 3, 4]);
 });
 
 test('shared terrain debug metadata remains deterministic', () => {
   const mesh = {
     isMesh: true,
-    userData: { tileId: 'tile', bbox: [0, 0, 1, 1] },
+    userData: {
+      tileId: 'tile', bbox: [0, 0, 1, 1], terrainSource: 'arcticdem_10m',
+    },
     material: { map: { image: { width: 256, height: 128 } }, color: { getHexString: () => 'abcdef' } },
   };
   const root = {
@@ -2178,7 +2182,7 @@ test('shared terrain debug metadata remains deterministic', () => {
   assert.deepEqual(collectTerrainDebugMeshes(root), [mesh]);
   assert.deepEqual(summarizeTerrainMesh(mesh), {
     tileId: 'tile', hasTexture: true, textureSize: '256x128',
-    color: '#abcdef', bbox: [0, 0, 1, 1],
+    color: '#abcdef', bbox: [0, 0, 1, 1], terrainSource: 'arcticdem_10m',
   });
 });
 

@@ -142,6 +142,7 @@ export function updateTerrainMeshHeightmap(mesh, tile) {
   ));
   Object.assign(mesh.userData, {
     heightmapPayload: tile.heightmap,
+    terrainSource: tile.source,
     terrainWaterMask,
     terrainWaterMaskKey: terrainWaterMaskKey(terrainWaterMask),
   });
@@ -175,6 +176,7 @@ export function createTerrainMeshBuilder({
     Object.assign(mesh.userData, {
       tileId: tile.id,
       bbox: tile.bbox,
+      terrainSource: tile.source,
       resolution,
       skirtDepth,
       terrainExaggeration: exaggeration,

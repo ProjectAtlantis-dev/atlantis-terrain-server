@@ -32,7 +32,7 @@ from classifier_job_control import (
 from gpu_profile_control import GpuProfileControl
 from terrain_config import (
   BOOTSTRAP_SEED_DEPTH, MAX_TILE_DEPTH, WMS_CONTRACT_DEPTH,
-  WMS_TEXTURE_PROBE_MAX_DEPTH,
+  WMS_TEXTURE_INSPECT_MIN_DEPTH, WMS_TEXTURE_PROBE_MAX_DEPTH,
 )
 from tile_address import parse_tile_id as _parse_tile_id
 from bathymetry_demand import (
@@ -220,9 +220,9 @@ _tex_pool = ThreadPoolExecutor(max_workers=4)
 _tex_fetching: set[str] = set()
 _tex_fetching_lock = threading.Lock()
 
-# Cumulative past-contract-depth texture pipeline counters (process lifetime).
+# Cumulative inspected texture pipeline counters (process lifetime).
 _d13_stats = {
-  "inspected": 0,       # past-contract metatiles scored by the detector
+  "inspected": 0,       # D11+ metatiles scored by the detector
   "genuine": 0,         # verdict: real provider detail, stored as usual
   "blowup": 0,          # verdict: provider upsample, routed to procedural cook
   "cooked": 0,          # procedural cooks completed (parent quads)
@@ -1264,11 +1264,11 @@ def _fetch_texture_metatile(tile_id: str) -> tuple[dict[str, bytes] | None, str 
   if jpeg is None:
     return None, fail_reason
 
-  # Past the WMS contract depth the provider may fill the request with a
-  # blowup of the level above. Inspect the finest-octave energy before
-  # trusting it; a blowup routes the caller to the procedural cook instead.
+  # From D11 onward the provider may fill a nominally finer request with a
+  # blowup of a D9/D10 image. Inspect the finest-octave energy before trusting
+  # it; a blowup routes the caller to the explicit cooked_upscale state.
   parsed = _parse_tile_id(tile_id)
-  if parsed is not None and parsed[0] > WMS_CONTRACT_DEPTH:
+  if parsed is not None and parsed[0] >= WMS_TEXTURE_INSPECT_MIN_DEPTH:
     from texture import METATILE_RECON_MIN, METATILE_SPECTRAL_MIN
 
     inspect_started = time.perf_counter()
@@ -1531,7 +1531,7 @@ def _queue_texture_fetch(
           ).fetchone()
           _resolve_no_coverage(db, tile_id, existing[0] if existing else None, "[tex-worker]")
         elif fail_reason == 'wms_upsampled':
-          # Provider blowup past the contract depth — cook the parent quad
+          # Provider blowup at an inspected depth — cook the parent quad
           # with the procedural upscaler at the same finality as a real fetch.
           # Every non-cooked outcome re-enters the retry queue: a tile must
           # never leave this branch with no future work scheduled.

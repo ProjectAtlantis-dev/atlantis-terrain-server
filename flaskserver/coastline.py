@@ -52,6 +52,9 @@ _OVERSAMPLE = 8
 _logged_effective_tiles: set[str] = set()
 _logged_effective_tiles_lock = threading.Lock()
 _connected_hydro_cache: dict[tuple[str, int], tuple[tuple, dict[str, np.ndarray]]] = {}
+_connectivity_signature_cache: dict[
+    tuple[tuple[str, int], int], tuple[int, int, tuple]
+] = {}
 _connected_hydro_cache_lock = threading.Lock()
 
 
@@ -171,6 +174,7 @@ def _write_mask(
     db.commit()
     with _connected_hydro_cache_lock:
         _connected_hydro_cache.clear()
+        _connectivity_signature_cache.clear()
 
 
 def write_water_mask(db, tile_id: str, water, source="gtk50_vector", version=2) -> None:
@@ -345,6 +349,24 @@ def _database_cache_key(db, depth: int) -> tuple[str, int]:
     return (path or f":memory:{id(db)}", depth)
 
 
+def _cached_connectivity_signature(db, depth: int) -> tuple:
+    """Reuse the expensive depth signature while this connection is unchanged."""
+    database_key = _database_cache_key(db, depth)
+    cache_key = (database_key, id(db))
+    data_version = int(db.execute("PRAGMA data_version").fetchone()[0])
+    total_changes = int(db.total_changes)
+    with _connected_hydro_cache_lock:
+        cached = _connectivity_signature_cache.get(cache_key)
+    if cached is not None and cached[:2] == (data_version, total_changes):
+        return cached[2]
+    signature = _connectivity_signature(db, depth)
+    with _connected_hydro_cache_lock:
+        _connectivity_signature_cache[cache_key] = (
+            data_version, total_changes, signature,
+        )
+    return signature
+
+
 def _build_connected_hydrography(db, depth: int) -> dict[str, np.ndarray]:
     """Flood Åbent Land components from trusted GTK50 tidal-sea edges.
 
@@ -460,7 +482,7 @@ def _connected_hydrography_for_tile(db, tile_id: str) -> np.ndarray | None:
         return None
     depth = int(row[0])
     key = _database_cache_key(db, depth)
-    signature = _connectivity_signature(db, depth)
+    signature = _cached_connectivity_signature(db, depth)
     with _connected_hydro_cache_lock:
         cached = _connected_hydro_cache.get(key)
     if cached is None or cached[0] != signature:

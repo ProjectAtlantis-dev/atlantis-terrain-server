@@ -27,6 +27,12 @@ MAX_TILE_DEPTH = 16
 # still have headroom there.
 WMS_CONTRACT_DEPTH = 12
 
+# Dataforsyningen is only trusted without a detail check through depth 10.
+# Starting at depth 11, score every fetched metatile for evidence that the
+# provider merely enlarged a coarser image and carved it into finer addresses.
+# This is deliberately independent from the depth-12 DEM contract.
+WMS_TEXTURE_INSPECT_MIN_DEPTH = 11
+
 # Deepest level worth asking the WMS for at all. Depth 13 metatiles are
 # fetched and blowup-inspected (measured: occasionally genuine); deeper
 # requests always came back as upsamples, so past this depth the texture

@@ -92,6 +92,17 @@ def _seed_legacy_db(path):
 
 
 class RetiredTerrainMigrationTest(unittest.TestCase):
+    def test_open_db_indexes_tile_addresses_for_depth_scoped_reads(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db = open_db(str(Path(directory) / "terrain.db"))
+
+            columns = [
+                row[2]
+                for row in db.execute("PRAGMA index_info(tiles_depth_col_row)")
+            ]
+            self.assertEqual(columns, ["depth", "col", "row"])
+            db.close()
+
     def test_procedural_cook_classifier_module_stays_retired(self):
         classifier_path = Path(__file__).resolve().parents[1] / "cook_classifier.py"
         self.assertFalse(classifier_path.exists())

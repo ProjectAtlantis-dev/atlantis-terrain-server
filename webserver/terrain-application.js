@@ -42,6 +42,7 @@ import { createTextureStreamer, rendererTextureAnisotropy } from './terrain-text
 import { evaluateTerrainRefetch, summarizeTerrainCamera, terrainCameraCoordinates, terrainCameraGridPosition, terrainCameraStereoPosition } from './terrain-tile-fetch.js';
 import { collectTerrainDebugMeshes, createTerrainHoverOutlineController, createTerrainMapGridController, formatTerrainSeamDiagnostic, summarizeTerrainMesh } from './terrain-debug-runtime.js';
 import { createTerrainFetchRuntime } from './terrain-fetch-runtime.js';
+import { classifyDemSource } from './terrain-tile-quality.js';
 import { createTerrainTileSet } from './terrain-tile-set.js';
 import { createTileEvictionGate } from './terrain-tile-eviction.js';
 import { createClassifierOverlay } from './terrain-classifier-overlay.js';
@@ -2736,12 +2737,19 @@ renderer.domElement.addEventListener('mousemove', event => {
 
   const src = texSource.get(info.tileId) || 'none';
   const srcLabel = `<span style="color:#f80">${src || 'no texture'}</span>`;
+  const demQuality = classifyDemSource(info.terrainSource);
+  const demLabel = demQuality.synthetic
+    ? '<b style="color:#ff1744">SYNTHETIC / UPSCALED</b>'
+    : demQuality.kind === 'measured'
+      ? '<span style="color:#22c55e">measured</span>'
+      : `<span style="color:#f59e0b">${demQuality.kind}</span>`;
   const matHex = info.color !== '-' ? info.color : '#ffffff';
   const seamRows = controls.seamMode ? mapGridController.diagnosticsForTile(info.tileId) : [];
   const badSeams = seamRows.filter(seam => seam.severity === 'bad').length;
   const warningSeams = seamRows.filter(seam => seam.severity === 'warning').length;
   tileInfoEl.innerHTML = [
     `<b style="color:${matHex}">${info.tileId}</b>`,
+    `DEM: ${info.terrainSource || 'none'} · ${demLabel}`,
     `tex: ${info.hasTexture ? 'YES' : 'NO'} ${info.textureSize}  source: ${srcLabel}`,
     controls.seamMode
       ? `<b>shared edges: ${seamRows.length} · <span style="color:#ff1744">${badSeams} bad</span> · <span style="color:#f59e0b">${warningSeams} inspect</span></b>`
