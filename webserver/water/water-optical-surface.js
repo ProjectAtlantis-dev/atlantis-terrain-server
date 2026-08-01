@@ -54,17 +54,23 @@ export function buildOpticalWaterGeometry(sourceMesh, {
   // fjord exposes the real floor hundreds of metres below. Ordinary depth
   // testing is the precise final mask — land geometry stays in front of this
   // plane, while every genuinely submerged fragment is covered.
+  // The proxy is flat and covers the complete tile, so its interior grid is
+  // redundant. Two triangles are geometrically identical to the old 8,192
+  // triangles on a 65x65 tile, while being cheap enough to create for every
+  // newly streamed wet tile before the frame is rendered.
+  const southWest = 0;
+  const southEast = resolution - 1;
+  const northWest = (resolution - 1) * resolution;
+  const northEast = resolution * resolution - 1;
   const target = { positions: [], uvs: [] };
-  for (let row = 0; row < resolution - 1; row += 1) {
-    for (let column = 0; column < resolution - 1; column += 1) {
-      const a = row * resolution + column;
-      const b = a + 1;
-      const d = a + resolution;
-      const f = d + 1;
-      appendTriangle(target, sourcePosition, sourceUv, [a, b, d], surfaceZ);
-      appendTriangle(target, sourcePosition, sourceUv, [b, f, d], surfaceZ);
-    }
-  }
+  appendTriangle(
+    target, sourcePosition, sourceUv,
+    [southWest, southEast, northWest], surfaceZ,
+  );
+  appendTriangle(
+    target, sourcePosition, sourceUv,
+    [southEast, northEast, northWest], surfaceZ,
+  );
   if (target.positions.length === 0) return null;
 
   const geometry = new THREE.BufferGeometry();
@@ -116,16 +122,12 @@ function createOpticalMesh(source) {
   return mesh;
 }
 
-// A LOD expansion admits a few hundred tiles at once, and building every
-// optical twin in the frame that notices them is what turned a streaming burst
-// into a half-second freeze. The surface is a visual proxy, so spreading the
-// work over the next few frames is invisible.
-//
-// The budget is a deadline, not a count: each twin copies every cell of its
-// source grid, so "four per frame" bought roughly 20ms — under a coarse hitch
-// threshold, but well over a 60fps frame, which read as continuous judder.
-const DEFAULT_OPTICAL_BUILD_BUDGET_MS = 3;
-const DEFAULT_OPTICAL_BUILD_BUDGET = 64;
+// Full-tile twins are two-triangle quads, so the default path can cover every
+// admitted wet tile in the same frame. Deferring them exposed the fjord floor
+// (and its cloud-shadow depth) during streaming. Finite budgets remain useful
+// for deterministic lifecycle tests and diagnostics.
+const DEFAULT_OPTICAL_BUILD_BUDGET_MS = Number.POSITIVE_INFINITY;
+const DEFAULT_OPTICAL_BUILD_BUDGET = Number.POSITIVE_INFINITY;
 // A footprint is a few hundred twins and oscillation swaps most of them, so
 // hold several footprints' worth before discarding any.
 const DEFAULT_OPTICAL_DORMANT_TWINS = 1500;

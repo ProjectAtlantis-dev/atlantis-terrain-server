@@ -26,6 +26,8 @@ import {
 export const DEFAULT_WATER_PARAMS = {
   enabled: true,           // hide/pause the dynamic surface when disabled;
                           // the underlying fjord imagery remains visible
+  opticalEnabled: true,    // independent diagnostic gate for the shallow
+                          // color/depth proxy consumed by Takram volumetrics
   waterline: 0.5,          // terrainRoot-local metres
   opticalDepth: DEFAULT_OPTICAL_WATER_DEPTH_M,
                           // satellite-water colour plane below waterline

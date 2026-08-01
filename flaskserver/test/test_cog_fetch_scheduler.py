@@ -5,6 +5,8 @@ import unittest
 from contextlib import contextmanager
 from unittest.mock import patch
 
+import numpy as np
+
 import ingest
 import serve_flask
 
@@ -39,6 +41,46 @@ class _ManualPool:
 
 
 class CogFetchSchedulerTests(unittest.TestCase):
+    def test_arctic_flat_sea_level_plate_is_not_terrain(self):
+        ocean = np.linspace(-0.3, -0.2, 65 * 65, dtype=np.float32).reshape(65, 65)
+        self.assertTrue(ingest._is_arctic_sea_level_plate(ocean))
+
+        low_relief_land = ocean + np.float32(2.0)
+        self.assertFalse(ingest._is_arctic_sea_level_plate(low_relief_land))
+
+        coast = ocean.copy()
+        coast[32, 32] = np.float32(4.0)
+        self.assertFalse(ingest._is_arctic_sea_level_plate(coast))
+
+    def test_authoritative_ocean_preflight_skips_all_cog_reads(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "t.db")
+            db = sqlite3.connect(path)
+            db.execute(
+                "CREATE TABLE tiles (tile_id TEXT PRIMARY KEY, "
+                "source TEXT, dem_requested_at TEXT)"
+            )
+            db.execute("INSERT INTO tiles (tile_id) VALUES ('10-326-208')")
+            db.commit()
+            db.close()
+
+            with (
+                patch.object(serve_flask, "DB_PATH", path),
+                patch("serve._cache_coastline", return_value=np.ones((65, 65), dtype=bool)),
+                patch("serve._mark_official_ocean") as mark_ocean,
+                patch.object(
+                    ingest, "_read_cog_heightmap",
+                    side_effect=AssertionError("ocean preflight must skip COGs"),
+                ),
+            ):
+                self.assertEqual(
+                    serve_flask._fetch_one_cog_tile(
+                        "10-326-208", (0.0, 0.0, 1.0, 1.0)
+                    ),
+                    "fetched",
+                )
+                mark_ocean.assert_called_once()
+
     def test_each_provider_cog_attempt_emits_requested_and_completed_events(self):
         events = []
 

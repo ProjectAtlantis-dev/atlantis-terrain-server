@@ -63,6 +63,45 @@ test('a wet tile gets a complete flat cover so deep floor cannot leak through ma
   ]).size, 1);
 });
 
+test('a full-resolution optical twin is only a two-triangle quad', () => {
+  const resolution = 65;
+  const geometry = new THREE.BufferGeometry();
+  const positions = new Float32Array(resolution * resolution * 3);
+  const uvs = new Float32Array(resolution * resolution * 2);
+  for (let row = 0; row < resolution; row += 1) {
+    for (let column = 0; column < resolution; column += 1) {
+      const index = row * resolution + column;
+      positions[index * 3] = column;
+      positions[index * 3 + 1] = row;
+      positions[index * 3 + 2] = -100;
+      uvs[index * 2] = column / (resolution - 1);
+      uvs[index * 2 + 1] = row / (resolution - 1);
+    }
+  }
+  geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+  geometry.setAttribute('uv', new THREE.BufferAttribute(uvs, 2));
+  const source = new THREE.Mesh(geometry, new THREE.MeshBasicMaterial());
+  Object.assign(source.userData, {
+    resolution,
+    terrainWaterMask: new Uint8Array(resolution * resolution).fill(1),
+  });
+
+  const optical = buildOpticalWaterGeometry(source);
+
+  assert.equal(optical.getAttribute('position').count, 6);
+  assert.deepEqual(
+    Array.from(optical.getAttribute('position').array),
+    [
+      0, 0, 0,
+      64, 0, 0,
+      0, 64, 0,
+      64, 0, 0,
+      64, 64, 0,
+      0, 64, 0,
+    ],
+  );
+});
+
 test('optical water owns visual depth only, is non-interactive, and follows waterline', () => {
   const terrainRoot = new THREE.Group();
   const source = terrainTile();
@@ -149,6 +188,21 @@ test('a seam repair that adds water re-evaluates a previously dry tile', () => {
   source.userData.heightmapPayload = 'payload-b';
   runtime.sync({});
   assert.equal(runtime.size, 1);
+});
+
+test('the default runtime covers a streaming burst in the same sync', () => {
+  const terrainRoot = new THREE.Group();
+  for (let index = 0; index < 100; index += 1) {
+    const source = terrainTile();
+    source.userData.tileId = `12-9-${index}`;
+    terrainRoot.add(source);
+  }
+  const runtime = createOpticalWaterSurfaceRuntime({ terrainRoot });
+
+  runtime.sync({});
+
+  assert.equal(runtime.size, 100);
+  assert.equal(runtime.pendingBuilds, 0);
 });
 
 test('optical builds are budgeted per sync instead of draining a whole burst', () => {

@@ -158,6 +158,30 @@ def _resample_native(data, win_transform, bbox, resolution):
 _MAX_ARCTIC_TILES = 16       # Don't attempt more than this many ArcticDEM COGs per request
 _ARCTIC_COG_WORKERS = 6      # Parallel HTTP readers for ArcticDEM
 
+# ArcticDEM encodes some open-ocean coverage as a completely valid, nearly
+# constant ellipsoidal-height sheet.  After the EGM2008 correction that sheet
+# sits at zero, so nodata checks alone cannot distinguish it from terrain.
+# Keep this deliberately tight: the rejection requires almost complete
+# coverage, sub-metre relief, and every sample within one metre of sea level.
+_ARCTIC_SEA_PLATE_VALID_FRACTION = 0.95
+_ARCTIC_SEA_PLATE_MAX_ABS_M = 0.75
+_ARCTIC_SEA_PLATE_MAX_RANGE_M = 1.0
+
+
+def _is_arctic_sea_level_plate(data) -> bool:
+    """Return whether corrected ArcticDEM data is its flat ocean artifact."""
+    if data is None:
+        return False
+    values = np.asarray(data, dtype=np.float32)
+    valid = np.isfinite(values)
+    if float(np.mean(valid)) < _ARCTIC_SEA_PLATE_VALID_FRACTION:
+        return False
+    samples = values[valid]
+    return bool(
+        np.max(np.abs(samples)) <= _ARCTIC_SEA_PLATE_MAX_ABS_M
+        and np.ptp(samples) <= _ARCTIC_SEA_PLATE_MAX_RANGE_M
+    )
+
 
 def _read_cog_heightmap(
     bbox, resolution=GRID_N, arctic_workers=_ARCTIC_COG_WORKERS, audit=None
@@ -275,6 +299,26 @@ def _read_cog_heightmap(
         geoid_n = _geoid_undulation(bbox)
         arctic -= np.float32(geoid_n)
         log_cog.info(f"  ArcticDEM geoid correction: N={geoid_n:.2f}m subtracted")
+
+    if _is_arctic_sea_level_plate(arctic):
+        assert arctic is not None
+        valid = arctic[np.isfinite(arctic)]
+        detail = {
+            "min_m": round(float(np.min(valid)), 3),
+            "max_m": round(float(np.max(valid)), 3),
+            "range_m": round(float(np.ptp(valid)), 3),
+        }
+        log_cog.info(
+            "  ArcticDEM rejected: flat sea-level ocean artifact "
+            f"(min={detail['min_m']:.3f}m max={detail['max_m']:.3f}m "
+            f"range={detail['range_m']:.3f}m)"
+        )
+        _audit("cog_rejected", "arcticdem", "sea_level_plate", detail)
+        log_cog.info(
+            "  Skipping Copernicus: corrected ArcticDEM sea-level plate "
+            "already proves open-ocean coverage"
+        )
+        return None, None
 
     arctic_ok = arctic is not None and np.any(~np.isnan(arctic))
 

@@ -335,8 +335,10 @@ const renderBackend = backendModule.createTerrainBackend({
     : WEBGL_TONE_MAPPING_EXPOSURE,
   scene,
   bootLog,
-  gpuProfilerEnabled: !USE_WEBGPU_RENDER_BACKEND
-    && localStorage.getItem('terrain-gpu-profiler') === '1',
+  // Timer queries force expensive command-buffer boundaries on Metal's
+  // tile-based renderer. Never restore profiling into normal rendering from
+  // localStorage; only the bounded /api/gpu-profile control may enable it.
+  gpuProfilerEnabled: false,
 });
 const webgpuAtmosphere = USE_WEBGPU_RENDER_BACKEND
   ? renderBackend.createAtmosphere({
@@ -668,6 +670,10 @@ function buildTuningControls(ap, ce) {
   tuningToggle('dynamic water', {
     value: waterParams.enabled,
     onChange: v => { waterParams.enabled = v; }
+  });
+  tuningToggle('optical water', {
+    value: waterParams.opticalEnabled,
+    onChange: v => { waterParams.opticalEnabled = v; }
   });
   tuningSlider('wind speed', {
     min: 1, max: 28, step: 0.1, value: waterParams.windSpeed,
@@ -1597,6 +1603,7 @@ const fpsCounter = createTerrainFpsCounter();
 // than a lag, and the reason a 50ms threshold reported "no hitches" while
 // flight still felt rough.
 const HITCH_MS = Number(localStorage.getItem('terrain-hitch-ms')) || 25;
+const HITCH_REPORT_INTERVAL_MS = 1000;
 const hitchDetector = createTerrainHitchDetector({
   hitchMs: HITCH_MS,
   sampleContext: () => {
@@ -1625,9 +1632,23 @@ window.__terrainHitchDetector = hitchDetector;
 // Timings for the frame that just ended, so an in-frame hitch reports the
 // section that caused it rather than one opaque total.
 const frameSections = {};
+let lastHitchReportMs = -Infinity;
+let suppressedHitchReports = 0;
 
 function reportHitch(hitch) {
   if (hitch == null) return;
+  // The detector records every hitch in memory, but sending every missed frame
+  // through the JSON logger creates a feedback loop: once rendering crosses
+  // the 25ms threshold, log serialization and fetch traffic can keep starving
+  // requestAnimationFrame even after the original transient has passed.
+  const nowMs = performance.now();
+  if (nowMs - lastHitchReportMs < HITCH_REPORT_INTERVAL_MS) {
+    suppressedHitchReports += 1;
+    return;
+  }
+  const suppressedSincePrevious = suppressedHitchReports;
+  suppressedHitchReports = 0;
+  lastHitchReportMs = nowMs;
   // Warn level so hitches survive the default client-log threshold and land in
   // the Flask log without turning on debug logging for everything else.
   enqueueClientLog('warn', 'frame.hitch', {
@@ -1635,6 +1656,7 @@ function reportHitch(hitch) {
     intervalMs: Number(hitch.intervalMs.toFixed(1)),
     workMs: Number(hitch.workMs.toFixed(1)),
     gapMs: Number(hitch.gapMs.toFixed(1)),
+    suppressedSincePrevious,
     context: hitch.context,
     // Only meaningful when render() itself ran long; the marks describe the
     // frame the detector just charged for the stall.
@@ -2830,7 +2852,7 @@ camera.updateMatrixWorld(true);
 updateMapCamera();
 updateHud();
 
-function render() {
+function renderFrame() {
   reportHitch(hitchDetector.frameStart(performance.now()));
   const frameStartedAt = cpuProfiler.begin();
   // In-frame stalls now outweigh anything between frames, and everything from
@@ -2890,7 +2912,7 @@ function render() {
     // Gridlines are a terrain inspection mode. Hide the cosmetic satellite
     // water proxy so the real bathymetry remains visible beneath the dynamic
     // water while the grid is active.
-    opticalVisible: waterParams.enabled && !controls.mapMode
+    opticalVisible: waterParams.opticalEnabled && waterParams.enabled && !controls.mapMode
       && !textureStreamer.waterDebug && !textureStreamer.hydroDebug
       && !gridlinesRuntime.active,
   });
@@ -3003,6 +3025,15 @@ function render() {
   renderBackend.stopRenderLoopIfIdle();
   cpuProfiler.end('frame-cpu', frameStartedAt);
   hitchDetector.frameEnd(performance.now());
+}
+
+function render() {
+  renderBackend.beginFrameProfile?.();
+  try {
+    renderFrame();
+  } finally {
+    renderBackend.endFrameProfile?.();
+  }
 }
 
 window.setInterval(runStreamingMaintenance, STREAMING_MAINTENANCE_MS);

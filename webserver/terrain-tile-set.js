@@ -751,6 +751,11 @@ export function createTerrainTileSet({
     return terrainVisibilityDistance(altitude);
   });
   const buildBudget = testOverrides.buildBudget ?? 200;
+  // Tile responses are applied between animation frames. Keep their combined
+  // geometry work below one half-frame at 60Hz; the reconciler independently
+  // preserves first-load coverage and guarantees progress for both queues.
+  const buildBudgetMs = testOverrides.buildBudgetMs ?? 4;
+  const refreshBudgetMs = testOverrides.refreshBudgetMs ?? 2;
   // WebGPU turns these values into native depth bias. At cross-LOD edges that
   // can pull depth-12 and depth-11 terrain apart, so keep this WebGL-only while
   // diagnosing the visible WebGPU seams.
@@ -920,6 +925,9 @@ export function createTerrainTileSet({
         buildMesh,
         log,
         buildBudget,
+        buildBudgetMs,
+        refreshBudgetMs,
+        ...(testOverrides.now == null ? {} : { now: testOverrides.now }),
         prepareUntexturedMesh,
         onMeshAdded: onMutated,
         onDiff,

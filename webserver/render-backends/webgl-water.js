@@ -762,12 +762,14 @@ const WATER_FRAGMENT = /* glsl */ `
 
 export function createWebGLWater({
   renderer,
+  gpuProfiler = null,
   geometry,
   resolution = 256,
   bathySize = 1024,
   bathyExtent = 30000,
 } = {}) {
   const sim = new WebGLWaterSimulation(renderer, { resolution });
+  gpuProfiler?.wrapMethod?.(sim, 'update', 'water.fft');
 
   const uniforms = {
     ...THREE.UniformsUtils.clone(THREE.UniformsLib.fog),

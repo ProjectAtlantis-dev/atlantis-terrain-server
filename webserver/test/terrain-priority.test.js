@@ -101,15 +101,15 @@ test('gridlines batch terrain-conforming tile edges without replacing textures',
 });
 
 test('water cascade pacing slows long and aerial waves without starving updates', () => {
-  assert.deepEqual([0, 1, 2].map(index => waterCascadeUpdateRate(index, 0)), [15, 30, 60]);
-  assert.deepEqual([0, 1, 2].map(index => waterCascadeUpdateRate(index, 3000)), [8, 15, 20]);
-  assert.ok(waterCascadeUpdateRate(2, 1500) < 60);
-  assert.ok(waterCascadeUpdateRate(2, 1500) > 20);
+  assert.deepEqual([0, 1, 2].map(index => waterCascadeUpdateRate(index, 0)), [12, 24, 36]);
+  assert.deepEqual([0, 1, 2].map(index => waterCascadeUpdateRate(index, 3000)), [6, 12, 18]);
+  assert.ok(waterCascadeUpdateRate(2, 1500) < 36);
+  assert.ok(waterCascadeUpdateRate(2, 1500) > 18);
 
   const schedule = {};
   assert.equal(waterCascadeUpdateDue(schedule, 0, 0, 0), true);
   assert.equal(waterCascadeUpdateDue(schedule, 0.03, 0, 0), false);
-  assert.equal(waterCascadeUpdateDue(schedule, 1 / 15, 0, 0), true);
+  assert.equal(waterCascadeUpdateDue(schedule, 1 / 12, 0, 0), true);
   assert.equal(waterCascadeUpdateDue(schedule, 0.01, 0, 0), true);
 });
 
@@ -576,7 +576,7 @@ test('shared cloud tuning registers controls and applies altitude, cirrus, and d
     onAppearanceChange: () => { appearanceChanges += 1; },
   });
   assert.deepEqual(sections, ['Clouds']);
-  assert.equal(definitions.size, 7);
+  assert.equal(definitions.size, 8);
   assert.equal(controls._cirrusCheckbox.label, 'cirrus');
 
   definitions.get('cloud altitude').onChange(-2000);
@@ -662,6 +662,7 @@ test('shared cloud tuning puts the Takram rendering checkbox first in the Clouds
       })),
       localWeatherRepeat: { x: 100, y: 100 },
       localWeatherVelocity: { set() {} },
+      lightShafts: true,
     },
     controls,
     section: label => order.push(`section:${label}`),
@@ -676,6 +677,7 @@ test('shared cloud tuning puts the Takram rendering checkbox first in the Clouds
   });
   assert.deepEqual(order.slice(0, 2), ['section:Clouds', 'toggle:Takram clouds']);
   assert.equal(controls._takramCloudsCheckbox.label, 'Takram clouds');
+  assert.equal(controls._cloudLightShaftsCheckbox.label, 'cloud light shafts');
   assert.deepEqual(renderingStates, [false]);
 });
 
@@ -1271,6 +1273,53 @@ test('terrain tile set owns reconciliation, scene residency, and texture demand'
   terrainRoot.children[0].material.map = baseTexture;
   terrainRoot.children[0].userData.terrainBaseTexture = baseTexture;
   assert.equal(terrainRoot.children[0].material.map, baseTexture);
+});
+
+test('terrain tile set caps routine response builds to its frame-safe deadline', () => {
+  let clock = 0;
+  const built = [];
+  const terrainRoot = {
+    children: [],
+    add(mesh) { this.children.push(mesh); },
+    remove(mesh) { this.children = this.children.filter(child => child !== mesh); },
+  };
+  const tileSet = createTerrainTileSet({
+    terrainRoot,
+    textureStreamer: {
+      texCache: new Map(), texSource: new Map(), pump() {}, releaseTileDemand() {},
+    },
+    terrain: {},
+    renderBackend: { kind: 'webgpu', prepareUntexturedTerrain() {} },
+    view: { controls: { mapMode: false } },
+    log() {},
+    testOverrides: {
+      now: () => clock,
+      priorityForTile: tile => tile.priority,
+      getVisibilityDistance: () => 1000,
+      buildMesh: tile => {
+        built.push(tile.id);
+        clock += 3;
+        return {
+          isMesh: true,
+          children: [],
+          userData: { tileId: tile.id, bbox: tile.bbox },
+          material: { map: null, color: { set() {} }, dispose() {} },
+          geometry: { dispose() {} },
+        };
+      },
+    },
+  });
+  const tiles = Array.from({ length: 5 }, (_, index) => ({
+    id: `8-${index}-0`,
+    bbox: [index, 0, index + 1, 1],
+    heightmap: 'hm',
+    priority: index,
+  }));
+
+  tileSet.reconcile(tiles);
+
+  assert.deepEqual(built, ['8-0-0', '8-1-0']);
+  assert.equal(tileSet.deferredTiles.size, tiles.length);
 });
 
 test('terrain tile set retains cached paint when a resident tile leaves demand', () => {

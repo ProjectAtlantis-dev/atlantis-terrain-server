@@ -488,7 +488,7 @@ class DepthEvidenceTest(unittest.TestCase):
                 db.execute(
                     "SELECT value FROM metadata WHERE key = 'schema_version'"
                 ).fetchone(),
-                ("17",),
+                ("18",),
             )
             db.close()
 
@@ -585,7 +585,7 @@ class DepthEvidenceTest(unittest.TestCase):
                 db.execute(
                     "SELECT value FROM metadata WHERE key = 'schema_version'"
                 ).fetchone(),
-                ("17",),
+                ("18",),
             )
             db.close()
 

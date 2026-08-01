@@ -625,6 +625,60 @@ def texture_sources_in(db, tile_ids):
 METATILE_RECON_MIN = 0.35
 METATILE_SPECTRAL_MIN = 0.15
 
+# Parent-relative evidence is stronger than an intrinsic spectrum once JPEG
+# edges and metatile harmonization have been applied. Calibration against the
+# stored corpus leaves a wide gap: known cooked upscales score <=0.9243 while
+# known genuine deep provider tiles score >=0.9991. A D10 parent is worth
+# refining when at least one of its four D11 children clears this midpoint.
+PARENT_DETAIL_MIN = 0.96
+
+
+def texture_detail_over_parent_score(
+    child_bytes, parent_bytes, column_bit: int, row_bit: int,
+) -> float:
+    """Return the child's high-frequency content independent of its parent."""
+    from scipy.ndimage import gaussian_filter
+
+    with Image.open(io.BytesIO(child_bytes)) as child_image:
+        child = np.asarray(child_image.convert("L"), dtype=np.float32)
+    with Image.open(io.BytesIO(parent_bytes)) as parent_image:
+        parent = parent_image.convert("L")
+    if child.shape != (256, 256) or parent.size != (256, 256):
+        raise ValueError(
+            f"parent detail comparison requires 256px tiles; got "
+            f"child={child.shape}, parent={parent.size}"
+        )
+    left = int(column_bit) * 128
+    top = (1 - int(row_bit)) * 128
+    quadrant = parent.crop((left, top, left + 128, top + 128))
+    enlarged = np.asarray(
+        quadrant.resize((256, 256), Image.Resampling.BILINEAR),
+        dtype=np.float32,
+    )
+    child_high = child - gaussian_filter(child, 1.2)
+    parent_high = enlarged - gaussian_filter(enlarged, 1.2)
+    gain = float(
+        np.sum(child_high * parent_high)
+        / (np.sum(parent_high * parent_high) + 1e-9)
+    )
+    independent = child_high - gain * parent_high
+    score = float(
+        np.sqrt(np.mean(independent * independent))
+        / (np.sqrt(np.mean(child_high * child_high)) + 1e-9)
+    )
+    return score
+
+
+def texture_quad_adds_parent_detail(children, parent_bytes):
+    """Return whether any child quadrant contains real parent-independent detail."""
+    scores = {
+        offset: texture_detail_over_parent_score(
+            child_bytes, parent_bytes, offset[0], offset[1],
+        )
+        for offset, child_bytes in children.items()
+    }
+    return any(score >= PARENT_DETAIL_MIN for score in scores.values()), scores
+
 
 def metatile_upsample_scores(image_bytes):
     """(reconstruction, spectral) evidence of detail beyond half resolution.

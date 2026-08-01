@@ -12,8 +12,14 @@ export const DEFAULT_CASCADES = [
   { size: 22, minWave: 0.4, maxWave: 7.5 },
 ];
 
-const GROUND_CASCADE_HZ = [15, 30, 60];
-const AERIAL_CASCADE_HZ = [8, 15, 20];
+// The surface holds the most recent spectrum between updates. Updating all
+// bands at display rate only creates redundant FFT work: each 256x256 cascade
+// is 36 fullscreen draws, and the old 15/30/60 schedule periodically aligned
+// into 108-draw frames. Keep the short band fluid while bounding the aggregate
+// ground schedule to 72 cascade updates/sec; altitude reduces it further.
+const GROUND_CASCADE_HZ = [12, 24, 36];
+const AERIAL_CASCADE_HZ = [6, 12, 18];
+const CASCADE_PHASE = [0, 1 / 3, 2 / 3];
 
 export function waterCascadeUpdateRate(cascadeIndex, cameraAltitudeM = 0) {
   const index = Math.max(0, Math.min(GROUND_CASCADE_HZ.length - 1, cascadeIndex | 0));
@@ -31,7 +37,11 @@ export function waterCascadeUpdateDue(state, time, cascadeIndex, cameraAltitudeM
     state.waterScheduleInitialized = true;
     state.waterScheduleLastTime = time;
     state.waterScheduleRate = rate;
-    state.waterScheduleNextTime = time + interval;
+    // All cascades render once at initialization so their textures are valid,
+    // then their next deadlines are offset to prevent recurring FFT bursts.
+    const phaseIndex = Math.max(0, Math.min(CASCADE_PHASE.length - 1, cascadeIndex | 0));
+    const phase = CASCADE_PHASE[phaseIndex] ?? 0;
+    state.waterScheduleNextTime = time + interval * (1 + phase);
     return true;
   }
   if (state.waterScheduleRate !== rate) {

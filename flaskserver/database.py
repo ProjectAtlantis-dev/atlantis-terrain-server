@@ -45,7 +45,7 @@ CONFIDENCE = {
 }
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
-SCHEMA_VERSION = 17
+SCHEMA_VERSION = 18
 _SCHEMA_VERSION_KEY = "schema_version"
 
 
@@ -878,6 +878,60 @@ def _migrate_to_v17(db):
     )
 
 
+def _migrate_to_v18(db):
+    """Discard cached ArcticDEM sea-level plates and their descendants."""
+    candidate_sources = (
+        "arcticdem", "arcticdem_10m", "parent_resampled", "cooked_dem",
+        "unmasked_arcticdem", "unmasked_arcticdem_10m",
+        "unmasked_parent_resampled", "clobbered_arcticdem_10m",
+        "clobbered_parent_resampled",
+    )
+    rejected = []
+    placeholders = ",".join("?" for _ in candidate_sources)
+    for tile_id, blob in db.execute(
+        f"SELECT tile_id, heightmap FROM tiles WHERE source IN ({placeholders}) "
+        "AND heightmap IS NOT NULL",
+        candidate_sources,
+    ):
+        try:
+            values = np.frombuffer(zlib.decompress(blob), dtype=np.float32)
+        except (TypeError, ValueError, zlib.error):
+            continue
+        valid = np.isfinite(values)
+        if float(np.mean(valid)) < 0.95:
+            continue
+        samples = values[valid]
+        if np.max(np.abs(samples)) <= 0.75 and np.ptp(samples) <= 1.0:
+            rejected.append(tile_id)
+
+    if not rejected:
+        return
+    now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    db.executemany(
+        "UPDATE tiles SET heightmap = NULL, confidence_map = NULL, "
+        "geometric_error = 0.0, source = 'empty', updated_at = ? "
+        "WHERE tile_id = ?",
+        ((now, tile_id) for tile_id in rejected),
+    )
+    tables = {
+        row[0]
+        for row in db.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+    }
+    if "terrain_seam_cache" in tables:
+        db.executemany(
+            "DELETE FROM terrain_seam_cache WHERE tile_a = ? OR tile_b = ?",
+            ((tile_id, tile_id) for tile_id in rejected),
+        )
+    if "classifier_tiles" in tables:
+        db.executemany(
+            "DELETE FROM classifier_tiles WHERE tile_id = ?",
+            ((tile_id,) for tile_id in rejected),
+        )
+    log_db.info(
+        f"Reset {len(rejected)} cached ArcticDEM ocean plates for classification"
+    )
+
+
 def _migrate_schema(db):
     row = db.execute(
         "SELECT value FROM metadata WHERE key = ?", (_SCHEMA_VERSION_KEY,)
@@ -1005,6 +1059,13 @@ def _migrate_schema(db):
         db.execute(
             "INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)",
             (_SCHEMA_VERSION_KEY, "17"),
+        )
+        version = 17
+    if version < 18:
+        _migrate_to_v18(db)
+        db.execute(
+            "INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)",
+            (_SCHEMA_VERSION_KEY, "18"),
         )
 
 

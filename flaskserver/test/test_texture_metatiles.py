@@ -194,6 +194,63 @@ class TextureMetatileFetchTest(unittest.TestCase):
         self.assertIsNone(children)
         self.assertEqual(error, "wms_upsampled")
 
+    def test_parent_relative_check_rejects_quad_when_no_child_adds_detail(self):
+        db = sqlite3.connect(":memory:")
+        init_textures(db)
+        db.execute(
+            "INSERT INTO textures (tile_id, source, texture, updated_at) "
+            "VALUES ('10-337-204', 'dataforsyningen_metatile4h2', ?, 'now')",
+            (b"parent",),
+        )
+        children = {
+            "11-674-408": b"00",
+            "11-674-409": b"01",
+            "11-675-408": b"10",
+            "11-675-409": b"11",
+        }
+        scores = {(0, 0): 0.89, (0, 1): 0.88, (1, 0): 0.87, (1, 1): 0.90}
+
+        with patch(
+            "texture.texture_quad_adds_parent_detail",
+            return_value=(False, scores),
+        ):
+            accepted, blowups = serve_flask._partition_texture_parent_blowups(
+                db, children,
+            )
+
+        self.assertEqual(accepted, {})
+        self.assertEqual(blowups[0][0], "11-674-408")
+        self.assertEqual(blowups[0][1], "10-337-204")
+        db.close()
+
+    def test_parent_relative_check_keeps_quad_when_one_child_adds_detail(self):
+        db = sqlite3.connect(":memory:")
+        init_textures(db)
+        db.execute(
+            "INSERT INTO textures (tile_id, source, texture, updated_at) "
+            "VALUES ('10-337-204', 'dataforsyningen_metatile4h2', ?, 'now')",
+            (b"parent",),
+        )
+        children = {
+            "11-674-408": b"00",
+            "11-674-409": b"01",
+            "11-675-408": b"10",
+            "11-675-409": b"11",
+        }
+        scores = {(0, 0): 0.89, (0, 1): 0.88, (1, 0): 0.97, (1, 1): 0.90}
+
+        with patch(
+            "texture.texture_quad_adds_parent_detail",
+            return_value=(True, scores),
+        ):
+            accepted, blowups = serve_flask._partition_texture_parent_blowups(
+                db, children,
+            )
+
+        self.assertEqual(accepted, children)
+        self.assertEqual(blowups, [])
+        db.close()
+
     def test_store_upgrades_legacy_children_without_clobbering_terminal_rows(self):
         db = sqlite3.connect(":memory:")
         init_textures(db)

@@ -76,7 +76,7 @@ export function createTerrainBackend({
     get sceneMutationVersion() { return sceneMutationVersion; },
     setFogDensity(value) { sceneFog.density = value; },
     setMapMode(active) { scene.fog = active ? null : sceneFog; },
-    createWater(options) { return createWebGLWater({ renderer, ...options }); },
+    createWater(options) { return createWebGLWater({ renderer, gpuProfiler, ...options }); },
     prepareUntexturedTerrain(mesh) {
       if (!mesh?.material || mesh.material.map) return;
       if (!mesh.material.vertexColors) {
@@ -128,6 +128,30 @@ export function createTerrainBackend({
         multisampling: Math.min(4, renderer.capabilities.maxSamples),
       });
       const scenePass = gpuProfiler.wrapPass(new RenderPass(scene, camera), 'scene+shadows');
+      const cloudProfileOptions = {
+        level: 'detail',
+        parent: 'clouds+aerial-perspective',
+      };
+      gpuProfiler.wrapPass(
+        cloudsEffect.shadowPass.currentPass,
+        'takram.shadow-march',
+        cloudProfileOptions,
+      );
+      gpuProfiler.wrapPass(
+        cloudsEffect.shadowPass.resolvePass,
+        'takram.shadow-resolve',
+        cloudProfileOptions,
+      );
+      gpuProfiler.wrapPass(
+        cloudsEffect.cloudsPass.currentPass,
+        'takram.cloud-march',
+        cloudProfileOptions,
+      );
+      gpuProfiler.wrapPass(
+        cloudsEffect.cloudsPass.resolvePass,
+        'takram.cloud-resolve',
+        cloudProfileOptions,
+      );
       atmospherePass = gpuProfiler.wrapPass(
         new EffectPass(camera, cloudsEffect, aerialPerspective),
         'clouds+aerial-perspective',
@@ -169,14 +193,11 @@ export function createTerrainBackend({
       }
     },
     renderScene(scene, camera, overlayScene = null) {
-      gpuProfiler.beginFrame();
-      try {
-        composer?.render();
-        renderDiagnosticOverlay(overlayScene, camera);
-      } finally {
-        gpuProfiler.endFrame();
-      }
+      composer?.render();
+      renderDiagnosticOverlay(overlayScene, camera);
     },
+    beginFrameProfile() { gpuProfiler.beginFrame(); },
+    endFrameProfile() { gpuProfiler.endFrame(); },
     configureDemandRendering(configuration) { demandRendering = configuration; },
     startRenderLoop() {
       if (animationLoopActive || demandRendering == null) return;

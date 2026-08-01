@@ -626,6 +626,27 @@ def _fetch_one_cog_tile(tile_id, bbox, origin="viewer"):
       f"bbox=[{bbox[0]:.0f},{bbox[1]:.0f},{bbox[2]:.0f},{bbox[3]:.0f}]"
     )
     _record_dem_request(db, tile_id, origin=origin)
+
+    # Coastline classification is cheaper and more authoritative than either
+    # elevation provider.  In particular, ArcticDEM publishes a technically
+    # valid flat sheet over parts of the ocean, so waiting until both COGs
+    # return nodata causes needless network traffic and stores false terrain.
+    try:
+      water = _cache_coastline(db, tile_id, bbox)
+    except Exception as exc:
+      water = None
+      log_cog.warning(
+        f"[cog-worker] {tile_id}: coastline preflight failed: "
+        f"{type(exc).__name__}: {exc}"
+      )
+    if water is not None and water.all():
+      log_cog.info(
+        f"[tile-audit] tile={tile_id} stage=dem_completed "
+        f"origin={origin} outcome=official_ocean"
+      )
+      _mark_official_ocean(db, tile_id)
+      return "fetched"
+
     data, src_name = _read_cog_heightmap(
       bbox,
       _GRID_N,
@@ -635,15 +656,6 @@ def _fetch_one_cog_tile(tile_id, bbox, origin="viewer"):
     )
 
     if data is None:
-      water = _cache_coastline(db, tile_id, bbox)
-      if water is not None and _np.all(water):
-        log_cog.info(
-          f"[tile-audit] tile={tile_id} stage=dem_completed "
-          f"origin={origin} outcome=official_ocean"
-        )
-        _mark_official_ocean(db, tile_id)
-        return "fetched"
-
       # A child whose source COG is empty may depend on a parent currently in
       # flight. Put it back into the live queue instead of blocking a worker or
       # prematurely caching it as no-data.
@@ -679,7 +691,6 @@ def _fetch_one_cog_tile(tile_id, bbox, origin="viewer"):
         db, tile_id, hm, cm, source_name, reconcile=False,
         allow_overwrite=upgrade,
       )
-      _cache_coastline(db, tile_id, bbox)
       if source_name == "parent_resampled":
         log_cog.info(f"[PARENT RESAMPLE] {tile_id}: filled from parent")
       log_cog.info(
@@ -1338,6 +1349,53 @@ def _store_texture_metatile(db, children: dict[str, bytes]) -> tuple[set[str], s
   return written, no_coverage
 
 
+def _partition_texture_parent_blowups(db, children: dict[str, bytes]):
+  """Separate complete child quads that add no detail over their exact parent."""
+  from texture import PARENT_DETAIL_MIN, texture_quad_adds_parent_detail
+
+  accepted = dict(children)
+  groups: dict[str, dict[tuple[int, int], tuple[str, bytes]]] = {}
+  for child_id, jpeg in children.items():
+    parsed = _parse_tile_id(child_id)
+    if parsed is None or parsed[0] < WMS_TEXTURE_INSPECT_MIN_DEPTH:
+      continue
+    depth, column, row = parsed
+    parent_id = f"{depth - 1}-{column // 2}-{row // 2}"
+    groups.setdefault(parent_id, {})[(column % 2, row % 2)] = (child_id, jpeg)
+
+  blowups = []
+  for parent_id, group in groups.items():
+    if len(group) != 4:
+      continue
+    parent = db.execute(
+      "SELECT texture, source FROM textures WHERE tile_id = ?", (parent_id,)
+    ).fetchone()
+    if parent is None or parent[0] is None or parent[1] in _TEX_TEMPORARY:
+      continue
+    adds_detail, scores = texture_quad_adds_parent_detail(
+      {offset: child[1] for offset, child in group.items()}, parent[0]
+    )
+    score_text = ", ".join(
+      f"{group[offset][0]}={scores[offset]:.4f}" for offset in sorted(scores)
+    )
+    if adds_detail:
+      log_d13.info(
+        f"{parent_id}: PARENT DETAIL genuine — {score_text}; "
+        f"at least one child >= {PARENT_DETAIL_MIN:.2f}"
+      )
+      continue
+    child_ids = [child[0] for child in group.values()]
+    for child_id in child_ids:
+      accepted.pop(child_id, None)
+    representative = min(child_ids)
+    blowups.append((representative, parent_id, scores))
+    log_d13.info(
+      f"{parent_id}: PARENT BLOWUP — {score_text}; "
+      f"no child >= {PARENT_DETAIL_MIN:.2f} → procedural cook"
+    )
+  return accepted, blowups
+
+
 
 def _cook_texture_quad(db, tile_id: str) -> bool:
   """Cook tile_id's parent quad from the parent's final texture.
@@ -1512,10 +1570,27 @@ def _queue_texture_fetch(
           )
           children, fail_reason = _fetch_texture_metatile(tile_id)
         if children is not None:
+          children, parent_blowups = _partition_texture_parent_blowups(db, children)
           written, no_coverage = _store_texture_metatile(db, children)
           log_tex.debug(
             f"[tex-worker] {tile_id}: metatile wrote {len(written)} children"
           )
+          for representative, _parent_id, _scores in parent_blowups:
+            try:
+              cooked = _cook_texture_quad(db, representative)
+            except Exception as exc:
+              totals = _d13_count(cook_failed=1)
+              log_d13.error(
+                f"{representative}: parent-relative cook FAILED "
+                f"({type(exc).__name__}: {exc}) — queued for retry | {totals}"
+              )
+              cooked = False
+            if not cooked:
+              parsed_child = _parse_tile_id(representative)
+              retry_bbox = (
+                tuple(_tile_bbox(*parsed_child)) if parsed_child is not None else bbox
+              )
+              _tex_retry_enqueue(representative, retry_bbox, attempt=0)
           if tile_id in no_coverage:
             existing = db.execute(
               "SELECT texture FROM textures WHERE tile_id = ?", (tile_id,)
@@ -3286,7 +3361,10 @@ def api_gpu_profile():
 @app.post("/api/gpu-profile/start")
 def api_gpu_profile_start():
   data = request.get_json(silent=True) or {}
-  raw_interval = data.get("sampleInterval", 10)
+  # A timer query can force a command-buffer boundary on tile-based GPUs.
+  # Keep the default sparse enough that an explicit capture does not turn its
+  # own instrumentation overhead into an apparent steady-state regression.
+  raw_interval = data.get("sampleInterval", 60)
   if isinstance(raw_interval, bool):
     raw_interval = None
   if not isinstance(raw_interval, (str, int, float)):
