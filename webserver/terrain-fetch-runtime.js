@@ -77,9 +77,16 @@ export function createTerrainFetchRuntime({
     // Damp the measurement before it reaches the server's stepped depth cap.
     // Unknown clearance must not anchor the band — it is a bootstrap ceiling,
     // not an observation.
+    const heldAgl = lodAltitudeStabilizer.held;
     const lodAltitude = Number.isFinite(measuredAgl)
       ? lodAltitudeStabilizer.stabilize(Math.max(0, measuredAgl))
-      : MAX_TERRAIN_AGL_M;
+      : Number.isFinite(heldAgl)
+        // A missing surface sample is common while crossing water or a brief
+        // residency gap. It is not evidence that the camera climbed to the
+        // bootstrap ceiling: keep the last measured demand so one absent
+        // sample cannot contract the topology and evict the fine tile set.
+        ? heldAgl
+        : MAX_TERRAIN_AGL_M;
     const gridPosition = state.frameOffsetReady
       ? terrainCameraGridPosition({
           eastM: cameraCoordinates.eastM,

@@ -2883,9 +2883,12 @@ function render() {
     const refetch = evaluateTerrainRefetch({
       cameraX: terrainPipelineState.cameraStereoX, cameraY: terrainPipelineState.cameraStereoY,
       lastFetchX: terrainPipelineState.lastFetchX, lastFetchY: terrainPipelineState.lastFetchY,
+      // Unknown AGL is not ground level. Passing zero here made a transient
+      // missing surface sample look like a steep descent and repeatedly
+      // triggered fetches while crossing water.
       cameraAltitude: cameraRuntimeState.aglValid
         ? cameraRuntimeState.agl
-        : 0,
+        : null,
       lastFetchAltitude: terrainPipelineState.lastFetchAltitude,
       nowMs, lastTriggerMs: terrainPipelineState.lastFetchTriggerMs,
       distanceThreshold: REFETCH_DIST, altitudeThreshold: REFETCH_ALTITUDE_DELTA,

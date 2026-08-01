@@ -1554,7 +1554,9 @@ function createTestFetchRuntime({
     vehicle: {},
     testOverrides: {
       getCameraCoordinates: () => cameraCoordinates,
-      getCameraAGL: () => cameraAgl,
+      getCameraAGL: () => (
+        typeof cameraAgl === 'function' ? cameraAgl() : cameraAgl
+      ),
       getCameraSnapshot: () => ({ camEastM: 0, camNorthM: 0 }),
       getCameraLocalPosition: () => ({ x: 0, y: 0 }),
       getHeading: () => 0,
@@ -1623,6 +1625,33 @@ test('shared fetch runtime bootstraps coarse and never substitutes ASL when AGL 
   assert.match(requestedUrl, /[?&]agl=10000(?:&|$)/);
   assert.doesNotMatch(requestedUrl, /[?&](?:alt|agl)=934(?:&|$)/);
   assert.equal(state.lastFetchAltitude, 10_000);
+});
+
+test('shared fetch runtime holds the last measured AGL through a water coverage gap', async () => {
+  let cameraAgl = 120;
+  const requestedUrls = [];
+  const { runtime, state } = createTestFetchRuntime({
+    cameraAgl: () => cameraAgl,
+    fetchImpl: async url => {
+      requestedUrls.push(url);
+      return {
+        status: 200,
+        json: async () => ({
+          ox: 0, oy: 0, qx: 0, qy: 0, tiles: [],
+          missing: [], downloading: [], texFetching: 0,
+        }),
+      };
+    },
+  });
+
+  await runtime.request();
+  cameraAgl = null;
+  await runtime.request();
+
+  assert.match(requestedUrls[0], /[?&]agl=120(?:&|$)/);
+  assert.match(requestedUrls[1], /[?&]agl=120(?:&|$)/);
+  assert.doesNotMatch(requestedUrls[1], /[?&]agl=10000(?:&|$)/);
+  assert.equal(state.lastFetchAltitude, 120);
 });
 
 test('shared fetch runtime polls pending terrain without a duplicate startup pass', async () => {
