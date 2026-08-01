@@ -191,6 +191,11 @@ export function createOpticalWaterSurfaceRuntime({
   buildBudgetMs = DEFAULT_OPTICAL_BUILD_BUDGET_MS,
   maxDormantTwins = DEFAULT_OPTICAL_DORMANT_TWINS,
   now = () => performance.now(),
+  // Inversions are per-sync events at 60Hz; a counter sampled once a second
+  // cannot say when one happened, which is the only thing that correlates
+  // with something visible on screen. Emit them, rate-limited.
+  onInversion = null,
+  inversionLogIntervalMs = 400,
 } = {}) {
   const group = new THREE.Group();
   group.name = 'WaterOpticalSurface';
@@ -221,6 +226,13 @@ export function createOpticalWaterSurfaceRuntime({
   let totalRebuilds = 0;
   let totalEvictions = 0;
   let totalRevivals = 0;
+  let inversions = 0;
+  let worstInversionM = 0;
+  let lastInversionLogAt = -Infinity;
+  let totalVisibilityFlips = 0;
+  let lastStatsSnapshot = {};
+  let lastBuiltFarthestM = null;
+  let lastDeferredNearestM = null;
   let totalDormantDrops = 0;
 
   function sameBbox(a, b) {
@@ -241,7 +253,25 @@ export function createOpticalWaterSurfaceRuntime({
     opticalByTile.delete(tileId);
   }
 
-  function sync({ visible = true, waterline = 0 } = {}) {
+  function bindTwin(entry, source) {
+    // A revived tile is a different mesh object carrying the same grid.
+    entry.optical.userData.sourceTerrainMesh = source;
+    const texture = tileTexture(source);
+    if (entry.optical.material.map !== texture) {
+      entry.optical.material.map = texture;
+      entry.optical.material.needsUpdate = true;
+    }
+    // A twin only becomes visible once its terrain tile has a texture, so a
+    // freshly streamed tile renders with no water surface for a while and then
+    // pops in. That flip changes depth under the cloud pass, so count it.
+    const nextVisible = texture != null;
+    if (entry.optical.visible !== nextVisible) totalVisibilityFlips += 1;
+    entry.optical.visible = nextVisible;
+  }
+
+  function sync({
+    visible = true, waterline = 0, cameraX = null, cameraY = null,
+  } = {}) {
     group.visible = visible;
     group.position.z = Number(waterline) - Number(opticalDepth);
 
@@ -249,9 +279,32 @@ export function createOpticalWaterSurfaceRuntime({
     let built = 0;
     deferredBuilds = 0;
     const buildDeadline = now() + buildBudgetMs;
+    // Ordering check, no behaviour change: record how far the built twins were
+    // from the camera versus the nearest one skipped. If a skipped twin is
+    // closer than a built one, the arbitrary scan order is starving near water
+    // and the missing surface is right where the viewer is looking.
+    const trackDistance = Number.isFinite(cameraX) && Number.isFinite(cameraY);
+    const distanceTo = bbox => {
+      if (!trackDistance || !Array.isArray(bbox) || bbox.length !== 4) return null;
+      return Math.hypot(
+        (bbox[0] + bbox[2]) * 0.5 - cameraX,
+        (bbox[1] + bbox[3]) * 0.5 - cameraY,
+      );
+    };
+    let builtFarthest = null;
+    let deferredNearest = null;
     // Always allow one: a deadline already spent by earlier frame work must not
     // stall the surface forever.
     const canBuild = () => built < buildBudget && (built === 0 || now() < buildDeadline);
+    // Two passes. The first resolves everything cheap — revivals, texture
+    // rebinding — and collects only the tiles that need a twin clipped. The
+    // second builds those nearest-first.
+    //
+    // A single pass built in scene-graph order, and with a budget that affords
+    // one or two twins per frame that meant water 21 km away could be clipped
+    // while a tile 3 km from the camera went without. Measured: 39 inversions
+    // on one fjord run, worst 18 km.
+    const candidates = [];
     for (const source of terrainRoot.children) {
       const tileId = source.userData?.tileId;
       if (!source.isMesh || !TERRAIN_TILE_ID.test(tileId ?? '')) continue;
@@ -290,32 +343,65 @@ export function createOpticalWaterSurfaceRuntime({
           && sameBbox(waterless.bbox, bbox)) {
           continue;
         }
-        if (!canBuild()) {
-          deferredBuilds += 1;
-          continue;
-        }
-        built += 1;
-        const optical = createOpticalMesh(source);
-        if (optical == null) {
-          waterlessTiles.set(tileId, { payload, bbox });
-          continue;
-        }
-        waterlessTiles.delete(tileId);
-        totalBuilds += 1;
-        entry = { optical, payload, bbox };
-        opticalByTile.set(tileId, entry);
-        group.add(optical);
+        candidates.push({ source, tileId, payload, bbox, distance: distanceTo(bbox) });
+        continue;
       }
-      // A revived tile is a different mesh object carrying the same grid.
-      entry.optical.userData.sourceTerrainMesh = source;
-
-      const texture = tileTexture(source);
-      if (entry.optical.material.map !== texture) {
-        entry.optical.material.map = texture;
-        entry.optical.material.needsUpdate = true;
-      }
-      entry.optical.visible = texture != null;
+      bindTwin(entry, source);
     }
+
+    if (candidates.length > 1) {
+      candidates.sort((a, b) => (
+        (a.distance ?? Number.POSITIVE_INFINITY) - (b.distance ?? Number.POSITIVE_INFINITY)
+      ));
+    }
+    for (const { source, tileId, payload, bbox, distance } of candidates) {
+      if (!canBuild()) {
+        deferredBuilds += 1;
+        if (distance != null && (deferredNearest == null || distance < deferredNearest)) {
+          deferredNearest = distance;
+        }
+        continue;
+      }
+      built += 1;
+      const optical = createOpticalMesh(source);
+      if (optical == null) {
+        waterlessTiles.set(tileId, { payload, bbox });
+        continue;
+      }
+      waterlessTiles.delete(tileId);
+      totalBuilds += 1;
+      if (distance != null && (builtFarthest == null || distance > builtFarthest)) {
+        builtFarthest = distance;
+      }
+      const entry = { optical, payload, bbox };
+      opticalByTile.set(tileId, entry);
+      group.add(optical);
+      bindTwin(entry, source);
+    }
+
+    if (builtFarthest != null && deferredNearest != null && deferredNearest < builtFarthest) {
+      inversions += 1;
+      const excessM = builtFarthest - deferredNearest;
+      worstInversionM = Math.max(worstInversionM, excessM);
+      const at = now();
+      if (onInversion != null && at - lastInversionLogAt >= inversionLogIntervalMs) {
+        lastInversionLogAt = at;
+        onInversion({
+          builtFarthestM: Math.round(builtFarthest),
+          deferredNearestM: Math.round(deferredNearest),
+          excessM: Math.round(excessM),
+          built,
+          deferred: deferredBuilds,
+          totalInversions: inversions,
+          // Local ENU metres, so an event can be placed against the flight
+          // path without needing the viewer to call it out live.
+          cameraX: Math.round(cameraX),
+          cameraY: Math.round(cameraY),
+        });
+      }
+    }
+    lastBuiltFarthestM = builtFarthest;
+    lastDeferredNearestM = deferredNearest;
 
     for (const [tileId, entry] of opticalByTile) {
       if (liveTiles.has(tileId)) continue;
@@ -344,8 +430,25 @@ export function createOpticalWaterSurfaceRuntime({
     get size() { return opticalByTile.size; },
     get waterlessSize() { return waterlessTiles.size; },
     get pendingBuilds() { return deferredBuilds; },
+    // Cumulative counters answer "how much since load", which is never the
+    // question during a flight. Deltas since the previous read answer "what is
+    // happening now" — sampled at 1Hz against a 60Hz loop, that is the only
+    // reading that correlates with something visible.
     stats() {
+      const snapshot = {
+        builds: totalBuilds,
+        rebuilds: totalRebuilds,
+        evictions: totalEvictions,
+        revivals: totalRevivals,
+        visibilityFlips: totalVisibilityFlips,
+      };
+      const delta = {};
+      for (const [key, value] of Object.entries(snapshot)) {
+        delta[key] = value - (lastStatsSnapshot[key] ?? 0);
+      }
+      lastStatsSnapshot = snapshot;
       return {
+        perSample: delta,
         size: opticalByTile.size,
         waterless: waterlessTiles.size,
         pendingBuilds: deferredBuilds,
@@ -355,6 +458,10 @@ export function createOpticalWaterSurfaceRuntime({
         revivals: totalRevivals,
         dormant: dormantTwins.size,
         dormantDrops: totalDormantDrops,
+        inversions,
+        worstInversionM: Math.round(worstInversionM),
+        builtFarthestM: lastBuiltFarthestM == null ? null : Math.round(lastBuiltFarthestM),
+        deferredNearestM: lastDeferredNearestM == null ? null : Math.round(lastDeferredNearestM),
       };
     },
     dispose() {

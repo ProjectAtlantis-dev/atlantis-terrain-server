@@ -369,3 +369,38 @@ test('dormant twins are bounded and disposed on overflow', () => {
   assert.equal(runtime.stats().dormant, 2);
   assert.equal(runtime.stats().dormantDrops, 1);
 });
+
+test('twins are clipped nearest-first, not in scene-graph order', () => {
+  const terrainRoot = new THREE.Group();
+  // Deliberately added far-to-near, which is the order that produced 21km
+  // twins while 3km tiles went without.
+  const offsets = [20000, 3000, 100];
+  offsets.forEach((offset, index) => {
+    const source = terrainTile();
+    source.userData.tileId = `12-8-${index}`;
+    source.userData.bbox = [offset, offset, offset + 10, offset + 10];
+    terrainRoot.add(source);
+  });
+  const runtime = createOpticalWaterSurfaceRuntime({
+    terrainRoot,
+    buildBudget: 1,
+    buildBudgetMs: 1000,
+  });
+
+  runtime.sync({ cameraX: 0, cameraY: 0 });
+  assert.equal(runtime.size, 1);
+  // The nearest tile (offset 100) must be the one that got built.
+  assert.equal(runtime.group.children[0].name, 'WaterOpticalSurface.12-8-2');
+});
+
+test('an unknown camera position falls back without throwing', () => {
+  const terrainRoot = new THREE.Group();
+  const source = terrainTile();
+  source.userData.bbox = [0, 0, 10, 10];
+  terrainRoot.add(source);
+  const runtime = createOpticalWaterSurfaceRuntime({ terrainRoot });
+
+  runtime.sync({});
+  assert.equal(runtime.size, 1);
+  assert.equal(runtime.stats().inversions, 0);
+});

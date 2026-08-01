@@ -91,6 +91,7 @@ export function createWaterRuntime({
   const opticalSurface = createOpticalWaterSurfaceRuntime({
     terrainRoot,
     opticalDepth: params.opticalDepth,
+    onInversion: details => log?.('water.optical.inversion', details),
   });
 
   const palette = createWaterPalette();
@@ -127,9 +128,14 @@ export function createWaterRuntime({
     const timings = {};
     const syncStartedAt = performance.now();
     water.mesh.visible = visible;
+    // Camera position is needed before the visibility early-return so the
+    // optical surface can report build ordering relative to the viewer.
+    rel.copy(camera.position).sub(anchorPosition);
     opticalSurface.sync({
       visible: opticalVisible,
       waterline: params.waterline ?? 0,
+      cameraX: rel.dot(east),
+      cameraY: rel.dot(north),
     });
     timings.opticalSync = performance.now() - syncStartedAt;
     if (!visible) return timings;

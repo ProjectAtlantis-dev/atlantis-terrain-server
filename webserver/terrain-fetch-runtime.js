@@ -274,6 +274,11 @@ export function createTerrainFetchRuntime({
       refreshed: reconciliation.refreshed,
       refreshDeferred: reconciliation.refreshDeferred,
       reusedSamples,
+      // The LOD ceiling this response settled on. Without it a capture cannot
+      // tell a genuine depth change from footprint drift, which is the
+      // distinction that matters when reading eviction counts.
+      depthCap: data.depthCap ?? null,
+      tilesReused: data.tilesReused ?? null,
       sampleCache: sampleCache.stats(),
       released: reconciliation.released,
       geometryCache: reconciliation.geometryCache,
