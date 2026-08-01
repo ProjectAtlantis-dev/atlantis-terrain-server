@@ -27,6 +27,7 @@ export function createTerrainHud({
   onToggleClassifierOverlay,
   onToggleWaterOverlay,
   onToggleHydrographyOverlay,
+  onToggleProcgen,
   onToggleRenderBackend,
   onToggleRoadDebug,
   onOpenGoogleMaps,
@@ -52,6 +53,7 @@ export function createTerrainHud({
       event.target.id === 'classifierOverlayLink' ||
       event.target.id === 'waterOverlayLink' ||
       event.target.id === 'hydrographyOverlayLink' ||
+      event.target.id === 'procgenLink' ||
       event.target.id === 'renderBackendLink' ||
       event.target.id === 'roadDebugLink' ||
       event.target.id === 'googleMaps3dLink' ||
@@ -107,6 +109,12 @@ export function createTerrainHud({
       event.stopPropagation();
       event.preventDefault();
       onToggleHydrographyOverlay();
+      return;
+    }
+    if (event.target.id === 'procgenLink') {
+      event.stopPropagation();
+      event.preventDefault();
+      onToggleProcgen();
       return;
     }
     if (event.target.id === 'renderBackendLink') {
@@ -171,6 +179,7 @@ export function createTerrainHud({
       event.target.id === 'classifierOverlayLink' ||
       event.target.id === 'waterOverlayLink' ||
       event.target.id === 'hydrographyOverlayLink' ||
+      event.target.id === 'procgenLink' ||
       event.target.id === 'renderBackendLink' ||
       event.target.id === 'roadDebugLink' ||
       event.target.id === 'googleMaps3dLink' ||

@@ -15,8 +15,27 @@ export function formatTerrainTileId(depth, col, row) {
   return `${depth}-${col}-${row}`;
 }
 
+// Residency sweeps parse the same few hundred ids tens of thousands of times
+// per response — every eviction candidate re-walks the desired set and the
+// resident coverage map. The id space is small and the result is immutable, so
+// memoizing turns that back into a map lookup. Frozen because callers share
+// one instance per id.
+const parsedTileIds = new Map();
+const PARSED_TILE_ID_CACHE_MAX = 20000;
+
 export function parseTerrainTileId(tileId) {
   if (typeof tileId !== 'string') return null;
+  const cached = parsedTileIds.get(tileId);
+  if (cached !== undefined) return cached;
+  const parsed = parseTerrainTileIdUncached(tileId);
+  // A flat reset keeps this O(1); the working set is far below the cap and a
+  // cold rebuild costs one parse per live id.
+  if (parsedTileIds.size >= PARSED_TILE_ID_CACHE_MAX) parsedTileIds.clear();
+  parsedTileIds.set(tileId, parsed);
+  return parsed;
+}
+
+function parseTerrainTileIdUncached(tileId) {
   const match = TILE_ID_PATTERN.exec(tileId.trim());
   if (!match) return null;
   const depth = Number(match[1]);
@@ -25,12 +44,12 @@ export function parseTerrainTileId(tileId) {
   if (depth > MAX_SAFE_TILE_DEPTH) return null;
   const tilesPerAxis = 2 ** depth;
   if (col >= tilesPerAxis || row >= tilesPerAxis) return null;
-  return {
+  return Object.freeze({
     depth,
     col,
     row,
     id: formatTerrainTileId(depth, col, row),
-  };
+  });
 }
 
 export function terrainTileDepth(tileId, fallback = -1) {

@@ -7,6 +7,7 @@ import {
 import { priorityHeading } from './terrain-priority.js';
 import { mergeTerrainTilesAgainstCurrentTileSet } from './terrain-tile-quality.js';
 import { MAX_TERRAIN_AGL_M } from './terrain-agl.js';
+import { createLodAltitudeStabilizer } from './terrain-lod-altitude.js';
 
 export function createTerrainFetchRuntime({
   state,
@@ -19,6 +20,7 @@ export function createTerrainFetchRuntime({
   schedulePoll = (callback, delay) => setTimeout(callback, delay),
   cancelPoll = timer => clearTimeout(timer),
   events = {},
+  lodAltitudeStabilizer = createLodAltitudeStabilizer(),
   testOverrides = {},
 }) {
   const {
@@ -66,8 +68,11 @@ export function createTerrainFetchRuntime({
     // Unknown clearance is not camera ASL. Bootstrap with the coarse safety
     // ceiling so startup can only refine after terrain supplies a real AGL;
     // starting at zero would over-refine and immediately request a downgrade.
+    // Damp the measurement before it reaches the server's stepped depth cap.
+    // Unknown clearance must not anchor the band — it is a bootstrap ceiling,
+    // not an observation.
     const lodAltitude = Number.isFinite(measuredAgl)
-      ? Math.max(0, measuredAgl)
+      ? lodAltitudeStabilizer.stabilize(Math.max(0, measuredAgl))
       : MAX_TERRAIN_AGL_M;
     const gridPosition = state.frameOffsetReady
       ? terrainCameraGridPosition({
@@ -97,9 +102,22 @@ export function createTerrainFetchRuntime({
       queryX: gridPosition?.x, queryY: gridPosition?.y,
       cameraSnapshot,
     });
-    logger.enqueue('info', 'fetchTiles.request', request.logDetails);
+    logger.enqueue('info', 'fetchTiles.request', {
+      ...request.logDetails,
+      // requestAglM is the damped value actually sent; keep the raw sample
+      // alongside it so the hysteresis band can be verified from a capture.
+      measuredAglM: Number.isFinite(measuredAgl)
+        ? Number(measuredAgl.toFixed(1))
+        : null,
+    });
     const response = await fetchImpl(request.url, { signal });
+    // Deserializing the response is synchronous main-thread work despite the
+    // await, and lands between frames where a frame-time profiler cannot see
+    // it. Time it separately from reconcile so a stall can be blamed on the
+    // payload or on mesh building rather than on "somewhere in the callback".
+    const parseStartedAt = performance.now();
     const data = await response.json();
+    const parseMs = performance.now() - parseStartedAt;
     if (response.ok === false || response.status >= 400) {
       const detail = typeof data?.error === 'string' ? `: ${data.error}` : '';
       throw new Error(`terrain tile request failed (${response.status})${detail}`);
@@ -185,13 +203,22 @@ export function createTerrainFetchRuntime({
 
     if (Array.isArray(data.buildings)) onBuildings(data.buildings);
 
+    const reconcileStartedAt = performance.now();
     const reconciliation = terrain.reconcile(data.tiles, {
       completeCoverage: wasFirstLoad,
       onDiff: details => logger.enqueue('info', 'fetchTiles.diff', details),
     });
+    const reconcileMs = performance.now() - reconcileStartedAt;
     logger.enqueue('info', 'fetchTiles.built', {
       meshesInScene: reconciliation.sceneMeshes,
       deferred: reconciliation.deferred,
+      responseTiles: data.tiles.length,
+      parseMs: Number(parseMs.toFixed(1)),
+      reconcileMs: Number(reconcileMs.toFixed(1)),
+      evictMs: reconciliation.evictMs,
+      buildMs: reconciliation.buildMs,
+      released: reconciliation.released,
+      geometryCache: reconciliation.geometryCache,
     });
 
     terrain.updateTextures(data.tiles);
@@ -275,6 +302,7 @@ export function createTerrainFetchRuntime({
   }
 
   function reset() {
+    lodAltitudeStabilizer.reset();
     queuedRequest = null;
     activeController?.abort();
     activeController = null;

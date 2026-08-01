@@ -9,6 +9,7 @@ import {
   createTerrainMeshBuilder,
   updateTerrainMeshHeightmap,
 } from './terrain-mesh-builder.js';
+import { createTerrainGeometryCache } from './terrain-geometry-cache.js';
 import { priorityHeading, terrainTilePriority } from './terrain-priority.js';
 import {
   diffTerrainTileIds,
@@ -63,6 +64,7 @@ export function createTileLifecycle({
   onReleaseTile = () => {},
   releaseStaleTexture = () => false,
   residentById = null,
+  parkGeometry = () => false,
 }) {
   const residentMeshes = () => (
     residentById
@@ -80,7 +82,10 @@ export function createTileLifecycle({
     releaseStaleTexture(mesh.userData?.terrainBaseTexture ?? mesh.material?.map);
     mesh.userData?.terrainPlaceholderTexture?.dispose?.();
     if (mesh.userData) delete mesh.userData.terrainPlaceholderTexture;
-    mesh.geometry?.dispose();
+    // Textures keep their own dormancy cache and are released above; only the
+    // grid is parked here, so a tile that comes straight back skips the
+    // expensive rebuild instead of paying for it twice per LOD oscillation.
+    if (!parkGeometry(mesh)) mesh.geometry?.dispose();
     if (Array.isArray(mesh.material)) {
       for (const material of mesh.material) material?.dispose?.();
     } else {
@@ -100,12 +105,15 @@ export function createTileLifecycle({
     );
     const retired = [];
     const retainedFallbacks = [];
+    // The desired set is fixed for the whole sweep; spreading it per candidate
+    // rebuilt a few-hundred-entry array for every tile being evicted.
+    const desiredIds = [...desired];
 
     for (const mesh of residents) {
       const tileId = mesh.userData?.tileId;
       if (!tileId || desired.has(tileId)) continue;
       const desiredDescendants = desiredDescendantIds(tileId, desired);
-      const desiredAncestors = [...desired].filter(
+      const desiredAncestors = desiredIds.filter(
         desiredId => isTerrainTileAncestor(desiredId, tileId),
       );
 
@@ -476,10 +484,15 @@ export function reconcileTerrainTiles({
   // residency has one owner: sweep the live meshes against that snapshot.
   // Material arrivals may request another sweep as coverage improves, but
   // they never make an independent ancestor-eviction decision.
+  // Eviction and building are separately expensive and fail in opposite
+  // directions — a contraction removes hundreds of meshes while building
+  // almost nothing. Time them apart so a spike names its own half.
+  const sweepStartedAt = performance.now();
   const sweep = lifecycle.sweepResidency?.(nextTileIds) ?? {
     retired: [],
     retainedFallbacks: [],
   };
+  const evictMs = performance.now() - sweepStartedAt;
   const released = sweep.retired.length;
   for (const tileId of sweep.retired) meshesById.delete(tileId);
 
@@ -505,10 +518,24 @@ export function reconcileTerrainTiles({
     sceneMeshes: terrainRoot.children.filter(mesh => mesh.isMesh).length,
   });
 
+  const buildStartedAt = performance.now();
   if (added.length > 0) {
     const existingIds = new Set(meshesById.keys());
     const candidates = prioritizeTerrainBuildCandidates(tiles, new Set(added), priorityForTile);
     let built = 0;
+    // Stale coverage only ever comes from meshes that were already resident
+    // and textured when this reconcile began. Nothing built below can join the
+    // set: the cached-texture branch materializes without touching meshesById,
+    // and both buildMesh branches publish untextured geometry. Collecting the
+    // candidates once therefore preserves the original result while dropping a
+    // full copy of the resident map per added tile — the loop rebuilt that
+    // array up to buildBudget times per response.
+    const texturedCoverage = [];
+    for (const mesh of meshesById.values()) {
+      if (mesh.isMesh && mesh.material?.map && mesh.userData?.bbox) {
+        texturedCoverage.push(mesh);
+      }
+    }
     for (const { tile } of candidates) {
       if (existingIds.has(tile.id) && !refreshedIds.has(tile.id)) continue;
       const cachedTexture = textureCache.get(tile.id);
@@ -548,9 +575,9 @@ export function reconcileTerrainTiles({
         }
         continue;
       }
-      const hasStaleCoverage = [...meshesById.values()].some(mesh => (
-        mesh.isMesh && mesh.material?.map && mesh.userData?.bbox && overlaps(mesh.userData.bbox, tile.bbox)
-      ));
+      const hasStaleCoverage = texturedCoverage.some(
+        mesh => overlaps(mesh.userData.bbox, tile.bbox),
+      );
       if (hasStaleCoverage) {
         log(tile.id, 'added — deferred (stale coverage exists)');
       } else if (completeCoverage || built < buildBudget) {
@@ -578,6 +605,8 @@ export function reconcileTerrainTiles({
     refreshRebuilds: refreshedIds.size,
     sceneMeshes: terrainRoot.children.filter(mesh => mesh.isMesh).length,
     deferred: deferredTiles.size,
+    evictMs: Number(evictMs.toFixed(1)),
+    buildMs: Number((performance.now() - buildStartedAt).toFixed(1)),
   };
 }
 
@@ -597,9 +626,11 @@ export function createTerrainTileSet({
     onMutated = () => {},
     onMaterialApplied = () => {},
   } = events;
+  const geometryCache = testOverrides.geometryCache ?? createTerrainGeometryCache();
   const buildMesh = testOverrides.buildMesh ?? createTerrainMeshBuilder({
     exaggeration: terrain.exaggeration,
     attachScatter: terrain.attachScatter,
+    geometryCache,
   });
   const priorityForTile = testOverrides.priorityForTile ?? (tile => {
     const relative = view.camera.position.clone().sub(view.anchorPosition);
@@ -731,6 +762,7 @@ export function createTerrainTileSet({
     onReleaseTile: releaseTileDemand,
     releaseStaleTexture: textureStreamer.releaseStaleTexture,
     residentById,
+    parkGeometry: mesh => geometryCache.park(mesh),
   });
   const meshRuntime = createTerrainMeshRuntime({
     terrainRoot,
@@ -801,7 +833,7 @@ export function createTerrainTileSet({
       throw error;
     }
     lastTiles = tiles;
-    return result;
+    return { ...result, geometryCache: geometryCache.stats() };
   }
 
   function updateTextures(tiles) {
