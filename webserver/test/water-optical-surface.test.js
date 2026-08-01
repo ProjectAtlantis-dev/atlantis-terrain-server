@@ -219,3 +219,44 @@ test('a re-centred frame offset rebuilds the twin at the new bbox', () => {
   runtime.sync({});
   assert.notEqual(runtime.group.children[0], twin, 'stale twin kept at the old bbox');
 });
+
+test('optical builds stop at a deadline rather than a mesh count', () => {
+  const terrainRoot = new THREE.Group();
+  for (let index = 0; index < 10; index += 1) {
+    const source = terrainTile();
+    source.userData.tileId = `12-2-${index}`;
+    terrainRoot.add(source);
+  }
+  // Each twin clips a whole grid; simulate 2ms apiece against a 3ms budget.
+  let clock = 0;
+  const runtime = createOpticalWaterSurfaceRuntime({
+    terrainRoot,
+    buildBudgetMs: 3,
+    now: () => { clock += 0; return clock; },
+  });
+  const originalAdd = runtime.group.add.bind(runtime.group);
+  runtime.group.add = mesh => { clock += 2; return originalAdd(mesh); };
+
+  runtime.sync({});
+  // 0ms -> build, 2ms -> build, 4ms -> past deadline.
+  assert.equal(runtime.size, 2);
+  assert.equal(runtime.pendingBuilds, 8);
+});
+
+test('one optical twin is always built even past the deadline', () => {
+  const terrainRoot = new THREE.Group();
+  for (let index = 0; index < 3; index += 1) {
+    const source = terrainTile();
+    source.userData.tileId = `12-3-${index}`;
+    terrainRoot.add(source);
+  }
+  const runtime = createOpticalWaterSurfaceRuntime({
+    terrainRoot,
+    buildBudgetMs: 0,
+    now: () => 1e6,
+  });
+
+  runtime.sync({});
+  assert.equal(runtime.size, 1, 'starvation guard must let the surface progress');
+  assert.equal(runtime.pendingBuilds, 2);
+});

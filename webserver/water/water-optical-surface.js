@@ -173,13 +173,20 @@ function createOpticalMesh(source) {
 // optical twin in the frame that notices them is what turned a streaming burst
 // into a half-second freeze. The surface is a visual proxy, so spreading the
 // work over the next few frames is invisible.
-const DEFAULT_OPTICAL_BUILD_BUDGET = 4;
+//
+// The budget is a deadline, not a count: each twin clips every triangle of its
+// source grid, so "four per frame" bought roughly 20ms — under a coarse hitch
+// threshold, but well over a 60fps frame, which read as continuous judder.
+const DEFAULT_OPTICAL_BUILD_BUDGET_MS = 3;
+const DEFAULT_OPTICAL_BUILD_BUDGET = 64;
 const TERRAIN_TILE_ID = /^\d+-\d+-\d+$/;
 
 export function createOpticalWaterSurfaceRuntime({
   terrainRoot,
   opticalDepth = DEFAULT_OPTICAL_WATER_DEPTH_M,
   buildBudget = DEFAULT_OPTICAL_BUILD_BUDGET,
+  buildBudgetMs = DEFAULT_OPTICAL_BUILD_BUDGET_MS,
+  now = () => performance.now(),
 } = {}) {
   const group = new THREE.Group();
   group.name = 'WaterOpticalSurface';
@@ -224,6 +231,10 @@ export function createOpticalWaterSurfaceRuntime({
     const liveTiles = new Set();
     let built = 0;
     deferredBuilds = 0;
+    const buildDeadline = now() + buildBudgetMs;
+    // Always allow one: a deadline already spent by earlier frame work must not
+    // stall the surface forever.
+    const canBuild = () => built < buildBudget && (built === 0 || now() < buildDeadline);
     for (const source of terrainRoot.children) {
       const tileId = source.userData?.tileId;
       if (!source.isMesh || !TERRAIN_TILE_ID.test(tileId ?? '')) continue;
@@ -243,7 +254,7 @@ export function createOpticalWaterSurfaceRuntime({
           && sameBbox(waterless.bbox, bbox)) {
           continue;
         }
-        if (built >= buildBudget) {
+        if (!canBuild()) {
           deferredBuilds += 1;
           continue;
         }

@@ -1581,7 +1581,10 @@ const fpsCounter = createTerrainFpsCounter();
 // across periodic sample frames. The detector watches every frame instead and
 // splits a stall into render() work versus time stolen between frames, then
 // names whatever tiles, textures, or shader programs appeared while it hung.
-const HITCH_MS = Number(localStorage.getItem('terrain-hitch-ms')) || 50;
+// 25ms is one dropped frame at 60fps — the band that reads as judder rather
+// than a lag, and the reason a 50ms threshold reported "no hitches" while
+// flight still felt rough.
+const HITCH_MS = Number(localStorage.getItem('terrain-hitch-ms')) || 25;
 const hitchDetector = createTerrainHitchDetector({
   hitchMs: HITCH_MS,
   sampleContext: () => {
@@ -1630,11 +1633,19 @@ function reportHitch(hitch) {
           .map(([name, ms]) => [name, Number(ms.toFixed(1))]),
       )
       : undefined,
-    longTasks: hitch.longTasks.map(task => ({
-      durationMs: Number(task.durationMs.toFixed(1)),
-      attribution: task.attribution,
-    })),
-    ...getCameraLogSnapshot(),
+    // The client logger deep-clones every entry, so at a judder-level threshold
+    // the camera snapshot and long-task list would be paid for many times a
+    // second — enough to show up in the very frames being measured. Attach the
+    // heavy fields only to stalls big enough to warrant locating.
+    ...(hitch.intervalMs >= 50
+      ? {
+        longTasks: hitch.longTasks.map(task => ({
+          durationMs: Number(task.durationMs.toFixed(1)),
+          attribution: task.attribution,
+        })),
+        ...getCameraLogSnapshot(),
+      }
+      : null),
   });
 }
 

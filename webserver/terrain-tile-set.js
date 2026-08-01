@@ -228,6 +228,11 @@ export function createTerrainTextureController({
   onMaterialApplied = () => {},
   scheduleFrame = callback => requestAnimationFrame(callback),
   applicationsPerFrame = 4,
+  // Each application materializes a mesh and runs a residency sweep, so the
+  // count says nothing about the frame cost it buys. The deadline is the real
+  // guard; the count stays as a ceiling.
+  applicationBudgetMs = 4,
+  now = () => performance.now(),
   residentById = null,
 }) {
   const findMesh = tileId => (
@@ -304,9 +309,14 @@ export function createTerrainTextureController({
 
   function drainApplications() {
     applicationFramePending = false;
-    let remaining = applicationsPerFrame;
+    let applied = 0;
+    const deadline = now() + applicationBudgetMs;
     for (const [tileId, pending] of pendingApplications) {
-      if (remaining-- <= 0) break;
+      // Always apply one so texture arrivals cannot stall behind a frame that
+      // was already over budget when this ran.
+      if (applied >= applicationsPerFrame) break;
+      if (applied > 0 && now() >= deadline) break;
+      applied += 1;
       pendingApplications.delete(tileId);
       const { tile, texture, logArrival } = pending;
       if (!desiredTileIds.has(tileId)) {
