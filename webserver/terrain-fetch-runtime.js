@@ -26,7 +26,8 @@ export function createTerrainFetchRuntime({
   cancelPoll = timer => clearTimeout(timer),
   events = {},
   lodAltitudeStabilizer = createLodAltitudeStabilizer(),
-  sampleCache = createTerrainSampleCache(),
+  evictionGate = null,
+  sampleCache = createTerrainSampleCache({ evictionGate }),
   testOverrides = {},
 }) {
   const {
@@ -124,6 +125,11 @@ export function createTerrainFetchRuntime({
         ? Number(measuredAgl.toFixed(1))
         : null,
     });
+    // The server may omit samples for every digest in this claim. Keep the
+    // corresponding cache-owned arrays alive for exactly this request: the
+    // bounded live LRU can otherwise evict an advertised entry while fetch is
+    // in flight, leaving a digest-only tile that cannot be materialized.
+    const residency = sampleCache.snapshot();
     const response = await fetchImpl(request.url, {
       signal,
       method: 'POST',
@@ -134,7 +140,7 @@ export function createTerrainFetchRuntime({
       // it lets the server hold that ceiling through ordinary terrain relief
       // instead of re-deciding from scratch and swapping the whole tile set.
       body: JSON.stringify({
-        known: sampleCache.residency(),
+        known: residency.known,
         depthCap: state.depthCap ?? null,
       }),
     });
@@ -159,7 +165,7 @@ export function createTerrainFetchRuntime({
         continue;
       }
       if (typeof tile.heightmap !== 'string' || tile.heightmapBytes !== 0) continue;
-      const held = sampleCache.take(tile.id, tile.heightmap);
+      const held = residency.take(tile.id, tile.heightmap);
       if (held == null) {
         unresolved.push(tile.id);
         continue;

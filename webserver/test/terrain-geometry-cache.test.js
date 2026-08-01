@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import { createTerrainGeometryCache } from '../terrain-geometry-cache.js';
+import { createTileEvictionGate } from '../terrain-tile-eviction.js';
 
 function fakeGeometry() {
   return { disposed: false, dispose() { this.disposed = true; } };
@@ -127,6 +128,21 @@ test('evicts oldest first once the cap is reached', () => {
   assert.ok(cache.take(tileFor(b)));
   assert.ok(cache.take(tileFor(c)));
   assert.equal(cache.stats().overflowDrops, 1);
+});
+
+test('the shared debug gate retains parked geometry beyond the cap', () => {
+  const gate = createTileEvictionGate(false);
+  const cache = createTerrainGeometryCache({ maxEntries: 1, evictionGate: gate });
+  const a = fakeMesh('12-1-1');
+  const b = fakeMesh('12-2-2');
+  cache.park(a);
+  cache.park(b);
+  assert.equal(cache.size, 2);
+  assert.equal(a.geometry.disposed, false);
+
+  gate.setEnabled(true);
+  assert.equal(cache.size, 1);
+  assert.equal(a.geometry.disposed, true);
 });
 
 test('declines meshes missing the identity needed to revive them safely', () => {

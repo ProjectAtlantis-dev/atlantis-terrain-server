@@ -1,6 +1,10 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { renderGameClock, terrainHudHeader } from '../terrain-hud.js';
+import {
+  renderGameClock,
+  terrainHudHeader,
+  tileEvictionHudLine,
+} from '../terrain-hud.js';
 
 test('renderGameClock only rewrites the DOM when the display changes', () => {
   const element = { innerHTML: '', dataset: {} };
@@ -36,4 +40,10 @@ test('terrain HUD header exposes its expanded state and dropdown direction', () 
   assert.match(collapsed, /aria-expanded="false"/);
   assert.match(collapsed, /Show HUD details/);
   assert.match(collapsed, /&#9660;/);
+});
+
+test('terrain HUD exposes data eviction as an explicit debug gate', () => {
+  assert.match(tileEvictionHudLine(true), /id="tileEvictionLink"/);
+  assert.match(tileEvictionHudLine(true), />enabled<\/span>/);
+  assert.match(tileEvictionHudLine(false), /data eviction: .*DISABLED/);
 });

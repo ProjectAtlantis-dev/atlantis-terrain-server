@@ -34,6 +34,7 @@ function sameBbox(a, b) {
  */
 export function createTerrainGeometryCache({
   maxEntries = DEFAULT_MAX_ENTRIES,
+  evictionGate = null,
 } = {}) {
   if (!Number.isInteger(maxEntries) || maxEntries < 0) {
     throw new RangeError('maxEntries must be a non-negative integer');
@@ -44,10 +45,32 @@ export function createTerrainGeometryCache({
   let misses = 0;
   let staleDrops = 0;
   let overflowDrops = 0;
+  const debugRetainedEntries = new Set();
 
   function disposeEntry(entry) {
+    if (evictionGate?.enabled === false) {
+      if (entry != null) debugRetainedEntries.add(entry);
+      return;
+    }
     entry?.geometry?.dispose?.();
   }
+
+  function evictOverflow() {
+    if (evictionGate?.enabled === false) return;
+    while (entries.size > maxEntries) {
+      const oldest = entries.keys().next().value;
+      const evicted = entries.get(oldest);
+      entries.delete(oldest);
+      disposeEntry(evicted);
+      overflowDrops += 1;
+    }
+  }
+  evictionGate?.onChange?.(enabled => {
+    if (!enabled) return;
+    for (const entry of debugRetainedEntries) entry?.geometry?.dispose?.();
+    debugRetainedEntries.clear();
+    evictOverflow();
+  });
 
   function drop(tileId) {
     const entry = entries.get(tileId);
@@ -81,13 +104,7 @@ export function createTerrainGeometryCache({
         skirtDepth: data.skirtDepth,
       });
 
-      while (entries.size > maxEntries) {
-        const oldest = entries.keys().next().value;
-        const evicted = entries.get(oldest);
-        entries.delete(oldest);
-        disposeEntry(evicted);
-        overflowDrops += 1;
-      }
+      evictOverflow();
       return true;
     },
 
@@ -133,6 +150,7 @@ export function createTerrainGeometryCache({
         misses,
         staleDrops,
         overflowDrops,
+        debugRetained: debugRetainedEntries.size,
         hitRate: hits + misses === 0 ? 0 : hits / (hits + misses),
       };
     },

@@ -78,6 +78,7 @@ export function createWaterRuntime({
   getTextureVersion = null,
   log = null,
   params = { ...DEFAULT_WATER_PARAMS },
+  evictionGate = null,
 }) {
   const water = backend.createWater?.({ geometry: buildRadialGridGeometry(), log }) ?? null;
   if (!water?.mesh) {
@@ -92,6 +93,7 @@ export function createWaterRuntime({
     terrainRoot,
     opticalDepth: params.opticalDepth,
     onInversion: details => log?.('water.optical.inversion', details),
+    evictionGate,
   });
 
   const palette = createWaterPalette();

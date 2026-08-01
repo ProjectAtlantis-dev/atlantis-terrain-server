@@ -33,7 +33,7 @@ TEXTURE SOURCE STATES:
                             drops the cooked children so the next demand
                             re-cooks against the new parent.
 - write_texture() has an expected_upgrades whitelist. If you add a new source,
-  update that whitelist or you'll get TEX CLOBBER warnings.
+  update that whitelist or cross-source writes will be refused as clobbers.
 
 SEA / OCEAN TILES:
 - Sea detection is per-PIXEL in the frontend (elevation ≤ 1m → blue vertex color,
@@ -377,8 +377,8 @@ def init_textures(db):
         log_tex.info("Created table: textures")
 
 
-# Workflow endpoints: sources the pipeline must never replace. Overwriting
-# one is logged as an error by write_texture (see TEX CLOBBER-TERMINAL).
+# Workflow endpoints: sources the pipeline must never replace. Attempts are
+# refused and logged as errors by write_texture (see TEX CLOBBER-TERMINAL).
 TERMINAL_SOURCES = {
     "dataforsyningen_metatile4h2",
     "cooked_upscale",
@@ -452,7 +452,12 @@ def drop_procedural_children(db, tile_id):
 
 
 def write_texture(db, tile_id, jpeg_bytes, source):
-    """Store a JPEG texture blob in the database."""
+    """Store a JPEG texture blob without replacing a better source.
+
+    Returns False when the source transition is not part of the declared
+    upgrade chain. The conditional upsert also protects terminal rows when a
+    separate connection wins the race after the read below.
+    """
     existing = db.execute(
         "SELECT source, updated_at, length(texture) FROM textures WHERE tile_id = ?",
         (tile_id,)
@@ -513,25 +518,56 @@ def write_texture(db, tile_id, jpeg_bytes, source):
             ("dataforsyningen_metatile4h", "cooked_upscale"),
         }
         msg = (
-            f"{tile_id}: replacing {ex_source} "
-            f"({ex_updated}, {ex_size}b) with {source} ({len(jpeg_bytes)}b)"
+            f"REFUSED {tile_id}: preserving {ex_source} "
+            f"({ex_updated}, {ex_size}b), rejected {source} "
+            f"({len(jpeg_bytes)}b)"
         )
         if ex_source != source and (ex_source, source) not in expected_upgrades:
             if ex_source in TERMINAL_SOURCES:
                 # Terminal rows are workflow endpoints (finished provider
                 # detail, procedural cooks, confirmed no-coverage). Nothing in
-                # the normal pipeline replaces them — this is either a manual
-                # reset or a bug losing finished work.
+                # the normal pipeline replaces them. An explicit reset must
+                # remove the row first; an attempted replacement is a bug.
                 log_tex.error(f"[TEX CLOBBER-TERMINAL] {msg}")
             else:
                 log_tex.warning(f"[TEX CLOBBER] {msg}")
+            return False
     now = datetime.datetime.now(datetime.timezone.utc).isoformat()
-    db.execute(
-        "INSERT OR REPLACE INTO textures (tile_id, source, texture, updated_at) "
-        "VALUES (?, ?, ?, ?)",
+    cursor = db.execute(
+        "INSERT INTO textures (tile_id, source, texture, updated_at) "
+        "VALUES (?, ?, ?, ?) "
+        "ON CONFLICT(tile_id) DO UPDATE SET "
+        "source = excluded.source, texture = excluded.texture, "
+        "updated_at = excluded.updated_at "
+        "WHERE textures.source NOT IN "
+        "('dataforsyningen_metatile4h2', 'cooked_upscale', "
+        " 'ancestor_crop_nodata', 'ocean_nodata') "
+        "OR textures.source = excluded.source "
+        "OR (textures.source = 'ancestor_crop_nodata' "
+        "    AND excluded.source IN ('ancestor_crop', 'ocean_nodata')) "
+        "OR (textures.source = 'ocean_nodata' "
+        "    AND excluded.source IN "
+        "    ('dataforsyningen', 'dataforsyningen_metatile', "
+        "     'dataforsyningen_metatile4', 'dataforsyningen_metatile4h2'))",
         (tile_id, source, jpeg_bytes, now)
     )
     db.commit()
+    if cursor.rowcount == 0:
+        # A terminal row appeared after the initial read. The conditional
+        # upsert preserved it atomically; report the same integrity failure.
+        current = db.execute(
+            "SELECT source, updated_at, length(texture) FROM textures "
+            "WHERE tile_id = ?",
+            (tile_id,),
+        ).fetchone()
+        if current:
+            ex_source, ex_updated, ex_size = current
+            log_tex.error(
+                f"[TEX CLOBBER-TERMINAL] REFUSED {tile_id}: preserving "
+                f"{ex_source} ({ex_updated}, {ex_size}b), rejected {source} "
+                f"({len(jpeg_bytes)}b)"
+            )
+        return False
 
     # Cooked descendants are derived from this tile's texture: any real
     # (non-placeholder) change to it makes the whole procedural subtree stale
@@ -546,6 +582,7 @@ def write_texture(db, tile_id, jpeg_bytes, source):
                 f"[TEX] {tile_id}: parent changed to {source} — dropped stale "
                 f"procedural children for re-cook: {', '.join(stale)}"
             )
+    return True
 
 
 def read_texture(db, tile_id):
@@ -611,7 +648,7 @@ def metatile_upsample_scores(image_bytes):
         return 1.0, 1.0
     full = Image.fromarray(gray, mode="F")
 
-    best_residual = None
+    best_residual = float("inf")
     for down_kernel in (Image.Resampling.LANCZOS, Image.Resampling.BOX):
         down = full.resize((width // 2, height // 2), down_kernel)
         for up_kernel in (
@@ -622,9 +659,7 @@ def metatile_upsample_scores(image_bytes):
         ):
             up = np.asarray(down.resize((width, height), up_kernel), dtype=np.float32)
             residual = float(np.sqrt(np.mean((gray - up) ** 2)))
-            best_residual = (
-                residual if best_residual is None else min(best_residual, residual)
-            )
+            best_residual = min(best_residual, residual)
     quarter = full.resize((width // 4, height // 4), Image.Resampling.LANCZOS)
     smooth = np.asarray(
         quarter.resize((width, height), Image.Resampling.LANCZOS), dtype=np.float32

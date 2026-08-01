@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import { createTerrainSampleCache } from '../terrain-sample-cache.js';
+import { createTileEvictionGate } from '../terrain-tile-eviction.js';
 
 test('returns samples only when the digest matches', () => {
   const cache = createTerrainSampleCache();
@@ -59,6 +60,19 @@ test('evicts least recently used once full', () => {
   assert.ok(cache.take('c', '3'));
 });
 
+test('the shared debug gate retains heightmaps beyond the cap until re-enabled', () => {
+  const gate = createTileEvictionGate(false);
+  const cache = createTerrainSampleCache({ maxEntries: 1, evictionGate: gate });
+  cache.store('a', '1', Float32Array.from([1]));
+  cache.store('b', '2', Float32Array.from([2]));
+  assert.equal(cache.size, 2);
+  assert.deepEqual(cache.residency(), { a: '1', b: '2' });
+
+  gate.setEnabled(true);
+  assert.equal(cache.size, 1);
+  assert.deepEqual(cache.residency(), { b: '2' });
+});
+
 test('a dropped tile disappears from the residency map', () => {
   const cache = createTerrainSampleCache({ maxEntries: 1 });
   cache.store('a', '1', Float32Array.from([1]));
@@ -67,6 +81,21 @@ test('a dropped tile disappears from the residency map', () => {
   // Claiming a tile it can no longer reconstruct would make the server
   // withhold samples the client needs.
   assert.deepEqual(cache.residency(), { b: '2' });
+});
+
+test('a residency snapshot reconstructs samples evicted while its request is in flight', () => {
+  const cache = createTerrainSampleCache({ maxEntries: 1 });
+  cache.store('a', '1', Float32Array.from([1]));
+  const snapshot = cache.snapshot();
+
+  // This is the observed race: a later response fills the bounded cache after
+  // the request advertised `a`, but before that request's response is decoded.
+  cache.store('b', '2', Float32Array.from([2]));
+  assert.equal(cache.take('a', '1'), null);
+
+  assert.deepEqual(snapshot.known, { a: '1' });
+  assert.deepEqual([...snapshot.take('a', '1')], [1]);
+  assert.equal(snapshot.take('a', 'stale'), null);
 });
 
 test('rejects entries it could not reconstruct from', () => {

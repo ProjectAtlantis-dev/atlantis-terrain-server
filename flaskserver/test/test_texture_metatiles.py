@@ -332,16 +332,27 @@ class TextureMetatileFetchTest(unittest.TestCase):
         sources = dict(db.execute("SELECT tile_id, source FROM textures"))
         self.assertEqual(sources["13-20-40"], "cooked_upscale")
 
-    def test_clobbering_terminal_source_logs_error_not_warning(self):
+    def test_ancestor_crop_cannot_clobber_final_provider_texture(self):
         db = sqlite3.connect(":memory:")
         init_textures(db)
-        jpeg = _encoded_image(np.full((8, 8, 3), 128), "JPEG")
-        write_texture(db, "13-5-5", jpeg, "cooked_upscale")
+        genuine = _encoded_image(np.full((8, 8, 3), 128), "JPEG")
+        fallback = _encoded_image(np.full((8, 8, 3), 32), "JPEG")
+        write_texture(db, "12-1350-825", genuine, "dataforsyningen_metatile4h2")
 
         with self.assertLogs("terrain.tex", level="ERROR") as captured:
-            write_texture(db, "13-5-5", jpeg, "ancestor_crop")
+            written = write_texture(db, "12-1350-825", fallback, "ancestor_crop")
+
+        source, texture = db.execute(
+            "SELECT source, texture FROM textures WHERE tile_id = '12-1350-825'"
+        ).fetchone()
+        self.assertFalse(written)
+        self.assertEqual(source, "dataforsyningen_metatile4h2")
+        self.assertEqual(texture, genuine)
         self.assertTrue(
-            any("TEX CLOBBER-TERMINAL" in line for line in captured.output)
+            any(
+                "TEX CLOBBER-TERMINAL" in line and "REFUSED" in line
+                for line in captured.output
+            )
         )
 
     def test_audit_flags_only_stale_unattended_temporary_rows(self):

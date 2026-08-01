@@ -21,6 +21,7 @@ import {
   terrainVisibilityDistance,
 } from './terrain-tile-runtime.js';
 import { createTerrainDetailRuntime } from './terrain-detail-runtime.js';
+import { createTileEvictionGate } from './terrain-tile-eviction.js';
 
 function desiredDescendantIds(parentTileId, desiredTileIds) {
   const parent = parseTerrainTileId(parentTileId);
@@ -65,7 +66,12 @@ export function createTileLifecycle({
   releaseStaleTexture = () => false,
   residentById = null,
   parkGeometry = () => false,
+  evictionEnabled = () => true,
 }) {
+  // Every terrain-mesh removal goes through retire(). Keep attempted removals
+  // while the debug gate is closed so replacements do not become anonymous
+  // scene children that can never be cleaned up when eviction resumes.
+  const suppressedRetirements = new Set();
   const residentMeshes = () => (
     residentById
       ? [...residentById.values()]
@@ -75,6 +81,14 @@ export function createTileLifecycle({
   function retire(mesh, reason = 'unspecified lifecycle retirement') {
     if (!mesh) return;
     const tileId = mesh.userData?.tileId || '?';
+    if (!evictionEnabled()) {
+      if (!suppressedRetirements.has(mesh)) {
+        log(tileId, `eviction suppressed — ${reason}`);
+        suppressedRetirements.add(mesh);
+      }
+      return false;
+    }
+    suppressedRetirements.delete(mesh);
     log(tileId, `evicted — ${reason}`);
     terrainRoot.remove(mesh);
     if (residentById?.get(tileId) === mesh) residentById.delete(tileId);
@@ -138,7 +152,9 @@ export function createTileLifecycle({
         retainedFallbacks.push(tileId);
         continue;
       }
-      retire(mesh, 'absent from current browser heatmap with replacement coverage');
+      if (!retire(mesh, 'absent from current browser heatmap with replacement coverage')) {
+        continue;
+      }
       onReleaseTile(tileId);
       residentTextures.delete(tileId);
       retired.push(tileId);
@@ -158,7 +174,27 @@ export function createTileLifecycle({
     sweepResidency(currentTileIds);
   }
 
-  return { retire, sweepResidency, replaceForMaterialized };
+  function flushSuppressedRetirements() {
+    if (!evictionEnabled()) return 0;
+    let retired = 0;
+    for (const mesh of [...suppressedRetirements]) {
+      const tileId = mesh.userData?.tileId;
+      // Only replacements are unconditionally stale. A residency retirement
+      // may have become desired again while the gate was closed; the next
+      // coverage-aware sweep decides those instead.
+      if (residentById?.get(tileId) === mesh) continue;
+      if (retire(mesh, 'deferred debug-gated replacement cleanup')) retired += 1;
+    }
+    return retired;
+  }
+
+  return {
+    retire,
+    sweepResidency,
+    replaceForMaterialized,
+    flushSuppressedRetirements,
+    get suppressedRetirements() { return suppressedRetirements.size; },
+  };
 }
 
 function applyDepthOffset(mesh, depth, enabled = true) {
@@ -442,6 +478,7 @@ export function reconcileTerrainTiles({
   depthOffsetEnabled = true,
   completeCoverage = false,
   refreshMesh = updateTerrainMeshHeightmap,
+  evictionEnabled = true,
 }) {
   const meshesById = residentById ?? new Map(
     terrainRoot.children
@@ -518,7 +555,7 @@ export function reconcileTerrainTiles({
   const { nextTileIds, added, removed } = diffTerrainTileIds(tiles, diffBaseIds);
   let purged = 0;
   for (const id of deferredTiles.keys()) {
-    if (!nextTileIds.has(id)) {
+    if (evictionEnabled && !nextTileIds.has(id)) {
       deferredTiles.delete(id);
       purged += 1;
     }
@@ -677,13 +714,17 @@ export function createTerrainTileSet({
   log,
   vehicle = {},
   events = {},
+  evictionGate = null,
   testOverrides = {},
 }) {
+  const effectiveEvictionGate = evictionGate ?? createTileEvictionGate();
   const {
     onMutated = () => {},
     onMaterialApplied = () => {},
   } = events;
-  const geometryCache = testOverrides.geometryCache ?? createTerrainGeometryCache();
+  const geometryCache = testOverrides.geometryCache ?? createTerrainGeometryCache({
+    evictionGate: effectiveEvictionGate,
+  });
   const buildMesh = testOverrides.buildMesh ?? createTerrainMeshBuilder({
     exaggeration: terrain.exaggeration,
     attachScatter: terrain.attachScatter,
@@ -820,6 +861,7 @@ export function createTerrainTileSet({
     releaseStaleTexture: textureStreamer.releaseStaleTexture,
     residentById,
     parkGeometry: mesh => geometryCache.park(mesh),
+    evictionEnabled: () => effectiveEvictionGate.enabled,
   });
   const meshRuntime = createTerrainMeshRuntime({
     terrainRoot,
@@ -883,6 +925,7 @@ export function createTerrainTileSet({
         onDiff,
         depthOffsetEnabled,
         completeCoverage,
+        evictionEnabled: effectiveEvictionGate.enabled,
       });
       currentTileIds = result.nextTileIds;
     } catch (error) {
@@ -902,8 +945,22 @@ export function createTerrainTileSet({
     if (lastTiles) updateTextureDemand(lastTiles);
   }
 
+  function setEvictionEnabled(enabled) {
+    const previous = effectiveEvictionGate.enabled;
+    const next = effectiveEvictionGate.setEnabled(enabled);
+    if (next === previous) return next;
+    if (next) {
+      lifecycle.flushSuppressedRetirements();
+      lifecycle.sweepResidency(currentTileIds);
+    }
+    onMutated();
+    return next;
+  }
+
   return {
     get currentTileIds() { return currentTileIds; },
+    get evictionEnabled() { return effectiveEvictionGate.enabled; },
+    get suppressedEvictions() { return lifecycle.suppressedRetirements; },
     deferredTiles,
     reconcile,
     updateTextures,
@@ -911,5 +968,6 @@ export function createTerrainTileSet({
     resetTextureApplications: updateTextureDemand.reset,
     setTextureOverlay,
     refreshTextureOverlay,
+    setEvictionEnabled,
   };
 }

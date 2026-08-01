@@ -8,6 +8,7 @@ import {
   DEFAULT_OPTICAL_WATER_DEPTH_M,
   OPTICAL_WATER_RENDER_ORDER,
 } from '../water/water-optical-surface.js';
+import { createTileEvictionGate } from '../terrain-tile-eviction.js';
 
 function terrainTile(mask = [1, 1, 1, 1]) {
   const geometry = new THREE.BufferGeometry();
@@ -34,19 +35,26 @@ function terrainTile(mask = [1, 1, 1, 1]) {
   return mesh;
 }
 
-test('optical water geometry is flat and clipped halfway across coastline cells', () => {
+test('a wet tile gets a complete flat cover so deep floor cannot leak through mask gaps', () => {
   const geometry = buildOpticalWaterGeometry(terrainTile([1, 0, 0, 0]));
   const position = geometry.getAttribute('position');
   const uv = geometry.getAttribute('uv');
 
-  assert.equal(position.count, 3);
+  assert.equal(position.count, 6);
   assert.deepEqual(
     Array.from(position.array),
-    [5, 0, 0, 0, 5, 0, 0, 0, 0],
+    [
+      0, 0, 0,
+      10, 0, 0,
+      0, 10, 0,
+      10, 0, 0,
+      10, 10, 0,
+      0, 10, 0,
+    ],
   );
   assert.deepEqual(
     Array.from(uv.array),
-    [0.5, 0, 0, 0.5, 0, 0],
+    [0, 0, 1, 0, 0, 1, 1, 0, 1, 1, 0, 1],
   );
   assert.equal(new Set([
     position.getZ(0),
@@ -101,7 +109,7 @@ test('optical water owns visual depth only, is non-interactive, and follows wate
   assert.equal(terrainRoot.children.includes(runtime.group), false);
 });
 
-test('a fully dry tile is rejected before any triangle clipping', () => {
+test('a fully dry tile is rejected before any cover geometry is built', () => {
   assert.equal(buildOpticalWaterGeometry(terrainTile([0, 0, 0, 0])), null);
   // A single wet sample must still produce geometry.
   assert.ok(buildOpticalWaterGeometry(terrainTile([1, 0, 0, 0])));
@@ -118,13 +126,13 @@ test('a waterless tile is only evaluated once while it stays resident', () => {
   assert.equal(runtime.size, 0);
   assert.equal(runtime.waterlessSize, 1);
 
-  // Re-clipping dry tiles every frame was the original half-second stall.
-  let clipped = 0;
+  // Rebuilding dry tiles every frame was the original half-second stall.
+  let sampled = 0;
   const position = source.geometry.getAttribute('position');
   const originalGetX = position.getX.bind(position);
-  position.getX = index => { clipped += 1; return originalGetX(index); };
+  position.getX = index => { sampled += 1; return originalGetX(index); };
   runtime.sync({});
-  assert.equal(clipped, 0);
+  assert.equal(sampled, 0);
 });
 
 test('a seam repair that adds water re-evaluates a previously dry tile', () => {
@@ -150,7 +158,11 @@ test('optical builds are budgeted per sync instead of draining a whole burst', (
     source.userData.tileId = `12-1-${index}`;
     terrainRoot.add(source);
   }
-  const runtime = createOpticalWaterSurfaceRuntime({ terrainRoot, buildBudget: 3 });
+  // This test isolates the count budget; wall-clock deadline behavior has its
+  // own deterministic fake-clock coverage below.
+  const runtime = createOpticalWaterSurfaceRuntime({
+    terrainRoot, buildBudget: 3, buildBudgetMs: Number.POSITIVE_INFINITY,
+  });
 
   runtime.sync({});
   assert.equal(runtime.size, 3);
@@ -179,7 +191,7 @@ test('waterless bookkeeping is released when a tile leaves residency', () => {
   assert.equal(runtime.waterlessSize, 0);
 });
 
-test('a rebuilt terrain mesh reuses its optical twin instead of re-clipping', () => {
+test('a rebuilt terrain mesh reuses its optical twin instead of rebuilding it', () => {
   const terrainRoot = new THREE.Group();
   const first = terrainTile();
   first.userData.heightmapPayload = 'payload-a';
@@ -227,7 +239,7 @@ test('optical builds stop at a deadline rather than a mesh count', () => {
     source.userData.tileId = `12-2-${index}`;
     terrainRoot.add(source);
   }
-  // Each twin clips a whole grid; simulate 2ms apiece against a 3ms budget.
+  // Each twin copies a whole grid; simulate 2ms apiece against a 3ms budget.
   let clock = 0;
   const runtime = createOpticalWaterSurfaceRuntime({
     terrainRoot,
@@ -320,9 +332,33 @@ test('an evicted twin is parked and revived when its tile returns', () => {
   terrainRoot.add(revived);
   runtime.sync({});
 
-  assert.equal(runtime.group.children[0], twin, 're-clipped instead of revived');
+  assert.equal(runtime.group.children[0], twin, 'rebuilt instead of revived');
   assert.equal(runtime.stats().builds, 1, 'revival must not count as a build');
   assert.equal(runtime.stats().revivals, 1);
+});
+
+test('the shared debug gate prevents optical-water tile eviction', () => {
+  const gate = createTileEvictionGate(false);
+  const terrainRoot = new THREE.Group();
+  const source = terrainTile();
+  terrainRoot.add(source);
+  const runtime = createOpticalWaterSurfaceRuntime({
+    terrainRoot,
+    evictionGate: gate,
+  });
+  runtime.sync({});
+  const twin = runtime.group.children[0];
+
+  terrainRoot.remove(source);
+  runtime.sync({});
+  assert.equal(runtime.size, 1);
+  assert.equal(runtime.group.children[0], twin);
+  assert.equal(runtime.stats().evictions, 0);
+
+  gate.setEnabled(true);
+  runtime.sync({});
+  assert.equal(runtime.size, 0);
+  assert.equal(runtime.stats().dormant, 1);
 });
 
 test('a parked twin whose shoreline changed is not revived', () => {
@@ -370,7 +406,7 @@ test('dormant twins are bounded and disposed on overflow', () => {
   assert.equal(runtime.stats().dormantDrops, 1);
 });
 
-test('twins are clipped nearest-first, not in scene-graph order', () => {
+test('twins are built nearest-first, not in scene-graph order', () => {
   const terrainRoot = new THREE.Group();
   // Deliberately added far-to-near, which is the order that produced 21km
   // twins while 3km tiles went without.

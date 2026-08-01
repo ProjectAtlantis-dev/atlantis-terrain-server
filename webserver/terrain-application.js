@@ -27,6 +27,7 @@ import {
   hudActionLink,
   renderGameClock,
   terrainHudHeader,
+  tileEvictionHudLine,
 } from './terrain-hud.js';
 import {
   applyMapDrag,
@@ -42,6 +43,7 @@ import { evaluateTerrainRefetch, summarizeTerrainCamera, terrainCameraCoordinate
 import { collectTerrainDebugMeshes, createTerrainHoverOutlineController, createTerrainMapGridController, formatTerrainSeamDiagnostic, summarizeTerrainMesh } from './terrain-debug-runtime.js';
 import { createTerrainFetchRuntime } from './terrain-fetch-runtime.js';
 import { createTerrainTileSet } from './terrain-tile-set.js';
+import { createTileEvictionGate } from './terrain-tile-eviction.js';
 import { createClassifierOverlay } from './terrain-classifier-overlay.js';
 import { createTerrainGridlinesRuntime } from './terrain-gridlines-runtime.js';
 import {
@@ -97,6 +99,11 @@ if (backend !== 'webgl' && backend !== 'webgpu') {
   throw new TypeError(`unsupported terrain backend: ${backend}`);
 }
 const USE_WEBGPU_RENDER_BACKEND = backend === 'webgpu';
+const tileEvictionGate = createTileEvictionGate();
+const surfaceFieldStore = sharedSurfaceFieldStore({
+  log: () => {},
+  evictionGate: tileEvictionGate,
+});
 const backendModule = USE_WEBGPU_RENDER_BACKEND
   ? await import('./render-backends/webgpu-backend.js')
   : await import('./render-backends/webgl-backend.js');
@@ -370,6 +377,7 @@ const { hud, alt, gameClock: gameClockEl } = createTerrainHud({
     onToggleRenderBackend();
   },
   onToggleRoadDebug: () => toggleRoadDebug(),
+  onToggleTileEviction: () => toggleTileEviction(),
   onOpenGoogleMaps: () => openGoogleMapsView(),
   onStartFastTime: () => startFastTime(),
   onReset: () => resetView(),
@@ -918,6 +926,7 @@ const waterRuntime = createWaterRuntime({
   getTextureVersion: () => terrainTextureVersion,
   log: (event, details) => enqueueClientLog('info', event, details),
   params: waterParams,
+  evictionGate: tileEvictionGate,
 });
 
 const camMarkerGeo = new THREE.ConeGeometry(200, 600, 4);
@@ -993,7 +1002,7 @@ function ensureGroundRing() {
   try {
     groundRing = createWebGLGroundRing({
       terrainRoot,
-      surfaceFields: sharedSurfaceFieldStore({ log: () => {} }),
+      surfaceFields: surfaceFieldStore,
       log: message => enqueueClientLog('info', 'ground-ring', { message }),
     });
   } catch (err) {
@@ -1056,7 +1065,7 @@ function attachTileScatter(mesh, tile, hm) {
     }
     // Full-resolution classifier fields gate WHERE things go; the same
     // store feeds the detail shader, so this is one shared fetch.
-    sharedSurfaceFieldStore({ log: () => {} }).get(tile.id).then(entry => {
+    surfaceFieldStore.get(tile.id).then(entry => {
       buildPending = false;
       if (!procgenEnabled || mesh.userData?.tileId !== tile.id) return;
       try {
@@ -1344,6 +1353,7 @@ const textureStreamer = createTextureStreamer({
   retryBaseMs: TEX_RETRY_202_BASE_MS, retryMaxMs: TEX_RETRY_202_MAX_MS,
   retryErrorMs: TEX_RETRY_ERROR_MS,
   getTextureAnisotropy: () => rendererTextureAnisotropy(renderer),
+  evictionGate: tileEvictionGate,
 });
 const {
   texCache, texSource, texInflight, texFetching, dormantTextures,
@@ -1379,6 +1389,7 @@ const terrainTileSet = createTerrainTileSet({
       requestRender();
     },
   },
+  evictionGate: tileEvictionGate,
 });
 // Classifier decision colors painted straight onto the terrain. The HUD link
 // toggles the full-resolution class map without leaving the 3D view.
@@ -1747,6 +1758,7 @@ const terrainFetchRuntime = createTerrainFetchRuntime({
   terrain: terrainTileSet,
   logger: { enqueue: enqueueClientLog, boot: bootLog },
   events: terrainFetchEvents,
+  evictionGate: tileEvictionGate,
 });
 const initialTerrainDemandHeading = getTerrainViewHeading();
 const TERRAIN_DEMAND_HEADING_THRESHOLD = 2 * Math.PI / 180;
@@ -2283,6 +2295,7 @@ function updateHud() {
     waterOverlayLine,
     hydrographyOverlayLine,
     procgenLine,
+    tileEvictionHudLine(terrainTileSet.evictionEnabled),
     vehicleRuntime.vehicleControlActive
       ? 'W/S drive, A/D steer, mouse orbit camera, Esc exits vehicle control'
       : 'WASD or Arrows move, Q/Z altitude, drag look',
@@ -2394,6 +2407,17 @@ function toggleRoadDebug() {
   terrainTileSet.resetTextureApplications();
   terrainTileSet.refreshTextures();
   enqueueClientLog('info', 'roads.debug.toggle', { enabled });
+  updateHud();
+  requestRender();
+  return enabled;
+}
+
+function toggleTileEviction() {
+  const enabled = terrainTileSet.setEvictionEnabled(!terrainTileSet.evictionEnabled);
+  enqueueClientLog('info', 'tile.eviction.toggle', {
+    enabled,
+    suppressed: terrainTileSet.suppressedEvictions,
+  });
   updateHud();
   requestRender();
   return enabled;

@@ -25,6 +25,7 @@ import {
 import { createTerrainMeshBuilder, decodeTerrainHeightmap } from '../terrain-mesh-builder.js';
 import { analyzeTerrainSeams, collectTerrainDebugMeshes, createTerrainHoverOutlineController, createTerrainMapGridController, formatTerrainSeamDiagnostic, summarizeTerrainMesh } from '../terrain-debug-runtime.js';
 import { createTerrainFetchRuntime } from '../terrain-fetch-runtime.js';
+import { createTerrainSampleCache } from '../terrain-sample-cache.js';
 import { restoreTerrainCameraState, terrainCameraState } from '../terrain-camera-state.js';
 import { createTerrainClientLogger } from '../terrain-client-logging.js';
 import { createTerrainFpsCounter } from '../terrain-fps-counter.js';
@@ -1603,6 +1604,50 @@ test('shared fetch runtime sends AGL rather than ASL for mountainside LOD', asyn
   assert.equal(state.lastFetchAltitude, 8);
 });
 
+test('fetch residency survives live sample-cache eviction while the response is in flight', async () => {
+  const sampleCache = createTerrainSampleCache({ maxEntries: 1 });
+  sampleCache.store('9-168-103', 'deadbeef', Float32Array.from([7]));
+  let advertisedKnown = null;
+  let appliedTile = null;
+  const { runtime } = createTestFetchRuntime({
+    sampleCache,
+    fetchImpl: async (_url, options) => {
+      advertisedKnown = JSON.parse(options.body).known;
+      // Reproduce the captured race: another response turns over a full LRU
+      // after this request advertises the tile but before it is decoded.
+      sampleCache.store('replacement', 'cafebabe', Float32Array.from([9]));
+      return {
+        status: 200,
+        json: async () => ({
+          ox: 0, oy: 0, qx: 0, qy: 0,
+          tiles: [{
+            id: '9-168-103', bbox: [0, 0, 1, 1], resolution: 1,
+            heightmap: 'deadbeef', heightmapBytes: 0,
+          }],
+          missing: [], downloading: [], texFetching: 0,
+        }),
+      };
+    },
+    terrain: {
+      reconcile(tiles) {
+        [appliedTile] = tiles;
+        return {
+          sceneMeshes: 0, deferred: 0, evictMs: 0, buildMs: 0,
+          refreshMs: 0, refreshed: 0, refreshDeferred: 0,
+          released: 0, geometryCache: {},
+        };
+      },
+      updateTextures() {},
+    },
+  });
+
+  await runtime.execute({});
+
+  assert.deepEqual(advertisedKnown, { '9-168-103': 'deadbeef' });
+  assert.equal(sampleCache.take('9-168-103', 'deadbeef'), null);
+  assert.deepEqual([...appliedTile.samples], [7]);
+});
+
 test('shared fetch runtime bootstraps coarse and never substitutes ASL when AGL is unknown', async () => {
   let requestedUrl = null;
   const { runtime, state } = createTestFetchRuntime({
@@ -2771,6 +2816,73 @@ test('shared lifecycle releases an invalidated texture when its mesh retires', (
 
   assert.equal(disposals, 1);
   assert.equal(streamer.releaseStaleTexture(texture), false);
+});
+
+test('shared lifecycle suppresses every retirement path behind the debug gate', () => {
+  let enabled = false;
+  const released = [];
+  const resident = {
+    isMesh: true,
+    children: [],
+    userData: { tileId: '10-1-1' },
+    material: { map: {}, dispose() {} },
+    geometry: { dispose() {} },
+  };
+  const replacement = {
+    isMesh: true,
+    children: [],
+    userData: { tileId: '10-1-1' },
+    material: { map: {}, dispose() {} },
+    geometry: { dispose() {} },
+  };
+  const root = {
+    children: [resident],
+    add(mesh) { this.children.push(mesh); },
+    remove(mesh) { this.children = this.children.filter(item => item !== mesh); },
+  };
+  const residentById = new Map([[resident.userData.tileId, resident]]);
+  const lifecycle = createTileLifecycle({
+    terrainRoot: root,
+    residentById,
+    disposeScatter() {},
+    log() {},
+    onReleaseTile: tileId => released.push(tileId),
+    evictionEnabled: () => enabled,
+  });
+
+  const sweep = lifecycle.sweepResidency(new Set());
+  assert.deepEqual(sweep.retired, []);
+  assert.deepEqual(root.children, [resident]);
+  assert.deepEqual(released, []);
+
+  lifecycle.replaceForMaterialized(replacement, new Set([replacement.userData.tileId]));
+  assert.deepEqual(root.children, [resident, replacement]);
+  assert.equal(lifecycle.suppressedRetirements, 1);
+
+  enabled = true;
+  assert.equal(lifecycle.flushSuppressedRetirements(), 1);
+  assert.deepEqual(root.children, [replacement]);
+});
+
+test('the debug gate retains deferred heightmap payloads outside current demand', () => {
+  const oldTile = { id: '12-1-1', heightmap: 'retained-heightmap' };
+  const deferredTiles = new Map([[oldTile.id, oldTile]]);
+  const result = reconcileTerrainTiles({
+    tiles: [],
+    currentTileIds: new Set([oldTile.id]),
+    deferredTiles,
+    terrainRoot: { children: [] },
+    lifecycle: { sweepResidency: () => ({ retired: [], retainedFallbacks: [] }) },
+    priorityForTile() { return 0; },
+    textureCache: new Map(),
+    materialize() {},
+    buildMesh() {},
+    log() {},
+    evictionEnabled: false,
+  });
+
+  assert.equal(deferredTiles.get(oldTile.id), oldTile);
+  assert.equal(result.purged, 0);
 });
 
 test('shared lifecycle retires parent when all four quadrants are textured', () => {

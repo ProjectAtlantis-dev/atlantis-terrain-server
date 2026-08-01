@@ -20,6 +20,7 @@ const DEFAULT_MAX_ENTRIES = 4000;
  */
 export function createTerrainSampleCache({
   maxEntries = DEFAULT_MAX_ENTRIES,
+  evictionGate = null,
 } = {}) {
   if (!Number.isInteger(maxEntries) || maxEntries < 0) {
     throw new RangeError('maxEntries must be a non-negative integer');
@@ -27,6 +28,14 @@ export function createTerrainSampleCache({
   const entries = new Map();
   let hits = 0;
   let misses = 0;
+
+  function evictOverflow() {
+    if (evictionGate?.enabled === false) return;
+    while (entries.size > maxEntries) entries.delete(entries.keys().next().value);
+  }
+  evictionGate?.onChange?.(enabled => {
+    if (enabled) evictOverflow();
+  });
 
   return {
     get size() { return entries.size; },
@@ -42,9 +51,7 @@ export function createTerrainSampleCache({
       // retaining one would pin the entire multi-megabyte payload in memory.
       entries.delete(tileId);
       entries.set(tileId, { digest, samples: samples.slice() });
-      while (entries.size > maxEntries) {
-        entries.delete(entries.keys().next().value);
-      }
+      evictOverflow();
       return true;
     },
 
@@ -67,6 +74,33 @@ export function createTerrainSampleCache({
       const known = {};
       for (const [tileId, entry] of entries) known[tileId] = entry.digest;
       return known;
+    },
+
+    /**
+     * Freeze the residency claim and its reconstruction data for one request.
+     *
+     * Cache capacity can turn over while the server is producing a response.
+     * Holding these entry references makes every digest advertised by this
+     * request reconstructible even if the live LRU evicts it meanwhile. The
+     * Float32Arrays are already cache-owned copies, so this does not copy the
+     * sample payload again.
+     */
+    snapshot() {
+      const heldEntries = new Map(entries);
+      const known = {};
+      for (const [tileId, entry] of heldEntries) known[tileId] = entry.digest;
+      return {
+        known,
+        take(tileId, digest) {
+          const entry = heldEntries.get(tileId);
+          if (entry == null || entry.digest !== digest) {
+            misses += 1;
+            return null;
+          }
+          hits += 1;
+          return entry.samples;
+        },
+      };
     },
 
     clear() { entries.clear(); },

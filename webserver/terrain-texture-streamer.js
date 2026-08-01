@@ -29,6 +29,7 @@ export function createTextureStreamer({
   queueMicrotaskImpl = callback => queueMicrotask(callback),
   scheduleRetryWake = (callback, delay) => setTimeout(callback, delay),
   cancelRetryWake = timer => clearTimeout(timer),
+  evictionGate = null,
 }) {
   const texCache = new Map();
   const texSource = new Map();
@@ -38,6 +39,7 @@ export function createTextureStreamer({
   const texRetryCount = new Map();
   const dormantTextures = new Map();
   const staleTextures = new Set();
+  const debugRetainedTextures = new Set();
   let version = Date.now();
   let roadDebug = false;
   let waterDebug = false;
@@ -70,6 +72,7 @@ export function createTextureStreamer({
   }
 
   function evictDormantOverflow() {
+    if (evictionGate?.enabled === false) return;
     while (dormantTextures.size > maxDormant) {
       const tileId = dormantTextures.keys().next().value;
       const texture = dormantTextures.get(tileId);
@@ -80,6 +83,12 @@ export function createTextureStreamer({
       texture?.dispose?.();
     }
   }
+  evictionGate?.onChange?.(enabled => {
+    if (!enabled) return;
+    for (const texture of debugRetainedTextures) texture?.dispose?.();
+    debugRetainedTextures.clear();
+    evictDormantOverflow();
+  });
 
   function retainDormantTexture(tileId) {
     const texture = texCache.get(tileId);
@@ -241,12 +250,22 @@ export function createTextureStreamer({
   function discardTexture(tileId, expectedTexture = null) {
     const cached = texCache.get(tileId);
     if (cached && (!expectedTexture || cached === expectedTexture)) {
+      if (evictionGate?.enabled === false) {
+        // The cache still owns this late arrival. Make that ownership visible
+        // to the dormant-cap trim that runs when eviction is re-enabled.
+        if (!dormantTextures.has(tileId)) retainDormantTexture(tileId);
+        return true;
+      }
       const texture = takeCachedTexture(tileId);
       staleTextures.delete(texture);
       texture?.dispose?.();
       return true;
     }
     if (!expectedTexture) return false;
+    if (evictionGate?.enabled === false && staleTextures.delete(expectedTexture)) {
+      debugRetainedTextures.add(expectedTexture);
+      return true;
+    }
     const wasStale = staleTextures.delete(expectedTexture);
     expectedTexture.dispose?.();
     return wasStale;
@@ -274,7 +293,10 @@ export function createTextureStreamer({
   function invalidateDebugVariants() {
     abortAll();
     for (const [tileId, texture] of texCache) {
-      if (dormantTextures.has(tileId)) texture.dispose?.();
+      if (dormantTextures.has(tileId)) {
+        if (evictionGate?.enabled === false) debugRetainedTextures.add(texture);
+        else texture.dispose?.();
+      }
       else staleTextures.add(texture);
     }
     texCache.clear();
@@ -310,7 +332,12 @@ export function createTextureStreamer({
   }
 
   function releaseStaleTexture(texture) {
-    if (!texture || !staleTextures.delete(texture)) return false;
+    if (!texture || !staleTextures.has(texture)) return false;
+    staleTextures.delete(texture);
+    if (evictionGate?.enabled === false) {
+      debugRetainedTextures.add(texture);
+      return true;
+    }
     texture.dispose?.();
     return true;
   }

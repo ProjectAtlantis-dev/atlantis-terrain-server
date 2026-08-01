@@ -13,63 +13,9 @@ function appendVertex(target, sourcePosition, sourceUv, index, z) {
   target.uvs.push(sourceUv.getX(index), sourceUv.getY(index));
 }
 
-function appendMidpoint(target, sourcePosition, sourceUv, a, b, z) {
-  target.positions.push(
-    (sourcePosition.getX(a) + sourcePosition.getX(b)) * 0.5,
-    (sourcePosition.getY(a) + sourcePosition.getY(b)) * 0.5,
-    z,
-  );
-  target.uvs.push(
-    (sourceUv.getX(a) + sourceUv.getX(b)) * 0.5,
-    (sourceUv.getY(a) + sourceUv.getY(b)) * 0.5,
-  );
-}
-
 function appendTriangle(target, sourcePosition, sourceUv, vertices, z) {
   for (const vertex of vertices) {
-    if (Array.isArray(vertex)) {
-      appendMidpoint(target, sourcePosition, sourceUv, vertex[0], vertex[1], z);
-    } else {
-      appendVertex(target, sourcePosition, sourceUv, vertex, z);
-    }
-  }
-}
-
-// Clip one terrain triangle against its binary water footprint. Mask changes
-// happen at the midpoint between neighboring terrain samples, matching the
-// raster convention while avoiding both a full-cell coastal overdraw and the
-// full-cell retreat caused by accepting only all-water triangles.
-function appendClippedTriangle(
-  target,
-  sourcePosition,
-  sourceUv,
-  waterMask,
-  [a, b, c],
-  z,
-) {
-  const input = [a, b, c];
-  const polygon = [];
-  for (let index = 0; index < input.length; index += 1) {
-    const start = input[index];
-    const end = input[(index + 1) % input.length];
-    const startIsWater = waterMask[start] > 0;
-    const endIsWater = waterMask[end] > 0;
-    if (endIsWater) {
-      if (!startIsWater) polygon.push([start, end]);
-      polygon.push(end);
-    } else if (startIsWater) {
-      polygon.push([start, end]);
-    }
-  }
-  if (polygon.length < 3) return;
-  for (let index = 1; index < polygon.length - 1; index += 1) {
-    appendTriangle(
-      target,
-      sourcePosition,
-      sourceUv,
-      [polygon[0], polygon[index], polygon[index + 1]],
-      z,
-    );
+    appendVertex(target, sourcePosition, sourceUv, vertex, z);
   }
 }
 
@@ -91,8 +37,8 @@ export function buildOpticalWaterGeometry(sourceMesh, {
     return null;
   }
 
-  // Most tiles inland are entirely dry, and clipping every triangle only to
-  // discover that costs the same as clipping a full fjord. One pass over the
+  // Most tiles inland are entirely dry, and building every triangle only to
+  // discover that costs the same as covering a full fjord. One pass over the
   // mask answers it before any geometry work starts.
   let hasWaterSample = false;
   for (let index = 0; index < waterMask.length; index += 1) {
@@ -103,6 +49,11 @@ export function buildOpticalWaterGeometry(sourceMesh, {
   }
   if (!hasWaterSample) return null;
 
+  // A wet tile gets a complete flat twin. Do not clip the fake cover back to
+  // the classification mask: a single missing/coarse mask cell over a deep
+  // fjord exposes the real floor hundreds of metres below. Ordinary depth
+  // testing is the precise final mask — land geometry stays in front of this
+  // plane, while every genuinely submerged fragment is covered.
   const target = { positions: [], uvs: [] };
   for (let row = 0; row < resolution - 1; row += 1) {
     for (let column = 0; column < resolution - 1; column += 1) {
@@ -110,12 +61,8 @@ export function buildOpticalWaterGeometry(sourceMesh, {
       const b = a + 1;
       const d = a + resolution;
       const f = d + 1;
-      appendClippedTriangle(
-        target, sourcePosition, sourceUv, waterMask, [a, b, d], surfaceZ,
-      );
-      appendClippedTriangle(
-        target, sourcePosition, sourceUv, waterMask, [b, f, d], surfaceZ,
-      );
+      appendTriangle(target, sourcePosition, sourceUv, [a, b, d], surfaceZ);
+      appendTriangle(target, sourcePosition, sourceUv, [b, f, d], surfaceZ);
     }
   }
   if (target.positions.length === 0) return null;
@@ -174,7 +121,7 @@ function createOpticalMesh(source) {
 // into a half-second freeze. The surface is a visual proxy, so spreading the
 // work over the next few frames is invisible.
 //
-// The budget is a deadline, not a count: each twin clips every triangle of its
+// The budget is a deadline, not a count: each twin copies every cell of its
 // source grid, so "four per frame" bought roughly 20ms — under a coarse hitch
 // threshold, but well over a 60fps frame, which read as continuous judder.
 const DEFAULT_OPTICAL_BUILD_BUDGET_MS = 3;
@@ -196,6 +143,7 @@ export function createOpticalWaterSurfaceRuntime({
   // with something visible on screen. Emit them, rate-limited.
   onInversion = null,
   inversionLogIntervalMs = 400,
+  evictionGate = null,
 } = {}) {
   const group = new THREE.Group();
   group.name = 'WaterOpticalSurface';
@@ -210,16 +158,17 @@ export function createOpticalWaterSurfaceRuntime({
   // repair rewrites elevations, and a re-centred frame offset moves the tile.
   const opticalByTile = new Map();
   // Tiles with no water produce no mesh, so opticalByTile can never remember
-  // them. Without this they were re-clipped on every single frame for as long
+  // them. Without this they were rebuilt on every single frame for as long
   // as they stayed resident.
   const waterlessTiles = new Map();
   // LOD oscillation evicts and re-admits the same tiles continuously, and a
-  // twin destroyed on eviction has to be re-clipped from scratch when the tile
+  // twin destroyed on eviction has to be rebuilt from scratch when the tile
   // returns moments later — measured at ~25 destroy/rebuild cycles per second,
   // which is visible as the water repainting. Park them instead; a twin is
   // just geometry plus a material reference, so holding a few hundred is
-  // cheaper than re-clipping one.
+  // cheaper than rebuilding one.
   const dormantTwins = new Map();
+  const debugRetainedTwins = new Set();
   let deferredBuilds = 0;
   // Rebuild churn is invisible on screen except as a repaint, so count it.
   let totalBuilds = 0;
@@ -247,11 +196,37 @@ export function createOpticalWaterSurfaceRuntime({
   }
 
   function remove(tileId, entry) {
-    group.remove(entry.optical);
-    entry.optical.geometry?.dispose?.();
-    entry.optical.material?.dispose?.();
+    if (evictionGate?.enabled === false) {
+      debugRetainedTwins.add(entry);
+    } else {
+      group.remove(entry.optical);
+      entry.optical.geometry?.dispose?.();
+      entry.optical.material?.dispose?.();
+    }
     opticalByTile.delete(tileId);
   }
+
+  function evictDormantOverflow() {
+    if (evictionGate?.enabled === false) return;
+    while (dormantTwins.size > maxDormantTwins) {
+      const oldest = dormantTwins.keys().next().value;
+      const stale = dormantTwins.get(oldest);
+      dormantTwins.delete(oldest);
+      stale.optical.geometry?.dispose?.();
+      stale.optical.material?.dispose?.();
+      totalDormantDrops += 1;
+    }
+  }
+  evictionGate?.onChange?.(enabled => {
+    if (!enabled) return;
+    for (const entry of debugRetainedTwins) {
+      group.remove(entry.optical);
+      entry.optical.geometry?.dispose?.();
+      entry.optical.material?.dispose?.();
+    }
+    debugRetainedTwins.clear();
+    evictDormantOverflow();
+  });
 
   function bindTwin(entry, source) {
     // A revived tile is a different mesh object carrying the same grid.
@@ -297,11 +272,11 @@ export function createOpticalWaterSurfaceRuntime({
     // stall the surface forever.
     const canBuild = () => built < buildBudget && (built === 0 || now() < buildDeadline);
     // Two passes. The first resolves everything cheap — revivals, texture
-    // rebinding — and collects only the tiles that need a twin clipped. The
+    // rebinding — and collects only the tiles that need a twin built. The
     // second builds those nearest-first.
     //
     // A single pass built in scene-graph order, and with a budget that affords
-    // one or two twins per frame that meant water 21 km away could be clipped
+    // one or two twins per frame that meant water 21 km away could be built
     // while a tile 3 km from the camera went without. Measured: 39 inversions
     // on one fjord run, worst 18 km.
     const candidates = [];
@@ -405,22 +380,16 @@ export function createOpticalWaterSurfaceRuntime({
 
     for (const [tileId, entry] of opticalByTile) {
       if (liveTiles.has(tileId)) continue;
+      if (evictionGate?.enabled === false) continue;
       group.remove(entry.optical);
       opticalByTile.delete(tileId);
       dormantTwins.delete(tileId);
       dormantTwins.set(tileId, entry);
       totalEvictions += 1;
-      while (dormantTwins.size > maxDormantTwins) {
-        const oldest = dormantTwins.keys().next().value;
-        const stale = dormantTwins.get(oldest);
-        dormantTwins.delete(oldest);
-        stale.optical.geometry?.dispose?.();
-        stale.optical.material?.dispose?.();
-        totalDormantDrops += 1;
-      }
+      evictDormantOverflow();
     }
     for (const tileId of waterlessTiles.keys()) {
-      if (!liveTiles.has(tileId)) waterlessTiles.delete(tileId);
+      if (evictionGate?.enabled !== false && !liveTiles.has(tileId)) waterlessTiles.delete(tileId);
     }
   }
 
@@ -458,6 +427,7 @@ export function createOpticalWaterSurfaceRuntime({
         revivals: totalRevivals,
         dormant: dormantTwins.size,
         dormantDrops: totalDormantDrops,
+        debugRetained: debugRetainedTwins.size,
         inversions,
         worstInversionM: Math.round(worstInversionM),
         builtFarthestM: lastBuiltFarthestM == null ? null : Math.round(lastBuiltFarthestM),
@@ -473,6 +443,12 @@ export function createOpticalWaterSurfaceRuntime({
         entry.optical.material?.dispose?.();
       }
       dormantTwins.clear();
+      for (const entry of debugRetainedTwins) {
+        group.remove(entry.optical);
+        entry.optical.geometry?.dispose?.();
+        entry.optical.material?.dispose?.();
+      }
+      debugRetainedTwins.clear();
       waterlessTiles.clear();
       terrainRoot.remove(group);
     },

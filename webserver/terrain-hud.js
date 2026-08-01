@@ -10,6 +10,12 @@ export function hudActionLink(id, label, color = '#0af') {
     + `cursor:pointer;pointer-events:auto">${label}</span>`;
 }
 
+export function tileEvictionHudLine(enabled) {
+  const state = enabled ? 'enabled' : 'DISABLED';
+  const color = enabled ? '#0af' : '#ff9500';
+  return `data eviction: ${hudActionLink('tileEvictionLink', state, color)}`;
+}
+
 function appendPanel(cssText) {
   const element = document.createElement('div');
   element.style.cssText = cssText.join(';');
@@ -30,6 +36,7 @@ export function createTerrainHud({
   onToggleProcgen,
   onToggleRenderBackend,
   onToggleRoadDebug,
+  onToggleTileEviction,
   onOpenGoogleMaps,
   onStartFastTime,
   onReset,
@@ -56,6 +63,7 @@ export function createTerrainHud({
       event.target.id === 'procgenLink' ||
       event.target.id === 'renderBackendLink' ||
       event.target.id === 'roadDebugLink' ||
+      event.target.id === 'tileEvictionLink' ||
       event.target.id === 'googleMaps3dLink' ||
       event.target.id === 'fastTimeLink' ||
       event.target.id === 'resetViewLink' ||
@@ -129,6 +137,12 @@ export function createTerrainHud({
       onToggleRoadDebug();
       return;
     }
+    if (event.target.id === 'tileEvictionLink') {
+      event.stopPropagation();
+      event.preventDefault();
+      onToggleTileEviction();
+      return;
+    }
     if (event.target.id === 'googleMaps3dLink') {
       event.stopPropagation();
       event.preventDefault();
@@ -182,6 +196,7 @@ export function createTerrainHud({
       event.target.id === 'procgenLink' ||
       event.target.id === 'renderBackendLink' ||
       event.target.id === 'roadDebugLink' ||
+      event.target.id === 'tileEvictionLink' ||
       event.target.id === 'googleMaps3dLink' ||
       event.target.id === 'fastTimeLink' || event.target.id === 'resetViewLink' ||
       TERRAIN_HUD_LINKS[event.target.id]
