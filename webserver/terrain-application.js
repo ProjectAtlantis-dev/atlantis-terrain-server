@@ -1,5 +1,6 @@
 // UX WIP scene: preserve baseline rendering, layer in map mode + movement + HUD.
 import * as THREE from 'three';
+import { WEBGPU_BACKEND_ENABLED } from './terrain-render-backend.js';
 import {
   AerialPerspectiveEffect,
   DEFAULT_PRECOMPUTED_TEXTURES_URL,
@@ -2285,6 +2286,11 @@ function updateHud() {
   const procgenLine = procgenHudLine(procgenEnabled, PROCGEN_AVAILABLE);
   const renderBackendLabel = backend === 'webgpu' ? 'WebGPU' : 'WebGL';
   const nextRenderBackendLabel = backend === 'webgpu' ? 'WebGL' : 'WebGPU';
+  // Only offer the switch while the WebGPU backend is usable; otherwise the
+  // renderer stays plain text so it cannot be clicked into a broken state.
+  const renderBackendHtml = WEBGPU_BACKEND_ENABLED
+    ? `<span id="renderBackendLink" title="Switch to ${nextRenderBackendLabel}" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">${renderBackendLabel}</span>`
+    : `<b title="WebGPU is temporarily disabled">${renderBackendLabel}</b>`;
   const roadDebugColor = textureStreamer.roadDebug ? '#ff3b30' : '#0af';
   const roadDebugLabel = textureStreamer.roadDebug ? 'roads RED' : 'roads';
 
@@ -2299,7 +2305,7 @@ function updateHud() {
   const hudRows = [
     terrainHudHeader(hudCollapsed),
     `mode: <b>${modeHtml}</b>`,
-    `renderer: <span id="renderBackendLink" title="Switch to ${nextRenderBackendLabel}" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">${renderBackendLabel}</span>`,
+    `renderer: ${renderBackendHtml}`,
     `fps: <b>${fpsCounter.display}</b>`,
     `lat: ${exactPosition.lat.toFixed(7)}°  lon: ${exactPosition.lon.toFixed(7)}°  alt: ${altM.toFixed(0)}m`,
     lastGoogleCoordinateComparison

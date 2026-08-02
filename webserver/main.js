@@ -3,6 +3,7 @@ import {
   alternateTerrainRenderBackend,
   resolveTerrainRenderBackend,
   TERRAIN_RENDER_BACKEND_STORAGE_KEY,
+  WEBGPU_BACKEND_ENABLED,
 } from './terrain-render-backend.js';
 
 const webgpuAvailable = Boolean(navigator.gpu);
@@ -17,6 +18,9 @@ await startTerrainApplication({
   backend,
   onToggleRenderBackend() {
     const nextBackend = alternateTerrainRenderBackend(backend);
+    if (nextBackend === 'webgpu' && !WEBGPU_BACKEND_ENABLED) {
+      return;
+    }
     if (nextBackend === 'webgpu' && !webgpuAvailable) {
       window.alert('WebGPU is not available in this browser.');
       return;
