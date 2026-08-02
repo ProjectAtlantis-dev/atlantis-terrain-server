@@ -48,6 +48,7 @@ import { createTerrainTileSet } from './terrain-tile-set.js';
 import { createTileEvictionGate } from './terrain-tile-eviction.js';
 import { createClassifierOverlay } from './terrain-classifier-overlay.js';
 import { createTerrainGridlinesRuntime } from './terrain-gridlines-runtime.js';
+import { createTerrainRetroRuntime } from './terrain-retro-mode.js';
 import {
   bathymetrySoundingTooltipHtml,
   createTerrainBathymetryMapRuntime,
@@ -368,6 +369,7 @@ const { hud, alt, gameClock: gameClockEl } = createTerrainHud({
   onToggleSeamMode: () => toggleSeamMode(),
   onToggleTileInspector: () => toggleTileInspector(),
   onToggleGridlines: () => toggleGridlines(),
+  onToggleRetroMode: () => toggleRetroMode(),
   onToggleBathymetryMap: () => toggleBathymetryMap(),
   onToggleClassifierOverlay: () => cycleClassifierOverlay(),
   onToggleWaterOverlay: () => toggleWaterOverlay(),
@@ -1431,6 +1433,21 @@ const gridlinesRuntime = createTerrainGridlinesRuntime({
     requestRender();
   },
 });
+// Retro mode renders its own scene of proxy meshes that share the live tiles'
+// buffers, so nothing here mutates the normal presentation. Toggling it off is
+// just a branch not taken.
+const retroRuntime = createTerrainRetroRuntime({
+  terrainRoot,
+  getWaterline: () => waterParams.waterline ?? 0,
+  onChanged: () => {
+    updateHud();
+    requestRender();
+  },
+});
+const retroCameraRel = new THREE.Vector3();
+function toggleRetroMode() {
+  retroRuntime.toggle();
+}
 buildingsRuntime = createTerrainBuildingsRuntime({
   terrainRoot,
   pipelineState: terrainPipelineState,
@@ -2260,13 +2277,18 @@ function updateHud() {
       ? 'SEAMS'
       : controls.mapMode
         ? 'MAP'
-        : (vehicleRuntime.vehicleControlActive ? 'VEHICLE' : 'FLIGHT');
+        : retroRuntime.active
+          ? 'RETRO'
+          : (vehicleRuntime.vehicleControlActive ? 'VEHICLE' : 'FLIGHT');
   const modeHtml = vehicleRuntime.vehicleControlActive
     ? '<span style="color:#ff3b30">VEHICLE</span>'
     : modeLabel;
   const gridlinesLine = gridlinesRuntime.active
     ? 'gridlines: <span id="gridlinesModeLink" style="color:#8f8;text-decoration:underline;cursor:pointer;pointer-events:auto">ON</span>'
     : 'gridlines: <span id="gridlinesModeLink" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">off</span>';
+  const retroLine = retroRuntime.active
+    ? 'retro: <span id="retroModeLink" title="Wireframe heightmap on black: no imagery, no clouds, no lighting" style="color:#a8a8d8;text-decoration:underline;cursor:pointer;pointer-events:auto">ON</span>'
+    : 'retro: <span id="retroModeLink" title="Wireframe heightmap on black: no imagery, no clouds, no lighting" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">off</span>';
   const bathymetryMapLine = bathymetryMapRuntime?.active
     ? 'bathymetry map: <span id="bathymetryMapLink" title="Cyan = carved bathymetry; circles = actual-bottom checks (raster markers are depth-12 aggregates); squares = lower-bound observations; hover near a marker for details; red = large model deviation" style="color:#00d8ff;text-decoration:underline;cursor:pointer;pointer-events:auto">ON</span>'
     : 'bathymetry map: <span id="bathymetryMapLink" title="Show carved bathymetry and source sounding evidence" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">off</span>';
@@ -2319,6 +2341,7 @@ function updateHud() {
     hmLine,
     texLine,
     gridlinesLine,
+    retroLine,
     bathymetryMapLine,
     classifierOverlayLine,
     waterOverlayLine,
@@ -2384,6 +2407,9 @@ function resetView() {
   controls.dragButton = 0;
   controls.mapMode = false;
   controls.seamMode = false;
+  // Reset is the explicit "put the view back" action, so it clears the
+  // remembered retro preference too; a plain refresh still restores it.
+  retroRuntime.setActive(false);
   tileInspectorRuntime?.setPresentation('hidden');
   vehicleRuntime.setVehicleControlActive(false, 'reset');
   controls.mapPanEast = 0;
@@ -2913,14 +2939,18 @@ function renderFrame() {
   const markPreWater = performance.now();
   const waterTimings = waterRuntime.update({
     dt, camera,
-    visible: waterParams.enabled && !controls.mapMode
+    // Retro mode draws its own flat grid plane, so the whole FFT surface is
+    // skipped here: `visible: false` returns before the cascade updates, the
+    // 737k-triangle radial grid, and the periodic bathymetry capture. That is
+    // most of the frame budget back, which is the point of the mode.
+    visible: waterParams.enabled && !controls.mapMode && !retroRuntime.active
       && !textureStreamer.waterDebug && !textureStreamer.hydroDebug,
     // Gridlines are a terrain inspection mode. Hide the cosmetic satellite
     // water proxy so the real bathymetry remains visible beneath the dynamic
     // water while the grid is active.
     opticalVisible: waterParams.opticalEnabled && waterParams.enabled && !controls.mapMode
       && !textureStreamer.waterDebug && !textureStreamer.hydroDebug
-      && !gridlinesRuntime.active,
+      && !gridlinesRuntime.active && !retroRuntime.active,
   });
 
   // Terrain streaming: check if camera moved far enough to re-fetch
@@ -2995,6 +3025,25 @@ function renderFrame() {
     camMarker.scale.setScalar(markerScale);
     vehicleRuntime.vehicleMarker.scale.setScalar(markerScale * vehicleRuntime.VEHICLE_MARKER_MAP_SCALE);
     renderBackend.renderMap(scene, mapCam, _mapBg, diagnosticOverlayScene);
+    renderBackend.stopRenderLoopIfIdle();
+    cpuProfiler.end('frame-cpu', frameStartedAt);
+    hitchDetector.frameEnd(performance.now());
+    return;
+  }
+  // Retro renders its own scene through renderMap(), which goes straight to
+  // renderer.render() and bypasses the EffectComposer entirely — no
+  // atmosphere, no clouds, no aerial perspective, no lens flare. Night mode
+  // and "no sun lighting" fall out of that rather than needing their own
+  // switches. The live scene is not touched, so leaving retro needs no repair.
+  if (retroRuntime.active) {
+    retroCameraRel.copy(camera.position).sub(anchorPosition);
+    retroRuntime.sync({
+      cameraLocalX: retroCameraRel.dot(east),
+      cameraLocalY: retroCameraRel.dot(north),
+    });
+    renderBackend.renderMap(
+      retroRuntime.scene, camera, retroRuntime.background, diagnosticOverlayScene,
+    );
     renderBackend.stopRenderLoopIfIdle();
     cpuProfiler.end('frame-cpu', frameStartedAt);
     hitchDetector.frameEnd(performance.now());

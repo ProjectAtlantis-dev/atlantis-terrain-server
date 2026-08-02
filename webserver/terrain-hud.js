@@ -29,6 +29,7 @@ export function createTerrainHud({
   onToggleSeamMode,
   onToggleTileInspector,
   onToggleGridlines,
+  onToggleRetroMode,
   onToggleBathymetryMap,
   onToggleClassifierOverlay,
   onToggleWaterOverlay,
@@ -56,6 +57,7 @@ export function createTerrainHud({
       event.target.id === 'seamModeLink' ||
       event.target.id === 'tileInspectorModeLink' ||
       event.target.id === 'gridlinesModeLink' ||
+      event.target.id === 'retroModeLink' ||
       event.target.id === 'bathymetryMapLink' ||
       event.target.id === 'classifierOverlayLink' ||
       event.target.id === 'waterOverlayLink' ||
@@ -93,6 +95,12 @@ export function createTerrainHud({
       event.stopPropagation();
       event.preventDefault();
       onToggleGridlines();
+      return;
+    }
+    if (event.target.id === 'retroModeLink') {
+      event.stopPropagation();
+      event.preventDefault();
+      onToggleRetroMode();
       return;
     }
     if (event.target.id === 'bathymetryMapLink') {
@@ -189,6 +197,7 @@ export function createTerrainHud({
       event.target.id === 'mapModeLink' || event.target.id === 'seamModeLink' ||
       event.target.id === 'tileInspectorModeLink' ||
       event.target.id === 'gridlinesModeLink' ||
+      event.target.id === 'retroModeLink' ||
       event.target.id === 'bathymetryMapLink' ||
       event.target.id === 'classifierOverlayLink' ||
       event.target.id === 'waterOverlayLink' ||

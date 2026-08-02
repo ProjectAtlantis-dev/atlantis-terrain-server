@@ -23,7 +23,13 @@ export function createTerrainBackend({
 } = {}) {
   const renderer = new THREE.WebGLRenderer({
     antialias: true,
-    depth: false,
+    // The composited path never needs canvas depth — EffectComposer renders
+    // into its own depth-equipped targets and the final pass is a flat blit.
+    // renderMap()/renderScene() callers that bypass the composer draw straight
+    // to the canvas, though, and with depth:false those get no depth test at
+    // all: geometry simply paints in draw order. Retro mode's hidden-surface
+    // removal depends on this attachment existing.
+    depth: true,
     logarithmicDepthBuffer: true,
   });
   renderer.setSize(width, height);
