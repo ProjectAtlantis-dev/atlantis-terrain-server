@@ -479,14 +479,16 @@ def _pavement_color(sampled: tuple[int, int, int]) -> tuple[int, int, int]:
 def _trail_color(
     sampled: tuple[int, int, int], natural: bool
 ) -> tuple[int, int, int]:
-    """Keep the local terrain color, with only enough darkening to read as a path."""
+    """Keep the local terrain hue while giving the path readable contrast."""
     red, green, blue = (channel / 255 for channel in sampled)
     hue, saturation, value = colorsys.rgb_to_hsv(red, green, blue)
-    # Natural trails should nearly disappear into their actual ground cover;
-    # constructed paths get a little more contrast without becoming a fixed
-    # tan stripe. The overlay alpha supplies the remaining edge definition.
-    value *= 0.88 if natural else 0.84
-    saturation *= 0.98
+    # Natursti centerlines are often drawn over olive or grey-green terrain.
+    # A 12% value change disappeared after alpha blending and JPEG encoding,
+    # leaving only faint grey survey lines. Preserve and gently reinforce the
+    # sampled chroma, but restore enough contrast for the baked trail surface
+    # to read at walking-scale LODs.
+    value *= 0.72 if natural else 0.80
+    saturation = min(1.0, saturation * 1.05)
     out_red, out_green, out_blue = colorsys.hsv_to_rgb(
         hue, saturation, value
     )

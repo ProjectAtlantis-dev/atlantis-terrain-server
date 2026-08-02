@@ -27,8 +27,14 @@ import {
   hudActionLink,
   renderGameClock,
   terrainHudHeader,
+  tileEvictionHudLine,
 } from './terrain-hud.js';
-import { applyMapDrag, installTerrainKeyboardControls, installTerrainPointerControls } from './terrain-controls.js';
+import {
+  applyMapDrag,
+  clampFreeFlightAltitude,
+  installTerrainKeyboardControls,
+  installTerrainPointerControls,
+} from './terrain-controls.js';
 import { stepVehicleDrive } from './terrain-vehicle.js';
 import { createTerrainVehicleRuntime } from './terrain-vehicle-runtime.js';
 import { createTileHistory, terrainFogDistance, tileDepthFromId } from './terrain-tile-runtime.js';
@@ -36,14 +42,22 @@ import { createTextureStreamer, rendererTextureAnisotropy } from './terrain-text
 import { evaluateTerrainRefetch, summarizeTerrainCamera, terrainCameraCoordinates, terrainCameraGridPosition, terrainCameraStereoPosition } from './terrain-tile-fetch.js';
 import { collectTerrainDebugMeshes, createTerrainHoverOutlineController, createTerrainMapGridController, formatTerrainSeamDiagnostic, summarizeTerrainMesh } from './terrain-debug-runtime.js';
 import { createTerrainFetchRuntime } from './terrain-fetch-runtime.js';
+import { classifyDemSource } from './terrain-tile-quality.js';
 import { createTerrainTileSet } from './terrain-tile-set.js';
+import { createTileEvictionGate } from './terrain-tile-eviction.js';
 import { createClassifierOverlay } from './terrain-classifier-overlay.js';
 import { createTerrainGridlinesRuntime } from './terrain-gridlines-runtime.js';
+import {
+  bathymetrySoundingTooltipHtml,
+  createTerrainBathymetryMapRuntime,
+  nearestBathymetrySounding,
+} from './terrain-bathymetry-map-runtime.js';
 import { restoreTerrainCameraState, terrainCameraState } from './terrain-camera-state.js';
 import { createTerrainClientLogger } from './terrain-client-logging.js';
 import { createTerrainGpuProfileControl } from './terrain-gpu-profile-control.js';
 import { createTerrainCpuProfiler } from './terrain-cpu-profiler.js';
 import { createTerrainFpsCounter } from './terrain-fps-counter.js';
+import { createTerrainHitchDetector } from './terrain-hitch-detector.js';
 import { loadTerrainStartupAssets } from './terrain-startup-assets.js';
 import { createTerrainAtmosphereTextureRuntime } from './terrain-atmosphere-textures.js';
 import { createTerrainTuningControls } from './terrain-tuning-controls.js';
@@ -76,6 +90,7 @@ import {
 } from './terrain-realtime-step.js';
 import { DETAIL_FADE_END_M, DETAIL_STRENGTH, setDetailTuning } from './terrain-detail-layer.js';
 import { terrainAglFromSurface, terrainSurfaceHeightAt } from './terrain-agl.js';
+import { DEFAULT_PROCGEN_ENABLED, procgenHudLine } from './terrain-procgen-toggle.js';
 
 export async function startTerrainApplication({
   backend = 'webgl',
@@ -85,6 +100,11 @@ if (backend !== 'webgl' && backend !== 'webgpu') {
   throw new TypeError(`unsupported terrain backend: ${backend}`);
 }
 const USE_WEBGPU_RENDER_BACKEND = backend === 'webgpu';
+const tileEvictionGate = createTileEvictionGate();
+const surfaceFieldStore = sharedSurfaceFieldStore({
+  log: () => {},
+  evictionGate: tileEvictionGate,
+});
 const backendModule = USE_WEBGPU_RENDER_BACKEND
   ? await import('./render-backends/webgpu-backend.js')
   : await import('./render-backends/webgl-backend.js');
@@ -283,10 +303,6 @@ const BASE_BRAKE = 800;
 const BASE_MAX_SPEED = 5000;
 const BASE_STRAFE_SPEED = 800;
 const TURN_SPEED = 1.5;
-// The synthetic fjord floor sits at -5 m. Leave a metre of clearance while
-// still allowing the free-flight camera to cross the waterline and explore
-// the water column.
-const MIN_FLIGHT_ALT = paramNumber('minFlightAlt', -4);
 // AGL-based speed scaling: full speed at AGL_FULL_SPEED_M, minimum factor at ground level
 const AGL_FULL_SPEED_M = 500;
 const AGL_MIN_FACTOR = 0.05;
@@ -319,8 +335,10 @@ const renderBackend = backendModule.createTerrainBackend({
     : WEBGL_TONE_MAPPING_EXPOSURE,
   scene,
   bootLog,
-  gpuProfilerEnabled: !USE_WEBGPU_RENDER_BACKEND
-    && localStorage.getItem('terrain-gpu-profiler') === '1',
+  // Timer queries force expensive command-buffer boundaries on Metal's
+  // tile-based renderer. Never restore profiling into normal rendering from
+  // localStorage; only the bounded /api/gpu-profile control may enable it.
+  gpuProfilerEnabled: false,
 });
 const webgpuAtmosphere = USE_WEBGPU_RENDER_BACKEND
   ? renderBackend.createAtmosphere({
@@ -336,7 +354,8 @@ const renderer = renderBackend.renderer;
 document.body.appendChild(renderer.domElement);
 renderer.domElement.addEventListener('contextmenu', event => event.preventDefault());
 let tileInspectorRuntime = null;
-let hudCollapsed = false;
+let bathymetryMapRuntime = null;
+let hudCollapsed = true;
 
 const { hud, alt, gameClock: gameClockEl } = createTerrainHud({
   onToggleCollapsed: () => {
@@ -348,9 +367,11 @@ const { hud, alt, gameClock: gameClockEl } = createTerrainHud({
   onToggleSeamMode: () => toggleSeamMode(),
   onToggleTileInspector: () => toggleTileInspector(),
   onToggleGridlines: () => toggleGridlines(),
+  onToggleBathymetryMap: () => toggleBathymetryMap(),
   onToggleClassifierOverlay: () => cycleClassifierOverlay(),
   onToggleWaterOverlay: () => toggleWaterOverlay(),
   onToggleHydrographyOverlay: () => toggleHydrographyOverlay(),
+  onToggleProcgen: () => toggleProcgen(),
   onToggleRenderBackend: () => {
     // beforeunload normally saves this too, but make the renderer transition
     // self-contained so a fast reload cannot race the camera/frame snapshot.
@@ -359,6 +380,7 @@ const { hud, alt, gameClock: gameClockEl } = createTerrainHud({
     onToggleRenderBackend();
   },
   onToggleRoadDebug: () => toggleRoadDebug(),
+  onToggleTileEviction: () => toggleTileEviction(),
   onOpenGoogleMaps: () => openGoogleMapsView(),
   onStartFastTime: () => startFastTime(),
   onReset: () => resetView(),
@@ -649,6 +671,10 @@ function buildTuningControls(ap, ce) {
     value: waterParams.enabled,
     onChange: v => { waterParams.enabled = v; }
   });
+  tuningToggle('optical water', {
+    value: waterParams.opticalEnabled,
+    onChange: v => { waterParams.opticalEnabled = v; }
+  });
   tuningSlider('wind speed', {
     min: 1, max: 28, step: 0.1, value: waterParams.windSpeed,
     decimals: 1,
@@ -675,6 +701,16 @@ function buildTuningControls(ap, ce) {
     decimals: 0,
     format: v => `${v.toFixed(0)}m`,
     onChange: v => { waterParams.shoreFetchRamp = v; }
+  });
+  tuningSlider('shore sparkle depth', {
+    min: 0, max: 12, step: 0.25, value: waterParams.shoreFoamDepth,
+    decimals: 2,
+    format: v => `${v.toFixed(2)}m`,
+    onChange: v => { waterParams.shoreFoamDepth = v; }
+  });
+  tuningSlider('shore sparkle', {
+    min: 0, max: 1.5, step: 0.05, value: waterParams.shoreFoamStrength,
+    onChange: v => { waterParams.shoreFoamStrength = v; }
   });
   tuningSlider('swell scale', {
     min: 0.3, max: 2, step: 0.01, value: waterParams.amplitude,
@@ -869,6 +905,15 @@ Ellipsoid.WGS84
   .getEastNorthUpFrame(anchorPosition)
   .decompose(terrainRoot.position, terrainRoot.quaternion, terrainRoot.scale);
 scene.add(terrainRoot);
+// Diagnostic colors must bypass atmosphere relighting. Keep their geometry in
+// the same tangent frame as terrain, but render it into the composited frame
+// only after the atmosphere pass has finished.
+const diagnosticOverlayScene = new THREE.Scene();
+const diagnosticOverlayRoot = new THREE.Group();
+diagnosticOverlayRoot.position.copy(terrainRoot.position);
+diagnosticOverlayRoot.quaternion.copy(terrainRoot.quaternion);
+diagnosticOverlayRoot.scale.copy(terrainRoot.scale);
+diagnosticOverlayScene.add(diagnosticOverlayRoot);
 
 // --- Fjord water (ocean2 FFT port) ---
 // A camera-following FFT water surface at local z=0; masked water terrain is
@@ -888,6 +933,7 @@ const waterRuntime = createWaterRuntime({
   getTextureVersion: () => terrainTextureVersion,
   log: (event, details) => enqueueClientLog('info', event, details),
   params: waterParams,
+  evictionGate: tileEvictionGate,
 });
 
 const camMarkerGeo = new THREE.ConeGeometry(200, 600, 4);
@@ -946,7 +992,10 @@ const EXAG = 1.0;
 // The asset library is raw GLSL ShaderMaterial — WebGL only. WebGPU clutter
 // is the procedural-runtime port (see the procedural-greenland checkout),
 // a separate work item.
-const SCATTER_ENABLED = renderBackend.kind === 'webgl';
+const PROCGEN_AVAILABLE = renderBackend.kind === 'webgl';
+// Procgen is intentionally opt-in. In addition to matching the HUD state,
+// this avoids allocating the scatter library and grass ring until requested.
+let procgenEnabled = DEFAULT_PROCGEN_ENABLED;
 // Only the deep LOD cores get clutter: their ~3-tile-width discs ARE the
 // camera-following near-field window the tundra densities are budgeted for.
 // d14 core ≈ 494 m — beyond that the frequency-split detail carries the eye.
@@ -955,22 +1004,24 @@ const SCATTER_SEED = 1337;
 // Camera-following grass carpet (WebGL clipmap ring): the layer that hides
 // bare terrain in the final ~50 m. Created lazily with the scatter library.
 let groundRing = null;
-if (SCATTER_ENABLED) {
+function ensureGroundRing() {
+  if (groundRing || !PROCGEN_AVAILABLE || !procgenEnabled) return groundRing;
   try {
     groundRing = createWebGLGroundRing({
       terrainRoot,
-      surfaceFields: sharedSurfaceFieldStore({ log: () => {} }),
+      surfaceFields: surfaceFieldStore,
       log: message => enqueueClientLog('info', 'ground-ring', { message }),
     });
   } catch (err) {
     console.error('[ground-ring] init failed', err);
     enqueueClientLog('error', 'ground-ring', { error: String(err) });
   }
+  return groundRing;
 }
 let _scatterLib = null;   // built lazily on the first deep tile
 let _scatterLibFailed = false;
 function scatterLibrary() {
-  if (_scatterLib || _scatterLibFailed || !SCATTER_ENABLED) return _scatterLib;
+  if (_scatterLib || _scatterLibFailed || !PROCGEN_AVAILABLE || !procgenEnabled) return _scatterLib;
   try {
     _scatterLib = buildAssetLibrary(renderer, SCATTER_SEED);
     console.log('[scatter] asset library built', _scatterLib.stats);
@@ -993,13 +1044,12 @@ function scatterLibrary() {
 const SCATTER_RETRY_DELAYS_MS = [1500, 4000, 10000];
 
 function attachTileScatter(mesh, tile, hm) {
-  if (!SCATTER_ENABLED || !mesh || !tile?.id) return;
+  if (!PROCGEN_AVAILABLE || !mesh || !tile?.id) return;
   const depth = tileDepthFromId(tile.id);
   if (depth < Math.max(SCATTER_MIN_DEPTH, SCATTER_ATTACH_MIN_DEPTH)) return;
-  const lib = scatterLibrary();
-  if (!lib) return;
 
   let currentGroup = null;
+  let buildPending = false;
 
   function disposeGroup(group) {
     if (!group) return;
@@ -1010,14 +1060,24 @@ function attachTileScatter(mesh, tile, hm) {
   }
 
   function fetchAndBuild(attempt) {
+    if (!procgenEnabled) {
+      buildPending = false;
+      return;
+    }
     // Tile evicted or its mesh recycled for a different tile since we
     // scheduled this retry — nothing to attach to anymore.
-    if (mesh.userData?.tileId !== tile.id) return;
+    if (mesh.userData?.tileId !== tile.id) {
+      buildPending = false;
+      return;
+    }
     // Full-resolution classifier fields gate WHERE things go; the same
     // store feeds the detail shader, so this is one shared fetch.
-    sharedSurfaceFieldStore({ log: () => {} }).get(tile.id).then(entry => {
-      if (mesh.userData?.tileId !== tile.id) return;
+    surfaceFieldStore.get(tile.id).then(entry => {
+      buildPending = false;
+      if (!procgenEnabled || mesh.userData?.tileId !== tile.id) return;
       try {
+        const lib = scatterLibrary();
+        if (!lib) return;
         const group = buildTileScatter({
           tileId: tile.id,
           bbox: tile.bbox,
@@ -1044,7 +1104,17 @@ function attachTileScatter(mesh, tile, hm) {
     });
   }
 
-  fetchAndBuild(0);
+  mesh.userData.enableProcgen = () => {
+    if (!procgenEnabled) return;
+    if (currentGroup) {
+      currentGroup.visible = true;
+      return;
+    }
+    if (buildPending) return;
+    buildPending = true;
+    fetchAndBuild(0);
+  };
+  mesh.userData.enableProcgen();
 }
 
 // Keep the camera comfortably inside the 4 km depth-12 plateau. A 5 km
@@ -1150,7 +1220,9 @@ const normalPass = new NormalPass(scene, camera);
 // untransformed blob at the terrain origin, corrupting the normal buffer
 // (same failure class as the 2a092d9 black-sprite fix). Hide it during the
 // pass — grass pixels then inherit the terrain's normals in the relight,
-// which is the right lighting for ground-hugging vegetation anyway.
+// which is the right lighting for ground-hugging vegetation anyway. Optical
+// water deliberately remains present: its flat normal and shallow visual
+// depth are what make atmosphere lighting and cloud shadows land on it.
 {
   const _originalNormalRender = normalPass.render.bind(normalPass);
   normalPass.render = function (...args) {
@@ -1267,16 +1339,6 @@ renderBackend.configureScenePipeline({
 
 // --- Heightmap decode + mesh building (adapted for ENU frame) ---
 
-// --- Tile priority colors ---
-
-function priorityColor(priority, minP, maxP) {
-  if (maxP <= minP) return new THREE.Color(1, 0, 0);
-  const t = Math.min(1, Math.max(0, (priority - minP) / (maxP - minP)));
-  if (t < 0.33) return new THREE.Color(1, t / 0.33, 0);
-  if (t < 0.66) return new THREE.Color(1 - (t - 0.33) / 0.33, 1, 0);
-  return new THREE.Color(0, 1 - (t - 0.66) / 0.34, (t - 0.66) / 0.34);
-}
-
 // --- Deferred tile system ---
 const { history: tileHistory, log: tileLog } = createTileHistory({
   emit: (details, level) => enqueueClientLog(level, 'tile', details),
@@ -1298,9 +1360,10 @@ const textureStreamer = createTextureStreamer({
   retryBaseMs: TEX_RETRY_202_BASE_MS, retryMaxMs: TEX_RETRY_202_MAX_MS,
   retryErrorMs: TEX_RETRY_ERROR_MS,
   getTextureAnisotropy: () => rendererTextureAnisotropy(renderer),
+  evictionGate: tileEvictionGate,
 });
 const {
-  texCache, texSource, texInflight, texFetching,
+  texCache, texSource, texInflight, texFetching, dormantTextures,
 } = textureStreamer;
 let buildingsRuntime = null;
 const terrainTileSet = createTerrainTileSet({
@@ -1333,6 +1396,7 @@ const terrainTileSet = createTerrainTileSet({
       requestRender();
     },
   },
+  evictionGate: tileEvictionGate,
 });
 // Classifier decision colors painted straight onto the terrain. The HUD link
 // toggles the full-resolution class map without leaving the 3D view.
@@ -1372,6 +1436,17 @@ buildingsRuntime = createTerrainBuildingsRuntime({
   exaggeration: EXAG,
   onMutated: markSceneMutated,
   requestRender,
+});
+bathymetryMapRuntime = createTerrainBathymetryMapRuntime({
+  terrainRoot: diagnosticOverlayRoot,
+  pipelineState: terrainPipelineState,
+  exaggeration: EXAG,
+  onChanged: () => {
+    updateHud();
+    markSceneMutated();
+  },
+  requestRender,
+  log: tileLog,
 });
 
 function getFogDistance() {
@@ -1520,6 +1595,94 @@ const clock = new THREE.Clock();
 const STREAMING_MAINTENANCE_MS = 1000;
 const fpsCounter = createTerrainFpsCounter();
 
+// Flight stutters are invisible to the sampling GPU profiler, which averages
+// across periodic sample frames. The detector watches every frame instead and
+// splits a stall into render() work versus time stolen between frames, then
+// names whatever tiles, textures, or shader programs appeared while it hung.
+// 25ms is one dropped frame at 60fps — the band that reads as judder rather
+// than a lag, and the reason a 50ms threshold reported "no hitches" while
+// flight still felt rough.
+const HITCH_MS = Number(localStorage.getItem('terrain-hitch-ms')) || 25;
+const HITCH_REPORT_INTERVAL_MS = 1000;
+const hitchDetector = createTerrainHitchDetector({
+  hitchMs: HITCH_MS,
+  sampleContext: () => {
+    const info = renderer?.info;
+    return {
+      programs: info?.programs?.length ?? 0,
+      textures: info?.memory?.textures ?? 0,
+      geometries: info?.memory?.geometries ?? 0,
+      tiles: terrainTileSet?.currentTileIds?.size ?? 0,
+      texCache: texCache?.size ?? 0,
+      texInflight: texInflight?.size ?? 0,
+    };
+  },
+  performanceObserver: typeof PerformanceObserver === 'function'
+    ? callback => {
+      const observer = new PerformanceObserver(list => callback(list.getEntries()));
+      observer.observe({ entryTypes: ['longtask'] });
+      return observer;
+    }
+    : null,
+});
+hitchDetector.setEnabled(localStorage.getItem('terrain-hitch-detector') !== '0');
+window.__terrainHitches = () => hitchDetector.getReport();
+window.__terrainHitchDetector = hitchDetector;
+
+// Timings for the frame that just ended, so an in-frame hitch reports the
+// section that caused it rather than one opaque total.
+const frameSections = {};
+let lastHitchReportMs = -Infinity;
+let suppressedHitchReports = 0;
+
+function reportHitch(hitch) {
+  if (hitch == null) return;
+  // The detector records every hitch in memory, but sending every missed frame
+  // through the JSON logger creates a feedback loop: once rendering crosses
+  // the 25ms threshold, log serialization and fetch traffic can keep starving
+  // requestAnimationFrame even after the original transient has passed.
+  const nowMs = performance.now();
+  if (nowMs - lastHitchReportMs < HITCH_REPORT_INTERVAL_MS) {
+    suppressedHitchReports += 1;
+    return;
+  }
+  const suppressedSincePrevious = suppressedHitchReports;
+  suppressedHitchReports = 0;
+  lastHitchReportMs = nowMs;
+  // Warn level so hitches survive the default client-log threshold and land in
+  // the Flask log without turning on debug logging for everything else.
+  enqueueClientLog('warn', 'frame.hitch', {
+    source: hitch.source,
+    intervalMs: Number(hitch.intervalMs.toFixed(1)),
+    workMs: Number(hitch.workMs.toFixed(1)),
+    gapMs: Number(hitch.gapMs.toFixed(1)),
+    suppressedSincePrevious,
+    context: hitch.context,
+    // Only meaningful when render() itself ran long; the marks describe the
+    // frame the detector just charged for the stall.
+    sections: hitch.source === 'in-frame'
+      ? Object.fromEntries(
+        Object.entries(frameSections)
+          .filter(([, ms]) => ms >= 1)
+          .map(([name, ms]) => [name, Number(ms.toFixed(1))]),
+      )
+      : undefined,
+    // The client logger deep-clones every entry, so at a judder-level threshold
+    // the camera snapshot and long-task list would be paid for many times a
+    // second — enough to show up in the very frames being measured. Attach the
+    // heavy fields only to stalls big enough to warrant locating.
+    ...(hitch.intervalMs >= 50
+      ? {
+        longTasks: hitch.longTasks.map(task => ({
+          durationMs: Number(task.durationMs.toFixed(1)),
+          attribution: task.attribution,
+        })),
+        ...getCameraLogSnapshot(),
+      }
+      : null),
+  });
+}
+
 function markSceneMutated() { renderBackend.markSceneMutated(); }
 
 function hasActiveKeyInput() {
@@ -1565,11 +1728,17 @@ function runStreamingMaintenance() {
     dateChanged = applyDate(currentDate, { force: false });
   }
   if (terrainPipelineState.lastTiles) {
-    terrainTileSet.updateTextures(terrainPipelineState.lastTiles);
     gridlinesRuntime.update();
   }
   if (dateChanged || renderBackend.sceneMutationVersion !== before) {
     requestRender();
+  }
+  // Optical twins are torn down and rebuilt silently; on screen that reads as
+  // the water repainting. Counters are cumulative, so a rising rebuild delta
+  // between samples is the signal.
+  const optical = waterRuntime.opticalStats?.();
+  if (optical != null) {
+    enqueueClientLog('info', 'water.optical.stats', optical);
   }
 }
 
@@ -1612,6 +1781,7 @@ const terrainFetchRuntime = createTerrainFetchRuntime({
   terrain: terrainTileSet,
   logger: { enqueue: enqueueClientLog, boot: bootLog },
   events: terrainFetchEvents,
+  evictionGate: tileEvictionGate,
 });
 const initialTerrainDemandHeading = getTerrainViewHeading();
 const TERRAIN_DEMAND_HEADING_THRESHOLD = 2 * Math.PI / 180;
@@ -1780,6 +1950,8 @@ window.takramDebug = {
   fetchTiles: terrainFetchRuntime.request,
   setBuildingsVisible: visible => buildingsRuntime.setVisible(visible),
   getBuildingsMesh: () => buildingsRuntime.getMesh(),
+  setBathymetryMapVisible: visible => bathymetryMapRuntime.setActive(visible),
+  getBathymetryMapGroup: () => bathymetryMapRuntime.group,
   saveVehicleState: reason => vehicleRuntime.saveVehicleState(reason ?? 'debug-api'),
   loadVehicleState: vehicleRuntime.loadVehicleState,
   setVehicleControlActive: active => vehicleRuntime.setVehicleControlActive(Boolean(active), 'debug-api'),
@@ -1857,10 +2029,28 @@ function hideTileInfo() {
   hoverOutlineController.show(null);
 }
 
+function showBathymetrySoundingInfo(event, sounding) {
+  hoverOutlineController.show(null);
+  tileInfoEl.innerHTML = bathymetrySoundingTooltipHtml(sounding);
+  tileInfoEl.style.left = `${event.clientX + 16}px`;
+  tileInfoEl.style.top = `${event.clientY + 16}px`;
+  tileInfoEl.style.right = 'auto';
+  tileInfoEl.style.maxWidth = '460px';
+  tileInfoEl.style.border = '1px solid #526778';
+  tileInfoEl.style.display = 'block';
+  const bounds = tileInfoEl.getBoundingClientRect();
+  if (bounds.right > window.innerWidth - 8) {
+    tileInfoEl.style.left = `${Math.max(8, event.clientX - bounds.width - 16)}px`;
+  }
+  if (bounds.bottom > window.innerHeight - 8) {
+    tileInfoEl.style.top = `${Math.max(8, event.clientY - bounds.height - 16)}px`;
+  }
+}
+
 function clampAltitude() {
   const rel = camera.position.clone().sub(anchorPosition);
   const altitude = rel.dot(up);
-  const clamped = Math.max(MIN_FLIGHT_ALT, Math.min(6000, altitude));
+  const clamped = clampFreeFlightAltitude(altitude);
   const delta = clamped - altitude;
   if (Math.abs(delta) > 1e-6) {
     camera.position.addScaledVector(up, delta);
@@ -2051,6 +2241,7 @@ function updateHud() {
   const srvMissing = terrainPipelineState.serverTextureStatus.missing || 0;
   const srvAncestor = terrainPipelineState.serverTextureStatus.ancestor_fallback || 0;
   let texLine = `tex: ${texCache.size} cached`;
+  if (dormantTextures.size > 0) texLine += `  ${dormantTextures.size} dormant`;
   // Client fetch pipeline
   if (texInflight.size > 0 || texFetching.size > 0) {
     texLine += `  <span style="color:#8cf">http: ${texInflight.size}</span>`;
@@ -2075,6 +2266,9 @@ function updateHud() {
   const gridlinesLine = gridlinesRuntime.active
     ? 'gridlines: <span id="gridlinesModeLink" style="color:#8f8;text-decoration:underline;cursor:pointer;pointer-events:auto">ON</span>'
     : 'gridlines: <span id="gridlinesModeLink" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">off</span>';
+  const bathymetryMapLine = bathymetryMapRuntime?.active
+    ? 'bathymetry map: <span id="bathymetryMapLink" title="Cyan = carved bathymetry; circles = actual-bottom checks (raster markers are depth-12 aggregates); squares = lower-bound observations; hover near a marker for details; red = large model deviation" style="color:#00d8ff;text-decoration:underline;cursor:pointer;pointer-events:auto">ON</span>'
+    : 'bathymetry map: <span id="bathymetryMapLink" title="Show carved bathymetry and source sounding evidence" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">off</span>';
   const classifierOverlayColor = {
     off: '#0af', classifier: '#6ecd3c',
   }[classifierOverlay.mode] ?? '#0af';
@@ -2088,6 +2282,7 @@ function updateHud() {
   const hydrographyOverlayLine = textureStreamer.hydroDebug
     ? 'Åbent Land: <span id="hydrographyOverlayLink" style="color:#008cff;text-decoration:underline;cursor:pointer;pointer-events:auto">BLUE</span>'
     : 'Åbent Land: <span id="hydrographyOverlayLink" style="color:#0af;text-decoration:underline;cursor:pointer;pointer-events:auto">off</span>';
+  const procgenLine = procgenHudLine(procgenEnabled, PROCGEN_AVAILABLE);
   const renderBackendLabel = backend === 'webgpu' ? 'WebGPU' : 'WebGL';
   const nextRenderBackendLabel = backend === 'webgpu' ? 'WebGL' : 'WebGPU';
   const roadDebugColor = textureStreamer.roadDebug ? '#ff3b30' : '#0af';
@@ -2118,9 +2313,12 @@ function updateHud() {
     hmLine,
     texLine,
     gridlinesLine,
+    bathymetryMapLine,
     classifierOverlayLine,
     waterOverlayLine,
     hydrographyOverlayLine,
+    procgenLine,
+    tileEvictionHudLine(terrainTileSet.evictionEnabled),
     vehicleRuntime.vehicleControlActive
       ? 'W/S drive, A/D steer, mouse orbit camera, Esc exits vehicle control'
       : 'WASD or Arrows move, Q/Z altitude, drag look',
@@ -2210,6 +2408,7 @@ function resetView() {
   tuningPanelOpen = false;
   tuningBody.style.display = 'none';
   document.getElementById('tuning-toggle').innerHTML = '&#9660;';
+  setProcgenEnabled(DEFAULT_PROCGEN_ENABLED);
   hudCollapsed = false;
   updateHud();
   // Re-fetch tiles around the reset camera position.
@@ -2234,6 +2433,38 @@ function toggleRoadDebug() {
   updateHud();
   requestRender();
   return enabled;
+}
+
+function toggleTileEviction() {
+  const enabled = terrainTileSet.setEvictionEnabled(!terrainTileSet.evictionEnabled);
+  enqueueClientLog('info', 'tile.eviction.toggle', {
+    enabled,
+    suppressed: terrainTileSet.suppressedEvictions,
+  });
+  updateHud();
+  requestRender();
+  return enabled;
+}
+
+function setProcgenEnabled(enabled) {
+  if (!PROCGEN_AVAILABLE) return false;
+  procgenEnabled = Boolean(enabled);
+  if (procgenEnabled) ensureGroundRing();
+  for (const tile of terrainRoot.children) {
+    for (const child of tile.children) {
+      if (child.userData?.isScatter) child.visible = procgenEnabled;
+    }
+    if (procgenEnabled) tile.userData?.enableProcgen?.();
+  }
+  for (const ring of groundRing?.meshes ?? []) ring.visible = procgenEnabled;
+  enqueueClientLog('info', 'procgen.toggle', { enabled: procgenEnabled });
+  updateHud();
+  requestRender();
+  return procgenEnabled;
+}
+
+function toggleProcgen() {
+  return setProcgenEnabled(!procgenEnabled);
 }
 
 function syncMapModePresentation() {
@@ -2337,6 +2568,14 @@ function toggleSeamMode() {
 function toggleGridlines() {
   if (controls.mapMode) return;
   gridlinesRuntime.toggle();
+}
+
+function toggleBathymetryMap() {
+  const active = bathymetryMapRuntime?.toggle() ?? false;
+  enqueueClientLog('info', 'bathymetry.map.toggle', { active });
+  updateHud();
+  requestRender();
+  return active;
 }
 
 function toggleWaterOverlay() {
@@ -2456,6 +2695,25 @@ renderer.domElement.addEventListener('mousemove', event => {
     hideTileInfo();
     return;
   }
+  if (controls.mapMode && bathymetryMapRuntime?.active) {
+    const rect = renderer.domElement.getBoundingClientRect();
+    const soundingHit = nearestBathymetrySounding(
+      bathymetryMapRuntime.group,
+      mapCam,
+      {
+        clientX: event.clientX,
+        clientY: event.clientY,
+        left: rect.left,
+        top: rect.top,
+        width: rect.width,
+        height: rect.height,
+      },
+    );
+    if (soundingHit) {
+      showBathymetrySoundingInfo(event, soundingHit.sounding);
+      return;
+    }
+  }
   const targets = collectTerrainDebugMeshes(terrainRoot, debugIntersectables);
   if (targets.length === 0) {
     hideTileInfo();
@@ -2473,6 +2731,8 @@ renderer.domElement.addEventListener('mousemove', event => {
   const mesh = hits[0].object;
   if (gridlines3dHover) {
     hoverOutlineController.show(null);
+    tileInfoEl.style.maxWidth = '';
+    tileInfoEl.style.border = 'none';
     tileInfoEl.textContent = `tile: ${mesh.userData.tileId}`;
     tileInfoEl.style.left = `${Math.max(8, Math.min(event.clientX + 14, window.innerWidth - 180))}px`;
     tileInfoEl.style.top = `${Math.max(8, Math.min(event.clientY + 14, window.innerHeight - 42))}px`;
@@ -2481,6 +2741,8 @@ renderer.domElement.addEventListener('mousemove', event => {
     return;
   }
   hoverOutlineController.show(mesh, 'outline');
+  tileInfoEl.style.maxWidth = '';
+  tileInfoEl.style.border = 'none';
   tileInfoEl.style.left = 'auto';
   tileInfoEl.style.top = '12px';
   tileInfoEl.style.right = '12px';
@@ -2497,12 +2759,19 @@ renderer.domElement.addEventListener('mousemove', event => {
 
   const src = texSource.get(info.tileId) || 'none';
   const srcLabel = `<span style="color:#f80">${src || 'no texture'}</span>`;
+  const demQuality = classifyDemSource(info.terrainSource);
+  const demLabel = demQuality.synthetic
+    ? '<b style="color:#ff1744">SYNTHETIC / UPSCALED</b>'
+    : demQuality.kind === 'measured'
+      ? '<span style="color:#22c55e">measured</span>'
+      : `<span style="color:#f59e0b">${demQuality.kind}</span>`;
   const matHex = info.color !== '-' ? info.color : '#ffffff';
   const seamRows = controls.seamMode ? mapGridController.diagnosticsForTile(info.tileId) : [];
   const badSeams = seamRows.filter(seam => seam.severity === 'bad').length;
   const warningSeams = seamRows.filter(seam => seam.severity === 'warning').length;
   tileInfoEl.innerHTML = [
     `<b style="color:${matHex}">${info.tileId}</b>`,
+    `DEM: ${info.terrainSource || 'none'} · ${demLabel}`,
     `tex: ${info.hasTexture ? 'YES' : 'NO'} ${info.textureSize}  source: ${srcLabel}`,
     controls.seamMode
       ? `<b>shared edges: ${seamRows.length} · <span style="color:#ff1744">${badSeams} bad</span> · <span style="color:#f59e0b">${warningSeams} inspect</span></b>`
@@ -2583,8 +2852,13 @@ camera.updateMatrixWorld(true);
 updateMapCamera();
 updateHud();
 
-function render() {
+function renderFrame() {
+  reportHitch(hitchDetector.frameStart(performance.now()));
   const frameStartedAt = cpuProfiler.begin();
+  // In-frame stalls now outweigh anything between frames, and everything from
+  // here to the draw call was a single opaque number. These marks are a handful
+  // of clock reads per frame and let a hitch name the section that caused it.
+  const markT0 = performance.now();
   const elapsedDt = clock.getDelta();
   // Movement consumes the entire wall-clock interval. If rendering stalls,
   // intermediate simulation states are advanced without rendering and this
@@ -2600,11 +2874,14 @@ function render() {
   if (gameClockState.running) {
     currentDate.setTime(getGameDateFromBrowserTime().getTime());
   }
+  const markMovement = performance.now();
   applyDate(currentDate, { force: false });
   applyCameraOrientation();
   recalibrateCloudWindForCamera();
   rebuildTerrainDemandForViewDirection();
+  const markDemand = performance.now();
   updateHud();
+  const markHud = performance.now();
   syncMapModePresentation();
 
   // Update fog density from slider
@@ -2627,10 +2904,17 @@ function render() {
     cloudCoverage,
     cloudRenderingEnabled,
   );
-  waterRuntime.update({
+  const markPreWater = performance.now();
+  const waterTimings = waterRuntime.update({
     dt, camera,
     visible: waterParams.enabled && !controls.mapMode
       && !textureStreamer.waterDebug && !textureStreamer.hydroDebug,
+    // Gridlines are a terrain inspection mode. Hide the cosmetic satellite
+    // water proxy so the real bathymetry remains visible beneath the dynamic
+    // water while the grid is active.
+    opticalVisible: waterParams.opticalEnabled && waterParams.enabled && !controls.mapMode
+      && !textureStreamer.waterDebug && !textureStreamer.hydroDebug
+      && !gridlinesRuntime.active,
   });
 
   // Terrain streaming: check if camera moved far enough to re-fetch
@@ -2653,9 +2937,12 @@ function render() {
     const refetch = evaluateTerrainRefetch({
       cameraX: terrainPipelineState.cameraStereoX, cameraY: terrainPipelineState.cameraStereoY,
       lastFetchX: terrainPipelineState.lastFetchX, lastFetchY: terrainPipelineState.lastFetchY,
+      // Unknown AGL is not ground level. Passing zero here made a transient
+      // missing surface sample look like a steep descent and repeatedly
+      // triggered fetches while crossing water.
       cameraAltitude: cameraRuntimeState.aglValid
         ? cameraRuntimeState.agl
-        : 0,
+        : null,
       lastFetchAltitude: terrainPipelineState.lastFetchAltitude,
       nowMs, lastTriggerMs: terrainPipelineState.lastFetchTriggerMs,
       distanceThreshold: REFETCH_DIST, altitudeThreshold: REFETCH_ALTITUDE_DELTA,
@@ -2664,6 +2951,7 @@ function render() {
     terrainPipelineState.lastFetchTriggerMs = refetch.nextTriggerMs;
     if (refetch.shouldFetch) terrainFetchRuntime.request();
   }
+  const markWater = performance.now();
   vehicleRuntime.snapVehicleToTerrain();
   vehicleRuntime.updateDieselVolume();
   vehicleRuntime.updateVehicleSuspension(dt);
@@ -2700,13 +2988,14 @@ function render() {
     const markerScale = controls.mapZoom / DEFAULT_MAP_ZOOM;
     camMarker.scale.setScalar(markerScale);
     vehicleRuntime.vehicleMarker.scale.setScalar(markerScale * vehicleRuntime.VEHICLE_MARKER_MAP_SCALE);
-    renderBackend.renderMap(scene, mapCam, _mapBg);
+    renderBackend.renderMap(scene, mapCam, _mapBg, diagnosticOverlayScene);
     renderBackend.stopRenderLoopIfIdle();
     cpuProfiler.end('frame-cpu', frameStartedAt);
+    hitchDetector.frameEnd(performance.now());
     return;
   }
-  if (SCATTER_ENABLED && _scatterLib) updateScatterVisibility(terrainRoot, camera);
-  if (groundRing && terrainPipelineState.ready) {
+  if (procgenEnabled && _scatterLib) updateScatterVisibility(terrainRoot, camera);
+  if (procgenEnabled && groundRing && terrainPipelineState.ready) {
     groundRing.update({
       camera,
       worldOffsetX: terrainPipelineState.originX - terrainPipelineState.frameOffsetX,
@@ -2715,14 +3004,36 @@ function render() {
     });
   }
   webgpuAtmosphere?.updateCloudShadows(clock.elapsedTime);
+  const markVehicle = performance.now();
   try {
-    renderBackend.renderScene(scene, camera);
+    renderBackend.renderScene(scene, camera, diagnosticOverlayScene);
   } finally {
     restoreCloudTemporalHistory?.();
     restoreCloudTemporalHistory = null;
   }
+  const markRender = performance.now();
+  frameSections.movement = markMovement - markT0;
+  frameSections.demand = markDemand - markMovement;
+  frameSections.hud = markHud - markDemand;
+  frameSections.preWater = markPreWater - markHud;
+  frameSections.water = markWater - markPreWater;
+  frameSections.waterOpticalSync = waterTimings?.opticalSync ?? 0;
+  frameSections.waterSim = waterTimings?.sim ?? 0;
+  frameSections.waterCapture = waterTimings?.capture ?? 0;
+  frameSections.vehicle = markVehicle - markWater;
+  frameSections.renderScene = markRender - markVehicle;
   renderBackend.stopRenderLoopIfIdle();
   cpuProfiler.end('frame-cpu', frameStartedAt);
+  hitchDetector.frameEnd(performance.now());
+}
+
+function render() {
+  renderBackend.beginFrameProfile?.();
+  try {
+    renderFrame();
+  } finally {
+    renderBackend.endFrameProfile?.();
+  }
 }
 
 window.setInterval(runStreamingMaintenance, STREAMING_MAINTENANCE_MS);

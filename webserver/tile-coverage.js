@@ -1,41 +1,40 @@
 import {
   formatTerrainTileId,
-  isTerrainTileAncestor,
   parseTerrainTileId,
 } from './terrain-tile-address.js';
 
-/**
- * Return resident ancestors that can be removed because textured resident
- * descendants cover every currently demanded descendant inside them. When
- * demand is omitted, require complete four-quadrant coverage.
- *
- * residentTextures maps tile IDs to whether their scene mesh is textured.
- * Selected ancestors are removed from the working set before higher ancestors
- * are checked, so a fallback selected for eviction cannot count as coverage.
- */
-export function findCoveredTileAncestors(
-  triggerTileId,
+export function hasCompleteTerrainTileCoverage(
+  tileId,
   residentTextures,
-  desiredTileIds = null,
+  { excludeTileIds = [] } = {},
 ) {
-  const trigger = parseTerrainTileId(triggerTileId);
-  if (!trigger || trigger.depth <= 0) return [];
-
-  const resident = new Map(residentTextures);
-  let maxDepth = trigger.depth;
-  for (const id of resident.keys()) {
+  const tile = parseTerrainTileId(tileId);
+  if (!tile) return false;
+  // A residency sweep calls this once per eviction candidate, so copying the
+  // resident map each time meant re-cloning a few hundred entries per tile.
+  // Exclusions are read through instead.
+  const excluded = excludeTileIds.length === 0
+    ? null
+    : (excludeTileIds instanceof Set ? excludeTileIds : new Set(excludeTileIds));
+  const isResident = id => (
+    (excluded == null || !excluded.has(id)) && residentTextures.get(id) === true
+  );
+  let maxDepth = tile.depth;
+  for (const id of residentTextures.keys()) {
+    if (excluded?.has(id)) continue;
     const address = parseTerrainTileId(id);
     if (address) maxDepth = Math.max(maxDepth, address.depth);
   }
 
-  const covered = (depth, col, row, memo) => {
+  const memo = new Map();
+  const covered = (depth, col, row) => {
     const id = formatTerrainTileId(depth, col, row);
     if (memo.has(id)) return memo.get(id);
-    if (resident.get(id) === true) return true;
+    if (isResident(id)) return true;
     if (depth >= maxDepth) return false;
     for (let dx = 0; dx < 2; dx++) {
       for (let dy = 0; dy < 2; dy++) {
-        if (!covered(depth + 1, col * 2 + dx, row * 2 + dy, memo)) {
+        if (!covered(depth + 1, col * 2 + dx, row * 2 + dy)) {
           memo.set(id, false);
           return false;
         }
@@ -45,39 +44,5 @@ export function findCoveredTileAncestors(
     return true;
   };
 
-  const evictable = [];
-  for (let depth = trigger.depth - 1; depth >= 0; depth--) {
-    const divisor = 2 ** (trigger.depth - depth);
-    const col = Math.floor(trigger.col / divisor);
-    const row = Math.floor(trigger.row / divisor);
-    const ancestorId = formatTerrainTileId(depth, col, row);
-    if (!resident.has(ancestorId)) continue;
-
-    const memo = new Map();
-    let fullyCovered;
-    if (desiredTileIds == null) {
-      fullyCovered = true;
-      for (let dx = 0; dx < 2 && fullyCovered; dx++) {
-        for (let dy = 0; dy < 2; dy++) {
-          if (!covered(depth + 1, col * 2 + dx, row * 2 + dy, memo)) {
-            fullyCovered = false;
-            break;
-          }
-        }
-      }
-    } else {
-      const demandedDescendants = [...desiredTileIds]
-        .filter(id => isTerrainTileAncestor(ancestorId, id))
-        .map(id => parseTerrainTileId(id))
-        .filter(Boolean);
-      fullyCovered = demandedDescendants.length > 0
-        && demandedDescendants.every(address => (
-          covered(address.depth, address.col, address.row, memo)
-        ));
-    }
-    if (!fullyCovered) continue;
-    evictable.push(ancestorId);
-    resident.delete(ancestorId);
-  }
-  return evictable;
+  return covered(tile.depth, tile.col, tile.row);
 }

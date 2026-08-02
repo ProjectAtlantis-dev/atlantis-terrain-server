@@ -17,6 +17,7 @@ export function summarizeTerrainMesh(mesh) {
     textureSize: image != null ? `${image.width}x${image.height}` : '-',
     color: mesh.material?.color != null ? `#${mesh.material.color.getHexString()}` : '-',
     bbox: mesh.userData?.bbox,
+    terrainSource: mesh.userData?.terrainSource ?? null,
   };
 }
 

@@ -12,6 +12,7 @@ from PIL import Image
 import coastline
 from coastline import (
     _OVERSAMPLE,
+    SHORELINE_SEAFLOOR_DROP_M,
     WATER_FLOOR_DROP_M,
     apply_water_mask,
     cache_official_water_mask,
@@ -33,6 +34,27 @@ def _png_bytes(rgb):
 
 
 class OfficialCoastlineTest(unittest.TestCase):
+    def test_connectivity_signature_is_reused_until_database_changes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db = open_db(str(Path(directory) / "terrain.db"))
+            seed_tiles(db, max_depth=0)
+            coastline._connectivity_signature_cache.clear()
+            with patch(
+                "coastline._connectivity_signature",
+                wraps=coastline._connectivity_signature,
+            ) as signature:
+                coastline._cached_connectivity_signature(db, 0)
+                coastline._cached_connectivity_signature(db, 0)
+                self.assertEqual(signature.call_count, 1)
+
+                db.execute(
+                    "INSERT OR REPLACE INTO metadata (key, value) "
+                    "VALUES ('signature-test', 'changed')"
+                )
+                coastline._cached_connectivity_signature(db, 0)
+                self.assertEqual(signature.call_count, 2)
+            db.close()
+
     def test_hydrography_source_has_no_retired_coastline_alias(self):
         self.assertEqual(
             coastline.HYDROGRAPHY_SOURCE,
@@ -65,15 +87,25 @@ class OfficialCoastlineTest(unittest.TestCase):
         )
 
     def test_drops_water_floor_only_on_water(self):
-        heightmap = np.array([[100.0, 20.0], [50.0, np.nan]], dtype=np.float32)
+        heightmap = np.array([[100.0, 20.0], [-10.0, np.nan]], dtype=np.float32)
         water = np.array([[True, False], [False, True]])
         original = heightmap.copy()
         result = apply_water_mask(heightmap, water)
         floor = -WATER_FLOOR_DROP_M
         np.testing.assert_array_equal(
-            result, np.array([[floor, 20.0], [50.0, floor]], dtype=np.float32)
+            result, np.array([[floor, 20.0], [-10.0, floor]], dtype=np.float32)
         )
         np.testing.assert_array_equal(heightmap, original)
+
+    def test_water_floor_replaces_retired_deeper_synthetic_values(self):
+        heightmap = np.array([[-10.0, -3.0]], dtype=np.float32)
+        result = apply_water_mask(
+            heightmap, np.array([[True, True]], dtype=bool),
+        )
+        np.testing.assert_array_equal(
+            result,
+            np.full(heightmap.shape, -WATER_FLOOR_DROP_M, dtype=np.float32),
+        )
 
     def test_database_preserves_raw_dem_and_masks_only_the_read_view(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -109,7 +141,10 @@ class OfficialCoastlineTest(unittest.TestCase):
             tile = read_tile(db, "0-0-0")
             assert tile is not None
             effective = tile["heightmap"]
-            np.testing.assert_array_equal(effective[:, :10], -WATER_FLOOR_DROP_M)
+            np.testing.assert_array_equal(
+                effective[:, :10],
+                -WATER_FLOOR_DROP_M - SHORELINE_SEAFLOOR_DROP_M,
+            )
             np.testing.assert_array_equal(effective[:, 10:], 120.0)
             db.close()
 
@@ -177,7 +212,7 @@ class OfficialCoastlineTest(unittest.TestCase):
                 db.execute(
                     "SELECT value FROM metadata WHERE key = 'schema_version'"
                 ).fetchone()[0],
-                "5",
+                "18",
             )
             db.close()
 
@@ -221,7 +256,8 @@ class OfficialCoastlineTest(unittest.TestCase):
             assert tile is not None
             effective = tile["heightmap"]
             np.testing.assert_array_equal(
-                effective[hydro], -WATER_FLOOR_DROP_M,
+                effective[hydro],
+                -WATER_FLOOR_DROP_M - SHORELINE_SEAFLOOR_DROP_M,
             )
             np.testing.assert_array_equal(effective[~hydro], raw[~hydro])
             db.close()

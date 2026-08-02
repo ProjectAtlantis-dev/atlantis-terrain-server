@@ -1,17 +1,19 @@
-"""Terrain demand coverage and LOD-history behavior."""
+"""Terrain demand and coverage behavior."""
 
+import datetime
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 import numpy as np
 
-from database import GRID_N
+from database import GRID_N, _tile_bbox, open_db
 from terrain_config import MAX_TILE_DEPTH, WMS_CONTRACT_DEPTH
 from serve import (
     _UPGRADEABLE_SOURCES,
     _balance_lod_leaves, _coarse_lod_neighbors, _cook_cooked_dem_quad,
-    _lod_complete_ancestors,
-    _lod_target_depth, _traverse, bbox_in_view_circle,
+    _ensure_children, _lod_target_depth, _traverse, bbox_in_view_circle,
 )
 
 
@@ -21,42 +23,48 @@ def _bbox_at(cx, cy, size=100.0):
 
 
 class TestViewCoverageCircle(unittest.TestCase):
+    def test_ensure_children_repairs_a_partial_sibling_quad(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db = open_db(str(Path(directory) / "terrain.db"))
+            now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            parent_id = "12-1373-784"
+            parent_bbox = _tile_bbox(12, 1373, 784)
+            child_bbox = _tile_bbox(13, 2746, 1568)
+            db.execute(
+                "INSERT INTO tiles "
+                "(tile_id,depth,col,row,x_min,y_min,x_max,y_max,parent_id,"
+                "geometric_error,source,updated_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,0,'arcticdem_10m',?)",
+                (parent_id, 12, 1373, 784, *parent_bbox, "11-686-392", now),
+            )
+            db.execute(
+                "INSERT INTO tiles "
+                "(tile_id,depth,col,row,x_min,y_min,x_max,y_max,parent_id,"
+                "geometric_error,source,updated_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,0,'pending',?)",
+                ("13-2746-1568", 13, 2746, 1568, *child_bbox, parent_id, now),
+            )
+            db.commit()
+
+            _ensure_children(db, 12, 1373, 784)
+
+            children = db.execute(
+                "SELECT tile_id FROM tiles WHERE parent_id = ? ORDER BY tile_id",
+                (parent_id,),
+            ).fetchall()
+            self.assertEqual(
+                [row[0] for row in children],
+                [
+                    "13-2746-1568",
+                    "13-2746-1569",
+                    "13-2747-1568",
+                    "13-2747-1569",
+                ],
+            )
+            db.close()
+
     def test_parent_resampled_tiles_remain_visible_upgrade_candidates(self):
         self.assertIn('parent_resampled', _UPGRADEABLE_SOURCES)
-
-    def test_lod_history_requires_complete_descendant_coverage(self):
-        complete = {'12-20-40', '12-21-40', '12-20-41', '12-21-41'}
-        self.assertIn((11, 10, 20), _lod_complete_ancestors(complete))
-        complete.remove('12-21-41')
-        self.assertNotIn((11, 10, 20), _lod_complete_ancestors(complete))
-
-    def test_traversal_uses_a_lower_threshold_to_coarsen(self):
-        parent = {
-            'source': 'arcticdem', 'bbox': [100, 0, 200, 100],
-            'geometric_error': 0.08,
-        }
-        child = {
-            'source': 'arcticdem', 'bbox': [100, 0, 150, 50],
-            'geometric_error': 0.01,
-        }
-        previous = {'12-20-40', '12-21-40', '12-20-41', '12-21-41'}
-
-        def metadata(_db, tile_id):
-            return parent if tile_id == '11-10-20' else child
-
-        without_history, with_history = [], []
-        with patch('serve.read_tile_metadata', side_effect=metadata):
-            _traverse(
-                None, 11, 10, 20, 0, 0, 12, 0.001,
-                without_history, [], max_range=0,
-            )
-            _traverse(
-                None, 11, 10, 20, 0, 0, 12, 0.001,
-                with_history, [], max_range=0,
-                previous_subdivided=_lod_complete_ancestors(previous),
-            )
-        self.assertEqual(without_history, ['11-10-20'])
-        self.assertEqual(set(with_history), previous)
 
     def test_radial_lod_curve_uses_every_depth_before_the_rim(self):
         max_range = 16000
@@ -209,7 +217,7 @@ class TestViewCoverageCircle(unittest.TestCase):
             patch('serve._tile_bbox', return_value=child['bbox']),
         ):
             refined = _balance_lod_leaves(
-                None, leaves, [], 0, 0, 12, 1.0, 1000, 0.0, set(),
+                None, leaves, [], 0, 0, 12, 1.0, 1000, 0.0,
             )
 
         self.assertEqual(refined, 1)

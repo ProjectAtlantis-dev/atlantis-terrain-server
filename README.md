@@ -64,6 +64,36 @@ Open <http://localhost:5173/>. Vite proxies browser API requests to Flask on por
 
 The first backend start creates `flaskserver/terrain.db`, seeds the terrain hierarchy, and begins downloading configured Asiaq settlement data in the background. Tile content continues to populate on demand as you move around the world.
 
+## Bathymetry handoff
+
+Underwater terrain is stored independently in `terrain.db.bathymetry`; it must
+not overwrite `tiles.heightmap`. The normal producer contract is one depth-8
+row per covered tile:
+
+- `tile_id` — existing `8-col-row` terrain tile
+- `heightmap` — zlib-compressed, south-first `65 × 65` float32 elevations
+- `water_px`, `min_z`, `max_z` — coverage and elevation summary metadata
+- `source`, `version`, `updated_at` — provenance and revision metadata
+
+The raster spans the corresponding tile's EPSG:3413 bounding box, including
+shared edge samples. Use `NaN` for missing samples. At render time, valid
+non-positive bathymetry inside the effective official-water mask overrides the
+synthetic −5 m seabed. Missing or positive samples remain exactly −5 m,
+land continues to use `tiles.heightmap`, and detailed terrain tiles
+crop/resample their depth-8 bathymetry ancestor automatically.
+
+When `~/work/glacier/runOnDemand` is present, flying close enough to load a
+depth-12 coastline mask also queues its uncovered depth-8 fjord section.
+Mixed land/water masks trigger directly; all-water tiles trigger only within
+2 km of that coast. Glacier requests the remaining DEM/mask coverage through
+Flask, solves a stable regional bed, writes depth 12, and derives depths 11–8.
+This intentionally excludes offshore banks such as Fylla until a separate
+bank model exists. Set `GLACIER_ROOT` if the Glacier checkout lives elsewhere.
+
+The HUD's **bathymetry map** toggle displays cyan depth-12 mapped footprints,
+yellow actual-bottom soundings, and orange lower-bound observations. It
+refreshes while enabled, so newly completed coverage appears during flight.
+
 ## GPU profiling
 
 Leave the WebGL terrain page open, then control its asynchronous GPU pass

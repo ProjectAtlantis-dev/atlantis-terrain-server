@@ -47,10 +47,8 @@ next item.
 - [x] Give terrain visibility and fog policies one Earth-horizon calculation
   while retaining their deliberately different distance caps.
   - Checkpoint: tile-runtime and affected priority tests — 90 passed.
-- [x] Audit the application and tile-inspector priority color ramps. They are
-  intentionally distinct palettes (Three.js scene color versus higher-contrast
-  canvas overlay), so merging them would change presentation rather than
-  remove redundant logic.
+- [x] Retire the unused application priority-color ramp; retain the live,
+  higher-contrast tile-inspector canvas palette.
 - [x] Remove the unused procedural cook-classifier island. Its only callers
   were its own tests, while the live classifier verifier already treats its
   persisted source names as stale.
@@ -88,18 +86,12 @@ next item.
   - Focused Pyright checks for every changed Python path: passed. The
     pre-existing whole-project baseline still reports 39 diagnostics in
     untouched classifier, ingest, calibration, and test code.
-- [x] Remove the fine-tile retention override that kept obsolete high-detail
-  meshes and texture demand alive after the server coarsened terrain demand.
-  - Checkpoint: explicit coarsening eviction/release regression test; full
-    browser suite — 173 passed.
-- [x] Retire coarse upscaling sources as soon as their currently demanded
-  descendants have been materialized from ancestor crops. Chopped child
-  textures now count as replacement coverage, and retirement releases the
-  ancestor texture cache entry instead of preserving a backup layer.
-  - Checkpoint: focused crop/coverage lifecycle tests — 5 passed; full browser
-    suite — 174 passed.
-- [x] Remove the `sweepStaleParents` no-op from the terrain lifecycle,
-  reconciliation, texture maintenance, diagnostics, and test mocks. Chopped
-  child coverage is the sole owner of parent retirement.
-  - Checkpoint: retirement and terrain-priority suites — 92 passed; full
-    browser suite — 175 passed.
+- [x] Make Flask terrain demand stateless. Each response is only the latest
+  camera heatmap; Flask retains no previous-LOD set and owns no browser
+  residency or retirement state.
+- [x] Centralize browser mesh retirement in one heatmap residency sweep.
+  Response reconciliation and asynchronous texture arrivals may invoke the
+  sweep, but cannot independently evict ancestors or descendants.
+- [x] Keep a stale parent or fine tile rendered until the replacement requested
+  by the latest heatmap has textured coverage. Reversing direction immediately
+  protects every tile in the newest heatmap, including `12-1398-779`.

@@ -28,11 +28,9 @@ export function textureRetryDelay(attempt, baseMs = 2000, maxMs = 30000) {
 }
 
 export function scoreTextureTiles(tiles, priorityForTile, maxPriority, refinementBias = 0.12) {
-  const tileIds = new Set();
   const scored = [];
   for (const tile of tiles) {
     if (!tile?.id || !tile?.bbox) continue;
-    tileIds.add(tile.id);
     const priority = priorityForTile(tile);
     if (priority <= maxPriority) {
       scored.push({
@@ -45,7 +43,7 @@ export function scoreTextureTiles(tiles, priorityForTile, maxPriority, refinemen
   // Refine within a nearby tile band before spending capacity on another
   // coarse covering tile. Spatial priority remains dominant over large gaps.
   scored.sort((a, b) => a.score - b.score || a.prio - b.prio);
-  return { tileIds, scored };
+  return { scored };
 }
 
 export function createTileHistory({ emit, maxTiles = 1000, maxEvents = 40 }) {
@@ -59,12 +57,16 @@ export function createTileHistory({ emit, maxTiles = 1000, maxEvents = 40 }) {
     const events = history.get(tileId);
     events.push(`${timestamp}s ${message}`);
     if (events.length > maxEvents) events.shift();
-    // Normal tile chatter is intentionally debug-only, but evictions must be
-    // durable diagnostics. The client logger defaults to an info threshold,
-    // which previously meant every eviction vanished before reaching
-    // client_debug.log and its live ring.
-    const level = message.startsWith('evict') ? 'info' : 'debug';
-    emit({ tileId, msg: message, ts: `${timestamp}s` }, level);
+    // Evictions were promoted to info so they would survive the client
+    // logger's info threshold, but LOD oscillation evicts a few hundred tiles
+    // per response — enough that this became the largest log source in the
+    // app, and every entry pays a stringify/parse clone from inside retire().
+    //
+    // The durable signal is kept elsewhere: fetchTiles.diff carries `released`
+    // as the per-response eviction count, and `history` below retains the
+    // per-tile trail for the tile inspector at any level. Only the redundant
+    // per-tile transmission is dropped.
+    emit({ tileId, msg: message, ts: `${timestamp}s` }, 'debug');
   };
   return { history, log };
 }

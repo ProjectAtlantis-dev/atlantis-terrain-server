@@ -169,12 +169,32 @@ class AssetCatalogTest(unittest.TestCase):
         natural = _trail_color(sampled, natural=True)
         self.assertLess(sum(constructed), sum(sampled))
         self.assertLess(sum(natural), sum(sampled))
-        self.assertGreater(sum(natural), sum(constructed))
-        self.assertLess(
+        self.assertLess(sum(natural), sum(constructed))
+        self.assertGreater(
             sum(abs(actual - base) for actual, base in zip(natural, sampled)),
             sum(abs(actual - base) for actual, base in zip(constructed, sampled)),
         )
         self.assertEqual(natural.index(max(natural)), sampled.index(max(sampled)))
+        self.assertGreater(
+            natural[1] * sampled[2],
+            sampled[1] * natural[2],
+        )
+
+    def test_natural_trail_remains_visible_over_olive_terrain(self):
+        sampled = (105, 92, 57)
+        natural = _trail_color(sampled, natural=True)
+        # With the normal path alpha (180/255), this leaves roughly 20% net
+        # value contrast instead of the former single-digit grey-line change.
+        composited = tuple(
+            round(base * (1 - 180 / 255) + trail * (180 / 255))
+            for base, trail in zip(sampled, natural)
+        )
+        self.assertGreater(
+            max(base - painted for base, painted in zip(sampled, composited)),
+            15,
+        )
+        self.assertGreater(composited[0], composited[1])
+        self.assertGreater(composited[1], composited[2])
 
     def test_building_color_comes_from_deepest_cached_texture(self):
         db = sqlite3.connect(":memory:")

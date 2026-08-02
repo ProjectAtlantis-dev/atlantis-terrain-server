@@ -16,18 +16,23 @@ const CACHE_LIMIT = 384;
 export function createSurfaceFieldStore({
   fetchImpl = (...args) => fetch(...args),
   log = () => {},
+  evictionGate = null,
 } = {}) {
   const entries = new Map(); // tileId -> { texture, fields }
   const inFlight = new Map();
   const failed = new Set();
 
   function evictOverflow() {
+    if (evictionGate?.enabled === false) return;
     while (entries.size > CACHE_LIMIT) {
       const [oldestId, oldest] = entries.entries().next().value;
       entries.delete(oldestId);
       oldest.texture?.dispose?.();
     }
   }
+  evictionGate?.onChange?.(enabled => {
+    if (enabled) evictOverflow();
+  });
 
   function decode(bitmap) {
     const size = bitmap.width;

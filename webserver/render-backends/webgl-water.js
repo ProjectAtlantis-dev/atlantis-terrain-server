@@ -97,6 +97,7 @@ const BATHY_GLSL = /* glsl */ `
   uniform sampler2D uBathy;    // top-down capture: R = local z, G = image brightness
   uniform vec2 uBathyCenter;
   uniform float uBathyExtent;
+  uniform float uWaterline;
   uniform vec2 uWindDir;       // local xy, direction the wind blows toward
   uniform float uFetchRamp;    // metres of open water upwind for a full sea
                                // state; 0 disables the lee-shore calm zone
@@ -107,6 +108,7 @@ const BATHY_GLSL = /* glsl */ `
     vec2 uv = (p - uBathyCenter) / uBathyExtent + 0.5;
     float inB = step(abs(uv.x - 0.5), 0.5) * step(abs(uv.y - 0.5), 0.5);
     vec4 b = texture2D(uBathy, uv);
+    b.r -= uWaterline;
     return mix(vec4(-5.0, 0.0, 0.0, 0.0), b, b.a * inB);
   }
 
@@ -189,10 +191,8 @@ const WATER_VERTEX = /* glsl */ `
     disp += detiledDisp(uDisp1, gridXY / uL.y) * f1;
     disp += detiledDisp(uDisp2, gridXY / uL.z) * f2;
 
-    // lee-shore fetch scales the whole displacement field. LINEAR in the
-    // open-water fraction: the physical sqrt growth curve kept ~70% wave
-    // amplitude across most of the band and the calm zone never read as
-    // calm — flat presentation beats fidelity here.
+    // Lee-shore fetch scales the displacement field. Shallow column depth
+    // deliberately does not flatten the waves.
     vFetch = fetchFractionAt(gridXY);
     disp *= vFetch;
 
@@ -235,6 +235,8 @@ const WATER_FRAGMENT = /* glsl */ `
   uniform float uOpacity;      // base veil opacity of the surface body
   uniform float uReflect;      // sky-reflection gain (fjord walls occlude sky)
   uniform float uGlintStrength; // direct-sun glitter gain
+  uniform float uShoreFoamDepth;
+  uniform float uShoreFoamStrength;
   uniform float uBathyTexel;   // world metres per bathy texel
   uniform float uAbsorb;       // Beer-Lambert absorption, 1/m of water column
   uniform float uNorthCliffReflectionPadding; // max reflection setback, metres
@@ -438,8 +440,8 @@ const WATER_FRAGMENT = /* glsl */ `
                    + max(D1.w - dot(D1.xy, D1.xy), 0.0) * f1 * f1
                    + max(D2.w - dot(D2.xy, D2.xy), 0.0) * f2 * f2;
 
-    // lee-shore fetch: slopes scale like amplitude (the vertex stage scaled
-    // the geometry by the same linear factor), variance like amplitude
+    // Lee-shore fetch damping: slopes scale like amplitude (the vertex stage
+    // scaled geometry by the same linear factor), variance like amplitude
     // squared. The micro-ripples get their own faster ramp: wind re-textures
     // a lee shore within the first stretch of open water, long before swell.
     // slopeVarFull keeps the FULL-fetch variance (including the micro energy
@@ -451,11 +453,11 @@ const WATER_FRAGMENT = /* glsl */ `
     // pixel-scale temporal glitter, and killing them by ~150 m left nothing
     // but smooth sheen from altitude.
     float microFade = 1.0 / (1.0 + d * 0.004);
-    float fetchAmp = vFetch;
+    float waveAmp = vFetch;
     // Calm is not flat: even directly behind a lee shore, retain a small
-    // wind-ripple field.  The fetch mask owns the swell amplitude; using it
-    // as an on/off switch for capillary detail made the calm band lose its
-    // moving normals and therefore read as matte water.
+    // wind-ripple field. The fetch gate owns the swell; using it as
+    // an on/off switch for capillary detail made calm water lose its moving
+    // normals and therefore read as matte water.
     float microGate = mix(
       ${WATER_RENDER_CONTRACT.microGateMinimum.toFixed(2)},
       1.0,
@@ -467,7 +469,7 @@ const WATER_FRAGMENT = /* glsl */ `
     );
     float slopeVarFull = slopeVar
       + 0.5 * (0.35 * uWindFactor) * (0.35 * uWindFactor) * (1.0 - microFade);
-    slope *= fetchAmp;
+    slope *= waveAmp;
     slopeVar *= vFetch * vFetch;
 
     // micro-ripple detail for near/mid-field sparkle; its slope energy
@@ -502,10 +504,9 @@ const WATER_FRAGMENT = /* glsl */ `
     );
     Ns = normalize(vec3(Ns.xy * facetGain, Ns.z));
 
-    // swell-phase elevation, used by the crest scatter term below.
-    // (The whitecap/foam system that lived here was removed at the user's
-    // request — repeated attempts read as garbage from altitude. The sim's
-    // foam passes went with it; the surface is waves + light only.)
+    // Swell-phase elevation, used by crest sparkle and the lightweight
+    // shallow-water breaker term below. There is deliberately no persistence
+    // buffer: depth, crest physics, and moving noise are sufficient here.
     float hN = clamp(vHeight / max(uHs * 0.5, 0.05), -1.0, 1.5);
 
     // ---- lighting ---------------------------------------------------------
@@ -587,15 +588,13 @@ const WATER_FRAGMENT = /* glsl */ `
     // away from the sun path — no hard fetch gate needed.
     spec *= 0.06 / (0.06 + slopeVarFull);
 
-    // Crest sparkle, not foam. Reuse the three physical signals that made
-    // plausible whitecap *locations*—high swell phase, a steep advancing
-    // face, and horizontal compression—but emit only reflected sun. There
-    // is no persistence buffer, breakup texture, white albedo, or residue.
-    // The narrow N.H term breaks crest rows into momentary facet flashes.
+    // Crest sparkle. Reuse high swell phase, a steep advancing face, and
+    // horizontal compression. The narrow N.H term breaks crest rows into
+    // momentary facet flashes.
     float J = 1.0 + ((D0.z - 1.0)
             + (D1.z - 1.0) * mix(f1, 1.0, 0.6)
-            + (D2.z - 1.0) * f2 * 0.5) * fetchAmp;
-    vec2 crestSlope = (D0.xy + D1.xy * 0.6) * fetchAmp;
+            + (D2.z - 1.0) * f2 * 0.5) * waveAmp;
+    vec2 crestSlope = (D0.xy + D1.xy * 0.6) * waveAmp;
     float faceSteep = max(-dot(crestSlope, uWindDir), 0.0);
     float crestTop = smoothstep(0.05, 0.55, hN);
     float advancingFace = smoothstep(0.025, 0.11, faceSteep);
@@ -628,7 +627,7 @@ const WATER_FRAGMENT = /* glsl */ `
     // facet lighting from the SWELL slope (cascades 0+1, chop excluded):
     // sunward ridge faces brighten, leeward faces darken. Using the full
     // normal here let metre-scale chop bury the dominant ridge trains.
-    vec2 swellSlope = (D0.xy + D1.xy * f1 * 0.5) * facetGain * fetchAmp;
+    vec2 swellSlope = (D0.xy + D1.xy * f1 * 0.5) * facetGain * waveAmp;
     vec3 Nsw = normalize(vec3(-swellSlope.x, -swellSlope.y, 1.0));
     float facet = (max(dot(Nsw, L), 0.0) - max(L.z, 0.0)) * (1.0 - 0.65 * uCloud);
 
@@ -677,8 +676,8 @@ const WATER_FRAGMENT = /* glsl */ `
     const float reflectionGain = 0.333333;
     float refl = fresnel * uReflect * bottomReflection * ambientReflection
                * bakedCliffVisibility * reflectionGain;
-    // Fetch changes surface roughness, not how reflective water is.  The
-    // retained micro-ripple normals keep the lee band from becoming a flat
+    // Fetch damping changes surface roughness, not how reflective water is.
+    // Retained micro-ripple normals keep calm regions from becoming a flat
     // oblique mirror, while Fresnel still makes calm water properly shiny.
     float a = bodyW + refl * (1.0 - bodyW);
     // Only the explicit surface opacity emits body colour. The extra wall
@@ -702,6 +701,59 @@ const WATER_FRAGMENT = /* glsl */ `
     // darkness as the cheap local occlusion proxy for direct sun glint.
     accum += spec * bottomReflection * northCliffReflection * uGlintStrength;
 
+    // Shore-break sparkle. Shoreline proximity is the only hard gate; wave
+    // direction and face activity are soft biases because coarse bathymetry
+    // and directional spreading make exact alignment too brittle.
+    float foamDepth = max(uShoreFoamDepth, 1e-4);
+    float shallowFoam = 1.0 - smoothstep(foamDepth * 0.25, foamDepth, colDepth);
+    shallowFoam = mix(shallowFoam, 0.0, step(uShoreFoamDepth, 0.0));
+    float waterCoverage = bathySample.a
+      * (1.0 - smoothstep(-0.05, 0.15, seabed));
+    vec2 shoreNormal = normalize(sgrad + vec2(1e-5, 0.0));
+    float shoreline = smoothstep(0.012, 0.070, length(sgrad));
+    float shoreExposure = mix(
+      0.35,
+      1.0,
+      smoothstep(-0.25, 0.50, dot(uWindDir, shoreNormal))
+    );
+    float impactFace = mix(
+      0.30,
+      1.0,
+      smoothstep(0.006, 0.045, faceSteep)
+    ) * mix(0.55, 1.0, crestTop);
+    float shoreWaveAction = shoreline * shoreExposure * impactFace;
+    vec2 foamCrossWind = vec2(uWindDir.y, -uWindDir.x);
+    float sparkleFlecks = smoothstep(
+      0.64,
+      0.86,
+      vnoise(pxy * 0.29 + foamCrossWind * uTime * 0.75)
+    );
+    float foamDistance = 1.0 - smoothstep(
+      ${WATER_RENDER_CONTRACT.shoreFoamDistanceStartM.toFixed(1)},
+      ${WATER_RENDER_CONTRACT.shoreFoamDistanceEndM.toFixed(1)},
+      d
+    );
+    float shoreSparkle = min(
+      max(uShoreFoamStrength, 0.0) * waterCoverage * shallowFoam
+        * shoreWaveAction * sparkleFlecks * foamDistance,
+      ${WATER_RENDER_CONTRACT.shoreFoamAlphaMaximum.toFixed(2)}
+    );
+    // The flecks only describe where broken shoreline water can contribute.
+    // Their brightness has no procedural pulse or minimum floor: use a
+    // broader GGX distribution for the unresolved facets in broken water,
+    // while the moving water normal, sun/view half-vector, and Fresnel term
+    // still determine whether each patch can reflect the sun.
+    float shoreAx = max(sqrt(ax2), 0.18);
+    float shoreAy = max(sqrt(ay2), 0.28);
+    vec3 shoreSunGlint = uGlintColor
+      * ggxAniso(H, N, Twind, Bwind, shoreAx, shoreAy)
+      * fresL * smoothstep(0.0, 0.06, L.z)
+      / (4.0 * max(NdotV, 0.1) * max(dot(N, L), 0.1));
+    // The background/reflection occlusion masks collapse at the land-water
+    // boundary and incorrectly erased this path. A breaker facet sits on the
+    // optical surface, so shoreline coverage already supplies its mask.
+    accum += shoreSunGlint * shoreSparkle * uGlintStrength * 2.4;
+
     // no in-shader haze: scene fog + the aerial perspective pass own that
     gl_FragColor = vec4(accum * uRadiance, clamp(a, 0.0, 1.0));
     #include <fog_fragment>
@@ -710,12 +762,14 @@ const WATER_FRAGMENT = /* glsl */ `
 
 export function createWebGLWater({
   renderer,
+  gpuProfiler = null,
   geometry,
   resolution = 256,
   bathySize = 1024,
   bathyExtent = 30000,
 } = {}) {
   const sim = new WebGLWaterSimulation(renderer, { resolution });
+  gpuProfiler?.wrapMethod?.(sim, 'update', 'water.fft');
 
   const uniforms = {
     ...THREE.UniformsUtils.clone(THREE.UniformsLib.fog),
@@ -744,10 +798,13 @@ export function createWebGLWater({
     uOpacity: { value: 0 },
     uReflect: { value: 0.4 },
     uGlintStrength: { value: 1 },
+    uShoreFoamDepth: { value: 3.5 },
+    uShoreFoamStrength: { value: 0.7 },
     uBathy: { value: null },
     uBathyCenter: { value: new THREE.Vector2() },
     uBathyExtent: { value: bathyExtent },
     uBathyTexel: { value: bathyExtent / bathySize },
+    uWaterline: { value: 0 },
     uAbsorb: { value: 0.25 },
     uFetchRamp: { value: 3000 },
     uNorthCliffReflectionPadding: { value: NORTH_CLIFF_REFLECTION_MAX_PADDING_M },
@@ -878,7 +935,10 @@ export function createWebGLWater({
       uniforms.uOpacity.value = params.opacity;
       uniforms.uReflect.value = params.reflectivity;
       uniforms.uGlintStrength.value = Math.max(0, params.glintStrength ?? 1);
+      uniforms.uShoreFoamDepth.value = Math.max(0, params.shoreFoamDepth ?? 3.5);
+      uniforms.uShoreFoamStrength.value = Math.max(0, params.shoreFoamStrength ?? 0.7);
       uniforms.uAbsorb.value = params.absorption;
+      uniforms.uWaterline.value = params.waterline ?? 0;
       uniforms.uFetchRamp.value = Math.max(0, params.shoreFetchRamp ?? 3000);
       uniforms.uNorthCliffReflectionPadding.value = Math.max(
         0,
@@ -897,6 +957,11 @@ export function createWebGLWater({
       const prevSortObjects = renderer.sortObjects;
       renderer.getClearColor(prevClearColor);
       const prevVisible = mesh.visible;
+      // This capture is the largest remaining in-frame stall, and its three
+      // phases fail for different reasons: preparation walks the tile list,
+      // the draw can stall on the GPU, and restoration touches every tile
+      // again. Time them apart so the next capture names its own cost.
+      const captureStartedAt = performance.now();
       const restoreTerrainTiles = prepareBathymetryTerrainTiles(terrainRoot);
       const renderCallbacks = [];
       const stats = { tiles: 0, textured: 0, untexturedIds: [] };
@@ -921,11 +986,14 @@ export function createWebGLWater({
       mesh.visible = false;
       renderer.sortObjects = true;
       renderer.setClearColor(0x000000, 0);
+      const prepareMs = performance.now() - captureStartedAt;
+      const drawStartedAt = performance.now();
       try {
         renderer.setRenderTarget(bathyTarget);
         renderer.clear();
         renderer.render(scene, bathyCamera);
       } finally {
+        stats.drawMs = Number((performance.now() - drawStartedAt).toFixed(1));
         renderer.setRenderTarget(prevTarget);
         renderer.setClearColor(prevClearColor, prevAlpha);
         scene.overrideMaterial = prevOverride;
@@ -937,6 +1005,11 @@ export function createWebGLWater({
       }
       uniforms.uBathyCenter.value.set(centerXY.x, centerXY.y);
       uniforms.uBathyExtent.value = bathyExtent;
+      stats.prepareMs = Number(prepareMs.toFixed(1));
+      stats.totalMs = Number((performance.now() - captureStartedAt).toFixed(1));
+      stats.restoreMs = Number(
+        (stats.totalMs - stats.prepareMs - stats.drawMs).toFixed(1),
+      );
       return stats;
     },
 

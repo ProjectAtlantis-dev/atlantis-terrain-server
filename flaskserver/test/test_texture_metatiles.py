@@ -21,7 +21,9 @@ from texture import (
     write_texture,
 )
 import serve_flask
-from terrain_config import MAX_TILE_DEPTH, WMS_CONTRACT_DEPTH
+from terrain_config import (
+    MAX_TILE_DEPTH, WMS_CONTRACT_DEPTH, WMS_TEXTURE_INSPECT_MIN_DEPTH,
+)
 
 
 def _encoded_image(array, image_format="PNG"):
@@ -105,6 +107,8 @@ class TextureMetatileFetchTest(unittest.TestCase):
         self.old_fetch = serve_flask._fetch_dataforsyningen_texture
         self.old_split = serve_flask._split_texture_metatile
         self.old_harmonize = serve_flask._harmonize_texture_metatile
+        self.old_detector = serve_flask._metatile_is_upsampled
+        serve_flask._metatile_is_upsampled = lambda _jpeg: (False, 0.8, 0.8)
         serve_flask._tile_bbox = lambda depth, column, row: (
             depth, column, row, depth + column + row
         )
@@ -114,6 +118,7 @@ class TextureMetatileFetchTest(unittest.TestCase):
         serve_flask._fetch_dataforsyningen_texture = self.old_fetch
         serve_flask._split_texture_metatile = self.old_split
         serve_flask._harmonize_texture_metatile = self.old_harmonize
+        serve_flask._metatile_is_upsampled = self.old_detector
 
     def test_spec_groups_sixteen_quadtree_tiles_under_grandparent(self):
         metatile_id, bbox, resolution, children = serve_flask._texture_metatile_spec(
@@ -154,6 +159,97 @@ class TextureMetatileFetchTest(unittest.TestCase):
         self.assertEqual(len(children), 16)
         self.assertEqual(children["12-1404-764"], b"0-0")
         self.assertEqual(children["12-1407-765"], b"3-1")
+
+    def test_fetch_inspects_provider_detail_at_d11_but_not_d10(self):
+        detector = Mock(return_value=(False, 0.56, 0.28))
+        serve_flask._metatile_is_upsampled = detector
+        serve_flask._fetch_dataforsyningen_texture = (
+            lambda bbox, resolution, lossless=False: (b"meta", None)
+        )
+        serve_flask._harmonize_texture_metatile = (
+            lambda jpeg, child_resolution, grid_size: jpeg
+        )
+        serve_flask._split_texture_metatile = (
+            lambda jpeg, child_resolution, grid_size: {
+                (column, row): b"child"
+                for column in range(grid_size)
+                for row in range(grid_size)
+            }
+        )
+
+        serve_flask._fetch_texture_metatile("10-337-205")
+        detector.assert_not_called()
+        serve_flask._fetch_texture_metatile("11-674-411")
+        detector.assert_called_once_with(b"meta")
+        self.assertEqual(WMS_TEXTURE_INSPECT_MIN_DEPTH, 11)
+
+    def test_d11_provider_blowup_is_flagged_for_explicit_upscale_provenance(self):
+        serve_flask._metatile_is_upsampled = lambda _jpeg: (True, 0.2, 0.04)
+        serve_flask._fetch_dataforsyningen_texture = (
+            lambda bbox, resolution, lossless=False: (b"meta", None)
+        )
+
+        children, error = serve_flask._fetch_texture_metatile("11-674-411")
+
+        self.assertIsNone(children)
+        self.assertEqual(error, "wms_upsampled")
+
+    def test_parent_relative_check_rejects_quad_when_no_child_adds_detail(self):
+        db = sqlite3.connect(":memory:")
+        init_textures(db)
+        db.execute(
+            "INSERT INTO textures (tile_id, source, texture, updated_at) "
+            "VALUES ('10-337-204', 'dataforsyningen_metatile4h2', ?, 'now')",
+            (b"parent",),
+        )
+        children = {
+            "11-674-408": b"00",
+            "11-674-409": b"01",
+            "11-675-408": b"10",
+            "11-675-409": b"11",
+        }
+        scores = {(0, 0): 0.89, (0, 1): 0.88, (1, 0): 0.87, (1, 1): 0.90}
+
+        with patch(
+            "texture.texture_quad_adds_parent_detail",
+            return_value=(False, scores),
+        ):
+            accepted, blowups = serve_flask._partition_texture_parent_blowups(
+                db, children,
+            )
+
+        self.assertEqual(accepted, {})
+        self.assertEqual(blowups[0][0], "11-674-408")
+        self.assertEqual(blowups[0][1], "10-337-204")
+        db.close()
+
+    def test_parent_relative_check_keeps_quad_when_one_child_adds_detail(self):
+        db = sqlite3.connect(":memory:")
+        init_textures(db)
+        db.execute(
+            "INSERT INTO textures (tile_id, source, texture, updated_at) "
+            "VALUES ('10-337-204', 'dataforsyningen_metatile4h2', ?, 'now')",
+            (b"parent",),
+        )
+        children = {
+            "11-674-408": b"00",
+            "11-674-409": b"01",
+            "11-675-408": b"10",
+            "11-675-409": b"11",
+        }
+        scores = {(0, 0): 0.89, (0, 1): 0.88, (1, 0): 0.97, (1, 1): 0.90}
+
+        with patch(
+            "texture.texture_quad_adds_parent_detail",
+            return_value=(True, scores),
+        ):
+            accepted, blowups = serve_flask._partition_texture_parent_blowups(
+                db, children,
+            )
+
+        self.assertEqual(accepted, children)
+        self.assertEqual(blowups, [])
+        db.close()
 
     def test_store_upgrades_legacy_children_without_clobbering_terminal_rows(self):
         db = sqlite3.connect(":memory:")
@@ -332,16 +428,27 @@ class TextureMetatileFetchTest(unittest.TestCase):
         sources = dict(db.execute("SELECT tile_id, source FROM textures"))
         self.assertEqual(sources["13-20-40"], "cooked_upscale")
 
-    def test_clobbering_terminal_source_logs_error_not_warning(self):
+    def test_ancestor_crop_cannot_clobber_final_provider_texture(self):
         db = sqlite3.connect(":memory:")
         init_textures(db)
-        jpeg = _encoded_image(np.full((8, 8, 3), 128), "JPEG")
-        write_texture(db, "13-5-5", jpeg, "cooked_upscale")
+        genuine = _encoded_image(np.full((8, 8, 3), 128), "JPEG")
+        fallback = _encoded_image(np.full((8, 8, 3), 32), "JPEG")
+        write_texture(db, "12-1350-825", genuine, "dataforsyningen_metatile4h2")
 
         with self.assertLogs("terrain.tex", level="ERROR") as captured:
-            write_texture(db, "13-5-5", jpeg, "ancestor_crop")
+            written = write_texture(db, "12-1350-825", fallback, "ancestor_crop")
+
+        source, texture = db.execute(
+            "SELECT source, texture FROM textures WHERE tile_id = '12-1350-825'"
+        ).fetchone()
+        self.assertFalse(written)
+        self.assertEqual(source, "dataforsyningen_metatile4h2")
+        self.assertEqual(texture, genuine)
         self.assertTrue(
-            any("TEX CLOBBER-TERMINAL" in line for line in captured.output)
+            any(
+                "TEX CLOBBER-TERMINAL" in line and "REFUSED" in line
+                for line in captured.output
+            )
         )
 
     def test_audit_flags_only_stale_unattended_temporary_rows(self):

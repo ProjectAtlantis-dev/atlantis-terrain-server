@@ -40,6 +40,17 @@ export function createTerrainBackend({
   scene.fog = null;
   scene.fogNode = fog(color(0x000000), densityFogFactor(fogDensity));
 
+  function renderDiagnosticOverlay(overlayScene, camera) {
+    if (overlayScene == null) return;
+    const previousAutoClear = renderer.autoClear;
+    renderer.autoClear = false;
+    try {
+      renderer.render(overlayScene, camera);
+    } finally {
+      renderer.autoClear = previousAutoClear;
+    }
+  }
+
   bootLog('renderer.ready', {
     backend: 'webgpu', width, height, pixelRatio,
     shadowMap: renderer.shadowMap.type,
@@ -85,7 +96,7 @@ export function createTerrainBackend({
     resize(nextWidth, nextHeight) {
       renderer.setSize(nextWidth, nextHeight);
     },
-    renderMap(scene, camera, background) {
+    renderMap(scene, camera, background, overlayScene = null) {
       if (!ready) return;
       const previousBackground = scene.background;
       const previousBackgroundNode = scene.backgroundNode;
@@ -93,15 +104,17 @@ export function createTerrainBackend({
       scene.backgroundNode = null;
       try {
         renderer.render(scene, camera);
+        renderDiagnosticOverlay(overlayScene, camera);
       } finally {
         scene.background = previousBackground;
         scene.backgroundNode = previousBackgroundNode;
       }
     },
-    renderScene(scene, camera) {
+    renderScene(scene, camera, overlayScene = null) {
       if (!ready) return;
       if (postProcessing != null) postProcessing.render();
       else renderer.render(scene, camera);
+      renderDiagnosticOverlay(overlayScene, camera);
     },
     configureDemandRendering(configuration) {
       demandRendering = configuration;

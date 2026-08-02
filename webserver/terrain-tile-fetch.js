@@ -16,6 +16,7 @@ export function buildTerrainTilesRequest({
   originY,
   queryX,
   queryY,
+  buildingsHash = null,
   cameraSnapshot = {},
 }) {
   const hasGridPosition = Number.isFinite(queryX) && Number.isFinite(queryY);
@@ -25,8 +26,13 @@ export function buildTerrainTilesRequest({
   // LOD altitude is height above the rendered ground, not geodetic/ASL
   // camera height. Keep the parameter name explicit so a mountainside
   // camera at 344 m ASL and 8 m AGL is not incorrectly capped at D13.
-  let url = `/api/tiles?${positionQuery}&agl=${altitude}&heading=${heading}&range=${range}`;
+  // Binary keeps float32 elevations out of JSON: base64 inflated them by a
+  // third and made the main-thread parse scale with the whole payload.
+  let url = `/api/tiles?${positionQuery}&agl=${altitude}&heading=${heading}&range=${range}&format=binary`;
   if (!isFirstLoad || frameOffsetReady) url += `&ox=${originX}&oy=${originY}`;
+  // Echoing the digest lets the server drop an unchanged footprint set,
+  // which is the bulk of the remaining JSON once elevations go binary.
+  if (buildingsHash) url += `&buildingsHash=${buildingsHash}`;
   return {
     url,
     logDetails: {

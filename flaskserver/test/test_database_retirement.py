@@ -92,6 +92,17 @@ def _seed_legacy_db(path):
 
 
 class RetiredTerrainMigrationTest(unittest.TestCase):
+    def test_open_db_indexes_tile_addresses_for_depth_scoped_reads(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db = open_db(str(Path(directory) / "terrain.db"))
+
+            columns = [
+                row[2]
+                for row in db.execute("PRAGMA index_info(tiles_depth_col_row)")
+            ]
+            self.assertEqual(columns, ["depth", "col", "row"])
+            db.close()
+
     def test_procedural_cook_classifier_module_stays_retired(self):
         classifier_path = Path(__file__).resolve().parents[1] / "cook_classifier.py"
         self.assertFalse(classifier_path.exists())
@@ -117,7 +128,7 @@ class RetiredTerrainMigrationTest(unittest.TestCase):
                 db.execute(
                     "SELECT value FROM metadata WHERE key = 'schema_version'"
                 ).fetchone(),
-                ("5",),
+                ("18",),
             )
             columns = {row[1] for row in db.execute("PRAGMA table_info(tiles)")}
             self.assertNotIn("has_sealevel_water", columns)
@@ -149,6 +160,51 @@ class RetiredTerrainMigrationTest(unittest.TestCase):
                     "SELECT source, heightmap FROM tiles WHERE tile_id = '11-1-1'"
                 ).fetchone(),
                 ("empty", None),
+            )
+            db.close()
+
+    def test_v18_discards_cached_arctic_ocean_plates_only(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "terrain.db"
+            db = open_db(str(path))
+            confidence = np.full((GRID_N, GRID_N), 6, dtype=np.uint8)
+            ocean = np.linspace(
+                -0.3, -0.2, GRID_N * GRID_N, dtype=np.float32
+            ).reshape(GRID_N, GRID_N)
+            land = ocean + np.float32(2.0)
+            for tile_id, values in (("10-1-1", ocean), ("10-1-2", land)):
+                db.execute(
+                    "INSERT INTO tiles "
+                    "(tile_id, depth, col, row, x_min, y_min, x_max, y_max, "
+                    "parent_id, geometric_error, source, updated_at, heightmap, "
+                    "confidence_map) VALUES (?, 10, 1, 1, 0, 0, 1, 1, NULL, "
+                    "1, 'arcticdem_10m', 'now', ?, ?)",
+                    (tile_id, _compress_array(values), _compress_array(confidence)),
+                )
+            db.execute(
+                "UPDATE metadata SET value = '17' WHERE key = 'schema_version'"
+            )
+            db.commit()
+            db.close()
+
+            db = open_db(str(path))
+            rows = dict(
+                db.execute(
+                    "SELECT tile_id, source FROM tiles "
+                    "WHERE tile_id IN ('10-1-1', '10-1-2')"
+                )
+            )
+            self.assertEqual(rows["10-1-1"], "empty")
+            self.assertEqual(rows["10-1-2"], "arcticdem_10m")
+            self.assertIsNone(
+                db.execute(
+                    "SELECT heightmap FROM tiles WHERE tile_id = '10-1-1'"
+                ).fetchone()[0]
+            )
+            self.assertIsNotNone(
+                db.execute(
+                    "SELECT heightmap FROM tiles WHERE tile_id = '10-1-2'"
+                ).fetchone()[0]
             )
             db.close()
 

@@ -22,7 +22,7 @@ TEXTURE SOURCE STATES:
 - dataforsyningen_metatile4h2: Primary source (SPOT 6/7, 1.6m/0.2m via
                                EPSG:3184), fetched/reprojected as an aligned
                                4x4 group with edge-driven color harmonization.
-- cooked_upscale:          Past WMS_CONTRACT_DEPTH only: the fetched metatile
+- cooked_upscale:          At D11+: the fetched metatile
                             carried no real detail beyond the level above
                             (provider blowup), so the tile was cooked from its
                             parent's final texture by terrain_upscale. Terminal
@@ -33,7 +33,7 @@ TEXTURE SOURCE STATES:
                             drops the cooked children so the next demand
                             re-cooks against the new parent.
 - write_texture() has an expected_upgrades whitelist. If you add a new source,
-  update that whitelist or you'll get TEX CLOBBER warnings.
+  update that whitelist or cross-source writes will be refused as clobbers.
 
 SEA / OCEAN TILES:
 - Sea detection is per-PIXEL in the frontend (elevation ≤ 1m → blue vertex color,
@@ -377,8 +377,8 @@ def init_textures(db):
         log_tex.info("Created table: textures")
 
 
-# Workflow endpoints: sources the pipeline must never replace. Overwriting
-# one is logged as an error by write_texture (see TEX CLOBBER-TERMINAL).
+# Workflow endpoints: sources the pipeline must never replace. Attempts are
+# refused and logged as errors by write_texture (see TEX CLOBBER-TERMINAL).
 TERMINAL_SOURCES = {
     "dataforsyningen_metatile4h2",
     "cooked_upscale",
@@ -452,7 +452,12 @@ def drop_procedural_children(db, tile_id):
 
 
 def write_texture(db, tile_id, jpeg_bytes, source):
-    """Store a JPEG texture blob in the database."""
+    """Store a JPEG texture blob without replacing a better source.
+
+    Returns False when the source transition is not part of the declared
+    upgrade chain. The conditional upsert also protects terminal rows when a
+    separate connection wins the race after the read below.
+    """
     existing = db.execute(
         "SELECT source, updated_at, length(texture) FROM textures WHERE tile_id = ?",
         (tile_id,)
@@ -513,25 +518,56 @@ def write_texture(db, tile_id, jpeg_bytes, source):
             ("dataforsyningen_metatile4h", "cooked_upscale"),
         }
         msg = (
-            f"{tile_id}: replacing {ex_source} "
-            f"({ex_updated}, {ex_size}b) with {source} ({len(jpeg_bytes)}b)"
+            f"REFUSED {tile_id}: preserving {ex_source} "
+            f"({ex_updated}, {ex_size}b), rejected {source} "
+            f"({len(jpeg_bytes)}b)"
         )
         if ex_source != source and (ex_source, source) not in expected_upgrades:
             if ex_source in TERMINAL_SOURCES:
                 # Terminal rows are workflow endpoints (finished provider
                 # detail, procedural cooks, confirmed no-coverage). Nothing in
-                # the normal pipeline replaces them — this is either a manual
-                # reset or a bug losing finished work.
+                # the normal pipeline replaces them. An explicit reset must
+                # remove the row first; an attempted replacement is a bug.
                 log_tex.error(f"[TEX CLOBBER-TERMINAL] {msg}")
             else:
                 log_tex.warning(f"[TEX CLOBBER] {msg}")
+            return False
     now = datetime.datetime.now(datetime.timezone.utc).isoformat()
-    db.execute(
-        "INSERT OR REPLACE INTO textures (tile_id, source, texture, updated_at) "
-        "VALUES (?, ?, ?, ?)",
+    cursor = db.execute(
+        "INSERT INTO textures (tile_id, source, texture, updated_at) "
+        "VALUES (?, ?, ?, ?) "
+        "ON CONFLICT(tile_id) DO UPDATE SET "
+        "source = excluded.source, texture = excluded.texture, "
+        "updated_at = excluded.updated_at "
+        "WHERE textures.source NOT IN "
+        "('dataforsyningen_metatile4h2', 'cooked_upscale', "
+        " 'ancestor_crop_nodata', 'ocean_nodata') "
+        "OR textures.source = excluded.source "
+        "OR (textures.source = 'ancestor_crop_nodata' "
+        "    AND excluded.source IN ('ancestor_crop', 'ocean_nodata')) "
+        "OR (textures.source = 'ocean_nodata' "
+        "    AND excluded.source IN "
+        "    ('dataforsyningen', 'dataforsyningen_metatile', "
+        "     'dataforsyningen_metatile4', 'dataforsyningen_metatile4h2'))",
         (tile_id, source, jpeg_bytes, now)
     )
     db.commit()
+    if cursor.rowcount == 0:
+        # A terminal row appeared after the initial read. The conditional
+        # upsert preserved it atomically; report the same integrity failure.
+        current = db.execute(
+            "SELECT source, updated_at, length(texture) FROM textures "
+            "WHERE tile_id = ?",
+            (tile_id,),
+        ).fetchone()
+        if current:
+            ex_source, ex_updated, ex_size = current
+            log_tex.error(
+                f"[TEX CLOBBER-TERMINAL] REFUSED {tile_id}: preserving "
+                f"{ex_source} ({ex_updated}, {ex_size}b), rejected {source} "
+                f"({len(jpeg_bytes)}b)"
+            )
+        return False
 
     # Cooked descendants are derived from this tile's texture: any real
     # (non-placeholder) change to it makes the whole procedural subtree stale
@@ -546,6 +582,7 @@ def write_texture(db, tile_id, jpeg_bytes, source):
                 f"[TEX] {tile_id}: parent changed to {source} — dropped stale "
                 f"procedural children for re-cook: {', '.join(stale)}"
             )
+    return True
 
 
 def read_texture(db, tile_id):
@@ -581,12 +618,66 @@ def texture_sources_in(db, tile_ids):
     return {r[0]: r[1] for r in rows}
 
 
-# A past-contract-depth metatile is a provider blowup when EITHER statistic
+# A D11+ metatile is a provider blowup when EITHER statistic
 # falls below its floor. Floors are empirical (synthetic real imagery scores
 # recon≈0.86 / spectral≈2.1; blowups ≤0.21 / ≤0.05, nearest-neighbour carve
-# 0.0 / 0.53); tune from the pair logged on every past-contract fetch.
+# 0.0 / 0.53); tune from the pair logged on every inspected fetch.
 METATILE_RECON_MIN = 0.35
 METATILE_SPECTRAL_MIN = 0.15
+
+# Parent-relative evidence is stronger than an intrinsic spectrum once JPEG
+# edges and metatile harmonization have been applied. Calibration against the
+# stored corpus leaves a wide gap: known cooked upscales score <=0.9243 while
+# known genuine deep provider tiles score >=0.9991. A D10 parent is worth
+# refining when at least one of its four D11 children clears this midpoint.
+PARENT_DETAIL_MIN = 0.96
+
+
+def texture_detail_over_parent_score(
+    child_bytes, parent_bytes, column_bit: int, row_bit: int,
+) -> float:
+    """Return the child's high-frequency content independent of its parent."""
+    from scipy.ndimage import gaussian_filter
+
+    with Image.open(io.BytesIO(child_bytes)) as child_image:
+        child = np.asarray(child_image.convert("L"), dtype=np.float32)
+    with Image.open(io.BytesIO(parent_bytes)) as parent_image:
+        parent = parent_image.convert("L")
+    if child.shape != (256, 256) or parent.size != (256, 256):
+        raise ValueError(
+            f"parent detail comparison requires 256px tiles; got "
+            f"child={child.shape}, parent={parent.size}"
+        )
+    left = int(column_bit) * 128
+    top = (1 - int(row_bit)) * 128
+    quadrant = parent.crop((left, top, left + 128, top + 128))
+    enlarged = np.asarray(
+        quadrant.resize((256, 256), Image.Resampling.BILINEAR),
+        dtype=np.float32,
+    )
+    child_high = child - gaussian_filter(child, 1.2)
+    parent_high = enlarged - gaussian_filter(enlarged, 1.2)
+    gain = float(
+        np.sum(child_high * parent_high)
+        / (np.sum(parent_high * parent_high) + 1e-9)
+    )
+    independent = child_high - gain * parent_high
+    score = float(
+        np.sqrt(np.mean(independent * independent))
+        / (np.sqrt(np.mean(child_high * child_high)) + 1e-9)
+    )
+    return score
+
+
+def texture_quad_adds_parent_detail(children, parent_bytes):
+    """Return whether any child quadrant contains real parent-independent detail."""
+    scores = {
+        offset: texture_detail_over_parent_score(
+            child_bytes, parent_bytes, offset[0], offset[1],
+        )
+        for offset, child_bytes in children.items()
+    }
+    return any(score >= PARENT_DETAIL_MIN for score in scores.values()), scores
 
 
 def metatile_upsample_scores(image_bytes):
@@ -611,7 +702,7 @@ def metatile_upsample_scores(image_bytes):
         return 1.0, 1.0
     full = Image.fromarray(gray, mode="F")
 
-    best_residual = None
+    best_residual = float("inf")
     for down_kernel in (Image.Resampling.LANCZOS, Image.Resampling.BOX):
         down = full.resize((width // 2, height // 2), down_kernel)
         for up_kernel in (
@@ -622,9 +713,7 @@ def metatile_upsample_scores(image_bytes):
         ):
             up = np.asarray(down.resize((width, height), up_kernel), dtype=np.float32)
             residual = float(np.sqrt(np.mean((gray - up) ** 2)))
-            best_residual = (
-                residual if best_residual is None else min(best_residual, residual)
-            )
+            best_residual = min(best_residual, residual)
     quarter = full.resize((width // 4, height // 4), Image.Resampling.LANCZOS)
     smooth = np.asarray(
         quarter.resize((width, height), Image.Resampling.LANCZOS), dtype=np.float32

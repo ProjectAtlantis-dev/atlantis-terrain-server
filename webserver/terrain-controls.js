@@ -1,3 +1,14 @@
+// Free flight has no terrain/land collision pass. Bathymetry is not
+// range-limited and can sit far below the retired synthetic -5 m seabed, so
+// imposing a global lower altitude clamp prevents underwater exploration.
+export const MAX_FREE_FLIGHT_ALTITUDE_M = 6000;
+
+export function clampFreeFlightAltitude(altitude, {
+  maxAltitude = MAX_FREE_FLIGHT_ALTITUDE_M,
+} = {}) {
+  return Math.min(maxAltitude, altitude);
+}
+
 export function applyMapDrag(controls, event, mouseSensitivity, panFactor) {
   if (controls.dragButton === 2) {
     const panStep = controls.mapZoom * mouseSensitivity * panFactor;
@@ -24,6 +35,40 @@ export function applyMapDrag(controls, event, mouseSensitivity, panFactor) {
   return 'rotate';
 }
 
+export function createRefocusPointerGuard({
+  graceMs = 250,
+  scheduleRelease = (callback, delay) => setTimeout(callback, delay),
+  cancelRelease = timer => clearTimeout(timer),
+} = {}) {
+  let armed = false;
+  let releaseTimer = null;
+
+  function clear() {
+    armed = false;
+    if (releaseTimer != null) cancelRelease(releaseTimer);
+    releaseTimer = null;
+  }
+
+  return {
+    arm() {
+      armed = true;
+      if (releaseTimer != null) cancelRelease(releaseTimer);
+      releaseTimer = null;
+    },
+    releaseSoon() {
+      if (!armed) return;
+      if (releaseTimer != null) cancelRelease(releaseTimer);
+      releaseTimer = scheduleRelease(clear, graceMs);
+    },
+    consume() {
+      if (!armed) return false;
+      clear();
+      return true;
+    },
+    dispose: clear,
+  };
+}
+
 export function installTerrainPointerControls({
   element,
   controls,
@@ -33,8 +78,18 @@ export function installTerrainPointerControls({
   onVehicleOrbit,
   onMapCameraChanged,
   onChanged = () => {},
+  windowTarget = window,
+  refocusGuard = createRefocusPointerGuard(),
 }) {
   const onMouseDown = event => {
+    // Clicking an inactive browser window can deliver focus, mousedown, and a
+    // small synthetic mousemove as one gesture. Consume that first mousedown;
+    // otherwise the synthetic delta becomes an unintended camera drag.
+    if (refocusGuard.consume()) {
+      controls.dragging = false;
+      controls.dragButton = 0;
+      return;
+    }
     controls.dragging = true;
     controls.dragButton = event.button;
     onChanged();
@@ -62,14 +117,27 @@ export function installTerrainPointerControls({
     controls.pitch = Math.max(-1.4, Math.min(1.2, controls.pitch));
     onChanged();
   };
+  const onWindowBlur = () => {
+    refocusGuard.arm();
+    if (!controls.dragging) return;
+    controls.dragging = false;
+    controls.dragButton = 0;
+    onChanged();
+  };
+  const onWindowFocus = () => refocusGuard.releaseSoon();
 
   element.addEventListener('mousedown', onMouseDown);
-  window.addEventListener('mouseup', onMouseUp);
-  window.addEventListener('mousemove', onMouseMove);
+  windowTarget.addEventListener('mouseup', onMouseUp);
+  windowTarget.addEventListener('mousemove', onMouseMove);
+  windowTarget.addEventListener('blur', onWindowBlur);
+  windowTarget.addEventListener('focus', onWindowFocus);
   return () => {
     element.removeEventListener('mousedown', onMouseDown);
-    window.removeEventListener('mouseup', onMouseUp);
-    window.removeEventListener('mousemove', onMouseMove);
+    windowTarget.removeEventListener('mouseup', onMouseUp);
+    windowTarget.removeEventListener('mousemove', onMouseMove);
+    windowTarget.removeEventListener('blur', onWindowBlur);
+    windowTarget.removeEventListener('focus', onWindowFocus);
+    refocusGuard.dispose();
   };
 }
 

@@ -2,23 +2,35 @@ import * as THREE from 'three';
 import { buildRadialGridGeometry } from './water-grid.js';
 import { createWaterPalette, computeWaterPalette } from './water-sky.js';
 import { NORTH_CLIFF_REFLECTION_MAX_PADDING_M } from './water-reflection-mask.js';
+import {
+  createOpticalWaterSurfaceRuntime,
+  DEFAULT_OPTICAL_WATER_DEPTH_M,
+  WATER_SURFACE_RENDER_ORDER,
+} from './water-optical-surface.js';
 
 // Backend-neutral fjord water orchestration: owns parameters, the camera-
 // local/sun-local frame math, and sim pacing. The backend supplies the
 // actual renderer work via createWater() (WebGL today; a WGSL/TSL port plugs
 // in behind the same interface). Backends without water simply don't
-// implement createWater and this runtime is inert. Colour inheritance needs
-// no orchestration: the surface is translucent and the seabed imagery —
-// which is satellite photography OF the water — shows through per-pixel.
+// implement createWater and this runtime is inert. Colour inheritance
+// orchestration now lives in the optical surface runtime: true bathymetry
+// remains at its measured depth while a color-only copy of the satellite
+// water footprint sits just below the dynamic surface.
 
 // Fjords are NOT fetch-limited: they are long enough to channel the east-west
 // winds, so the default sea state stays ocean-grade — wind along the fjord
 // axis. Do not pre-calm; the sliders exist for that.
-// (No foam/whitecap params: the foam system was removed — every presentation
-// read as garbage from altitude. Waves + light only.)
+// Shore sparkle is deliberately analytic and close-range only. The old foam
+// persistence simulation read as garbage from altitude; this version reuses
+// bathymetry and crest signals already sampled by the surface shader.
 export const DEFAULT_WATER_PARAMS = {
   enabled: true,           // hide/pause the dynamic surface when disabled;
                           // the underlying fjord imagery remains visible
+  opticalEnabled: true,    // independent diagnostic gate for the shallow
+                          // color/depth proxy consumed by Takram volumetrics
+  waterline: 0.5,          // terrainRoot-local metres
+  opticalDepth: DEFAULT_OPTICAL_WATER_DEPTH_M,
+                          // satellite-water colour plane below waterline
   windSpeed: 13,          // m/s
   windDirection: 90,      // degrees the wind blows toward (90 = east)
   fetchKm: 100,           // wave-growth fetch: sets the JONSWAP peak so a
@@ -29,6 +41,8 @@ export const DEFAULT_WATER_PARAMS = {
                           // counterpart of fetchKm (which stays global). This
                           // calms only wind-FROM-land shorelines, not the
                           // fjord as a whole — see the note above.
+  shoreFoamDepth: 3.5,    // metres: shallow sparkle fades out by here
+  shoreFoamStrength: 0.7,
   alignment: 1.0,         // directional spreading of the spectrum
   choppiness: 1.38,       // horizontal displacement scale
   amplitude: 1.0,
@@ -66,15 +80,23 @@ export function createWaterRuntime({
   getTextureVersion = null,
   log = null,
   params = { ...DEFAULT_WATER_PARAMS },
+  evictionGate = null,
 }) {
   const water = backend.createWater?.({ geometry: buildRadialGridGeometry(), log }) ?? null;
   if (!water?.mesh) {
     return {
-      enabled: false, params,
+      enabled: false, params, opticalSurface: null,
       applyWind() {}, update() {}, dispose() {}, setDebugMode() {},
     };
   }
+  water.mesh.renderOrder = WATER_SURFACE_RENDER_ORDER;
   terrainRoot.add(water.mesh);
+  const opticalSurface = createOpticalWaterSurfaceRuntime({
+    terrainRoot,
+    opticalDepth: params.opticalDepth,
+    onInversion: details => log?.('water.optical.inversion', details),
+    evictionGate,
+  });
 
   const palette = createWaterPalette();
   const rel = new THREE.Vector3();
@@ -99,14 +121,39 @@ export function createWaterRuntime({
   }
   applyWind();
 
-  function update({ dt, camera, visible }) {
+  function update({
+    dt,
+    camera,
+    visible,
+    opticalVisible = visible,
+  }) {
+    // The water block is the largest remaining in-frame stall and the depth
+    // capture was measured out of it, so time the rest of the phases here.
+    const timings = {};
+    const syncStartedAt = performance.now();
     water.mesh.visible = visible;
-    if (!visible) return;
+    // Camera position is needed before the visibility early-return so the
+    // optical surface can report build ordering relative to the viewer.
+    rel.copy(camera.position).sub(anchorPosition);
+    opticalSurface.sync({
+      visible: opticalVisible,
+      waterline: params.waterline ?? 0,
+      cameraX: rel.dot(east),
+      cameraY: rel.dot(north),
+    });
+    timings.opticalSync = performance.now() - syncStartedAt;
+    if (!visible) return timings;
 
     rel.copy(camera.position).sub(anchorPosition);
     cameraLocal.set(rel.dot(east), rel.dot(north), rel.dot(up));
     meshOffset.set(cameraLocal.x, cameraLocal.y);
-    water.mesh.position.set(meshOffset.x, meshOffset.y, 0);
+    const waterline = params.waterline ?? 0;
+    cameraLocal.z -= waterline;
+    water.mesh.position.set(
+      meshOffset.x,
+      meshOffset.y,
+      waterline,
+    );
 
     const sunEcef = getSunDirection();
     sunLocal.set(sunEcef.dot(east), sunEcef.dot(north), sunEcef.dot(up)).normalize();
@@ -120,13 +167,14 @@ export function createWaterRuntime({
     simParams.choppiness = params.choppiness;
     simParams.cameraAltitude = Math.max(0, cameraLocal.z);
 
+    const simStartedAt = performance.now();
     water.update({
       simTime, dt: scaledDt, meshOffset, cameraLocal, sunLocal,
       palette, params, simParams,
     });
+    timings.sim = performance.now() - simStartedAt;
+    const captureStartedAt = performance.now();
 
-    // The seabed is a static -5 m floor — water terrain effectively never
-    // changes; at most the shoreline sharpens as higher-LOD tiles stream in.
     // Re-capture when movement re-centres the window, when tile textures have
     // changed since the last capture (debounced — streaming arrives in
     // bursts), plus a lazy periodic refresh as a backstop. The texture
@@ -162,15 +210,20 @@ export function createWaterRuntime({
         });
       }
     }
+    timings.capture = performance.now() - captureStartedAt;
+    return timings;
   }
 
   return {
     enabled: true,
     params,
+    opticalSurface: opticalSurface.group,
+    opticalStats: () => opticalSurface.stats(),
     applyWind,
     update,
     setDebugMode(mode) { water.setDebugMode?.(mode); },
     dispose() {
+      opticalSurface.dispose();
       terrainRoot.remove(water.mesh);
       water.dispose();
     },

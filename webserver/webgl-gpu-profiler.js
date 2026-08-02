@@ -41,13 +41,20 @@ export function createWebGLGpuProfiler(renderer, {
     && typeof gl.beginQuery === 'function';
   const histories = new Map();
   const pending = [];
+  const detailNames = [];
   let activeQuery = null;
   let activeName = null;
+  let activeLevel = null;
+  let activeParent = null;
   let activeRenderInfo = null;
+  let activeDimensions = null;
   let frame = 0;
   let samplingFrame = false;
   let samplingWholeFrame = false;
+  let samplingLevel = null;
+  let samplingDetailName = null;
   let sampledFrameCount = 0;
+  let sampledDetailCount = 0;
   let isEnabled = Boolean(enabled && supported);
   let interval = Math.max(1, Math.round(sampleInterval));
   let maxHistory = Math.max(1, Math.round(historySize));
@@ -67,7 +74,10 @@ export function createWebGLGpuProfiler(renderer, {
     }
     activeQuery = null;
     activeName = null;
+    activeLevel = null;
+    activeParent = null;
     activeRenderInfo = null;
+    activeDimensions = null;
     for (const item of pending) gl.deleteQuery(item.query);
     pending.length = 0;
   }
@@ -90,6 +100,10 @@ export function createWebGLGpuProfiler(renderer, {
       history.push({
         frame: item.frame,
         ms: durationNs / 1e6,
+        level: item.level,
+        parent: item.parent,
+        width: item.dimensions?.width ?? 0,
+        height: item.dimensions?.height ?? 0,
         ...item.renderInfo,
       });
       if (history.length > maxHistory) history.splice(0, history.length - maxHistory);
@@ -111,7 +125,15 @@ export function createWebGLGpuProfiler(renderer, {
     }
     if (samplingFrame) {
       sampledFrameCount += 1;
-      samplingWholeFrame = sampledFrameCount % 2 === 0;
+      // Timer queries cannot be nested. Alternate aggregate composer timings
+      // with whole-frame timing and detail timings so an instrumented effect
+      // can expose its internal passes without hiding its aggregate cost.
+      const phase = sampledFrameCount % 3;
+      samplingWholeFrame = phase === 2;
+      samplingLevel = phase === 0 ? 'detail' : 'top';
+      samplingDetailName = samplingLevel === 'detail' && detailNames.length > 0
+        ? detailNames[sampledDetailCount++ % detailNames.length]
+        : null;
       if (samplingWholeFrame) beginPass('whole-frame');
     }
   }
@@ -120,20 +142,34 @@ export function createWebGLGpuProfiler(renderer, {
     if (activeQuery != null) endPass();
     samplingFrame = false;
     samplingWholeFrame = false;
+    samplingLevel = null;
+    samplingDetailName = null;
     restoreRenderInfoReset();
   }
 
-  function beginPass(name) {
+  function beginPass(name, {
+    level = 'top',
+    parent = null,
+    dimensions = null,
+  } = {}) {
     if (
       !samplingFrame
       || activeQuery != null
       || (samplingWholeFrame && name !== 'whole-frame')
+      || (!samplingWholeFrame && level !== samplingLevel)
+      || (level === 'detail' && name !== samplingDetailName)
     ) return false;
     const query = gl.createQuery();
     if (query == null) return false;
     activeQuery = query;
     activeName = name;
+    activeLevel = level;
+    activeParent = parent;
     activeRenderInfo = renderInfoSnapshot(renderer);
+    activeDimensions = dimensions ?? {
+      width: gl.drawingBufferWidth ?? 0,
+      height: gl.drawingBufferHeight ?? 0,
+    };
     gl.beginQuery(extension.TIME_ELAPSED_EXT, query);
     return true;
   }
@@ -146,23 +182,43 @@ export function createWebGLGpuProfiler(renderer, {
       name: activeName,
       frame,
       renderInfo: renderInfoDelta(activeRenderInfo, renderInfoSnapshot(renderer)),
+      dimensions: activeDimensions,
+      level: activeLevel,
+      parent: activeParent,
     });
     activeQuery = null;
     activeName = null;
+    activeLevel = null;
+    activeParent = null;
     activeRenderInfo = null;
+    activeDimensions = null;
   }
 
-  function wrapPass(pass, name) {
-    const render = pass.render.bind(pass);
-    pass.render = (...args) => {
-      if (!beginPass(name)) return render(...args);
+  function wrapMethod(target, methodName, name, options = {}) {
+    if (options.level === 'detail' && !detailNames.includes(name)) {
+      detailNames.push(name);
+    }
+    const method = target[methodName].bind(target);
+    target[methodName] = (...args) => {
+      // ShaderPass.render(renderer, input, output) exposes the actual target.
+      // This distinguishes Takram's quarter-resolution march from its
+      // full-resolution temporal resolve in resized-window profiles.
+      const outputTarget = args[2];
+      const dimensions = outputTarget?.width > 0 && outputTarget?.height > 0
+        ? { width: outputTarget.width, height: outputTarget.height }
+        : null;
+      if (!beginPass(name, { ...options, dimensions })) return method(...args);
       try {
-        return render(...args);
+        return method(...args);
       } finally {
         endPass();
       }
     };
-    return pass;
+    return target;
+  }
+
+  function wrapPass(pass, name, options = {}) {
+    return wrapMethod(pass, 'render', name, options);
   }
 
   function getSummary() {
@@ -171,6 +227,12 @@ export function createWebGLGpuProfiler(renderer, {
     for (const [name, history] of histories) {
       const durations = history.map(sample => sample.ms);
       const latest = history.at(-1);
+      const megapixels = history.map(sample => (
+        (sample.width ?? 0) * (sample.height ?? 0) / 1e6
+      ));
+      const msPerMegapixel = history.flatMap((sample, index) => (
+        megapixels[index] > 0 ? [sample.ms / megapixels[index]] : []
+      ));
       const summary = {
         samples: history.length,
         latestMs: latest.ms,
@@ -181,12 +243,29 @@ export function createWebGLGpuProfiler(renderer, {
         latestCalls: latest.calls,
         latestTriangles: latest.triangles,
         latestFrame: latest.frame,
+        latestWidth: latest.width ?? 0,
+        latestHeight: latest.height ?? 0,
+        averageMegapixels: mean(megapixels),
+        averageMsPerMegapixel: msPerMegapixel.length > 0
+          ? mean(msPerMegapixel)
+          : null,
+        level: latest.level ?? 'top',
+        parent: latest.parent ?? null,
       };
-      if (name !== 'whole-frame') measuredTotalMs += summary.averageMs;
+      if (name !== 'whole-frame' && summary.level !== 'detail') {
+        measuredTotalMs += summary.averageMs;
+      }
       passes[name] = summary;
     }
     for (const summary of Object.values(passes)) {
-      summary.percent = measuredTotalMs > 0 ? summary.averageMs / measuredTotalMs * 100 : 0;
+      const parentAverage = summary.parent != null
+        ? passes[summary.parent]?.averageMs
+        : null;
+      summary.percent = parentAverage > 0
+        ? summary.averageMs / parentAverage * 100
+        : measuredTotalMs > 0
+          ? summary.averageMs / measuredTotalMs * 100
+          : 0;
     }
     if (passes['whole-frame'] != null) passes['whole-frame'].percent = 100;
     return {
@@ -206,6 +285,7 @@ export function createWebGLGpuProfiler(renderer, {
     beginFrame,
     endFrame,
     wrapPass,
+    wrapMethod,
     setEnabled(value) {
       isEnabled = Boolean(value && supported);
       if (!isEnabled) {

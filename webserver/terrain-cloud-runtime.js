@@ -234,6 +234,13 @@ export function registerTerrainCloudTuning({
       onChange: onRenderingEnabledChange,
     });
   }
+  controls._cloudLightShaftsCheckbox = toggle('cloud light shafts', {
+    value: effect.lightShafts ?? true,
+    onChange: enabled => {
+      effect.lightShafts = enabled;
+      appearanceChanged();
+    },
+  });
   const defaultAltitudes = effect.cloudLayers.map(layer => layer.altitude);
   slider('cloud altitude', {
     min: -2000, max: 5000, step: 50, value: 0, decimals: 0,

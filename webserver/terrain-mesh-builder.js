@@ -1,5 +1,36 @@
 import * as THREE from 'three';
 
+/**
+ * Elevation samples for a tile, from whichever transport delivered it.
+ *
+ * The binary payload hands back a Float32Array view over the response buffer
+ * and keeps `heightmap` as a digest, so decoding is a no-op there. The JSON
+ * transport still carries base64 and is decoded on demand.
+ */
+/**
+ * Cheap identity for a tile's water footprint.
+ *
+ * Consumers that only care about where water is — the optical surface, for one
+ * — must not rebuild when seam repair nudges elevations. Repair rewrites edge
+ * samples on nearly every response, but almost never moves one across sea
+ * level, so keying on the mask instead of the heightmap keeps derived meshes
+ * alive through routine repair.
+ */
+export function terrainWaterMaskKey(waterMask) {
+  if (!(waterMask instanceof Uint8Array)) return null;
+  let hash = 0x811c9dc5;
+  for (let index = 0; index < waterMask.length; index += 1) {
+    hash ^= waterMask[index];
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return `${waterMask.length}:${(hash >>> 0).toString(16)}`;
+}
+
+export function terrainTileSamples(tile) {
+  if (tile?.samples instanceof Float32Array) return tile.samples;
+  return decodeTerrainHeightmap(tile?.heightmap);
+}
+
 export function decodeTerrainHeightmap(base64, decodeBase64 = value => atob(value)) {
   const raw = decodeBase64(base64);
   const bytes = new Uint8Array(raw.length);
@@ -30,10 +61,169 @@ function elevationColor(elevation) {
   return stops.at(-1);
 }
 
-export function createTerrainMeshBuilder({ exaggeration, attachScatter }) {
+function terrainEdgeIndices(resolution) {
+  return [
+    Array.from({ length: resolution }, (_, column) => column),
+    Array.from(
+      { length: resolution },
+      (_, column) => (resolution - 1) * resolution + column,
+    ),
+    Array.from({ length: resolution }, (_, row) => row * resolution),
+    Array.from(
+      { length: resolution },
+      (_, row) => row * resolution + resolution - 1,
+    ),
+  ];
+}
+
+export function updateTerrainMeshHeightmap(mesh, tile) {
+  const resolution = Number(mesh?.userData?.resolution);
+  if (
+    !mesh?.geometry
+    || !tile?.heightmap
+    || !Number.isInteger(resolution)
+    || resolution < 2
+    || Number(tile.resolution) !== resolution
+  ) return false;
+
+  const heightmap = terrainTileSamples(tile);
+  if (heightmap.length !== resolution * resolution) return false;
+  const position = mesh.geometry.getAttribute?.('position');
+  const color = mesh.geometry.getAttribute?.('color');
+  const expectedVertices = resolution * resolution + resolution * 2 * 4;
+  if (!position || position.count !== expectedVertices) return false;
+
+  const exaggeration = Number.isFinite(Number(mesh.userData.terrainExaggeration))
+    ? Number(mesh.userData.terrainExaggeration)
+    : 1;
+  const skirtDepth = Number(mesh.userData.skirtDepth) || 0;
+  const surfaceVertexCount = resolution * resolution;
+  for (let index = 0; index < surfaceVertexCount; index += 1) {
+    const elevation = heightmap[index];
+    position.setZ(index, elevation * exaggeration);
+    if (color) {
+      const nextColor = elevationColor(elevation);
+      color.setXYZ(index, nextColor.r, nextColor.g, nextColor.b);
+    }
+  }
+
+  let skirtVertex = surfaceVertexCount;
+  for (const surfaceIndices of terrainEdgeIndices(resolution)) {
+    for (const surfaceIndex of surfaceIndices) {
+      const top = skirtVertex++;
+      const bottom = skirtVertex++;
+      const topZ = position.getZ(surfaceIndex);
+      position.setZ(top, topZ);
+      position.setZ(bottom, topZ - skirtDepth);
+      if (color) {
+        color.setXYZ(
+          top,
+          color.getX(surfaceIndex),
+          color.getY(surfaceIndex),
+          color.getZ(surfaceIndex),
+        );
+        color.setXYZ(
+          bottom,
+          color.getX(surfaceIndex),
+          color.getY(surfaceIndex),
+          color.getZ(surfaceIndex),
+        );
+      }
+    }
+  }
+
+  position.needsUpdate = true;
+  if (color) color.needsUpdate = true;
+  mesh.geometry.computeVertexNormals?.();
+  mesh.geometry.computeBoundingBox?.();
+  mesh.geometry.computeBoundingSphere?.();
+  const terrainWaterMask = Uint8Array.from(heightmap, elevation => (
+    Number.isFinite(elevation) && elevation <= 0 ? 1 : 0
+  ));
+  Object.assign(mesh.userData, {
+    heightmapPayload: tile.heightmap,
+    terrainSource: tile.source,
+    terrainWaterMask,
+    terrainWaterMaskKey: terrainWaterMaskKey(terrainWaterMask),
+  });
+  return true;
+}
+
+export function createTerrainMeshBuilder({
+  exaggeration,
+  attachScatter,
+  geometryCache = null,
+}) {
+  // Everything except the grid itself is cheap to redo: decoding the heightmap
+  // and deriving the water mask are linear passes over 65x65 samples, while the
+  // parked geometry represents the per-vertex colouring, index assembly, and
+  // normal computation that dominate a rebuild.
+  function skirtDepthFor(tile) {
+    const geometricError = Number.isFinite(Number(tile.geometric_error))
+      ? Math.max(0, Number(tile.geometric_error))
+      : 0;
+    return Math.max(30, geometricError * 2) * Math.abs(exaggeration);
+  }
+
+  function finishMesh({
+    tile, geometry, heightmap, resolution, skirtDepth,
+    refreshElevations = false,
+  }) {
+    const material = new THREE.MeshBasicMaterial({
+      color: 0xffffff, side: THREE.FrontSide, vertexColors: true,
+    });
+    const mesh = new THREE.Mesh(geometry, material);
+    Object.assign(mesh.userData, {
+      tileId: tile.id,
+      bbox: tile.bbox,
+      terrainSource: tile.source,
+      resolution,
+      skirtDepth,
+      terrainExaggeration: exaggeration,
+      // The server's effective terrain contract puts tidal-water samples at
+      // or below local sea level. Retain that footprint independently of the
+      // rendered z values so the water renderer can place satellite colour on
+      // a shallow optical-only surface while true bathymetry stays untouched.
+      ...(() => {
+        const terrainWaterMask = Uint8Array.from(heightmap, elevation => (
+          Number.isFinite(elevation) && elevation <= 0 ? 1 : 0
+        ));
+        return {
+          terrainWaterMask,
+          terrainWaterMaskKey: terrainWaterMaskKey(terrainWaterMask),
+        };
+      })(),
+      // Seam repair is response-dependent: the same physical tile can get a
+      // different boundary when the rendered LOD of its neighbor changes.
+      // Keep the exact payload that produced this mesh so reconciliation can
+      // replace stale geometry without requiring a page refresh.
+      heightmapPayload: tile.heightmap,
+      terrainColorAttribute: geometry.getAttribute('color'),
+    });
+    // A revived grid carries the elevations it was parked with. Rewriting them
+    // in place restores this response's seam repair without paying for index
+    // assembly or attribute allocation again.
+    if (refreshElevations) updateTerrainMeshHeightmap(mesh, tile);
+    attachScatter(mesh, tile, heightmap);
+    return mesh;
+  }
+
   return function buildTerrainMesh(tile) {
     const resolution = tile.resolution;
-    const heightmap = decodeTerrainHeightmap(tile.heightmap);
+    const heightmap = terrainTileSamples(tile);
+    const parked = geometryCache?.take(tile) ?? null;
+    if (parked) {
+      return finishMesh({
+        tile,
+        geometry: parked.geometry,
+        heightmap,
+        resolution,
+        // Derive from this response, not the parked one: the refresh rebuilds
+        // skirts from userData, so a stale depth would bake in wrong skirts.
+        skirtDepth: skirtDepthFor(tile),
+        refreshElevations: !parked.payloadMatches,
+      });
+    }
     const [xMin, yMin, xMax, yMax] = tile.bbox;
     const surfaceVertexCount = resolution * resolution;
     // Each edge gets an independent top/bottom pair per surface vertex. The
@@ -63,10 +253,7 @@ export function createTerrainMeshBuilder({ exaggeration, attachScatter }) {
       indices.push(a, b, d, b, f, d);
     }
 
-    const geometricError = Number.isFinite(Number(tile.geometric_error))
-      ? Math.max(0, Number(tile.geometric_error))
-      : 0;
-    const skirtDepth = Math.max(30, geometricError * 2) * Math.abs(exaggeration);
+    const skirtDepth = skirtDepthFor(tile);
     let nextVertex = surfaceVertexCount;
     function appendSkirt(surfaceIndices, outwardWinding) {
       const skirtStart = nextVertex;
@@ -98,16 +285,7 @@ export function createTerrainMeshBuilder({ exaggeration, attachScatter }) {
         }
       }
     }
-    const south = Array.from({ length: resolution }, (_, column) => column);
-    const north = Array.from(
-      { length: resolution },
-      (_, column) => (resolution - 1) * resolution + column,
-    );
-    const west = Array.from({ length: resolution }, (_, row) => row * resolution);
-    const east = Array.from(
-      { length: resolution },
-      (_, row) => row * resolution + resolution - 1,
-    );
+    const [south, north, west, east] = terrainEdgeIndices(resolution);
     appendSkirt(south, true);
     appendSkirt(north, false);
     appendSkirt(west, false);
@@ -121,23 +299,6 @@ export function createTerrainMeshBuilder({ exaggeration, attachScatter }) {
     geometry.setAttribute('uv', new THREE.BufferAttribute(uvs, 2));
     geometry.setIndex(indices);
     geometry.computeVertexNormals();
-    const material = new THREE.MeshBasicMaterial({
-      color: 0xffffff, side: THREE.FrontSide, vertexColors: true,
-    });
-    const mesh = new THREE.Mesh(geometry, material);
-    Object.assign(mesh.userData, {
-      tileId: tile.id,
-      bbox: tile.bbox,
-      resolution,
-      skirtDepth,
-      // Seam repair is response-dependent: the same physical tile can get a
-      // different boundary when the rendered LOD of its neighbor changes.
-      // Keep the exact payload that produced this mesh so reconciliation can
-      // replace stale geometry without requiring a page refresh.
-      heightmapPayload: tile.heightmap,
-      terrainColorAttribute,
-    });
-    attachScatter(mesh, tile, heightmap);
-    return mesh;
+    return finishMesh({ tile, geometry, heightmap, resolution, skirtDepth });
   };
 }

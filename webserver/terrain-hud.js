@@ -10,6 +10,12 @@ export function hudActionLink(id, label, color = '#0af') {
     + `cursor:pointer;pointer-events:auto">${label}</span>`;
 }
 
+export function tileEvictionHudLine(enabled) {
+  const state = enabled ? 'enabled' : 'DISABLED';
+  const color = enabled ? '#0af' : '#ff9500';
+  return `data eviction: ${hudActionLink('tileEvictionLink', state, color)}`;
+}
+
 function appendPanel(cssText) {
   const element = document.createElement('div');
   element.style.cssText = cssText.join(';');
@@ -23,11 +29,14 @@ export function createTerrainHud({
   onToggleSeamMode,
   onToggleTileInspector,
   onToggleGridlines,
+  onToggleBathymetryMap,
   onToggleClassifierOverlay,
   onToggleWaterOverlay,
   onToggleHydrographyOverlay,
+  onToggleProcgen,
   onToggleRenderBackend,
   onToggleRoadDebug,
+  onToggleTileEviction,
   onOpenGoogleMaps,
   onStartFastTime,
   onReset,
@@ -47,11 +56,14 @@ export function createTerrainHud({
       event.target.id === 'seamModeLink' ||
       event.target.id === 'tileInspectorModeLink' ||
       event.target.id === 'gridlinesModeLink' ||
+      event.target.id === 'bathymetryMapLink' ||
       event.target.id === 'classifierOverlayLink' ||
       event.target.id === 'waterOverlayLink' ||
       event.target.id === 'hydrographyOverlayLink' ||
+      event.target.id === 'procgenLink' ||
       event.target.id === 'renderBackendLink' ||
       event.target.id === 'roadDebugLink' ||
+      event.target.id === 'tileEvictionLink' ||
       event.target.id === 'googleMaps3dLink' ||
       event.target.id === 'fastTimeLink' ||
       event.target.id === 'resetViewLink' ||
@@ -83,6 +95,12 @@ export function createTerrainHud({
       onToggleGridlines();
       return;
     }
+    if (event.target.id === 'bathymetryMapLink') {
+      event.stopPropagation();
+      event.preventDefault();
+      onToggleBathymetryMap();
+      return;
+    }
     if (event.target.id === 'classifierOverlayLink') {
       event.stopPropagation();
       event.preventDefault();
@@ -101,6 +119,12 @@ export function createTerrainHud({
       onToggleHydrographyOverlay();
       return;
     }
+    if (event.target.id === 'procgenLink') {
+      event.stopPropagation();
+      event.preventDefault();
+      onToggleProcgen();
+      return;
+    }
     if (event.target.id === 'renderBackendLink') {
       event.stopPropagation();
       event.preventDefault();
@@ -111,6 +135,12 @@ export function createTerrainHud({
       event.stopPropagation();
       event.preventDefault();
       onToggleRoadDebug();
+      return;
+    }
+    if (event.target.id === 'tileEvictionLink') {
+      event.stopPropagation();
+      event.preventDefault();
+      onToggleTileEviction();
       return;
     }
     if (event.target.id === 'googleMaps3dLink') {
@@ -159,11 +189,14 @@ export function createTerrainHud({
       event.target.id === 'mapModeLink' || event.target.id === 'seamModeLink' ||
       event.target.id === 'tileInspectorModeLink' ||
       event.target.id === 'gridlinesModeLink' ||
+      event.target.id === 'bathymetryMapLink' ||
       event.target.id === 'classifierOverlayLink' ||
       event.target.id === 'waterOverlayLink' ||
       event.target.id === 'hydrographyOverlayLink' ||
+      event.target.id === 'procgenLink' ||
       event.target.id === 'renderBackendLink' ||
       event.target.id === 'roadDebugLink' ||
+      event.target.id === 'tileEvictionLink' ||
       event.target.id === 'googleMaps3dLink' ||
       event.target.id === 'fastTimeLink' || event.target.id === 'resetViewLink' ||
       TERRAIN_HUD_LINKS[event.target.id]

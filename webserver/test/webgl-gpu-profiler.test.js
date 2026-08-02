@@ -11,6 +11,8 @@ function createFakeRenderer({ supported = true } = {}) {
     ? { TIME_ELAPSED_EXT: 0x88BF, GPU_DISJOINT_EXT: 0x8FBB }
     : null;
   const gl = {
+    drawingBufferWidth: 1920,
+    drawingBufferHeight: 1080,
     QUERY_RESULT_AVAILABLE: 0x8867,
     QUERY_RESULT: 0x8866,
     getExtension: name => name === 'EXT_disjoint_timer_query_webgl2' ? extension : null,
@@ -64,6 +66,10 @@ test('GPU profiler samples wrapped passes without synchronously waiting for resu
   assert.equal(summary.passes.scene.latestMs, 2.5);
   assert.equal(summary.passes.scene.averageCalls, 3);
   assert.equal(summary.passes.scene.averageTriangles, 120);
+  assert.equal(summary.passes.scene.latestWidth, 1920);
+  assert.equal(summary.passes.scene.latestHeight, 1080);
+  assert.ok(Math.abs(summary.passes.scene.averageMegapixels - 2.0736) < 1e-9);
+  assert.ok(Math.abs(summary.passes.scene.averageMsPerMegapixel - (2.5 / 2.0736)) < 1e-9);
   assert.equal(summary.passes.scene.percent, 100);
   assert.deepEqual(fake.deleted, [1]);
 
@@ -97,4 +103,74 @@ test('GPU profiler remains inert when timer queries are unavailable', () => {
     wholeFrameAverageMs: null,
     passes: {},
   });
+});
+
+test('GPU profiler alternates aggregate and nested detail pass samples', () => {
+  const fake = createFakeRenderer();
+  const profiler = createWebGLGpuProfiler(fake.renderer, {
+    enabled: true,
+    sampleInterval: 1,
+  });
+  const detail = profiler.wrapPass({ render() {} }, 'takram.cloud-march', {
+    level: 'detail',
+    parent: 'clouds+aerial-perspective',
+  });
+  const aggregate = profiler.wrapPass({
+    render() { detail.render(); },
+  }, 'clouds+aerial-perspective');
+
+  // Aggregate phase: the outer pass owns the query, detail remains inert.
+  profiler.beginFrame();
+  aggregate.render();
+  profiler.endFrame();
+
+  // Whole-frame phase: neither wrapper attempts a nested query.
+  profiler.beginFrame();
+  aggregate.render();
+  profiler.endFrame();
+
+  // Detail phase: aggregate remains inert and the Takram stage owns the query.
+  profiler.beginFrame();
+  aggregate.render();
+  profiler.endFrame();
+
+  // Poll all three results.
+  profiler.beginFrame();
+  const summary = profiler.getSummary();
+  assert.equal(summary.passes['clouds+aerial-perspective'].averageMs, 2.5);
+  assert.equal(summary.passes['takram.cloud-march'].averageMs, 2.5);
+  assert.equal(summary.passes['takram.cloud-march'].level, 'detail');
+  assert.equal(
+    summary.passes['takram.cloud-march'].parent,
+    'clouds+aerial-perspective',
+  );
+  assert.equal(summary.passes['takram.cloud-march'].percent, 100);
+  assert.equal(summary.measuredTotalAverageMs, 2.5);
+  profiler.endFrame();
+});
+
+test('GPU profiler can instrument non-render methods', () => {
+  const fake = createFakeRenderer();
+  const profiler = createWebGLGpuProfiler(fake.renderer, {
+    enabled: true,
+    sampleInterval: 1,
+  });
+  let updates = 0;
+  const simulation = profiler.wrapMethod({
+    update() {
+      updates += 1;
+      fake.renderer.info.render.calls += 2;
+    },
+  }, 'update', 'water.fft');
+
+  profiler.beginFrame();
+  simulation.update();
+  profiler.endFrame();
+  profiler.beginFrame();
+
+  const summary = profiler.getSummary();
+  assert.equal(updates, 1);
+  assert.equal(summary.passes['water.fft'].averageMs, 2.5);
+  assert.equal(summary.passes['water.fft'].averageCalls, 2);
+  profiler.endFrame();
 });

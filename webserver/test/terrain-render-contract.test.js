@@ -15,6 +15,9 @@ test('cross-backend water calibration has one immutable contract', () => {
   assert.equal(Object.isFrozen(WATER_RENDER_CONTRACT), true);
   assert.deepEqual(WATER_RENDER_CONTRACT, {
     fetchFractionScale: 3,
+    shoreFoamDistanceStartM: 700,
+    shoreFoamDistanceEndM: 2800,
+    shoreFoamAlphaMaximum: 0.75,
     microGateMinimum: 0.22,
     microGateStart: 0.02,
     microGateEnd: 0.25,
@@ -35,6 +38,20 @@ test('water backends do not retain the retired local bathymetry constant', () =>
     );
     assert.doesNotMatch(source, /\bBATHYMETRY_LAYER\b/);
     assert.match(source, /\bTERRAIN_BATHYMETRY_LAYER\b/);
+  }
+});
+
+test('shore sparkle is real sun reflection rather than procedural flashing', () => {
+  for (const backend of ['webgl-water.js', 'webgpu-water.js']) {
+    const source = readFileSync(
+      new URL(`../render-backends/${backend}`, import.meta.url),
+      'utf8',
+    );
+    assert.match(source, /\bshoreSunGlint\b/);
+    assert.match(source, /\bggxAniso\b/);
+    assert.match(source, /\bfresL\b/);
+    assert.doesNotMatch(source, /\btwinkle(?:Phase|Wave)?\b/);
+    assert.doesNotMatch(source, /\bsparkleFacet\b/);
   }
 });
 
