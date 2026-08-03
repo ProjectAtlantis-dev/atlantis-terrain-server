@@ -179,6 +179,10 @@ flushClientLogQueue();
 const referenceDate = new Date('2025-07-01T12:00:00Z');
 const GAME_TIME_SCALE = 1;
 const SUN_DIRECTION_SYNC_INTERVAL_MS = 60 * 1000;
+// ~8 Hz. Fast enough that readouts feel live, slow enough that HUD assembly
+// stops showing up in the frame budget.
+const HUD_REFRESH_INTERVAL_MS = 125;
+let lastHudRefreshMs = -Infinity;
 const GAME_CLOCK_STORAGE_KEY = 'game-clock-state';
 const LEGACY_GAME_CLOCK_STORAGE_KEY = 'game-clock-ms';
 const savedGameClock = parseGameClockSnapshot(
@@ -2246,31 +2250,30 @@ function updateHud() {
   const speedKmh = Math.hypot(controls.speed, controls.strafeSpeed) * 3.6;
   const headingForHud = vehicleRuntime.vehicleControlActive ? vehicleRuntime.vehicleHeadingRad : controls.yaw;
   const { degrees: deg, compass } = compassHeading(headingForHud);
-  // Heightmap line — always present, stable width
-  const hmPending = terrainPipelineState.heightmapsMissing + terrainPipelineState.heightmapsDownloading;
-  const hmLine = `hm: ${terrainTileSet.currentTileIds.size} tiles`
-    + (hmPending > 0
-      ? `  <span style="color:#fc8">${terrainPipelineState.heightmapsDownloading} downloading  ${terrainPipelineState.heightmapsMissing} queued</span>`
-      : '');
-
-  // Texture line: client fetch status + server-side pipeline
-  const srvReady = terrainPipelineState.serverTextureStatus.ready || 0;
-  const srvFetching = terrainPipelineState.serverTextureStatus.fetching || 0;
-  const srvMissing = terrainPipelineState.serverTextureStatus.missing || 0;
-  const srvAncestor = terrainPipelineState.serverTextureStatus.ancestor_fallback || 0;
-  let texLine = `tex: ${texCache.size} cached`;
-  if (dormantTextures.size > 0) texLine += `  ${dormantTextures.size} dormant`;
-  // Client fetch pipeline
-  if (texInflight.size > 0 || texFetching.size > 0) {
-    texLine += `  <span style="color:#8cf">http: ${texInflight.size}</span>`;
-    texLine += `  <span style="color:#fc8">poll: ${texFetching.size}</span>`;
-  }
-  // Server-side pipeline — show when there's work happening
-  if (terrainPipelineState.serverTexturesFetching > 0 || terrainPipelineState.serverTexturesRetrying > 0 || srvMissing > 0) {
-    texLine += `  <span style="color:#f8c">srv: ${terrainPipelineState.serverTexturesFetching} fetching</span>`;
-    if (terrainPipelineState.serverTexturesRetrying > 0) texLine += `  <span style="color:#f66">${terrainPipelineState.serverTexturesRetrying} retry</span>`;
-    if (srvMissing > 0) texLine += `  <span style="color:#999">${srvMissing} missing</span>`;
-  }
+  // Heightmap and texture pipeline readouts are commented out: they were the
+  // most expensive rows to assemble (several Map size reads plus conditional
+  // span building every refresh) and the least useful during normal flight.
+  // Restore both blocks, and their entries in hudRows below, to debug
+  // streaming.
+  //
+  // const hmPending = terrainPipelineState.heightmapsMissing + terrainPipelineState.heightmapsDownloading;
+  // const hmLine = `hm: ${terrainTileSet.currentTileIds.size} tiles`
+  //   + (hmPending > 0
+  //     ? `  <span style="color:#fc8">${terrainPipelineState.heightmapsDownloading} downloading  ${terrainPipelineState.heightmapsMissing} queued</span>`
+  //     : '');
+  //
+  // const srvMissing = terrainPipelineState.serverTextureStatus.missing || 0;
+  // let texLine = `tex: ${texCache.size} cached`;
+  // if (dormantTextures.size > 0) texLine += `  ${dormantTextures.size} dormant`;
+  // if (texInflight.size > 0 || texFetching.size > 0) {
+  //   texLine += `  <span style="color:#8cf">http: ${texInflight.size}</span>`;
+  //   texLine += `  <span style="color:#fc8">poll: ${texFetching.size}</span>`;
+  // }
+  // if (terrainPipelineState.serverTexturesFetching > 0 || terrainPipelineState.serverTexturesRetrying > 0 || srvMissing > 0) {
+  //   texLine += `  <span style="color:#f8c">srv: ${terrainPipelineState.serverTexturesFetching} fetching</span>`;
+  //   if (terrainPipelineState.serverTexturesRetrying > 0) texLine += `  <span style="color:#f66">${terrainPipelineState.serverTexturesRetrying} retry</span>`;
+  //   if (srvMissing > 0) texLine += `  <span style="color:#999">${srvMissing} missing</span>`;
+  // }
   const modeLabel = tileInspectorRuntime?.active
     ? 'TILE INSPECTOR'
     : controls.seamMode
@@ -2338,8 +2341,8 @@ function updateHud() {
       : '',
     `enu: E ${eastM.toFixed(0)}m  N ${northM.toFixed(0)}m  U ${altM.toFixed(0)}m`,
     `speed: ${speedKmh.toFixed(0)} km/h${cameraDriftIndicator(cameraRuntimeState.driftMode)}  heading: ${deg.toFixed(0)}° ${compass}`,
-    hmLine,
-    texLine,
+    // hmLine,
+    // texLine,
     gridlinesLine,
     retroLine,
     bathymetryMapLine,
@@ -2912,7 +2915,14 @@ function renderFrame() {
   recalibrateCloudWindForCamera();
   rebuildTerrainDemandForViewDirection();
   const markDemand = performance.now();
-  updateHud();
+  // Rebuilding the HUD rows means dozens of template literals, toFixed calls
+  // and an innerHTML diff; at 120 fps that is pure overhead for text nobody
+  // can read that fast. Explicit updateHud() calls from toggles stay immediate,
+  // so only this per-frame refresh is paced.
+  if (markDemand - lastHudRefreshMs >= HUD_REFRESH_INTERVAL_MS) {
+    lastHudRefreshMs = markDemand;
+    updateHud();
+  }
   const markHud = performance.now();
   syncMapModePresentation();
 
@@ -3040,6 +3050,7 @@ function renderFrame() {
     retroRuntime.sync({
       cameraLocalX: retroCameraRel.dot(east),
       cameraLocalY: retroCameraRel.dot(north),
+      cameraLocalZ: retroCameraRel.dot(up),
     });
     renderBackend.renderMap(
       retroRuntime.scene, camera, retroRuntime.background, diagnosticOverlayScene,

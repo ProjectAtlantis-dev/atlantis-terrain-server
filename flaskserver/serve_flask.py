@@ -220,6 +220,92 @@ _tex_pool = ThreadPoolExecutor(max_workers=4)
 _tex_fetching: set[str] = set()
 _tex_fetching_lock = threading.Lock()
 
+# Coastline rasterization can take seconds across a fresh camera footprint.
+# It must never run in /api/tiles: camera topology owns request latency, while
+# derived masks are allowed to trail and trigger an ordinary polling refresh.
+_coastline_demand_lock = threading.Lock()
+_coastline_demand_pending: dict[str, tuple] = {}
+_coastline_demand_active: str | None = None
+_coastline_demand_thread: threading.Thread | None = None
+
+
+def _coastline_demand_worker() -> None:
+  global _coastline_demand_active, _coastline_demand_thread
+  from coastline import cache_official_water_mask
+
+  while True:
+    with _coastline_demand_lock:
+      if not _coastline_demand_pending:
+        _coastline_demand_active = None
+        _coastline_demand_thread = None
+        return
+      tile_id = next(iter(_coastline_demand_pending))
+      bbox = _coastline_demand_pending.pop(tile_id)
+      _coastline_demand_active = tile_id
+
+    db = sqlite3.connect(
+      str(DB_PATH), timeout=30.0, check_same_thread=False,
+    )
+    db.execute("PRAGMA busy_timeout=30000")
+    try:
+      cache_official_water_mask(db, tile_id, bbox, _GRID_N)
+      db.commit()
+    except sqlite3.OperationalError as exc:
+      # The next camera poll will requeue a still-visible tile. Do not let a
+      # transient bulk-ingest writer kill this worker or block topology.
+      log.warning(
+        f"[coastline-demand] {tile_id}: {exc}; deferred to next camera poll"
+      )
+      db.rollback()
+    finally:
+      db.close()
+      with _coastline_demand_lock:
+        if _coastline_demand_active == tile_id:
+          _coastline_demand_active = None
+
+
+def _schedule_coastline_demand(
+  db, targets: dict[str, tuple],
+) -> tuple[int, int]:
+  """Replace unstarted mask work with the latest visible camera footprint."""
+  global _coastline_demand_pending, _coastline_demand_thread
+  if not targets:
+    with _coastline_demand_lock:
+      _coastline_demand_pending = {}
+      return int(_coastline_demand_active is not None), 0
+
+  marks = ",".join("?" for _ in targets)
+  existing = {
+    row[0] for row in db.execute(
+      f"SELECT tile_id FROM coastline_masks WHERE tile_id IN ({marks})",
+      tuple(targets),
+    )
+  }
+  needed = {
+    tile_id: bbox for tile_id, bbox in targets.items()
+    if tile_id not in existing
+  }
+  with _coastline_demand_lock:
+    _coastline_demand_pending = {
+      tile_id: bbox for tile_id, bbox in needed.items()
+      if tile_id != _coastline_demand_active
+    }
+    if (
+      _coastline_demand_pending
+      and (_coastline_demand_thread is None
+           or not _coastline_demand_thread.is_alive())
+    ):
+      _coastline_demand_thread = threading.Thread(
+        target=_coastline_demand_worker,
+        name="coastline-demand",
+        daemon=True,
+      )
+      _coastline_demand_thread.start()
+    return (
+      int(_coastline_demand_active is not None),
+      len(_coastline_demand_pending),
+    )
+
 # Cumulative inspected texture pipeline counters (process lifetime).
 _d13_stats = {
   "inspected": 0,       # D11+ metatiles scored by the detector
@@ -957,6 +1043,11 @@ def _bootstrap_backend() -> None:
     from ingest_coastline import ensure_gtk50_blocks
     threading.Thread(target=ensure_gtk50_blocks, daemon=True).start()
 
+    # Blocks beyond the seed set are acquired as tiles ask for them, so flying
+    # into new territory no longer needs anyone to predeclare its coastline.
+    import gtk50_demand
+    gtk50_demand.enable()
+
   except Exception as exc:  # pragma: no cover - runtime setup path
     _backend_error = (
       f"Terrain backend unavailable: {type(exc).__name__}: {exc}. "
@@ -976,12 +1067,13 @@ def _terrain_unavailable_response(status: int = 503):
 def _get_db() -> sqlite3.Connection:
   db = cast(sqlite3.Connection | None, g.get("terrain_db"))
   if db is None:
-    db = sqlite3.connect(str(DB_PATH), check_same_thread=False)
-    db.execute("PRAGMA journal_mode=WAL")
-    if _init_textures is not None:
-      _init_textures(db)
-    if _init_classifier_tiles is not None:
-      _init_classifier_tiles(db)
+    # WAL is established once during backend bootstrap. Reissuing the journal
+    # mode pragma on every request takes a schema/write lock and made camera
+    # LOD requests fail while GTK50 was committing derived masks.
+    db = sqlite3.connect(
+      str(DB_PATH), timeout=30.0, check_same_thread=False,
+    )
+    db.execute("PRAGMA busy_timeout=30000")
     g.terrain_db = db
   return db
 
@@ -1720,6 +1812,27 @@ def api_tiles():
     log.error(f"[/api/tiles] query FAILED: {type(exc).__name__}: {exc}")
     return jsonify({"error": f"tile query failed: {type(exc).__name__}: {exc}"}), 500
 
+  # A global derived reset retains origin DEMs, so those tiles do not pass
+  # through the COG worker that normally performs coastline preflight. Make
+  # visible camera demand restore the missing contract-depth masks explicitly.
+  # Deep derived tiles still preflight their exact mask when they recook.
+  coastline_targets = {}
+  for tile in tiles:
+    if tile.get("heightmap") is None:
+      continue
+    depth, column, row = _parse_tile_id(tile["id"]) or (0, 0, 0)
+    if depth > WMS_CONTRACT_DEPTH:
+      shift = depth - WMS_CONTRACT_DEPTH
+      depth, column, row = (
+        WMS_CONTRACT_DEPTH, column >> shift, row >> shift,
+      )
+    target_id = f"{depth}-{column}-{row}"
+    coastline_targets[target_id] = tuple(_tile_bbox(depth, column, row))
+
+  coastline_active, coastline_pending = _schedule_coastline_demand(
+    _get_db(), coastline_targets,
+  )
+
   _tiles_result_key = f"{len(tiles)}:{len(missing)}:{qx:.0f}:{qy:.0f}"
   if _api_tiles_state["last_result"] != _tiles_result_key:
     _api_tiles_state["last_result"] = _tiles_result_key
@@ -1883,6 +1996,7 @@ def api_tiles():
       "texFetching": len(tex_fetching),
       "texQueued": len(tex_fetching),
       "texRetryQueue": len(_tex_retry_queue),
+      "coastlineQueued": coastline_active + coastline_pending,
       "texStatusCounts": tex_status_counts,
       "bathymetryQueued": bathymetry_submitted,
       "bathymetryStatus": bathymetry_status,

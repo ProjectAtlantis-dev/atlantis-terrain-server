@@ -278,13 +278,17 @@ class BathymetryDemandScheduler:
         now = time.time()
         with self._lock:
             for job_id in jobs:
+                # ``jobs`` contains only currently eligible tiles with no
+                # bathymetry row. A global derived-data reset can therefore
+                # make a job eligible again after this process completed it;
+                # persistent state wins over the in-memory completion hint.
+                self._completed.discard(job_id)
                 failure = failures[job_id]
                 if failure is not None:
                     self._failed_at[job_id] = failure["failed_at"]
                     self._last_error[job_id] = failure["error"]
                 if (
                     job_id in self._active
-                    or job_id in self._completed
                     or (
                         failure is not None
                         and now < failure["retry_at"]

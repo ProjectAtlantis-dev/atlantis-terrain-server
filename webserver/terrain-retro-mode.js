@@ -314,7 +314,14 @@ export function createRetroStarMaterial({ color = RETRO_LINE_COLOR } = {}) {
     // Additive keeps overlapping faint stars from building into grey blocks
     // and gives the bright ones a little bloom against the black.
     blending: THREE.AdditiveBlending,
-    depthTest: false,
+    // Depth test ON, despite this being the sky. three.js draws transparent
+    // objects after all opaque ones and renderOrder only sorts within that
+    // transparent pass, so the sky cannot be made to draw "first" — with
+    // depthTest off it simply paints over mountains and sea. Testing against
+    // the depth terrain already wrote is what puts the stars behind it.
+    depthTest: true,
+    // Still no depth writes: stars must never occlude each other or anything
+    // drawn later.
     depthWrite: false,
     toneMapped: false,
   });
@@ -360,7 +367,6 @@ export function createTerrainRetroRuntime({
   // paint over the sky. Nothing needs to sort against it.
   const starMaterial = createRetroStarMaterial();
   const starField = new THREE.Points(createRetroStarGeometry(), starMaterial);
-  starField.renderOrder = -1;
   starField.frustumCulled = false;
   // Position tracks the camera so stars never translate; rotation is left
   // alone so turning the camera sweeps across them as it should.

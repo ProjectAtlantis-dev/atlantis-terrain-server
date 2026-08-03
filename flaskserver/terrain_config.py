@@ -50,8 +50,14 @@ BOOTSTRAP_SEED_DEPTH = 8
 # no manual steps. Add folders here to cover more settlements.
 GRUNDKORT_SETTLEMENTS = ["0600NUK_Nuuk"]
 
-# Åbent Land GL50 vector blocks (100 km GR96/UTM-24N ids) the server keeps
-# downloaded for exact fjord coastline masks. Downloading needs the
+# Åbent Land GL50 vector blocks (100 km GR96/UTM-24N ids) fetched at first
+# start so a fresh clone has exact fjord coastline around the default Nuuk
+# camera immediately, rather than flying over WMS-derived shoreline while the
+# first blocks download.
+#
+# This is a seed, NOT the set of blocks the server can use: anything else is
+# acquired on demand by gtk50_demand as tiles ask for it, so there is no need
+# to add ids here when flying somewhere new. Downloading needs the
 # Dataforsyningen account login in .env; without it the server logs a loud
 # startup error and coastline masks fall back to the rendered-WMS decoder.
 GTK50_BLOCKS = ["71_-1", "71_-2"]

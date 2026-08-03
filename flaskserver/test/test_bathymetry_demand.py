@@ -182,7 +182,7 @@ class BathymetrySchedulerTests(unittest.TestCase):
             self.assertEqual(pool.calls, [])
             self.assertTrue(scheduler.status()["paused"])
 
-    def test_scheduler_deduplicates_active_and_completed_jobs(self):
+    def test_scheduler_deduplicates_active_and_persisted_completed_jobs(self):
         db = _db()
         self.addCleanup(db.close)
         coast = np.zeros((GRID_N, GRID_N), dtype=bool)
@@ -203,8 +203,15 @@ class BathymetrySchedulerTests(unittest.TestCase):
             pool.futures[0].complete(
                 type("Result", (), {"returncode": 0, "stdout": "", "stderr": ""})()
             )
+            job_id = format_tile_id(BATHYMETRY_JOB_DEPTH, 100, 56)
+            db.execute("INSERT INTO bathymetry (tile_id) VALUES (?)", (job_id,))
             self.assertEqual(scheduler.schedule(db, [tile_id]), [])
             self.assertEqual(scheduler.status()["completed"], 1)
+
+            # A global derived reset removes the row. Persistent absence must
+            # override the in-memory completion hint and schedule it again.
+            db.execute("DELETE FROM bathymetry WHERE tile_id = ?", (job_id,))
+            self.assertEqual(scheduler.schedule(db, [tile_id]), [job_id])
 
     def test_failed_job_cooldown_survives_scheduler_restart(self):
         with tempfile.TemporaryDirectory() as directory:

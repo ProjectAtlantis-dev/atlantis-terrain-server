@@ -124,10 +124,15 @@ def fetch_official_water_mask(bbox, resolution: int) -> np.ndarray | None:
         return None
 
 
-def apply_water_mask(heightmap, water):
-    """Return derived render geometry without mutating the raw DEM."""
-    if heightmap is None:
-        return None
+def apply_water_mask(heightmap, water) -> np.ndarray:
+    """Return derived render geometry without mutating the raw DEM.
+
+    Always returns an array. The previous ``None`` passthrough was never
+    exercised — every caller narrows the missing-DEM case first — and typing it
+    as optional made ``result`` optional at both assignment sites in
+    ``effective_heightmap``, so every later use looked like a possible None
+    dereference.
+    """
     result = np.asarray(heightmap, dtype=np.float32).copy()
     water = np.asarray(water, dtype=bool)
     if water.shape != result.shape:
@@ -177,14 +182,32 @@ def _write_mask(
         _connectivity_signature_cache.clear()
 
 
-def write_water_mask(db, tile_id: str, water, source="gtk50_vector", version=2) -> None:
-    """Store an authoritative tidal-sea mask used by terrain rendering."""
+def write_water_mask(db, tile_id: str, water, source="gtk50_vector", version=2) -> int:
+    """Store an authoritative tidal-sea mask used by terrain rendering.
+
+    Return the number of cooked descendants invalidated by a real mask change.
+    Keeping this check at the write boundary covers every arrival path,
+    including a block that lands during the WMS fallback fetch and therefore
+    was absent from the downloader's earlier database sweep.
+    """
+    mask = np.asarray(water, dtype=np.uint8)
+    encoded = zlib.compress(mask.tobytes(), level=6)
+    previous = db.execute(
+        "SELECT width, height, mask, source, version FROM coastline_masks "
+        "WHERE tile_id = ?",
+        (tile_id,),
+    ).fetchone()
+    changed = previous is None or previous != (
+        int(mask.shape[1]), int(mask.shape[0]), encoded, source, version,
+    )
     _write_mask(db, "coastline_masks", tile_id, water, source, version)
+    invalidated = invalidate_cooked_descendants(db, tile_id) if changed else 0
     # The canonical DEM did not change, but its derived render edge may have.
     from terrain_seams import invalidate_tile_seams
 
     invalidate_tile_seams(db, tile_id)
     db.commit()
+    return invalidated
 
 
 def write_hydrography_mask(
@@ -511,13 +534,97 @@ def cache_official_water_mask(db, tile_id: str, bbox=None, resolution=65):
         if water is not None:
             write_water_mask(db, tile_id, water, VECTOR_SOURCE, VECTOR_VERSION)
             return water
-    water = fetch_official_water_mask(bbox, resolution)
-    if water is not None:
-        write_hydrography_mask(db, tile_id, water)
+    # A derived reset deliberately keeps downloaded WMS hydrography. Reuse
+    # that origin instead of downloading the same pixels again merely because
+    # the derived vector mask is absent.
+    hydrography = _read_mask(db, "hydrography_masks", tile_id)
+    if hydrography is None:
+        hydrography = fetch_official_water_mask(bbox, resolution)
+        if hydrography is not None:
+            write_hydrography_mask(db, tile_id, hydrography)
+    if os.environ.get("COASTLINE_VECTOR", "1") != "0":
+        import gtk50_demand
+        from gtk50_vector import VECTOR_SOURCE, VECTOR_VERSION, vector_water_mask
+
+        # The WMS fetch above is slow, and a block can land during it —
+        # typically pulled by a neighbouring tile. The rebuild that fires on
+        # arrival only visits tiles that already have a mask row, and this
+        # tile's row did not exist yet, so it was not repaired. Re-checking
+        # here is what closes that window: neither ordering of the two writes
+        # is safe on its own, because the request below schedules nothing once
+        # the block is present.
+        water = vector_water_mask(bbox, resolution)
+        if water is not None:
+            write_water_mask(db, tile_id, water, VECTOR_SOURCE, VECTOR_VERSION)
+            return water
+        # Still missing, so this call is the only thing that knows the block is
+        # needed. Discarding that is what stranded whole regions on WMS.
+        gtk50_demand.request_for_bbox(bbox)
     # The rendered map also contains lakes and watercourses. Retain it as raw
     # hydrography; only a separately proven flood-connected component can
     # later participate in the effective tidal mask.
     return None
+
+
+def invalidate_cooked_descendants(db, tile_id: str) -> int:
+    """Reset cooked descendants of a tile whose water mask just changed.
+
+    Everything else in the pipeline self-heals: ``effective_heightmap``
+    re-applies water on every read, so a measured tile picks up a late-arriving
+    coastline immediately. Cooked DEMs are the exception, because
+    ``_cook_cooked_dem_quad`` takes the parent's water mask as an *input* and
+    bakes the result into the stored child heightmap.
+
+    Nothing re-cooks them on its own. ``cooked_dem`` is in ``REAL_SOURCES``, so
+    the cook returns early for any tile that already has one, and the only
+    existing invalidation is gated on ``macro_terrain_version`` — a recipe
+    change, not a data arrival. The invariant in serve.py assumes derived tiles
+    cannot go stale because their parent's *source* never changes; the mask is
+    a second input that assumption does not cover.
+
+    Left alone, a block landing after the cook strands every descendant with
+    invented land baked in — 37 m skerries cooked into 84 m spikes over water a
+    multibeam survey puts at 36-88 m deep. Resetting to ``pending`` drops the
+    payload so normal demand re-cooks against the mask that now exists.
+    """
+    from terrain_seams import invalidate_tile_seams
+
+    depth, col, row = (int(part) for part in tile_id.split("-"))
+    # Descendant quadrant arithmetic: at depth D a tile spans
+    # [col << (D - d), (col + 1) << (D - d)) in each axis. Expressed against
+    # the indexed depth/col/row columns rather than a tile_id LIKE, which would
+    # match 1460 for a search on 146.
+    stale = [
+        stale_id
+        for (stale_id,) in db.execute(
+            """
+            SELECT tile_id FROM tiles
+            WHERE source = 'cooked_dem'
+              AND depth > :depth
+              AND col >= (:col << (depth - :depth))
+              AND col <  ((:col + 1) << (depth - :depth))
+              AND row >= (:row << (depth - :depth))
+              AND row <  ((:row + 1) << (depth - :depth))
+            """,
+            {"depth": depth, "col": col, "row": row},
+        ).fetchall()
+    ]
+    if not stale:
+        return 0
+    now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    db.executemany(
+        "UPDATE tiles SET source = 'pending', heightmap = NULL, "
+        "confidence_map = NULL, geometric_error = 0, updated_at = ? "
+        "WHERE tile_id = ?",
+        ((now_iso, stale_id) for stale_id in stale),
+    )
+    for stale_id in stale:
+        invalidate_tile_seams(db, stale_id)
+    log_coast.info(
+        f"[coastline] {tile_id}: water mask changed, reset {len(stale)} cooked "
+        "descendants for re-cooking"
+    )
+    return len(stale)
 
 
 def ensure_water_floor_version(db) -> None:
@@ -593,7 +700,23 @@ def effective_heightmap(db, tile_id: str, raw_heightmap):
             result[stale_water_on_land] = 0.0
     from bathymetry import complete_bathymetry_for_water, read_bathymetry
 
-    bathymetry = read_bathymetry(db, tile_id, result.shape)
+    # Spelled out as a 2-tuple: ndarray.shape is variadic, so passing it
+    # directly does not satisfy the (rows, cols) contract read_bathymetry
+    # declares, and a 1-D or 3-D array would slip through unnoticed.
+    if result.ndim != 2:
+        raise ValueError(
+            f"effective heightmap for {tile_id} must be 2-D, got {result.ndim}-D"
+        )
+    # NumPy's shape type is variadic, so even after the ndim guard Pylance
+    # cannot safely unpack/index it. len() gives the same two dimensions with
+    # a type contract the checker can prove.
+    height = len(result)
+    width = len(result[0]) if height else 0
+    if height < 2 or width < 2:
+        raise ValueError(
+            f"effective heightmap for {tile_id} is too small: {height}x{width}"
+        )
+    bathymetry = read_bathymetry(db, tile_id, (height, width))
     bathymetry_vertices = 0
     if bathymetry is not None:
         if bathymetry.shape != result.shape:
@@ -608,8 +731,8 @@ def effective_heightmap(db, tile_id: str, raw_heightmap):
         if bbox_row is None:
             raise ValueError(f"missing tile metadata for {tile_id}")
         cell_size_m = max(
-            (float(bbox_row[2]) - float(bbox_row[0])) / (result.shape[1] - 1),
-            (float(bbox_row[3]) - float(bbox_row[1])) / (result.shape[0] - 1),
+            (float(bbox_row[2]) - float(bbox_row[0])) / (width - 1),
+            (float(bbox_row[3]) - float(bbox_row[1])) / (height - 1),
         )
         bathymetry = complete_bathymetry_for_water(
             bathymetry, water, cell_size_m=cell_size_m,

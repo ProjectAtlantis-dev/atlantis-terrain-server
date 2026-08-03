@@ -1513,6 +1513,7 @@ test('terrain origin and pipeline decisions use one request mode', () => {
   assert.equal(origin.cameraY, 210);
   assert.equal(origin.logDetails.originDeltaX, -5.3);
   assert.equal(terrainPipelineStatus({ missing: [{}], downloading: [], texFetching: 0 }).nextAction, 'poll');
+  assert.equal(terrainPipelineStatus({ missing: [], downloading: [], texFetching: 0, coastlineQueued: 1 }).nextAction, 'poll');
   assert.equal(terrainPipelineStatus({ missing: [], downloading: [], texFetching: 0 }).nextAction, 'idle');
   assert.deepEqual(terrainCameraStereoPosition({
     latitude: 64, longitude: -51, anchorLatitude: 64, anchorLongitude: -51,

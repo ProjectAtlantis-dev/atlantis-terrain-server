@@ -226,15 +226,18 @@ export function terrainPipelineStatus(data) {
   const missing = data?.missing?.length ?? 0;
   const downloading = data?.downloading?.length ?? 0;
   const textureFetching = data?.texFetching ?? 0;
+  const coastlineQueued = data?.coastlineQueued ?? 0;
   const syntheticHeightmaps = retryableSyntheticDemCount(data?.tiles);
   return {
     missing,
     downloading,
     syntheticHeightmaps,
     textureFetching,
+    coastlineQueued,
     textureRetryQueue: data?.texRetryQueue ?? 0,
     textureStatusCounts: data?.texStatusCounts || {},
     nextAction: missing > 0 || downloading > 0 || textureFetching > 0
+      || coastlineQueued > 0
       || syntheticHeightmaps > 0 ? 'poll' : 'idle',
   };
 }

@@ -54,6 +54,60 @@ def block_path(block: str) -> Path:
     return BLOCK_DIR / f"GL50_Vektordata_100km_{block}.gpkg"
 
 
+def missing_blocks_for_bbox(bbox) -> list[str]:
+    """Block ids this bbox needs that are not on disk.
+
+    This is the whole reason coastline coverage needs no static configuration:
+    the requirement is derivable per tile. ``gtk50_demand`` turns the result
+    into a download.
+    """
+    return [b for b in blocks_for_bbox(bbox) if not block_path(b).exists()]
+
+
+def block_is_usable(block: str) -> bool:
+    """True when a local block actually parses into coastline geometry.
+
+    Existence is not enough. A block whose tables are missing or unreadable
+    parses to empty water and empty islands, which rasterises as solid land —
+    indistinguishable downstream from a genuine inland tile. Checking that the
+    parse yields geometry turns that silent wrong answer into a failed
+    download that can be retried.
+    """
+    invalidate_block_cache(block)
+    try:
+        parsed = _load_block(block)
+    except Exception:
+        return False
+    if parsed is None:
+        return False
+    water, islands = parsed
+    return bool(water) or bool(islands)
+
+
+def clear_block_cache() -> None:
+    """Drop every memoised parse, including memoised misses.
+
+    Any path that has just downloaded blocks must call this before rebuilding
+    masks. A long-running server that served tiles over a block while it was
+    still downloading has ``None`` cached for it, and the rebuild would then
+    skip precisely the tiles the download was meant to repair — silently, since
+    a skipped tile just keeps its old WMS mask.
+    """
+    with _block_lock:
+        _block_cache.clear()
+
+
+def invalidate_block_cache(block: str) -> None:
+    """Forget a memoised parse, including a memoised miss.
+
+    ``_load_block`` caches ``None`` for an absent block, so a block downloaded
+    while the server is running would keep reading as absent for the life of
+    the process without this.
+    """
+    with _block_lock:
+        _block_cache.pop(block, None)
+
+
 def blocks_for_bbox(bbox) -> list[str]:
     """100 km UTM-24N block ids intersecting an EPSG:3413 bbox.
 

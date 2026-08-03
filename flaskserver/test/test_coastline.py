@@ -185,6 +185,90 @@ class OfficialCoastlineTest(unittest.TestCase):
             )
             db.close()
 
+    def test_retained_wms_origin_is_not_downloaded_again_during_healing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db = open_db(str(Path(directory) / "terrain.db"))
+            seed_tiles(db, max_depth=0)
+            hydro = np.array([[True, False], [True, True]], dtype=bool)
+            write_hydrography_mask(db, "0-0-0", hydro)
+
+            class _Demand:
+                @staticmethod
+                def request_for_bbox(_bbox):
+                    return []
+
+            with (
+                patch("gtk50_vector.vector_water_mask", return_value=None),
+                patch("coastline.fetch_official_water_mask") as fetch,
+                patch.dict("sys.modules", {"gtk50_demand": _Demand}),
+            ):
+                result = cache_official_water_mask(
+                    db, "0-0-0", bbox=(0, 0, 1, 1), resolution=2,
+                )
+
+            self.assertIsNone(result)
+            fetch.assert_not_called()
+            np.testing.assert_array_equal(
+                read_hydrography_mask(db, "0-0-0"), hydro,
+            )
+            db.close()
+
+    def test_block_arriving_during_the_wms_fetch_is_used_immediately(self):
+        """A block can land while this tile is still fetching its fallback.
+
+        The rebuild that fires on arrival only visits tiles that already have a
+        mask row, and this tile's row does not exist yet, so it is not repaired.
+        Requesting the download afterwards schedules nothing either, because the
+        block is no longer missing. Without re-checking here the tile keeps its
+        WMS mask forever.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            db = open_db(str(Path(directory) / "terrain.db"))
+            seed_tiles(db, max_depth=0)
+            hydro = np.array([[True, False], [True, True]], dtype=bool)
+            vector = np.array([[True, True], [False, False]], dtype=bool)
+            calls = {"vector": 0}
+
+            def late_arrival(bbox, resolution):
+                # Missing on the first look, present by the time the slow WMS
+                # fetch returns.
+                calls["vector"] += 1
+                return None if calls["vector"] == 1 else vector
+
+            requested = []
+
+            class _Demand:
+                @staticmethod
+                def request_for_bbox(bbox):
+                    requested.append(bbox)
+                    return []
+
+            with (
+                patch("gtk50_vector.vector_water_mask", side_effect=late_arrival),
+                patch("coastline.fetch_official_water_mask", return_value=hydro),
+                patch.dict("sys.modules", {"gtk50_demand": _Demand}),
+                patch(
+                    "coastline.invalidate_cooked_descendants", return_value=0,
+                ) as invalidate_descendants,
+            ):
+                result = cache_official_water_mask(
+                    db, "0-0-0", bbox=(0, 0, 1, 1), resolution=2,
+                )
+
+            self.assertIsNotNone(result)
+            # read_water_mask folds in flood-connected hydrography by design, so
+            # assert on provenance: the tile must now carry an authoritative
+            # vector row rather than being left on the WMS fallback.
+            row = db.execute(
+                "SELECT source FROM coastline_masks WHERE tile_id = '0-0-0'"
+            ).fetchone()
+            self.assertIsNotNone(row, "no coastline mask written for the tile")
+            self.assertEqual(row[0], "gtk50_vector")
+            invalidate_descendants.assert_called_once_with(db, "0-0-0")
+            # Nothing to download: the block is already here.
+            self.assertEqual(requested, [])
+            db.close()
+
     def test_schema_v4_moves_existing_wms_masks_out_of_sea_authority(self):
         with tempfile.TemporaryDirectory() as directory:
             path = str(Path(directory) / "terrain.db")

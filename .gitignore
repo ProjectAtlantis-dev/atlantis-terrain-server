@@ -63,3 +63,15 @@ webserver/public/segmentation-results
 
 flaskserver/grundkort/
 artifacts/
+
+# Downloaded source data — multi-GB NASA/NSIDC granules, fetched on demand
+flaskserver/bedmachine/
+
+# GTK50 coastline blocks are acquired on demand and routinely exceed GitHub's
+# 100 MiB per-file limit (72_-1 is 104,943,616 bytes), so `git add -A` would
+# create an unpushable commit. Ignore the payloads, not the directory, so the
+# two already-tracked seed blocks can stay force-included below.
+flaskserver/gtk50_blocks/*.gpkg
+flaskserver/gtk50_blocks/*.gpkg.part
+!flaskserver/gtk50_blocks/GL50_Vektordata_100km_71_-1.gpkg
+!flaskserver/gtk50_blocks/GL50_Vektordata_100km_71_-2.gpkg
