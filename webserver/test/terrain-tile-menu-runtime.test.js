@@ -78,7 +78,7 @@ test('tile menu opens classifier operations with the selected tile', () => {
   assert.deepEqual(opened, ['/classifier.html?tile=14-5499-3176']);
 });
 
-test('flagging a regression posts the tile and note, then opens the gallery', async () => {
+test('flagging a regression posts the tile and note without leaving terrain', async () => {
   const body = createElement('body');
   const documentImpl = { body, createElement, addEventListener() {} };
   const fetchCalls = [];
@@ -101,7 +101,7 @@ test('flagging a regression posts the tile and note, then opens the gallery', as
     child => child.textContent === '⚑ Flag classifier regression…',
   );
   assert.ok(flag, 'flag action present');
-  await flag.listeners.get('click')();
+  await flag.listeners.get('click')({ currentTarget: flag });
 
   assert.equal(fetchCalls.length, 1);
   assert.equal(fetchCalls[0].url, '/api/regression/cases');
@@ -109,7 +109,8 @@ test('flagging a regression posts the tile and note, then opens the gallery', as
     tile: '12-1380-791',
     note: 'green painted on the lake',
   });
-  assert.deepEqual(opened, ['/api/regression/']);
+  assert.deepEqual(opened, []);
+  assert.equal(flag.textContent, '✓ Regression flagged');
 });
 
 test('cancelling the regression prompt sends nothing', async () => {

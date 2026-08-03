@@ -2766,21 +2766,14 @@ renderer.domElement.addEventListener('mousemove', event => {
   const mesh = hits[0].object;
   if (gridlines3dHover) {
     hoverOutlineController.show(null);
-    tileInfoEl.style.maxWidth = '';
-    tileInfoEl.style.border = 'none';
-    tileInfoEl.textContent = `tile: ${mesh.userData.tileId}`;
-    tileInfoEl.style.left = `${Math.max(8, Math.min(event.clientX + 14, window.innerWidth - 180))}px`;
-    tileInfoEl.style.top = `${Math.max(8, Math.min(event.clientY + 14, window.innerHeight - 42))}px`;
-    tileInfoEl.style.right = 'auto';
-    tileInfoEl.style.display = 'block';
-    return;
+  } else {
+    hoverOutlineController.show(mesh, 'outline');
   }
-  hoverOutlineController.show(mesh, 'outline');
-  tileInfoEl.style.maxWidth = '';
+  tileInfoEl.style.maxWidth = gridlines3dHover ? '420px' : '';
   tileInfoEl.style.border = 'none';
-  tileInfoEl.style.left = 'auto';
-  tileInfoEl.style.top = '12px';
-  tileInfoEl.style.right = '12px';
+  tileInfoEl.style.left = gridlines3dHover ? '0' : 'auto';
+  tileInfoEl.style.top = gridlines3dHover ? '0' : '12px';
+  tileInfoEl.style.right = gridlines3dHover ? 'auto' : '12px';
   const info = summarizeTerrainMesh(mesh);
   const overlappingMeshes = [...new Map(hits
     .filter(hit => hit.object.userData?.tileId && hit.object.userData.tileId !== info.tileId)
@@ -2819,6 +2812,17 @@ renderer.domElement.addEventListener('mousemove', event => {
     overlapLines.length > 0 ? overlapLines.join('<br>') : null
   ].filter(Boolean).join('<br>');
   tileInfoEl.style.display = 'block';
+  if (gridlines3dHover) {
+    const margin = 8;
+    const cursorGap = 14;
+    const maxLeft = Math.max(margin, window.innerWidth - tileInfoEl.offsetWidth - margin);
+    const maxTop = Math.max(margin, window.innerHeight - tileInfoEl.offsetHeight - margin);
+    const preferredTop = event.clientY + cursorGap + tileInfoEl.offsetHeight <= window.innerHeight - margin
+      ? event.clientY + cursorGap
+      : event.clientY - tileInfoEl.offsetHeight - cursorGap;
+    tileInfoEl.style.left = `${Math.max(margin, Math.min(event.clientX + cursorGap, maxLeft))}px`;
+    tileInfoEl.style.top = `${Math.max(margin, Math.min(preferredTop, maxTop))}px`;
+  }
 });
 
 renderer.domElement.addEventListener('mouseleave', hideTileInfo);

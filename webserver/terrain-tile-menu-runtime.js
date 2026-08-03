@@ -74,8 +74,8 @@ export function createTerrainTileMenuRuntime({
     // The classifier regression loop: the USER curates the known-bad set
     // by flagging tiles live; the server bakes the full verification
     // panels (ladder steps, Google ref, Asiaq overlay) immediately and
-    // the gallery at /api/regression/ is re-eyeballed after every
-    // classifier change.
+    // Filing stays in the terrain review loop so nearby failures can be
+    // curated without spawning a new page after every tile.
     addAction('⚑ Flag classifier regression…', async event => {
       const action = event?.currentTarget;
       const note = windowImpl.prompt(
@@ -90,8 +90,7 @@ export function createTerrainTileMenuRuntime({
           body: JSON.stringify({ tile: tileId, note }),
         });
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
-        hide();
-        windowImpl.open('/api/regression/', '_blank');
+        if (action) action.textContent = '✓ Regression flagged';
       } catch (error) {
         if (action) action.textContent = '⚑ Flag failed — click to retry';
         console.error(`[regression-flag] ${tileId}:`, error);

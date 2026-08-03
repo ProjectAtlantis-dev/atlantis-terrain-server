@@ -405,13 +405,13 @@ class BathymetryDemandScheduler:
 
         with self._lock:
             self._active.discard(job_id)
-            if error is None:
+            if failure is None:
                 self._completed.add(job_id)
                 self._failed_at.pop(job_id, None)
                 self._last_error.pop(job_id, None)
             else:
                 self._failed_at[job_id] = failure["failed_at"]
-                self._last_error[job_id] = error
+                self._last_error[job_id] = failure["error"]
 
         if error is None and self.db_path.is_file():
             try:
