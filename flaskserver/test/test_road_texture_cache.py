@@ -21,9 +21,8 @@ class RoadTextureCacheTest(unittest.TestCase):
         self.assets_path = Path(self.directory.name) / "assets.db"
         assets = connect(self.assets_path)
         road = {
-            "kind": "path",
-            "category": "Natursti",
-            "widthM": 4,
+            "sourceLayer": "STIMIDTE",
+            "sourceProperties": {"revision": "one"},
             "path": [[0, 50, 0], [100, 50, 0]],
         }
         assets.execute(
@@ -32,7 +31,7 @@ class RoadTextureCacheTest(unittest.TestCase):
             "updated_at,cx,cy,min_x,min_y,max_x,max_y) "
             "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
-                "trail-1", "road", 1, 0, 0, 0, None,
+                "trail-1", "STIMIDTE", 1, 0, 0, 0, None,
                 json.dumps(road), None, "roads-v1",
                 50, 50, 0, 50, 100, 50,
             ),
@@ -94,9 +93,8 @@ class RoadTextureCacheTest(unittest.TestCase):
 
         assets = connect(self.assets_path)
         changed = {
-            "kind": "path",
-            "category": "Anlagt",
-            "widthM": 6,
+            "sourceLayer": "STIMIDTE",
+            "sourceProperties": {"revision": "two"},
             "path": [[0, 50, 0], [100, 50, 0]],
         }
         assets.execute(

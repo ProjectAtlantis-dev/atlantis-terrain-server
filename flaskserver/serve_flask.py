@@ -1744,13 +1744,26 @@ _BUILDING_QUERY_RANGE_M = 25000.0
 
 def _buildings_for_tile_query(qx: float, qy: float, ox: float, oy: float):
   """Resolve scene buildings as part of the terrain-tile transaction."""
-  from asset_catalog import color_buildings_from_textures, query_buildings
+  from asset_catalog import color_buildings_from_textures, query_asset_by_type
   from gtk50_vector import query_structures
-  from ingest_buildings import GroundSampler
+  from ingest_buildings import GroundSampler, SOURCE_LAYER
 
-  buildings = query_buildings(
-    _get_assets_db(), qx, qy, _BUILDING_QUERY_RANGE_M, ox, oy
+  building_assets = query_asset_by_type(
+    _get_assets_db(), SOURCE_LAYER, qx, qy, _BUILDING_QUERY_RANGE_M
   )
+  buildings = []
+  for asset in building_assets:
+    props = asset["properties"]
+    ring = props.get("ring")
+    if not isinstance(ring, list) or len(ring) < 3:
+      continue
+    buildings.append({
+      "id": asset["id"],
+      "sourceLayer": props.get("sourceLayer"),
+      "sourceProperties": props.get("sourceProperties"),
+      "groundZ": props.get("groundZ", 0),
+      "ring": [[point[0] - ox, point[1] - oy, point[2]] for point in ring],
+    })
   bbox = (
     qx - _BUILDING_QUERY_RANGE_M, qy - _BUILDING_QUERY_RANGE_M,
     qx + _BUILDING_QUERY_RANGE_M, qy + _BUILDING_QUERY_RANGE_M,
@@ -3145,11 +3158,14 @@ def api_classifier_training_tile(tile_id: str):
     from classifier.segmentation import SEGMENTER_VERSION
     from classifier.training import (
       CLASSES, geographic_group, geographic_split,
-      load_segmented_tile, read_annotations,
+      load_segmented_tile, read_annotations, read_classifier_suggestions,
     )
 
     _, segmented = load_segmented_tile(_get_db(), tile_id)
     annotations = read_annotations(_get_db(), tile_id)
+    _, suggestion_source = read_classifier_suggestions(
+      _get_db(), tile_id, segmented.labels.shape
+    )
     regression_tiles = _training_regression_tiles()
     return jsonify({
       "tile": tile_id,
@@ -3162,6 +3178,7 @@ def api_classifier_training_tile(tile_id: str):
         str(segment_id): class_name
         for segment_id, class_name in annotations.items()
       },
+      "suggestionSource": suggestion_source,
       "group": geographic_group(tile_id),
       "split": geographic_split(tile_id, regression_tiles),
       "overlayUrl": f"/api/classifier/training/{tile_id}/overlay.png",
@@ -3178,7 +3195,7 @@ def api_classifier_training_image(tile_id: str, kind: str):
   try:
     from classifier.training import (
       encode_segment_ids, load_segmented_tile,
-      read_annotations, render_annotation_overlay,
+      read_annotations, read_classifier_suggestions, render_annotation_overlay,
     )
     from PIL import Image as TrainingImage
 
@@ -3186,8 +3203,11 @@ def api_classifier_training_image(tile_id: str, kind: str):
     if kind == "ids":
       rendered = encode_segment_ids(segmented.labels)
     else:
+      suggestions, _ = read_classifier_suggestions(
+        _get_db(), tile_id, segmented.labels.shape
+      )
       rendered = render_annotation_overlay(
-        rgb, segmented, read_annotations(_get_db(), tile_id)
+        rgb, segmented, read_annotations(_get_db(), tile_id), suggestions
       )
     buffer = io.BytesIO()
     TrainingImage.fromarray(rendered, mode="RGB").save(buffer, format="PNG")
@@ -3248,6 +3268,8 @@ def api_classifier_training_model():
     })
   try:
     model = model_metadata()
+    if model is None:
+      raise OSError("classifier model metadata is unavailable")
     return jsonify({
       "trained": True, "format": model["format"],
       "createdAt": model.get("createdAt"),

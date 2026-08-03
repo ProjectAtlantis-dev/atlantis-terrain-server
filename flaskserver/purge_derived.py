@@ -7,7 +7,7 @@ originally arrived.
 
 Retained origins include measured/downloaded DEMs, provider textures and
 terminal provider no-coverage results, WMS hydrography, GTK50 GeoPackages on
-disk, roads, buildings, and sounding evidence. Derived rasters, classifications,
+disk, and sounding evidence. Asset vectors live in ``assets.db``. Derived rasters, classifications,
 cooks, presentation caches, bathymetry solves, seams, and sounding/model
 comparisons are removed or reset.
 

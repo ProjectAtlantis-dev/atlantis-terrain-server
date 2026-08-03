@@ -6,13 +6,13 @@ tile/texture being served.
 """
 from __future__ import annotations
 
+import colorsys
 import io
 import json
 import math
 import sqlite3
 import statistics
 import time
-import colorsys
 from pathlib import Path
 from typing import Any
 
@@ -23,17 +23,8 @@ ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_ASSETS_DB_PATH = ROOT / "assetserver" / "assets.db"
 DEFAULT_METADATA_PATH = ROOT / "assetserver" / "assets_metadata.json"
 
-ROAD_WIDTH_SCALE = {
-    "road:Hovedvej": 1.35,
-    "road:Lokalvej": 1.25,
-    "road:Adgangsvej": 1.25,
-    "road:Kørespor": 1.15,
-    "road:Under anlæg": 1.2,
-    "road:Tunnel": 1.2,
-    "path:Anlagt": 1.15,
-    "path:Natursti": 1.1,
-}
 ROAD_SUPERSAMPLE = 4
+DEFAULT_LINE_WIDTH_M = 3.0
 _BUILDING_COLOR_CACHE: dict[tuple[str, str, str], tuple[int, int, int]] = {}
 
 
@@ -47,12 +38,18 @@ def connect(path: Path = DEFAULT_ASSETS_DB_PATH) -> sqlite3.Connection:
         "id TEXT PRIMARY KEY,type TEXT NOT NULL,enabled INTEGER NOT NULL DEFAULT 1,"
         "lat REAL NOT NULL,lon REAL NOT NULL,heading_deg REAL NOT NULL DEFAULT 0,"
         "z REAL,properties TEXT NOT NULL DEFAULT '{}',saved_at REAL,"
-        "updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)"
+        "updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,"
+        "cx REAL,cy REAL,min_x REAL,min_y REAL,max_x REAL,max_y REAL)"
     )
     columns = {row[1] for row in db.execute("PRAGMA table_info(assets)")}
-    for column in ("cx", "cy", "min_x", "min_y", "max_x", "max_y"):
-        if column not in columns:
-            db.execute(f"ALTER TABLE assets ADD COLUMN {column} REAL")
+    required = {"cx", "cy", "min_x", "min_y", "max_x", "max_y"}
+    missing = sorted(required - columns)
+    if missing:
+        db.close()
+        raise RuntimeError(
+            "assets.db has an obsolete schema; purge and reload it "
+            f"(missing: {', '.join(missing)})"
+        )
     db.execute("CREATE INDEX IF NOT EXISTS idx_assets_cxy ON assets(cx,cy)")
     db.execute(
         "CREATE INDEX IF NOT EXISTS idx_assets_bounds "
@@ -70,37 +67,30 @@ def _properties(raw: str) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
-def query_buildings(
+def query_asset_by_type(
     db: sqlite3.Connection,
+    asset_type: str,
     qx: float,
     qy: float,
     max_range: float,
-    ox: float,
-    oy: float,
 ) -> list[dict[str, Any]]:
     try:
         rows = db.execute(
-            "SELECT id, properties FROM assets "
-            "WHERE type = 'building' AND enabled = 1 "
+            "SELECT id, type, properties FROM assets "
+            "WHERE type = ? AND enabled = 1 "
             "AND cx BETWEEN ? AND ? AND cy BETWEEN ? AND ? LIMIT 20000",
-            (qx - max_range, qx + max_range, qy - max_range, qy + max_range),
+            (
+                asset_type,
+                qx - max_range, qx + max_range,
+                qy - max_range, qy + max_range,
+            ),
         ).fetchall()
     except sqlite3.OperationalError:
         return []
-    result = []
-    for asset_id, raw in rows:
-        props = _properties(raw)
-        ring = props.get("ring")
-        if not isinstance(ring, list) or len(ring) < 3:
-            continue
-        result.append({
-            "id": asset_id,
-            "b": props.get("b"),
-            "use": props.get("use"),
-            "groundZ": props.get("groundZ", 0),
-            "ring": [[point[0] - ox, point[1] - oy, point[2]] for point in ring],
-        })
-    return result
+    return [
+        {"id": asset_id, "type": row_type, "properties": _properties(raw)}
+        for asset_id, row_type, raw in rows
+    ]
 
 
 def _point_in_polygon(x: float, y: float, polygon: list[tuple[float, float]]) -> bool:
@@ -275,19 +265,19 @@ def query_roads(
     x_min, y_min, x_max, y_max = bbox
     try:
         rows = db.execute(
-            "SELECT id, properties FROM assets "
-            "WHERE type = 'road' AND enabled = 1 "
+            "SELECT id, type, properties FROM assets "
+            "WHERE enabled = 1 AND json_type(properties,'$.path')='array' "
             "AND min_x <= ? AND max_x >= ? AND min_y <= ? AND max_y >= ?",
             (x_max, x_min, y_max, y_min),
         ).fetchall()
     except sqlite3.OperationalError:
         return []
     result = []
-    for asset_id, raw in rows:
+    for asset_id, source_layer, raw in rows:
         props = _properties(raw)
         path = props.get("path")
         if isinstance(path, list) and len(path) >= 2:
-            result.append({"id": asset_id, **props})
+            result.append({"id": asset_id, "type": source_layer, **props})
     return result
 
 
@@ -344,18 +334,8 @@ def _road_raster_specs(
         if len(points) < 2:
             continue
         points = _smooth_points(points)
-        width_m = float(road.get("widthM", 4.0))
-        key = f"{road.get('kind', 'road')}:{road.get('category', '')}"
-        profile_scale = ROAD_WIDTH_SCALE.get(
-            key, 1.25 if road.get("kind") == "road" else 1.1
-        )
-        width_px = width_m * profile_scale / span_x * width * scale
-        if road.get("kind") == "road":
-            minimum_screen_px = 1.5
-        elif road.get("category") == "Anlagt":
-            minimum_screen_px = 2.0
-        else:
-            minimum_screen_px = 1.5
+        width_px = DEFAULT_LINE_WIDTH_M / span_x * width * scale
+        minimum_screen_px = 1.5
         fill_width = max(
             1, int(round(max(width_px, minimum_screen_px * scale)))
         )
@@ -476,29 +456,6 @@ def _pavement_color(sampled: tuple[int, int, int]) -> tuple[int, int, int]:
     )
 
 
-def _trail_color(
-    sampled: tuple[int, int, int], natural: bool
-) -> tuple[int, int, int]:
-    """Keep the local terrain hue while giving the path readable contrast."""
-    red, green, blue = (channel / 255 for channel in sampled)
-    hue, saturation, value = colorsys.rgb_to_hsv(red, green, blue)
-    # Natursti centerlines are often drawn over olive or grey-green terrain.
-    # A 12% value change disappeared after alpha blending and JPEG encoding,
-    # leaving only faint grey survey lines. Preserve and gently reinforce the
-    # sampled chroma, but restore enough contrast for the baked trail surface
-    # to read at walking-scale LODs.
-    value *= 0.72 if natural else 0.80
-    saturation = min(1.0, saturation * 1.05)
-    out_red, out_green, out_blue = colorsys.hsv_to_rgb(
-        hue, saturation, value
-    )
-    return (
-        int(round(out_red * 255)),
-        int(round(out_green * 255)),
-        int(round(out_blue * 255)),
-    )
-
-
 def paint_roads_image(
     image: Image.Image,
     bbox: tuple[float, float, float, float],
@@ -531,7 +488,7 @@ def paint_roads_image(
         # One continuous two-lane surface. Supersampling supplies the edge
         # transition; extra casing/crown strokes incorrectly imply separate
         # carriageways and a median.
-        alpha = 230 if debug else (180 if road.get("kind") == "path" else 145)
+        alpha = 230 if debug else 145
         if debug:
             _draw_round_line(draw, points, (255, 20, 20, alpha), fill_width)
             painted += 1
@@ -543,10 +500,7 @@ def paint_roads_image(
             )
             if sampled is None:
                 continue
-            if road.get("kind") == "path":
-                color = _trail_color(sampled, road.get("category") == "Natursti")
-            else:
-                color = _pavement_color(sampled)
+            color = _pavement_color(sampled)
             _draw_round_line(draw, [first, second], (*color, alpha), fill_width)
             segment_painted = True
         if segment_painted:
@@ -596,25 +550,30 @@ def get_assets_response(
     db: sqlite3.Connection, metadata_path: Path = DEFAULT_METADATA_PATH
 ) -> dict[str, Any]:
     metadata = _metadata(metadata_path)
+    vehicle_type = str(metadata.get("vehicle_asset_type") or "").strip()
+    structure_type = str(metadata.get("structure_asset_type") or "").strip()
+    if not vehicle_type or not structure_type:
+        raise ValueError("asset metadata must define runtime asset type strings")
     seeded_structures = _ensure_seed_assets(
-        db, "structure", metadata.get("seed_structure_instances", [])
+        db, structure_type, metadata.get("seed_structure_instances", []), vehicle=False
     )
     seeded_vehicles = _ensure_seed_assets(
-        db, "vehicle", metadata.get("seed_vehicle_instances", [])
+        db, vehicle_type, metadata.get("seed_vehicle_instances", []), vehicle=True
     )
     vehicles = []
     structures = []
     try:
         rows = db.execute(
             "SELECT id, type, lat, lon, heading_deg, z, properties, saved_at "
-            "FROM assets WHERE enabled = 1 AND type IN ('vehicle', 'structure') "
-            "ORDER BY updated_at DESC, id"
+            "FROM assets WHERE enabled = 1 AND type IN (?,?) "
+            "ORDER BY updated_at DESC, id",
+            (vehicle_type, structure_type),
         ).fetchall()
     except sqlite3.OperationalError:
         rows = []
     for asset_id, asset_type, lat, lon, heading, z, raw, saved_at in rows:
         props = _properties(raw)
-        if asset_type == "vehicle":
+        if asset_type == vehicle_type:
             item = {
                 "id": asset_id, "lat": lat, "lon": lon,
                 "headingDeg": heading, "headlightsOn": props.get("headlightsOn", True),
@@ -661,7 +620,7 @@ def get_assets_response(
 
 
 def _ensure_seed_assets(
-    db: sqlite3.Connection, asset_type: str, seeds: Any
+    db: sqlite3.Connection, asset_type: str, seeds: Any, *, vehicle: bool
 ) -> bool:
     if db.execute("SELECT 1 FROM assets WHERE type=? LIMIT 1", (asset_type,)).fetchone():
         return False
@@ -678,7 +637,7 @@ def _ensure_seed_assets(
             heading = float(seed.get("headingDeg", 0))
         except (KeyError, TypeError, ValueError):
             continue
-        if asset_type == "vehicle":
+        if vehicle:
             props = {"headlightsOn": seed.get("headlightsOn", True)}
             for key in ("terrainDepth", "terrainTileId"):
                 if seed.get(key) is not None:
@@ -713,9 +672,13 @@ def save_vehicle_state(db: sqlite3.Connection, payload: dict[str, Any]) -> tuple
     if not all(math.isfinite(value) for value in (lat, lon, heading)):
         return {"error": "invalid vehicle state payload: coordinates must be finite"}, 400
 
+    vehicle_type = str(_metadata().get("vehicle_asset_type") or "").strip()
+    if not vehicle_type:
+        return {"error": "asset metadata has no vehicle_asset_type"}, 500
     row = db.execute(
-        "SELECT id, properties FROM assets WHERE type='vehicle' "
-        "ORDER BY enabled DESC, updated_at DESC, id LIMIT 1"
+        "SELECT id, properties FROM assets WHERE type=? "
+        "ORDER BY enabled DESC, updated_at DESC, id LIMIT 1",
+        (vehicle_type,),
     ).fetchone()
     vehicle_id = str(row[0]) if row else "amv-01"
     props = _properties(row[1]) if row else {"headlightsOn": True}
@@ -736,11 +699,12 @@ def save_vehicle_state(db: sqlite3.Connection, payload: dict[str, Any]) -> tuple
     db.execute(
         "INSERT INTO assets "
         "(id,type,enabled,lat,lon,heading_deg,z,properties,saved_at,updated_at) "
-        "VALUES (?,'vehicle',1,?,?,?,?,?,?,CURRENT_TIMESTAMP) "
-        "ON CONFLICT(id) DO UPDATE SET enabled=1,lat=excluded.lat,lon=excluded.lon,"
+        "VALUES (?,?,1,?,?,?,?,?,?,CURRENT_TIMESTAMP) "
+        "ON CONFLICT(id) DO UPDATE SET type=excluded.type,enabled=1,"
+        "lat=excluded.lat,lon=excluded.lon,"
         "heading_deg=excluded.heading_deg,z=excluded.z,properties=excluded.properties,"
         "saved_at=excluded.saved_at,updated_at=CURRENT_TIMESTAMP",
-        (vehicle_id, lat, lon, heading, z, json.dumps(props), saved_at),
+        (vehicle_id, vehicle_type, lat, lon, heading, z, json.dumps(props), saved_at),
     )
     db.commit()
     state = {"lat": lat, "lon": lon, "headingDeg": heading, "savedAt": saved_at}

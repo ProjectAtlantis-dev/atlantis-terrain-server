@@ -60,7 +60,7 @@ def _real_texture(db, tile_id):
     return row[0]
 
 
-def asiaq_built_mask(db, bbox, size):
+def asiaq_built_mask(bbox, size):
     """Buildings + roads rasterized into the tile frame, image-oriented."""
     x0, y0, x1, y1 = (float(v) for v in bbox)
     pad = 50.0
@@ -73,28 +73,34 @@ def asiaq_built_mask(db, bbox, size):
             (y1 - y) / (y1 - y0) * (size - 1),
         )
 
+    from asset_catalog import (
+        DEFAULT_LINE_WIDTH_M,
+        connect,
+        query_asset_by_type,
+        query_roads,
+    )
+    from ingest_buildings import SOURCE_LAYER
+
+    assets_db = connect()
     count = 0
-    for (ring_json,) in db.execute(
-        "SELECT ring FROM buildings WHERE cx BETWEEN ? AND ? "
-        "AND cy BETWEEN ? AND ?",
-        (x0 - pad, x1 + pad, y0 - pad, y1 + pad),
-    ):
-        ring = json.loads(ring_json)
+    qx, qy = (x0 + x1) / 2, (y0 + y1) / 2
+    radius = max(x1 - x0, y1 - y0) / 2 + pad
+    for asset in query_asset_by_type(assets_db, SOURCE_LAYER, qx, qy, radius):
+        ring = asset["properties"].get("ring")
+        if not isinstance(ring, list):
+            continue
         draw.polygon([to_px(px, py) for px, py, *_ in ring], fill=255)
         count += 1
     meters_per_px = (x1 - x0) / size
-    for path_json, width_m in db.execute(
-        "SELECT path, width_m FROM roads WHERE cx BETWEEN ? AND ? "
-        "AND cy BETWEEN ? AND ?",
-        (x0 - pad, x1 + pad, y0 - pad, y1 + pad),
-    ):
-        path = json.loads(path_json)
-        width_px = max(1, round(float(width_m or 4.0) / meters_per_px))
+    for road in query_roads(assets_db, (x0 - pad, y0 - pad, x1 + pad, y1 + pad)):
+        path = road["path"]
+        width_px = max(1, round(DEFAULT_LINE_WIDTH_M / meters_per_px))
         draw.line(
             [to_px(px, py) for px, py, *_ in path],
             fill=255, width=width_px,
         )
         count += 1
+    assets_db.close()
     return np.asarray(image) > 127, count
 
 
@@ -231,7 +237,7 @@ def verify_tile(db, tile_id, out_dir, use_google=True):
 
     metrics = {"tile": tile_id, "stats": stats}
 
-    built, feature_count = asiaq_built_mask(db, tile["bbox"], SIZE)
+    built, feature_count = asiaq_built_mask(tile["bbox"], SIZE)
     metrics["asiaq_features"] = feature_count
     if np.any(built):
         built_n = int(np.count_nonzero(built))

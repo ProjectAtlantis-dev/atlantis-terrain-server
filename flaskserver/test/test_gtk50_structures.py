@@ -35,10 +35,11 @@ class Gtk50StructureTests(unittest.TestCase):
         self.assertEqual(len(result), 1)
         self.assertEqual(result[0]["groundZ"], 125.0)
         self.assertEqual(result[0]["ring"][0], [5.0, 10.0, 133.0])
+        self.assertEqual(result[0]["sourceLayer"], "building_s")
         self.assertEqual(result[0]["_center"], [15.0, 20.0])
         self.assertEqual(len(ground.samples), 1)
 
-    def test_power_station_gets_semantic_use_and_default_height(self):
+    def test_power_station_preserves_source_layer_and_gets_default_height(self):
         polygon = Polygon([(0, 0), (2, 0), (2, 2), (0, 2)])
         with (
             patch.object(gtk50_vector, "blocks_for_bbox", return_value=["1_01"]),
@@ -54,7 +55,9 @@ class Gtk50StructureTests(unittest.TestCase):
                 (-1, -1, 3, 3), ground_sampler=_Ground(None), ox=0, oy=0
             )
 
-        self.assertEqual(result[0]["use"], "powerStation")
+        self.assertEqual(result[0]["sourceLayer"], "electricpowerstation_s")
+        self.assertNotIn("b", result[0])
+        self.assertNotIn("use", result[0])
         self.assertEqual(result[0]["groundZ"], 0.0)
         self.assertEqual(result[0]["ring"][0][2], 5.0)
 

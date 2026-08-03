@@ -4,30 +4,33 @@ Settlement zips (``*_TekniskGrundkort_SHP.zip``) live in ``grundkort/``
 (gitignored). At server startup a background thread downloads any
 configured settlement (``terrain_config.GRUNDKORT_SETTLEMENTS``) that is
 missing locally — kortforsyning.asiaq.gl is an open file server, no
-auth — then ingests any settlement whose buildings/roads rows are
-missing. A fresh clone or a flushed terrain.db repopulates itself the
+auth — then ingests any settlement whose asset rows are missing. A fresh
+clone or a flushed assets.db repopulates itself the
 same way tiles and masks do; extra zips dropped in manually are ingested
 too.
 
-After ingest, buildings are synced into the asset server's ``assets.db``
-as ``type='building'`` rows. Flask reads that catalog while processing
+Buildings and roads are ingested directly into ``assets.db``. Flask reads
+that catalog while processing
 ``/api/tiles`` and includes the matching buildings in the tile response;
 the browser never contacts the asset server or a separate building endpoint.
 
 Fresh-DB ordering is handled by deferral: buildings ingested before the
-area's heightmaps exist get ``ground_sampled = 0`` (roof-derived ground
-estimate); a background loop re-samples them from real heightmaps as
-those stream in and re-syncs the fixed rows to assets.db.
+area's heightmaps exist keep ``groundSampled=false`` in their asset properties;
+a background loop re-samples them from real heightmaps as those stream in.
 """
 from __future__ import annotations
 
 import json
+import hashlib
 import re
 import sqlite3
 import threading
 import time
+import urllib.error
 import urllib.request
+import zipfile
 from concurrent.futures import ThreadPoolExecutor
+from email.utils import formatdate
 from pathlib import Path
 from typing import Callable
 
@@ -41,79 +44,172 @@ DB_PATH = Path(__file__).resolve().parent / "terrain.db"
 ASSETS_DB_PATH = Path(__file__).resolve().parent.parent / "assetserver" / "assets.db"
 _FILES_URL = "https://kortforsyning.asiaq.gl/files"
 _GROUND_RETRY_S = 60.0
+REFRESH_INTERVAL_S = 7 * 24 * 60 * 60
+REFRESH_POLL_S = 24 * 60 * 60
 DEMAND_RADIUS_M = 30_000.0
 DEMAND_RETRY_AFTER_S = 300.0
 _ingest_lock = threading.RLock()
 
-# Mirrors the asset server's initDb DDL (server.ts) so seeding works even
-# if the asset server has never run; both sides guard the cx/cy migration.
-_ASSETS_SCHEMA = """
-CREATE TABLE IF NOT EXISTS assets (
-  id          TEXT PRIMARY KEY,
-  type        TEXT NOT NULL,
-  enabled     INTEGER NOT NULL DEFAULT 1,
-  lat         REAL NOT NULL,
-  lon         REAL NOT NULL,
-  heading_deg REAL NOT NULL DEFAULT 0,
-  z           REAL,
-  properties  TEXT NOT NULL DEFAULT '{}',
-  saved_at    REAL,
-  updated_at  TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-"""
+
+def _refresh_metadata_path(target: Path) -> Path:
+    return target.with_name(target.name + ".refresh.json")
 
 
-def _download_settlement(folder: str) -> None:
-    """Fetch a settlement's SHP zip from the open Asiaq file server."""
+def _read_refresh_metadata(target: Path) -> dict:
+    try:
+        value = json.loads(_refresh_metadata_path(target).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _write_refresh_metadata(target: Path, metadata: dict) -> None:
+    path = _refresh_metadata_path(target)
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(
+        json.dumps(metadata, ensure_ascii=False, sort_keys=True), encoding="utf-8"
+    )
+    temporary.replace(path)
+
+
+def _archive_content_digest(path: Path) -> str:
+    """Hash source payloads while ignoring the DBF last-update date."""
+    from ingest_buildings import SOURCE_LAYER as building_layer
+    from ingest_roads import SOURCE_LAYERS as road_layers
+
+    digest = hashlib.sha256()
+    with zipfile.ZipFile(path) as archive:
+        names = {Path(name).name.upper(): name for name in archive.namelist()}
+        for layer in (building_layer, *road_layers):
+            for suffix in ("SHP", "DBF", "PRJ"):
+                member_name = f"{layer}.{suffix}"
+                digest.update(member_name.encode("ascii"))
+                archive_name = names.get(member_name)
+                if archive_name is None:
+                    digest.update(b"\0missing")
+                    continue
+                data = archive.read(archive_name)
+                if suffix == "DBF" and len(data) >= 4:
+                    # Bytes 1-3 are YY/MM/DD and change when Asiaq republishes
+                    # an otherwise identical shapefile export.
+                    data = data[:1] + b"\0\0\0" + data[4:]
+                digest.update(data)
+    return digest.hexdigest()
+
+
+def _download_settlement(folder: str, *, now: float | None = None) -> bool:
+    """Refresh a settlement archive when due; return source-content change."""
     code = folder.split("_")[0]
     target = ZIP_DIR / f"{code}_TekniskGrundkort_SHP.zip"
-    if target.exists():
-        return
+    checked_at = time.time() if now is None else now
+    metadata = _read_refresh_metadata(target)
+    try:
+        previous_check = float(metadata.get("checkedAt", 0))
+    except (TypeError, ValueError):
+        previous_check = 0
+    current_digest = metadata.get("contentDigest")
+    if target.exists() and checked_at - previous_check < REFRESH_INTERVAL_S:
+        if not isinstance(current_digest, str):
+            current_digest = _archive_content_digest(target)
+        return current_digest != metadata.get("ingestedDigest")
+
     url = f"{_FILES_URL}/{folder}/SHP/{target.name}"
     partial = target.with_name(target.name + ".part")
-    log.info(f"[grundkort] downloading {target.name} from {url}")
+    headers = {"User-Agent": "atlantis-terrain/grundkort"}
+    if target.exists():
+        if metadata.get("etag"):
+            headers["If-None-Match"] = str(metadata["etag"])
+        if metadata.get("lastModified"):
+            headers["If-Modified-Since"] = str(metadata["lastModified"])
+        elif not metadata.get("etag"):
+            headers["If-Modified-Since"] = formatdate(
+                target.stat().st_mtime, usegmt=True
+            )
+    log.info(f"[grundkort] checking {target.name} for source updates")
     started = time.time()
-    request = urllib.request.Request(
-        url, headers={"User-Agent": "atlantis-terrain/grundkort"}
-    )
-    with urllib.request.urlopen(request, timeout=60) as response:
-        total = int(response.headers.get("Content-Length") or 0)
-        done = 0
-        next_report = 0.1
-        with open(partial, "wb") as out:
-            while chunk := response.read(1 << 20):
-                out.write(chunk)
-                done += len(chunk)
-                if total and done / total >= next_report:
-                    elapsed = time.time() - started
-                    eta = elapsed / done * (total - done)
-                    log.info(
-                        f"[grundkort] {target.name}: {done * 100 // total}% "
-                        f"eta {eta:.0f}s"
-                    )
-                    next_report += 0.1
-    partial.rename(target)
+    request = urllib.request.Request(url, headers=headers)
+    try:
+        response = urllib.request.urlopen(request, timeout=60)
+    except urllib.error.HTTPError as exc:
+        if exc.code != 304 or not target.exists():
+            raise
+        if not isinstance(current_digest, str):
+            current_digest = _archive_content_digest(target)
+        metadata.update({
+            "checkedAt": checked_at,
+            "contentDigest": current_digest,
+            "etag": exc.headers.get("ETag") or metadata.get("etag"),
+            "lastModified": (
+                exc.headers.get("Last-Modified") or metadata.get("lastModified")
+            ),
+        })
+        _write_refresh_metadata(target, metadata)
+        log.info(f"[grundkort] {target.name} is current")
+        return current_digest != metadata.get("ingestedDigest")
+
+    try:
+        with response:
+            total = int(response.headers.get("Content-Length") or 0)
+            done = 0
+            next_report = 0.1
+            with open(partial, "wb") as out:
+                while chunk := response.read(1 << 20):
+                    out.write(chunk)
+                    done += len(chunk)
+                    if total and done / total >= next_report:
+                        elapsed = time.time() - started
+                        eta = elapsed / done * (total - done)
+                        log.info(
+                            f"[grundkort] {target.name}: {done * 100 // total}% "
+                            f"eta {eta:.0f}s"
+                        )
+                        next_report += 0.1
+            next_digest = _archive_content_digest(partial)
+            partial.replace(target)
+            metadata.update({
+                "checkedAt": checked_at,
+                "contentDigest": next_digest,
+                "etag": response.headers.get("ETag"),
+                "lastModified": response.headers.get("Last-Modified"),
+            })
+    finally:
+        partial.unlink(missing_ok=True)
+    _write_refresh_metadata(target, metadata)
     log.info(
-        f"[grundkort] {target.name} downloaded "
+        f"[grundkort] {target.name} refreshed "
         f"({(target.stat().st_size) / 1e6:.0f} MB in {time.time() - started:.0f}s)"
     )
+    return next_digest != metadata.get("ingestedDigest")
 
 
-def _settlement_loaded(folder: str, db_path: Path = DB_PATH) -> bool:
+def _mark_archive_ingested(target: Path) -> None:
+    metadata = _read_refresh_metadata(target)
+    digest = metadata.get("contentDigest")
+    if not isinstance(digest, str):
+        digest = _archive_content_digest(target)
+        metadata["contentDigest"] = digest
+    metadata["ingestedDigest"] = digest
+    _write_refresh_metadata(target, metadata)
+
+
+def _settlement_loaded(folder: str, assets_db_path: Path = ASSETS_DB_PATH) -> bool:
     """Return whether this package has produced either vector layer."""
     settlement = _settlement_of(folder)
-    if settlement is None or not db_path.exists():
+    if settlement is None or not assets_db_path.exists():
         return False
-    db = sqlite3.connect(str(db_path))
+    db = sqlite3.connect(str(assets_db_path))
     try:
+        from ingest_buildings import SOURCE_LAYER as building_layer
+        from ingest_roads import SOURCE_LAYERS as road_layers
         return bool(
             db.execute(
-                "SELECT 1 FROM buildings WHERE settlement = ? LIMIT 1",
-                (settlement,),
+                "SELECT 1 FROM assets WHERE type=? AND id LIKE ? LIMIT 1",
+                (building_layer, f"{settlement}_%"),
             ).fetchone()
             or db.execute(
-                "SELECT 1 FROM roads WHERE settlement = ? LIMIT 1",
-                (settlement,),
+                "SELECT 1 FROM assets WHERE type IN (?,?) "
+                "AND id LIKE ? LIMIT 1",
+                (*road_layers, f"{settlement}_%"),
             ).fetchone()
         )
     except sqlite3.OperationalError:
@@ -125,21 +221,6 @@ def _settlement_loaded(folder: str, db_path: Path = DB_PATH) -> bool:
 def _settlement_of(name: str) -> str | None:
     match = re.match(r"(\d{4}[A-Z]{3})", name)
     return match.group(1) if match else None
-
-
-def _ensure_schema(db) -> None:
-    from ingest_buildings import BUILDINGS_SCHEMA
-    from ingest_roads import ROADS_SCHEMA
-
-    db.executescript(BUILDINGS_SCHEMA)
-    db.executescript(ROADS_SCHEMA)
-    columns = {row[1] for row in db.execute("PRAGMA table_info(buildings)")}
-    if "ground_sampled" not in columns:
-        db.execute(
-            "ALTER TABLE buildings "
-            "ADD COLUMN ground_sampled INTEGER NOT NULL DEFAULT 1"
-        )
-    db.commit()
 
 
 def ensure_grundkort(db_path: Path = DB_PATH) -> None:
@@ -162,10 +243,8 @@ def ensure_grundkort(db_path: Path = DB_PATH) -> None:
         return
 
     db = sqlite3.connect(str(db_path))
-    _, pending = repair_unsampled_ground(db)
+    _, pending = repair_unsampled_ground(db, ASSETS_DB_PATH)
     db.close()
-    sync_buildings_to_assets(db_path)
-    sync_roads_to_assets(db_path)
     if pending:
         log.info(
             f"[grundkort] {pending} building grounds still estimated — "
@@ -177,47 +256,59 @@ def ensure_grundkort(db_path: Path = DB_PATH) -> None:
 
 
 def ensure_settlement(folder: str, db_path: Path = DB_PATH) -> None:
-    """Download and ingest one Asiaq settlement package, idempotently."""
+    """Refresh and ingest one Asiaq settlement package idempotently."""
     with _ingest_lock:
         ZIP_DIR.mkdir(exist_ok=True)
-        _download_settlement(folder)
+        source_changed = _download_settlement(folder)
         code = folder.split("_")[0]
-        ensure_settlement_archive(
-            ZIP_DIR / f"{code}_TekniskGrundkort_SHP.zip", db_path
+        target = ZIP_DIR / f"{code}_TekniskGrundkort_SHP.zip"
+        ingested = ensure_settlement_archive(
+            target, db_path, force=source_changed
         )
+        if source_changed and ingested:
+            _mark_archive_ingested(target)
 
 
-def ensure_settlement_archive(zip_path: Path, db_path: Path = DB_PATH) -> None:
-    """Ingest missing vector layers from one already-local archive."""
+def ensure_settlement_archive(
+    zip_path: Path, db_path: Path = DB_PATH, *, force: bool = False
+) -> bool:
+    """Ingest missing layers, or every layer after a source-content change."""
     with _ingest_lock:
         settlement = _settlement_of(zip_path.name)
         if settlement is None:
             log.warning(f"[grundkort] cannot infer settlement from {zip_path.name}, skipping")
-            return
-        db = sqlite3.connect(str(db_path))
+            return False
+        from asset_catalog import connect
+        from ingest_buildings import SOURCE_LAYER as building_layer
+        from ingest_roads import SOURCE_LAYERS as road_layers
+        db = connect(ASSETS_DB_PATH)
         try:
-            _ensure_schema(db)
             missing_buildings = not db.execute(
-                "SELECT 1 FROM buildings WHERE settlement = ? LIMIT 1", (settlement,)
+                "SELECT 1 FROM assets WHERE type=? AND id LIKE ? LIMIT 1",
+                (building_layer, f"{settlement}_%"),
             ).fetchone()
             missing_roads = not db.execute(
-                "SELECT 1 FROM roads WHERE settlement = ? LIMIT 1", (settlement,)
+                "SELECT 1 FROM assets WHERE type IN (?,?) "
+                "AND id LIKE ? LIMIT 1",
+                (*road_layers, f"{settlement}_%"),
             ).fetchone()
         finally:
             db.close()
-        if missing_buildings:
+        if missing_buildings or force:
             import ingest_buildings
 
-            log.info(f"[grundkort] {settlement}: buildings missing, ingesting {zip_path.name}")
-            ingest_buildings.ingest(zip_path, db_path)
-        if missing_roads:
+            reason = "source changed" if force else "buildings missing"
+            log.info(f"[grundkort] {settlement}: {reason}, ingesting {zip_path.name}")
+            if ingest_buildings.ingest(zip_path, db_path, ASSETS_DB_PATH) != 0:
+                raise RuntimeError(f"building ingest failed for {zip_path.name}")
+        if missing_roads or force:
             import ingest_roads
 
-            log.info(f"[grundkort] {settlement}: roads missing, ingesting {zip_path.name}")
-            ingest_roads.ingest(zip_path, db_path)
-        if missing_buildings or missing_roads:
-            sync_buildings_to_assets(db_path)
-            sync_roads_to_assets(db_path)
+            reason = "source changed" if force else "roads missing"
+            log.info(f"[grundkort] {settlement}: {reason}, ingesting {zip_path.name}")
+            if ingest_roads.ingest(zip_path, ASSETS_DB_PATH) != 0:
+                raise RuntimeError(f"road ingest failed for {zip_path.name}")
+        return bool(missing_buildings or missing_roads or force)
 
 
 def ensure_grundkort_async() -> None:
@@ -226,6 +317,16 @@ def ensure_grundkort_async() -> None:
             ensure_grundkort()
         except Exception as exc:
             log.error(f"[grundkort] startup ingest failed: {type(exc).__name__}: {exc}")
+        while True:
+            time.sleep(REFRESH_POLL_S)
+            for folder in GRUNDKORT_SETTLEMENTS:
+                try:
+                    ensure_settlement(folder)
+                except Exception as exc:
+                    log.warning(
+                        f"[grundkort] refresh of {folder} failed "
+                        f"({type(exc).__name__}: {exc}) — retrying on next daily check"
+                    )
 
     threading.Thread(target=_run, daemon=True).start()
 
@@ -341,160 +442,54 @@ def demand_status() -> dict[str, list[str]]:
     return default_demand().status()
 
 
-def repair_unsampled_ground(db) -> tuple[int, int]:
+def repair_unsampled_ground(
+    terrain_db: sqlite3.Connection,
+    assets_db_path: Path = ASSETS_DB_PATH,
+) -> tuple[int, int]:
     """Re-sample estimated building grounds; return (fixed, still_pending)."""
+    if not assets_db_path.exists():
+        return 0, 0
+    assets_db = sqlite3.connect(str(assets_db_path))
     try:
-        rows = db.execute(
-            "SELECT building_id, cx, cy, ring FROM buildings WHERE ground_sampled = 0"
+        from ingest_buildings import SOURCE_LAYER
+        rows = assets_db.execute(
+            "SELECT id,cx,cy,properties FROM assets "
+            "WHERE type=? "
+            "AND json_extract(properties,'$.groundSampled')=0",
+            (SOURCE_LAYER,),
         ).fetchall()
     except sqlite3.OperationalError:
+        assets_db.close()
         return 0, 0  # schema not ensured yet
     if not rows:
+        assets_db.close()
         return 0, 0
     from ingest_buildings import GroundSampler
 
-    sampler = GroundSampler(db)
+    sampler = GroundSampler(terrain_db)
     if not sampler.tiles:
+        assets_db.close()
         return 0, len(rows)
     fixed = 0
-    for building_id, cx, cy, ring_json in rows:
+    for building_id, cx, cy, raw_properties in rows:
         ground = sampler.sample(cx, cy)
         if ground is None:
             continue
-        roof_min = min(z for _, _, z in json.loads(ring_json))
-        db.execute(
-            "UPDATE buildings SET ground_z = ?, ground_sampled = 1 "
-            "WHERE building_id = ?",
-            (round(min(ground, roof_min - 0.5), 2), building_id),
+        properties = json.loads(raw_properties)
+        roof_min = min(z for _, _, z in properties["ring"])
+        ground = round(min(ground, roof_min - 0.5), 2)
+        properties["groundZ"] = ground
+        properties["groundSampled"] = True
+        assets_db.execute(
+            "UPDATE assets SET z=?,properties=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
+            (ground, json.dumps(properties, ensure_ascii=False), building_id),
         )
         fixed += 1
     if fixed:
-        db.commit()
+        assets_db.commit()
         log.info(f"[grundkort] re-sampled ground for {fixed} buildings from heightmaps")
+    assets_db.close()
     return fixed, len(rows) - fixed
-
-
-def _ensure_assets_schema(adb) -> None:
-    adb.execute("PRAGMA journal_mode=WAL")
-    adb.executescript(_ASSETS_SCHEMA)
-    columns = {row[1] for row in adb.execute("PRAGMA table_info(assets)")}
-    for column in ("cx", "cy", "min_x", "min_y", "max_x", "max_y"):
-        if column not in columns:
-            adb.execute(f"ALTER TABLE assets ADD COLUMN {column} REAL")
-    adb.execute("CREATE INDEX IF NOT EXISTS idx_assets_cxy ON assets(cx, cy)")
-    adb.execute(
-        "CREATE INDEX IF NOT EXISTS idx_assets_bounds "
-        "ON assets(type, min_x, max_x, min_y, max_y)"
-    )
-    adb.commit()
-
-
-def sync_buildings_to_assets(
-    db_path: Path = DB_PATH, assets_db_path: Path = ASSETS_DB_PATH
-) -> int:
-    """Upsert every terrain.db building into assets.db as type='building'.
-
-    Keeps a manually-set ``enabled`` flag intact on update. Ring vertices
-    stay absolute EPSG:3413; the asset server shifts them per request.
-    """
-    from coords import to_wgs84
-
-    db = sqlite3.connect(str(db_path))
-    try:
-        rows = db.execute(
-            "SELECT building_id, b_number, use_type, cx, cy, ground_z, ring "
-            "FROM buildings"
-        ).fetchall()
-    except sqlite3.OperationalError:
-        rows = []
-    db.close()
-    if not rows:
-        return 0
-
-    adb = sqlite3.connect(str(assets_db_path))
-    _ensure_assets_schema(adb)
-    for building_id, b_number, use_type, cx, cy, ground_z, ring_json in rows:
-        ring = json.loads(ring_json)
-        xs = [point[0] for point in ring]
-        ys = [point[1] for point in ring]
-        lat, lon = to_wgs84(cx, cy)
-        properties = json.dumps({
-            "b": b_number,
-            "use": use_type,
-            "groundZ": ground_z,
-            "ring": ring,
-        })
-        adb.execute(
-            "INSERT INTO assets "
-            "(id, type, enabled, lat, lon, heading_deg, z, properties, cx, cy, "
-            "min_x, min_y, max_x, max_y, updated_at) "
-            "VALUES (?, 'building', 1, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP) "
-            "ON CONFLICT(id) DO UPDATE SET "
-            "lat=excluded.lat, lon=excluded.lon, z=excluded.z, "
-            "properties=excluded.properties, cx=excluded.cx, cy=excluded.cy, "
-            "min_x=excluded.min_x, min_y=excluded.min_y, "
-            "max_x=excluded.max_x, max_y=excluded.max_y, "
-            "updated_at=CURRENT_TIMESTAMP",
-            (
-                building_id, float(lat), float(lon), ground_z, properties, cx, cy,
-                min(xs), min(ys), max(xs), max(ys),
-            ),
-        )
-    adb.commit()
-    adb.close()
-    log.info(f"[grundkort] synced {len(rows)} buildings into {assets_db_path.name}")
-    return len(rows)
-
-
-def sync_roads_to_assets(
-    db_path: Path = DB_PATH, assets_db_path: Path = ASSETS_DB_PATH
-) -> int:
-    """Upsert terrain.db road/path centerlines into the shared asset catalog."""
-    from coords import to_wgs84
-
-    db = sqlite3.connect(str(db_path))
-    try:
-        rows = db.execute(
-            "SELECT road_id, kind, category, name, width_m, cx, cy, path FROM roads"
-        ).fetchall()
-    except sqlite3.OperationalError:
-        rows = []
-    db.close()
-    if not rows:
-        return 0
-
-    adb = sqlite3.connect(str(assets_db_path))
-    _ensure_assets_schema(adb)
-    for road_id, kind, category, name, width_m, cx, cy, path_json in rows:
-        path = json.loads(path_json)
-        xs = [point[0] for point in path]
-        ys = [point[1] for point in path]
-        lat, lon = to_wgs84(cx, cy)
-        properties = json.dumps({
-            "kind": kind,
-            "category": category,
-            "name": name,
-            "widthM": width_m,
-            "path": path,
-        })
-        adb.execute(
-            "INSERT INTO assets "
-            "(id,type,enabled,lat,lon,heading_deg,z,properties,cx,cy,"
-            "min_x,min_y,max_x,max_y,updated_at) "
-            "VALUES (?,'road',1,?,?,0,NULL,?,?,?,?,?,?,?,CURRENT_TIMESTAMP) "
-            "ON CONFLICT(id) DO UPDATE SET "
-            "lat=excluded.lat,lon=excluded.lon,properties=excluded.properties,"
-            "cx=excluded.cx,cy=excluded.cy,min_x=excluded.min_x,min_y=excluded.min_y,"
-            "max_x=excluded.max_x,max_y=excluded.max_y,updated_at=CURRENT_TIMESTAMP",
-            (
-                road_id, float(lat), float(lon), properties, cx, cy,
-                min(xs), min(ys), max(xs), max(ys),
-            ),
-        )
-    adb.commit()
-    adb.close()
-    log.info(f"[grundkort] synced {len(rows)} roads into {assets_db_path.name}")
-    return len(rows)
 
 
 def _ground_retry_loop(db_path: Path) -> None:
@@ -502,10 +497,8 @@ def _ground_retry_loop(db_path: Path) -> None:
     while True:
         time.sleep(_GROUND_RETRY_S)
         db = sqlite3.connect(str(db_path))
-        fixed, pending = repair_unsampled_ground(db)
+        fixed, pending = repair_unsampled_ground(db, ASSETS_DB_PATH)
         db.close()
-        if fixed:
-            sync_buildings_to_assets(db_path)
         if pending == 0:
             log.info("[grundkort] all building grounds sampled from heightmaps")
             return

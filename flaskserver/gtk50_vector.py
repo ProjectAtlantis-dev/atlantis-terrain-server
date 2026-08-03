@@ -270,8 +270,10 @@ def query_structures(
             ]
             result.append({
                 "id": structure_id,
-                "b": None,
-                "use": "powerStation" if table == "electricpowerstation_s" else None,
+                # Preserve the source classification verbatim. Consumers can
+                # interpret the GeoPackage layer name without us inventing a
+                # second taxonomy here.
+                "sourceLayer": table,
                 "groundZ": float(ground),
                 "ring": ring,
                 # Private reconciliation hints removed before serialization.

@@ -31,6 +31,19 @@ const idsContext = idsCanvas.getContext('2d', { willReadFrequently: true });
 
 function tileId() { return `12-${tile.col}-${tile.row}`; }
 
+function loadParentTile() {
+  const parent = `11-${Math.floor(tile.col / 2)}-${Math.floor(tile.row / 2)}`;
+  $('parent-id').textContent = parent;
+  $('parent-message').textContent = 'Loading parent…';
+  const quadrant = $('child-quadrant');
+  quadrant.style.left = `${(tile.col % 2) * 50}%`;
+  quadrant.style.top = `${(1 - (tile.row % 2)) * 50}%`;
+  const image = $('parent-image');
+  image.onload = () => { $('parent-message').textContent = ''; };
+  image.onerror = () => { $('parent-message').textContent = 'Parent texture unavailable'; };
+  image.src = `/api/texture/${parent}.jpg?t=${Date.now()}`;
+}
+
 function setStatus(element, message, className = '') {
   element.textContent = message;
   element.className = className;
@@ -63,6 +76,7 @@ function loadImage(url) {
 
 async function loadTile() {
   $('tile').value = tileId();
+  loadParentTile();
   $('canvas-message').textContent = 'Loading segmentation…';
   const url = new URL(location);
   url.searchParams.set('tile', tileId());
@@ -85,7 +99,8 @@ async function loadTile() {
     canvas.height = result.height;
     context.drawImage(overlayImage, 0, 0);
     $('canvas-message').textContent = '';
-    $('tile-meta').textContent = `${result.regionCount} regions · group ${result.group} · ${result.split} split`;
+    const suggestion = result.suggestionSource ? ` · suggestions ${result.suggestionSource}` : ' · no existing suggestions';
+    $('tile-meta').textContent = `${result.regionCount} regions · group ${result.group} · ${result.split} split${suggestion}`;
     $('tile-meta').className = result.split === 'regression' ? 'warning' : '';
     $('annotated-count').textContent = `${Object.keys(result.annotations).length} / ${result.regionCount} regions labeled`;
     setStatus($('save-status'), result.split === 'regression'
@@ -204,16 +219,26 @@ async function loadModelStatus() {
   }
 }
 
-function move(dx, dy) { tile.col += dx; tile.row += dy; loadTile(); }
+const ZOOM_MIN = 100;
+const ZOOM_MAX = 400;
+const ZOOM_STEP = 25;
+
+function setZoom(value) {
+  const zoom = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, Number(value)));
+  $('zoom').value = String(zoom);
+  $('zoom-level').textContent = `${zoom}%`;
+  canvas.style.setProperty('--canvas-zoom', `${zoom}%`);
+}
+
 $('load').addEventListener('click', () => { const parsed = parseD12($('tile').value); if (parsed) { tile = parsed; loadTile(); } });
 $('tile').addEventListener('keydown', event => { if (event.key === 'Enter') $('load').click(); });
-$('west').addEventListener('click', () => move(-1, 0));
-$('east').addEventListener('click', () => move(1, 0));
-$('north').addEventListener('click', () => move(0, 1));
-$('south').addEventListener('click', () => move(0, -1));
+$('zoom').addEventListener('input', event => setZoom(event.target.value));
+$('zoom-out').addEventListener('click', () => setZoom(Number($('zoom').value) - ZOOM_STEP));
+$('zoom-in').addEventListener('click', () => setZoom(Number($('zoom').value) + ZOOM_STEP));
 $('train-model').addEventListener('click', trainModel);
 $('predict-tile').addEventListener('click', predictTile);
 
 renderClasses();
+setZoom(100);
 loadModelStatus();
 loadTile();

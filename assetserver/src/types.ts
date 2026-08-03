@@ -61,6 +61,8 @@ export interface VehicleSeedInstance {
 
 export interface AssetMetadata {
   source: string;
+  vehicleAssetType: string;
+  structureAssetType: string;
   vehicleDefinition: VehicleDefinition;
   vehicleHeadlights: VehicleHeadlights;
   structureDefinition: StructureDefinition;
@@ -98,7 +100,7 @@ export interface AssetsResponse {
 
 // --- Unified asset types ---
 
-export type AssetType = "vehicle" | "structure";
+export type AssetType = string;
 
 export interface VehicleProperties {
   headlightsOn: boolean;

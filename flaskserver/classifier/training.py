@@ -18,7 +18,6 @@ from PIL import Image
 from classifier.segmentation import (
     SEGMENTER_VERSION,
     SegmentationConfig,
-    render_boundaries,
     segment_terrain_tile,
 )
 
@@ -169,17 +168,77 @@ def semantic_mask(db: sqlite3.Connection, tile_id: str, segmented) -> np.ndarray
     return output
 
 
-def render_annotation_overlay(rgb, segmented, annotations):
+_SUGGESTION_CLASS_MAP = {
+    "grey": "bare_rock",
+    "green": "vegetation",
+    "dark": "soil_scree",
+    "white": "snow_ice",
+    "water": "water",
+    "shadow": "unknown_shadow",
+    "lake": "lake",
+    "beach": "sand",
+    "sand": "sand",
+    "shore_rock": "shore_rock",
+}
+
+
+def read_classifier_suggestions(
+    db: sqlite3.Connection, tile_id: str, shape: tuple[int, int]
+) -> tuple[np.ndarray | None, str | None]:
+    """Translate an existing classifier tile into annotation-display classes.
+
+    Suggestions are never returned by ``semantic_mask`` and therefore can
+    never become training labels without an explicit human annotation.
+    """
+    from classifier.storage import CLASS_SCHEMAS, decode_class_map
+
+    row = db.execute(
+        "SELECT class_schema,width,height,class_map,source FROM classifier_tiles "
+        "WHERE tile_id=?", (tile_id,),
+    ).fetchone()
+    if row is None or row[0] not in CLASS_SCHEMAS:
+        return None, None
+    labels = decode_class_map(row[3], int(row[1]), int(row[2]))
+    if labels.shape != shape:
+        labels = np.asarray(
+            Image.fromarray(labels, mode="L").resize(
+                (shape[1], shape[0]), Image.Resampling.NEAREST
+            ), dtype=np.uint8,
+        )
+    translated = np.full(shape, -1, dtype=np.int16)
+    for source_index, source_name in enumerate(CLASS_SCHEMAS[row[0]]["names"]):
+        class_name = _SUGGESTION_CLASS_MAP.get(source_name)
+        if class_name in CLASSES:
+            translated[labels == source_index] = CLASSES.index(class_name)
+    return translated, str(row[4])
+
+
+def render_annotation_overlay(rgb, segmented, annotations, suggestions=None):
     output = np.asarray(rgb, dtype=np.uint8).copy()
+    if suggestions is not None:
+        suggested = np.asarray(suggestions)
+        for class_index, color in enumerate(PALETTE):
+            mask = suggested == class_index
+            output[mask] = np.rint(
+                output[mask] * 0.58 + color * 0.42
+            ).astype(np.uint8)
     for segment_id, class_name in annotations.items():
         if segment_id >= len(segmented.regions) or class_name not in CLASSES:
             continue
         mask = segmented.labels == segment_id
         color = PALETTE[CLASSES.index(class_name)]
         output[mask] = np.rint(
-            output[mask] * 0.35 + color * 0.65
+            output[mask] * 0.25 + color * 0.75
         ).astype(np.uint8)
-    return render_boundaries(output, segmented.labels, color=(255, 255, 255))
+    labels = np.asarray(segmented.labels)
+    boundary = np.zeros(labels.shape, dtype=bool)
+    boundary[1:, :] |= labels[1:, :] != labels[:-1, :]
+    boundary[:, 1:] |= labels[:, 1:] != labels[:, :-1]
+    # A translucent one-sided edge stays legible without hiding both regions.
+    output[boundary] = np.rint(
+        output[boundary] * 0.62
+    ).astype(np.uint8)
+    return output
 
 
 def encode_segment_ids(labels):

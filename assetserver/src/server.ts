@@ -31,14 +31,6 @@ const ASSETS_RESPONSE_SCHEMA_VERSION = 4;
 const DEFAULT_VEHICLE_INSTANCE_ID = "amv-01";
 type SqliteDb = Database<sqlite3.Database, sqlite3.Statement>;
 
-// Asiaq Teknisk Grundkort footprints seeded by flaskserver/grundkort.py.
-// Ring vertices are absolute EPSG:3413 [x, y, roofZ].
-type BuildingProperties = {
-  b?: string | null;
-  use?: string | null;
-  groundZ?: number;
-  ring?: [number, number, number][];
-};
 type SeedVehicleMetadata = VehicleStateCommon & { id: string; headlightsOn: boolean };
 
 const FALLBACK_VEHICLE_DEFINITION: VehicleDefinition = {
@@ -81,14 +73,7 @@ const FALLBACK_SEED_VEHICLE_INSTANCES: SeedVehicleMetadata[] = [
   },
 ];
 
-const FALLBACK_SEED_STRUCTURE_INSTANCES: StructureInstance[] = [
-  { id: "nuuk-01", lat: 64.179102, lon: -51.712988, headingDeg: 22, scale: 1.0, tileId: "12-1375-791" },
-  { id: "nuuk-02", lat: 64.174556, lon: -51.703948, headingDeg: 58, scale: 0.96, tileId: "12-1376-791" },
-  { id: "nuuk-03", lat: 64.18533, lon: -51.703495, headingDeg: 96, scale: 1.08, tileId: "12-1376-792" },
-  { id: "nuuk-04", lat: 64.182984, lon: -51.726468, headingDeg: 144, scale: 1.03, tileId: "12-1374-792" },
-  { id: "nuuk-05", lat: 64.173514, lon: -51.718454, headingDeg: 210, scale: 0.98, tileId: "12-1374-791" },
-  { id: "nuuk-06", lat: 64.178473, lon: -51.724776, headingDeg: 288, scale: 1.04, tileId: "12-1374-791" },
-];
+const FALLBACK_SEED_STRUCTURE_INSTANCES: StructureInstance[] = [];
 
 const ASSETSERVER_DIR = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
 const ROOT_DIR = path.resolve(ASSETSERVER_DIR, "..");
@@ -576,22 +561,24 @@ async function loadAssetsMetadata(): Promise<AssetMetadata> {
     }
   }
 
+  const vehicleAssetType = typeof payload.vehicle_asset_type === "string"
+    ? payload.vehicle_asset_type.trim() : "";
+  const structureAssetType = typeof payload.structure_asset_type === "string"
+    ? payload.structure_asset_type.trim() : "";
+  if (!vehicleAssetType || !structureAssetType) {
+    throw new Error("asset metadata must define runtime asset type strings");
+  }
+
   return {
     source,
+    vehicleAssetType,
+    structureAssetType,
     vehicleDefinition,
     vehicleHeadlights,
     structureDefinition,
     seedVehicleInstances,
     seedStructureInstances,
   };
-}
-
-async function tableExists(db: SqliteDb, name: string): Promise<boolean> {
-  const row = await db.get<{ cnt: number }>(
-    "SELECT COUNT(*) as cnt FROM sqlite_master WHERE type='table' AND name=?",
-    [name],
-  );
-  return (row?.cnt ?? 0) > 0;
 }
 
 async function initDb(db: SqliteDb): Promise<void> {
@@ -609,75 +596,42 @@ async function initDb(db: SqliteDb): Promise<void> {
       z           REAL,
       properties  TEXT NOT NULL DEFAULT '{}',
       saved_at    REAL,
-      updated_at  TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+      updated_at  TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      cx          REAL,
+      cy          REAL,
+      min_x       REAL,
+      min_y       REAL,
+      max_x       REAL,
+      max_y       REAL
     );
   `);
 
-  // Terrain-coupled assets are spatially queried in EPSG:3413. grundkort.py
-  // performs the same guarded migration while syncing buildings and roads.
-  const assetColumns = await db.all<{ name: string }[]>("PRAGMA table_info(assets);");
-  for (const column of ["cx", "cy", "min_x", "min_y", "max_x", "max_y"]) {
-    if (!assetColumns.some((existing) => existing.name === column)) {
-      await db.exec(`ALTER TABLE assets ADD COLUMN ${column} REAL;`);
-    }
+  const assetColumns = new Set(
+    (await db.all<{ name: string }[]>("PRAGMA table_info(assets);")).map((column) => column.name),
+  );
+  const missingColumns = ["cx", "cy", "min_x", "min_y", "max_x", "max_y"]
+    .filter((column) => !assetColumns.has(column));
+  if (missingColumns.length > 0) {
+    throw new Error(
+      `assets.db has an obsolete schema; purge and reload it (missing: ${missingColumns.join(", ")})`,
+    );
   }
+
   await db.exec("CREATE INDEX IF NOT EXISTS idx_assets_cxy ON assets(cx, cy);");
   await db.exec(
     "CREATE INDEX IF NOT EXISTS idx_assets_bounds ON assets(type, min_x, max_x, min_y, max_y);",
   );
-
-  // Migrate old tables if they exist
-  if (await tableExists(db, "vehicle_instances")) {
-    log.info("migrating vehicle_instances → assets", { phase: "assets.migrate.vehicles" });
-    await db.exec(`
-      INSERT OR IGNORE INTO assets (id, type, enabled, lat, lon, heading_deg, z, properties, saved_at, updated_at)
-      SELECT
-        vehicle_id,
-        'vehicle',
-        enabled,
-        lat,
-        lon,
-        heading_deg,
-        z,
-        json_object(
-          'headlightsOn', CASE WHEN headlights_on = 1 THEN json('true') ELSE json('false') END,
-          'terrainDepth', terrain_depth,
-          'terrainTileId', terrain_tile_id
-        ),
-        saved_at,
-        updated_at
-      FROM vehicle_instances;
-    `);
-    await db.exec("DROP TABLE vehicle_instances;");
-  }
-
-  if (await tableExists(db, "structure_sites")) {
-    log.info("migrating structure_sites → assets", { phase: "assets.migrate.structures" });
-    await db.exec(`
-      INSERT OR IGNORE INTO assets (id, type, enabled, lat, lon, heading_deg, z, properties, saved_at, updated_at)
-      SELECT
-        id,
-        'structure',
-        enabled,
-        lat,
-        lon,
-        heading_deg,
-        NULL,
-        json_object('scale', scale, 'tileId', tile_id),
-        NULL,
-        updated_at
-      FROM structure_sites;
-    `);
-    await db.exec("DROP TABLE structure_sites;");
-  }
 }
 
-async function ensureStructureSeeds(db: SqliteDb, seedInstances: StructureInstance[]): Promise<boolean> {
-  const row = await db.get<{ count: number }>("SELECT COUNT(*) as count FROM assets WHERE type = 'structure'");
+async function ensureStructureSeeds(
+  db: SqliteDb, assetType: string, seedInstances: StructureInstance[],
+): Promise<boolean> {
+  const row = await db.get<{ count: number }>("SELECT COUNT(*) as count FROM assets WHERE type = ?", [assetType]);
   if ((row?.count ?? 0) > 0) {
     return false;
   }
 
+  let inserted = false;
   for (const site of seedInstances) {
     const props: StructureProperties = { scale: site.scale };
     if (site.tileId) {
@@ -687,22 +641,26 @@ async function ensureStructureSeeds(db: SqliteDb, seedInstances: StructureInstan
       `
       INSERT OR REPLACE INTO assets
       (id, type, enabled, lat, lon, heading_deg, z, properties, saved_at, updated_at)
-      VALUES (?, 'structure', 1, ?, ?, ?, NULL, ?, NULL, CURRENT_TIMESTAMP)
+      VALUES (?, ?, 1, ?, ?, ?, NULL, ?, NULL, CURRENT_TIMESTAMP)
       `,
-      [site.id, site.lat, site.lon, site.headingDeg, JSON.stringify(props)],
+      [site.id, assetType, site.lat, site.lon, site.headingDeg, JSON.stringify(props)],
     );
+    inserted = true;
   }
 
-  return true;
+  return inserted;
 }
 
-async function ensureVehicleSeeds(db: SqliteDb, seedInstances: VehicleSeedInstance[]): Promise<boolean> {
-  const row = await db.get<{ count: number }>("SELECT COUNT(*) as count FROM assets WHERE type = 'vehicle'");
+async function ensureVehicleSeeds(
+  db: SqliteDb, assetType: string, seedInstances: VehicleSeedInstance[],
+): Promise<boolean> {
+  const row = await db.get<{ count: number }>("SELECT COUNT(*) as count FROM assets WHERE type = ?", [assetType]);
   if ((row?.count ?? 0) > 0) {
     return false;
   }
 
   const now = Date.now() / 1000;
+  let inserted = false;
   for (const instance of seedInstances) {
     const props: VehicleProperties = {
       headlightsOn: instance.headlightsOn,
@@ -717,10 +675,11 @@ async function ensureVehicleSeeds(db: SqliteDb, seedInstances: VehicleSeedInstan
       `
       INSERT OR REPLACE INTO assets
       (id, type, enabled, lat, lon, heading_deg, z, properties, saved_at, updated_at)
-      VALUES (?, 'vehicle', 1, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+      VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
       `,
       [
         instance.vehicleId,
+        assetType,
         instance.state.lat,
         instance.state.lon,
         instance.state.headingDeg,
@@ -729,9 +688,10 @@ async function ensureVehicleSeeds(db: SqliteDb, seedInstances: VehicleSeedInstan
         now,
       ],
     );
+    inserted = true;
   }
 
-  return true;
+  return inserted;
 }
 
 function parseProperties<T>(raw: string): T {
@@ -742,14 +702,15 @@ function parseProperties<T>(raw: string): T {
   }
 }
 
-async function loadVehicleInstances(db: SqliteDb): Promise<VehicleInstance[]> {
+async function loadVehicleInstances(db: SqliteDb, assetType: string): Promise<VehicleInstance[]> {
   const rows = await db.all<AssetRow[]>(
     `
     SELECT id, lat, lon, heading_deg, z, properties, saved_at
     FROM assets
-    WHERE type = 'vehicle' AND enabled = 1
+    WHERE type = ? AND enabled = 1
     ORDER BY updated_at DESC, id
     `,
+    [assetType],
   );
 
   const out: VehicleInstance[] = [];
@@ -778,14 +739,15 @@ async function loadVehicleInstances(db: SqliteDb): Promise<VehicleInstance[]> {
   return out;
 }
 
-async function loadStructureInstances(db: SqliteDb): Promise<StructureInstance[]> {
+async function loadStructureInstances(db: SqliteDb, assetType: string): Promise<StructureInstance[]> {
   const rows = await db.all<AssetRow[]>(
     `
     SELECT id, lat, lon, heading_deg, properties
     FROM assets
-    WHERE type = 'structure' AND enabled = 1
+    WHERE type = ? AND enabled = 1
     ORDER BY id
     `,
+    [assetType],
   );
 
   const out: StructureInstance[] = [];
@@ -811,15 +773,16 @@ async function loadStructureInstances(db: SqliteDb): Promise<StructureInstance[]
   return out;
 }
 
-async function resolvePrimaryVehicleId(db: SqliteDb): Promise<string> {
+async function resolvePrimaryVehicleId(db: SqliteDb, assetType: string): Promise<string> {
   const primaryEnabled = await db.get<{ id: string }>(
     `
     SELECT id
     FROM assets
-    WHERE type = 'vehicle' AND enabled = 1
+    WHERE type = ? AND enabled = 1
     ORDER BY updated_at DESC, id
     LIMIT 1
     `,
+    [assetType],
   );
   if (primaryEnabled?.id) {
     return String(primaryEnabled.id);
@@ -829,10 +792,11 @@ async function resolvePrimaryVehicleId(db: SqliteDb): Promise<string> {
     `
     SELECT id
     FROM assets
-    WHERE type = 'vehicle'
+    WHERE type = ?
     ORDER BY updated_at DESC, id
     LIMIT 1
     `,
+    [assetType],
   );
   if (anyVehicle?.id) {
     return String(anyVehicle.id);
@@ -843,11 +807,15 @@ async function resolvePrimaryVehicleId(db: SqliteDb): Promise<string> {
 
 async function getAssetsResponse(db: SqliteDb): Promise<AssetsResponse> {
   const metadata = await loadAssetsMetadata();
-  const seededStructures = await ensureStructureSeeds(db, metadata.seedStructureInstances);
-  const seededVehicles = await ensureVehicleSeeds(db, metadata.seedVehicleInstances);
+  const seededStructures = await ensureStructureSeeds(
+    db, metadata.structureAssetType, metadata.seedStructureInstances,
+  );
+  const seededVehicles = await ensureVehicleSeeds(
+    db, metadata.vehicleAssetType, metadata.seedVehicleInstances,
+  );
 
-  const structureInstances = await loadStructureInstances(db);
-  const vehicleInstances = await loadVehicleInstances(db);
+  const structureInstances = await loadStructureInstances(db, metadata.structureAssetType);
+  const vehicleInstances = await loadVehicleInstances(db, metadata.vehicleAssetType);
 
   return {
     ok: true,
@@ -868,7 +836,8 @@ async function getAssetsResponse(db: SqliteDb): Promise<AssetsResponse> {
 }
 
 async function saveVehicleState(db: SqliteDb, request: SaveVehicleRequest): Promise<SaveVehicleStateResponse> {
-  const vehicleId = await resolvePrimaryVehicleId(db);
+  const metadata = await loadAssetsMetadata();
+  const vehicleId = await resolvePrimaryVehicleId(db, metadata.vehicleAssetType);
   const savedAt = Date.now() / 1000;
 
   // Preserve existing properties, just update spatial fields
@@ -887,8 +856,9 @@ async function saveVehicleState(db: SqliteDb, request: SaveVehicleRequest): Prom
     `
     INSERT INTO assets
     (id, type, enabled, lat, lon, heading_deg, z, properties, saved_at, updated_at)
-    VALUES (?, 'vehicle', 1, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+    VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
     ON CONFLICT(id) DO UPDATE SET
+      type = excluded.type,
       enabled = 1,
       lat = excluded.lat,
       lon = excluded.lon,
@@ -900,6 +870,7 @@ async function saveVehicleState(db: SqliteDb, request: SaveVehicleRequest): Prom
     `,
     [
       vehicleId,
+      metadata.vehicleAssetType,
       request.lat,
       request.lon,
       request.headingDeg,
@@ -1018,48 +989,6 @@ async function main(): Promise<void> {
         error,
       });
       res.status(500).json({ error: "asset endpoint failed" });
-    }
-  });
-
-  app.get("/api/buildings", async (req: Request, res: Response) => {
-    try {
-      const sx = Number(req.query.sx);
-      const sy = Number(req.query.sy);
-      if (!Number.isFinite(sx) || !Number.isFinite(sy)) {
-        res.status(400).json({ error: "sx and sy (EPSG:3413) are required" });
-        return;
-      }
-      const range = Number(req.query.range) || 20000;
-      const ox = Number(req.query.ox);
-      const oy = Number(req.query.oy);
-      const originX = Number.isFinite(ox) ? ox : sx;
-      const originY = Number.isFinite(oy) ? oy : sy;
-      const rows = await db.all<{ id: string; properties: string }[]>(
-        `SELECT id, properties FROM assets
-         WHERE type = 'building' AND enabled = 1
-           AND cx BETWEEN ? AND ? AND cy BETWEEN ? AND ?
-         LIMIT 20000`,
-        [sx - range, sx + range, sy - range, sy + range],
-      );
-      const buildings = [];
-      for (const row of rows) {
-        const props = parseProperties<BuildingProperties>(row.properties);
-        if (!Array.isArray(props.ring) || props.ring.length < 3) continue;
-        buildings.push({
-          id: row.id,
-          b: props.b ?? null,
-          use: props.use ?? null,
-          groundZ: props.groundZ ?? 0,
-          ring: props.ring.map(([x, y, z]) => [x - originX, y - originY, z]),
-        });
-      }
-      res.json({ buildings, count: buildings.length, qx: sx, qy: sy });
-    } catch (error) {
-      log.error("/api/buildings failed", {
-        phase: "assets.api.buildings_failed",
-        error,
-      });
-      res.status(500).json({ error: "buildings endpoint failed" });
     }
   });
 

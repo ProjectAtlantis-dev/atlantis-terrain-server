@@ -16,26 +16,40 @@
   </header>
   <main>
     <section class="toolbar">
-      <button id="west" title="West">←</button>
-      <button id="south" title="South">↓</button>
       <input id="tile" spellcheck="false" aria-label="D12 tile ID">
       <button id="load">Load tile</button>
-      <button id="north" title="North">↑</button>
-      <button id="east" title="East">→</button>
       <span id="tile-meta"></span>
+      <div class="zoom-controls" role="group" aria-label="Annotation zoom">
+        <button id="zoom-out" type="button" aria-label="Zoom out">−</button>
+        <input id="zoom" type="range" min="100" max="400" step="25" value="100" aria-label="Zoom level">
+        <output id="zoom-level" for="zoom">100%</output>
+        <button id="zoom-in" type="button" aria-label="Zoom in">+</button>
+      </div>
     </section>
 
     <section class="workspace">
+      <div class="parent-column">
+        <div class="parent-heading">
+          <strong>Parent tile</strong>
+          <span id="parent-id"></span>
+        </div>
+        <div class="parent-frame">
+          <img id="parent-image" alt="Parent tile context">
+          <div id="child-quadrant" aria-hidden="true"></div>
+          <div id="parent-message">Loading parent…</div>
+        </div>
+        <p>The outlined quadrant is the D12 tile being labeled.</p>
+      </div>
       <div class="canvas-column">
         <div class="canvas-frame">
           <canvas id="annotation-canvas" width="512" height="512"></canvas>
           <div id="canvas-message">Loading segmentation…</div>
         </div>
-        <p>Drag across regions to paint. White lines are deterministic 40 m superpixels.</p>
+        <p>Faint colors are existing classifier suggestions. Zoom and scroll to inspect details, then drag across regions to correct them; stronger colors are saved human labels.</p>
       </div>
       <aside>
         <h1>Label terrain</h1>
-        <p class="lede">Labels—not ladder output—are the source of truth for training.</p>
+        <p class="lede">The existing classifier is an editable visual starting point, never an automatic training label.</p>
         <div id="classes" class="classes"></div>
         <div class="annotation-status">
           <strong id="annotated-count">0 / 0 regions labeled</strong>

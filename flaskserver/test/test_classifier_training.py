@@ -12,7 +12,8 @@ from classifier.neural import (
 )
 from classifier.training import (
     CLASSES, encode_segment_ids, geographic_group, geographic_split,
-    init_classifier_annotations, read_annotations, write_annotations,
+    init_classifier_annotations, read_annotations, read_classifier_suggestions,
+    render_annotation_overlay, write_annotations,
 )
 from classifier.training_data import CHANNEL_NAMES, DATASET_VERSION, normalize_channels
 
@@ -66,6 +67,36 @@ class GeographicSplitTest(unittest.TestCase):
 
 
 class NeuralContractTest(unittest.TestCase):
+    def test_existing_coarse_map_is_display_only_semantic_suggestion(self):
+        from classifier.storage import init_classifier_tiles, write_classifier_tile
+        db = sqlite3.connect(":memory:")
+        db.execute("CREATE TABLE tiles (tile_id TEXT PRIMARY KEY)")
+        db.execute("INSERT INTO tiles VALUES ('12-1-2')")
+        init_classifier_tiles(db)
+        write_classifier_tile(
+            db, "12-1-2", np.asarray([[0, 1], [5, 8]], np.uint8),
+            class_schema="coarse_v4", source="ladder_d12_v9",
+            enforce_official_water=False,
+        )
+        suggestions, source = read_classifier_suggestions(db, "12-1-2", (2, 2))
+        np.testing.assert_array_equal(suggestions, np.asarray([
+            [CLASSES.index("bare_rock"), CLASSES.index("vegetation")],
+            [CLASSES.index("unknown_shadow"), CLASSES.index("shore_rock")],
+        ]))
+        self.assertEqual(source, "ladder_d12_v9")
+        db.close()
+
+    def test_annotation_overlay_uses_thin_translucent_black_boundaries(self):
+        rgb = np.full((1, 3, 3), 200, dtype=np.uint8)
+        segmented = type("Segmented", (), {
+            "labels": np.asarray([[0, 1, 1]], dtype=np.int32),
+            "regions": [None, None],
+        })()
+        rendered = render_annotation_overlay(rgb, segmented, {})
+        np.testing.assert_array_equal(rendered[0, 0], [200, 200, 200])
+        np.testing.assert_array_equal(rendered[0, 1], [124, 124, 124])
+        np.testing.assert_array_equal(rendered[0, 2], [200, 200, 200])
+
     def test_network_has_reference_and_semantic_heads(self):
         import torch
         network = build_network(base_channels=4)

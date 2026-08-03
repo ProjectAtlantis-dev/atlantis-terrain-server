@@ -16,7 +16,7 @@ from pathlib import Path
 from asset_catalog import connect, paint_roads, query_roads
 
 
-ROAD_TEXTURE_BAKE_VERSION = 2
+ROAD_TEXTURE_BAKE_VERSION = 3
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS road_texture_bakes (

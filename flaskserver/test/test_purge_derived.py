@@ -27,8 +27,6 @@ def _db():
         );
         CREATE TABLE bathymetry (tile_id TEXT PRIMARY KEY, source TEXT);
         CREATE TABLE water_purge_audit (tile_id TEXT PRIMARY KEY);
-        CREATE TABLE roads (road_id TEXT PRIMARY KEY);
-        CREATE TABLE buildings (building_id TEXT PRIMARY KEY);
         CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT);
         CREATE TABLE soundings (
             source_url TEXT, record_id TEXT, depth_m REAL,
@@ -94,8 +92,6 @@ def _seed(db, *, reverse=False):
     db.execute(
         "INSERT INTO terrain_seam_cache VALUES ('12-1-1','east','12-1-2')"
     )
-    db.execute("INSERT INTO roads VALUES ('road-origin')")
-    db.execute("INSERT INTO buildings VALUES ('building-origin')")
     db.execute("INSERT INTO metadata VALUES ('schema_version','18')")
     db.execute(
         "INSERT INTO metadata VALUES "
@@ -120,8 +116,8 @@ def _snapshot(db):
         for table in (
             "tiles", "textures", "coastline_masks", "hydrography_masks",
             "classifier_tiles", "road_texture_bakes", "cliff_graft_assets",
-            "terrain_seam_cache", "bathymetry", "water_purge_audit", "roads",
-            "buildings", "metadata", "soundings",
+            "terrain_seam_cache", "bathymetry", "water_purge_audit",
+            "metadata", "soundings",
         )
     }
 
@@ -180,8 +176,6 @@ class GlobalDerivedPurgeTests(unittest.TestCase):
             )
         # Downloaded WMS evidence and non-tile origins survive.
         self.assertEqual(db.execute("SELECT COUNT(*) FROM hydrography_masks").fetchone()[0], 1)
-        self.assertEqual(db.execute("SELECT COUNT(*) FROM roads").fetchone()[0], 1)
-        self.assertEqual(db.execute("SELECT COUNT(*) FROM buildings").fetchone()[0], 1)
         self.assertEqual(
             db.execute("SELECT depth_m,evidence_sw_m,evidence_se_m FROM soundings").fetchone(),
             (42.0, 41.0, 43.0),

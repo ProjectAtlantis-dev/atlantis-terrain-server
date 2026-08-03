@@ -1,4 +1,4 @@
-"""Ingest Asiaq Teknisk Grundkort building footprints into terrain.db.
+"""Ingest an Asiaq Teknisk Grundkort building layer into assets.db.
 
 Buildings come from Asiaq's settlement base maps (kortforsyning.asiaq.gl) as
 ESRI PolygonZ shapefiles: the outline is traced at the roof overhang and every
@@ -7,10 +7,12 @@ ArcticDEM-derived heights agree to within noise at Nuuk, so roof Z is used
 directly against ground sampled from the tiles table — no datum shift.
 
 Usage:
-    python ingest_buildings.py <TekniskGrundkort_SHP.zip> [--db terrain.db]
+    python ingest_buildings.py <TekniskGrundkort_SHP.zip> \
+        [--terrain-db terrain.db] [--assets-db ../assetserver/assets.db]
 
 The settlement code (e.g. 0600NUK) is taken from the zip filename. The source
-UTM zone is read from BYGNING.prj (GR96 zones 18N-24N = EPSG:3178-3184).
+The UTM zone is read from the source layer's PRJ file (GR96 zones 18N-24N =
+EPSG:3178-3184).
 
 Attribution: Contains data from Asiaq, Greenland Survey — Teknisk Grundkort.
 Terms: https://www.asiaq.gl/wp-content/uploads/2026/04/EN_Terms_of_use_for_Asiaq_geodata.pdf
@@ -34,21 +36,8 @@ from colored_log import get_logger
 
 log = get_logger("terrain.buildings")
 
-BUILDINGS_SCHEMA = """
-CREATE TABLE IF NOT EXISTS buildings (
-    building_id TEXT PRIMARY KEY,
-    settlement  TEXT NOT NULL,
-    b_number    TEXT,
-    use_type    TEXT,
-    cx          REAL NOT NULL,
-    cy          REAL NOT NULL,
-    ground_z    REAL NOT NULL,
-    ground_sampled INTEGER NOT NULL DEFAULT 1,
-    ring        TEXT NOT NULL,
-    updated_at  TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_buildings_cxy ON buildings(cx, cy);
-"""
+DEFAULT_ASSETS_DB_PATH = Path(__file__).resolve().parent.parent / "assetserver" / "assets.db"
+SOURCE_LAYER = "BYGNING"
 
 
 def _decode_dbf_text(raw):
@@ -151,7 +140,7 @@ class GroundSampler:
         return None
 
 
-def ingest(zip_path, db_path):
+def ingest(zip_path, terrain_db_path, assets_db_path=DEFAULT_ASSETS_DB_PATH):
     settlement_match = re.match(r"(\d{4}[A-Z]{3})", zip_path.name)
     if not settlement_match:
         log.error(f"cannot infer settlement code from filename: {zip_path.name}")
@@ -161,9 +150,9 @@ def ingest(zip_path, db_path):
     archive = zipfile.ZipFile(zip_path)
     names = {Path(n).name.upper(): n for n in archive.namelist()}
     try:
-        shp = archive.read(names["BYGNING.SHP"])
-        dbf = archive.read(names["BYGNING.DBF"])
-        prj = archive.read(names["BYGNING.PRJ"]).decode("latin1")
+        shp = archive.read(names[f"{SOURCE_LAYER}.SHP"])
+        dbf = archive.read(names[f"{SOURCE_LAYER}.DBF"])
+        prj = archive.read(names[f"{SOURCE_LAYER}.PRJ"]).decode("latin1")
     except KeyError as exc:
         log.error(f"zip is missing {exc} — not a Teknisk Grundkort SHP archive?")
         return 1
@@ -178,14 +167,12 @@ def ingest(zip_path, db_path):
         log.warning(f"attribute/shape count mismatch: {len(attrs)} vs {len(rings)}")
 
     import sqlite3
-    db = sqlite3.connect(str(db_path))
-    db.executescript(BUILDINGS_SCHEMA)
-    columns = {row[1] for row in db.execute("PRAGMA table_info(buildings)")}
-    if "ground_sampled" not in columns:
-        db.execute(
-            "ALTER TABLE buildings ADD COLUMN ground_sampled INTEGER NOT NULL DEFAULT 1"
-        )
-    sampler = GroundSampler(db)
+    from asset_catalog import connect
+    from coords import to_wgs84
+
+    terrain_db = sqlite3.connect(str(terrain_db_path))
+    sampler = GroundSampler(terrain_db)
+    assets_db = connect(Path(assets_db_path))
     if not sampler.tiles:
         log.warning("tiles table has no heightmaps — ground will fall back to roof-derived estimate")
 
@@ -227,39 +214,50 @@ def ingest(zip_path, db_path):
             [round(x, 2), round(y, 2), round(z, 2)]
             for x, y, z in zip(tx, ty, zs)
         ]
-        db.execute(
-            "INSERT OR REPLACE INTO buildings "
-            "(building_id, settlement, b_number, use_type, cx, cy, ground_z, "
-            "ground_sampled, ring, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        lat, lon = to_wgs84(cx, cy)
+        properties = json.dumps({
+            "sourceLayer": SOURCE_LAYER,
+            "sourceProperties": attributes,
+            "groundZ": round(ground, 2),
+            "groundSampled": ground_sampled,
+            "ring": ring_3413,
+        }, ensure_ascii=False, separators=(",", ":"))
+        assets_db.execute(
+            "INSERT INTO assets "
+            "(id,type,enabled,lat,lon,heading_deg,z,properties,cx,cy,"
+            "min_x,min_y,max_x,max_y,updated_at) "
+            "VALUES (?,?,1,?,?,0,?,?,?,?,?,?,?,?,?) "
+            "ON CONFLICT(id) DO UPDATE SET type=excluded.type,lat=excluded.lat,"
+            "lon=excluded.lon,z=excluded.z,properties=excluded.properties,"
+            "cx=excluded.cx,cy=excluded.cy,min_x=excluded.min_x,min_y=excluded.min_y,"
+            "max_x=excluded.max_x,max_y=excluded.max_y,updated_at=excluded.updated_at",
             (
-                building_id, settlement,
-                attributes.get("B_nummer") or None,
-                attributes.get("bygningsbr") or None,
-                cx, cy, round(ground, 2), 1 if ground_sampled else 0,
-                json.dumps(ring_3413), now,
+                building_id, SOURCE_LAYER, float(lat), float(lon), round(ground, 2), properties,
+                cx, cy, min(tx), min(ty), max(tx), max(ty), now,
             ),
         )
         written += 1
-    db.commit()
+    assets_db.commit()
     log.info(
         f"{settlement}: wrote {written} buildings "
         f"({skipped} skipped, {no_ground} without heightmap ground) "
         f"in {time.time() - started:.1f}s"
     )
-    db.close()
+    assets_db.close()
+    terrain_db.close()
     return 0
 
 
 def main():
     parser = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[0])
     parser.add_argument("zip", type=Path, help="TekniskGrundkort SHP zip from kortforsyning.asiaq.gl")
-    parser.add_argument("--db", type=Path, default=Path(__file__).parent / "terrain.db")
+    parser.add_argument("--terrain-db", type=Path, default=Path(__file__).parent / "terrain.db")
+    parser.add_argument("--assets-db", type=Path, default=DEFAULT_ASSETS_DB_PATH)
     args = parser.parse_args()
     if not args.zip.exists():
         log.error(f"no such file: {args.zip}")
         return 1
-    return ingest(args.zip, args.db)
+    return ingest(args.zip, args.terrain_db, args.assets_db)
 
 
 if __name__ == "__main__":

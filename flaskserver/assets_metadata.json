@@ -1,5 +1,7 @@
 {
   "metadataVersion": 2,
+  "vehicle_asset_type": "KØRETØJ",
+  "structure_asset_type": "STRUKTUR",
   "structure_definition": {
     "url": "/models/house_test.glb",
     "altOffsetM": 0.4,
@@ -36,12 +38,5 @@
       "headlightsOn": true
     }
   ],
-  "seed_structure_instances": [
-    {"id": "nuuk-01", "lat": 64.179102, "lon": -51.712988, "headingDeg": 22, "scale": 1.0, "tileId": "12-1375-791"},
-    {"id": "nuuk-02", "lat": 64.174556, "lon": -51.703948, "headingDeg": 58, "scale": 0.96, "tileId": "12-1376-791"},
-    {"id": "nuuk-03", "lat": 64.18533, "lon": -51.703495, "headingDeg": 96, "scale": 1.08, "tileId": "12-1376-792"},
-    {"id": "nuuk-04", "lat": 64.182984, "lon": -51.726468, "headingDeg": 144, "scale": 1.03, "tileId": "12-1374-792"},
-    {"id": "nuuk-05", "lat": 64.173514, "lon": -51.718454, "headingDeg": 210, "scale": 0.98, "tileId": "12-1374-791"},
-    {"id": "nuuk-06", "lat": 64.178473, "lon": -51.724776, "headingDeg": 288, "scale": 1.04, "tileId": "12-1374-791"}
-  ]
+  "seed_structure_instances": []
 }

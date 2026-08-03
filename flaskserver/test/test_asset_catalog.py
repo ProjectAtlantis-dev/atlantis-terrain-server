@@ -13,10 +13,9 @@ from asset_catalog import (
     _local_segments,
     _rgb_pixel,
     _sample_underlying_color,
-    _trail_color,
     color_buildings_from_textures,
     paint_roads,
-    query_buildings,
+    query_asset_by_type,
     query_roads,
     road_corridor_mask,
 )
@@ -49,36 +48,68 @@ class AssetCatalogTest(unittest.TestCase):
     def test_road_painter_has_no_retired_fixed_color_palette(self):
         self.assertFalse(hasattr(asset_catalog, "ROAD_COLORS"))
         self.assertFalse(hasattr(asset_catalog, "DEFAULT_ROAD_COLOR"))
-        self.assertIn("road:Lokalvej", asset_catalog.ROAD_WIDTH_SCALE)
+        self.assertFalse(hasattr(asset_catalog, "ROAD_WIDTH_SCALE"))
+        self.assertEqual(asset_catalog.DEFAULT_LINE_WIDTH_M, 3.0)
 
     def make_db(self, path):
         db = sqlite3.connect(path)
         db.executescript(SCHEMA)
         return db
 
+    def test_obsolete_asset_schema_requires_reload(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "assets.db"
+            db = sqlite3.connect(path)
+            db.execute(
+                "CREATE TABLE assets ("
+                "id TEXT PRIMARY KEY,type TEXT NOT NULL,enabled INTEGER NOT NULL,"
+                "lat REAL NOT NULL,lon REAL NOT NULL,heading_deg REAL NOT NULL,"
+                "z REAL,properties TEXT NOT NULL,saved_at REAL,updated_at TEXT)"
+            )
+            db.commit()
+            db.close()
+
+            with self.assertRaisesRegex(RuntimeError, "purge and reload"):
+                asset_catalog.connect(path)
+
     def test_spatial_queries_use_catalog_geometry(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "assets.db"
             db = self.make_db(path)
             road = {
-                "kind": "road", "category": "Lokalvej", "widthM": 6,
+                "sourceLayer": "VEJMIDTE",
+                "sourceProperties": {"vejkategor": "Lokalvej"},
                 "path": [[0, 50, 4], [100, 50, 5]],
             }
-            building = {"groundZ": 3, "ring": [[10, 10, 8], [20, 10, 8], [20, 20, 8]]}
+            building = {
+                "groundZ": 3,
+                "sourceLayer": "BYGNING",
+                "sourceProperties": {
+                    "bygningsty": "Bygning",
+                    "bygningsbr": "Elværk",
+                },
+                "ring": [[10, 10, 8], [20, 10, 8], [20, 20, 8]],
+            }
             db.execute(
                 "INSERT INTO assets VALUES "
-                "('r','road',1,0,0,0,NULL,?,NULL,'now',50,50,0,50,100,50)",
+                "('r','VEJMIDTE',1,0,0,0,NULL,?,NULL,'now',50,50,0,50,100,50)",
                 (json.dumps(road),),
             )
             db.execute(
                 "INSERT INTO assets VALUES "
-                "('b','building',1,0,0,0,3,?,NULL,'now',15,15,10,10,20,20)",
+                "('b','BYGNING',1,0,0,0,3,?,NULL,'now',15,15,10,10,20,20)",
                 (json.dumps(building),),
             )
             db.commit()
             self.assertEqual([item["id"] for item in query_roads(db, (40, 40, 60, 60))], ["r"])
-            result = query_buildings(db, 15, 15, 20, 10, 10)
-            self.assertEqual(result[0]["ring"][0], [0, 0, 8])
+            result = query_asset_by_type(db, "BYGNING", 15, 15, 20)
+            self.assertEqual(result[0]["type"], "BYGNING")
+            self.assertEqual(result[0]["properties"]["ring"][0], [10, 10, 8])
+            self.assertEqual(result[0]["properties"]["sourceLayer"], "BYGNING")
+            self.assertEqual(
+                result[0]["properties"]["sourceProperties"]["bygningsbr"],
+                "Elværk",
+            )
             db.close()
 
     def test_road_is_painted_in_tile_pixel_coordinates(self):
@@ -86,12 +117,13 @@ class AssetCatalogTest(unittest.TestCase):
             path = Path(directory) / "assets.db"
             db = self.make_db(path)
             props = json.dumps({
-                "kind": "road", "category": "Lokalvej", "widthM": 8,
+                "sourceLayer": "VEJMIDTE",
+                "sourceProperties": {"vejkategor": "Lokalvej"},
                 "path": [[0, 50, 0], [100, 50, 0]],
             })
             db.execute(
                 "INSERT INTO assets VALUES "
-                "('r','road',1,0,0,0,NULL,?,NULL,'now',50,50,0,50,100,50)",
+                "('r','VEJMIDTE',1,0,0,0,NULL,?,NULL,'now',50,50,0,50,100,50)",
                 (props,),
             )
             db.commit()
@@ -107,7 +139,7 @@ class AssetCatalogTest(unittest.TestCase):
             vertical = [_rgb_pixel(image, 50, y) for y in range(100)]
             differences = [sum(abs(a - b) for a, b in zip(pixel, base)) for pixel in vertical]
             self.assertGreater(differences[50], 15)
-            self.assertGreaterEqual(sum(value > 10 for value in differences), 8)
+            self.assertGreaterEqual(sum(value > 10 for value in differences), 4)
             self.assertTrue(any(1 < value < 15 for value in differences))
             self.assertLess(differences[10], 5)
             self.assertGreater(vertical[50][2], vertical[50][1])
@@ -162,39 +194,6 @@ class AssetCatalogTest(unittest.TestCase):
         color = _roof_color([brown, brown, brown, blue])
         assert color is not None
         self.assertGreater(color[2], color[0])
-
-    def test_trail_color_preserves_sampled_hue_but_darkens_terrain(self):
-        sampled = (130, 145, 105)
-        constructed = _trail_color(sampled, natural=False)
-        natural = _trail_color(sampled, natural=True)
-        self.assertLess(sum(constructed), sum(sampled))
-        self.assertLess(sum(natural), sum(sampled))
-        self.assertLess(sum(natural), sum(constructed))
-        self.assertGreater(
-            sum(abs(actual - base) for actual, base in zip(natural, sampled)),
-            sum(abs(actual - base) for actual, base in zip(constructed, sampled)),
-        )
-        self.assertEqual(natural.index(max(natural)), sampled.index(max(sampled)))
-        self.assertGreater(
-            natural[1] * sampled[2],
-            sampled[1] * natural[2],
-        )
-
-    def test_natural_trail_remains_visible_over_olive_terrain(self):
-        sampled = (105, 92, 57)
-        natural = _trail_color(sampled, natural=True)
-        # With the normal path alpha (180/255), this leaves roughly 20% net
-        # value contrast instead of the former single-digit grey-line change.
-        composited = tuple(
-            round(base * (1 - 180 / 255) + trail * (180 / 255))
-            for base, trail in zip(sampled, natural)
-        )
-        self.assertGreater(
-            max(base - painted for base, painted in zip(sampled, composited)),
-            15,
-        )
-        self.assertGreater(composited[0], composited[1])
-        self.assertGreater(composited[1], composited[2])
 
     def test_building_color_comes_from_deepest_cached_texture(self):
         db = sqlite3.connect(":memory:")
