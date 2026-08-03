@@ -39,9 +39,20 @@ def query_bathymetry_map(
     """Return origin-relative mapped footprints and nearby sounding points."""
     radius = max(float(max_range), 0.0)
     bbox = (qx - radius, qy - radius, qx + radius, qy + radius)
-    # Generation/import paths normally persist comparisons. This repairs
-    # legacy rows, interrupted jobs, and bathymetry written by external SQL.
-    if refresh_sounding_health(db, bounds=bbox):
+    # Generation and import paths maintain comparisons when their source data
+    # changes. Keep this frequently-polled read endpoint cheap: only invoke the
+    # raster sampling repair for legacy/interrupted rows that were never
+    # compared, rather than re-validating every nearby sounding on every poll.
+    missing_comparison = db.execute(
+        "SELECT 1 FROM soundings WHERE evidence_status = 'accepted' "
+        "AND stereo_x BETWEEN ? AND ? AND stereo_y BETWEEN ? AND ? "
+        "AND compared_at IS NULL LIMIT 1",
+        (bbox[0], bbox[2], bbox[1], bbox[3]),
+    ).fetchone()
+    if (
+        missing_comparison is not None
+        and refresh_sounding_health(db, bounds=bbox)
+    ):
         db.commit()
     coverage_rows = db.execute(
         "SELECT b.tile_id, t.x_min, t.y_min, t.x_max, t.y_max, "

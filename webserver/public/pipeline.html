@@ -89,6 +89,7 @@
   <button id="up" title="parent tile ([)">&minus; depth</button>
   <button id="down" title="child tile (])">+ depth</button>
   <a href="/classifier.html">classifier operations &rarr;</a>
+  <a id="training-link" href="/training.html">label training data &rarr;</a>
   <span id="meta"></span>
 </div>
 <div id="flow"></div>
@@ -240,6 +241,7 @@ async function load() {
   const url = new URL(location);
   url.searchParams.set('tile', tid);
   history.replaceState(null, '', url);
+  $('training-link').href = `/training.html?tile=${encodeURIComponent(tid)}`;
   $('meta').textContent = `depth ${depth}`;
   let meta = null;
   try {

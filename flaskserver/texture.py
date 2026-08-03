@@ -627,10 +627,11 @@ METATILE_SPECTRAL_MIN = 0.15
 
 # Parent-relative evidence is stronger than an intrinsic spectrum once JPEG
 # edges and metatile harmonization have been applied. Calibration against the
-# stored corpus leaves a wide gap: known cooked upscales score <=0.9243 while
-# known genuine deep provider tiles score >=0.9991. A D10 parent is worth
-# refining when at least one of its four D11 children clears this midpoint.
-PARENT_DETAIL_MIN = 0.96
+# stored corpus puts known cooked upscales at <=0.9243. A live, intrinsically
+# genuine D11 metatile around 11-748-412 measured 0.9406 at the weakest parent
+# quad (2026-08-03), so keep the decision boundary inside that observed gap.
+# A D10 parent is worth refining when any of its four children clears it.
+PARENT_DETAIL_MIN = 0.93
 
 
 def texture_detail_over_parent_score(
@@ -745,25 +746,32 @@ def metatile_is_upsampled(image_bytes):
 # ---------------------------------------------------------------------------
 
 def _fetch_url(url, timeout=30, retries=3):
-    """Fetch URL bytes, return None on error. Retries on 429/503 with backoff."""
+    """Fetch URL bytes, returning ``None`` after retryable failures expire."""
     import time as _time
+    retryable_http_statuses = {408, 425, 429, 500, 502, 503, 504}
+    host = url.split('/')[2] if '/' in url else url
     for attempt in range(retries):
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "greenland-terrain/1.0"})
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 return resp.read()
         except urllib.error.HTTPError as e:
-            if e.code in (429, 503) and attempt < retries - 1:
+            if e.code in retryable_http_statuses and attempt < retries - 1:
                 _time.sleep(2 ** attempt)
                 continue
-            host = url.split('/')[2] if '/' in url else url
             log_tex.warning(f"[FETCH] HTTP {e.code} from {host} (after {attempt + 1} tries)")
             return None
         except urllib.error.URLError as e:
-            log_tex.warning(f"[FETCH] URL error for {url}: {e.reason}")
+            if attempt < retries - 1:
+                _time.sleep(2 ** attempt)
+                continue
+            # Never log the full URL: provider credentials live in its query string.
+            log_tex.warning(
+                f"[FETCH] URL error from {host} after {attempt + 1} tries: {e.reason}"
+            )
             return None
         except Exception as e:
-            log_tex.warning(f"[FETCH] {type(e).__name__} for {url}: {e}")
+            log_tex.warning(f"[FETCH] {type(e).__name__} from {host}: {e}")
             return None
     return None
 

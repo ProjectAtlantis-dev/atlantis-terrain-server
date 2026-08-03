@@ -1,3 +1,10 @@
+export function classifierD12TileId(tileId) {
+  const match = /^(\d+)-(\d+)-(\d+)$/.exec(String(tileId));
+  if (!match || Number(match[1]) < 12) return null;
+  const shift = Number(match[1]) - 12;
+  return `12-${Math.floor(Number(match[2]) / (2 ** shift))}-${Math.floor(Number(match[3]) / (2 ** shift))}`;
+}
+
 export function createTerrainTileMenuRuntime({
   tileInfoElement,
   documentImpl = globalThis.document,
@@ -57,6 +64,7 @@ export function createTerrainTileMenuRuntime({
   }
 
   function show(x, y, tileId, source, heightmapPayload = '', resolution = 0) {
+    const classifierTileId = classifierD12TileId(tileId);
     tileInfoElement.style.display = 'none';
     menu.innerHTML = '';
     const header = documentImpl.createElement('div');
@@ -71,15 +79,16 @@ export function createTerrainTileMenuRuntime({
       hide();
       windowImpl.open(`/classifier.html?tile=${tileId}`, '_blank');
     });
-    // The classifier regression loop: the USER curates the known-bad set
-    // by flagging tiles live; the server bakes the full verification
-    // panels (ladder steps, Google ref, Asiaq overlay) immediately and
-    // Filing stays in the terrain review loop so nearby failures can be
-    // curated without spawning a new page after every tile.
+    addAction('Label classifier training data', () => {
+      hide();
+      windowImpl.open(`/training.html?tile=${classifierTileId || tileId}`, '_blank');
+    });
+    // The classifier regression loop starts in flight. Filing stays in the
+    // terrain view while the server freezes the D12 case for evaluation.
     addAction('⚑ Flag classifier regression…', async event => {
       const action = event?.currentTarget;
       const note = windowImpl.prompt(
-        `What looks wrong on ${tileId}? (stored with the regression case)`,
+        `What looks wrong on ${classifierTileId || tileId}? (stored with the regression case)`,
       );
       if (note === null) return; // cancelled
       if (action) action.textContent = 'Flagging…';
@@ -87,7 +96,7 @@ export function createTerrainTileMenuRuntime({
         const response = await windowImpl.fetch('/api/regression/cases', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ tile: tileId, note }),
+          body: JSON.stringify({ tile: classifierTileId || tileId, note }),
         });
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
         if (action) action.textContent = '✓ Regression flagged';

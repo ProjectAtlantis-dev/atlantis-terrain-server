@@ -2,11 +2,9 @@
 
 ![Greenland terrain](greenland.png)
 
-Atlantis Terrain is a future collaborative builder for Greenland: a shared 3D environment where people can understand the land, develop ideas, and build together. Today it provides the terrain foundation, streaming elevation, imagery, coastlines, buildings, and roads into a globe-scale Three.js world with atmosphere, clouds, lighting, and water. The atmosphere and cloud effects use [Takram's three-geospatial](https://github.com/takram-design-engineering/three-geospatial).
+Atlantis Terrain is a future collaborative builder for Greenland: a shared 3D threejs environment where people can explore and build together. The atmosphere and cloud effects use [Takram's three-geospatial](https://github.com/takram-design-engineering/three-geospatial).
 
-> **First run is slow.** The tile database is not included in the repository. Terrain and imagery are fetched, processed, and cached as you explore, so new areas may take time to appear. Once those tiles have been built in the local SQLite database, later visits are much faster.
-
-The project is built for local development and is still evolving. Generated databases, downloaded source data, and credentials are deliberately not committed.
+> **First run is slow.** The various data sources are pulled from various government bodies (free but some registrations are required - see attributions section below) based on camera location, so new areas may take time to appear. Once data has been cached in the local Flask/SQLite database, later visits are much faster.
 
 ## Quick start
 

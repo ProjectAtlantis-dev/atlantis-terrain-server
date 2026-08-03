@@ -1,6 +1,7 @@
 import sqlite3
 import unittest
 import zlib
+from unittest import mock
 
 import numpy as np
 
@@ -104,6 +105,12 @@ class BathymetryMapTests(unittest.TestCase):
             payload["soundings"][0]["evidenceCornersM"],
             [None, None, None, None],
         )
+
+        with mock.patch("bathymetry_map.refresh_sounding_health") as refresh:
+            query_bathymetry_map(
+                db, qx, qy, 1000, ox=qx - 10, oy=qy - 20,
+            )
+        refresh.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Classifier Training · Atlantis Terrain</title>
+  <link rel="stylesheet" href="/training.css">
+</head>
+<body>
+  <header>
+    <a class="brand" href="/">ATLANTIS / CLASSIFIER TRAINING</a>
+    <nav>
+      <a href="/pipeline.html">Tile inspector</a>
+      <a href="/classifier.html">Operations</a>
+    </nav>
+  </header>
+  <main>
+    <section class="toolbar">
+      <button id="west" title="West">←</button>
+      <button id="south" title="South">↓</button>
+      <input id="tile" spellcheck="false" aria-label="D12 tile ID">
+      <button id="load">Load tile</button>
+      <button id="north" title="North">↑</button>
+      <button id="east" title="East">→</button>
+      <span id="tile-meta"></span>
+    </section>
+
+    <section class="workspace">
+      <div class="canvas-column">
+        <div class="canvas-frame">
+          <canvas id="annotation-canvas" width="512" height="512"></canvas>
+          <div id="canvas-message">Loading segmentation…</div>
+        </div>
+        <p>Drag across regions to paint. White lines are deterministic 40 m superpixels.</p>
+      </div>
+      <aside>
+        <h1>Label terrain</h1>
+        <p class="lede">Labels—not ladder output—are the source of truth for training.</p>
+        <div id="classes" class="classes"></div>
+        <div class="annotation-status">
+          <strong id="annotated-count">0 / 0 regions labeled</strong>
+          <span id="save-status"></span>
+        </div>
+        <div class="actions">
+          <button id="train-model" class="primary">Train model</button>
+          <button id="predict-tile">Predict this tile</button>
+        </div>
+        <a class="dataset-link" href="/api/classifier/training/dataset.json">Download pair manifest</a>
+        <div id="model-status" class="model-status"></div>
+      </aside>
+    </section>
+
+    <section class="method">
+      <h2>Data contract</h2>
+      <div class="method-grid">
+        <div><b>Unit</b><span>Aligned D12 image pair; trusted labels may cover part of a tile</span></div>
+        <div><b>Inference inputs</b><span>SPOT RGB, elevation, relief, slope, southness, eastness, sun exposure</span></div>
+        <div><b>Split</b><span>D8 geographic groups; regression tiles are never training samples</span></div>
+        <div><b>Model</b><span>U-Net: reference reconstruction pretraining, then trusted semantic fine-tuning</span></div>
+      </div>
+    </section>
+  </main>
+  <script type="module" src="/training.js"></script>
+</body>
+</html>

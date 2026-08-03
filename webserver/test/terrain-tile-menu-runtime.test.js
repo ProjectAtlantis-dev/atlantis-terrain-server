@@ -1,7 +1,15 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { createTerrainTileMenuRuntime } from '../terrain-tile-menu-runtime.js';
+import {
+  classifierD12TileId, createTerrainTileMenuRuntime,
+} from '../terrain-tile-menu-runtime.js';
+
+test('classifier collection normalizes visible descendants to D12', () => {
+  assert.equal(classifierD12TileId('12-1373-784'), '12-1373-784');
+  assert.equal(classifierD12TileId('14-5499-3176'), '12-1374-794');
+  assert.equal(classifierD12TileId('11-1-2'), null);
+});
 
 function createElement(tagName) {
   return {

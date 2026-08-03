@@ -40,6 +40,17 @@ class TerrainSegmentationTest(unittest.TestCase):
         outer_cost = float(np.concatenate((cost[:, :16], cost[:, 48:]), 1).mean())
         self.assertGreater(center_cost, outer_cost + 20)
 
+    def test_southness_is_an_independent_image_aligned_feature(self):
+        rgb = np.full((8, 8, 3), 100, dtype=np.uint8)
+        # DB rows progress south -> north. Rising north means a south-facing
+        # surface, and flipping to image orientation must not change its sign.
+        heightmap = np.repeat(
+            np.linspace(0, 40, 5, dtype=np.float32)[:, None], 5, axis=1
+        )
+        channels = terrain_feature_channels(rgb, heightmap, 40.0)
+        self.assertGreater(float(channels["southness"].mean()), 0.5)
+        self.assertIn("insolation", channels)
+
     def test_official_water_mask_overrides_elevation_fallback(self):
         rgb = np.full((8, 8, 3), 100, dtype=np.uint8)
         heightmap = np.full((5, 5), 150.0, dtype=np.float32)

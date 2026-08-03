@@ -2984,6 +2984,7 @@ function renderFrame() {
     });
     terrainPipelineState.cameraStereoX = gridPosition.x;
     terrainPipelineState.cameraStereoY = gridPosition.y;
+    bathymetryMapRuntime.sync();
     const refetch = evaluateTerrainRefetch({
       cameraX: terrainPipelineState.cameraStereoX, cameraY: terrainPipelineState.cameraStereoY,
       lastFetchX: terrainPipelineState.lastFetchX, lastFetchY: terrainPipelineState.lastFetchY,

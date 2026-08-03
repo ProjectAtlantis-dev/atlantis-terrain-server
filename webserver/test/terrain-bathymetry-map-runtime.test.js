@@ -69,6 +69,12 @@ test('bathymetry map builds coverage quads and vertical sounding markers', () =>
   assert.equal(lines.material.toneMapped, false);
   assert.equal(actualPoints.material.toneMapped, false);
   assert.equal(soundingPoints.material.toneMapped, false);
+  assert.equal(lines.material.depthTest, true);
+  assert.equal(lines.material.depthWrite, false);
+  assert.equal(actualPoints.material.depthTest, true);
+  assert.equal(actualPoints.material.depthWrite, false);
+  assert.equal(soundingPoints.material.depthTest, true);
+  assert.equal(soundingPoints.material.depthWrite, false);
   assert.equal(coverage.material.blending, THREE.AdditiveBlending);
   assert.equal(lines.material.blending, THREE.NormalBlending);
   assert.equal(actualPoints.material.blending, THREE.NormalBlending);
@@ -165,24 +171,31 @@ test('bathymetry coverage is clipped to the requested circle', () => {
 
 test('runtime fetches only while enabled and reports mapped counts', async () => {
   const added = [];
+  const fetchedUrls = [];
   const terrainRoot = {
     add(item) { added.push(item); },
     remove() {},
   };
+  const pipelineState = {
+    ready: true,
+    frameOffsetReady: true,
+    cameraStereoX: 1010,
+    cameraStereoY: 2020,
+    lastFetchX: 1000,
+    lastFetchY: 2000,
+    originX: 900,
+    originY: 1900,
+    frameOffsetX: 4,
+    frameOffsetY: -3,
+  };
   let intervalCallback = null;
   const runtime = createTerrainBathymetryMapRuntime({
     terrainRoot,
-    pipelineState: {
-      ready: true,
-      frameOffsetReady: true,
-      lastFetchX: 1000,
-      lastFetchY: 2000,
-      originX: 900,
-      originY: 1900,
-      frameOffsetX: 4,
-      frameOffsetY: -3,
+    pipelineState,
+    fetchImpl: async url => {
+      fetchedUrls.push(url);
+      return { ok: true, json: async () => payload };
     },
-    fetchImpl: async () => ({ ok: true, json: async () => payload }),
     setIntervalImpl: callback => {
       intervalCallback = callback;
       return 7;
@@ -196,5 +209,18 @@ test('runtime fetches only while enabled and reports mapped counts', async () =>
   assert.equal(runtime.active, true);
   assert.deepEqual(runtime.counts, { coverage: 1, soundings: 2 });
   assert.equal(added.length, 1);
+  assert.match(fetchedUrls[0], /[?&]sx=1010(?:&|$)/);
+  assert.match(fetchedUrls[0], /[?&]sy=2020(?:&|$)/);
+  assert.match(fetchedUrls[0], /[?&]range=2000(?:&|$)/);
   assert.equal(typeof intervalCallback, 'function');
+
+  // Terrain fetch coordinates remain stale while the live camera advances.
+  // Movement itself must refresh from the camera coordinates without waiting
+  // for the periodic overlay poll.
+  pipelineState.cameraStereoX = 1400;
+  pipelineState.cameraStereoY = 2600;
+  await runtime.sync();
+  assert.equal(added.length, 2);
+  assert.match(fetchedUrls[1], /[?&]sx=1400(?:&|$)/);
+  assert.match(fetchedUrls[1], /[?&]sy=2600(?:&|$)/);
 });

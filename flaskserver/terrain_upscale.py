@@ -29,7 +29,7 @@ log_upscale = get_logger("terrain.upscale")
 # on startup, resets every cooked_dem tile back to pending, and drops
 # cooked_upscale textures, so exploration recooks both with the current
 # recipe.
-MACRO_TERRAIN_VERSION = 5
+MACRO_TERRAIN_VERSION = 6
 
 def _smoothstep(value):
     return value * value * (3.0 - 2.0 * value)

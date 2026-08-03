@@ -1,10 +1,12 @@
 import io
 import os
+from email.message import Message
 from pathlib import Path
 import sqlite3
 import tempfile
 import unittest
-from unittest.mock import Mock, patch
+import urllib.error
+from unittest.mock import MagicMock, Mock, patch
 
 import numpy as np
 from PIL import Image
@@ -12,11 +14,13 @@ from PIL import Image
 os.environ.setdefault("DATAFORSYNINGEN_TOKEN", "test-token")
 
 from texture import (
+    _fetch_url,
     init_textures,
     harmonize_texture_metatile,
     is_no_coverage_fill_jpeg,
     metatile_is_upsampled,
     split_texture_metatile,
+    texture_quad_adds_parent_detail,
     texture_sources_in,
     write_texture,
 )
@@ -32,7 +36,61 @@ def _encoded_image(array, image_format="PNG"):
     return buf.getvalue()
 
 
+class TextureHttpFetchTest(unittest.TestCase):
+    def test_retries_bad_gateway_before_succeeding(self):
+        response = MagicMock()
+        response.__enter__.return_value.read.return_value = b"provider-image"
+        bad_gateway = urllib.error.HTTPError(
+            "https://provider.invalid/wms", 502, "Bad Gateway", Message(), None,
+        )
+
+        with (
+            patch(
+                "texture.urllib.request.urlopen",
+                side_effect=[bad_gateway, response],
+            ) as urlopen,
+            patch("time.sleep") as sleep,
+        ):
+            result = _fetch_url("https://provider.invalid/wms?token=secret")
+
+        self.assertEqual(result, b"provider-image")
+        self.assertEqual(urlopen.call_count, 2)
+        sleep.assert_called_once_with(1)
+
+    def test_does_not_retry_non_transient_http_error(self):
+        not_found = urllib.error.HTTPError(
+            "https://provider.invalid/wms", 404, "Not Found", Message(), None,
+        )
+
+        with (
+            patch("texture.urllib.request.urlopen", side_effect=not_found) as urlopen,
+            patch("time.sleep") as sleep,
+        ):
+            result = _fetch_url("https://provider.invalid/wms?token=secret")
+
+        self.assertIsNone(result)
+        urlopen.assert_called_once()
+        sleep.assert_not_called()
+
+
 class TextureMetatileTest(unittest.TestCase):
+    def test_parent_detail_boundary_separates_observed_cook_and_genuine_scores(self):
+        children = {(0, 0): b"00", (0, 1): b"01", (1, 0): b"10", (1, 1): b"11"}
+
+        with patch(
+            "texture.texture_detail_over_parent_score",
+            side_effect=[0.91, 0.9243, 0.90, 0.92],
+        ):
+            adds_detail, _ = texture_quad_adds_parent_detail(children, b"parent")
+        self.assertFalse(adds_detail)
+
+        with patch(
+            "texture.texture_detail_over_parent_score",
+            side_effect=[0.91, 0.9406, 0.90, 0.92],
+        ):
+            adds_detail, _ = texture_quad_adds_parent_detail(children, b"parent")
+        self.assertTrue(adds_detail)
+
     def test_split_uses_quadtree_row_orientation(self):
         image = np.zeros((512, 512, 3), dtype=np.uint8)
         colors = {

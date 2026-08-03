@@ -1,7 +1,8 @@
 import * as THREE from 'three';
 
-const DEFAULT_RANGE_M = 50000;
+const DEFAULT_RANGE_M = 2000;
 const DEFAULT_POLL_MS = 5000;
+const DEFAULT_MOVE_REFRESH_M = 250;
 
 const COVERAGE_COLOR = 0x00d8ff;
 const HEALTH_COLORS = {
@@ -58,7 +59,8 @@ function addPointMarkers(group, positions, colors, {
     sizeAttenuation: false,
     vertexColors: true,
     transparent: true,
-    depthTest: false,
+    depthTest: true,
+    depthWrite: false,
     toneMapped: false,
     blending: THREE.NormalBlending,
   };
@@ -339,7 +341,8 @@ export function buildBathymetryMapGroup(payload, {
         vertexColors: true,
         transparent: true,
         opacity: 0.9,
-        depthTest: false,
+        depthTest: true,
+        depthWrite: false,
         toneMapped: false,
         blending: THREE.NormalBlending,
       }),
@@ -381,6 +384,7 @@ export function createTerrainBathymetryMapRuntime({
   exaggeration = 1,
   rangeM = DEFAULT_RANGE_M,
   pollMs = DEFAULT_POLL_MS,
+  moveRefreshM = DEFAULT_MOVE_REFRESH_M,
   fetchImpl = (...args) => fetch(...args),
   setIntervalImpl = (...args) => setInterval(...args),
   clearIntervalImpl = timer => clearInterval(timer),
@@ -392,6 +396,9 @@ export function createTerrainBathymetryMapRuntime({
   let fetching = false;
   let group = null;
   let timer = null;
+  let lastQueryX = null;
+  let lastQueryY = null;
+  let movementRefreshQueued = false;
   let counts = { coverage: 0, soundings: 0 };
 
   function replaceGroup(next) {
@@ -409,15 +416,23 @@ export function createTerrainBathymetryMapRuntime({
     if (
       !active || fetching || !pipelineState.ready
       || !pipelineState.frameOffsetReady
-      || !Number.isFinite(pipelineState.lastFetchX)
-      || !Number.isFinite(pipelineState.lastFetchY)
+      || !Number.isFinite(pipelineState.cameraStereoX)
+      || !Number.isFinite(pipelineState.cameraStereoY)
     ) return;
     fetching = true;
+    const queryX = pipelineState.cameraStereoX;
+    const queryY = pipelineState.cameraStereoY;
+    lastQueryX = queryX;
+    lastQueryY = queryY;
+    const originX = pipelineState.originX;
+    const originY = pipelineState.originY;
+    const offsetX = pipelineState.frameOffsetX;
+    const offsetY = pipelineState.frameOffsetY;
     try {
       const url = '/api/bathymetry-map'
-        + `?sx=${pipelineState.lastFetchX}&sy=${pipelineState.lastFetchY}`
+        + `?sx=${queryX}&sy=${queryY}`
         + `&range=${rangeM}`
-        + `&ox=${pipelineState.originX}&oy=${pipelineState.originY}`;
+        + `&ox=${originX}&oy=${originY}`;
       const response = await fetchImpl(url);
       if (!response.ok) throw new Error(`http ${response.status}`);
       const payload = await response.json();
@@ -426,12 +441,12 @@ export function createTerrainBathymetryMapRuntime({
         soundings: Number(payload.soundingCount) || 0,
       };
       replaceGroup(buildBathymetryMapGroup(payload, {
-        offsetX: pipelineState.frameOffsetX,
-        offsetY: pipelineState.frameOffsetY,
+        offsetX,
+        offsetY,
         exaggeration,
         clipCircle: {
-          x: pipelineState.lastFetchX - pipelineState.originX,
-          y: pipelineState.lastFetchY - pipelineState.originY,
+          x: queryX - originX,
+          y: queryY - originY,
           radius: rangeM,
         },
       }));
@@ -441,7 +456,31 @@ export function createTerrainBathymetryMapRuntime({
     } finally {
       fetching = false;
       onChanged();
+      if (movementRefreshQueued) {
+        movementRefreshQueued = false;
+        sync();
+      }
     }
+  }
+
+  function sync() {
+    if (
+      !active
+      || !Number.isFinite(pipelineState.cameraStereoX)
+      || !Number.isFinite(pipelineState.cameraStereoY)
+    ) return undefined;
+    const distance = lastQueryX == null || lastQueryY == null
+      ? Infinity
+      : Math.hypot(
+          pipelineState.cameraStereoX - lastQueryX,
+          pipelineState.cameraStereoY - lastQueryY,
+        );
+    if (distance < Math.max(0, Number(moveRefreshM) || 0)) return undefined;
+    if (fetching) {
+      movementRefreshQueued = true;
+      return undefined;
+    }
+    return refresh();
   }
 
   function setActive(value) {
@@ -461,6 +500,7 @@ export function createTerrainBathymetryMapRuntime({
 
   return {
     refresh,
+    sync,
     setActive,
     toggle: () => setActive(!active),
     get active() { return active; },

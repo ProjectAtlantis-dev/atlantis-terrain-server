@@ -30,10 +30,12 @@ DEFAULT_ZOOM = 16
 _FETCH_PAUSE_S = 0.05
 
 
-def _fetch_tile(zoom, x, y, cache_dir):
+def _fetch_tile(zoom, x, y, cache_dir, *, allow_network=True):
     os.makedirs(cache_dir, exist_ok=True)
     path = os.path.join(cache_dir, f"z{zoom}_x{x}_y{y}.jpg")
     if not os.path.exists(path):
+        if not allow_network:
+            raise FileNotFoundError(path)
         request = urllib.request.Request(
             TILE_URL.format(x=x, y=y, z=zoom),
             headers={"User-Agent": "atlantis-terrain classifier verification"},
@@ -46,7 +48,10 @@ def _fetch_tile(zoom, x, y, cache_dir):
     return np.asarray(Image.open(path).convert("RGB"), dtype=np.uint8)
 
 
-def google_reference(bbox, size=512, zoom=DEFAULT_ZOOM, cache_dir=CACHE_DIR):
+def google_reference(
+    bbox, size=512, zoom=DEFAULT_ZOOM, cache_dir=CACHE_DIR,
+    *, allow_network=True,
+):
     """Google mosaic reprojected onto an EPSG:3413 bbox, image-oriented.
 
     Returns HxWx3 uint8 (row 0 = north) or None when any tile fetch fails
@@ -72,7 +77,9 @@ def google_reference(bbox, size=512, zoom=DEFAULT_ZOOM, cache_dir=CACHE_DIR):
     try:
         for ty in range(ty0, ty1 + 1):
             for tx in range(tx0, tx1 + 1):
-                tile = _fetch_tile(zoom, tx, ty, cache_dir)
+                tile = _fetch_tile(
+                    zoom, tx, ty, cache_dir, allow_network=allow_network
+                )
                 mosaic[
                     (ty - ty0) * 256:(ty - ty0 + 1) * 256,
                     (tx - tx0) * 256:(tx - tx0 + 1) * 256,

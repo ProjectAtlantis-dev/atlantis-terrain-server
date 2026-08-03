@@ -29,6 +29,7 @@ from classifier_job_control import (
   classifier_inventory,
   regression_case_summaries,
 )
+from classifier_training_control import ClassifierTrainingControl
 from gpu_profile_control import GpuProfileControl
 from terrain_config import (
   BOOTSTRAP_SEED_DEPTH, MAX_TILE_DEPTH, WMS_CONTRACT_DEPTH,
@@ -77,6 +78,7 @@ DB_PATH = _resolve_db_path()
 app = Flask(__name__, static_folder=STATIC_DIR, static_url_path="")
 _gpu_profile_control = GpuProfileControl()
 _classifier_job_control = ClassifierJobControl(DB_PATH)
+_classifier_training_control = ClassifierTrainingControl()
 
 
 def _env_int(name: str, default: int) -> int:
@@ -1039,6 +1041,7 @@ def _bootstrap_backend() -> None:
 
     import grundkort
     grundkort.ensure_grundkort_async()
+    grundkort.enable_demand()
 
     from ingest_coastline import ensure_gtk50_blocks
     threading.Thread(target=ensure_gtk50_blocks, daemon=True).start()
@@ -1742,10 +1745,39 @@ _BUILDING_QUERY_RANGE_M = 25000.0
 def _buildings_for_tile_query(qx: float, qy: float, ox: float, oy: float):
   """Resolve scene buildings as part of the terrain-tile transaction."""
   from asset_catalog import color_buildings_from_textures, query_buildings
+  from gtk50_vector import query_structures
+  from ingest_buildings import GroundSampler
 
   buildings = query_buildings(
     _get_assets_db(), qx, qy, _BUILDING_QUERY_RANGE_M, ox, oy
   )
+  bbox = (
+    qx - _BUILDING_QUERY_RANGE_M, qy - _BUILDING_QUERY_RANGE_M,
+    qx + _BUILDING_QUERY_RANGE_M, qy + _BUILDING_QUERY_RANGE_M,
+  )
+  gtk50 = query_structures(
+    bbox, ground_sampler=GroundSampler(_get_db()), ox=ox, oy=oy,
+  )
+  # Asiaq's surveyed PolygonZ is the higher-detail authority inside towns.
+  # Suppress a coarse GTK50 footprint when its centre falls into an Asiaq
+  # footprint's bounds, avoiding doubled walls and overlapping roofs.
+  asiaq_bounds: dict[tuple[int, int], list[tuple[float, float, float, float]]] = {}
+  index_cell_m = 100.0
+  for building in buildings:
+    xs = [point[0] for point in building["ring"]]
+    ys = [point[1] for point in building["ring"]]
+    bounds = (min(xs) - 2, min(ys) - 2, max(xs) + 2, max(ys) + 2)
+    for ix in range(math.floor(bounds[0] / index_cell_m), math.floor(bounds[2] / index_cell_m) + 1):
+      for iy in range(math.floor(bounds[1] / index_cell_m), math.floor(bounds[3] / index_cell_m) + 1):
+        asiaq_bounds.setdefault((ix, iy), []).append(bounds)
+  for structure in gtk50:
+    cx, cy = structure.pop("_center")
+    candidates = asiaq_bounds.get(
+      (math.floor(cx / index_cell_m), math.floor(cy / index_cell_m)), []
+    )
+    if any(x0 <= cx <= x1 and y0 <= cy <= y1 for x0, y0, x1, y1 in candidates):
+      continue
+    buildings.append(structure)
   color_buildings_from_textures(_get_db(), buildings, ox, oy)
   return buildings
 
@@ -1958,6 +1990,32 @@ def api_tiles():
     )
   bathymetry_status = _bathymetry_demand.status()
 
+  # Asiaq publishes one vector archive per settlement. Only real viewer
+  # movement may acquire one; synthetic bathymetry sweeps must not populate
+  # unrelated villages. The background worker ingests and syncs the package,
+  # and the browser's normal polling observes the changed building hash.
+  grundkort_scheduled = []
+  grundkort_inflight = []
+  if demand_origin == "viewer":
+    try:
+      import grundkort
+      grundkort_scheduled = grundkort.request_for_point(qx, qy)
+      grundkort_inflight = grundkort.demand_status()["inflight"]
+    except Exception as exc:
+      log.warning(
+        f"[/api/tiles] Grundkort demand FAILED: {type(exc).__name__}: {exc}"
+      )
+    try:
+      import gtk50_demand
+      gtk50_demand.request_for_bbox((
+        qx - _BUILDING_QUERY_RANGE_M, qy - _BUILDING_QUERY_RANGE_M,
+        qx + _BUILDING_QUERY_RANGE_M, qy + _BUILDING_QUERY_RANGE_M,
+      ))
+    except Exception as exc:
+      log.warning(
+        f"[/api/tiles] GTK50 structure demand FAILED: {type(exc).__name__}: {exc}"
+      )
+
   try:
     buildings = _buildings_for_tile_query(qx, qy, ox, oy)
   except Exception as exc:
@@ -2000,6 +2058,7 @@ def api_tiles():
       "texStatusCounts": tex_status_counts,
       "bathymetryQueued": bathymetry_submitted,
       "bathymetryStatus": bathymetry_status,
+      "grundkortQueued": sorted(set(grundkort_scheduled + grundkort_inflight)),
       "buildings": buildings,
       "buildingCount": len(buildings) if buildings is not None else None,
       "buildingsHash": buildings_hash,
@@ -2677,23 +2736,20 @@ CLASSIFIER_PINK_WATER_ENABLED = False
 
 
 def _ensure_d12_class_map(db, tile_id: str) -> None:
-  """Classify D12 on demand from its evidence plus D10/D11 lake priors.
+  """Run trained-model D12 inference when a versioned artifact is available.
 
-  D12 supplies the authoritative texture and measured heightmap. D10 decides
-  whether inferred lake water may exist and D11 localizes that hypothesis;
-  neither parent supplies a final D12 boundary. Rows are stored only when all
-  inputs are final, so placeholder-derived labels are never persisted.
-  Deterministic given its inputs.
+  Legacy ladder rows may still be read while the first dataset is labeled,
+  but this path never creates or refreshes heuristic classifications.
   """
   parsed = _parse_tile_id(tile_id)
   if parsed is None or parsed[0] != WMS_CONTRACT_DEPTH:
     return
-  from classifier.ladder import LADDER_SOURCE
+  from classifier.training import MODEL_PATH, predict_tile
 
   existing = db.execute(
     "SELECT source FROM classifier_tiles WHERE tile_id = ?", (tile_id,)
   ).fetchone()
-  if existing and existing[0] == LADDER_SOURCE:
+  if existing and str(existing[0]).startswith("model:"):
     return
   texture_row = db.execute(
     "SELECT texture, source FROM textures WHERE tile_id = ?", (tile_id,)
@@ -2703,74 +2759,18 @@ def _ensure_d12_class_map(db, tile_id: str) -> None:
     or texture_row[1] in _TEX_TEMPORARY
   ):
     return
-  from database import read_tile
-  tile = read_tile(db, tile_id)
-  if tile is None or tile.get("heightmap") is None:
+  if not MODEL_PATH.exists():
     return
   try:
-    import numpy as np
-    from PIL import Image
-
-    from classifier.hierarchy import d12_lake_prior, lake_prior_ancestor_ids
-    from classifier.ladder import classify_ladder, macro_grain
-    from classifier.storage import (
-      COARSE_V4_SCHEMA, init_classifier_tiles, write_classifier_tile,
-    )
-    from coastline import read_water_mask
-
-    try:
-      water_mask = read_water_mask(db, tile_id)
-      if water_mask is not None and water_mask.shape != tile["heightmap"].shape:
-        water_mask = None
-    except Exception:
-      water_mask = None
-    # d8 macro grain: the region's structural strike (NE-SW on the west
-    # coast) rides along as conditioning context for the ladder's stats.
-    grain = None
-    try:
-      depth, col, row = parsed
-      shift = depth - 8
-      if shift > 0:
-        ancestor = read_tile(db, f"8-{col >> shift}-{row >> shift}")
-        if ancestor is not None and ancestor.get("heightmap") is not None:
-          grain = macro_grain(
-            ancestor["heightmap"],
-            float(ancestor["bbox"][2]) - float(ancestor["bbox"][0]),
-          )
-    except Exception:
-      grain = None
-    rgb = np.asarray(Image.open(io.BytesIO(texture_row[0])).convert("RGB"))
-    # D10 answers whether inferred water exists at all; D11 localizes that
-    # support. If either parent is unavailable, leave this tile pending rather
-    # than persist a D12-only lake guess that can never repair itself.
-    lake_prior = d12_lake_prior(db, tile_id)
-    if lake_prior is None:
-      for ancestor_id in lake_prior_ancestor_ids(tile_id):
-        ancestor = _parse_tile_id(ancestor_id)
-        if ancestor is not None:
-          _queue_texture_fetch(ancestor_id, tuple(_tile_bbox(*ancestor)))
-      log.info(
-        f"[classifier] {tile_id}: waiting for d10/d11 lake priors"
-      )
-      return
-    labels, stats = classify_ladder(
-      rgb, tile["heightmap"], list(tile["bbox"]),
-      water_mask=water_mask, grain=grain, lake_prior=lake_prior,
-    )
-    init_classifier_tiles(db)
-    write_classifier_tile(
-      db, tile_id, labels, class_schema=COARSE_V4_SCHEMA, source=LADDER_SOURCE,
-    )
+    result = predict_tile(db, tile_id)
     log.info(
-      f"[classifier] {tile_id}: ladder d12 classification stored "
-      f"({texture_row[1]} texture, {labels.shape[0]}px, "
-      f"shadow {stats['fractions']['shadow']:.1%}, "
-      f"lake candidates {stats['lake_candidate_fraction']:.1%} -> "
-      f"{stats['fractions']['lake']:.1%})"
+      f"[classifier] {tile_id}: trained model classification stored "
+      f"({result['regions']} regions, confidence "
+      f"{result['meanConfidence']:.1%})"
     )
   except Exception as exc:
     log.warning(
-      f"[classifier] {tile_id}: live d12 classification failed "
+      f"[classifier] {tile_id}: trained model inference failed "
       f"({type(exc).__name__}: {exc})"
     )
 
@@ -3128,6 +3128,189 @@ def api_classifier_verification_gallery(subpath="index.html"):
   return send_from_directory(OUT_DIR, subpath)
 
 
+def _training_regression_tiles() -> set[str]:
+  import regression_cases
+
+  return {
+    str(case.get("tile", "")) for case in regression_cases.load_cases()
+  }
+
+
+@app.get("/api/classifier/training/<tile_id>")
+def api_classifier_training_tile(tile_id: str):
+  """Annotation state and deterministic segment metadata for one D12 tile."""
+  if _parse_tile_id(tile_id) is None:
+    return jsonify({"error": "bad tile id"}), 400
+  try:
+    from classifier.segmentation import SEGMENTER_VERSION
+    from classifier.training import (
+      CLASSES, geographic_group, geographic_split,
+      load_segmented_tile, read_annotations,
+    )
+
+    _, segmented = load_segmented_tile(_get_db(), tile_id)
+    annotations = read_annotations(_get_db(), tile_id)
+    regression_tiles = _training_regression_tiles()
+    return jsonify({
+      "tile": tile_id,
+      "segmenterVersion": SEGMENTER_VERSION,
+      "width": int(segmented.labels.shape[1]),
+      "height": int(segmented.labels.shape[0]),
+      "regionCount": len(segmented.regions),
+      "classes": list(CLASSES),
+      "annotations": {
+        str(segment_id): class_name
+        for segment_id, class_name in annotations.items()
+      },
+      "group": geographic_group(tile_id),
+      "split": geographic_split(tile_id, regression_tiles),
+      "overlayUrl": f"/api/classifier/training/{tile_id}/overlay.png",
+      "segmentIdsUrl": f"/api/classifier/training/{tile_id}/ids.png",
+    })
+  except ValueError as exc:
+    return jsonify({"error": str(exc)}), 404
+
+
+@app.get("/api/classifier/training/<tile_id>/<kind>.png")
+def api_classifier_training_image(tile_id: str, kind: str):
+  if kind not in {"overlay", "ids"} or _parse_tile_id(tile_id) is None:
+    return Response(b"", status=400)
+  try:
+    from classifier.training import (
+      encode_segment_ids, load_segmented_tile,
+      read_annotations, render_annotation_overlay,
+    )
+    from PIL import Image as TrainingImage
+
+    rgb, segmented = load_segmented_tile(_get_db(), tile_id)
+    if kind == "ids":
+      rendered = encode_segment_ids(segmented.labels)
+    else:
+      rendered = render_annotation_overlay(
+        rgb, segmented, read_annotations(_get_db(), tile_id)
+      )
+    buffer = io.BytesIO()
+    TrainingImage.fromarray(rendered, mode="RGB").save(buffer, format="PNG")
+    return Response(
+      buffer.getvalue(), mimetype="image/png",
+      headers={"Cache-Control": "no-store"},
+    )
+  except ValueError as exc:
+    return jsonify({"error": str(exc)}), 404
+
+
+@app.put("/api/classifier/training/<tile_id>")
+def api_classifier_training_annotate(tile_id: str):
+  if _parse_tile_id(tile_id) is None:
+    return jsonify({"error": "bad tile id"}), 400
+  payload = request.get_json(silent=True)
+  if not isinstance(payload, dict) or not isinstance(payload.get("assignments"), list):
+    return jsonify({"error": "assignments list required"}), 400
+  try:
+    from classifier.training import load_segmented_tile, write_annotations
+
+    _, segmented = load_segmented_tile(_get_db(), tile_id)
+    annotations = write_annotations(
+      _get_db(), tile_id, payload["assignments"],
+      region_count=len(segmented.regions),
+    )
+    pair_updated = False
+    try:
+      from classifier.training_data import export_pairs
+
+      export_pairs(
+        _get_db(), [tile_id], regression_tiles=_training_regression_tiles(),
+        allow_network=False,
+      )
+      pair_updated = True
+    except (FileNotFoundError, ValueError):
+      # The annotation is authoritative even when its reference pair has not
+      # been cached yet; the next explicit export will materialize it.
+      pass
+    return jsonify({
+      "ok": True,
+      "annotations": {str(key): value for key, value in annotations.items()},
+      "annotated": len(annotations),
+      "pairUpdated": pair_updated,
+    })
+  except (TypeError, ValueError) as exc:
+    return jsonify({"error": str(exc)}), 400
+
+
+@app.get("/api/classifier/training/model")
+def api_classifier_training_model():
+  from classifier.neural import MODEL_CANDIDATE_PATH, MODEL_PATH, model_metadata
+
+  if not MODEL_PATH.exists():
+    return jsonify({
+      "trained": False, "trainingJob": _classifier_training_control.status(),
+      "candidate": model_metadata(MODEL_CANDIDATE_PATH),
+    })
+  try:
+    model = model_metadata()
+    return jsonify({
+      "trained": True, "format": model["format"],
+      "createdAt": model.get("createdAt"),
+      "metrics": model.get("metrics", {}),
+      "datasetDigest": model.get("datasetDigest"),
+      "datasetEntries": model.get("datasetEntries", 0),
+      "candidate": model_metadata(MODEL_CANDIDATE_PATH),
+      "trainingJob": _classifier_training_control.status(),
+    })
+  except (OSError, ValueError) as exc:
+    return jsonify({"trained": False, "error": str(exc)}), 500
+
+
+@app.get("/api/classifier/training/dataset.json")
+def api_classifier_training_dataset():
+  from classifier.training_data import load_manifest
+
+  response = jsonify(load_manifest())
+  response.headers["Content-Disposition"] = (
+    'attachment; filename="atlantis-classifier-manifest.json"'
+  )
+  response.headers["Cache-Control"] = "no-store"
+  return response
+
+
+@app.post("/api/classifier/training/train")
+def api_classifier_training_train():
+  try:
+    from classifier.neural import MODEL_CANDIDATE_PATH
+    from classifier.training_data import load_manifest
+
+    manifest = load_manifest()
+    if not any(entry.get("split") == "train" for entry in manifest["entries"]):
+      raise ValueError(
+        "no exported training pairs; run classifier_train.py export first"
+      )
+    payload = request.get_json(silent=True) or {}
+    options = {
+      "pretrain_steps": max(0, min(int(payload.get("pretrainSteps", 2000)), 100000)),
+      "finetune_steps": max(0, min(int(payload.get("finetuneSteps", 2000)), 100000)),
+      "batch_size": max(1, min(int(payload.get("batchSize", 4)), 64)),
+      "patch_size": max(32, min(int(payload.get("patchSize", 128)), 256)),
+      "seed": int(payload.get("seed", 20260803)),
+      "model_path": MODEL_CANDIDATE_PATH,
+    }
+    state = _classifier_training_control.start(**options)
+    return jsonify({"ok": True, "trainingJob": state}), 202
+  except (TypeError, ValueError) as exc:
+    return jsonify({"error": str(exc)}), 400
+
+
+@app.post("/api/classifier/training/predict/<tile_id>")
+def api_classifier_training_predict(tile_id: str):
+  if _parse_tile_id(tile_id) is None:
+    return jsonify({"error": "bad tile id"}), 400
+  try:
+    from classifier.training import predict_tile
+
+    return jsonify({"ok": True, **predict_tile(_get_db(), tile_id)})
+  except ValueError as exc:
+    return jsonify({"error": str(exc)}), 400
+
+
 @app.post("/api/regression/cases")
 def api_regression_flag():
   """Flag a tile as a classifier regression case (⚑ in the 3D client).
@@ -3157,9 +3340,26 @@ def api_regression_flag():
       f"({type(exc).__name__}: {exc})"
     )
     baked = False
+  training_pair = False
+  try:
+    from classifier.training_data import export_pairs
+
+    export_pairs(
+      _get_db(), [tile_id], regression_tiles={
+        str(case.get("tile", "")) for case in regression_cases.load_cases()
+      }, allow_network=False,
+    )
+    training_pair = True
+  except Exception as exc:
+    log.info(
+      f"[regression] {tile_id}: frozen neural evaluation pair unavailable "
+      f"({type(exc).__name__}: {exc})"
+    )
   return {
     "ok": True,
     "baked": baked,
+    "trainingPair": training_pair,
+    "split": "regression",
     "cases": [case["tile"] for case in regression_cases.load_cases()],
   }
 

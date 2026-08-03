@@ -27,7 +27,9 @@ import sqlite3
 import threading
 import time
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import Callable
 
 from colored_log import get_logger
 from terrain_config import GRUNDKORT_SETTLEMENTS
@@ -39,6 +41,9 @@ DB_PATH = Path(__file__).resolve().parent / "terrain.db"
 ASSETS_DB_PATH = Path(__file__).resolve().parent.parent / "assetserver" / "assets.db"
 _FILES_URL = "https://kortforsyning.asiaq.gl/files"
 _GROUND_RETRY_S = 60.0
+DEMAND_RADIUS_M = 30_000.0
+DEMAND_RETRY_AFTER_S = 300.0
+_ingest_lock = threading.RLock()
 
 # Mirrors the asset server's initDb DDL (server.ts) so seeding works even
 # if the asset server has never run; both sides guard the cx/cy migration.
@@ -94,6 +99,29 @@ def _download_settlement(folder: str) -> None:
     )
 
 
+def _settlement_loaded(folder: str, db_path: Path = DB_PATH) -> bool:
+    """Return whether this package has produced either vector layer."""
+    settlement = _settlement_of(folder)
+    if settlement is None or not db_path.exists():
+        return False
+    db = sqlite3.connect(str(db_path))
+    try:
+        return bool(
+            db.execute(
+                "SELECT 1 FROM buildings WHERE settlement = ? LIMIT 1",
+                (settlement,),
+            ).fetchone()
+            or db.execute(
+                "SELECT 1 FROM roads WHERE settlement = ? LIMIT 1",
+                (settlement,),
+            ).fetchone()
+        )
+    except sqlite3.OperationalError:
+        return False
+    finally:
+        db.close()
+
+
 def _settlement_of(name: str) -> str | None:
     match = re.match(r"(\d{4}[A-Z]{3})", name)
     return match.group(1) if match else None
@@ -119,39 +147,16 @@ def ensure_grundkort(db_path: Path = DB_PATH) -> None:
     ZIP_DIR.mkdir(exist_ok=True)
     for folder in GRUNDKORT_SETTLEMENTS:
         try:
-            _download_settlement(folder)
+            ensure_settlement(folder, db_path)
         except Exception as exc:
             log.warning(
-                f"[grundkort] download of {folder} failed "
+                f"[grundkort] acquisition of {folder} failed "
                 f"({type(exc).__name__}: {exc}) — will retry next startup"
             )
+    # Manually dropped archives remain supported and are ingested at startup.
+    for zip_path in sorted(ZIP_DIR.glob("*.zip")):
+        ensure_settlement_archive(zip_path, db_path)
     zips = sorted(ZIP_DIR.glob("*.zip"))
-    db = sqlite3.connect(str(db_path))
-    try:
-        _ensure_schema(db)
-        for zip_path in zips:
-            settlement = _settlement_of(zip_path.name)
-            if settlement is None:
-                log.warning(f"[grundkort] cannot infer settlement from {zip_path.name}, skipping")
-                continue
-            missing_buildings = not db.execute(
-                "SELECT 1 FROM buildings WHERE settlement = ? LIMIT 1", (settlement,)
-            ).fetchone()
-            missing_roads = not db.execute(
-                "SELECT 1 FROM roads WHERE settlement = ? LIMIT 1", (settlement,)
-            ).fetchone()
-            if missing_buildings:
-                import ingest_buildings
-
-                log.info(f"[grundkort] {settlement}: buildings missing, ingesting {zip_path.name}")
-                ingest_buildings.ingest(zip_path, db_path)
-            if missing_roads:
-                import ingest_roads
-
-                log.info(f"[grundkort] {settlement}: roads missing, ingesting {zip_path.name}")
-                ingest_roads.ingest(zip_path, db_path)
-    finally:
-        db.close()
     if not zips:
         log.info("[grundkort] no settlement zips in grundkort/ — buildings/roads stay empty")
         return
@@ -171,6 +176,50 @@ def ensure_grundkort(db_path: Path = DB_PATH) -> None:
         ).start()
 
 
+def ensure_settlement(folder: str, db_path: Path = DB_PATH) -> None:
+    """Download and ingest one Asiaq settlement package, idempotently."""
+    with _ingest_lock:
+        ZIP_DIR.mkdir(exist_ok=True)
+        _download_settlement(folder)
+        code = folder.split("_")[0]
+        ensure_settlement_archive(
+            ZIP_DIR / f"{code}_TekniskGrundkort_SHP.zip", db_path
+        )
+
+
+def ensure_settlement_archive(zip_path: Path, db_path: Path = DB_PATH) -> None:
+    """Ingest missing vector layers from one already-local archive."""
+    with _ingest_lock:
+        settlement = _settlement_of(zip_path.name)
+        if settlement is None:
+            log.warning(f"[grundkort] cannot infer settlement from {zip_path.name}, skipping")
+            return
+        db = sqlite3.connect(str(db_path))
+        try:
+            _ensure_schema(db)
+            missing_buildings = not db.execute(
+                "SELECT 1 FROM buildings WHERE settlement = ? LIMIT 1", (settlement,)
+            ).fetchone()
+            missing_roads = not db.execute(
+                "SELECT 1 FROM roads WHERE settlement = ? LIMIT 1", (settlement,)
+            ).fetchone()
+        finally:
+            db.close()
+        if missing_buildings:
+            import ingest_buildings
+
+            log.info(f"[grundkort] {settlement}: buildings missing, ingesting {zip_path.name}")
+            ingest_buildings.ingest(zip_path, db_path)
+        if missing_roads:
+            import ingest_roads
+
+            log.info(f"[grundkort] {settlement}: roads missing, ingesting {zip_path.name}")
+            ingest_roads.ingest(zip_path, db_path)
+        if missing_buildings or missing_roads:
+            sync_buildings_to_assets(db_path)
+            sync_roads_to_assets(db_path)
+
+
 def ensure_grundkort_async() -> None:
     def _run() -> None:
         try:
@@ -179,6 +228,117 @@ def ensure_grundkort_async() -> None:
             log.error(f"[grundkort] startup ingest failed: {type(exc).__name__}: {exc}")
 
     threading.Thread(target=_run, daemon=True).start()
+
+
+class GrundkortDemand:
+    """Single-worker acquisition queue driven by camera position."""
+
+    def __init__(
+        self,
+        *,
+        centres: tuple[tuple[str, float, float], ...],
+        acquire: Callable[[str], None],
+        loaded: Callable[[str], bool],
+        radius_m: float = DEMAND_RADIUS_M,
+        retry_after_s: float = DEMAND_RETRY_AFTER_S,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._centres = centres
+        self._acquire = acquire
+        self._loaded = loaded
+        self._radius_sq = radius_m * radius_m
+        self._retry_after_s = retry_after_s
+        self._clock = clock
+        # Settlement archives vary from a few MB to tens of MB. Serial work
+        # avoids competing downloads and concurrent bulk SQLite writes.
+        self._pool = ThreadPoolExecutor(max_workers=1)
+        self._lock = threading.RLock()
+        self._enabled = False
+        self._inflight: set[str] = set()
+        self._failed_at: dict[str, float] = {}
+
+    def enable(self) -> None:
+        with self._lock:
+            self._enabled = True
+
+    def request_for_point(self, qx: float, qy: float) -> list[str]:
+        nearby = [
+            folder
+            for folder, cx, cy in self._centres
+            if (cx - qx) ** 2 + (cy - qy) ** 2 <= self._radius_sq
+        ]
+        scheduled: list[str] = []
+        with self._lock:
+            if not self._enabled:
+                return scheduled
+            now = self._clock()
+            for folder in nearby:
+                if folder in self._inflight or self._loaded(folder):
+                    continue
+                failed_at = self._failed_at.get(folder)
+                if failed_at is not None and now - failed_at < self._retry_after_s:
+                    continue
+                self._inflight.add(folder)
+                scheduled.append(folder)
+        for folder in scheduled:
+            log.info(f"[grundkort-demand] {folder}: queued from camera demand")
+            self._pool.submit(self._run, folder)
+        return scheduled
+
+    def _run(self, folder: str) -> None:
+        try:
+            self._acquire(folder)
+            with self._lock:
+                self._failed_at.pop(folder, None)
+            log.info(f"[grundkort-demand] {folder}: acquisition complete")
+        except Exception as exc:
+            with self._lock:
+                self._failed_at[folder] = self._clock()
+            log.warning(
+                f"[grundkort-demand] {folder}: {type(exc).__name__}: {exc}; "
+                f"retrying after {self._retry_after_s:.0f}s on later demand"
+            )
+        finally:
+            with self._lock:
+                self._inflight.discard(folder)
+
+    def status(self) -> dict[str, list[str]]:
+        with self._lock:
+            return {"inflight": sorted(self._inflight)}
+
+
+_default_demand_lock = threading.Lock()
+_default_demand: GrundkortDemand | None = None
+
+
+def default_demand() -> GrundkortDemand:
+    global _default_demand
+    with _default_demand_lock:
+        if _default_demand is None:
+            from coords import to_stereo
+            from grundkort_catalog import SETTLEMENTS
+
+            centres = tuple(
+                (folder, *to_stereo(lat, lon)) for folder, lat, lon in SETTLEMENTS
+            )
+            _default_demand = GrundkortDemand(
+                centres=centres,
+                acquire=ensure_settlement,
+                loaded=_settlement_loaded,
+            )
+        return _default_demand
+
+
+def enable_demand() -> None:
+    default_demand().enable()
+
+
+def request_for_point(qx: float, qy: float) -> list[str]:
+    return default_demand().request_for_point(qx, qy)
+
+
+def demand_status() -> dict[str, list[str]]:
+    return default_demand().status()
 
 
 def repair_unsampled_ground(db) -> tuple[int, int]:

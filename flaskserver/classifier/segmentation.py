@@ -19,6 +19,9 @@ from PIL import Image
 from scipy import ndimage
 
 
+SEGMENTER_VERSION = "terrain_slic_v2"
+
+
 @dataclass(frozen=True)
 class SegmentationConfig:
     """Physical scales and feature weights for terrain superpixels."""
@@ -133,7 +136,21 @@ def terrain_feature_channels(
     spacing_y = tile_size_m / (heightmap.shape[0] - 1)
     spacing_x = tile_size_m / (heightmap.shape[1] - 1)
     gy, gx = np.gradient(heightmap, spacing_y, spacing_x)
-    slope_degrees = np.degrees(np.arctan(np.hypot(gx, gy))).astype(np.float32)
+    gradient = np.hypot(gx, gy)
+    slope_degrees = np.degrees(np.arctan(gradient)).astype(np.float32)
+    normal_length = np.sqrt(gx * gx + gy * gy + 1.0)
+    # Positive gy means the surface rises northward, so its normal faces
+    # south. Keep aspect components independent: the trained model learns
+    # their interaction with color instead of a hand-written product gate.
+    southness_native = (gy / normal_length).astype(np.float32)
+    eastness_native = (-gx / normal_length).astype(np.float32)
+    sun_elevation = np.deg2rad(25.0)
+    insolation_native = np.clip(
+        (gy * np.cos(sun_elevation) + np.sin(sun_elevation))
+        / (normal_length * np.sin(sun_elevation)),
+        0.0,
+        2.0,
+    ).astype(np.float32)
     relief_sigma = max(
         0.5,
         config.relief_radius_m / max(spacing_x, spacing_y),
@@ -146,6 +163,9 @@ def terrain_feature_channels(
     elevation = _resize_float(heightmap[::-1], out_w, out_h)
     slope = _resize_float(slope_degrees[::-1], out_w, out_h)
     relief = _resize_float(local_relief[::-1], out_w, out_h)
+    southness = _resize_float(southness_native[::-1], out_w, out_h)
+    eastness = _resize_float(eastness_native[::-1], out_w, out_h)
+    insolation = _resize_float(insolation_native[::-1], out_w, out_h)
     if water_mask is None:
         water = (elevation <= config.sea_level_m).astype(np.float32)
     else:
@@ -164,6 +184,9 @@ def terrain_feature_channels(
         "elevation": elevation,
         "slope_degrees": slope,
         "local_relief": relief,
+        "southness": southness,
+        "eastness": eastness,
+        "insolation": insolation,
         "water": water,
         "valid_rgb": valid_rgb,
     }
@@ -320,14 +343,32 @@ def _region_statistics(labels, rgb, channels):
                      int(ys.max()) + 1],
             "mean_rgb": [float(v) for v in pixels.mean(axis=0)],
             "std_rgb": [float(v) for v in pixels.std(axis=0)],
+            "mean_lab": [
+                float(v) for v in channels["lab"][ys, xs].mean(axis=0)
+            ],
+            "std_lab": [
+                float(v) for v in channels["lab"][ys, xs].std(axis=0)
+            ],
             "mean_elevation_m": float(channels["elevation"][ys, xs].mean()),
             "std_elevation_m": float(channels["elevation"][ys, xs].std()),
             "mean_slope_degrees": float(
                 channels["slope_degrees"][ys, xs].mean()
             ),
+            "std_slope_degrees": float(
+                channels["slope_degrees"][ys, xs].std()
+            ),
             "mean_local_relief_m": float(
                 channels["local_relief"][ys, xs].mean()
             ),
+            "std_local_relief_m": float(
+                channels["local_relief"][ys, xs].std()
+            ),
+            "mean_southness": float(channels["southness"][ys, xs].mean()),
+            "std_southness": float(channels["southness"][ys, xs].std()),
+            "mean_eastness": float(channels["eastness"][ys, xs].mean()),
+            "std_eastness": float(channels["eastness"][ys, xs].std()),
+            "mean_insolation": float(channels["insolation"][ys, xs].mean()),
+            "std_insolation": float(channels["insolation"][ys, xs].std()),
             "water_fraction": float(channels["water"][ys, xs].mean()),
             "valid_rgb_fraction": float(
                 channels["valid_rgb"][ys, xs].mean()

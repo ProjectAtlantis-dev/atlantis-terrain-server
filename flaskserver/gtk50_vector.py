@@ -43,6 +43,9 @@ _to_utm = Transformer.from_crs(3413, 3184, always_xy=True)
 _to_stereo = Transformer.from_crs(3184, 3413, always_xy=True)
 
 _block_cache: dict[str, tuple[list, list] | None] = {}
+_structure_cache: dict[
+    str, list[tuple[str, Polygon, float | None, str | None]] | None
+] = {}
 _block_lock = threading.Lock()
 
 
@@ -95,6 +98,7 @@ def clear_block_cache() -> None:
     """
     with _block_lock:
         _block_cache.clear()
+        _structure_cache.clear()
 
 
 def invalidate_block_cache(block: str) -> None:
@@ -106,6 +110,7 @@ def invalidate_block_cache(block: str) -> None:
     """
     with _block_lock:
         _block_cache.pop(block, None)
+        _structure_cache.pop(block, None)
 
 
 def blocks_for_bbox(bbox) -> list[str]:
@@ -178,6 +183,101 @@ def _load_block(block: str):
     with _block_lock:
         _block_cache[block] = (water, islands)
     return water, islands
+
+
+def _load_structures(block: str):
+    """Return polygon structures in EPSG:3413 for one GTK50 block."""
+    with _block_lock:
+        if block in _structure_cache:
+            return _structure_cache[block]
+    path = block_path(block)
+    if not path.exists():
+        with _block_lock:
+            _structure_cache[block] = None
+        return None
+    structures: list[tuple[str, Polygon, float | None, str | None]] = []
+    db = sqlite3.connect(str(path))
+    try:
+        # The broad building layer covers cabins and isolated utility
+        # buildings. Power stations are a separate polygon theme and would be
+        # the exact omission this source is intended to close.
+        for table in ("building_s", "electricpowerstation_s"):
+            try:
+                rows = db.execute(
+                    f'SELECT id, geom, heightabovesurfacelevel, '
+                    f'COALESCE(id_lokalid, CAST(id AS TEXT)) FROM "{table}"'
+                ).fetchall()
+            except sqlite3.OperationalError:
+                continue
+            for row_id, blob, raw_height, local_id in rows:
+                if blob is None:
+                    continue
+                geom = shapely_wkb.loads(_gpkg_wkb(blob))
+                geom = shapely_transform(_to_stereo.transform, geom)
+                polygons = list(geom.geoms) if isinstance(geom, MultiPolygon) else [geom]
+                for part, polygon in enumerate(polygons):
+                    if not isinstance(polygon, Polygon) or polygon.is_empty:
+                        continue
+                    height = None
+                    if raw_height is not None and 0.5 <= float(raw_height) <= 200.0:
+                        height = float(raw_height)
+                    suffix = f":{part}" if len(polygons) > 1 else ""
+                    structure_id = f"gtk50:{block}:{table}:{local_id or row_id}{suffix}"
+                    structures.append((structure_id, polygon, height, table))
+    finally:
+        db.close()
+    log_vec.info(f"[gtk50] loaded block {block}: {len(structures)} structures")
+    with _block_lock:
+        _structure_cache[block] = structures
+    return structures
+
+
+def query_structures(
+    bbox,
+    *,
+    ground_sampler,
+    ox: float,
+    oy: float,
+    default_height_m: float = 5.0,
+) -> list[dict]:
+    """Return camera-local extrusions from available Greenland-wide blocks.
+
+    Missing blocks return no structures while ``gtk50_demand`` downloads them;
+    the next normal camera poll sees them. Ground comes from the deepest local
+    terrain tile, while GTK50's optional height-above-surface supplies height.
+    """
+    x0, y0, x1, y1 = (float(value) for value in bbox)
+    result: list[dict] = []
+    for block in blocks_for_bbox(bbox):
+        structures = _load_structures(block)
+        if structures is None:
+            continue
+        for structure_id, polygon, height, table in structures:
+            px0, py0, px1, py1 = polygon.bounds
+            if px1 < x0 or px0 > x1 or py1 < y0 or py0 > y1:
+                continue
+            center = polygon.representative_point()
+            ground = ground_sampler.sample(center.x, center.y)
+            if ground is None:
+                # Terrain demand and GTK50 acquisition are asynchronous. A
+                # zero base is safer than inventing absolute elevation, and
+                # this is recalculated on every response as DEM tiles arrive.
+                ground = 0.0
+            roof_z = float(ground) + float(height or default_height_m)
+            ring = [
+                [float(x) - ox, float(y) - oy, roof_z]
+                for x, y in polygon.exterior.coords
+            ]
+            result.append({
+                "id": structure_id,
+                "b": None,
+                "use": "powerStation" if table == "electricpowerstation_s" else None,
+                "groundZ": float(ground),
+                "ring": ring,
+                # Private reconciliation hints removed before serialization.
+                "_center": [float(center.x) - ox, float(center.y) - oy],
+            })
+    return result
 
 
 def vector_water_mask(bbox, resolution: int) -> np.ndarray | None:

@@ -29,6 +29,7 @@ def terrain_channels(hm, tile_size_m):
   slope = np.hypot(gx, gy)
   norm = np.sqrt(gx * gx + gy * gy + 1.0)
   southness = gy / norm
+  eastness = -gx / norm
   insol = (gy * SUN_COS + SUN_SIN) / (norm * SUN_SIN)
 
   rows = np.arange(GRID_N, dtype=np.float32)
@@ -46,6 +47,7 @@ def terrain_channels(hm, tile_size_m):
     "elev": hm.astype(np.float32),
     "slope": slope.astype(np.float32),
     "southness": southness.astype(np.float32),
+    "eastness": eastness.astype(np.float32),
     "sun": (insol * shade).astype(np.float32),
   }
 
@@ -65,8 +67,8 @@ def _diverging(values):
 
 def render_channel(channels, channel):
   """Render one terrain channel as an RGB uint8 image."""
-  if channel == "southness":
-    return _diverging(channels["southness"])
+  if channel in ("southness", "eastness"):
+    return _diverging(channels[channel])
   if channel == "slope":
     return _gray(channels["slope"], 0.0, 1.0)
   if channel == "sun":

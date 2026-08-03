@@ -1102,6 +1102,9 @@ def open_db(path=None):
     from classifier.storage import init_classifier_tiles
     init_classifier_tiles(db)
 
+    from classifier.training import init_classifier_annotations
+    init_classifier_annotations(db)
+
     from cliff_graft_cache import init_cliff_graft_assets
     init_cliff_graft_assets(db)
 
