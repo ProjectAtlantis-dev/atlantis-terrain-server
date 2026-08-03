@@ -73,6 +73,17 @@ export function createTerrainHud({
       TERRAIN_HUD_LINKS[event.target.id]
     );
     if (!isLink) hud.dataset.selecting = 'true';
+    // Handled on mousedown like every other link, deliberately. The HUD
+    // rewrites its innerHTML whenever content changes — fps alone changes
+    // constantly — so the button node is often replaced between mousedown and
+    // mouseup. The browser then dispatches click on the common ancestor rather
+    // than the button, and a click-based handler simply never fires.
+    if (event.target.id === 'hudToggleLink') {
+      event.stopPropagation();
+      event.preventDefault();
+      onToggleCollapsed();
+      return;
+    }
     if (event.target.id === 'mapModeLink') {
       event.stopPropagation();
       event.preventDefault();
@@ -187,13 +198,8 @@ export function createTerrainHud({
   window.addEventListener('contextmenu', clearSelecting);
   window.addEventListener('blur', clearSelecting);
   hud.addEventListener('click', event => {
-    if (event.target.id === 'hudToggleLink') {
-      event.stopPropagation();
-      event.preventDefault();
-      onToggleCollapsed();
-      return;
-    }
     if (
+      event.target.id === 'hudToggleLink' ||
       event.target.id === 'mapModeLink' || event.target.id === 'seamModeLink' ||
       event.target.id === 'tileInspectorModeLink' ||
       event.target.id === 'gridlinesModeLink' ||

@@ -3,12 +3,21 @@ import test from 'node:test';
 import * as THREE from 'three';
 
 import {
-  RETRO_WATER_CELL_M,
-  RETRO_WATER_EXTENT_M,
+  RETRO_CELL_M,
+  RETRO_MODE_STORAGE_KEY,
   createRetroTileGeometry,
   createTerrainRetroRuntime,
   retroSurfaceIndexCount,
 } from '../terrain-retro-mode.js';
+
+function fakeStorage(initial = {}) {
+  const values = new Map(Object.entries(initial));
+  return {
+    getItem: key => (values.has(key) ? values.get(key) : null),
+    setItem: (key, value) => { values.set(key, String(value)); },
+    values,
+  };
+}
 
 function buildTileMesh({ tileId = '8-1-1', resolution = 5 } = {}) {
   const surfaceVertices = resolution * resolution;
@@ -53,16 +62,20 @@ test('retro tile geometry shares source buffers and clips skirts', () => {
   // Same attribute instances: three.js reuses the GPU buffers, so a proxy
   // costs no vertex memory and tracks in-place heightmap rewrites.
   assert.equal(geometry.getAttribute('position'), mesh.geometry.getAttribute('position'));
-  assert.equal(geometry.getAttribute('uv'), mesh.geometry.getAttribute('uv'));
   assert.equal(geometry.getIndex(), mesh.geometry.getIndex());
   assert.equal(geometry.drawRange.count, retroSurfaceIndexCount(5));
+  // The grid comes from world metres, so uv must not be bound at all.
+  assert.equal(geometry.getAttribute('uv'), undefined);
 });
 
-test('retro tile geometry refuses meshes without uv', () => {
-  const geometry = new THREE.BufferGeometry();
-  geometry.setAttribute('position', new THREE.BufferAttribute(new Float32Array(9), 3));
-  geometry.setIndex([0, 1, 2]);
-  assert.equal(createRetroTileGeometry(geometry, 2), null);
+test('retro tile geometry refuses meshes without position or index', () => {
+  const noIndex = new THREE.BufferGeometry();
+  noIndex.setAttribute('position', new THREE.BufferAttribute(new Float32Array(9), 3));
+  assert.equal(createRetroTileGeometry(noIndex, 2), null);
+
+  const noPosition = new THREE.BufferGeometry();
+  noPosition.setIndex([0, 1, 2]);
+  assert.equal(createRetroTileGeometry(noPosition, 2), null);
 });
 
 test('runtime builds one proxy per tile only while active', () => {
@@ -188,12 +201,82 @@ test('water grid follows the camera and sits at the waterline', () => {
   retro.dispose();
 });
 
-test('water grid cells are a fixed world-space size', () => {
+test('water grid stays pinned to the world as the plane follows the camera', () => {
   const terrainRoot = new THREE.Group();
   const retro = createTerrainRetroRuntime({ terrainRoot });
-  const cells = retro.waterMesh.material.uniforms.uCells.value;
-  assert.equal(cells.x, RETRO_WATER_EXTENT_M / RETRO_WATER_CELL_M);
-  assert.equal(cells.y, RETRO_WATER_EXTENT_M / RETRO_WATER_CELL_M);
+  retro.setActive(true);
+
+  // The plane rides with the camera; the shader offset must cancel that motion
+  // exactly, or the sea grid slides along underneath instead of standing still.
+  retro.sync({ cameraLocalX: 1234, cameraLocalY: -567 });
+  const offset = retro.waterMesh.material.uniforms.uGridOffset.value;
+  assert.equal(offset.x, retro.waterMesh.position.x);
+  assert.equal(offset.y, retro.waterMesh.position.y);
+  retro.dispose();
+});
+
+test('terrain and water share one fixed cell size', () => {
+  const terrainRoot = new THREE.Group();
+  const retro = createTerrainRetroRuntime({ terrainRoot });
+  assert.equal(retro.terrainMaterial.uniforms.uCellSizeM.value, RETRO_CELL_M);
+  assert.equal(retro.waterMesh.material.uniforms.uCellSizeM.value, RETRO_CELL_M);
+  retro.dispose();
+});
+
+test('grid spacing does not depend on tile resolution', () => {
+  const terrainRoot = new THREE.Group();
+  terrainRoot.add(buildTileMesh({ tileId: 'coarse', resolution: 5 }));
+  terrainRoot.add(buildTileMesh({ tileId: 'fine', resolution: 9 }));
+  const retro = createTerrainRetroRuntime({ terrainRoot });
+  retro.setActive(true);
+  retro.sync();
+
+  // Tiles of different LOD must not carry different cell sizes, or granularity
+  // repops as the LOD under the camera changes while flying.
+  const proxies = retro.scene.children[0].children.filter(
+    child => child.userData.sourceGeometry != null,
+  );
+  assert.equal(proxies.length, 2);
+  for (const proxy of proxies) {
+    assert.equal(proxy.userData.cells, undefined);
+  }
+  assert.equal(retro.terrainMaterial.uniforms.uCellSizeM.value, RETRO_CELL_M);
+  retro.dispose();
+});
+
+test('retro mode is restored from storage on reload', () => {
+  const terrainRoot = new THREE.Group();
+  const storage = fakeStorage({ [RETRO_MODE_STORAGE_KEY]: '1' });
+  const retro = createTerrainRetroRuntime({ terrainRoot, storage });
+
+  // Active before the first frame, so a reload left in retro renders retro
+  // immediately rather than flashing the composited scene.
+  assert.equal(retro.active, true);
+  retro.dispose();
+});
+
+test('toggling persists the preference', () => {
+  const terrainRoot = new THREE.Group();
+  const storage = fakeStorage();
+  const retro = createTerrainRetroRuntime({ terrainRoot, storage });
+  assert.equal(retro.active, false);
+
+  retro.toggle();
+  assert.equal(storage.getItem(RETRO_MODE_STORAGE_KEY), '1');
+  retro.toggle();
+  assert.equal(storage.getItem(RETRO_MODE_STORAGE_KEY), '0');
+  retro.dispose();
+});
+
+test('a throwing storage never breaks the toggle', () => {
+  const terrainRoot = new THREE.Group();
+  const hostile = {
+    getItem() { throw new Error('denied'); },
+    setItem() { throw new Error('denied'); },
+  };
+  const retro = createTerrainRetroRuntime({ terrainRoot, storage: hostile });
+  assert.equal(retro.active, false);
+  assert.equal(retro.toggle(), true);
   retro.dispose();
 });
 

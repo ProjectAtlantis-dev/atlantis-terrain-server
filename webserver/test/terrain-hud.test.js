@@ -1,10 +1,109 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
+  createTerrainHud,
   renderGameClock,
   terrainHudHeader,
   tileEvictionHudLine,
 } from '../terrain-hud.js';
+
+function makeElement() {
+  return {
+    style: { cssText: '' },
+    dataset: {},
+    id: '',
+    innerHTML: '',
+    listeners: new Map(),
+    addEventListener(type, handler) {
+      if (!this.listeners.has(type)) this.listeners.set(type, []);
+      this.listeners.get(type).push(handler);
+    },
+    dispatch(type, event) {
+      for (const handler of this.listeners.get(type) ?? []) handler(event);
+    },
+  };
+}
+
+// createTerrainHud needs only a sliver of the DOM, so stub that rather than
+// pull in a full document implementation.
+function withFakeDom(run) {
+  const previousDocument = globalThis.document;
+  const previousWindow = globalThis.window;
+  const created = [];
+  globalThis.document = {
+    createElement: () => {
+      const element = makeElement();
+      created.push(element);
+      return element;
+    },
+    body: { appendChild() {} },
+  };
+  globalThis.window = { addEventListener() {}, open() {} };
+  try {
+    return run(created);
+  } finally {
+    globalThis.document = previousDocument;
+    globalThis.window = previousWindow;
+  }
+}
+
+function hudEvent(id) {
+  return { target: { id }, stopPropagation() {}, preventDefault() {} };
+}
+
+const noopHudHandlers = Object.fromEntries([
+  'onToggleMapMode', 'onToggleSeamMode', 'onToggleTileInspector',
+  'onToggleGridlines', 'onToggleRetroMode', 'onToggleBathymetryMap',
+  'onToggleClassifierOverlay', 'onToggleWaterOverlay',
+  'onToggleHydrographyOverlay', 'onToggleProcgen', 'onToggleRenderBackend',
+  'onToggleRoadDebug', 'onToggleTileEviction', 'onOpenGoogleMaps',
+  'onStartFastTime', 'onReset', 'onClockAction',
+].map(name => [name, () => {}]));
+
+test('the HUD collapse toggle fires on mousedown, not click', () => {
+  withFakeDom(created => {
+    let collapses = 0;
+    createTerrainHud({
+      ...noopHudHandlers,
+      onToggleCollapsed: () => { collapses += 1; },
+    });
+    const hud = created[0];
+
+    // The HUD rewrites innerHTML as fps changes, so the button node is often
+    // replaced between mousedown and mouseup and the browser then dispatches
+    // click on the HUD div instead. Handling mousedown is what makes the
+    // arrow reliably clickable.
+    hud.dispatch('mousedown', hudEvent('hudToggleLink'));
+    assert.equal(collapses, 1);
+
+    // The click listener must only suppress the event, never toggle again, or
+    // a click that does survive would collapse and immediately re-expand.
+    hud.dispatch('click', hudEvent('hudToggleLink'));
+    assert.equal(collapses, 1);
+  });
+});
+
+test('mousedown on the collapse toggle does not start a text selection', () => {
+  withFakeDom(created => {
+    createTerrainHud({ ...noopHudHandlers, onToggleCollapsed: () => {} });
+    const hud = created[0];
+    hud.dispatch('mousedown', hudEvent('hudToggleLink'));
+    assert.notEqual(hud.dataset.selecting, 'true');
+  });
+});
+
+test('retro mode toggles from its HUD link', () => {
+  withFakeDom(created => {
+    let retroToggles = 0;
+    createTerrainHud({
+      ...noopHudHandlers,
+      onToggleCollapsed: () => {},
+      onToggleRetroMode: () => { retroToggles += 1; },
+    });
+    created[0].dispatch('mousedown', hudEvent('retroModeLink'));
+    assert.equal(retroToggles, 1);
+  });
+});
 
 test('renderGameClock only rewrites the DOM when the display changes', () => {
   const element = { innerHTML: '', dataset: {} };
