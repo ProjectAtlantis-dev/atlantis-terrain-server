@@ -213,7 +213,7 @@ class ClassifierJobControl:
 
 def classifier_inventory(db: sqlite3.Connection) -> dict[str, Any]:
     """Summarize persisted classifier coverage for the operations page."""
-    from classifier.ladder import LADDER_SOURCE
+    from classifier.vote_ladder import LADDER_SOURCE
 
     rows = [
         {
@@ -236,14 +236,20 @@ def classifier_inventory(db: sqlite3.Connection) -> dict[str, Any]:
     ).fetchone()[0])
     total = sum(row["count"] for row in rows)
     current = sum(row["count"] for row in rows if row["current"])
+    covered_d12 = int(db.execute(
+        "SELECT COUNT(*) FROM classifier_tiles c JOIN tiles t USING(tile_id) "
+        "WHERE t.depth=12 AND c.source=?",
+        (LADDER_SOURCE,),
+    ).fetchone()[0])
     return {
         "currentSource": LADDER_SOURCE,
         "totalRows": total,
         "currentRows": current,
         "legacyRows": total - current,
         "readyD12": ready_d12,
+        "coveredD12": covered_d12,
         "coveragePct": (
-            round(100.0 * current / ready_d12, 2) if ready_d12 else 0.0
+            round(100.0 * covered_d12 / ready_d12, 2) if ready_d12 else 0.0
         ),
         "sources": rows,
     }

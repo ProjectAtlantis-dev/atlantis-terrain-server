@@ -12,8 +12,8 @@ from classifier.neural import (
 )
 from classifier.training import (
     CLASSES, encode_segment_ids, geographic_group, geographic_split,
-    init_classifier_annotations, read_annotations, read_classifier_suggestions,
-    render_annotation_overlay, write_annotations,
+    explain_classifier_suggestion, init_classifier_annotations, read_annotations,
+    read_classifier_suggestions, render_annotation_overlay, write_annotations,
 )
 from classifier.training_data import CHANNEL_NAMES, DATASET_VERSION, normalize_channels
 
@@ -84,6 +84,48 @@ class NeuralContractTest(unittest.TestCase):
             [CLASSES.index("unknown_shadow"), CLASSES.index("shore_rock")],
         ]))
         self.assertEqual(source, "ladder_d12_v9")
+        db.close()
+
+    def test_explanation_identifies_model_confidence_and_authority_inputs(self):
+        from classifier.storage import init_classifier_tiles, write_classifier_tile
+        db = sqlite3.connect(":memory:")
+        db.execute("CREATE TABLE tiles (tile_id TEXT PRIMARY KEY)")
+        db.execute("INSERT INTO tiles VALUES ('12-1-2')")
+        init_classifier_tiles(db)
+        write_classifier_tile(
+            db, "12-1-2", np.asarray([[1, 4], [0, 3]], np.uint8),
+            class_schema="coarse_v4",
+            confidence=np.asarray([[204, 255], [128, 230]], np.uint8),
+            source="model:terrain_unet_v2", enforce_official_water=False,
+        )
+        channels = {
+            "elevation": np.full((2, 2), 32.5),
+            "slope_degrees": np.full((2, 2), 17.0),
+            "local_relief": np.full((2, 2), 2.5),
+            "southness": np.full((2, 2), 0.4),
+            "eastness": np.full((2, 2), -0.2),
+            "insolation": np.full((2, 2), 1.1),
+            "water": np.asarray([[0, 1], [0, 0]], np.float32),
+            "valid_rgb": np.ones((2, 2), np.float32),
+        }
+        region = {
+            "pixel_count": 4, "mean_rgb": [20.0, 80.0, 30.0],
+            "mean_elevation_m": 32.5, "mean_slope_degrees": 17.0,
+            "mean_local_relief_m": 2.5, "mean_southness": 0.4,
+            "mean_eastness": -0.2, "mean_insolation": 1.1,
+            "water_fraction": 0.25,
+        }
+        segmented = type("Segmented", (), {
+            "labels": np.zeros((2, 2), np.int32), "regions": [region],
+            "channels": channels,
+        })()
+        model = explain_classifier_suggestion(db, "12-1-2", segmented, 0, 0)
+        self.assertEqual(model["assignment"], "vegetation")
+        self.assertAlmostEqual(model["confidence"], 0.8)
+        self.assertEqual(model["decision"]["kind"], "model_argmax")
+        water = explain_classifier_suggestion(db, "12-1-2", segmented, 1, 0)
+        self.assertEqual(water["assignment"], "water")
+        self.assertEqual(water["decision"]["kind"], "authority_override")
         db.close()
 
     def test_annotation_overlay_uses_thin_translucent_black_boundaries(self):

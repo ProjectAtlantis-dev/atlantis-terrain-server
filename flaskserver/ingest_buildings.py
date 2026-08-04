@@ -173,6 +173,18 @@ def ingest(zip_path, terrain_db_path, assets_db_path=DEFAULT_ASSETS_DB_PATH):
     terrain_db = sqlite3.connect(str(terrain_db_path))
     sampler = GroundSampler(terrain_db)
     assets_db = connect(Path(assets_db_path))
+    id_prefix = f"{settlement}_"
+    enabled_by_id = dict(assets_db.execute(
+        "SELECT id,enabled FROM assets WHERE type=? AND substr(id,1,?)=?",
+        (SOURCE_LAYER, len(id_prefix), id_prefix),
+    ))
+    # The source archive is a complete settlement snapshot. Replace this
+    # layer in one transaction so features removed upstream do not survive a
+    # refresh, while retaining local visibility choices for stable IDs.
+    assets_db.execute(
+        "DELETE FROM assets WHERE type=? AND substr(id,1,?)=?",
+        (SOURCE_LAYER, len(id_prefix), id_prefix),
+    )
     if not sampler.tiles:
         log.warning("tiles table has no heightmaps — ground will fall back to roof-derived estimate")
 
@@ -226,13 +238,14 @@ def ingest(zip_path, terrain_db_path, assets_db_path=DEFAULT_ASSETS_DB_PATH):
             "INSERT INTO assets "
             "(id,type,enabled,lat,lon,heading_deg,z,properties,cx,cy,"
             "min_x,min_y,max_x,max_y,updated_at) "
-            "VALUES (?,?,1,?,?,0,?,?,?,?,?,?,?,?,?) "
+            "VALUES (?,?,?,?,?,0,?,?,?,?,?,?,?,?,?) "
             "ON CONFLICT(id) DO UPDATE SET type=excluded.type,lat=excluded.lat,"
             "lon=excluded.lon,z=excluded.z,properties=excluded.properties,"
             "cx=excluded.cx,cy=excluded.cy,min_x=excluded.min_x,min_y=excluded.min_y,"
             "max_x=excluded.max_x,max_y=excluded.max_y,updated_at=excluded.updated_at",
             (
-                building_id, SOURCE_LAYER, float(lat), float(lon), round(ground, 2), properties,
+                building_id, SOURCE_LAYER, enabled_by_id.get(building_id, 1),
+                float(lat), float(lon), round(ground, 2), properties,
                 cx, cy, min(tx), min(ty), max(tx), max(ty), now,
             ),
         )

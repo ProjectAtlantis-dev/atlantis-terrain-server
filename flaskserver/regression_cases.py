@@ -82,7 +82,7 @@ def build_gallery(baked):
             line = _metric_line(metrics)
         note = case.get("note") or ""
         rows.append(
-            f"<tr><th><a href='/pipeline.html?tile={tile}'>{tile}</a>"
+            f"<tr><th><a href='/training.html?tile={tile}'>{tile}</a>"
             f"<div class=n>⚑ {note}</div><div class=m>{line}</div></th>"
             f"{body}</tr>"
         )
@@ -97,7 +97,7 @@ def build_gallery(baked):
         "td div{color:#6889a8;font-size:11px;text-align:center}</style>"
         "<h1>Classifier regression cases</h1>"
         "<p>Flagged by the user from the 3D client (gridlines mode → "
-        "right-click → ⚑) or pipeline.html. Rerun after every classifier "
+        "right-click → ⚑) or training.html. Rerun after every classifier "
         "change: <code>venv/bin/python regression_cases.py</code></p>"
         + (
             f"<table>{''.join(rows)}</table>" if rows

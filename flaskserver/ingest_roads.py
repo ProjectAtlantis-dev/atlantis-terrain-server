@@ -69,6 +69,15 @@ def ingest_layer(db, archive, names, layer, settlement, transformer, now):
         return 0
     attrs = read_dbf_records(dbf)
     records = list(read_polylinez_parts(shp))
+    id_prefix = f"{settlement}_{layer}_"
+    enabled_by_id = dict(db.execute(
+        "SELECT id,enabled FROM assets WHERE type=? AND substr(id,1,?)=?",
+        (layer, len(id_prefix), id_prefix),
+    ))
+    db.execute(
+        "DELETE FROM assets WHERE type=? AND substr(id,1,?)=?",
+        (layer, len(id_prefix), id_prefix),
+    )
     written = 0
     total = len(records)
     started = time.time()
@@ -104,13 +113,14 @@ def ingest_layer(db, archive, names, layer, settlement, transformer, now):
                 "INSERT INTO assets "
                 "(id,type,enabled,lat,lon,heading_deg,z,properties,cx,cy,"
                 "min_x,min_y,max_x,max_y,updated_at) "
-                "VALUES (?,?,1,?,?,0,NULL,?,?,?,?,?,?,?,?) "
+                "VALUES (?,?,?,?,?,0,NULL,?,?,?,?,?,?,?,?) "
                 "ON CONFLICT(id) DO UPDATE SET type=excluded.type,lat=excluded.lat,"
                 "lon=excluded.lon,properties=excluded.properties,cx=excluded.cx,"
                 "cy=excluded.cy,min_x=excluded.min_x,min_y=excluded.min_y,"
                 "max_x=excluded.max_x,max_y=excluded.max_y,updated_at=excluded.updated_at",
                 (
-                    road_id, layer, float(lat), float(lon), properties, cx, cy,
+                    road_id, layer, enabled_by_id.get(road_id, 1),
+                    float(lat), float(lon), properties, cx, cy,
                     min(tx), min(ty), max(tx), max(ty), now,
                 ),
             )

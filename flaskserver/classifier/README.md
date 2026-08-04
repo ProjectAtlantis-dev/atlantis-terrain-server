@@ -9,6 +9,17 @@ The classifier is a terrain-conditioned U-Net. It predicts the nine
 - southness and eastness
 - modeled sun exposure
 
+## Vote ladder
+
+The deployed semantic map is a ladder, not a single D12 decision. A target
+starts with the broad classification of its D8 ancestor. Each rung down the
+quadtree crops the accumulated tally into the selected child and adds one
+local vote. The full per-class D8→target tally is stored in
+`classifier_votes`; `classifier_tiles` stores its winning class and confidence
+for rendering. The finest local vote breaks an exact tie, so children can
+refine broad evidence without erasing the ancestor history. D13+ terrain
+inherits the resulting D12 map because provider imagery ends at D12.
+
 Southness is an independent signed channel. The network can therefore learn
 that otherwise similar ground has a different color distribution on a
 south-facing slope; there is no south-slope color rule in inference.
@@ -32,8 +43,8 @@ south-facing slope; there is no south-slope color rule in inference.
    inference. Merely filing or labeling a case never silently changes the
    deployed classifier.
 
-The static gallery and `pipeline.html` remain diagnostic views. They are not
-the primary collection workflow.
+The static gallery remains a diagnostic view. `training.html` is the single
+tile inspection, explanation, and labeling workspace.
 
 ## Reproducible commands
 

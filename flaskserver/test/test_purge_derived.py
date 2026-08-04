@@ -19,6 +19,7 @@ def _db():
         CREATE TABLE coastline_masks (tile_id TEXT PRIMARY KEY);
         CREATE TABLE hydrography_masks (tile_id TEXT PRIMARY KEY, source TEXT);
         CREATE TABLE classifier_tiles (tile_id TEXT PRIMARY KEY);
+        CREATE TABLE classifier_votes (tile_id TEXT PRIMARY KEY);
         CREATE TABLE road_texture_bakes (tile_id TEXT PRIMARY KEY);
         CREATE TABLE cliff_graft_assets (donor_tile_id TEXT PRIMARY KEY);
         CREATE TABLE terrain_seam_cache (
@@ -77,6 +78,7 @@ def _seed(db, *, reverse=False):
         ("coastline_masks", "tile_id", "12-1-1"),
         ("hydrography_masks", "tile_id", "12-1-1"),
         ("classifier_tiles", "tile_id", "12-1-1"),
+        ("classifier_votes", "tile_id", "12-1-1"),
         ("road_texture_bakes", "tile_id", "12-1-1"),
         ("cliff_graft_assets", "donor_tile_id", "12-1-1"),
         ("bathymetry", "tile_id", "8-0-0"),
@@ -116,6 +118,7 @@ def _snapshot(db):
         for table in (
             "tiles", "textures", "coastline_masks", "hydrography_masks",
             "classifier_tiles", "road_texture_bakes", "cliff_graft_assets",
+            "classifier_votes",
             "terrain_seam_cache", "bathymetry", "water_purge_audit",
             "metadata", "soundings",
         )
@@ -167,7 +170,8 @@ class GlobalDerivedPurgeTests(unittest.TestCase):
              ("12-1-2", "ancestor_crop_nodata")],
         )
         for table in (
-            "coastline_masks", "classifier_tiles", "road_texture_bakes",
+            "coastline_masks", "classifier_tiles", "classifier_votes",
+            "road_texture_bakes",
             "cliff_graft_assets", "terrain_seam_cache", "bathymetry",
             "water_purge_audit",
         ):

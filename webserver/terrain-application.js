@@ -1196,7 +1196,7 @@ tileInspectorRuntime = createTerrainTileInspectorRuntime({
     if (action === 'pan') updateMapCamera();
     requestRender();
   },
-  onTileClick: tile => window.open(`/pipeline.html?tile=${tile.id}`, '_blank'),
+  onTileClick: tile => window.open(`/training.html?tile=${tile.id}`, '_blank'),
 });
 
 function paramNumber(_name, fallback) {

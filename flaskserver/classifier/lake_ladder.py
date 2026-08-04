@@ -1,4 +1,4 @@
-"""Coarse-to-fine priors for the authoritative D12 classification.
+"""Coarse-to-fine lake rungs for the authoritative D12 classification.
 
 D10 answers whether an inferred lake exists at all; D11 localizes that
 support; D12 resolves the precise boundary. These helpers read only measured
@@ -31,7 +31,7 @@ TEMPORARY_TEXTURE_SOURCES = {
 def lake_prior_ancestor_ids(tile_id: str) -> tuple[str, str]:
     depth, col, row = require_tile_id(tile_id)
     if depth != 12:
-        raise ValueError("lake hierarchy prior is defined for d12 tiles")
+        raise ValueError("lake ladder prior is defined for d12 tiles")
     return (
         f"10-{col >> 2}-{row >> 2}",
         f"11-{col >> 1}-{row >> 1}",

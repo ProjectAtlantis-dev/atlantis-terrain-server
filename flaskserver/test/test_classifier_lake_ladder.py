@@ -10,11 +10,11 @@ from PIL import Image
 os.environ.setdefault("DATAFORSYNINGEN_TOKEN", "test-token")
 
 import database
-from classifier.hierarchy import d12_lake_prior
+from classifier.lake_ladder import d12_lake_prior
 from texture import init_textures, write_texture
 
 
-class ClassifierHierarchyTest(unittest.TestCase):
+class ClassifierLakeLadderTest(unittest.TestCase):
     def setUp(self):
         self.db = sqlite3.connect(":memory:")
         self.db.executescript(database._SCHEMA)
@@ -56,7 +56,7 @@ class ClassifierHierarchyTest(unittest.TestCase):
         d11[0:128, 0:128] = True
 
         with patch(
-            "classifier.hierarchy.lake_support_mask",
+            "classifier.lake_ladder.lake_support_mask",
             side_effect=(d10, d11),
         ):
             prior = d12_lake_prior(self.db, "12-6-9")
@@ -71,7 +71,7 @@ class ClassifierHierarchyTest(unittest.TestCase):
         d11 = np.ones((256, 256), dtype=bool)
 
         with patch(
-            "classifier.hierarchy.lake_support_mask",
+            "classifier.lake_ladder.lake_support_mask",
             side_effect=(d10, d11),
         ):
             prior = d12_lake_prior(self.db, "12-6-9")

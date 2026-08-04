@@ -7,8 +7,21 @@ export const CLASS_COLORS = {
 };
 
 export function parseD12(value) {
-  const match = /^12-(\d+)-(\d+)$/.exec(String(value ?? '').trim());
-  return match ? { depth: 12, col: Number(match[1]), row: Number(match[2]) } : null;
+  const match = /^(\d+)-(\d+)-(\d+)$/.exec(String(value ?? '').trim());
+  if (!match) return null;
+  const sourceDepth = Number(match[1]);
+  let col = Number(match[2]);
+  let row = Number(match[3]);
+  if (sourceDepth > 12) {
+    const scale = 2 ** (sourceDepth - 12);
+    col = Math.floor(col / scale);
+    row = Math.floor(row / scale);
+  } else if (sourceDepth < 12) {
+    const scale = 2 ** (12 - sourceDepth);
+    col *= scale;
+    row *= scale;
+  }
+  return { depth: 12, col, row };
 }
 
 export function decodeSegmentId(pixel) {
@@ -22,8 +35,11 @@ let tile = parseD12(new URLSearchParams(location.search).get('tile'))
 let metadata = null;
 let selectedClass = 'vegetation';
 let painting = false;
+let pointerStart = null;
 let paintedSegments = new Set();
 let overlayImage = null;
+let activeView = 'annotation';
+let inspectedPoint = null;
 const canvas = $('annotation-canvas');
 const context = canvas.getContext('2d');
 const idsCanvas = document.createElement('canvas');
@@ -74,6 +90,42 @@ function loadImage(url) {
   });
 }
 
+const VIEW_HELP = {
+  annotation: 'Faint colors are existing classifier suggestions. Click a region to inspect why it received its default, or drag to correct it; stronger colors are saved human labels.',
+  texture: 'The exact source RGB supplied to segmentation and the trained classifier.',
+  elev: 'Elevation derived from the cached DEM, aligned to the tile image.',
+  slope: 'Terrain steepness derived from the cached DEM; brighter pixels are steeper.',
+  southness: 'Aspect derived from the DEM: red faces south and blue faces north.',
+  sun: 'Terrain insolation derived from slope and aspect.',
+  classifier: 'The persisted default class map. Select a point to see its actual source and confidence.',
+};
+
+function evidenceUrl(view) {
+  if (view === 'texture') return `/api/texture/${tileId()}.jpg`;
+  if (view === 'classifier') return `/api/classifier/${tileId()}.png?res=${metadata?.width || 512}`;
+  return `/api/channel/${tileId()}/${view}.png?res=${metadata?.width || 512}`;
+}
+
+function setView(view) {
+  activeView = view;
+  const annotation = view === 'annotation';
+  canvas.style.display = annotation ? 'block' : 'none';
+  $('evidence-image').style.display = annotation ? 'none' : 'block';
+  $('view-help').textContent = VIEW_HELP[view];
+  for (const tab of document.querySelectorAll('.view-tab')) {
+    const selected = tab.dataset.view === view;
+    tab.classList.toggle('active', selected);
+    tab.setAttribute('aria-selected', String(selected));
+  }
+  if (!annotation && metadata) {
+    $('canvas-message').textContent = 'Loading evidence…';
+    const image = $('evidence-image');
+    image.onload = () => { $('canvas-message').textContent = ''; };
+    image.onerror = () => { $('canvas-message').textContent = 'Evidence unavailable'; };
+    image.src = `${evidenceUrl(view)}${evidenceUrl(view).includes('?') ? '&' : '?'}t=${Date.now()}`;
+  }
+}
+
 async function loadTile() {
   $('tile').value = tileId();
   loadParentTile();
@@ -107,18 +159,71 @@ async function loadTile() {
       ? 'Frozen evaluation tile: labels score the model but never train it.'
       : 'Drag across regions to label them.');
     renderClasses();
+    setView(activeView);
+    inspectPoint(Math.floor(result.width / 2), Math.floor(result.height / 2));
   } catch (error) {
     $('canvas-message').textContent = error.message;
     setStatus($('save-status'), error.message, 'error');
   }
 }
 
-function segmentAt(event) {
+function pointAt(event) {
   if (!metadata) return -1;
-  const rect = canvas.getBoundingClientRect();
+  const rect = $('view-surface').getBoundingClientRect();
   const x = Math.max(0, Math.min(metadata.width - 1, Math.floor((event.clientX - rect.left) * metadata.width / rect.width)));
   const y = Math.max(0, Math.min(metadata.height - 1, Math.floor((event.clientY - rect.top) * metadata.height / rect.height)));
-  return decodeSegmentId(idsContext.getImageData(x, y, 1, 1).data);
+  return { x, y };
+}
+
+function segmentAt(event) {
+  const point = pointAt(event);
+  return point === -1 ? -1 : decodeSegmentId(idsContext.getImageData(point.x, point.y, 1, 1).data);
+}
+
+function formatNumber(value, digits = 1) {
+  return value == null ? 'n/a' : Number(value).toFixed(digits);
+}
+
+function renderProvenance(result) {
+  const className = result.assignment || 'no suggestion';
+  const color = CLASS_COLORS[result.assignment] || [110, 130, 145];
+  const confidence = result.confidence == null ? 'confidence not retained' : `${Math.round(result.confidence * 100)}% confidence`;
+  const inputs = result.inputs;
+  $('provenance-pixel').textContent = `px ${result.pixel.x}, ${result.pixel.y} · region ${result.segmentId}`;
+  $('provenance-content').className = '';
+  $('provenance-content').innerHTML = `
+    <div class="assignment-line"><span class="swatch" style="background:rgb(${color.join(',')})"></span><span class="assignment-name">${className.replaceAll('_', ' ')}</span><span class="confidence">${confidence}</span></div>
+    <div class="source-line">${result.source || 'no stored classifier'} · ${result.schema || 'no schema'}${result.updatedAt ? ` · ${new Date(result.updatedAt).toLocaleString()}` : ''}</div>
+    <p class="decision-summary">${result.decision.summary}</p>
+    <div class="evidence-values">
+      <div><b>RGB at pixel</b><span>${inputs.rgb.join(', ')}</span></div>
+      <div><b>Elevation</b><span>${formatNumber(inputs.elevationM)} m</span></div>
+      <div><b>Slope</b><span>${formatNumber(inputs.slopeDegrees)}°</span></div>
+      <div><b>Local relief</b><span>${formatNumber(inputs.localReliefM)} m</span></div>
+      <div><b>Southness</b><span>${formatNumber(inputs.southness, 3)}</span></div>
+      <div><b>Eastness</b><span>${formatNumber(inputs.eastness, 3)}</span></div>
+      <div><b>Insolation</b><span>${formatNumber(inputs.insolation, 3)}</span></div>
+      <div><b>Official water</b><span>${inputs.officialWater ? 'yes — authoritative' : 'no'}</span></div>
+    </div>`;
+}
+
+async function inspectPoint(x, y) {
+  inspectedPoint = { x, y };
+  const marker = $('inspection-marker');
+  marker.style.display = 'block';
+  marker.style.left = `${(x + .5) * 100 / metadata.width}%`;
+  marker.style.top = `${(y + .5) * 100 / metadata.height}%`;
+  $('provenance-pixel').textContent = `px ${x}, ${y}`;
+  $('provenance-content').className = 'provenance-empty';
+  $('provenance-content').textContent = 'Loading assignment provenance…';
+  try {
+    const response = await fetch(`/api/classifier/training/${tileId()}/explain?x=${x}&y=${y}`, { cache: 'no-store' });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || `HTTP ${response.status}`);
+    if (inspectedPoint?.x === x && inspectedPoint?.y === y) renderProvenance(result);
+  } catch (error) {
+    $('provenance-content').textContent = error.message;
+  }
 }
 
 function collectSegment(event) {
@@ -152,13 +257,38 @@ async function savePainted() {
 }
 
 canvas.addEventListener('pointerdown', event => {
-  painting = true;
+  painting = false;
+  pointerStart = {
+    clientX: event.clientX,
+    clientY: event.clientY,
+    segmentId: segmentAt(event),
+  };
   canvas.setPointerCapture(event.pointerId);
-  collectSegment(event);
+  const point = pointAt(event);
+  if (point !== -1) inspectPoint(point.x, point.y);
 });
-canvas.addEventListener('pointermove', event => { if (painting) collectSegment(event); });
-canvas.addEventListener('pointerup', async () => { painting = false; await savePainted(); });
-canvas.addEventListener('pointercancel', () => { painting = false; paintedSegments.clear(); });
+canvas.addEventListener('pointermove', event => {
+  if (!pointerStart) return;
+  if (!painting && Math.hypot(
+    event.clientX - pointerStart.clientX,
+    event.clientY - pointerStart.clientY,
+  ) >= 4) {
+    painting = true;
+    if (pointerStart.segmentId >= 0) paintedSegments.add(pointerStart.segmentId);
+  }
+  if (painting) collectSegment(event);
+});
+canvas.addEventListener('pointerup', async () => {
+  const shouldSave = painting;
+  painting = false;
+  pointerStart = null;
+  if (shouldSave) await savePainted();
+});
+canvas.addEventListener('pointercancel', () => {
+  painting = false;
+  pointerStart = null;
+  paintedSegments.clear();
+});
 
 async function trainModel() {
   $('train-model').disabled = true;
@@ -227,7 +357,7 @@ function setZoom(value) {
   const zoom = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, Number(value)));
   $('zoom').value = String(zoom);
   $('zoom-level').textContent = `${zoom}%`;
-  canvas.style.setProperty('--canvas-zoom', `${zoom}%`);
+  $('view-surface').style.setProperty('--canvas-zoom', `${zoom}%`);
 }
 
 $('load').addEventListener('click', () => { const parsed = parseD12($('tile').value); if (parsed) { tile = parsed; loadTile(); } });
@@ -237,6 +367,11 @@ $('zoom-out').addEventListener('click', () => setZoom(Number($('zoom').value) - 
 $('zoom-in').addEventListener('click', () => setZoom(Number($('zoom').value) + ZOOM_STEP));
 $('train-model').addEventListener('click', trainModel);
 $('predict-tile').addEventListener('click', predictTile);
+for (const tab of document.querySelectorAll('.view-tab')) tab.addEventListener('click', () => setView(tab.dataset.view));
+$('evidence-image').addEventListener('click', event => {
+  const point = pointAt(event);
+  if (point !== -1) inspectPoint(point.x, point.y);
+});
 
 renderClasses();
 setZoom(100);

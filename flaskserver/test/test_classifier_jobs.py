@@ -69,19 +69,19 @@ class ClassifierJobControlTest(unittest.TestCase):
               tile_id TEXT, source TEXT
             );
             CREATE TABLE tiles (
-              tile_id TEXT, heightmap BLOB
+              tile_id TEXT, depth INTEGER, heightmap BLOB
             );
             INSERT INTO classifier_tiles VALUES
-              ('12-1-1', 'coarse_v4', 'ladder_d12_v9'),
+              ('12-1-1', 'coarse_v4', 'ladder_d8_votes_v1'),
               ('12-1-2', 'coarse_v2', 'ladder_d12_v2');
             INSERT INTO textures VALUES
               ('12-1-1', 'dataforsyningen'),
               ('12-1-2', 'dataforsyningen'),
               ('12-1-3', 'placeholder');
             INSERT INTO tiles VALUES
-              ('12-1-1', X'01'),
-              ('12-1-2', X'01'),
-              ('12-1-3', X'01');
+              ('12-1-1', 12, X'01'),
+              ('12-1-2', 12, X'01'),
+              ('12-1-3', 12, X'01');
         """)
 
         result = classifier_inventory(db)
@@ -102,7 +102,7 @@ class ClassifierJobEndpointTest(unittest.TestCase):
               tile_id TEXT, class_schema TEXT, source TEXT
             );
             CREATE TABLE textures (tile_id TEXT, source TEXT);
-            CREATE TABLE tiles (tile_id TEXT, heightmap BLOB);
+            CREATE TABLE tiles (tile_id TEXT, depth INTEGER, heightmap BLOB);
         """)
         self.control = MagicMock()
         self.control.snapshot.return_value = {"status": "idle"}
@@ -146,7 +146,19 @@ class ClassifierJobEndpointTest(unittest.TestCase):
         self.assertEqual(status.headers["Cache-Control"], "no-store")
         self.assertIn("inventory", status.get_json())
 
-    def test_rejects_non_d12_selected_tile(self):
+    def test_accepts_a_broad_d8_target(self):
+        with self._patches()[0], self._patches()[1], self._patches()[2], self._patches()[3]:
+            response = serve_flask.app.test_client().post(
+                "/api/classifier/jobs",
+                json={"scope": "selected", "tiles": ["8-2-4"]},
+            )
+
+        self.assertEqual(response.status_code, 202)
+        self.control.start.assert_called_once_with(
+            scope="selected", tiles=["8-2-4"], use_google=False,
+        )
+
+    def test_rejects_a_target_below_or_beyond_the_ladder(self):
         with self._patches()[0], self._patches()[1], self._patches()[2], self._patches()[3]:
             response = serve_flask.app.test_client().post(
                 "/api/classifier/jobs",
@@ -154,7 +166,7 @@ class ClassifierJobEndpointTest(unittest.TestCase):
             )
 
         self.assertEqual(response.status_code, 400)
-        self.assertIn("require D12", response.get_json()["error"])
+        self.assertIn("require D8-D12", response.get_json()["error"])
         self.control.start.assert_not_called()
 
 

@@ -1553,7 +1553,7 @@ def _cook_texture_quad(db, tile_id: str) -> bool:
   # 2026-07-22): there's no ground truth past the WMS contract depth, and
   # d13-d16 imagery is procedurally upscaled — increasingly synthetic, with no
   # new real information for a fresh classification to key off. The design
-  # is HIERARCHICAL: classify coarsely where imagery is real (d12, via
+  # follows the CLASSIFIER LADDER through real imagery (d8-d12, via
   # _ensure_d12_class_map's live classification), and let every deeper
   # depth INHERIT that label via the ancestor-walk already built into
   # /api/classifier/<id>.png (crop + nearest-neighbor resize down from the
@@ -1579,7 +1579,7 @@ def _cook_texture_quad(db, tile_id: str) -> bool:
         continue
       _write_texture(db, child_id, quadrants[(column_bit, row_bit)], _COOKED_SOURCE)
       written.append(child_id)
-      # No classifier_tiles write here — see the hierarchical-inheritance
+      # No classifier_tiles write here — see the ladder-inheritance
       # note above. Deep tiles read their classification through the
       # ancestor walk in /api/classifier/<id>.png instead of storing their
       # own.
@@ -2665,7 +2665,7 @@ def api_tile_package(tile_id: str):
 
 def _heightmap_ancestor_crop(db, d: int, c: int, r: int, max_up: int = 4):
   """Tile heightmap, cropped out of the nearest ancestor's when the tile
-  itself was never seeded/flown (pipeline.html can ask for any tile id; tile
+  itself was never seeded/flown (the training workspace can ask for a tile whose
   rows only exist where browser terrain demand requested them). Same philosophy
   as ancestor-crop textures. Returns (hm, source, depth_found) or
   (None, None, None); hm is (GRID_N, GRID_N), row 0 = south.
@@ -2762,8 +2762,10 @@ def _ensure_d12_class_map(db, tile_id: str) -> None:
   existing = db.execute(
     "SELECT source FROM classifier_tiles WHERE tile_id = ?", (tile_id,)
   ).fetchone()
-  if existing and str(existing[0]).startswith("model:"):
-    return
+  if existing:
+    from classifier.vote_ladder import LADDER_SOURCE
+    if str(existing[0]).startswith("model:") or str(existing[0]) == LADDER_SOURCE:
+      return
   texture_row = db.execute(
     "SELECT texture, source FROM textures WHERE tile_id = ?", (tile_id,)
   ).fetchone()
@@ -3073,11 +3075,11 @@ def _classifier_requested_tiles(
   invalid = [
     tile for tile in tiles
     if (parsed := _parse_tile_id(tile)) is None
-    or parsed[0] != WMS_CONTRACT_DEPTH
+    or not 8 <= parsed[0] <= WMS_CONTRACT_DEPTH
   ]
   if invalid:
     raise ValueError(
-      "selected jobs require D12 tile ids; invalid: "
+      f"selected jobs require D8-D{WMS_CONTRACT_DEPTH} tile ids; invalid: "
       + ", ".join(invalid[:5])
     )
   return scope, list(dict.fromkeys(tiles))
@@ -3215,6 +3217,34 @@ def api_classifier_training_image(tile_id: str, kind: str):
       buffer.getvalue(), mimetype="image/png",
       headers={"Cache-Control": "no-store"},
     )
+  except ValueError as exc:
+    return jsonify({"error": str(exc)}), 404
+
+
+@app.get("/api/classifier/training/<tile_id>/explain")
+def api_classifier_training_explain(tile_id: str):
+  """Provenance and measured inputs for one default assignment pixel."""
+  parsed = _parse_tile_id(tile_id)
+  if parsed is None or parsed[0] != WMS_CONTRACT_DEPTH:
+    return jsonify({"error": "a D12 tile id is required"}), 400
+  try:
+    x = int(request.args["x"])
+    y = int(request.args["y"])
+  except (KeyError, ValueError):
+    return jsonify({"error": "integer x and y pixel coordinates are required"}), 400
+  try:
+    from classifier.training import (
+      explain_classifier_suggestion, load_segmented_tile,
+    )
+
+    rgb, segmented = load_segmented_tile(_get_db(), tile_id)
+    response = jsonify(
+      explain_classifier_suggestion(
+        _get_db(), tile_id, segmented, x, y, rgb=rgb,
+      )
+    )
+    response.headers["Cache-Control"] = "no-store"
+    return response
   except ValueError as exc:
     return jsonify({"error": str(exc)}), 404
 
@@ -3429,7 +3459,7 @@ def api_pipeline_at():
 
 @app.get("/api/pipeline/<tile_id>.json")
 def api_pipeline(tile_id: str):
-  """Per-stage pipeline status for one tile — drives pipeline.html. Says what
+  """Per-stage pipeline status for one tile. Says what
   each stage has (and where it came from) without rendering anything."""
   if _parse_tile_id(tile_id) is None:
     return jsonify({"error": f"bad tile id: {tile_id!r}"}), 400

@@ -10,7 +10,6 @@
   <header>
     <a class="brand" href="/">ATLANTIS / CLASSIFIER TRAINING</a>
     <nav>
-      <a href="/pipeline.html">Tile inspector</a>
       <a href="/classifier.html">Operations</a>
     </nav>
   </header>
@@ -41,13 +40,34 @@
         <p>The outlined quadrant is the D12 tile being labeled.</p>
       </div>
       <div class="canvas-column">
+        <div class="view-tabs" role="tablist" aria-label="Tile evidence">
+          <button class="view-tab active" data-view="annotation" role="tab" aria-selected="true">Assignment</button>
+          <button class="view-tab" data-view="texture" role="tab">Texture</button>
+          <button class="view-tab" data-view="elev" role="tab">Elevation</button>
+          <button class="view-tab" data-view="slope" role="tab">Slope</button>
+          <button class="view-tab" data-view="southness" role="tab">Southness</button>
+          <button class="view-tab" data-view="sun" role="tab">Sun</button>
+          <button class="view-tab" data-view="classifier" role="tab">Classifier</button>
+        </div>
         <div class="canvas-frame">
-          <canvas id="annotation-canvas" width="512" height="512"></canvas>
+          <div id="view-surface">
+            <canvas id="annotation-canvas" width="512" height="512"></canvas>
+            <img id="evidence-image" alt="Selected tile evidence">
+            <div id="inspection-marker" aria-hidden="true"></div>
+          </div>
           <div id="canvas-message">Loading segmentation…</div>
         </div>
-        <p>Faint colors are existing classifier suggestions. Zoom and scroll to inspect details, then drag across regions to correct them; stronger colors are saved human labels.</p>
+        <p id="view-help">Faint colors are existing classifier suggestions. Click a region to inspect why it received its default, or drag to correct it; stronger colors are saved human labels.</p>
       </div>
       <aside>
+        <section class="provenance" aria-live="polite">
+          <div class="provenance-heading">
+            <h1>Default assignment</h1>
+            <span id="provenance-pixel">Select a point</span>
+          </div>
+          <div id="provenance-content" class="provenance-empty">Click anywhere in the tile to see the actual classifier source, confidence, and inputs at that location.</div>
+        </section>
+        <div class="aside-divider"></div>
         <h1>Label terrain</h1>
         <p class="lede">The existing classifier is an editable visual starting point, never an automatic training label.</p>
         <div id="classes" class="classes"></div>

@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Verify the d12 classification ladder against data we already have.
+"""Verify the D8-to-target classification vote ladder against known data.
 
-For every verified tile this runs the full ladder with per-rung debug
-dumps, stores the fresh coarse_v4 row (so the running client serves the
-same labels the gallery shows), and measures the labels against every
-independent reference available:
+For every target this classifies the broad D8 ancestor, crops that vote into
+each descendant, and adds one local vote per available level through the
+target. It stores both the full per-class tally and the winning coarse_v4 map,
+then measures that consensus against every independent reference available:
 
   - official water (Åbent Land / coastline masks) — the settled authority;
   - Asiaq buildings and roads — built footprints must not read GREEN, and
@@ -19,8 +19,8 @@ independent reference available:
 Gallery: sample/classifier_verify/index.html (regenerable, gitignored).
 
 Usage:
-    venv/bin/python classifier_verify.py 12-1373-784 [more tiles...]
-    venv/bin/python classifier_verify.py --all            # every real d12
+    venv/bin/python classifier_verify.py 8-85-49 12-1373-784
+    venv/bin/python classifier_verify.py --all            # every real D12 target
     venv/bin/python classifier_verify.py --all --reset    # purge stale rows
     venv/bin/python classifier_verify.py --no-google ...
 """
@@ -181,59 +181,113 @@ def _google_bright_rock(google):
 
 
 def verify_tile(db, tile_id, out_dir, use_google=True):
-    """Classify one tile, persist the row, measure, and dump panels.
+    """Run the D8-to-target vote ladder, persist it, measure, and dump panels.
 
     Returns the metrics dict, or None when the tile has no real texture or
-    no heightmap yet.
+    no heightmap yet. Every available level contributes one vote; D8 is
+    mandatory because it is the broad root of the classification contract.
     """
     from classifier.ladder import (
-        GREEN, LAKE, WATER, LADDER_SOURCE, classify_ladder, macro_grain,
+        GREEN, LAKE, WATER, classify_ladder, macro_grain,
     )
-    from classifier.hierarchy import d12_lake_prior
-    from classifier.storage import COARSE_V4_SCHEMA, write_classifier_tile
+    from classifier.vote_ladder import (
+        LADDER_SOURCE, add_vote, crop_parent_field, ladder_tile_ids,
+    )
+    from classifier.storage import (
+        CLASS_SCHEMAS, COARSE_V4_SCHEMA, colorize_class_map,
+        write_classifier_tile, write_classifier_votes,
+    )
     from coastline import read_water_mask
     from database import read_tile
 
-    texture = _real_texture(db, tile_id)
-    if texture is None:
-        return None
-    tile = read_tile(db, tile_id)
-    if tile is None or tile.get("heightmap") is None:
-        return None
-
     import io
-    rgb = np.asarray(Image.open(io.BytesIO(texture)).convert("RGB"))
-    try:
-        water_mask = read_water_mask(db, tile_id)
-        if water_mask is not None and water_mask.shape != tile["heightmap"].shape:
-            water_mask = None
-    except Exception:
-        water_mask = None
-
-    grain = None
-    depth, col, row = require_tile_id(tile_id)
-    shift = depth - 8
-    if shift > 0:
-        ancestor = read_tile(db, f"8-{col >> shift}-{row >> shift}")
-        if ancestor is not None and ancestor.get("heightmap") is not None:
-            grain = macro_grain(
-                ancestor["heightmap"],
-                float(ancestor["bbox"][2]) - float(ancestor["bbox"][0]),
-            )
-    lake_prior = d12_lake_prior(db, tile_id)
-    if lake_prior is None:
-        return None
-
     tile_dir = os.path.join(out_dir, tile_id)
-    labels, stats = classify_ladder(
-        rgb, tile["heightmap"], list(tile["bbox"]),
-        water_mask=water_mask, grain=grain, lake_prior=lake_prior,
-        output_size=SIZE, debug_dir=tile_dir,
-    )
-    write_classifier_tile(
-        db, tile_id, labels,
-        class_schema=COARSE_V4_SCHEMA, source=LADDER_SOURCE,
-    )
+    path = ladder_tile_ids(tile_id)
+    class_count = len(CLASS_SCHEMAS[COARSE_V4_SCHEMA]["names"])
+    votes = None
+    grain = None
+    contributed = []
+    target_values = None
+
+    for level_id in path:
+        level_depth, level_col, level_row = require_tile_id(level_id)
+        if votes is not None:
+            votes = crop_parent_field(votes, level_col, level_row)
+
+        texture = _real_texture(db, level_id)
+        level_tile = read_tile(db, level_id)
+        if (
+            texture is None or level_tile is None
+            or level_tile.get("heightmap") is None
+        ):
+            if level_depth == 8:
+                return None
+            continue
+
+        level_rgb = np.asarray(
+            Image.open(io.BytesIO(texture)).convert("RGB")
+        )
+        try:
+            level_water = read_water_mask(db, level_id)
+            if (
+                level_water is not None
+                and level_water.shape != level_tile["heightmap"].shape
+            ):
+                level_water = None
+        except Exception:
+            level_water = None
+
+        if level_depth == 8:
+            grain = macro_grain(
+                level_tile["heightmap"],
+                float(level_tile["bbox"][2]) - float(level_tile["bbox"][0]),
+            )
+        # D8 is allowed to propose broad lake evidence. Descendants can only
+        # add a lake vote where an ancestor has already voted water/lake.
+        lake_prior = (
+            np.ones((SIZE, SIZE), dtype=bool)
+            if votes is None
+            else (votes[WATER] + votes[LAKE]) > 0
+        )
+        local_labels, level_stats = classify_ladder(
+            level_rgb, level_tile["heightmap"], list(level_tile["bbox"]),
+            water_mask=level_water, grain=grain, lake_prior=lake_prior,
+            output_size=SIZE,
+            debug_dir=tile_dir if level_id == tile_id else None,
+        )
+        votes, consensus, confidence = add_vote(
+            votes, local_labels, class_count,
+        )
+        contributed.append(level_id)
+        write_classifier_votes(
+            db, level_id, votes, class_schema=COARSE_V4_SCHEMA,
+            source=LADDER_SOURCE,
+        )
+        write_classifier_tile(
+            db, level_id, consensus, class_schema=COARSE_V4_SCHEMA,
+            confidence=confidence, source=LADDER_SOURCE,
+        )
+        if level_id == tile_id:
+            target_values = (
+                level_rgb, level_tile, consensus, level_stats, confidence,
+            )
+
+    if target_values is None:
+        return None
+    rgb, tile, labels, stats, confidence = target_values
+    stats["ladder"] = {
+        "startDepth": 8,
+        "path": path,
+        "contributors": contributed,
+        "votesPerPixel": int(votes.sum(axis=0).max()) if votes is not None else 0,
+        "meanConfidence": float(confidence.mean() / 255.0),
+    }
+    # The gallery's final panel must show the accumulated vote, not merely
+    # the finest local proposal emitted by classify_ladder.
+    os.makedirs(tile_dir, exist_ok=True)
+    Image.fromarray(
+        colorize_class_map(labels, COARSE_V4_SCHEMA), mode="RGB"
+    ).save(os.path.join(tile_dir, "step_12_final.png"))
 
     metrics = {"tile": tile_id, "stats": stats}
 
@@ -374,7 +428,7 @@ def build_gallery(out_dir, all_metrics):
             if os.path.exists(os.path.join(out_dir, tile, fname))
         )
         rows.append(
-            f"<tr><th><a href='/pipeline.html?tile={tile}'>{tile}</a>"
+            f"<tr><th><a href='/training.html?tile={tile}'>{tile}</a>"
             f"<div class=m>{_metric_line(metrics)}</div></th>{cells}</tr>"
         )
     html = (
@@ -407,9 +461,9 @@ def build_gallery(out_dir, all_metrics):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("tiles", nargs="*", help="tile ids (12-col-row)")
+    parser.add_argument("tiles", nargs="*", help="target tile ids (D8-D12)")
     parser.add_argument("--all", action="store_true",
-                        help="every d12 tile with a real texture")
+                        help="every D12 target with a real texture")
     parser.add_argument("--reset", action="store_true",
                         help="purge superseded classifier rows first")
     parser.add_argument("--no-google", action="store_true")

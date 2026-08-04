@@ -1,4 +1,4 @@
-"""The hierarchical classification ladder: DEM co-proposes, never just color.
+"""The classification ladder: DEM co-proposes, never just color.
 
 Covers the properties per-tile percentiles could never give:
   - a uniform tile stays entirely GREY (no forced DARK/WHITE fractions),
@@ -178,7 +178,7 @@ class WaterAuthority(unittest.TestCase):
 
     def test_d10_d11_prior_vetoes_a_d12_only_phantom_lake(self):
         """A locally convincing D12 basin cannot originate inferred water
-        when the coarse hierarchy found no lake at that location."""
+        when the broader ladder rungs found no lake at that location."""
         surface = _tilted_surface(0.15)
         basin = np.s_[N // 4: 3 * N // 4, N // 4: 3 * N // 4]
         surface = surface.copy()

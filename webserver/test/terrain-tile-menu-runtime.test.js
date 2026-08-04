@@ -66,24 +66,19 @@ test('tile menu does not offer a download before a texture is available', () => 
   assert.equal(runtime.menu.children.some(child => child.tagName === 'a'), false);
 });
 
-test('tile menu opens classifier operations with the selected tile', () => {
+test('tile menu leaves classifier operations in the main HUD', () => {
   const body = createElement('body');
   const documentImpl = { body, createElement, addEventListener() {} };
-  const opened = [];
   const runtime = createTerrainTileMenuRuntime({
     tileInfoElement: { style: {} },
     documentImpl,
-    windowImpl: { open(url) { opened.push(url); } },
+    windowImpl: { open() {} },
   });
 
   runtime.show(20, 30, '14-5499-3176', 'fractal_upscale');
-  const action = runtime.menu.children.find(
+  assert.equal(runtime.menu.children.some(
     child => child.textContent === 'Classifier operations',
-  );
-  assert.ok(action);
-  action.listeners.get('click')();
-
-  assert.deepEqual(opened, ['/classifier.html?tile=14-5499-3176']);
+  ), false);
 });
 
 test('flagging a regression posts the tile and note without leaving terrain', async () => {

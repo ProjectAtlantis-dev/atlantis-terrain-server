@@ -94,6 +94,18 @@ CREATE TABLE IF NOT EXISTS classifier_tiles (
     updated_at      TEXT NOT NULL,
     FOREIGN KEY (tile_id) REFERENCES tiles(tile_id) ON DELETE CASCADE
 );
+
+CREATE TABLE IF NOT EXISTS classifier_votes (
+    tile_id         TEXT PRIMARY KEY,
+    class_schema    TEXT NOT NULL,
+    width           INTEGER NOT NULL CHECK (width > 0),
+    height          INTEGER NOT NULL CHECK (height > 0),
+    vote_map        BLOB NOT NULL,
+    vote_count      INTEGER NOT NULL CHECK (vote_count > 0),
+    source          TEXT NOT NULL,
+    updated_at      TEXT NOT NULL,
+    FOREIGN KEY (tile_id) REFERENCES tiles(tile_id) ON DELETE CASCADE
+);
 """
 
 
@@ -116,6 +128,56 @@ def decode_class_map(blob, width, height):
     if values.size != expected:
         raise ValueError(f"classifier map has {values.size} labels; expected {expected}")
     return values.reshape((int(height), int(width))).copy()
+
+
+def encode_vote_map(votes):
+    array = np.asarray(votes, dtype=np.uint16)
+    if array.ndim != 3:
+        raise ValueError("classifier vote map must be classes x height x width")
+    return zlib.compress(array.tobytes(), level=6)
+
+
+def decode_vote_map(blob, class_count, width, height):
+    values = np.frombuffer(zlib.decompress(blob), dtype=np.uint16)
+    expected = int(class_count) * int(width) * int(height)
+    if values.size != expected:
+        raise ValueError(
+            f"classifier vote map has {values.size} values; expected {expected}"
+        )
+    return values.reshape((int(class_count), int(height), int(width))).copy()
+
+
+def write_classifier_votes(
+    db, tile_id, votes, *, class_schema=COARSE_SCHEMA, source="classifier",
+):
+    """Persist the complete ladder tally; never discard losing votes."""
+    if class_schema not in CLASS_SCHEMAS:
+        raise ValueError(f"unknown classifier schema: {class_schema}")
+    array = np.asarray(votes, dtype=np.uint16)
+    class_count = len(CLASS_SCHEMAS[class_schema]["names"])
+    if array.ndim != 3 or array.shape[0] != class_count:
+        raise ValueError(
+            f"classifier vote map must contain {class_count} class planes"
+        )
+    vote_count = int(array.sum(axis=0).max(initial=0))
+    if vote_count <= 0:
+        raise ValueError("classifier vote map is empty")
+    now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    db.execute(
+        "INSERT INTO classifier_votes "
+        "(tile_id,class_schema,width,height,vote_map,vote_count,source,updated_at) "
+        "VALUES (?,?,?,?,?,?,?,?) "
+        "ON CONFLICT(tile_id) DO UPDATE SET "
+        "class_schema=excluded.class_schema,width=excluded.width,"
+        "height=excluded.height,vote_map=excluded.vote_map,"
+        "vote_count=excluded.vote_count,source=excluded.source,"
+        "updated_at=excluded.updated_at",
+        (
+            tile_id, class_schema, int(array.shape[2]), int(array.shape[1]),
+            encode_vote_map(array), vote_count, source, now,
+        ),
+    )
+    db.commit()
 
 
 def write_classifier_tile(

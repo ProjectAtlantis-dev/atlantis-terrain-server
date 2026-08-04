@@ -9,6 +9,8 @@ from classifier.storage import (
     COARSE_SCHEMA,
     colorize_class_map,
     decode_class_map,
+    decode_vote_map,
+    write_classifier_votes,
     write_classifier_tile,
 )
 from database import open_db
@@ -76,6 +78,29 @@ class ClassifierStorageTest(unittest.TestCase):
             ).reshape(labels.shape)
             np.testing.assert_array_equal(stored == 4, water)
             np.testing.assert_array_equal(stored_confidence[water], 255)
+            db.close()
+
+    def test_ladder_vote_tallies_round_trip_without_losing_minorities(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db = open_db(str(Path(directory) / "terrain.db"))
+            db.execute(
+                "INSERT INTO tiles "
+                "(tile_id, depth, col, row, x_min, y_min, x_max, y_max, "
+                "parent_id, geometric_error, source, updated_at) "
+                "VALUES ('8-1-2', 8, 1, 2, 0, 0, 1, 1, NULL, 0, 'test', 'now')"
+            )
+            votes = np.zeros((5, 2, 3), dtype=np.uint16)
+            votes[0] = 3
+            votes[1, 0, 0] = 2
+            write_classifier_votes(db, "8-1-2", votes, source="ladder-test")
+            schema, width, height, blob, count = db.execute(
+                "SELECT class_schema,width,height,vote_map,vote_count "
+                "FROM classifier_votes WHERE tile_id='8-1-2'"
+            ).fetchone()
+            self.assertEqual((schema, width, height, count), (COARSE_SCHEMA, 3, 2, 5))
+            np.testing.assert_array_equal(
+                decode_vote_map(blob, 5, width, height), votes,
+            )
             db.close()
 
     def test_rejects_labels_outside_the_declared_schema(self):

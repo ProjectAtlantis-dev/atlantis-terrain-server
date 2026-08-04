@@ -4,6 +4,7 @@ import tempfile
 import unittest
 import urllib.error
 import zipfile
+from email.message import Message
 from pathlib import Path
 from unittest import mock
 
@@ -35,6 +36,12 @@ class _Response(io.BytesIO):
 
 
 class GrundkortRefreshTests(unittest.TestCase):
+    def test_daily_polling_cannot_defer_a_check_past_one_week(self):
+        self.assertLessEqual(
+            grundkort.REFRESH_INTERVAL_S + grundkort.REFRESH_POLL_S,
+            7 * 24 * 60 * 60,
+        )
+
     def test_content_digest_ignores_dbf_export_date(self):
         with tempfile.TemporaryDirectory() as directory:
             first = Path(directory) / "first.zip"
@@ -89,9 +96,12 @@ class GrundkortRefreshTests(unittest.TestCase):
                 "ingestedDigest": digest,
                 "etag": '"source-v1"',
             })
+            response_headers = Message()
+            response_headers["ETag"] = '"source-v1"'
+            response_headers["Last-Modified"] = "now"
             not_modified = urllib.error.HTTPError(
                 "https://example.invalid/source.zip", 304, "Not Modified",
-                {"ETag": '"source-v1"', "Last-Modified": "now"}, None,
+                response_headers, None,
             )
             with (
                 mock.patch.object(grundkort, "ZIP_DIR", root),
@@ -142,6 +152,42 @@ class GrundkortRefreshTests(unittest.TestCase):
 
             self.assertFalse(changed)
             self.assertEqual(
+                grundkort._archive_content_digest(target), digest
+            )
+
+    def test_changed_source_payload_forces_reingest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "0600NUK_TekniskGrundkort_SHP.zip"
+            replacement = root / "replacement.zip"
+            _write_source_archive(target, dbf_day=6)
+            _write_source_archive(
+                replacement, dbf_day=20, road_marker=b"new-road-data"
+            )
+            digest = grundkort._archive_content_digest(target)
+            grundkort._write_refresh_metadata(target, {
+                "checkedAt": 1.0,
+                "contentDigest": digest,
+                "ingestedDigest": digest,
+                "etag": '"source-v1"',
+            })
+            payload = replacement.read_bytes()
+            response = _Response(payload, {
+                "Content-Length": str(len(payload)), "ETag": '"source-v2"',
+                "Last-Modified": "later",
+            })
+            with (
+                mock.patch.object(grundkort, "ZIP_DIR", root),
+                mock.patch.object(
+                    grundkort.urllib.request, "urlopen", return_value=response
+                ),
+            ):
+                changed = grundkort._download_settlement(
+                    "0600NUK_Nuuk", now=grundkort.REFRESH_INTERVAL_S + 2,
+                )
+
+            self.assertTrue(changed)
+            self.assertNotEqual(
                 grundkort._archive_content_digest(target), digest
             )
 

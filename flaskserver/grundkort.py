@@ -1,13 +1,13 @@
 """Self-healing Asiaq Teknisk Grundkort ingestion.
 
 Settlement zips (``*_TekniskGrundkort_SHP.zip``) live in ``grundkort/``
-(gitignored). At server startup a background thread downloads any
-configured settlement (``terrain_config.GRUNDKORT_SETTLEMENTS``) that is
-missing locally — kortforsyning.asiaq.gl is an open file server, no
-auth — then ingests any settlement whose asset rows are missing. A fresh
-clone or a flushed assets.db repopulates itself the
-same way tiles and masks do; extra zips dropped in manually are ingested
-too.
+(gitignored). A background worker conditionally refreshes configured
+settlements (``terrain_config.GRUNDKORT_SETTLEMENTS``) at least weekly using
+the source server's ETag/Last-Modified validators. Re-ingestion happens only
+when the normalized SHP/DBF/PRJ payload changes, so a repackaged archive or a
+DBF export-date change does not churn the asset catalog. A fresh clone or a
+flushed assets.db repopulates itself the same way tiles and masks do; extra
+zips dropped in manually are ingested too.
 
 Buildings and roads are ingested directly into ``assets.db``. Flask reads
 that catalog while processing
@@ -44,8 +44,10 @@ DB_PATH = Path(__file__).resolve().parent / "terrain.db"
 ASSETS_DB_PATH = Path(__file__).resolve().parent.parent / "assetserver" / "assets.db"
 _FILES_URL = "https://kortforsyning.asiaq.gl/files"
 _GROUND_RETRY_S = 60.0
-REFRESH_INTERVAL_S = 7 * 24 * 60 * 60
 REFRESH_POLL_S = 24 * 60 * 60
+# The daily scheduler can notice a TTL boundary up to one poll late. A six-day
+# TTL therefore guarantees a successful source check at least once per week.
+REFRESH_INTERVAL_S = 6 * 24 * 60 * 60
 DEMAND_RADIUS_M = 30_000.0
 DEMAND_RETRY_AFTER_S = 300.0
 _ingest_lock = threading.RLock()
@@ -232,7 +234,7 @@ def ensure_grundkort(db_path: Path = DB_PATH) -> None:
         except Exception as exc:
             log.warning(
                 f"[grundkort] acquisition of {folder} failed "
-                f"({type(exc).__name__}: {exc}) — will retry next startup"
+                f"({type(exc).__name__}: {exc}) — will retry during refresh"
             )
     # Manually dropped archives remain supported and are ingested at startup.
     for zip_path in sorted(ZIP_DIR.glob("*.zip")):

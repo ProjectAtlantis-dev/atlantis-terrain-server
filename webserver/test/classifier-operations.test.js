@@ -3,8 +3,8 @@ import test from 'node:test';
 
 import {
   jobProgress,
-  normalizeD12TileId,
   parseTileIds,
+  validateLadderTileId,
 } from '../public/classifier.js';
 
 test('classifier job tile input accepts whitespace and commas without duplicates', () => {
@@ -14,11 +14,13 @@ test('classifier job tile input accepts whitespace and commas without duplicates
   );
 });
 
-test('tile menu links can normalize deep terrain tiles to their D12 ancestor', () => {
-  assert.equal(normalizeD12TileId('12-1373-784'), '12-1373-784');
-  assert.equal(normalizeD12TileId('14-5499-3176'), '12-1374-794');
-  assert.equal(normalizeD12TileId('11-1-2'), null);
-  assert.equal(normalizeD12TileId('not-a-tile'), null);
+test('classifier targets preserve every supported ladder rung', () => {
+  assert.equal(validateLadderTileId('8-85-49'), '8-85-49');
+  assert.equal(validateLadderTileId('11-686-392'), '11-686-392');
+  assert.equal(validateLadderTileId('12-1373-784'), '12-1373-784');
+  assert.equal(validateLadderTileId('14-5499-3176'), null);
+  assert.equal(validateLadderTileId('7-1-2'), null);
+  assert.equal(validateLadderTileId('not-a-tile'), null);
 });
 
 test('job progress is bounded and handles an idle job', () => {

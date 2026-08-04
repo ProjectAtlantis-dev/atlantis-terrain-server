@@ -68,6 +68,7 @@ DERIVED_TEXTURE_SOURCES = {
 DERIVED_TABLES = (
     "coastline_masks",       # rasterized from local GTK50 GeoPackages
     "classifier_tiles",      # textures + masks
+    "classifier_votes",      # D8-to-target semantic vote tallies
     "road_texture_bakes",    # provider texture + retained road vectors
     "cliff_graft_assets",    # provider texture + classifier/masks
     "terrain_seam_cache",    # effective heightmaps

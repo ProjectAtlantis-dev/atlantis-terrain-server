@@ -7,13 +7,12 @@ export function parseTileIds(value) {
   )];
 }
 
-export function normalizeD12TileId(value) {
+export function validateLadderTileId(value) {
   const match = /^(\d+)-(\d+)-(\d+)$/.exec(String(value ?? "").trim());
   if (!match) return null;
   const depth = Number(match[1]);
-  if (depth < 12) return null;
-  const shift = depth - 12;
-  return `12-${Number(match[2]) >> shift}-${Number(match[3]) >> shift}`;
+  if (depth < 8 || depth > 12) return null;
+  return `${depth}-${Number(match[2])}-${Number(match[3])}`;
 }
 
 export function jobProgress(job) {
@@ -128,7 +127,7 @@ function renderRegressions(cases) {
         ${figures}
         <div class="regression-copy">
           <div class="regression-title">
-            <a href="/pipeline.html?tile=${encodeURIComponent(item.tile)}">${escapeHtml(item.tile)}</a>
+            <a href="/training.html?tile=${encodeURIComponent(item.tile)}">${escapeHtml(item.tile)}</a>
             <span class="bake-state ${item.baked ? "" : "pending"}">${item.baked ? "baked" : "pending"}</span>
           </div>
           <p class="regression-note">${escapeHtml(item.note || "No review note")}</p>
@@ -145,9 +144,9 @@ function updateScope() {
   const scope = $("job-scope").value;
   $("tile-field").classList.toggle("hidden", scope !== "selected");
   const notes = {
-    selected: "Only D12 IDs are accepted; deeper tiles inherit from their D12 classifier ancestor.",
+    selected: "Each target accumulates spatial votes from its D8 ancestor through the selected depth.",
     regressions: `${snapshot?.regressions?.length ?? 0} curated case(s) will be rebaked and compared.`,
-    ready: `${formatter.format(snapshot?.inventory?.readyD12 ?? 0)} ready tiles. This can be a long-running job.`,
+    ready: `${formatter.format(snapshot?.inventory?.readyD12 ?? 0)} ready D12 targets, each with a D8→D12 ladder. This can be a long-running job.`,
   };
   $("scope-note").textContent = notes[scope];
   $("scope-note").className = `scope-note ${scope === "ready" ? "warning" : ""}`;
@@ -183,7 +182,7 @@ async function launchJob(scopeOverride = null) {
   if (scope === "selected") {
     payload.tiles = parseTileIds($("job-tiles").value);
     if (!payload.tiles.length) {
-      $("form-error").textContent = "Enter at least one D12 tile ID.";
+      $("form-error").textContent = "Enter at least one D8–D12 tile ID.";
       return;
     }
   }
@@ -208,7 +207,7 @@ async function launchJob(scopeOverride = null) {
 }
 
 export function initializeClassifierPage() {
-  const requestedTile = normalizeD12TileId(
+  const requestedTile = validateLadderTileId(
     new URLSearchParams(location.search).get("tile"),
   );
   if (requestedTile) $("job-tiles").value = requestedTile;

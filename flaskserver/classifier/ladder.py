@@ -1,19 +1,20 @@
-"""Hierarchical coarse terrain classification — the classification ladder.
+"""Local evidence generator for one rung of the classifier vote ladder.
 
-Each rung only refines what the rung above established, and every rung is a
-small, inspectable step (dump with ``debug_dir`` to get ``step_NN_name.png``
-per stage — no heuristic monolith).
+The cross-depth ladder lives in :mod:`classifier.vote_ladder`: D8 contributes
+the broad vote and every descendant contributes another. This module produces
+one inspectable local vote at any of those rungs (dump ``debug_dir`` to get
+``step_NN_name.png`` per stage).
 
 Rung 0 — physics, DEM only. Slope, aspect (southness) and a horizon-marched
     sun channel are facts about the surface, available before any pixel of
     imagery is read. A north-facing slope under the low southern sun is
     shadow-prone terrain *immediately*, even though nothing downstream knows
     what to do with shadow yet.
-Rung 1 — hierarchy priors. D10 establishes whether inferred lake water exists
-    at all, D11 localizes that support, and D12 may only refine a candidate
-    that survives both parents. Official water remains authoritative and
-    bypasses this inferred-lake gate. D8 macro grain separately records the
-    regional ridge/fjord strike for later structural refinement.
+Rung 1 — ladder context. D8 establishes broad inferred-lake support;
+    descendants may only add a lake vote where an ancestor already supplied
+    water/lake evidence. Official water remains authoritative and bypasses
+    this gate. D8 macro grain separately records the regional ridge/fjord
+    strike for later structural refinement.
 Rung 2 — joint color × surface proposals. The heightmap is a CO-PROPOSER,
     not just a veto: a DEM vegetation prior (gentle slope × south aspect ×
     lit × below the greenline) promotes ambiguous green color where the
@@ -54,7 +55,9 @@ from PIL import Image
 
 from terrain_upscale import _resize_bilinear
 
-LADDER_SOURCE = "ladder_d12_v9"
+LOCAL_VOTE_SOURCE = "local_vote_v10"
+# Compatibility for external diagnostics that imported the former name.
+LADDER_SOURCE = LOCAL_VOTE_SOURCE
 
 # coarse_v4 label indices (classifier.storage.CLASS_SCHEMAS order).
 # 0-4 match coarse_v1 exactly so every index-based consumer keeps working;
@@ -196,11 +199,11 @@ def _detect_lake_sheets(
 
 
 def _gate_inferred_lakes(lake_candidates, lake_prior):
-    """Keep only D12 lake components supported by the D10∩D11 prior.
+    """Keep local lake components supported by accumulated ancestor votes.
 
-    The prior is deliberately component-level rather than a final mask: coarse
-    parents decide whether a water body may exist, while D12 retains authority
-    over its precise shoreline.
+    The prior is deliberately component-level rather than a final mask: broad
+    levels decide whether a water body may exist while the current level
+    retains authority over its precise shoreline.
     """
     from scipy import ndimage
 
@@ -227,9 +230,9 @@ def _gate_inferred_lakes(lake_candidates, lake_prior):
 def lake_support_mask(rgb, heightmap, bbox, output_size=256):
     """Coarse visual/DEM evidence that an inferred lake may exist.
 
-    Used on D10 and D11 before D12 classification. The minimum component size
-    is expressed in square metres so the coarse parents do not accidentally
-    require a lake to occupy the same *fraction* of their much larger tiles.
+    The minimum component size is expressed in square metres so broad levels
+    do not accidentally require a lake to occupy the same *fraction* of their
+    much larger tiles.
     """
     image = np.asarray(
         Image.fromarray(np.asarray(rgb, dtype=np.uint8), "RGB").resize(
@@ -462,10 +465,10 @@ def classify_ladder(
     water_mask: south-first bool array on the heightmap grid, or None.
     grain: optional dict from macro_grain(d8 ancestor) — conditioning
     context recorded in stats (nothing labels from it yet).
-    lake_prior: D10∩D11 support raster, image-oriented and matching
-    output_size. D12 may refine only lake components with coarse support;
-    omitting the prior prohibits inferred lakes. Official water is independent
-    and remains authoritative.
+    lake_prior: accumulated ancestor water/lake support, image-oriented and
+    matching output_size. The local vote may refine only lake components with
+    broad support; omitting the prior prohibits inferred lakes. Official water
+    is independent and remains authoritative.
     debug_dir: when set, every rung dumps a step_NN_*.png there.
 
     labels are coarse_v4 uint8; stats is a JSON-able dict of everything a

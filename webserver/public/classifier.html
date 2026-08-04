@@ -15,7 +15,6 @@
       </a>
       <nav aria-label="Operations navigation">
         <a href="/">Terrain</a>
-        <a href="/pipeline.html">Tile inspector</a>
         <a href="/training.html">Training</a>
         <a href="/api/classifier/verification/" target="_blank">Latest gallery</a>
       </nav>
@@ -31,8 +30,8 @@
           <p class="eyebrow">Semantic surface pipeline</p>
           <h1>Classifier operations</h1>
           <p class="lede">
-            Launch D12 classification runs, watch their progress, and keep
-            known-bad terrain visible as a permanent regression suite.
+            Launch D8→target classifier ladders, watch their progress,
+            and keep known-bad terrain visible as a permanent regression suite.
           </p>
         </div>
         <div class="hero-signal" aria-hidden="true">
@@ -47,7 +46,7 @@
           <small id="current-source">loading source</small>
         </article>
         <article class="metric-card">
-          <p>Ready D12 inputs</p>
+          <p>Ready D12 targets</p>
           <strong id="ready-tiles">—</strong>
           <small>real texture + measured DEM</small>
         </article>
@@ -59,7 +58,7 @@
         <article class="metric-card">
           <p>Current coverage</p>
           <strong id="coverage-pct">—</strong>
-          <small>of ready D12 inputs</small>
+          <small>of ready D12 targets</small>
         </article>
       </section>
 
@@ -76,9 +75,9 @@
           <form id="job-form">
             <label for="job-scope">Job scope</label>
             <select id="job-scope" name="scope">
-              <option value="selected">Selected D12 tiles</option>
+              <option value="selected">Selected D8–D12 targets</option>
               <option value="regressions">Regression suite</option>
-              <option value="ready">Every ready D12 tile</option>
+              <option value="ready">Every ready D12 ladder</option>
             </select>
 
             <div id="tile-field">
@@ -91,7 +90,7 @@
                 name="tiles"
                 rows="5"
                 spellcheck="false"
-                placeholder="12-1373-784&#10;12-1369-799"
+                placeholder="8-85-49&#10;12-1373-784"
               ></textarea>
             </div>
 

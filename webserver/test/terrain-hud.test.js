@@ -2,7 +2,9 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   createTerrainHud,
+  hudActionLink,
   renderGameClock,
+  TERRAIN_HUD_LINKS,
   terrainHudHeader,
   tileEvictionHudLine,
 } from '../terrain-hud.js';
@@ -145,4 +147,12 @@ test('terrain HUD exposes data eviction as an explicit debug gate', () => {
   assert.match(tileEvictionHudLine(true), /id="tileEvictionLink"/);
   assert.match(tileEvictionHudLine(true), />enabled<\/span>/);
   assert.match(tileEvictionHudLine(false), /data eviction: .*DISABLED/);
+});
+
+test('terrain HUD owns the classifier operations link', () => {
+  assert.equal(TERRAIN_HUD_LINKS.classifierOpsLink, '/classifier.html');
+  assert.match(
+    hudActionLink('classifierOpsLink', 'classifier ops'),
+    /id="classifierOpsLink".*>classifier ops<\/span>/,
+  );
 });

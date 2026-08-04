@@ -40,7 +40,7 @@ next item.
   coordinate-conversion import; retain the stereo-coordinate entry point used
   by the application.
   - Checkpoint: serve-cruft, terrain-demand, tile-address, and classifier
-    hierarchy tests — 25 passed; focused Pyright check passed.
+    ladder tests — 25 passed; focused Pyright check passed.
 - [x] Consolidate the duplicate browser percentile implementation used by CPU
   profiling and WebGPU bathymetry diagnostics.
   - Checkpoint: full browser suite — 175 passed.
