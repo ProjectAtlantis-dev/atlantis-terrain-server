@@ -90,7 +90,9 @@ import {
   MAX_REALTIME_STEP_SECONDS,
   stepFreeFlightVelocity,
 } from './terrain-realtime-step.js';
-import { DETAIL_FADE_END_M, DETAIL_STRENGTH, setDetailTuning } from './terrain-detail-layer.js';
+import {
+  DETAIL_FADE_END_M, DETAIL_STRENGTH, graftIsolate, setDetailTuning,
+} from './terrain-detail-layer.js';
 import { terrainAglFromSurface, terrainSurfaceHeightAt } from './terrain-agl.js';
 import { DEFAULT_PROCGEN_ENABLED, procgenHudLine } from './terrain-procgen-toggle.js';
 
@@ -617,6 +619,14 @@ function buildTuningControls(ap, ce) {
     decimals: 0,
     onChange: v => setDetailTuning({ fadeEnd: v }),
   });
+  if (!USE_WEBGPU_RENDER_BACKEND) {
+  // Diagnostic: the cliff material alone on black, with nothing underneath and
+  // no matching to the surrounding photo, so its own faults are visible.
+  tuningToggle('isolate cliff graft', {
+    value: graftIsolate.value > 0.5,
+    onChange: v => { graftIsolate.value = v ? 1 : 0; requestRender(); },
+  });
+  }
 
   if (!USE_WEBGPU_RENDER_BACKEND) {
   tuningSectionLabel('Aerial Perspective');

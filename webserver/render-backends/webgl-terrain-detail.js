@@ -1,9 +1,11 @@
 import * as THREE from 'three';
 import {
   DETAIL_RELATIVE_PERIOD,
+  ROCK_COLOR_RELATIVE_PERIOD,
   DETAIL_SHADE_STRENGTH,
   DETAIL_SUN_DIR,
   detailParams,
+  graftIsolate,
 } from '../terrain-detail-layer.js';
 
 // WebGL side of the frequency-split ground detail. Keep the math in sync
@@ -13,12 +15,18 @@ import {
 const FRAGMENT_DECLS = `
 uniform sampler2D detailMask;
 uniform sampler2D detailRock;
+uniform sampler2D detailRockColor;
 uniform sampler2D detailVegetation;
 uniform sampler2D detailSnow;
 uniform sampler2D detailRockNormal;
 uniform sampler2D detailVegetationNormal;
 uniform sampler2D detailSnowNormal;
 uniform sampler2D detailGraft;
+uniform sampler2D detailGraftNormal;
+uniform sampler2D detailGraftSecondaryTexture;
+uniform sampler2D detailGraftSecondaryNormal;
+uniform sampler2D detailGraftTertiaryTexture;
+uniform sampler2D detailGraftTertiaryNormal;
 uniform sampler2D detailUnderlying;
 uniform vec3 detailParams;
 uniform vec4 detailShade; // xyz = sun direction, w = shade strength
@@ -26,18 +34,48 @@ uniform float detailUseUnderlying;
 uniform float detailSurfaceEnabled;
 uniform vec4 detailGraftParams; // period, slope start/end, strength
 uniform vec2 detailGraftSecondary; // scale, mix
+uniform vec4 detailGraftVariation; // tertiary scale/mix, variation period/amount
 uniform vec2 detailGraftAspect; // south-facing feather start/end
 uniform float detailGraftTint;
+uniform float detailGraftNormalStrength;
+uniform float detailGraftAllAspects;
+uniform vec3 detailGraftRelief; // slope gain, relief contrast, clamp floor
+uniform float detailGraftIsolate; // 1 = graft alone on black, no blending
 uniform vec4 detailGraftPhase;
 varying vec2 vDetailUv;
 varying float vDetailDist;
 varying vec3 vDetailPosition;
 varying vec3 vDetailNormal;
+
+// Each graft normal sample arrives in its own triplanar projection's tangent
+// frame, so it has to be rebuilt against the world axes that projection's u, v
+// and projection directions actually correspond to. Dotting the raw sample
+// against a world-space sun instead lights a vertical cliff as if it were lying
+// flat, which flattens the rock out. Stretching the material far past its
+// capture scale also dilutes the encoded slopes, so detailGraftRelief.x scales
+// them back up to legible relief.
+// The graft textures upload with flipY = false, which reverses the surface
+// gradient along v while the map's green channel still encodes the original
+// +v. Left uncorrected every bump lights as a dent, so negate y here.
+vec3 graftWorldNormal(vec3 sampled, vec3 uDir, vec3 vDir, vec3 wDir) {
+  vec3 tangentNormal = vec3(
+    vec2(sampled.x, -sampled.y) * detailGraftRelief.x,
+    max(sampled.z, 0.05));
+  return normalize(
+    tangentNormal.x * uDir + tangentNormal.y * vDir + tangentNormal.z * wDir);
+}
 `;
 
 const FRAGMENT_GRAFT = `
   if (detailGraftParams.w > 0.001) {
     vec3 geometricNormal = normalize(vDetailNormal);
+    vec3 graftWorldX = vec3(1.0, 0.0, 0.0);
+    vec3 graftWorldY = vec3(0.0, 1.0, 0.0);
+    vec3 graftWorldZ = vec3(0.0, 0.0, 1.0);
+    // Each projection faces along its own axis, flipped to the side of the
+    // surface the camera can actually see.
+    vec3 graftAxisX = vec3(geometricNormal.x >= 0.0 ? 1.0 : -1.0, 0.0, 0.0);
+    vec3 graftAxisY = vec3(0.0, geometricNormal.y >= 0.0 ? 1.0 : -1.0, 0.0);
     vec2 sideWeights = abs(geometricNormal.xy);
     sideWeights /= max(sideWeights.x + sideWeights.y, 0.001);
     float period = detailGraftParams.x;
@@ -47,14 +85,79 @@ const FRAGMENT_GRAFT = `
       texture2D(detailGraft, graftXUv).rgb * sideWeights.x +
       texture2D(detailGraft, graftYUv).rgb * sideWeights.y;
     vec2 graftSecondaryXUv =
-      vDetailPosition.zy / period * detailGraftSecondary.x + detailGraftPhase.zw;
+      vDetailPosition.zy / detailGraftSecondary.x + detailGraftPhase.zw;
     vec2 graftSecondaryYUv =
-      vDetailPosition.zx / period * detailGraftSecondary.x + detailGraftPhase.wz;
+      vDetailPosition.zx / detailGraftSecondary.x + detailGraftPhase.wz;
     vec3 graftSecondary =
-      texture2D(detailGraft, graftSecondaryXUv).rgb * sideWeights.x +
-      texture2D(detailGraft, graftSecondaryYUv).rgb * sideWeights.y;
-    vec3 graftColor = mix(
-      graftPrimary, graftSecondary, detailGraftSecondary.y);
+      texture2D(detailGraftSecondaryTexture, graftSecondaryXUv).rgb * sideWeights.x +
+      texture2D(detailGraftSecondaryTexture, graftSecondaryYUv).rgb * sideWeights.y;
+    mat2 graftRotation = mat2(0.7986, -0.6018, 0.6018, 0.7986);
+    vec2 graftTertiaryXUv = graftRotation *
+      (vDetailPosition.yz / detailGraftVariation.x) +
+      detailGraftPhase.wy + vec2(0.371, 0.113);
+    vec2 graftTertiaryYUv = graftRotation *
+      (vDetailPosition.xz / detailGraftVariation.x) +
+      detailGraftPhase.xz + vec2(0.193, 0.467);
+    vec3 graftTertiary =
+      texture2D(detailGraftTertiaryTexture, graftTertiaryXUv).rgb * sideWeights.x +
+      texture2D(detailGraftTertiaryTexture, graftTertiaryYUv).rgb * sideWeights.y;
+    float scaleVariation = 0.5 + 0.5 *
+      sin((vDetailPosition.x + vDetailPosition.y) / detailGraftVariation.z) *
+      sin((vDetailPosition.z - vDetailPosition.x) /
+        (detailGraftVariation.z * 0.73));
+    // Floor at zero, not 0.08: a spec asking for a single sample must get one,
+    // because every part mixed in costs contrast.
+    float secondaryMix = clamp(
+      detailGraftSecondary.y +
+      (scaleVariation - 0.5) * detailGraftVariation.w, 0.0, 0.62);
+    float tertiaryMix = detailGraftVariation.y *
+      (1.15 - 0.55 * scaleVariation);
+    vec3 graftColor = mix(graftPrimary, graftSecondary, secondaryMix);
+    graftColor = mix(graftColor, graftTertiary, tertiaryMix);
+    // Primary projections sample position.yz and position.xz.
+    vec3 graftNormalPrimary = normalize(
+      graftWorldNormal(
+        texture2D(detailGraftNormal, graftXUv).rgb * 2.0 - 1.0,
+        graftWorldY, graftWorldZ, graftAxisX) * sideWeights.x +
+      graftWorldNormal(
+        texture2D(detailGraftNormal, graftYUv).rgb * 2.0 - 1.0,
+        graftWorldX, graftWorldZ, graftAxisY) * sideWeights.y);
+    // The secondary projections swap u and v to break alignment, so their
+    // world axes swap with them.
+    vec3 graftNormalSecondary = normalize(
+      graftWorldNormal(
+        texture2D(detailGraftSecondaryNormal, graftSecondaryXUv).rgb * 2.0 - 1.0,
+        graftWorldZ, graftWorldY, graftAxisX) * sideWeights.x +
+      graftWorldNormal(
+        texture2D(detailGraftSecondaryNormal, graftSecondaryYUv).rgb * 2.0 - 1.0,
+        graftWorldZ, graftWorldX, graftAxisY) * sideWeights.y);
+    // The tertiary projections rotate their uv, so counter-rotate the sampled
+    // tangent directions back before rebuilding. In GLSL a vector times a
+    // matrix applies the transpose, which for a rotation is its inverse.
+    vec3 tertiaryXSample =
+      texture2D(detailGraftTertiaryNormal, graftTertiaryXUv).rgb * 2.0 - 1.0;
+    tertiaryXSample.xy = tertiaryXSample.xy * graftRotation;
+    vec3 tertiaryYSample =
+      texture2D(detailGraftTertiaryNormal, graftTertiaryYUv).rgb * 2.0 - 1.0;
+    tertiaryYSample.xy = tertiaryYSample.xy * graftRotation;
+    vec3 graftNormalTertiary = normalize(
+      graftWorldNormal(
+        tertiaryXSample, graftWorldY, graftWorldZ, graftAxisX) * sideWeights.x +
+      graftWorldNormal(
+        tertiaryYSample, graftWorldX, graftWorldZ, graftAxisY) * sideWeights.y);
+    vec3 graftNormal = mix(graftNormalPrimary, graftNormalSecondary, secondaryMix);
+    graftNormal = normalize(mix(graftNormal, graftNormalTertiary, tertiaryMix));
+    // Shade on how much the rock's relief turns away from the sun relative to
+    // the face it sits on, not on absolute light. The sun points nearly
+    // straight at a south wall, so absolute light is both high and almost
+    // constant there — using it directly just scales the whole face up.
+    float graftLight = dot(graftNormal, detailShade.xyz);
+    float faceLight = dot(geometricNormal, detailShade.xyz);
+    float relief = (graftLight - faceLight) * detailGraftRelief.y;
+    graftColor *= mix(
+      1.0,
+      clamp(1.0 + relief, detailGraftRelief.z, 2.0 - detailGraftRelief.z),
+      detailGraftNormalStrength);
 
     // Keep the recipient's large-scale brightness and shadows while replacing
     // the vertically stretched orthophoto detail.
@@ -66,11 +169,16 @@ const FRAGMENT_GRAFT = `
     vec3 tintRatio = clamp(
       baseChroma / max(graftChroma, vec3(0.05)),
       vec3(0.72), vec3(1.38));
-    graftColor *= mix(vec3(1.0), tintRatio, detailGraftTint);
+    // Isolating the graft skips both matches — they exist only to marry the
+    // material to the photo that is being hidden.
+    float blendToPhoto = 1.0 - detailGraftIsolate;
+    graftColor *= mix(vec3(1.0), tintRatio, detailGraftTint * blendToPhoto);
     graftLuma = dot(graftColor, lumaWeights);
     float toneScale = clamp(
       (baseLuma + 0.03) / (graftLuma + 0.03), 0.65, 1.35);
-    graftColor *= mix(1.0, toneScale, 0.32);
+    // Pulling the graft back toward the photo's luminance also cancels the
+    // relief shading above, so match tone only loosely.
+    graftColor *= mix(1.0, toneScale, 0.15 * blendToPhoto);
 
     float slopeSignal = 1.0 - abs(geometricNormal.z);
     float targetLand = smoothstep(0.001, 0.02, weightTotal);
@@ -78,10 +186,13 @@ const FRAGMENT_GRAFT = `
     float southness = max(-geometricNormal.y / horizontalLength, 0.0);
     float southBlend = smoothstep(
       detailGraftAspect.x, detailGraftAspect.y, southness);
+    southBlend = mix(southBlend, 1.0, detailGraftAllAspects);
     float graftBlend =
       smoothstep(detailGraftParams.y, detailGraftParams.z, slopeSignal) *
       southBlend * detailGraftParams.w * targetLand;
-    diffuseColor.rgb = mix(diffuseColor.rgb, graftColor, graftBlend);
+    diffuseColor.rgb = mix(
+      diffuseColor.rgb * blendToPhoto, graftColor, graftBlend);
+    graftCoverage = graftBlend;
   }
 `;
 
@@ -98,13 +209,32 @@ const FRAGMENT_BLEND = `
   if (detailUseUnderlying > 0.5) {
     underlayColor = texture2D(detailUnderlying, vMapUv).rgb;
   }
+  float graftCoverage = 0.0;
 ${FRAGMENT_GRAFT}
   float fade = 1.0 - smoothstep(detailParams.x, detailParams.y, vDetailDist);
-  float surfaceDetailWeight = detailSurfaceEnabled * weightTotal * fade;
+  // The flat-ground detail below carries its own material and its own shading
+  // term. Where the cliff graft has taken the surface over, stacking both
+  // blends two rock materials onto one face, so hand the surface across.
+  float surfaceDetailWeight = detailSurfaceEnabled * weightTotal * fade
+    * (1.0 - graftCoverage) * (1.0 - detailGraftIsolate);
+  // Tiles with no graft at all never enter the block above, so black them out
+  // here instead — isolating means only graft pixels survive.
+  if (detailGraftParams.w <= 0.001) {
+    diffuseColor.rgb *= 1.0 - detailGraftIsolate;
+  }
   if (surfaceDetailWeight > 0.001) {
     vec2 rockUv = vDetailUv * ${DETAIL_RELATIVE_PERIOD.rock.toFixed(3)};
     vec2 vegUv = vDetailUv * ${DETAIL_RELATIVE_PERIOD.vegetation.toFixed(3)};
     vec2 snowUv = vDetailUv * ${DETAIL_RELATIVE_PERIOD.snow.toFixed(3)};
+    float flatRockWeight = surfaceWeights.r *
+      smoothstep(0.55, 0.90, abs(normalize(vDetailNormal).z));
+    vec2 rockColorUv = vDetailUv * ${ROCK_COLOR_RELATIVE_PERIOD.toFixed(4)};
+    vec3 rockAlbedo = texture2D(detailRockColor, rockColorUv).rgb;
+    float rockAlbedoLuma = dot(rockAlbedo, vec3(0.2126, 0.7152, 0.0722));
+    vec3 rockChroma = clamp(
+      rockAlbedo / max(rockAlbedoLuma, 0.05), vec3(0.72), vec3(1.28));
+    diffuseColor.rgb *= mix(
+      vec3(1.0), rockChroma, flatRockWeight * fade * 0.38);
     float detailValue =
       texture2D(detailRock, rockUv).r * surfaceWeights.r +
       texture2D(detailVegetation, vegUv).r * surfaceWeights.g +
@@ -132,7 +262,11 @@ ${FRAGMENT_GRAFT}
 export function applyTerrainDetailWebGL(mesh, context) {
   const material = mesh?.material;
   if (!material || !material.map) return false;
-  const southGraft = context.grafts?.find(graft => graft.spec.aspect === 'south');
+  const cliffGraft = context.grafts?.[0];
+  const cliffLayers = cliffGraft?.layers ?? [];
+  const primaryLayer = cliffLayers[0];
+  const secondaryLayer = cliffLayers[1] ?? primaryLayer;
+  const tertiaryLayer = cliffLayers[2] ?? primaryLayer;
   const tintMap = context.tintMap ?? material.map;
   const useUnderlying = tintMap !== material.map;
   const state = material.userData;
@@ -144,25 +278,50 @@ export function applyTerrainDetailWebGL(mesh, context) {
       context.uv.offsetX, context.uv.offsetY,
     );
     state.terrainDetailUniforms.detailGraft.value =
-      southGraft?.texture ?? context.textures.rock;
+      cliffGraft?.texture ?? context.textures.rock;
+    state.terrainDetailUniforms.detailGraftNormal.value =
+      cliffGraft?.normalTexture ?? context.textures.rockNormal;
+    state.terrainDetailUniforms.detailGraftSecondaryTexture.value =
+      secondaryLayer?.texture ?? context.textures.rock;
+    state.terrainDetailUniforms.detailGraftSecondaryNormal.value =
+      secondaryLayer?.normalTexture ?? context.textures.rockNormal;
+    state.terrainDetailUniforms.detailGraftTertiaryTexture.value =
+      tertiaryLayer?.texture ?? context.textures.rock;
+    state.terrainDetailUniforms.detailGraftTertiaryNormal.value =
+      tertiaryLayer?.normalTexture ?? context.textures.rockNormal;
     state.terrainDetailUniforms.detailGraftParams.value.set(
-      southGraft?.spec.periodM ?? 1,
-      southGraft?.spec.slopeStart ?? 0,
-      southGraft?.spec.slopeEnd ?? 1,
-      southGraft?.spec.strength ?? 0,
+      cliffGraft?.spec.periodM ?? primaryLayer?.periodM ?? 1,
+      cliffGraft?.spec.slopeStart ?? 0,
+      cliffGraft?.spec.slopeEnd ?? 1,
+      cliffGraft?.spec.strength ?? 0,
     );
     state.terrainDetailUniforms.detailGraftSecondary.value.set(
-      southGraft?.spec.secondaryScale ?? 1,
-      southGraft?.spec.secondaryMix ?? 0,
+      cliffGraft?.spec.periodM ?? primaryLayer?.periodM ?? 1,
+      cliffGraft?.spec.phaseMix ?? 0,
+    );
+    state.terrainDetailUniforms.detailGraftVariation.value.set(
+      cliffGraft?.spec.periodM ?? primaryLayer?.periodM ?? 1,
+      cliffGraft?.spec.phaseMix2 ?? 0,
+      cliffGraft?.spec.variationPeriodM ?? 1,
+      cliffGraft?.spec.phaseVariation ?? 0,
     );
     state.terrainDetailUniforms.detailGraftAspect.value.set(
-      southGraft?.spec.southStart ?? 1,
-      southGraft?.spec.southEnd ?? 1,
+      cliffGraft?.spec.southStart ?? 0,
+      cliffGraft?.spec.southEnd ?? 1,
     );
     state.terrainDetailUniforms.detailGraftTint.value =
-      southGraft?.spec.tintStrength ?? 0;
+      cliffGraft?.spec.tintStrength ?? 0;
+    state.terrainDetailUniforms.detailGraftNormalStrength.value =
+      cliffGraft?.spec.normalStrength ?? 0;
+    state.terrainDetailUniforms.detailGraftAllAspects.value =
+      cliffGraft?.spec.aspect === 'all' ? 1 : 0;
+    state.terrainDetailUniforms.detailGraftRelief.value.set(
+      cliffGraft?.spec.normalRelief ?? 1,
+      cliffGraft?.spec.reliefContrast ?? 0,
+      cliffGraft?.spec.reliefFloor ?? 0.5,
+    );
     state.terrainDetailUniforms.detailGraftPhase.value.fromArray(
-      southGraft?.spec.phase ?? [0, 0, 0, 0],
+      cliffGraft?.spec.phase ?? [0, 0, 0, 0],
     );
     state.terrainDetailUniforms.detailUnderlying.value = tintMap;
     state.terrainDetailUniforms.detailUseUnderlying.value =
@@ -175,35 +334,72 @@ export function applyTerrainDetailWebGL(mesh, context) {
   const uniforms = {
     detailMask: { value: context.maskTexture },
     detailRock: { value: context.textures.rock },
+    detailRockColor: { value: context.textures.rockColor },
     detailVegetation: { value: context.textures.vegetation },
     detailSnow: { value: context.textures.snow },
     detailRockNormal: { value: context.textures.rockNormal },
     detailVegetationNormal: { value: context.textures.vegetationNormal },
     detailSnowNormal: { value: context.textures.snowNormal },
-    detailGraft: { value: southGraft?.texture ?? context.textures.rock },
+    detailGraft: { value: cliffGraft?.texture ?? context.textures.rock },
+    detailGraftNormal: {
+      value: cliffGraft?.normalTexture ?? context.textures.rockNormal,
+    },
+    detailGraftSecondaryTexture: {
+      value: secondaryLayer?.texture ?? context.textures.rock,
+    },
+    detailGraftSecondaryNormal: {
+      value: secondaryLayer?.normalTexture ?? context.textures.rockNormal,
+    },
+    detailGraftTertiaryTexture: {
+      value: tertiaryLayer?.texture ?? context.textures.rock,
+    },
+    detailGraftTertiaryNormal: {
+      value: tertiaryLayer?.normalTexture ?? context.textures.rockNormal,
+    },
     detailGraftParams: {
       value: new THREE.Vector4(
-        southGraft?.spec.periodM ?? 1,
-        southGraft?.spec.slopeStart ?? 0,
-        southGraft?.spec.slopeEnd ?? 1,
-        southGraft?.spec.strength ?? 0,
+        cliffGraft?.spec.periodM ?? primaryLayer?.periodM ?? 1,
+        cliffGraft?.spec.slopeStart ?? 0,
+        cliffGraft?.spec.slopeEnd ?? 1,
+        cliffGraft?.spec.strength ?? 0,
       ),
     },
     detailGraftSecondary: {
       value: new THREE.Vector2(
-        southGraft?.spec.secondaryScale ?? 1,
-        southGraft?.spec.secondaryMix ?? 0,
+        cliffGraft?.spec.periodM ?? primaryLayer?.periodM ?? 1,
+        cliffGraft?.spec.phaseMix ?? 0,
+      ),
+    },
+    detailGraftVariation: {
+      value: new THREE.Vector4(
+        cliffGraft?.spec.periodM ?? primaryLayer?.periodM ?? 1,
+        cliffGraft?.spec.phaseMix2 ?? 0,
+        cliffGraft?.spec.variationPeriodM ?? 1,
+        cliffGraft?.spec.phaseVariation ?? 0,
       ),
     },
     detailGraftAspect: {
       value: new THREE.Vector2(
-        southGraft?.spec.southStart ?? 1,
-        southGraft?.spec.southEnd ?? 1,
+        cliffGraft?.spec.southStart ?? 0,
+        cliffGraft?.spec.southEnd ?? 1,
       ),
     },
-    detailGraftTint: { value: southGraft?.spec.tintStrength ?? 0 },
+    detailGraftTint: { value: cliffGraft?.spec.tintStrength ?? 0 },
+    detailGraftNormalStrength: {
+      value: cliffGraft?.spec.normalStrength ?? 0,
+    },
+    detailGraftAllAspects: {
+      value: cliffGraft?.spec.aspect === 'all' ? 1 : 0,
+    },
+    detailGraftRelief: {
+      value: new THREE.Vector3(
+        cliffGraft?.spec.normalRelief ?? 1,
+        cliffGraft?.spec.reliefContrast ?? 0,
+        cliffGraft?.spec.reliefFloor ?? 0.5,
+      ),
+    },
     detailGraftPhase: {
-      value: new THREE.Vector4(...(southGraft?.spec.phase ?? [0, 0, 0, 0])),
+      value: new THREE.Vector4(...(cliffGraft?.spec.phase ?? [0, 0, 0, 0])),
     },
     detailUnderlying: { value: tintMap },
     detailUseUnderlying: { value: useUnderlying ? 1 : 0 },
@@ -219,6 +415,8 @@ export function applyTerrainDetailWebGL(mesh, context) {
     },
     // Shared live-tuning vector — the tuning panel mutates it in place.
     detailParams: { value: detailParams },
+    // Shared diagnostic flag — the same object the HUD toggle mutates.
+    detailGraftIsolate: graftIsolate,
   };
   state.terrainDetailUniforms = uniforms;
   material.onBeforeCompile = shader => {
@@ -246,7 +444,7 @@ export function applyTerrainDetailWebGL(mesh, context) {
       .replace('#include <common>', '#include <common>\n' + FRAGMENT_DECLS)
       .replace('#include <map_fragment>', '#include <map_fragment>\n' + FRAGMENT_BLEND);
   };
-  material.customProgramCacheKey = () => 'terrain-detail-v7-south-graft-only';
+  material.customProgramCacheKey = () => 'terrain-detail-v15-single-sample';
   material.needsUpdate = true;
   return true;
 }

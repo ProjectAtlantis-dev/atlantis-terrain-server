@@ -27,6 +27,9 @@ export const TERRAIN_ROOT_WIDTH_M = 2700000;
 // vegetation repeats every 3 m (finer tufts), snow every 12 m (broad drift).
 export const DETAIL_PERIOD_M = 6;
 export const DETAIL_RELATIVE_PERIOD = { rock: 1.0, vegetation: 2.0, snow: 0.5 };
+// Aerial Rocks 01 covers an 80 m square. Keep its macro albedo at capture
+// scale while the separate procedural/normal detail continues at 6 m.
+export const ROCK_COLOR_RELATIVE_PERIOD = DETAIL_PERIOD_M / 80;
 
 // View-distance cross-fade for the detail layer.
 export const DETAIL_FADE_START_M = 120;
@@ -41,6 +44,13 @@ export const DETAIL_STRENGTH = 0.55;
 export const detailParams = new THREE.Vector3(
   DETAIL_FADE_START_M, DETAIL_FADE_END_M, DETAIL_STRENGTH,
 );
+
+// Diagnostic: render the cliff graft material alone against black, with no
+// orthophoto underneath and no tint or tone matching to the surrounding
+// terrain. Judging the material through the blend hides whether a fault is in
+// the material or in how it is being married to the photo. Shared and mutated
+// in place, exactly like detailParams, so it doubles as the uniform itself.
+export const graftIsolate = { value: 0 };
 
 export function setDetailTuning({ strength, fadeEnd } = {}) {
   if (strength != null) detailParams.z = strength;
@@ -152,6 +162,12 @@ function configureTilingTexture(texture) {
   return texture;
 }
 
+function loadTilingTexture(url, colorSpace) {
+  const texture = configureTilingTexture(new THREE.TextureLoader().load(url));
+  texture.colorSpace = colorSpace;
+  return texture;
+}
+
 function buildDetailTexture(shade) {
   const size = DETAIL_TEXTURE_SIZE;
   const data = new Uint8Array(size * size);
@@ -224,9 +240,19 @@ export function createDetailTextures() {
   });
   return {
     rock,
+    // Aerial Rocks 01 is reserved for classifier-confirmed, flatter exposed
+    // rock. Its albedo supplies natural color variation while the base
+    // orthophoto remains the low-frequency source of truth.
+    rockColor: loadTilingTexture(
+      '/textures/polyhaven/aerial_rocks_01/aerial_rocks_01_diff_1k.jpg',
+      THREE.SRGBColorSpace,
+    ),
     vegetation,
     snow,
-    rockNormal: buildDetailNormalTexture(rock, DETAIL_BUMP.rock),
+    rockNormal: loadTilingTexture(
+      '/textures/polyhaven/aerial_rocks_01/aerial_rocks_01_nor_gl_1k.jpg',
+      THREE.NoColorSpace,
+    ),
     vegetationNormal: buildDetailNormalTexture(vegetation, DETAIL_BUMP.vegetation),
     snowNormal: buildDetailNormalTexture(snow, DETAIL_BUMP.snow),
   };

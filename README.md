@@ -129,6 +129,7 @@ The browser application talks only to Flask. Flask also reads and creates `asset
 - Coastline masks use the Åbent Land Grønland 1:50,000 vector dataset from Klimadatastyrelsen.
 - **Contains data from Asiaq, Greenland Survey:** buildings and roads are sourced from Asiaq's Teknisk Grundkort settlement maps, obtained through [Asiaq Kortforsyning](https://kortforsyning.asiaq.gl/). See [Asiaq's terms of use](https://www.asiaq.gl/wp-content/uploads/2026/04/EN_Terms_of_use_for_Asiaq_geodata.pdf).
 - Atmosphere and clouds use [three-geospatial](https://github.com/takram-design-engineering/three-geospatial) by Takram.
+- Rock and cliff detail uses selected [Poly Haven](https://polyhaven.com/textures/aerial) materials under the [CC0 license](https://polyhaven.com/license), including Aerial Rocks 01 and Marble Rock 03.
 
 Google satellite imagery is used only as an external debugging and classification reference; it is not distributed by this project.
 

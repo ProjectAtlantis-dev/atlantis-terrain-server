@@ -8,6 +8,8 @@ import {
   normalize,
   positionLocal,
   positionView,
+  sign,
+  sin,
   smoothstep,
   texture,
   uniform,
@@ -17,6 +19,7 @@ import {
 } from 'three/tsl';
 import {
   DETAIL_RELATIVE_PERIOD,
+  ROCK_COLOR_RELATIVE_PERIOD,
   DETAIL_SHADE_STRENGTH,
   DETAIL_SUN_DIR,
   detailParams,
@@ -32,8 +35,33 @@ import {
 // wraps the SAME vector the WebGL twin and the tuning sliders mutate.
 const detailTuning = uniform(detailParams);
 
+// Each graft normal sample arrives in its own triplanar projection's tangent
+// frame, so it has to be rebuilt against the world axes that projection's u, v
+// and projection directions actually correspond to. Dotting the raw sample
+// against a world-space sun instead lights a vertical cliff as if it were lying
+// flat, which flattens the rock out. Stretching the material far past its
+// capture scale also dilutes the encoded slopes, so relief scales them back up.
+function graftWorldNormal(sampled, uDir, vDir, wDir, relief) {
+  return normalize(
+    uDir.mul(sampled.x.mul(relief))
+      .add(vDir.mul(sampled.y.mul(relief)))
+      .add(wDir.mul(sampled.z.max(0.05))),
+  );
+}
+
+// Counter-rotate a tangent sample by the tertiary projection's uv rotation.
+function graftUnrotate(sampled) {
+  return vec3(
+    sampled.x.mul(0.7986).add(sampled.y.mul(0.6018)),
+    sampled.y.mul(0.7986).sub(sampled.x.mul(0.6018)),
+    sampled.z,
+  );
+}
+
 function graftTextureKey(grafts = []) {
-  return grafts.map(graft => graft.texture.uuid).join('|');
+  return grafts
+    .map(graft => `${graft.texture.uuid}:${graft.normalTexture?.uuid ?? '-'}`)
+    .join('|');
 }
 
 function buildColorNode({
@@ -72,18 +100,100 @@ function buildColorNode({
       const graftYUv = position.xz.div(period).add(vec2(phase[1], phase[0]));
       const primary = texture(graft.texture, graftXUv).rgb.mul(xWeight)
         .add(texture(graft.texture, graftYUv).rgb.mul(yWeight));
-      const secondaryScale = float(graft.spec.secondaryScale);
-      const secondaryXUv = position.zy.div(period).mul(secondaryScale)
+      const secondaryXUv = position.zy.div(period)
         .add(vec2(phase[2], phase[3]));
-      const secondaryYUv = position.zx.div(period).mul(secondaryScale)
+      const secondaryYUv = position.zx.div(period)
         .add(vec2(phase[3], phase[2]));
       const secondary = texture(graft.texture, secondaryXUv).rgb.mul(xWeight)
         .add(texture(graft.texture, secondaryYUv).rgb.mul(yWeight));
-      let graftColor = mix(
-        primary,
-        secondary,
-        float(graft.spec.secondaryMix),
+      const tertiaryXUv = vec2(
+        position.y.mul(0.7986).sub(position.z.mul(0.6018)),
+        position.y.mul(0.6018).add(position.z.mul(0.7986)),
+      ).div(period)
+        .add(vec2(phase[3] + 0.371, phase[1] + 0.113));
+      const tertiaryYUv = vec2(
+        position.x.mul(0.7986).sub(position.z.mul(0.6018)),
+        position.x.mul(0.6018).add(position.z.mul(0.7986)),
+      ).div(period)
+        .add(vec2(phase[0] + 0.193, phase[2] + 0.467));
+      const tertiary = texture(graft.texture, tertiaryXUv).rgb.mul(xWeight)
+        .add(texture(graft.texture, tertiaryYUv).rgb.mul(yWeight));
+      const variationPeriod = float(graft.spec.variationPeriodM);
+      const scaleVariation = float(0.5).add(
+        sin(position.x.add(position.y).div(variationPeriod))
+          .mul(sin(position.z.sub(position.x).div(
+            variationPeriod.mul(0.73),
+          )))
+          .mul(0.5),
       );
+      const secondaryMix = float(graft.spec.phaseMix).add(
+        scaleVariation.sub(0.5).mul(float(graft.spec.phaseVariation)),
+      ).max(0.08).min(0.62);
+      const tertiaryMix = float(graft.spec.phaseMix2).mul(
+        float(1.15).sub(scaleVariation.mul(0.55)),
+      );
+      let graftColor = mix(primary, secondary, secondaryMix);
+      graftColor = mix(graftColor, tertiary, tertiaryMix);
+      const relief = float(graft.spec.normalRelief ?? 1);
+      const worldX = vec3(1.0, 0.0, 0.0);
+      const worldY = vec3(0.0, 1.0, 0.0);
+      const worldZ = vec3(0.0, 0.0, 1.0);
+      // Each projection faces along its own axis, flipped to the side of the
+      // surface the camera can actually see.
+      const axisX = vec3(sign(geometricNormal.x), 0.0, 0.0);
+      const axisY = vec3(0.0, sign(geometricNormal.y), 0.0);
+      // Primary projections sample position.yz and position.xz.
+      const primaryNormal = normalize(
+        graftWorldNormal(
+          texture(graft.normalTexture, graftXUv).rgb.mul(2.0).sub(1.0),
+          worldY, worldZ, axisX, relief,
+        ).mul(xWeight).add(
+          graftWorldNormal(
+            texture(graft.normalTexture, graftYUv).rgb.mul(2.0).sub(1.0),
+            worldX, worldZ, axisY, relief,
+          ).mul(yWeight),
+        ),
+      );
+      // The secondary projections swap u and v to break alignment, so their
+      // world axes swap with them.
+      const secondaryNormal = normalize(
+        graftWorldNormal(
+          texture(graft.normalTexture, secondaryXUv).rgb.mul(2.0).sub(1.0),
+          worldZ, worldY, axisX, relief,
+        ).mul(xWeight).add(
+          graftWorldNormal(
+            texture(graft.normalTexture, secondaryYUv).rgb.mul(2.0).sub(1.0),
+            worldZ, worldX, axisY, relief,
+          ).mul(yWeight),
+        ),
+      );
+      const tertiaryNormal = normalize(
+        graftWorldNormal(
+          graftUnrotate(
+            texture(graft.normalTexture, tertiaryXUv).rgb.mul(2.0).sub(1.0),
+          ),
+          worldY, worldZ, axisX, relief,
+        ).mul(xWeight).add(
+          graftWorldNormal(
+            graftUnrotate(
+              texture(graft.normalTexture, tertiaryYUv).rgb.mul(2.0).sub(1.0),
+            ),
+            worldX, worldZ, axisY, relief,
+          ).mul(yWeight),
+        ),
+      );
+      const graftNormal = normalize(mix(
+        mix(primaryNormal, secondaryNormal, secondaryMix),
+        tertiaryNormal,
+        tertiaryMix,
+      ));
+      const graftLight = graftNormal.dot(vec3(...DETAIL_SUN_DIR)).max(0.0);
+      graftColor = graftColor.mul(mix(
+        float(1.0),
+        float(graft.spec.shadeFloor ?? 0.55)
+          .add(graftLight.mul(float(graft.spec.shadeGain ?? 0.9))),
+        float(graft.spec.normalStrength ?? 0),
+      ));
 
       // Preserve macro lighting/shadows from the recipient while replacing
       // its stretched cliff paint with the donor's intact ground texture.
@@ -105,7 +215,9 @@ function buildColorNode({
       const tintedGraftLuma = graftColor.dot(lumaWeights);
       const toneScale = baseLuma.add(0.03).div(tintedGraftLuma.add(0.03))
         .max(0.65).min(1.35);
-      graftColor = graftColor.mul(mix(float(1.0), toneScale, float(0.32)));
+      // Pulling the graft back toward the photo's luminance also cancels the
+      // relief shading above, so match tone only loosely.
+      graftColor = graftColor.mul(mix(float(1.0), toneScale, float(0.15)));
 
       const slopeSignal = float(1.0).sub(geometricNormal.z.abs());
       const targetLand = smoothstep(float(0.001), float(0.02), weightTotal);
@@ -116,11 +228,13 @@ function buildColorNode({
       );
       const horizontalLength = geometricNormal.xy.length().max(0.001);
       const southness = geometricNormal.y.negate().div(horizontalLength).max(0.0);
-      const aspectBlend = smoothstep(
-        float(graft.spec.southStart),
-        float(graft.spec.southEnd),
-        southness,
-      );
+      const aspectBlend = graft.spec.aspect === 'all'
+        ? float(1.0)
+        : smoothstep(
+          float(graft.spec.southStart),
+          float(graft.spec.southEnd),
+          southness,
+        );
       const finalGraftBlend = graftBlend
         .mul(aspectBlend)
         .mul(float(graft.spec.strength))
@@ -142,6 +256,17 @@ function buildColorNode({
     const rockUv = detailUv.mul(float(DETAIL_RELATIVE_PERIOD.rock));
     const vegUv = detailUv.mul(float(DETAIL_RELATIVE_PERIOD.vegetation));
     const snowUv = detailUv.mul(float(DETAIL_RELATIVE_PERIOD.snow));
+    const flatRockWeight = surfaceWeights.r.mul(smoothstep(
+      float(0.55), float(0.90), normalLocal.z.abs(),
+    )).mul(fade);
+    const rockColorUv = detailUv.mul(float(ROCK_COLOR_RELATIVE_PERIOD));
+    const rockAlbedo = texture(textures.rockColor, rockColorUv).rgb;
+    const rockAlbedoLuma = rockAlbedo.dot(vec3(0.2126, 0.7152, 0.0722));
+    const rockChroma = rockAlbedo.div(rockAlbedoLuma.max(0.05))
+      .max(vec3(0.72)).min(vec3(1.28));
+    terrainColor = terrainColor.mul(mix(
+      vec3(1.0), rockChroma, flatRockWeight.mul(0.38),
+    ));
     const detailValue = texture(textures.rock, rockUv).r.mul(surfaceWeights.r)
       .add(texture(textures.vegetation, vegUv).r.mul(surfaceWeights.g))
       .add(texture(textures.snow, snowUv).r.mul(surfaceWeights.b));

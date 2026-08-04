@@ -39,23 +39,22 @@ export function createTerrainDetailRuntime({
 
   function graftAsset(spec) {
     if (!spec) return Promise.resolve(null);
-    const cached = graftAssets.get(spec.donorTileId);
+    const assetKey = spec.assetId;
+    const cached = graftAssets.get(assetKey);
     if (cached) return Promise.resolve({ spec, ...cached });
-    const pending = graftInflight.get(spec.donorTileId);
+    const pending = graftInflight.get(assetKey);
     if (pending) return pending.then(asset => ({ spec, ...asset }));
     const request = loadCliffGraftTexture({ spec })
       .then(asset => {
-        graftAssets.set(spec.donorTileId, asset);
+        graftAssets.set(assetKey, asset);
         log(
-          spec.donorTileId,
-          `cliff graft donor ${spec.donorTileId} ready`
-            + ` (${asset.inpaint.waterPixels} water pixels replaced,`
-            + ` server cache ${asset.cache})`,
+          assetKey,
+          `cliff material ${assetKey} ready`,
         );
         return asset;
       })
-      .finally(() => graftInflight.delete(spec.donorTileId));
-    graftInflight.set(spec.donorTileId, request);
+      .finally(() => graftInflight.delete(assetKey));
+    graftInflight.set(assetKey, request);
     return request.then(asset => ({ spec, ...asset }));
   }
 
@@ -76,7 +75,7 @@ export function createTerrainDetailRuntime({
         graftAsset(spec).catch(error => {
           log(
             tileId,
-            `cliff graft ${spec.donorTileId} unavailable: ${error?.message ?? error}`,
+            `cliff material ${spec.assetId} unavailable: ${error?.message ?? error}`,
           );
           return null;
         })
@@ -111,7 +110,12 @@ export function createTerrainDetailRuntime({
       for (const texture of Object.values(textures)) texture.dispose?.();
       textures = null;
     }
-    for (const asset of graftAssets.values()) asset.texture.dispose?.();
+    for (const asset of graftAssets.values()) {
+      for (const layer of asset.layers ?? [asset]) {
+        layer.texture?.dispose?.();
+        layer.normalTexture?.dispose?.();
+      }
+    }
     graftAssets.clear();
     graftInflight.clear();
   }
