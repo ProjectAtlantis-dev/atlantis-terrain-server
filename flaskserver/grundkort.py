@@ -214,8 +214,10 @@ def _settlement_loaded(folder: str, assets_db_path: Path = ASSETS_DB_PATH) -> bo
                 (*road_layers, f"{settlement}_%"),
             ).fetchone()
         )
-    except sqlite3.OperationalError:
-        return False
+    except sqlite3.OperationalError as exc:
+        if "no such table" in str(exc).lower():
+            return False
+        raise
     finally:
         db.close()
 
@@ -460,9 +462,11 @@ def repair_unsampled_ground(
             "AND json_extract(properties,'$.groundSampled')=0",
             (SOURCE_LAYER,),
         ).fetchall()
-    except sqlite3.OperationalError:
+    except sqlite3.OperationalError as exc:
         assets_db.close()
-        return 0, 0  # schema not ensured yet
+        if "no such table" in str(exc).lower():
+            return 0, 0  # schema not ensured yet
+        raise
     if not rows:
         assets_db.close()
         return 0, 0

@@ -127,7 +127,10 @@ function connectWs() {
   ws.onmessage = (evt) => {
     try {
       addEntry(JSON.parse(evt.data));
-    } catch (e) { /* ignore */ }
+    } catch (error) {
+      statusEl.textContent = 'invalid live log message: ' + error.message;
+      statusEl.className = 'ws-dead';
+    }
   };
 
   ws.onclose = () => {

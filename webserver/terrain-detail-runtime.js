@@ -95,11 +95,19 @@ export function createTerrainDetailRuntime({
         tintMap: resolvedTintMap,
         detailEnabled: !graftOnly,
       });
+      // Backends report 'patched' / 'refreshed' / 'unchanged' (older ones just
+      // true). A redundant re-apply writes the same uniform values it already
+      // held, so repainting for it is pure churn — and logging it identically
+      // to real work hides that churn instead of exposing it.
+      if (applied === 'unchanged') {
+        log(tileId, 'ground-detail unchanged');
+        return;
+      }
       if (applied) {
         // Diagnosis breadcrumb (cheap, once per texture land): "is the
         // detail layer even patching this tile" must be answerable from
         // the client log, not from theorizing over screenshots.
-        log(tileId, 'ground-detail applied');
+        log(tileId, `ground-detail ${applied === true ? 'applied' : applied}`);
         requestRender();
       }
     });

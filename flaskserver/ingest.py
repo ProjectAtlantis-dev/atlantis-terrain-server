@@ -192,7 +192,9 @@ def _read_cog_heightmap(
     If the bbox spans too many COG tiles (coarse quadtree node), skip
     ArcticDEM entirely and go straight to Copernicus.
 
-    Returns (float32 NxN, source_name) or (None, None).
+    Returns (float32 NxN, source_name), ``(None, 'official_ocean')`` for a
+    terminal sea-level plate, or ``(None, None)`` when no provider resolved
+    the tile.
     """
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -318,7 +320,11 @@ def _read_cog_heightmap(
             "  Skipping Copernicus: corrected ArcticDEM sea-level plate "
             "already proves open-ocean coverage"
         )
-        return None, None
+        # Preserve the terminal classification for the caller. Returning the
+        # generic no-data pair made the COG worker install a parent-resampled
+        # fallback, which remained upgradeable forever even though the
+        # provider had already proved this tile was ocean.
+        return None, 'official_ocean'
 
     arctic_ok = arctic is not None and np.any(~np.isnan(arctic))
 

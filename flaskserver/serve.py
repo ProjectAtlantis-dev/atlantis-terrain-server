@@ -269,9 +269,10 @@ def load_no_data_cache(db):
 
 def mark_no_data(db, tile_id):
     """Mark a tile as having no COG data — in memory AND in the DB."""
-    _no_data_cache.add(tile_id)
     db.execute("UPDATE tiles SET source = 'no_data' WHERE tile_id = ?", (tile_id,))
     db.commit()
+    # Publish the in-memory terminal state only after durable persistence.
+    _no_data_cache.add(tile_id)
 
 
 def _cache_coastline(db, tile_id, bbox=None):
@@ -349,11 +350,8 @@ def _cook_cooked_dem_quad(db, tile_id, allow_overwrite=False):
         )
         return False
 
-    try:
-        water_mask = read_water_mask(db, parent_id)
-        if water_mask is not None and water_mask.shape != parent['heightmap'].shape:
-            water_mask = None
-    except Exception:
+    water_mask = read_water_mask(db, parent_id)
+    if water_mask is not None and water_mask.shape != parent['heightmap'].shape:
         water_mask = None
 
     cook_started = time.perf_counter()

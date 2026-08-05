@@ -1,6 +1,7 @@
 """Terrain demand and coverage behavior."""
 
 import datetime
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -14,6 +15,7 @@ from serve import (
     _UPGRADEABLE_SOURCES,
     _balance_lod_leaves, _coarse_lod_neighbors, _cook_cooked_dem_quad,
     _ensure_children, _lod_target_depth, _traverse, bbox_in_view_circle,
+    mark_no_data,
 )
 
 
@@ -23,6 +25,19 @@ def _bbox_at(cx, cy, size=100.0):
 
 
 class TestViewCoverageCircle(unittest.TestCase):
+    def test_no_data_cache_is_published_only_after_database_commit(self):
+        class FailingDatabase:
+            def execute(self, *_args):
+                return self
+
+            def commit(self):
+                raise sqlite3.OperationalError("disk full")
+
+        with patch("serve._no_data_cache", set()) as cache:
+            with self.assertRaisesRegex(sqlite3.OperationalError, "disk full"):
+                mark_no_data(FailingDatabase(), "12-1-1")
+            self.assertNotIn("12-1-1", cache)
+
     def test_ensure_children_repairs_a_partial_sibling_quad(self):
         with tempfile.TemporaryDirectory() as directory:
             db = open_db(str(Path(directory) / "terrain.db"))

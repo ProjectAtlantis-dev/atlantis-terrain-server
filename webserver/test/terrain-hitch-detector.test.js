@@ -186,6 +186,21 @@ test('clear() resets counters and samples', () => {
   assert.equal(report.worstIntervalMs, 0);
 });
 
+test('sampling and observer failures remain visible in the report', () => {
+  const detector = createTerrainHitchDetector({
+    hitchMs: 50,
+    sampleContext: () => { throw new Error('context probe failed'); },
+    performanceObserver: () => { throw new Error('observer setup failed'); },
+  });
+  detector.setEnabled(true);
+  detector.frameStart(0);
+
+  const report = detector.getReport();
+  assert.equal(report.contextErrorCount, 1);
+  assert.equal(report.contextLastError, 'context probe failed');
+  assert.equal(report.observerError, 'observer setup failed');
+});
+
 test('rejects a non-positive threshold', () => {
   assert.throws(() => createTerrainHitchDetector({ hitchMs: 0 }), RangeError);
 });

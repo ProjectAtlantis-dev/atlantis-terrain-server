@@ -5,7 +5,6 @@ import {
   DETAIL_SHADE_STRENGTH,
   DETAIL_SUN_DIR,
   detailParams,
-  graftIsolate,
 } from '../terrain-detail-layer.js';
 
 // WebGL side of the frequency-split ground detail. Keep the math in sync
@@ -40,7 +39,7 @@ uniform float detailGraftTint;
 uniform float detailGraftNormalStrength;
 uniform float detailGraftAllAspects;
 uniform vec3 detailGraftRelief; // slope gain, relief contrast, clamp floor
-uniform float detailGraftIsolate; // 1 = graft alone on black, no blending
+uniform float detailGraftSaturation; // 1 = capture as shot, 0 = fully the tint
 uniform vec4 detailGraftPhase;
 varying vec2 vDetailUv;
 varying float vDetailDist;
@@ -169,16 +168,22 @@ const FRAGMENT_GRAFT = `
     vec3 tintRatio = clamp(
       baseChroma / max(graftChroma, vec3(0.05)),
       vec3(0.72), vec3(1.38));
-    // Isolating the graft skips both matches — they exist only to marry the
-    // material to the photo that is being hidden.
-    float blendToPhoto = 1.0 - detailGraftIsolate;
-    graftColor *= mix(vec3(1.0), tintRatio, detailGraftTint * blendToPhoto);
+    graftColor *= mix(vec3(1.0), tintRatio, detailGraftTint);
     graftLuma = dot(graftColor, lumaWeights);
     float toneScale = clamp(
       (baseLuma + 0.03) / (graftLuma + 0.03), 0.65, 1.35);
     // Pulling the graft back toward the photo's luminance also cancels the
     // relief shading above, so match tone only loosely.
-    graftColor *= mix(1.0, toneScale, 0.15 * blendToPhoto);
+    graftColor *= mix(1.0, toneScale, 0.15);
+
+    // The capture's blue-grey granite balance is baked into the albedo at load
+    // time (see terrain-cliff-graft.js), so only chroma variation is left to
+    // trim here. This desaturates toward plain luminance, which drifts green
+    // because luma weights green at 0.72 — change greyTint for hue, this only
+    // to flatten variation.
+    float graftSaturationLuma = dot(graftColor, lumaWeights);
+    graftColor = mix(
+      vec3(graftSaturationLuma), graftColor, detailGraftSaturation);
 
     float slopeSignal = 1.0 - abs(geometricNormal.z);
     float targetLand = smoothstep(0.001, 0.02, weightTotal);
@@ -189,9 +194,8 @@ const FRAGMENT_GRAFT = `
     southBlend = mix(southBlend, 1.0, detailGraftAllAspects);
     float graftBlend =
       smoothstep(detailGraftParams.y, detailGraftParams.z, slopeSignal) *
-      southBlend * detailGraftParams.w * targetLand;
-    diffuseColor.rgb = mix(
-      diffuseColor.rgb * blendToPhoto, graftColor, graftBlend);
+      southBlend * detailGraftParams.w * targetLand * fade;
+    diffuseColor.rgb = mix(diffuseColor.rgb, graftColor, graftBlend);
     graftCoverage = graftBlend;
   }
 `;
@@ -209,19 +213,18 @@ const FRAGMENT_BLEND = `
   if (detailUseUnderlying > 0.5) {
     underlayColor = texture2D(detailUnderlying, vMapUv).rgb;
   }
+  // Computed before the graft, not after: the graft needs it too. Without a
+  // distance fade the cliff material runs at full strength until the tile LOD
+  // drops below its minDepth and it vanishes at a tile edge, which reads as a
+  // hard cutoff — and it aliases into noise well before that.
+  float fade = 1.0 - smoothstep(detailParams.x, detailParams.y, vDetailDist);
   float graftCoverage = 0.0;
 ${FRAGMENT_GRAFT}
-  float fade = 1.0 - smoothstep(detailParams.x, detailParams.y, vDetailDist);
   // The flat-ground detail below carries its own material and its own shading
   // term. Where the cliff graft has taken the surface over, stacking both
   // blends two rock materials onto one face, so hand the surface across.
-  float surfaceDetailWeight = detailSurfaceEnabled * weightTotal * fade
-    * (1.0 - graftCoverage) * (1.0 - detailGraftIsolate);
-  // Tiles with no graft at all never enter the block above, so black them out
-  // here instead — isolating means only graft pixels survive.
-  if (detailGraftParams.w <= 0.001) {
-    diffuseColor.rgb *= 1.0 - detailGraftIsolate;
-  }
+  float surfaceDetailWeight =
+    detailSurfaceEnabled * weightTotal * fade * (1.0 - graftCoverage);
   if (surfaceDetailWeight > 0.001) {
     vec2 rockUv = vDetailUv * ${DETAIL_RELATIVE_PERIOD.rock.toFixed(3)};
     vec2 vegUv = vDetailUv * ${DETAIL_RELATIVE_PERIOD.vegetation.toFixed(3)};
@@ -259,6 +262,29 @@ ${FRAGMENT_GRAFT}
 }
 `;
 
+// Every input the patched uniforms are derived from. Re-applying a tile whose
+// inputs are all unchanged writes identical values and still costs a repaint,
+// so callers need to be able to tell that apart from real work.
+function detailInputSignature(context, cliffGraft, layers, tintMap) {
+  const spec = cliffGraft?.spec;
+  return [
+    context.maskTexture?.uuid,
+    context.uv.scale, context.uv.offsetX, context.uv.offsetY,
+    cliffGraft?.texture?.uuid, cliffGraft?.normalTexture?.uuid,
+    layers[1]?.texture?.uuid, layers[2]?.texture?.uuid,
+    tintMap?.uuid,
+    context.detailEnabled === false ? 0 : 1,
+    spec?.aspect, spec?.periodM, spec?.slopeStart, spec?.slopeEnd,
+    spec?.strength, spec?.phaseMix, spec?.phaseMix2, spec?.phaseVariation,
+    spec?.variationPeriodM, spec?.southStart, spec?.southEnd,
+    spec?.tintStrength, spec?.normalStrength, spec?.normalRelief,
+    spec?.reliefContrast, spec?.reliefFloor, spec?.saturation,
+  ].join('|');
+}
+
+// Returns 'patched' on the first application, 'refreshed' when an input really
+// changed, 'unchanged' when the call was redundant, or false when the mesh
+// cannot take the detail layer at all.
 export function applyTerrainDetailWebGL(mesh, context) {
   const material = mesh?.material;
   if (!material || !material.map) return false;
@@ -270,7 +296,12 @@ export function applyTerrainDetailWebGL(mesh, context) {
   const tintMap = context.tintMap ?? material.map;
   const useUnderlying = tintMap !== material.map;
   const state = material.userData;
+  const signature = detailInputSignature(
+    context, cliffGraft, cliffLayers, tintMap,
+  );
   if (state.terrainDetailUniforms) {
+    if (state.terrainDetailSignature === signature) return 'unchanged';
+    state.terrainDetailSignature = signature;
     // Material already patched — refresh the per-tile inputs in place.
     state.terrainDetailUniforms.detailMask.value = context.maskTexture;
     state.terrainDetailUniforms.detailUvScale.value = context.uv.scale;
@@ -315,6 +346,8 @@ export function applyTerrainDetailWebGL(mesh, context) {
       cliffGraft?.spec.normalStrength ?? 0;
     state.terrainDetailUniforms.detailGraftAllAspects.value =
       cliffGraft?.spec.aspect === 'all' ? 1 : 0;
+    state.terrainDetailUniforms.detailGraftSaturation.value =
+      cliffGraft?.spec.saturation ?? 1;
     state.terrainDetailUniforms.detailGraftRelief.value.set(
       cliffGraft?.spec.normalRelief ?? 1,
       cliffGraft?.spec.reliefContrast ?? 0,
@@ -328,7 +361,7 @@ export function applyTerrainDetailWebGL(mesh, context) {
       useUnderlying ? 1 : 0;
     state.terrainDetailUniforms.detailSurfaceEnabled.value =
       context.detailEnabled === false ? 0 : 1;
-    return true;
+    return 'refreshed';
   }
 
   const uniforms = {
@@ -391,6 +424,7 @@ export function applyTerrainDetailWebGL(mesh, context) {
     detailGraftAllAspects: {
       value: cliffGraft?.spec.aspect === 'all' ? 1 : 0,
     },
+    detailGraftSaturation: { value: cliffGraft?.spec.saturation ?? 1 },
     detailGraftRelief: {
       value: new THREE.Vector3(
         cliffGraft?.spec.normalRelief ?? 1,
@@ -415,10 +449,9 @@ export function applyTerrainDetailWebGL(mesh, context) {
     },
     // Shared live-tuning vector — the tuning panel mutates it in place.
     detailParams: { value: detailParams },
-    // Shared diagnostic flag — the same object the HUD toggle mutates.
-    detailGraftIsolate: graftIsolate,
   };
   state.terrainDetailUniforms = uniforms;
+  state.terrainDetailSignature = signature;
   material.onBeforeCompile = shader => {
     Object.assign(shader.uniforms, uniforms);
     shader.vertexShader = shader.vertexShader
@@ -444,7 +477,7 @@ export function applyTerrainDetailWebGL(mesh, context) {
       .replace('#include <common>', '#include <common>\n' + FRAGMENT_DECLS)
       .replace('#include <map_fragment>', '#include <map_fragment>\n' + FRAGMENT_BLEND);
   };
-  material.customProgramCacheKey = () => 'terrain-detail-v15-single-sample';
+  material.customProgramCacheKey = () => 'terrain-detail-v21-no-isolate';
   material.needsUpdate = true;
-  return true;
+  return 'patched';
 }

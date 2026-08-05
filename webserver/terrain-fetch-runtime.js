@@ -315,7 +315,10 @@ export function createTerrainFetchRuntime({
     state.serverTexturesFetching = pipeline.textureFetching;
     state.serverTexturesRetrying = pipeline.textureRetryQueue;
     state.serverTextureStatus = pipeline.textureStatusCounts;
-    return { nextAction: pipeline.nextAction };
+    return {
+      nextAction: pipeline.nextAction,
+      pollAfterMs: pipeline.pollAfterMs,
+    };
   }
 
   async function runRequest({ lat, lon }) {
@@ -331,7 +334,7 @@ export function createTerrainFetchRuntime({
           pollTimer = null;
           onPoll();
           request();
-        }, pollMs);
+        }, result.pollAfterMs ?? pollMs);
       }
     } catch (error) {
       if (controller.signal.aborted || error?.name === 'AbortError') return;

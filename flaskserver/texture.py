@@ -52,6 +52,7 @@ import datetime
 import io
 import math
 import os
+import sqlite3
 import urllib.error
 import urllib.request
 
@@ -86,7 +87,7 @@ def is_white_fill_jpeg(jpeg_bytes):
     """is_white_fill() for an encoded image. Undecodable input → False."""
     try:
         arr = np.array(Image.open(io.BytesIO(jpeg_bytes)).convert("RGB"))
-    except Exception:
+    except (OSError, TypeError, ValueError):
         return False
     return is_white_fill(arr)
 
@@ -95,7 +96,7 @@ def is_no_coverage_fill_jpeg(jpeg_bytes):
     """True when a cropped child is provider white-fill or mostly warp void."""
     try:
         arr = np.array(Image.open(io.BytesIO(jpeg_bytes)).convert("RGB"))
-    except Exception:
+    except (OSError, TypeError, ValueError):
         return False
     return is_white_fill(arr) or float((arr.max(axis=2) == 0).mean() * 100.0) > 50.0
 
@@ -445,8 +446,10 @@ def drop_procedural_children(db, tile_id):
                 "AND source = 'procedural_cook_v1'",
                 stale,
             )
-        except Exception:
-            pass  # classifier storage not initialized in this database
+        except sqlite3.OperationalError as exc:
+            if "no such table" not in str(exc).lower():
+                raise
+            # Classifier storage is optional in small/legacy databases.
         db.commit()
     return stale
 

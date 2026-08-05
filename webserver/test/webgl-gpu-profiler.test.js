@@ -99,10 +99,29 @@ test('GPU profiler remains inert when timer queries are unavailable', () => {
     sampleInterval: 1,
     pendingQueries: 0,
     disjointCount: 0,
+    cleanupErrorCount: 0,
     measuredTotalAverageMs: 0,
     wholeFrameAverageMs: null,
     passes: {},
   });
+});
+
+test('GPU profiler exposes query cleanup failures', () => {
+  const fake = createFakeRenderer();
+  const profiler = createWebGLGpuProfiler(fake.renderer, {
+    enabled: true,
+    sampleInterval: 1,
+  });
+  // The second sampled frame is the whole-frame query, which remains active
+  // until endFrame. Disabling mid-frame forces clearPending to close it.
+  profiler.beginFrame();
+  profiler.endFrame();
+  profiler.beginFrame();
+  fake.gl.endQuery = () => { throw new Error('lost WebGL context'); };
+
+  profiler.setEnabled(false);
+
+  assert.equal(profiler.getSummary().cleanupErrorCount, 1);
 });
 
 test('GPU profiler alternates aggregate and nested detail pass samples', () => {

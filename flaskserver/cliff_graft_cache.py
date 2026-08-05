@@ -11,6 +11,7 @@ import datetime
 import hashlib
 import io
 import json
+import sqlite3
 import threading
 
 import numpy as np
@@ -86,7 +87,9 @@ def _mask_dependency_rows(db, tile_id: str):
                 f"FROM {table} WHERE tile_id = ?",
                 (tile_id,),
             ).fetchone()
-        except Exception:
+        except sqlite3.OperationalError as exc:
+            if "no such table" not in str(exc).lower():
+                raise
             row = None
         rows.append((table, row))
     return rows

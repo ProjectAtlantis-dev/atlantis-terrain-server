@@ -1772,6 +1772,28 @@ test('shared fetch runtime polls pending terrain without a duplicate startup pas
   assert.equal(requests, 2);
 });
 
+test('shared fetch runtime honors the server DEM retry cooldown', async () => {
+  let scheduledDelay = null;
+  const { runtime } = createTestFetchRuntime({
+    fetchImpl: async () => ({
+      status: 200,
+      json: async () => ({
+        ox: 0, oy: 0, qx: 0, qy: 0,
+        tiles: [{ source: 'parent_resampled' }],
+        missing: [{ id: '12-1359-785' }], downloading: [], texFetching: 0,
+        demActionable: false, demRetryAfterMs: 297000,
+      }),
+    }),
+    schedulePoll: (_callback, delay) => {
+      scheduledDelay = delay;
+      return 7;
+    },
+  });
+
+  await runtime.request();
+  assert.equal(scheduledDelay, 297000);
+});
+
 test('shared fetch runtime coalesces movement without starving the latest request', async () => {
   const releases = [];
   const signals = [];

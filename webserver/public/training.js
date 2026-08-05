@@ -250,7 +250,13 @@ async function savePainted() {
     overlayImage = await loadImage(metadata.overlayUrl);
     context.drawImage(overlayImage, 0, 0);
     $('annotated-count').textContent = `${result.annotated} / ${metadata.regionCount} regions labeled`;
-    setStatus($('save-status'), `Saved ${assignments.length} region(s).`, 'ok');
+    setStatus(
+      $('save-status'),
+      result.pairError
+        ? `Saved ${assignments.length} region(s); dataset export deferred: ${result.pairError}`
+        : `Saved ${assignments.length} region(s) and updated the dataset pair.`,
+      result.pairError ? '' : 'ok',
+    );
   } catch (error) {
     setStatus($('save-status'), error.message, 'error');
   }

@@ -59,6 +59,7 @@ export function createWebGLGpuProfiler(renderer, {
   let interval = Math.max(1, Math.round(sampleInterval));
   let maxHistory = Math.max(1, Math.round(historySize));
   let disjointCount = 0;
+  let cleanupErrorCount = 0;
   let previousInfoAutoReset = null;
 
   function restoreRenderInfoReset() {
@@ -69,7 +70,11 @@ export function createWebGLGpuProfiler(renderer, {
 
   function clearPending() {
     if (activeQuery != null) {
-      try { gl.endQuery(extension.TIME_ELAPSED_EXT); } catch (_) {}
+      try {
+        gl.endQuery(extension.TIME_ELAPSED_EXT);
+      } catch (error) {
+        cleanupErrorCount += 1;
+      }
       gl.deleteQuery(activeQuery);
     }
     activeQuery = null;
@@ -274,6 +279,7 @@ export function createWebGLGpuProfiler(renderer, {
       sampleInterval: interval,
       pendingQueries: pending.length,
       disjointCount,
+      cleanupErrorCount,
       measuredTotalAverageMs: measuredTotalMs,
       wholeFrameAverageMs: passes['whole-frame']?.averageMs ?? null,
       passes,
@@ -304,6 +310,7 @@ export function createWebGLGpuProfiler(renderer, {
       restoreRenderInfoReset();
       histories.clear();
       disjointCount = 0;
+      cleanupErrorCount = 0;
     },
     getSummary,
     dispose() {

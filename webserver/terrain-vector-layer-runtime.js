@@ -14,6 +14,9 @@ export function createTerrainVectorLayerRuntime({
   endpoint, itemsKey, logLabel,
   buildGeometry,
   buildKeyForItem = item => item.id,
+  // Applies presentation-only changes to an existing mesh. Without it, such a
+  // change has to fall through to a full rebuild.
+  updateColors = null,
   bootLog = () => {}, onMutated = () => {}, requestRender = () => {},
   fetchImpl = (...args) => fetch(...args),
 }) {
@@ -34,22 +37,39 @@ export function createTerrainVectorLayerRuntime({
   }
 
   function applyItems(items) {
-    const buildKey = `${pipelineState.originX},${pipelineState.originY},`
-      + `${pipelineState.frameOffsetX},${pipelineState.frameOffsetY}:`
+    // Identity only. The frame offset is a translation and colour is a vertex
+    // attribute; folding either into this key made every step of the floating
+    // origin, and every roof colour that arrived late, re-triangulate the
+    // whole settlement. The server origin stays in it because the item
+    // coordinates themselves are expressed relative to it.
+    const buildKey = `${pipelineState.originX},${pipelineState.originY}:`
       + items.map(buildKeyForItem).join(',');
-    if (buildKey === lastBuildKey) return;
-    lastBuildKey = buildKey;
-    disposeMesh();
-    const geometry = buildGeometry(items, {
-      offsetX: pipelineState.frameOffsetX,
-      offsetY: pipelineState.frameOffsetY,
-    });
-    if (!geometry) return;
-    const material = new THREE.MeshBasicMaterial({ vertexColors: true });
-    mesh = new THREE.Mesh(geometry, material);
-    mesh.visible = visible;
-    mesh.userData[`is${logLabel}`] = true;
-    terrainRoot.add(mesh);
+    let rebuilt = false;
+    if (buildKey !== lastBuildKey) {
+      lastBuildKey = buildKey;
+      disposeMesh();
+      // Built at the origin; the frame offset is applied to the mesh below.
+      const geometry = buildGeometry(items, { offsetX: 0, offsetY: 0 });
+      if (geometry) {
+        const material = new THREE.MeshBasicMaterial({ vertexColors: true });
+        mesh = new THREE.Mesh(geometry, material);
+        mesh.visible = visible;
+        mesh.userData[`is${logLabel}`] = true;
+        terrainRoot.add(mesh);
+        rebuilt = true;
+      }
+    }
+    if (!mesh) return;
+
+    // A fresh build already carries the current colours.
+    const recoloured = rebuilt ? false : Boolean(updateColors?.(mesh.geometry, items));
+
+    const offsetX = pipelineState.frameOffsetX;
+    const offsetY = pipelineState.frameOffsetY;
+    const moved = mesh.position.x !== offsetX || mesh.position.y !== offsetY;
+    if (moved) mesh.position.set(offsetX, offsetY, 0);
+
+    if (!rebuilt && !recoloured && !moved) return;
     onMutated();
     requestRender();
   }

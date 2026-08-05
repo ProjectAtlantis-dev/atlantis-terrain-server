@@ -38,19 +38,38 @@ function roofShade(buildingId) {
 }
 
 export function buildBuildingsGeometry(buildings, {
-  offsetX = 0, offsetY = 0, exaggeration = 1,
+  offsetX = 0, offsetY = 0, exaggeration = 1, onError = () => {},
 } = {}) {
   const positions = [];
   const colors = [];
   const indices = [];
+  // Per-vertex shade and per-building vertex spans, so a roof colour that
+  // changes later can be rewritten in place instead of re-triangulating the
+  // whole settlement. Colour is presentation; it must not invalidate geometry.
+  const shades = [];
+  const ranges = [];
 
   for (const building of buildings) {
+    // Binary transport hands over a flat xyz Float32Array view; the JSON path
+    // still produces [[x, y, z], ...]. Both fan out to the same three arrays.
+    const flat = building.ringXYZ;
     const ring = building.ring;
-    if (!Array.isArray(ring) || ring.length < 3) continue;
+    const pointCount = flat instanceof Float32Array
+      ? Math.floor(flat.length / 3)
+      : (Array.isArray(ring) ? ring.length : 0);
+    if (pointCount < 3) continue;
 
-    let xs = ring.map(point => point[0] + offsetX);
-    let ys = ring.map(point => point[1] + offsetY);
-    let zs = ring.map(point => point[2] * exaggeration);
+    let xs = new Array(pointCount);
+    let ys = new Array(pointCount);
+    let zs = new Array(pointCount);
+    for (let index = 0; index < pointCount; index++) {
+      const x = flat ? flat[index * 3] : ring[index][0];
+      const y = flat ? flat[index * 3 + 1] : ring[index][1];
+      const z = flat ? flat[index * 3 + 2] : ring[index][2];
+      xs[index] = x + offsetX;
+      ys[index] = y + offsetY;
+      zs[index] = z * exaggeration;
+    }
     // Signed area > 0 means CCW, which the roof cap and wall winding assume.
     let area = 0;
     for (let index = 0; index < xs.length; index++) {
@@ -69,13 +88,16 @@ export function buildBuildingsGeometry(buildings, {
     let triangles;
     try {
       triangles = THREE.ShapeUtils.triangulateShape(contour, []);
-    } catch (_) {
+    } catch (error) {
+      onError(error, building);
       continue;
     }
-    const roofStart = positions.length / 3;
+    const buildingStart = positions.length / 3;
+    const roofStart = buildingStart;
     for (let index = 0; index < xs.length; index++) {
       positions.push(xs[index], ys[index], zs[index]);
       colors.push(...roofColor);
+      shades.push(1);
     }
     for (const [a, b, c] of triangles) {
       indices.push(roofStart + a, roofStart + b, roofStart + c);
@@ -84,7 +106,13 @@ export function buildBuildingsGeometry(buildings, {
     // Walls: one flat-shaded quad per edge, ground to per-vertex roof Z.
     for (let index = 0; index < xs.length; index++) {
       const next = (index + 1) % xs.length;
-      const shade = shadeForEdge(xs[next] - xs[index], ys[next] - ys[index]);
+      // Rounded here because it is stored in a Float32Array and read back by
+      // applyBuildingColors; using the unrounded value would make the rebuilt
+      // colour differ from the recomputed one in the last bit, and every
+      // colour pass would then look like a change.
+      const shade = Math.fround(
+        shadeForEdge(xs[next] - xs[index], ys[next] - ys[index]),
+      );
       const wallStart = positions.length / 3;
       positions.push(
         xs[index], ys[index], baseZ,
@@ -93,8 +121,15 @@ export function buildBuildingsGeometry(buildings, {
         xs[index], ys[index], zs[index],
       );
       const wallColor = roofColor.map(channel => Math.max(0, Math.min(1, channel * shade)));
-      for (let corner = 0; corner < 4; corner++) colors.push(...wallColor);
+      for (let corner = 0; corner < 4; corner++) {
+        colors.push(...wallColor);
+        shades.push(shade);
+      }
       indices.push(wallStart, wallStart + 1, wallStart + 2, wallStart, wallStart + 2, wallStart + 3);
+    }
+    const vertexCount = positions.length / 3 - buildingStart;
+    if (vertexCount > 0) {
+      ranges.push({ id: building.id, start: buildingStart, count: vertexCount });
     }
   }
 
@@ -103,21 +138,77 @@ export function buildBuildingsGeometry(buildings, {
   geometry.setAttribute('position', new THREE.BufferAttribute(new Float32Array(positions), 3));
   geometry.setAttribute('color', new THREE.BufferAttribute(new Float32Array(colors), 3));
   geometry.setIndex(indices);
+  geometry.userData.buildingRanges = ranges;
+  geometry.userData.buildingShades = new Float32Array(shades);
   // The aerial-perspective passes (NormalPass / MRT normalView) relight the
   // scene from the normal buffer; geometry without normals renders black.
   geometry.computeVertexNormals();
   return geometry;
 }
 
+/**
+ * Rewrite roof colours in place on an existing merged mesh.
+ *
+ * Roof colour arrives late and keeps changing as imagery streams in. Treating
+ * that as a geometry change re-triangulated every footprint in the settlement
+ * — 19ms and an 88k-vertex re-upload for Nuuk, once a second. Colour is a
+ * vertex attribute, so it can simply be written.
+ *
+ * Returns true when anything actually changed.
+ */
+export function applyBuildingColors(geometry, buildings) {
+  const ranges = geometry?.userData?.buildingRanges;
+  const shades = geometry?.userData?.buildingShades;
+  const attribute = geometry?.getAttribute?.('color');
+  if (!ranges || !shades || !attribute) return false;
+
+  const byId = new Map();
+  for (const building of buildings) byId.set(building.id, building);
+  const array = attribute.array;
+  let changed = false;
+  for (const { id, start, count } of ranges) {
+    const building = byId.get(id);
+    if (!building) continue;
+    const roofColor = normalizedBuildingColor(building);
+    for (let vertex = start; vertex < start + count; vertex++) {
+      const shade = shades[vertex];
+      for (let channel = 0; channel < 3; channel++) {
+        // The attribute is float32, so the stored value is rounded on write.
+        // Comparing against the unrounded double would report a change every
+        // time and re-upload the buffer on every poll.
+        const value = Math.fround(
+          Math.max(0, Math.min(1, roofColor[channel] * shade)),
+        );
+        const index = vertex * 3 + channel;
+        if (array[index] !== value) {
+          array[index] = value;
+          changed = true;
+        }
+      }
+    }
+  }
+  if (changed) attribute.needsUpdate = true;
+  return changed;
+}
+
 export function createTerrainBuildingsRuntime({
-  terrainRoot, pipelineState, exaggeration = 1, onMutated, requestRender,
+  terrainRoot, pipelineState, exaggeration = 1, bootLog = () => {},
+  onMutated, requestRender,
 }) {
   const layer = createTerrainVectorLayerRuntime({
     terrainRoot, pipelineState,
     endpoint: null, itemsKey: 'buildings', logLabel: 'Buildings',
-    buildKeyForItem: item => `${item.id}:${item.colorVersion ?? ''}:${item.color?.join(',') ?? ''}`,
+    // Identity only — colour is applied through updateColors below.
+    buildKeyForItem: item => item.id,
+    updateColors: applyBuildingColors,
     buildGeometry: (items, { offsetX, offsetY }) =>
-      buildBuildingsGeometry(items, { offsetX, offsetY, exaggeration }),
+      buildBuildingsGeometry(items, {
+        offsetX, offsetY, exaggeration,
+        onError: (error, building) => bootLog('buildings.geometry.error', {
+          buildingId: building?.id ?? null,
+          message: error?.message ?? String(error),
+        }, 'warn'),
+      }),
     onMutated, requestRender,
   });
   return {

@@ -21,7 +21,10 @@ import urllib.request
 import numpy as np
 from PIL import Image
 
+from colored_log import get_logger
 from coords import to_wgs84
+
+log = get_logger("terrain.google-ref")
 
 TILE_URL = "https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}"
 CACHE_DIR = os.path.join(os.path.dirname(__file__), "sample", "google_refs")
@@ -84,6 +87,14 @@ def google_reference(
                     (ty - ty0) * 256:(ty - ty0 + 1) * 256,
                     (tx - tx0) * 256:(tx - tx0 + 1) * 256,
                 ] = tile
-    except Exception:
+    except FileNotFoundError:
+        # Cache-only callers use absence as a normal "not exported yet" state.
+        return None
+    except OSError as exc:
+        log.warning(
+            "Google reference tile unavailable for mosaic "
+            f"z{zoom}/{tx0}-{tx1}/{ty0}-{ty1}: "
+            f"{type(exc).__name__}: {exc}"
+        )
         return None
     return mosaic[py - ty0 * 256, px - tx0 * 256]

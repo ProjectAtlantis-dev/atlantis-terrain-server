@@ -275,7 +275,11 @@ def _migrate_to_v1(db):
     ):
         try:
             confidence = np.frombuffer(zlib.decompress(blob), dtype=np.uint8)
-        except (TypeError, ValueError, zlib.error):
+        except (TypeError, ValueError, zlib.error) as exc:
+            log_db.warning(
+                f"Migration could not decode confidence map for {tile_id}: "
+                f"{type(exc).__name__}: {exc}"
+            )
             continue
         if np.any(confidence >= 7):
             reload_ids.add(tile_id)
@@ -895,7 +899,11 @@ def _migrate_to_v18(db):
     ):
         try:
             values = np.frombuffer(zlib.decompress(blob), dtype=np.float32)
-        except (TypeError, ValueError, zlib.error):
+        except (TypeError, ValueError, zlib.error) as exc:
+            log_db.warning(
+                f"Migration could not decode heightmap for {tile_id}: "
+                f"{type(exc).__name__}: {exc}"
+            )
             continue
         valid = np.isfinite(values)
         if float(np.mean(valid)) < 0.95:

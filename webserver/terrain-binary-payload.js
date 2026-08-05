@@ -50,6 +50,21 @@ export function decodeTerrainBinaryPayload(buffer) {
     );
     offset += byteLength;
   }
+
+  // Footprint rings follow the tile samples, in header order. As JSON they
+  // were the single largest thing the main thread parsed each poll; here the
+  // ring becomes a flat xyz view over the response with no copy.
+  for (const building of header.buildings ?? []) {
+    const byteLength = building.ringBytes;
+    if (!Number.isInteger(byteLength) || byteLength <= 0) continue;
+    if (offset + byteLength > buffer.byteLength) {
+      throw new RangeError(`building ring truncated for ${building.id}`);
+    }
+    building.ringXYZ = new Float32Array(
+      buffer, offset, byteLength / FLOAT32_BYTES,
+    );
+    offset += byteLength;
+  }
   return header;
 }
 

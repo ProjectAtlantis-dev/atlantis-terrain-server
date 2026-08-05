@@ -33,6 +33,7 @@ import numpy as np
 from pyproj import Transformer
 
 from colored_log import get_logger
+from terrain_config import GREENLAND_BBOX
 
 log = get_logger("terrain.buildings")
 
@@ -108,18 +109,70 @@ def source_epsg_from_prj(prj_text):
 
 
 class GroundSampler:
-    """Sample ground elevation from the deepest cached heightmap tile."""
+    """Sample ground elevation from the deepest cached heightmap tile.
 
-    def __init__(self, db):
-        self.tiles = db.execute(
-            "SELECT tile_id, depth, x_min, y_min, x_max, y_max FROM tiles "
-            "WHERE heightmap IS NOT NULL ORDER BY depth DESC"
-        ).fetchall()
+    Tiles are addressed, not scanned. The tile grid is a regular quadtree over
+    ``GREENLAND_BBOX``, so a point maps to exactly one ``(col, row)`` at each
+    depth and the deepest covering tile can be found with one dict lookup per
+    depth. The previous linear scan over every heightmap tile cost 34M bbox
+    tests per /api/tiles request (1226 buildings x 28039 tiles).
+
+    ``bbox`` restricts the loaded tile set to a region of interest. Callers
+    that sample a bounded area (the building query) should pass it; the
+    ingest path samples arbitrary points and leaves it None.
+    """
+
+    def __init__(self, db, bbox=None, index=None, cache=None):
+        """``index`` and ``cache`` let callers share the expensive parts.
+
+        The tile index and the decompressed heightmaps are immutable and
+        connection-independent, so they can be reused across requests. The
+        connection cannot: it belongs to one request and is closed when that
+        request ends. Sharing a whole sampler and rebinding ``db`` on it races
+        two concurrent requests into operating on a closed connection, so each
+        request gets its own instance over the shared data instead.
+        """
         self.db = db
-        self.cache = {}
+        self.cache = {} if cache is None else cache
+        if index is not None:
+            self._by_depth, self._depths = index
+            return
+
+        sql = (
+            "SELECT tile_id, depth, col, row, x_min, y_min, x_max, y_max "
+            "FROM tiles WHERE heightmap IS NOT NULL"
+        )
+        params: tuple = ()
+        if bbox is not None:
+            sql += " AND x_max > ? AND x_min < ? AND y_max > ? AND y_min < ?"
+            params = (bbox[0], bbox[2], bbox[1], bbox[3])
+        self._by_depth: dict[int, dict[tuple[int, int], tuple]] = {}
+        for tile_id, depth, col, row, x0, y0, x1, y1 in db.execute(sql, params):
+            self._by_depth.setdefault(depth, {})[(col, row)] = (
+                tile_id, x0, y0, x1, y1,
+            )
+        # Deepest first: the finest tile covering a point wins, as before.
+        self._depths = sorted(self._by_depth, reverse=True)
+
+    @property
+    def index(self):
+        """The connection-independent tile index, safe to share."""
+        return (self._by_depth, self._depths)
 
     def sample(self, x, y):
-        for tile_id, depth, x_min, y_min, x_max, y_max in self.tiles:
+        rx_min, ry_min, rx_max, ry_max = GREENLAND_BBOX
+        span_x = rx_max - rx_min
+        span_y = ry_max - ry_min
+        for depth in self._depths:
+            n_tiles = 1 << depth
+            col = int((x - rx_min) / span_x * n_tiles)
+            row = int((y - ry_min) / span_y * n_tiles)
+            entry = self._by_depth[depth].get((col, row))
+            if entry is None:
+                continue
+            tile_id, x_min, y_min, x_max, y_max = entry
+            # The stored bbox stays authoritative for interpolation, so a tile
+            # whose extent disagrees with the addressing still samples right.
             if not (x_min <= x < x_max and y_min <= y < y_max):
                 continue
             hm = self.cache.get(tile_id)
@@ -131,9 +184,9 @@ class GroundSampler:
                 n = int(round(len(arr) ** 0.5))
                 hm = self.cache[tile_id] = arr.reshape(n, n)
             n = hm.shape[0]
-            col = int((x - x_min) / (x_max - x_min) * (n - 1))
-            row = int((y - y_min) / (y_max - y_min) * (n - 1))  # row 0 = south
-            value = float(hm[row, col])
+            col_px = int((x - x_min) / (x_max - x_min) * (n - 1))
+            row_px = int((y - y_min) / (y_max - y_min) * (n - 1))  # row 0 = south
+            value = float(hm[row_px, col_px])
             if np.isnan(value):
                 continue
             return value

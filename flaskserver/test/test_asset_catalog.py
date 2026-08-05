@@ -112,6 +112,23 @@ class AssetCatalogTest(unittest.TestCase):
             )
             db.close()
 
+    def test_building_query_does_not_hide_schema_errors(self):
+        db = sqlite3.connect(":memory:")
+        with self.assertRaises(sqlite3.OperationalError):
+            query_asset_by_type(db, "BYGNING", 15, 15, 20)
+        db.close()
+
+    def test_building_query_does_not_hide_corrupt_properties(self):
+        db = sqlite3.connect(":memory:")
+        db.executescript(SCHEMA)
+        db.execute(
+            "INSERT INTO assets VALUES "
+            "('b','BYGNING',1,0,0,0,3,'not-json',NULL,'now',15,15,10,10,20,20)"
+        )
+        with self.assertRaises(json.JSONDecodeError):
+            query_asset_by_type(db, "BYGNING", 15, 15, 20)
+        db.close()
+
     def test_road_is_painted_in_tile_pixel_coordinates(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "assets.db"
@@ -221,6 +238,16 @@ class AssetCatalogTest(unittest.TestCase):
         self.assertEqual(building["colorVersion"], "12-1-1:v1")
         self.assertGreater(building["color"][2], building["color"][1])
         self.assertGreater(building["color"][1], building["color"][0])
+        db.close()
+
+    def test_building_color_does_not_hide_texture_schema_errors(self):
+        db = sqlite3.connect(":memory:")
+        building = {
+            "id": "b", "groundZ": 0,
+            "ring": [[40, 40, 10], [60, 40, 10], [60, 60, 10]],
+        }
+        with self.assertRaises(sqlite3.OperationalError):
+            color_buildings_from_textures(db, [building], 0, 0)
         db.close()
 
 

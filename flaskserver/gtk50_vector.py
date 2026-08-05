@@ -79,7 +79,11 @@ def block_is_usable(block: str) -> bool:
     invalidate_block_cache(block)
     try:
         parsed = _load_block(block)
-    except Exception:
+    except Exception as exc:
+        log_vec.warning(
+            f"[gtk50] block {block} is unreadable: "
+            f"{type(exc).__name__}: {exc}"
+        )
         return False
     if parsed is None:
         return False
@@ -163,8 +167,10 @@ def _load_block(block: str):
         for table, target in (("tidalwater_s", water), ("island_s", islands)):
             try:
                 rows = db.execute(f'SELECT geom FROM "{table}"').fetchall()
-            except sqlite3.OperationalError:
-                continue
+            except sqlite3.OperationalError as exc:
+                if "no such table" in str(exc).lower():
+                    continue
+                raise
             for (blob,) in rows:
                 if blob is None:
                     continue
@@ -207,8 +213,10 @@ def _load_structures(block: str):
                     f'SELECT id, geom, heightabovesurfacelevel, '
                     f'COALESCE(id_lokalid, CAST(id AS TEXT)) FROM "{table}"'
                 ).fetchall()
-            except sqlite3.OperationalError:
-                continue
+            except sqlite3.OperationalError as exc:
+                if "no such table" in str(exc).lower():
+                    continue
+                raise
             for row_id, blob, raw_height, local_id in rows:
                 if blob is None:
                     continue

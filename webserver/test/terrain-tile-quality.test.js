@@ -39,6 +39,30 @@ test('retryable synthetic heightmaps keep browser reconciliation polling alive',
   );
 });
 
+test('server DEM cooldown delays synthetic reconciliation polling', () => {
+  const status = terrainPipelineStatus({
+    tiles: [{ source: 'parent_resampled' }],
+    missing: [{ id: '12-1359-785' }],
+    downloading: [],
+    demActionable: false,
+    demRetryAfterMs: 297000,
+  });
+  assert.equal(status.nextAction, 'poll');
+  assert.equal(status.pollAfterMs, 297000);
+});
+
+test('actionable terrain work keeps the normal polling cadence', () => {
+  const status = terrainPipelineStatus({
+    tiles: [{ source: 'parent_resampled' }],
+    missing: [{ id: '12-1359-785' }],
+    downloading: [],
+    demActionable: true,
+    demRetryAfterMs: null,
+  });
+  assert.equal(status.nextAction, 'poll');
+  assert.equal(status.pollAfterMs, null);
+});
+
 test('late terrain data upgrades exact resident tiles without changing topology', () => {
   const current = [
     {

@@ -45,13 +45,6 @@ export const detailParams = new THREE.Vector3(
   DETAIL_FADE_START_M, DETAIL_FADE_END_M, DETAIL_STRENGTH,
 );
 
-// Diagnostic: render the cliff graft material alone against black, with no
-// orthophoto underneath and no tint or tone matching to the surrounding
-// terrain. Judging the material through the blend hides whether a fault is in
-// the material or in how it is being married to the photo. Shared and mutated
-// in place, exactly like detailParams, so it doubles as the uniform itself.
-export const graftIsolate = { value: 0 };
-
 export function setDetailTuning({ strength, fadeEnd } = {}) {
   if (strength != null) detailParams.z = strength;
   if (fadeEnd != null) {
@@ -151,19 +144,30 @@ function tilingFbm(u, v, baseCells, octaves, seed, persistence = 0.5) {
   return sum / total;
 }
 
-function configureTilingTexture(texture) {
+// Procedurally built textures own their pixels before this runs; loaded ones
+// do not, so they must not be marked for update yet.
+function configureTilingTexture(texture, { hasPixels = true } = {}) {
   texture.wrapS = THREE.RepeatWrapping;
   texture.wrapT = THREE.RepeatWrapping;
   texture.magFilter = THREE.LinearFilter;
   texture.minFilter = THREE.LinearMipmapLinearFilter;
   texture.generateMipmaps = true;
   texture.colorSpace = THREE.NoColorSpace;
-  texture.needsUpdate = true;
+  if (hasPixels) texture.needsUpdate = true;
   return texture;
 }
 
 function loadTilingTexture(url, colorSpace) {
-  const texture = configureTilingTexture(new THREE.TextureLoader().load(url));
+  // TextureLoader hands back an image-less texture immediately and fills it in
+  // asynchronously. Marking that for update makes three.js attempt an upload
+  // with nothing to upload — once per frame, per texture, until the image
+  // lands — which it reports as "Texture marked for update but no image data
+  // found". The loader sets needsUpdate itself once the pixels are actually
+  // there, so the flag must wait for its callback.
+  const texture = new THREE.TextureLoader().load(url, loaded => {
+    loaded.needsUpdate = true;
+  });
+  configureTilingTexture(texture, { hasPixels: false });
   texture.colorSpace = colorSpace;
   return texture;
 }

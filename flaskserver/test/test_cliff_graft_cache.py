@@ -9,6 +9,7 @@ from PIL import Image
 from classifier.storage import COARSE_V2_SCHEMA
 from cliff_graft_cache import (
     CLIFF_GRAFT_ASSET_VERSION,
+    _mask_dependency_rows,
     get_or_create_cliff_graft_asset,
     init_cliff_graft_assets,
 )
@@ -112,6 +113,14 @@ class CliffGraftCacheTest(unittest.TestCase):
             "SELECT COUNT(*) FROM cliff_graft_assets",
         ).fetchone()[0]
         self.assertEqual(count, 0)
+
+    def test_mask_dependency_query_does_not_bury_database_failures(self):
+        class BrokenDatabase:
+            def execute(self, *_args, **_kwargs):
+                raise sqlite3.OperationalError("database is locked")
+
+        with self.assertRaisesRegex(sqlite3.OperationalError, "locked"):
+            _mask_dependency_rows(BrokenDatabase(), "12-1-1")
 
 
 if __name__ == "__main__":

@@ -263,18 +263,20 @@ def regression_case_summaries() -> list[dict[str, Any]]:
         tile_id = str(case.get("tile", ""))
         metrics_path = Path(regression_cases.OUT_DIR) / tile_id / "metrics.json"
         metrics = None
+        metrics_error = None
         if metrics_path.exists():
             try:
                 with metrics_path.open() as handle:
                     metrics = json.load(handle)
-            except (OSError, ValueError):
-                metrics = None
+            except (OSError, ValueError) as exc:
+                metrics_error = f"{type(exc).__name__}: {exc}"
         summaries.append({
             "tile": tile_id,
             "note": str(case.get("note", "")),
             "flaggedAt": case.get("flagged_at"),
             "baked": metrics is not None,
             "metrics": metrics,
+            "metricsError": metrics_error,
             "textureUrl": (
                 f"/api/regression/{tile_id}/step_01_texture.png"
                 if metrics is not None else None

@@ -62,7 +62,10 @@ test('graft loader composes the configured Poly Haven color and normal sources',
   )));
   assert.ok(requestedUrls.some(url => url.includes('marble_rock_03_diff_1k')));
   assert.ok(requestedUrls.some(url => url.includes('marble_rock_03_nor_gl_1k')));
-  assert.equal(imageReads, 0);
+  // Exactly one readback: the albedo is colour-balanced to Greenland granite
+  // at load time. The normal map must never be read back — scaling direction
+  // channels would tilt every normal it encodes.
+  assert.equal(imageReads, 1);
   assert.equal(asset.source, 'marble-rock-03');
   assert.equal(asset.layers.length, 1);
   asset.texture.dispose();

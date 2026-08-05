@@ -24,6 +24,7 @@ from typing import Any, cast
 import asyncio
 
 from colored_log import get_logger
+from buildings_query import buildings_for_tile_query, pack_buildings
 from classifier_job_control import (
   ClassifierJobControl,
   classifier_inventory,
@@ -186,8 +187,11 @@ if not _client_log.handlers:
           f"{self._PHASE_COLOR}{phase}{self._RESET} "
           f"{pretty}"
         )
-      except Exception:
-        return f"{self._DIM}{ts}{self._RESET} {color}[{level}]{self._RESET} {msg}"
+      except Exception as exc:
+        return (
+          f"{self._DIM}{ts}{self._RESET} {color}[{level}]{self._RESET} "
+          f"{msg} [formatter fallback: {type(exc).__name__}: {exc}]"
+        )
 
   _client_handler.setFormatter(_ClientColorFormatter())
   _client_log.addHandler(_client_handler)
@@ -571,9 +575,18 @@ _cog_fetched_total = 0      # lifetime count of COG tiles fetched from S3
 _cog_skipped_total = 0      # lifetime count of tiles skipped (already had data)
 _cog_already_fetched: set[str] = set()  # tile IDs we've already fetched this session
 _cog_synthetic_retry_at: dict[str, float] = {}
+_cog_failure_retry_at: dict[str, float] = {}
+_cog_failure_attempts: dict[str, int] = {}
 _COG_TILE_WORKERS = max(1, _env_int("COG_TILE_WORKERS", 6))
 _COG_SYNTHETIC_RETRY_SECONDS = max(
   1, _env_int("COG_SYNTHETIC_RETRY_SECONDS", 300)
+)
+_COG_FAILURE_RETRY_BASE_SECONDS = max(
+  1, _env_int("COG_FAILURE_RETRY_BASE_SECONDS", 5)
+)
+_COG_FAILURE_RETRY_MAX_SECONDS = max(
+  _COG_FAILURE_RETRY_BASE_SECONDS,
+  _env_int("COG_FAILURE_RETRY_MAX_SECONDS", 300),
 )
 _cog_pool = ThreadPoolExecutor(max_workers=_COG_TILE_WORKERS)
 _cog_audit_lock = threading.Lock()
@@ -743,6 +756,14 @@ def _fetch_one_cog_tile(tile_id, bbox, origin="viewer"):
       ),
     )
 
+    if data is None and src_name == "official_ocean":
+      log_cog.info(
+        f"[tile-audit] tile={tile_id} stage=dem_completed "
+        f"origin={origin} outcome=official_ocean provider=arcticdem"
+      )
+      _mark_official_ocean(db, tile_id)
+      return "fetched"
+
     if data is None:
       # A child whose source COG is empty may depend on a parent currently in
       # flight. Put it back into the live queue instead of blocking a worker or
@@ -793,18 +814,16 @@ def _fetch_one_cog_tile(tile_id, bbox, origin="viewer"):
       )
       return "skipped"
   except Exception as exc:
-    log_cog.warning(
+    log_cog.error(
       f"[COG FETCH] {tile_id}: {type(exc).__name__}: {exc}"
     )
-    try:
-      log_cog.info(
-        f"[tile-audit] tile={tile_id} stage=dem_completed "
-        f"origin={origin} outcome=error error={type(exc).__name__}"
-      )
-      mark_no_data(db, tile_id)
-    except Exception:
-      pass
-    return "no_data"
+    log_cog.info(
+      f"[tile-audit] tile={tile_id} stage=dem_completed "
+      f"origin={origin} outcome=error error={type(exc).__name__}"
+    )
+    # An operational failure is not evidence that the provider has no data.
+    # Keep the tile eligible, but let the scheduler apply bounded backoff.
+    return "retry"
   finally:
     db.close()
 
@@ -831,22 +850,39 @@ def _finish_cog_tile(tile_id, bbox, origin, future):
     outcome = future.result()
   except Exception as exc:  # pragma: no cover - defensive executor boundary
     log_cog.error(f"[COG worker] {tile_id}: {type(exc).__name__}: {exc}")
-    outcome = "no_data"
+    outcome = "retry"
 
   with _cog_scheduler_lock:
     _cog_fetching_tiles.discard(tile_id)
     if outcome == "defer":
+      # Dependency deferrals become eligible on the next demand refresh. Do
+      # not resubmit inside this completion callback: the dependency may still
+      # be running, which otherwise creates a millisecond-fast loop.
       _cog_already_fetched.discard(tile_id)
-      if tile_id in _cog_demand_ids:
-        _cog_pending_tiles[tile_id] = (bbox, origin)
+    elif outcome == "retry":
+      attempts = _cog_failure_attempts.get(tile_id, 0) + 1
+      delay = min(
+        _COG_FAILURE_RETRY_BASE_SECONDS * (2 ** min(attempts - 1, 20)),
+        _COG_FAILURE_RETRY_MAX_SECONDS,
+      )
+      _cog_failure_attempts[tile_id] = attempts
+      _cog_failure_retry_at[tile_id] = time.time() + delay
+      log_cog.warning(
+        f"[tile-audit] tile={tile_id} stage=dem_retry_scheduled "
+        f"origin={origin} attempt={attempts} delay_s={delay}"
+      )
     elif outcome == "cook_deferred":
       # Eligible again, but only the next demand refresh re-queues it —
       # by then the measured parent this cook was waiting on may exist.
       _cog_already_fetched.discard(tile_id)
     elif outcome == "fetched":
       _cog_synthetic_retry_at.pop(tile_id, None)
+      _cog_failure_retry_at.pop(tile_id, None)
+      _cog_failure_attempts.pop(tile_id, None)
       _cog_fetched_total += 1
     elif outcome == "synthetic":
+      _cog_failure_retry_at.pop(tile_id, None)
+      _cog_failure_attempts.pop(tile_id, None)
       _cog_fetched_total += 1
       _cog_synthetic_retry_at[tile_id] = (
         time.time() + _COG_SYNTHETIC_RETRY_SECONDS
@@ -856,7 +892,12 @@ def _finish_cog_tile(tile_id, bbox, origin, future):
         f"origin={origin} delay_s={_COG_SYNTHETIC_RETRY_SECONDS}"
       )
     elif outcome == "skipped":
+      _cog_failure_retry_at.pop(tile_id, None)
+      _cog_failure_attempts.pop(tile_id, None)
       _cog_skipped_total += 1
+    elif outcome == "no_data":
+      _cog_failure_retry_at.pop(tile_id, None)
+      _cog_failure_attempts.pop(tile_id, None)
     _fill_cog_workers_locked()
 
 
@@ -865,8 +906,18 @@ def _schedule_cog_demand(
 ):
   """Replace unstarted work with the latest camera-priority ordering."""
   global _cog_pending_tiles, _cog_demand_ids
+  missing_ids = {tile_id for tile_id, _ in missing}
   with _cog_scheduler_lock:
     now = time.time()
+    missing_ids = {tile_id for tile_id, _ in missing}
+    for tile_id, retry_at in list(_cog_failure_retry_at.items()):
+      if tile_id not in missing_ids or retry_at > now:
+        continue
+      _cog_failure_retry_at.pop(tile_id, None)
+      _cog_already_fetched.discard(tile_id)
+      log_cog.info(
+        f"[tile-audit] tile={tile_id} stage=dem_retry_due origin={origin}"
+      )
     visible_retry_bboxes = dict(visible_synthetic)
     due_retries = []
     for tile_id, retry_at in list(_cog_synthetic_retry_at.items()):
@@ -884,6 +935,7 @@ def _schedule_cog_demand(
       tile_id: (bbox, origin) for tile_id, bbox in demand
       if tile_id not in _cog_already_fetched
       and tile_id not in _cog_fetching_tiles
+      and _cog_failure_retry_at.get(tile_id, 0) <= now
     }
     _fill_cog_workers_locked()
     return len(_cog_fetching_tiles), len(_cog_pending_tiles)
@@ -957,8 +1009,10 @@ def _bootstrap_backend() -> None:
         "UPDATE textures SET source = 'cooked_upscale' "
         "WHERE source = 'fractal_upscale'"
       )
-    except sqlite3.OperationalError:
-      pass  # fresh database — textures table not created yet
+    except sqlite3.OperationalError as exc:
+      if "no such table" not in str(exc).lower():
+        raise
+      # Fresh database — textures table not created yet.
     db.commit()
 
     # Cooked DEMs and cooked deep textures are derived artifacts: when the
@@ -993,8 +1047,10 @@ def _bootstrap_backend() -> None:
         ).fetchone()[0]
         if stale_textures:
           db.execute("DELETE FROM textures WHERE source = 'cooked_upscale'")
-      except sqlite3.OperationalError:
-        pass  # fresh database — textures table not created yet
+      except sqlite3.OperationalError as exc:
+        if "no such table" not in str(exc).lower():
+          raise
+        # Fresh database — textures table not created yet.
       db.execute(
         "INSERT OR REPLACE INTO metadata (key, value) "
         "VALUES ('macro_terrain_version', ?)",
@@ -1007,10 +1063,7 @@ def _bootstrap_backend() -> None:
         f"cooked_upscale textures for recook"
       )
 
-    try:
-      no_data_count = load_no_data_cache(db)
-    except Exception:
-      no_data_count = 0
+    no_data_count = load_no_data_cache(db)
 
     db.close()
 
@@ -1739,60 +1792,9 @@ def _queue_texture_fetch(
 
 
 _api_tiles_state: dict[str, str | None] = {"last_result": None}
-_BUILDING_QUERY_RANGE_M = 25000.0
-
-
-def _buildings_for_tile_query(qx: float, qy: float, ox: float, oy: float):
-  """Resolve scene buildings as part of the terrain-tile transaction."""
-  from asset_catalog import color_buildings_from_textures, query_asset_by_type
-  from gtk50_vector import query_structures
-  from ingest_buildings import GroundSampler, SOURCE_LAYER
-
-  building_assets = query_asset_by_type(
-    _get_assets_db(), SOURCE_LAYER, qx, qy, _BUILDING_QUERY_RANGE_M
-  )
-  buildings = []
-  for asset in building_assets:
-    props = asset["properties"]
-    ring = props.get("ring")
-    if not isinstance(ring, list) or len(ring) < 3:
-      continue
-    buildings.append({
-      "id": asset["id"],
-      "sourceLayer": props.get("sourceLayer"),
-      "sourceProperties": props.get("sourceProperties"),
-      "groundZ": props.get("groundZ", 0),
-      "ring": [[point[0] - ox, point[1] - oy, point[2]] for point in ring],
-    })
-  bbox = (
-    qx - _BUILDING_QUERY_RANGE_M, qy - _BUILDING_QUERY_RANGE_M,
-    qx + _BUILDING_QUERY_RANGE_M, qy + _BUILDING_QUERY_RANGE_M,
-  )
-  gtk50 = query_structures(
-    bbox, ground_sampler=GroundSampler(_get_db()), ox=ox, oy=oy,
-  )
-  # Asiaq's surveyed PolygonZ is the higher-detail authority inside towns.
-  # Suppress a coarse GTK50 footprint when its centre falls into an Asiaq
-  # footprint's bounds, avoiding doubled walls and overlapping roofs.
-  asiaq_bounds: dict[tuple[int, int], list[tuple[float, float, float, float]]] = {}
-  index_cell_m = 100.0
-  for building in buildings:
-    xs = [point[0] for point in building["ring"]]
-    ys = [point[1] for point in building["ring"]]
-    bounds = (min(xs) - 2, min(ys) - 2, max(xs) + 2, max(ys) + 2)
-    for ix in range(math.floor(bounds[0] / index_cell_m), math.floor(bounds[2] / index_cell_m) + 1):
-      for iy in range(math.floor(bounds[1] / index_cell_m), math.floor(bounds[3] / index_cell_m) + 1):
-        asiaq_bounds.setdefault((ix, iy), []).append(bounds)
-  for structure in gtk50:
-    cx, cy = structure.pop("_center")
-    candidates = asiaq_bounds.get(
-      (math.floor(cx / index_cell_m), math.floor(cy / index_cell_m)), []
-    )
-    if any(x0 <= cx <= x1 and y0 <= cy <= y1 for x0, y0, x1, y1 in candidates):
-      continue
-    buildings.append(structure)
-  color_buildings_from_textures(_get_db(), buildings, ox, oy)
-  return buildings
+# Downloading GTK50 packages is slow, so keep prefetch well ahead of what is
+# rendered — the data should already be cached by the time you fly into it.
+_GTK50_PREFETCH_RANGE_M = 25000.0
 
 
 @app.get("/api/tiles")
@@ -1801,6 +1803,16 @@ def api_tiles():
   unavailable = _terrain_unavailable_response()
   if unavailable is not None:
     return unavailable
+
+  # DIAGNOSTIC (temporary): stage timings for the ~840ms /api/tiles response.
+  # The tile query itself measures ~50ms, so the cost is elsewhere in here.
+  _t_stages: list[tuple[str, float]] = []
+  _t_last = [time.perf_counter()]
+
+  def _mark(name: str) -> None:
+    now = time.perf_counter()
+    _t_stages.append((name, (now - _t_last[0]) * 1000.0))
+    _t_last[0] = now
 
   error = _arg_float("error", 0.0005)
   # Only an untagged viewer request may drive terrain/coastline below the
@@ -1857,6 +1869,8 @@ def api_tiles():
     log.error(f"[/api/tiles] query FAILED: {type(exc).__name__}: {exc}")
     return jsonify({"error": f"tile query failed: {type(exc).__name__}: {exc}"}), 500
 
+  _mark("query_tiles")
+
   # A global derived reset retains origin DEMs, so those tiles do not pass
   # through the COG worker that normally performs coastline preflight. Make
   # visible camera demand restore the missing contract-depth masks explicitly.
@@ -1877,6 +1891,7 @@ def api_tiles():
   coastline_active, coastline_pending = _schedule_coastline_demand(
     _get_db(), coastline_targets,
   )
+  _mark("coastline_sched")
 
   _tiles_result_key = f"{len(tiles)}:{len(missing)}:{qx:.0f}:{qy:.0f}"
   if _api_tiles_state["last_result"] != _tiles_result_key:
@@ -1895,7 +1910,9 @@ def api_tiles():
       r //= 2
       check_ids.add(f"{d}-{c}-{r}")
 
+  _mark("ancestor_ids")
   texture_sources = _texture_sources_in(_get_db(), list(check_ids))
+  _mark("texture_sources")
   texture_ids = set(texture_sources)
   with _tex_fetching_lock:
     tex_fetching = list(_tex_fetching)
@@ -1966,6 +1983,8 @@ def api_tiles():
       }
     )
 
+  _mark("pack_tiles")
+
   missing_data = []
   for tid, bbox in missing:
     missing_data.append(
@@ -1986,6 +2005,36 @@ def api_tiles():
   active_cog, pending_cog = _schedule_cog_demand(
     missing, visible_synthetic, origin=demand_origin
   )
+  _mark("dem_cog_sched")
+  # A parent fallback is useful immediately but is only eligible for another
+  # provider attempt after the scheduler cooldown. Tell the browser whether
+  # DEM work is actionable now and, if not, when it should wake. Without this
+  # distinction it polls every few seconds throughout the 300-second backoff.
+  missing_ids = {tile_id for tile_id, _ in missing}
+  with _cog_scheduler_lock:
+    now = time.time()
+    visible_synthetic_ids = {tile_id for tile_id, _ in visible_synthetic}
+    delayed_visible_retries = {
+      tile_id: retry_at
+      for tile_id, retry_at in _cog_synthetic_retry_at.items()
+      if tile_id in visible_synthetic_ids and retry_at > now
+    }
+    delayed_failure_retries = {
+      tile_id: retry_at
+      for tile_id, retry_at in _cog_failure_retry_at.items()
+      if tile_id in missing_ids and retry_at > now
+    }
+  dem_actionable = bool(active_cog or pending_cog) or any(
+    tile_id not in delayed_failure_retries for tile_id in missing_ids
+  )
+  delayed_retry_times = [
+    *delayed_visible_retries.values(), *delayed_failure_retries.values(),
+  ]
+  dem_retry_after_ms = (
+    max(1_000, int((min(delayed_retry_times) - now) * 1_000))
+    if delayed_retry_times and not dem_actionable
+    else None
+  )
   if missing:
     log_cog.debug(
       f"[COG scheduler] {active_cog} active, {pending_cog} priority-queued"
@@ -2002,6 +2051,7 @@ def api_tiles():
       _get_db(), all_tile_ids
     )
   bathymetry_status = _bathymetry_demand.status()
+  _mark("bathymetry_sched")
 
   # Asiaq publishes one vector archive per settlement. Only real viewer
   # movement may acquire one; synthetic bathymetry sweeps must not populate
@@ -2010,55 +2060,45 @@ def api_tiles():
   grundkort_scheduled = []
   grundkort_inflight = []
   if demand_origin == "viewer":
-    try:
-      import grundkort
-      grundkort_scheduled = grundkort.request_for_point(qx, qy)
-      grundkort_inflight = grundkort.demand_status()["inflight"]
-    except Exception as exc:
-      log.warning(
-        f"[/api/tiles] Grundkort demand FAILED: {type(exc).__name__}: {exc}"
-      )
-    try:
-      import gtk50_demand
-      gtk50_demand.request_for_bbox((
-        qx - _BUILDING_QUERY_RANGE_M, qy - _BUILDING_QUERY_RANGE_M,
-        qx + _BUILDING_QUERY_RANGE_M, qy + _BUILDING_QUERY_RANGE_M,
-      ))
-    except Exception as exc:
-      log.warning(
-        f"[/api/tiles] GTK50 structure demand FAILED: {type(exc).__name__}: {exc}"
-      )
+    import grundkort
+    grundkort_scheduled = grundkort.request_for_point(qx, qy)
+    grundkort_inflight = grundkort.demand_status()["inflight"]
+    import gtk50_demand
+    gtk50_demand.request_for_bbox((
+      qx - _GTK50_PREFETCH_RANGE_M, qy - _GTK50_PREFETCH_RANGE_M,
+      qx + _GTK50_PREFETCH_RANGE_M, qy + _GTK50_PREFETCH_RANGE_M,
+    ))
 
-  try:
-    buildings = _buildings_for_tile_query(qx, qy, ox, oy)
-  except Exception as exc:
-    # Terrain delivery remains usable if the optional asset catalog is being
-    # rebuilt. Omit the field so the client preserves its current mesh.
-    buildings = None
-    log.warning(
-      f"[/api/tiles] building query FAILED: {type(exc).__name__}: {exc}"
-    )
+  _mark("grundkort_sched")
+  buildings = buildings_for_tile_query(
+    _get_db(), _get_assets_db(), qx, qy, ox, oy,
+  )
+  _mark("buildings_query")
 
   # Building footprints dominate the response once heightmaps move to binary —
   # thousands of polygon rings, re-serialized on every poll even when the
   # camera has not moved far enough to change the set. The client echoes back
   # the digest it already holds, so an unchanged set costs one field instead
   # of megabytes of JSON it would only parse and discard.
-  buildings_hash = None
-  if buildings is not None:
-    buildings_hash = f"{zlib.crc32(json.dumps(buildings, separators=(',', ':'), sort_keys=True).encode('utf-8')) & 0xFFFFFFFF:08x}"
-    if buildings_hash == request.args.get("buildingsHash"):
-      buildings = None
-      buildings_unchanged = True
-    else:
-      buildings_unchanged = False
-  else:
-    buildings_unchanged = False
+  buildings, ring_blobs, buildings_hash = pack_buildings(
+    buildings, binary_heightmaps,
+  )
+  buildings_unchanged = (
+    buildings_hash is not None
+    and buildings_hash == request.args.get("buildingsHash")
+  )
+  if buildings_unchanged:
+    buildings = None
+    ring_blobs = []
+
+  _mark("buildings_hash")
 
   payload = {
       "tiles": tile_data,
       "missing": missing_data,
       "downloading": downloading,
+      "demActionable": dem_actionable,
+      "demRetryAfterMs": dem_retry_after_ms,
       "qx": qx,
       "qy": qy,
       "ox": ox,
@@ -2084,15 +2124,31 @@ def api_tiles():
   if not binary_heightmaps:
     return jsonify(payload)
 
-  # [uint32 LE header length][header JSON + pad][float32 samples, tile order]
+  # [uint32 LE header length][header JSON + pad][float32 tile samples, tile
+  #  order][float32 building rings, building order]
   #
   # The header is padded to a 4-byte boundary so the sample block starts
   # aligned: a browser cannot create a Float32Array view over an unaligned
   # offset, and copying to realign would give back the win. Trailing spaces
-  # are insignificant whitespace to any JSON parser.
+  # are insignificant whitespace to any JSON parser. Every block is a whole
+  # number of float32s, so each following block stays aligned too.
   header = json.dumps(payload, separators=(",", ":")).encode("utf-8")
   header += b" " * (-(len(header) + 4) % 4)
-  body = b"".join([struct.pack("<I", len(header)), header, *heightmap_blobs])
+  body = b"".join([
+    struct.pack("<I", len(header)), header, *heightmap_blobs, *ring_blobs,
+  ])
+  _mark("serialize")
+  log.info(
+    "[/api/tiles TIMING] total=%.0fms  %s  | tiles=%d reused=%d buildings=%s "
+    "unchanged=%s clientSentHash=%s header=%.2fMB samples=%.2fMB rings=%.2fMB",
+    sum(ms for _, ms in _t_stages),
+    "  ".join(f"{name}={ms:.0f}" for name, ms in _t_stages if ms >= 1.0),
+    len(tile_data), tile_reused,
+    len(buildings) if buildings is not None else None,
+    buildings_unchanged, request.args.get("buildingsHash") is not None,
+    len(header) / 1e6, sum(len(b) for b in heightmap_blobs) / 1e6,
+    sum(len(b) for b in ring_blobs) / 1e6,
+  )
   return app.response_class(
     body,
     mimetype="application/octet-stream",
@@ -2859,8 +2915,12 @@ def api_classifier_tile(tile_id: str):
       if depth == 0:
         if effective_water is not None:
           break
+        # 204, not 404: never-classified ground is a normal state, not an
+        # error, and the browser writes a console line for every 404 it sees.
+        # One per newly visible tile floods the console while flying, and
+        # that logging is itself a main-thread stall.
         return Response(
-          b"", status=404,
+          b"", status=204,
           headers={"Cache-Control": "no-store", "X-Classifier-Status": "missing"},
         )
       depth -= 1
@@ -3273,15 +3333,22 @@ def api_classifier_training_annotate(tile_id: str):
         allow_network=False,
       )
       pair_updated = True
-    except (FileNotFoundError, ValueError):
+    except (FileNotFoundError, ValueError) as exc:
       # The annotation is authoritative even when its reference pair has not
       # been cached yet; the next explicit export will materialize it.
-      pass
+      pair_error = f"{type(exc).__name__}: {exc}"
+      log.info(
+        f"[classifier-training] {tile_id}: annotation saved but pair export "
+        f"deferred ({pair_error})"
+      )
+    else:
+      pair_error = None
     return jsonify({
       "ok": True,
       "annotations": {str(key): value for key, value in annotations.items()},
       "annotated": len(annotations),
       "pairUpdated": pair_updated,
+      "pairError": pair_error,
     })
   except (TypeError, ValueError) as exc:
     return jsonify({"error": str(exc)}), 400
@@ -3686,12 +3753,7 @@ def api_client_log():
     payload = {k: v for k, v in payload.items() if v is not None}
     if "phase" not in payload:
       payload["phase"] = "client.log"
-    try:
-      line = json.dumps(payload, ensure_ascii=False, default=str)
-    except Exception:
-      line = json.dumps(
-        {"phase": payload.get("phase", "client.log"), "serializeError": True},
-      )
+    line = json.dumps(payload, ensure_ascii=False, default=str)
     if len(line) > 20000:
       line = line[:20000] + "...<truncated>"
     _client_log.log(_client_log_level(item.get("level")), line)
@@ -3808,7 +3870,11 @@ async def _ws_broadcaster() -> None:
     for ws in list(_ws_clients):
       try:
         await ws.send(msg)
-      except Exception:
+      except Exception as exc:
+        log.debug(
+          f"[WS] dropping client after send failed: "
+          f"{type(exc).__name__}: {exc}"
+        )
         dead.add(ws)
     for ws in dead:
       _ws_clients.discard(ws)
@@ -3819,8 +3885,10 @@ async def _ws_handler(websocket) -> None:
   _ws_clients.add(websocket)
   try:
     await websocket.wait_closed()
-  except Exception:
-    pass
+  except Exception as exc:
+    log.debug(
+      f"[WS] client close raised {type(exc).__name__}: {exc}"
+    )
   finally:
     _ws_clients.discard(websocket)
     log.info(f"[WS] client disconnected, total={len(_ws_clients)}")
@@ -3854,8 +3922,16 @@ def terrain_health():
   try:
     row = _get_db().execute("SELECT COUNT(*) FROM tiles").fetchone()
     tile_rows = int(row[0]) if row else 0
-  except Exception:
-    tile_rows = 0
+  except Exception as exc:
+    log.error(
+      f"[health] terrain database check failed: {type(exc).__name__}: {exc}"
+    )
+    return jsonify({
+      "ok": False,
+      "dbPath": str(DB_PATH),
+      "dbExists": db_exists,
+      "error": f"{type(exc).__name__}: {exc}",
+    }), 500
 
   return jsonify(
     {

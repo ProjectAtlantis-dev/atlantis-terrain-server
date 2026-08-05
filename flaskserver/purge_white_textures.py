@@ -83,7 +83,7 @@ def main() -> None:
         ).fetchone()[0]
         try:
             arr = np.array(Image.open(io.BytesIO(blob)).convert("RGB"))
-        except Exception:
+        except (OSError, TypeError, ValueError):
             undecodable += 1
             doomed.append(tile_id)
             by_source[source] = by_source.get(source, 0) + 1

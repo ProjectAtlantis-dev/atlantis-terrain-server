@@ -91,3 +91,43 @@ test('detects the binary transport from response headers', () => {
     headers: { get: () => 'application/json' },
   }), false);
 });
+
+test('decodes building rings into flat xyz views after the tile samples', () => {
+  const buffer = encodePayload({
+    tiles: [{ id: '12-1-1', heightmap: 'aaaa1111', heightmapBytes: 8 }],
+    buildings: [
+      { id: 'b1', groundZ: 3, ringBytes: 36 },
+      { id: 'b2', groundZ: 7, ringBytes: 36 },
+    ],
+  }, [
+    [9, 9],
+    [0, 0, 1, 10, 0, 1, 10, 10, 1],
+    [20, 20, 2, 30, 20, 2, 30, 30, 2],
+  ]);
+
+  const header = decodeTerrainBinaryPayload(buffer);
+  // Tile samples still come first and are unaffected by the new block.
+  assert.deepEqual([...header.tiles[0].samples], [9, 9]);
+  assert.deepEqual([...header.buildings[0].ringXYZ],
+    [0, 0, 1, 10, 0, 1, 10, 10, 1]);
+  assert.deepEqual([...header.buildings[1].ringXYZ],
+    [20, 20, 2, 30, 20, 2, 30, 30, 2]);
+  assert.equal(header.buildings[0].ringXYZ.buffer, buffer);
+});
+
+test('a building with no ring block is left without a view', () => {
+  const buffer = encodePayload({
+    tiles: [],
+    buildings: [{ id: 'b1', groundZ: 0, ringBytes: 0 }],
+  }, []);
+  const header = decodeTerrainBinaryPayload(buffer);
+  assert.equal(header.buildings[0].ringXYZ, undefined);
+});
+
+test('a truncated ring block is reported rather than silently misread', () => {
+  const buffer = encodePayload({
+    tiles: [],
+    buildings: [{ id: 'b1', groundZ: 0, ringBytes: 36 }],
+  }, [[1, 2, 3]]);
+  assert.throws(() => decodeTerrainBinaryPayload(buffer), /ring truncated/);
+});

@@ -77,9 +77,11 @@ def bathymetry_demand_paused(db) -> bool:
             "SELECT value FROM metadata WHERE key = ?",
             (BATHYMETRY_DEMAND_PAUSED_KEY,),
         ).fetchone()
-    except Exception:
+    except sqlite3.OperationalError as exc:
         # Small unit-test/legacy databases may predate the metadata table.
-        return False
+        if "no such table" in str(exc).lower():
+            return False
+        raise
     return bool(
         row
         and str(row[0]).strip().lower() in {"1", "true", "yes", "on"}
@@ -90,7 +92,7 @@ def _failure_key(job_id: str) -> str:
     return f"{BATHYMETRY_FAILURE_KEY_PREFIX}{job_id}"
 
 
-def _read_failure(db, job_id: str) -> dict | None:
+def _read_failure(db, job_id: str, logger=None) -> dict | None:
     """Read one durable failed-job cooldown from existing metadata."""
     try:
         row = db.execute(
@@ -106,7 +108,16 @@ def _read_failure(db, job_id: str) -> dict | None:
             "retry_at": float(value["retry_at"]),
             "error": str(value.get("error") or ""),
         }
-    except (KeyError, TypeError, ValueError, json.JSONDecodeError, sqlite3.Error):
+    except sqlite3.OperationalError as exc:
+        if "no such table" in str(exc).lower():
+            return None
+        raise
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        if logger is not None:
+            logger.warning(
+                f"[bathymetry-demand] ignoring corrupt failure state for "
+                f"{job_id}: {type(exc).__name__}: {exc}"
+            )
         return None
 
 
@@ -273,7 +284,9 @@ class BathymetryDemandScheduler:
         if not self.enabled or paused:
             return []
         jobs = sorted(eligible_fjord_jobs(db, visible_tile_ids))
-        failures = {job_id: _read_failure(db, job_id) for job_id in jobs}
+        failures = {
+            job_id: _read_failure(db, job_id, self.log) for job_id in jobs
+        }
         submitted = []
         now = time.time()
         with self._lock:
@@ -330,7 +343,7 @@ class BathymetryDemandScheduler:
             db = None
             try:
                 db = sqlite3.connect(self.db_path, timeout=5)
-                previous = _read_failure(db, job_id)
+                previous = _read_failure(db, job_id, self.log)
                 attempts = int(previous["attempts"]) + 1 if previous else 1
                 delay = min(
                     self.retry_seconds * (2 ** min(attempts - 1, 20)),

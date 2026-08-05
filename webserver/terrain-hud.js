@@ -16,6 +16,12 @@ export function tileEvictionHudLine(enabled) {
   return `data eviction: ${hudActionLink('tileEvictionLink', state, color)}`;
 }
 
+export function setTerrainGotoCollapsed(gotoPanel, collapsed) {
+  // Use an explicit display value. The form itself is display:flex, which can
+  // override the browser's default [hidden] rule and remain visible.
+  gotoPanel.style.display = collapsed ? 'none' : 'block';
+}
+
 function appendPanel(cssText) {
   const element = document.createElement('div');
   element.style.cssText = cssText.join(';');
@@ -42,6 +48,8 @@ export function createTerrainHud({
   onStartFastTime,
   onReset,
   onClockAction,
+  onGotoTown = () => ({ ok: false, error: 'Town travel is unavailable' }),
+  gotoTowns = [],
 }) {
   const hud = appendPanel([
     'position:absolute', 'top:12px', 'left:12px', 'padding:10px 12px',
@@ -51,6 +59,68 @@ export function createTerrainHud({
     'cursor:text', 'z-index:5',
   ]);
   hud.id = 'terrain-hud';
+  const hudContent = document.createElement('div');
+  hudContent.id = 'terrain-hud-content';
+  hud.appendChild(hudContent);
+
+  // Keep this form outside hudContent: the live readout is intentionally
+  // rewritten several times a second, while users need uninterrupted typing.
+  const gotoPanel = document.createElement('div');
+  gotoPanel.id = 'terrain-goto-panel';
+  gotoPanel.style.cssText = 'display:none';
+  const gotoForm = document.createElement('form');
+  gotoForm.id = 'terrain-goto-form';
+  gotoForm.style.cssText = [
+    'display:flex', 'align-items:center', 'gap:5px', 'margin-top:8px',
+  ].join(';');
+  const gotoLabel = document.createElement('label');
+  gotoLabel.htmlFor = 'terrain-goto-input';
+  gotoLabel.textContent = 'GOTO';
+  gotoLabel.style.cssText = 'color:#8fd0ff;font-weight:700';
+  const gotoInput = document.createElement('input');
+  gotoInput.id = 'terrain-goto-input';
+  gotoInput.name = 'town';
+  gotoInput.type = 'text';
+  gotoInput.placeholder = 'Greenland town';
+  gotoInput.autocomplete = 'off';
+  gotoInput.setAttribute('list', 'terrain-town-list');
+  gotoInput.setAttribute('aria-label', 'Greenland town');
+  gotoInput.style.cssText = [
+    'width:145px', 'box-sizing:border-box', 'border:1px solid #52718a',
+    'border-radius:3px', 'padding:2px 5px', 'background:#101820',
+    'color:#f4f8fb', 'font:inherit', 'outline:none',
+  ].join(';');
+  const gotoButton = document.createElement('button');
+  gotoButton.type = 'submit';
+  gotoButton.textContent = 'GO';
+  gotoButton.style.cssText = [
+    'border:1px solid #1684b8', 'border-radius:3px', 'padding:2px 7px',
+    'background:#064d70', 'color:#dff5ff', 'font:inherit', 'cursor:pointer',
+  ].join(';');
+  const gotoList = document.createElement('datalist');
+  gotoList.id = 'terrain-town-list';
+  gotoList.innerHTML = gotoTowns.map(name => `<option value="${name}"></option>`).join('');
+  const gotoStatus = document.createElement('span');
+  gotoStatus.id = 'terrain-goto-status';
+  gotoStatus.setAttribute('role', 'status');
+  gotoStatus.style.cssText = 'display:none;color:#ffb020';
+  gotoForm.appendChild(gotoLabel);
+  gotoForm.appendChild(gotoInput);
+  gotoForm.appendChild(gotoButton);
+  gotoForm.appendChild(gotoList);
+  gotoPanel.appendChild(gotoForm);
+  gotoPanel.appendChild(gotoStatus);
+  hud.appendChild(gotoPanel);
+  gotoForm.addEventListener('submit', event => {
+    event.preventDefault();
+    event.stopPropagation();
+    const result = onGotoTown(gotoInput.value);
+    gotoStatus.textContent = result?.ok
+      ? `Travelling to ${result.label ?? gotoInput.value}`
+      : (result?.error ?? 'Town not found');
+    gotoStatus.style.display = 'block';
+    gotoStatus.style.color = result?.ok ? '#8f8' : '#ffb020';
+  });
   hud.addEventListener('mousedown', event => {
     const isLink = (
       event.target.id === 'mapModeLink' ||
@@ -242,7 +312,9 @@ export function createTerrainHud({
     onClockAction(button.dataset.gc);
   });
 
-  return { hud, alt, gameClock };
+  return {
+    hud, hudContent, gotoPanel, gotoForm, gotoInput, gotoStatus, alt, gameClock,
+  };
 }
 
 export function compassHeading(headingRad) {

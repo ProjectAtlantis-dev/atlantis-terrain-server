@@ -20,6 +20,8 @@ class _ManualFuture:
         self.callback = callback
 
     def result(self):
+        if isinstance(self.outcome, BaseException):
+            raise self.outcome
         return self.outcome
 
     def complete(self, outcome="fetched"):
@@ -76,6 +78,42 @@ class CogFetchSchedulerTests(unittest.TestCase):
                 self.assertEqual(
                     serve_flask._fetch_one_cog_tile(
                         "10-326-208", (0.0, 0.0, 1.0, 1.0)
+                    ),
+                    "fetched",
+                )
+                mark_ocean.assert_called_once()
+
+    def test_provider_ocean_classification_is_terminal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "t.db")
+            db = sqlite3.connect(path)
+            db.execute(
+                "CREATE TABLE tiles (tile_id TEXT PRIMARY KEY, "
+                "source TEXT, dem_requested_at TEXT)"
+            )
+            db.execute(
+                "INSERT INTO tiles (tile_id, source) VALUES "
+                "('12-1359-785', 'parent_resampled')"
+            )
+            db.commit()
+            db.close()
+
+            with (
+                patch.object(serve_flask, "DB_PATH", path),
+                patch("serve._cache_coastline", return_value=None),
+                patch("serve._mark_official_ocean") as mark_ocean,
+                patch.object(
+                    ingest, "_read_cog_heightmap",
+                    return_value=(None, "official_ocean"),
+                ),
+                patch.object(
+                    ingest, "_resample_from_parent",
+                    side_effect=AssertionError("terminal ocean must not resample"),
+                ),
+            ):
+                self.assertEqual(
+                    serve_flask._fetch_one_cog_tile(
+                        "12-1359-785", (0.0, 0.0, 1.0, 1.0)
                     ),
                     "fetched",
                 )
@@ -261,6 +299,42 @@ class CogFetchSchedulerTests(unittest.TestCase):
                 serve_flask._schedule_cog_demand([], [tile]), (1, 0)
             )
             self.assertEqual([item[1] for item in pool.submissions], [tile[0]])
+
+    def test_worker_exception_retries_visible_tile_after_backoff(self):
+        pool = _ManualPool()
+        tile = ("12-7-9", (0, 0, 1, 1))
+        with (
+            patch.object(serve_flask, "_COG_TILE_WORKERS", 1),
+            patch.object(serve_flask, "_cog_pool", pool),
+            patch.object(serve_flask, "_cog_fetching_tiles", set()),
+            patch.object(serve_flask, "_cog_pending_tiles", {}),
+            patch.object(serve_flask, "_cog_demand_ids", set()),
+            patch.object(serve_flask, "_cog_already_fetched", set()),
+            patch.object(serve_flask, "_cog_synthetic_retry_at", {}),
+            patch.object(serve_flask, "_cog_failure_retry_at", {}),
+            patch.object(serve_flask, "_cog_failure_attempts", {}),
+            patch.object(serve_flask, "_COG_FAILURE_RETRY_BASE_SECONDS", 10),
+            patch.object(serve_flask, "_COG_FAILURE_RETRY_MAX_SECONDS", 60),
+            patch.object(serve_flask.time, "time", return_value=100) as now,
+        ):
+            self.assertEqual(serve_flask._schedule_cog_demand([tile]), (1, 0))
+            pool.futures[0].complete(RuntimeError("worker exploded"))
+
+            self.assertNotIn(tile[0], serve_flask._cog_fetching_tiles)
+            self.assertEqual(len(pool.submissions), 1)
+            self.assertEqual(serve_flask._cog_failure_retry_at, {tile[0]: 110})
+
+            now.return_value = 109
+            self.assertEqual(serve_flask._schedule_cog_demand([tile]), (0, 0))
+            self.assertEqual(len(pool.submissions), 1)
+
+            now.return_value = 110
+            self.assertEqual(serve_flask._schedule_cog_demand([tile]), (1, 0))
+            self.assertEqual(len(pool.submissions), 2)
+
+            pool.futures[1].complete(RuntimeError("worker still offline"))
+            self.assertEqual(len(pool.submissions), 2)
+            self.assertEqual(serve_flask._cog_failure_retry_at, {tile[0]: 130})
 
     def test_overdue_synthetic_retry_waits_until_tile_is_visible(self):
         tile = ("12-7-9", (0, 0, 1, 1))

@@ -42,13 +42,18 @@ export function createTerrainHitchDetector({
   let droppedLongTasks = 0;
   let worstIntervalMs = 0;
   let totalHitchMs = 0;
+  let contextErrorCount = 0;
+  let contextLastError = null;
+  let observerError = null;
 
   function readContext() {
     if (typeof sampleContext !== 'function') return null;
     try {
       const snapshot = sampleContext();
       return snapshot == null ? null : { ...snapshot };
-    } catch (_) {
+    } catch (error) {
+      contextErrorCount += 1;
+      contextLastError = error?.message ?? String(error);
       return null;
     }
   }
@@ -97,13 +102,18 @@ export function createTerrainHitchDetector({
           });
         }
       });
-    } catch (_) {
+    } catch (error) {
       observer = null;
+      observerError = error?.message ?? String(error);
     }
   }
 
   function stopObserver() {
-    try { observer?.disconnect?.(); } catch (_) { /* already gone */ }
+    try {
+      observer?.disconnect?.();
+    } catch (error) {
+      observerError = error?.message ?? String(error);
+    }
     observer = null;
   }
 
@@ -165,6 +175,9 @@ export function createTerrainHitchDetector({
       totalHitchMs,
       droppedLongTasks,
       longTaskObserver: observer != null,
+      observerError,
+      contextErrorCount,
+      contextLastError,
       worstHitch: worstHitch == null ? null : { ...worstHitch },
       hitches: hitches.map(hitch => ({ ...hitch })),
     };
@@ -195,6 +208,8 @@ export function createTerrainHitchDetector({
       droppedLongTasks = 0;
       worstIntervalMs = 0;
       totalHitchMs = 0;
+      contextErrorCount = 0;
+      contextLastError = null;
       previousStartMs = null;
       previousEndMs = null;
       previousContext = null;

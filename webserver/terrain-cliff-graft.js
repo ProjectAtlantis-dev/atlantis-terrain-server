@@ -3,7 +3,7 @@ import { parseTerrainTileId } from './terrain-tile-address.js';
 
 export { parseTerrainTileId } from './terrain-tile-address.js';
 
-export const CLIFF_GRAFT_ASSET_VERSION = 3;
+export const CLIFF_GRAFT_ASSET_VERSION = 4;
 
 const POLYHAVEN_MARBLE_ROCK_03 =
   '/textures/polyhaven/marble_rock_03/marble_rock_03';
@@ -53,6 +53,13 @@ export const CLIFF_GRAFTS = Object.freeze([
     // Pulls the rock's colour toward the surrounding orthophoto so the graft
     // sits in its landscape. Too much of it bleaches the capture's own warmth.
     tintStrength: 0.40,
+    // Full chroma variation kept; the cast is corrected by greyTint instead.
+    saturation: 1.0,
+    // The capture's own white balance (0.852, 1.025, 1.377) times the granite
+    // tint measured off a photograph of the real cliff (0.943, 1.011, 1.059).
+    // Warm quarry brown at R/B 1.62 becomes blue-grey granite at 0.89, which
+    // is what the real rock measures.
+    greyTint: [0.803, 1.036, 1.458],
     // A ceiling below 1 leaves the orthophoto permanently mixed into even the
     // steepest face, capping how much of the rock can ever be seen.
     strength: 1.0,
@@ -102,6 +109,25 @@ export async function loadCliffGraftTexture({
     ));
   }
 
+  // Correcting the capture's colour once, here, beats carrying it as a shader
+  // uniform: it costs nothing per frame and cannot be stranded by a cached
+  // shader program. Multiplies in the stored sRGB values, matching how the
+  // balance was measured.
+  function bakeColorBalance(context, canvas, balance) {
+    if (!balance) return;
+    const image = context.getImageData?.(0, 0, canvas.width, canvas.height);
+    const data = image?.data;
+    // Test doubles and any canvas that will not read back simply skip this.
+    if (!data) return;
+    const [r, g, b] = balance;
+    for (let i = 0; i < data.length; i += 4) {
+      data[i] = Math.min(255, data[i] * r);
+      data[i + 1] = Math.min(255, data[i + 1] * g);
+      data[i + 2] = Math.min(255, data[i + 2] * b);
+    }
+    context.putImageData?.(image, 0, 0);
+  }
+
   async function loadTexture(source, urlKey, colorSpace) {
     const bitmap = await loadBitmap(source[urlKey]);
     try {
@@ -109,6 +135,11 @@ export async function loadCliffGraftTexture({
       const context = canvas.getContext('2d', { willReadFrequently: true });
       if (!context) throw new Error('could not create cliff texture canvas');
       context.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+      // Colour balance applies to the albedo only — a normal map's channels are
+      // directions, and scaling them would tilt every normal.
+      if (colorSpace === THREE.SRGBColorSpace) {
+        bakeColorBalance(context, canvas, spec.greyTint);
+      }
 
       const texture = new THREE.CanvasTexture(canvas);
       texture.flipY = false;

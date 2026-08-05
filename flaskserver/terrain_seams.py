@@ -7,7 +7,10 @@ behind ``SqliteSeamCache`` so repair remains usable without a database.
 import datetime
 import numpy as np
 
+from colored_log import get_logger
 from tile_address import require_tile_id as _tile_address
+
+log = get_logger("terrain.seams")
 
 
 SEAM_CACHE_SCHEMA = """
@@ -40,9 +43,17 @@ class SqliteSeamCache:
             return None
         try:
             edge = np.frombuffer(row[0], dtype=np.float32)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError) as exc:
+            log.warning(
+                f"[seam-cache] corrupt edge for {key}: "
+                f"{type(exc).__name__}: {exc}; recomputing"
+            )
             return None
         if edge.size != sample_count:
+            log.warning(
+                f"[seam-cache] wrong edge size for {key}: "
+                f"{edge.size}, expected {sample_count}; recomputing"
+            )
             return None
         return edge.copy()
 

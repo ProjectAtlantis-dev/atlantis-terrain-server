@@ -1,5 +1,10 @@
 import cors from "cors";
-import express, { type Request, type Response } from "express";
+import express, {
+  type NextFunction,
+  type Request,
+  type RequestHandler,
+  type Response,
+} from "express";
 import { open, type Database } from "sqlite";
 import sqlite3 from "sqlite3";
 import fs from "node:fs/promises";
@@ -435,21 +440,25 @@ async function readJsonFile(filePath: string): Promise<unknown> {
   return JSON.parse(raw);
 }
 
-async function resolveMetadataFilePath(): Promise<string | null> {
+async function fileExists(filePath: string): Promise<boolean> {
   try {
-    await fs.access(METADATA_PATH);
+    await fs.access(filePath);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return false;
+    }
+    throw error;
+  }
+}
+
+async function resolveMetadataFilePath(): Promise<string | null> {
+  if (await fileExists(METADATA_PATH)) {
     return METADATA_PATH;
-  } catch {
-    // ignore
   }
 
-  if (METADATA_PATH != LEGACY_METADATA_PATH) {
-    try {
-      await fs.access(LEGACY_METADATA_PATH);
-      return LEGACY_METADATA_PATH;
-    } catch {
-      return null;
-    }
+  if (METADATA_PATH != LEGACY_METADATA_PATH && await fileExists(LEGACY_METADATA_PATH)) {
+    return LEGACY_METADATA_PATH;
   }
 
   return null;
@@ -469,24 +478,12 @@ async function loadAssetsMetadata(): Promise<AssetMetadata> {
   let source = "defaults";
 
   if (metadataPath != null) {
-    try {
-      const parsed = await readJsonFile(metadataPath);
-      if (parsed != null && typeof parsed === "object") {
-        payload = parsed as JsonObject;
-        source = "metadata_file";
-      } else {
-        log.warn(`metadata root is not an object: ${metadataPath}`, {
-          phase: "assets.metadata.invalid_root",
-          metadataPath,
-        });
-      }
-    } catch (error) {
-      log.warn(`failed to load metadata ${metadataPath}`, {
-        phase: "assets.metadata.load_failed",
-        metadataPath,
-        error,
-      });
+    const parsed = await readJsonFile(metadataPath);
+    if (parsed == null || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new TypeError(`metadata root must be an object: ${metadataPath}`);
     }
+    payload = parsed as JsonObject;
+    source = "metadata_file";
   } else {
     log.warn("no metadata file found; using defaults", {
       phase: "assets.metadata.missing",
@@ -695,11 +692,7 @@ async function ensureVehicleSeeds(
 }
 
 function parseProperties<T>(raw: string): T {
-  try {
-    return JSON.parse(raw) as T;
-  } catch {
-    return {} as T;
-  }
+  return JSON.parse(raw) as T;
 }
 
 async function loadVehicleInstances(db: SqliteDb, assetType: string): Promise<VehicleInstance[]> {
@@ -935,35 +928,36 @@ async function patchAsset(db: SqliteDb, id: string, patch: PatchAssetRequest): P
 }
 
 async function logStartupAssetSummary(db: SqliteDb): Promise<void> {
-  try {
-    const payload = await getAssetsResponse(db);
-    const seeded = payload.seeded ?? { structureInstances: false, vehicleInstances: false };
-    const structureInstances = Array.isArray(payload.structure_instances) ? payload.structure_instances : [];
-    const vehicleInstances = Array.isArray(payload.vehicle_instances) ? payload.vehicle_instances : [];
-    const structureDefinition = payload.structure_definition ?? FALLBACK_STRUCTURE_DEFINITION;
-    const vehicleDefinition = payload.vehicle_definition ?? FALLBACK_VEHICLE_DEFINITION;
+  const payload = await getAssetsResponse(db);
+  const seeded = payload.seeded ?? { structureInstances: false, vehicleInstances: false };
+  const structureInstances = Array.isArray(payload.structure_instances) ? payload.structure_instances : [];
+  const vehicleInstances = Array.isArray(payload.vehicle_instances) ? payload.vehicle_instances : [];
+  const structureDefinition = payload.structure_definition ?? FALLBACK_STRUCTURE_DEFINITION;
+  const vehicleDefinition = payload.vehicle_definition ?? FALLBACK_VEHICLE_DEFINITION;
 
-    log.info("startup assets summary", {
-      phase: "assets.startup.summary",
-    });
-    log.info("asset catalog", {
-      phase: "assets.startup.catalog",
-      assetTypes: 2,
-      schemaVersion: payload.schemaVersion,
-      source: payload.source,
-      structureInstances: structureInstances.length,
-      structureSeeded: seeded.structureInstances,
-      structureModelUrl: String(structureDefinition.url ?? ""),
-      vehicleInstances: vehicleInstances.length,
-      vehicleSeeded: seeded.vehicleInstances,
-      vehicleModelUrl: String(vehicleDefinition.url ?? ""),
-    });
-  } catch (error) {
-    log.warn("startup assets summary failed", {
-      phase: "assets.startup.summary_failed",
-      error,
-    });
-  }
+  log.info("startup assets summary", {
+    phase: "assets.startup.summary",
+  });
+  log.info("asset catalog", {
+    phase: "assets.startup.catalog",
+    assetTypes: 2,
+    schemaVersion: payload.schemaVersion,
+    source: payload.source,
+    structureInstances: structureInstances.length,
+    structureSeeded: seeded.structureInstances,
+    structureModelUrl: String(structureDefinition.url ?? ""),
+    vehicleInstances: vehicleInstances.length,
+    vehicleSeeded: seeded.vehicleInstances,
+    vehicleModelUrl: String(vehicleDefinition.url ?? ""),
+  });
+}
+
+function asyncRoute(
+  handler: (req: Request, res: Response) => Promise<void>,
+): RequestHandler {
+  return (req: Request, res: Response, next: NextFunction): void => {
+    void handler(req, res).catch(next);
+  };
 }
 
 async function main(): Promise<void> {
@@ -979,39 +973,23 @@ async function main(): Promise<void> {
   app.use(cors());
   app.use(express.json({ limit: "256kb" }));
 
-  app.get("/api/assets", async (_req: Request, res: Response) => {
-    try {
-      const payload = await getAssetsResponse(db);
-      res.json(payload);
-    } catch (error) {
-      log.error("/api/assets failed", {
-        phase: "assets.api.get_failed",
-        error,
-      });
-      res.status(500).json({ error: "asset endpoint failed" });
-    }
-  });
+  app.get("/api/assets", asyncRoute(async (_req: Request, res: Response) => {
+    const payload = await getAssetsResponse(db);
+    res.json(payload);
+  }));
 
-  app.post("/api/vehicle_state", async (req: Request, res: Response) => {
+  app.post("/api/vehicle_state", asyncRoute(async (req: Request, res: Response) => {
     const parsed = parseSaveVehicleRequest(req.body);
     if (!parsed.ok) {
       res.status(400).json({ error: parsed.error });
       return;
     }
 
-    try {
-      const payload = await saveVehicleState(db, parsed.value);
-      res.json(payload);
-    } catch (error) {
-      log.error("/api/vehicle_state failed", {
-        phase: "assets.api.vehicle_state_failed",
-        error,
-      });
-      res.status(500).json({ error: "vehicle state save failed" });
-    }
-  });
+    const payload = await saveVehicleState(db, parsed.value);
+    res.json(payload);
+  }));
 
-  app.patch("/api/asset/:id", async (req: Request, res: Response) => {
+  app.patch("/api/asset/:id", asyncRoute(async (req: Request, res: Response) => {
     const { id } = req.params;
     if (!id) {
       res.status(400).json({ error: "missing asset id" });
@@ -1069,25 +1047,24 @@ async function main(): Promise<void> {
       patch.properties = body.properties as PatchAssetRequest["properties"];
     }
 
-    try {
-      const result = await patchAsset(db, id, patch);
-      if (result == null) {
-        res.status(404).json({ error: `asset '${id}' not found` });
-        return;
-      }
-      res.json(result);
-    } catch (error) {
-      log.error(`/api/asset/${id} PATCH failed`, {
-        phase: "assets.api.patch_failed",
-        assetId: id,
-        error,
-      });
-      res.status(500).json({ error: "asset patch failed" });
+    const result = await patchAsset(db, id, patch);
+    if (result == null) {
+      res.status(404).json({ error: `asset '${id}' not found` });
+      return;
     }
-  });
+    res.json(result);
+  }));
 
   app.get("/healthz", (_req: Request, res: Response) => {
     res.json({ ok: true, dbPath: DB_PATH });
+  });
+
+  app.use((error: unknown, req: Request, res: Response, _next: NextFunction) => {
+    log.error(`${req.method} ${req.originalUrl} failed`, {
+      phase: "assets.api.failed",
+      error,
+    });
+    res.status(500).json({ error: "internal server error" });
   });
 
   const server = app.listen(PORT, HOST, () => {

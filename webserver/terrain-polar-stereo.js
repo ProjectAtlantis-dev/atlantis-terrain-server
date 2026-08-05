@@ -31,6 +31,22 @@ export function epsg3413ToWgs84(x, y) {
   return { lat: latitude * RAD_TO_DEG, lon: longitude };
 }
 
+export function wgs84ToEpsg3413(lat, lon) {
+  const latitude = lat * DEG_TO_RAD;
+  const longitudeDelta = (lon - CENTRAL_MERIDIAN) * DEG_TO_RAD;
+  const sinLatitude = Math.sin(latitude);
+  const t = Math.tan(Math.PI / 4 - latitude / 2) / Math.pow(
+    (1 - ECCENTRICITY * sinLatitude) /
+      (1 + ECCENTRICITY * sinLatitude),
+    ECCENTRICITY / 2,
+  );
+  const rho = WGS84_A * MC * t / TC;
+  return {
+    x: rho * Math.sin(longitudeDelta),
+    y: -rho * Math.cos(longitudeDelta),
+  };
+}
+
 export function epsg3413DirectionBearing({ x, y, directionX, directionY }) {
   const horizontalLength = Math.hypot(directionX, directionY);
   if (horizontalLength < 1e-12) return 0;

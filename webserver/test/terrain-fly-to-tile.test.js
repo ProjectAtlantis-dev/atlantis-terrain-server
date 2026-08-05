@@ -4,6 +4,7 @@ import { epsg3413ToWgs84 } from '../terrain-polar-stereo.js';
 import {
   TILE_GRID_ROOT_BBOX,
   createTerrainFlyToTileRuntime,
+  flyToLocationScenePosition,
   flyToTileScenePosition,
   parseTileId,
   tileBbox,
@@ -63,6 +64,18 @@ test('flyToTileScenePosition falls back to the linear lat/lon mapping before the
   assert.equal(target.usedFrame, false);
   assert.ok(Math.abs(target.northM - 111320) < 1e-6);
   assert.ok(Math.abs(target.eastM - 2 * 111320 * Math.cos(anchorLat * Math.PI / 180)) < 1e-6);
+});
+
+test('flyToLocationScenePosition uses the established terrain grid frame', () => {
+  const target = flyToLocationScenePosition({
+    lat: 69.21981,
+    lon: -51.09861,
+    frame: { frameOffsetReady: true, originX: 100, originY: 200, frameOffsetX: 7, frameOffsetY: -3 },
+    anchorLat: 64.1835,
+    anchorLon: -51.7216,
+    toGrid: () => ({ x: 1000, y: 2000 }),
+  });
+  assert.deepEqual(target, { eastM: 907, northM: 1797, usedFrame: true });
 });
 
 test('tileViewAltitude fits the tile in view and clamps extremes', () => {
@@ -159,6 +172,28 @@ test('flyToTile outside map mode leaves the map pan and zoom alone', () => {
   assert.equal(controls.mapPanEast, 1500);
   assert.equal(controls.mapZoom, 20000);
   assert.equal(calls.mapCamera, 0);
+});
+
+test('flyToLocation transports the camera and starts terrain streaming', () => {
+  const { runtime, camera, controls, calls } = createRuntimeHarness();
+  const result = runtime.flyToLocation({ lat: 69.21981, lon: -51.09861, label: 'Ilulissat' });
+  assert.equal(result.ok, true);
+  assert.equal(result.label, 'Ilulissat');
+  assert.equal(camera.position.z, 1200);
+  assert.equal(controls.yaw, 0);
+  assert.equal(controls.pitch, -1.4);
+  assert.equal(controls.speed, 0);
+  assert.equal(calls.exitVehicle, 1);
+  assert.equal(calls.requestFetch, 1);
+  assert.equal(calls.logs.at(-1).event, 'flyToLocation');
+});
+
+test('flyToLocation rejects invalid coordinates without moving', () => {
+  const { runtime, camera, calls } = createRuntimeHarness();
+  const result = runtime.flyToLocation({ lat: 100, lon: -51 });
+  assert.equal(result.ok, false);
+  assert.equal(camera.position.x, 9000);
+  assert.equal(calls.requestFetch, 0);
 });
 
 test('tileMapZoom frames the tile and clamps to the wheel limits', () => {

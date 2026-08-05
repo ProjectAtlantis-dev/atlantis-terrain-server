@@ -2,6 +2,8 @@ import * as THREE from 'three';
 
 import { textureRetryDelay } from './terrain-tile-runtime.js';
 
+const anisotropyFailures = new WeakSet();
+
 export function rendererTextureAnisotropy(renderer) {
   try {
     if (typeof renderer?.getMaxAnisotropy === 'function') {
@@ -10,7 +12,12 @@ export function rendererTextureAnisotropy(renderer) {
     if (typeof renderer?.capabilities?.getMaxAnisotropy === 'function') {
       return renderer.capabilities.getMaxAnisotropy();
     }
-  } catch (_) {}
+  } catch (error) {
+    if (renderer && !anisotropyFailures.has(renderer)) {
+      anisotropyFailures.add(renderer);
+      console.warn('[TEX] renderer anisotropy unavailable; using 1x', error);
+    }
+  }
   return 1;
 }
 
@@ -48,6 +55,7 @@ export function createTextureStreamer({
   let refillPending = false;
   let retryWakeTimer = null;
   let retryWakeAtMs = Infinity;
+  let anisotropyFailureReported = false;
 
   function advanceVersion() {
     version = Math.max(version + 1, Date.now());
@@ -61,7 +69,12 @@ export function createTextureStreamer({
     let available = 1;
     try {
       available = Number(getTextureAnisotropy());
-    } catch (_) {}
+    } catch (error) {
+      if (!anisotropyFailureReported) {
+        anisotropyFailureReported = true;
+        console.warn('[TEX] texture anisotropy probe failed; using 1x', error);
+      }
+    }
     texture.anisotropy = Number.isFinite(available)
       ? Math.max(1, Math.min(8, available))
       : 1;

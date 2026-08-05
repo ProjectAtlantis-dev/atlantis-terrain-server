@@ -228,6 +228,15 @@ export function terrainPipelineStatus(data) {
   const textureFetching = data?.texFetching ?? 0;
   const coastlineQueued = data?.coastlineQueued ?? 0;
   const syntheticHeightmaps = retryableSyntheticDemCount(data?.tiles);
+  const hasServerDemSchedule = typeof data?.demActionable === 'boolean';
+  const demActionable = hasServerDemSchedule
+    ? data.demActionable
+    : missing > 0 || downloading > 0 || syntheticHeightmaps > 0;
+  const demRetryAfterMs = Number.isFinite(data?.demRetryAfterMs)
+    ? Math.max(0, data.demRetryAfterMs)
+    : null;
+  const otherWork = textureFetching > 0 || coastlineQueued > 0;
+  const shouldPoll = demActionable || otherWork || demRetryAfterMs != null;
   return {
     missing,
     downloading,
@@ -236,8 +245,7 @@ export function terrainPipelineStatus(data) {
     coastlineQueued,
     textureRetryQueue: data?.texRetryQueue ?? 0,
     textureStatusCounts: data?.texStatusCounts || {},
-    nextAction: missing > 0 || downloading > 0 || textureFetching > 0
-      || coastlineQueued > 0
-      || syntheticHeightmaps > 0 ? 'poll' : 'idle',
+    nextAction: shouldPoll ? 'poll' : 'idle',
+    pollAfterMs: !demActionable && !otherWork ? demRetryAfterMs : null,
   };
 }

@@ -1,4 +1,4 @@
-import { epsg3413ToWgs84 } from './terrain-polar-stereo.js';
+import { epsg3413ToWgs84, wgs84ToEpsg3413 } from './terrain-polar-stereo.js';
 import { approximateLatLonToLocalMeters } from './terrain-local-coordinates.js';
 import {
   parseTerrainTileId,
@@ -21,6 +21,8 @@ const GROUND_RAY_START_ALT_M = 9000;
 const USER_MOVE_EPSILON_M = 4;
 const MIN_MAP_ZOOM = 500;   // matches the map-mode wheel clamp
 const MAX_MAP_ZOOM = 40000;
+const LOCATION_VIEW_ALT_M = 1200;
+const LOCATION_MAP_SIZE_M = 8000;
 
 /** Ortho half-height at which the tile roughly fills the map view. */
 export function tileMapZoom(sizeM) {
@@ -60,6 +62,23 @@ export function flyToTileScenePosition({
     eastM: local.eastM,
     northM: local.northM,
     sizeM,
+    usedFrame: false,
+  };
+}
+
+export function flyToLocationScenePosition({
+  lat, lon, frame, anchorLat, anchorLon, toGrid = wgs84ToEpsg3413,
+}) {
+  if (frame?.frameOffsetReady) {
+    const { x, y } = toGrid(lat, lon);
+    return {
+      eastM: x - frame.originX + frame.frameOffsetX,
+      northM: y - frame.originY + frame.frameOffsetY,
+      usedFrame: true,
+    };
+  }
+  return {
+    ...approximateLatLonToLocalMeters({ lat, lon, anchorLat, anchorLon }),
     usedFrame: false,
   };
 }
@@ -184,5 +203,52 @@ export function createTerrainFlyToTileRuntime({
     return { ok: true, tileId: parsed.id, bbox, viewAlt };
   }
 
-  return { flyToTile };
+  function flyToLocation({ lat, lon, label = null } = {}) {
+    if (!Number.isFinite(lat) || !Number.isFinite(lon) ||
+        lat < -90 || lat > 90 || lon < -180 || lon > 180) {
+      return { ok: false, error: 'invalid location coordinates' };
+    }
+    generation += 1;
+    if (pollTimer != null) {
+      cancel(pollTimer);
+      pollTimer = null;
+    }
+    const target = flyToLocationScenePosition({
+      lat, lon, frame: pipelineState, anchorLat, anchorLon,
+    });
+    exitVehicle();
+    cameraRuntimeState.driftMode = false;
+    controls.speed = 0;
+    controls.strafeSpeed = 0;
+    controls.yaw = 0;
+    controls.pitch = TOP_DOWN_PITCH_RAD;
+    placeCamera(target.eastM, target.northM, LOCATION_VIEW_ALT_M);
+    applyCameraOrientation();
+    if (controls.mapMode) {
+      controls.mapPanEast = 0;
+      controls.mapPanNorth = 0;
+      controls.mapZoom = tileMapZoom(LOCATION_MAP_SIZE_M);
+      updateMapCamera();
+    }
+    enqueueLog('info', 'flyToLocation', {
+      label, lat, lon, usedFrame: target.usedFrame,
+      eastM: Number(target.eastM.toFixed(1)),
+      northM: Number(target.northM.toFixed(1)),
+      viewAltM: LOCATION_VIEW_ALT_M,
+    });
+    requestFetch();
+    requestRender();
+    const pollState = {
+      generation,
+      eastM: target.eastM,
+      northM: target.northM,
+      viewAlt: LOCATION_VIEW_ALT_M,
+      expected: camera.position.clone(),
+      deadline: now() + GROUND_POLL_TIMEOUT_MS,
+    };
+    pollTimer = schedule(() => pollGroundCorrection(pollState), GROUND_POLL_MS);
+    return { ok: true, lat, lon, label, viewAlt: LOCATION_VIEW_ALT_M };
+  }
+
+  return { flyToTile, flyToLocation };
 }

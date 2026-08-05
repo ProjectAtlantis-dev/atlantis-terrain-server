@@ -27,6 +27,7 @@ import {
   createTerrainHud,
   hudActionLink,
   renderGameClock,
+  setTerrainGotoCollapsed,
   terrainHudHeader,
   tileEvictionHudLine,
 } from './terrain-hud.js';
@@ -75,6 +76,7 @@ import { createTerrainTileInspectorRuntime } from './terrain-tile-inspector-runt
 import { resolveTerrainViewToggle } from './terrain-view-mode.js';
 import { googleMaps3dUrl } from './terrain-google-maps.js';
 import { createTerrainFlyToTileRuntime } from './terrain-fly-to-tile.js';
+import { findGreenlandTown, GREENLAND_TOWNS } from './terrain-greenland-towns.js';
 import { approximateLatLonToLocalMeters } from './terrain-local-coordinates.js';
 import { epsg3413DirectionBearing, epsg3413ToWgs84 } from './terrain-polar-stereo.js';
 import { createWaterRuntime, DEFAULT_WATER_PARAMS } from './water/water-runtime.js';
@@ -90,11 +92,12 @@ import {
   MAX_REALTIME_STEP_SECONDS,
   stepFreeFlightVelocity,
 } from './terrain-realtime-step.js';
-import {
-  DETAIL_FADE_END_M, DETAIL_STRENGTH, graftIsolate, setDetailTuning,
-} from './terrain-detail-layer.js';
+import { DETAIL_FADE_END_M, DETAIL_STRENGTH, setDetailTuning } from './terrain-detail-layer.js';
 import { terrainAglFromSurface, terrainSurfaceHeightAt } from './terrain-agl.js';
 import { DEFAULT_PROCGEN_ENABLED, procgenHudLine } from './terrain-procgen-toggle.js';
+import {
+  readCameraState, removeCameraState, writeCameraState,
+} from './terrain-camera-storage.js';
 
 export async function startTerrainApplication({
   backend = 'webgl',
@@ -365,7 +368,9 @@ let tileInspectorRuntime = null;
 let bathymetryMapRuntime = null;
 let hudCollapsed = true;
 
-const { hud, alt, gameClock: gameClockEl } = createTerrainHud({
+const {
+  hud, hudContent, gotoPanel, alt, gameClock: gameClockEl,
+} = createTerrainHud({
   onToggleCollapsed: () => {
     hudCollapsed = !hudCollapsed;
     updateHud();
@@ -381,10 +386,20 @@ const { hud, alt, gameClock: gameClockEl } = createTerrainHud({
   onToggleWaterOverlay: () => toggleWaterOverlay(),
   onToggleHydrographyOverlay: () => toggleHydrographyOverlay(),
   onToggleProcgen: () => toggleProcgen(),
-  onToggleRenderBackend: () => {
+  onToggleRenderBackend: async () => {
     // beforeunload normally saves this too, but make the renderer transition
     // self-contained so a fast reload cannot race the camera/frame snapshot.
-    savePosition();
+    // savePosition persists to IndexedDB asynchronously, so the await is what
+    // makes that true: a transaction still open when the document unloads is
+    // discarded, and the reload below happens immediately.
+    try {
+      await savePosition('renderer-toggle');
+    } catch (error) {
+      // A storage failure must not strand the user on the old backend.
+      bootLog('camera.position.toggle-save.failed', {
+        message: error?.message ?? String(error),
+      }, 'warn');
+    }
     saveGameClock();
     onToggleRenderBackend();
   },
@@ -393,6 +408,8 @@ const { hud, alt, gameClock: gameClockEl } = createTerrainHud({
   onOpenGoogleMaps: () => openGoogleMapsView(),
   onStartFastTime: () => startFastTime(),
   onReset: () => resetView(),
+  gotoTowns: GREENLAND_TOWNS.map(town => town.name),
+  onGotoTown: name => gotoTown(name),
   onClockAction: action => {
     if (action === 'rw') rewindGameClock();
     else if (action === 'stop') stopGameClock();
@@ -619,14 +636,6 @@ function buildTuningControls(ap, ce) {
     decimals: 0,
     onChange: v => setDetailTuning({ fadeEnd: v }),
   });
-  if (!USE_WEBGPU_RENDER_BACKEND) {
-  // Diagnostic: the cliff material alone on black, with nothing underneath and
-  // no matching to the surrounding photo, so its own faults are visible.
-  tuningToggle('isolate cliff graft', {
-    value: graftIsolate.value > 0.5,
-    onChange: v => { graftIsolate.value = v ? 1 : 0; requestRender(); },
-  });
-  }
 
   if (!USE_WEBGPU_RENDER_BACKEND) {
   tuningSectionLabel('Aerial Perspective');
@@ -1466,6 +1475,7 @@ buildingsRuntime = createTerrainBuildingsRuntime({
   terrainRoot,
   pipelineState: terrainPipelineState,
   exaggeration: EXAG,
+  bootLog,
   onMutated: markSceneMutated,
   requestRender,
 });
@@ -1880,10 +1890,35 @@ function promptFlyToTile() {
   if (tileId) flyToTileRuntime.flyToTile(tileId);
 }
 
+function gotoTown(name) {
+  const town = findGreenlandTown(name);
+  if (!town) {
+    return { ok: false, error: `Unknown town: ${String(name ?? '').trim() || '(empty)'}` };
+  }
+  return flyToTileRuntime.flyToLocation({
+    lat: town.lat, lon: town.lon, label: town.name,
+  });
+}
+
 // --- Save/restore camera position ---
 
-function savePosition() {
-  if (terrainPipelineState.firstLoad) return;
+const CAMERA_STORAGE_KEY = 'clouds-cam';
+const CAMERA_SAVE_INTERVAL_MS = 1000;
+const CAMERA_SAVE_LOG_INTERVAL_MS = 5000;
+let lastSavedCameraPose = null;
+let lastCameraSaveLogMs = -Infinity;
+let lastCameraSaveStartedMs = -Infinity;
+let cameraSaveInFlight = false;
+let cameraSaveCount = 0;
+
+async function savePosition(reason = 'interval') {
+  const nowMs = performance.now();
+  const force = reason === 'pagehide';
+  if (!force && (
+    cameraSaveInFlight
+    || nowMs - lastCameraSaveStartedMs < CAMERA_SAVE_INTERVAL_MS
+  )) return false;
+
   const coordinates = terrainCameraCoordinates({
     position: camera.position, anchorPosition, east, north, up,
     anchorLatitude: anchorLat, anchorLongitude: anchorLon,
@@ -1910,15 +1945,78 @@ function savePosition() {
         }
       : null,
   });
-  localStorage.setItem('clouds-cam', JSON.stringify(saved));
+  const pose = JSON.stringify(saved);
+  if (pose === lastSavedCameraPose && !force) return false;
+
+  const persisted = JSON.stringify({
+    ...saved,
+    savedAt: new Date().toISOString(),
+  });
+  lastCameraSaveStartedMs = nowMs;
+  cameraSaveInFlight = true;
+  try {
+    await writeCameraState(CAMERA_STORAGE_KEY, persisted);
+  } catch (error) {
+    bootLog('camera.position.save.failed', {
+      reason,
+      storageKey: CAMERA_STORAGE_KEY,
+      firstLoad: terrainPipelineState.firstLoad,
+      frameOffsetReady: terrainPipelineState.frameOffsetReady,
+      message: error?.message ?? String(error),
+      stack: error?.stack ?? null,
+    }, 'error');
+    return false;
+  } finally {
+    cameraSaveInFlight = false;
+  }
+
+  lastSavedCameraPose = pose;
+  cameraSaveCount += 1;
+  const completedAtMs = performance.now();
+  if (
+    cameraSaveCount === 1
+    || force
+    || completedAtMs - lastCameraSaveLogMs >= CAMERA_SAVE_LOG_INTERVAL_MS
+  ) {
+    lastCameraSaveLogMs = completedAtMs;
+    enqueueClientLog('info', 'camera.position.saved', {
+      reason,
+      saveCount: cameraSaveCount,
+      storageKey: CAMERA_STORAGE_KEY,
+      storageBytes: persisted.length,
+      firstLoad: terrainPipelineState.firstLoad,
+      frameOffsetReady: terrainPipelineState.frameOffsetReady,
+      lat: Number(saved.lat.toFixed(7)),
+      lon: Number(saved.lon.toFixed(7)),
+      alt: Number(saved.alt.toFixed(2)),
+      yaw: Number(saved.yaw.toFixed(5)),
+      pitch: Number(saved.pitch.toFixed(5)),
+    });
+  }
+  return true;
 }
-setInterval(savePosition, 250);
-window.addEventListener('beforeunload', savePosition);
+setInterval(() => { void savePosition(); }, CAMERA_SAVE_INTERVAL_MS);
+window.addEventListener('pagehide', () => {
+  void savePosition('pagehide');
+});
+window.addEventListener('beforeunload', () => {
+  flushClientLogQueue({ useBeacon: true });
+});
 window.addEventListener('beforeunload', saveGameClock);
 
 // Restore saved camera position (lat/lon/alt are origin-independent)
 try {
-  const saved = JSON.parse(localStorage.getItem('clouds-cam'));
+  // IndexedDB keeps routine persistence off the rendering thread. The
+  // localStorage fallback imports camera poses written by older builds.
+  const storedCamera = await readCameraState(CAMERA_STORAGE_KEY).catch(error => {
+    bootLog('camera.position.async-restore.failed', {
+      storageKey: CAMERA_STORAGE_KEY,
+      message: error?.message ?? String(error),
+    }, 'warn');
+    return null;
+  });
+  const rawSavedCamera = storedCamera ?? localStorage.getItem(CAMERA_STORAGE_KEY);
+  const saved = rawSavedCamera == null ? null : JSON.parse(rawSavedCamera);
   const restored = restoreTerrainCameraState(saved, { anchorLat, anchorLon });
   if (restored) {
     camera.position.copy(anchorPosition)
@@ -1942,8 +2040,39 @@ try {
       terrainPipelineState.frameOffsetReady = true;
     }
     applyCameraOrientation();
+    lastSavedCameraPose = JSON.stringify(terrainCameraState({
+      cameraLatLon: { lat: saved.lat, lon: saved.lon, alt: restored.alt },
+      cameraGrid: Number.isFinite(saved.gridX) && Number.isFinite(saved.gridY)
+        ? { x: saved.gridX, y: saved.gridY }
+        : null,
+      yaw: restored.yaw,
+      pitch: restored.pitch,
+      mapZoom: restored.mapZoom,
+      terrainFrame: restored.terrainFrame,
+    }));
+    bootLog('camera.position.restored', {
+      storageKey: CAMERA_STORAGE_KEY,
+      savedAt: saved.savedAt ?? null,
+      lat: Number(saved.lat.toFixed(7)),
+      lon: Number(saved.lon.toFixed(7)),
+      alt: Number(restored.alt.toFixed(2)),
+      hasTerrainFrame: restored.terrainFrame != null,
+    });
+  } else {
+    bootLog('camera.position.restore.empty', {
+      storageKey: CAMERA_STORAGE_KEY,
+      storedValuePresent: rawSavedCamera != null,
+    });
   }
-} catch (_) {}
+} catch (error) {
+  // Swallowing this made a failed restore look exactly like a failed save:
+  // the camera just started at the anchor with nothing to explain why.
+  bootLog('camera.restore.failed', {
+    storageKey: CAMERA_STORAGE_KEY,
+    message: error?.message ?? String(error),
+    stack: error?.stack ?? null,
+  }, 'error');
+}
 // Start tile fetch at the current camera location (which may have been restored
 // from localStorage), not the static anchor location.
 const initialCamLL = getCameraLatLon();
@@ -2252,6 +2381,7 @@ let lastHudHtml = '';
 let lastAltText = '';
 
 function updateHud() {
+  setTerrainGotoCollapsed(gotoPanel, hudCollapsed);
   const rel = camera.position.clone().sub(anchorPosition);
   const eastM = rel.dot(east);
   const northM = rel.dot(north);
@@ -2388,7 +2518,7 @@ function updateHud() {
       )
     );
     if (hud.dataset.selecting !== 'true' && !selectionInsideHud) {
-      hud.innerHTML = hudHtml;
+      hudContent.innerHTML = hudHtml;
       lastHudHtml = hudHtml;
     }
   }
@@ -2407,7 +2537,14 @@ function updateHud() {
 }
 
 function resetView() {
-  localStorage.removeItem('clouds-cam');
+  localStorage.removeItem(CAMERA_STORAGE_KEY);
+  void removeCameraState(CAMERA_STORAGE_KEY).catch(error => {
+    bootLog('camera.position.remove.failed', {
+      storageKey: CAMERA_STORAGE_KEY,
+      message: error?.message ?? String(error),
+    }, 'warn');
+  });
+  lastSavedCameraPose = null;
   localStorage.removeItem(TUNING_STORAGE_KEY);
   localStorage.removeItem(GAME_CLOCK_STORAGE_KEY);
   localStorage.removeItem(LEGACY_GAME_CLOCK_STORAGE_KEY);
@@ -2726,7 +2863,14 @@ renderer.domElement.addEventListener('click', event => {
         poFactor: polygonOffsetFactor,
         bbox: info.bbox ?? null
       })
-    }).catch(() => {});
+    }).then(response => {
+      if (!response.ok) throw new Error(`tile inspect status ${response.status}`);
+    }).catch(error => {
+      enqueueClientLog('warn', 'tile.inspect.failed', {
+        tileId: info.tileId,
+        message: error?.message ?? String(error),
+      });
+    });
   });
 });
 

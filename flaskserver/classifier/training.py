@@ -21,6 +21,7 @@ from PIL import Image
 from classifier.segmentation import (
     SEGMENTER_VERSION,
     SegmentationConfig,
+    SegmentationResult,
     segment_terrain_tile,
 )
 
@@ -51,9 +52,9 @@ CREATE TABLE IF NOT EXISTS classifier_annotations (
 """
 
 _SEGMENT_CACHE_LIMIT = 8
-_segment_cache: OrderedDict[tuple[str, str, str, str], tuple[np.ndarray, object]] = (
-    OrderedDict()
-)
+_segment_cache: OrderedDict[
+    tuple[str, str, str, str], tuple[np.ndarray, SegmentationResult]
+] = OrderedDict()
 _segment_cache_lock = threading.Lock()
 
 
@@ -92,7 +93,9 @@ def geographic_split(tile_id: str, regression_tiles=()) -> str:
     return "test"
 
 
-def load_segmented_tile(db: sqlite3.Connection, tile_id: str):
+def load_segmented_tile(
+    db: sqlite3.Connection, tile_id: str
+) -> tuple[np.ndarray, SegmentationResult]:
     from classifier.official_water import classifier_water_mask_for_tile
     from database import GRID_N, _decompress_float32
 

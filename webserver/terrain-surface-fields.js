@@ -123,6 +123,14 @@ export function createSurfaceFieldStore({
     if (inFlightRequest) return inFlightRequest;
     const request = fetchImpl(detailMaskUrl(tileId))
       .then(response => {
+        // 204 = no classifier row for this tile or any ancestor. It is a
+        // normal answer, so it must not be thrown: an error status would be
+        // logged by the browser for every unclassified tile in view.
+        if (response.status === 204
+          || response.headers.get('X-Classifier-Status') === 'missing') {
+          failed.add(tileId);
+          return null;
+        }
         if (!response.ok) throw new Error(`mask http ${response.status}`);
         // The server returns 200 with an all-black fallback mask when a
         // tile has no classifier row anywhere in its ancestor chain yet
@@ -133,10 +141,12 @@ export function createSurfaceFieldStore({
         const pending = response.headers.get('X-Classifier-Status') === 'pending';
         return response.blob().then(blob => ({ blob, pending }));
       })
-      .then(({ blob, pending }) => createImageBitmap(
-        blob, { premultiplyAlpha: 'none' },
-      ).then(bitmap => ({ bitmap, pending })))
-      .then(({ bitmap, pending }) => {
+      .then(result => (result === null ? null : createImageBitmap(
+        result.blob, { premultiplyAlpha: 'none' },
+      ).then(bitmap => ({ bitmap, pending: result.pending }))))
+      .then(result => {
+        if (result === null) return null;
+        const { bitmap, pending } = result;
         const entry = decode(bitmap);
         if (!pending) {
           entries.set(tileId, entry);

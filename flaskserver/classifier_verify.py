@@ -227,14 +227,11 @@ def verify_tile(db, tile_id, out_dir, use_google=True):
         level_rgb = np.asarray(
             Image.open(io.BytesIO(texture)).convert("RGB")
         )
-        try:
-            level_water = read_water_mask(db, level_id)
-            if (
-                level_water is not None
-                and level_water.shape != level_tile["heightmap"].shape
-            ):
-                level_water = None
-        except Exception:
+        level_water = read_water_mask(db, level_id)
+        if (
+            level_water is not None
+            and level_water.shape != level_tile["heightmap"].shape
+        ):
             level_water = None
 
         if level_depth == 8:

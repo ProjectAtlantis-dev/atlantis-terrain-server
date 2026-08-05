@@ -12,11 +12,15 @@ import json
 import math
 import sqlite3
 import statistics
+import threading
 import time
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 from PIL import Image, ImageDraw
+
+from terrain_config import GREENLAND_BBOX
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -60,11 +64,10 @@ def connect(path: Path = DEFAULT_ASSETS_DB_PATH) -> sqlite3.Connection:
 
 
 def _properties(raw: str) -> dict[str, Any]:
-    try:
-        value = json.loads(raw)
-    except (TypeError, ValueError):
-        return {}
-    return value if isinstance(value, dict) else {}
+    value = json.loads(raw)
+    if not isinstance(value, dict):
+        raise ValueError("asset properties must decode to a JSON object")
+    return value
 
 
 def query_asset_by_type(
@@ -74,19 +77,16 @@ def query_asset_by_type(
     qy: float,
     max_range: float,
 ) -> list[dict[str, Any]]:
-    try:
-        rows = db.execute(
-            "SELECT id, type, properties FROM assets "
-            "WHERE type = ? AND enabled = 1 "
-            "AND cx BETWEEN ? AND ? AND cy BETWEEN ? AND ? LIMIT 20000",
-            (
-                asset_type,
-                qx - max_range, qx + max_range,
-                qy - max_range, qy + max_range,
-            ),
-        ).fetchall()
-    except sqlite3.OperationalError:
-        return []
+    rows = db.execute(
+        "SELECT id, type, properties FROM assets "
+        "WHERE type = ? AND enabled = 1 "
+        "AND cx BETWEEN ? AND ? AND cy BETWEEN ? AND ? LIMIT 20000",
+        (
+            asset_type,
+            qx - max_range, qx + max_range,
+            qy - max_range, qy + max_range,
+        ),
+    ).fetchall()
     return [
         {"id": asset_id, "type": row_type, "properties": _properties(raw)}
         for asset_id, row_type, raw in rows
@@ -108,34 +108,29 @@ def _point_in_polygon(x: float, y: float, polygon: list[tuple[float, float]]) ->
     return inside
 
 
-def _roof_color(pixels: list[tuple[int, int, int]]) -> tuple[int, int, int] | None:
-    """Weighted roof color, preferring non-earth pixels inside the footprint."""
-    weighted: list[tuple[tuple[int, int, int], float]] = []
-    for pixel in pixels:
-        red, green, blue = pixel
-        brightness = (red + green + blue) / 3
-        if brightness < 20 or brightness > 248:
-            continue
-        hue, saturation, _ = colorsys.rgb_to_hsv(red / 255, green / 255, blue / 255)
-        earth_tone = 0.055 <= hue <= 0.46 and saturation >= 0.12
-        if earth_tone:
-            weight = 1.0
-        elif saturation < 0.12:
-            weight = 2.0  # neutral metal/concrete roofs
-        else:
-            weight = 4.0  # red/blue/cyan roof material
-        weighted.append((pixel, weight))
-    if not weighted:
-        return None
-    total = sum(weight for _, weight in weighted)
-    channel = lambda index: int(round(
-        sum(pixel[index] * weight for pixel, weight in weighted) / total
-    ))
-    return (
-        channel(0),
-        channel(1),
-        channel(2),
-    )
+def _hue_saturation(rgb: "np.ndarray") -> tuple["np.ndarray", "np.ndarray"]:
+    """Vectorised colorsys.rgb_to_hsv hue/saturation for an (N, 3) 0-255 array."""
+    scaled = rgb / 255.0
+    maxc = scaled.max(axis=1)
+    minc = scaled.min(axis=1)
+    span = maxc - minc
+    with np.errstate(invalid="ignore", divide="ignore"):
+        saturation = np.where(maxc == 0, 0.0, span / np.where(maxc == 0, 1.0, maxc))
+        safe_span = np.where(span == 0, 1.0, span)
+        rc = (maxc - scaled[:, 0]) / safe_span
+        gc = (maxc - scaled[:, 1]) / safe_span
+        bc = (maxc - scaled[:, 2]) / safe_span
+    hue = np.zeros_like(maxc)
+    red_max = scaled[:, 0] == maxc
+    green_max = (~red_max) & (scaled[:, 1] == maxc)
+    blue_max = ~(red_max | green_max)
+    hue[red_max] = (bc - gc)[red_max]
+    hue[green_max] = (2.0 + rc - bc)[green_max]
+    hue[blue_max] = (4.0 + gc - rc)[blue_max]
+    hue = (hue / 6.0) % 1.0
+    # colorsys returns hue 0 for a greyscale pixel rather than a wrapped value.
+    hue[span == 0] = 0.0
+    return hue, saturation
 
 
 def _rgb_pixel(image: Image.Image, x: int, y: int) -> tuple[int, int, int]:
@@ -149,12 +144,48 @@ def _rgb_pixel(image: Image.Image, x: int, y: int) -> tuple[int, int, int]:
     return value, value, value
 
 
+def _roof_color(pixels) -> tuple[int, int, int] | None:
+    """Weighted roof color, preferring non-earth pixels inside the footprint.
+
+    Accepts an (N, 3) array or any sequence of RGB triples.
+    """
+    pixels = np.asarray(pixels, dtype=np.float64)
+    if pixels.size == 0:
+        return None
+    brightness = pixels.sum(axis=1) / 3.0
+    usable = (brightness >= 20) & (brightness <= 248)
+    if not usable.any():
+        return None
+    kept = pixels[usable]
+    hue, saturation = _hue_saturation(kept)
+    earth_tone = (hue >= 0.055) & (hue <= 0.46) & (saturation >= 0.12)
+    # Earth tones are the surrounding ground bleeding in, so they carry the
+    # least weight; saturated roof materials carry the most.
+    weight = np.where(
+        earth_tone, 1.0, np.where(saturation < 0.12, 2.0, 4.0),
+    )
+    total = weight.sum()
+    channels = (kept * weight[:, None]).sum(axis=0) / total
+    return (
+        int(round(float(channels[0]))),
+        int(round(float(channels[1]))),
+        int(round(float(channels[2]))),
+    )
+
+
 def _sample_footprint_color(
-    image: Image.Image,
+    image: "np.ndarray",
     ring: list[list[float]],
     bbox: tuple[float, float, float, float],
 ) -> tuple[int, int, int] | None:
-    width, height = image.size
+    """Roof colour for one footprint, sampled from an (H, W, 3) uint8 array.
+
+    Rasterising the polygon with numpy rather than testing each pixel in
+    Python is what makes flying into an uncached settlement cheap: the scalar
+    version ran a point-in-polygon test and a PIL ``getpixel`` per pixel, which
+    came to 1.75M and 780k calls respectively for one Nuuk-sized request.
+    """
+    height, width = image.shape[0], image.shape[1]
     x_min, y_min, x_max, y_max = bbox
     span_x, span_y = x_max - x_min, y_max - y_min
     polygon = [
@@ -166,17 +197,155 @@ def _sample_footprint_color(
     right = min(width - 1, int(math.ceil(max(point[0] for point in polygon))))
     top = max(0, int(math.floor(min(point[1] for point in polygon))))
     bottom = min(height - 1, int(math.ceil(max(point[1] for point in polygon))))
-    pixels: list[tuple[int, int, int]] = [
-        _rgb_pixel(image, x, y)
-        for y in range(top, bottom + 1)
-        for x in range(left, right + 1)
-        if _point_in_polygon(x + 0.5, y + 0.5, polygon)
-    ]
-    if not pixels:
+
+    if right >= left and bottom >= top:
+        grid_x = np.arange(left, right + 1, dtype=np.float64) + 0.5
+        grid_y = np.arange(top, bottom + 1, dtype=np.float64) + 0.5
+        xs = grid_x[None, :]
+        ys = grid_y[:, None]
+        # Even-odd ray casting, one edge at a time across the whole crop. A
+        # horizontal edge can never toggle the crossing test, so it is skipped
+        # and never divides by zero.
+        inside = np.zeros((len(grid_y), len(grid_x)), dtype=bool)
+        previous = polygon[-1]
+        for current in polygon:
+            denominator = previous[1] - current[1]
+            if denominator != 0:
+                straddles = (current[1] > ys) != (previous[1] > ys)
+                crossing = (
+                    (previous[0] - current[0]) * (ys - current[1]) / denominator
+                    + current[0]
+                )
+                inside ^= straddles & (xs < crossing)
+            previous = current
+        selected = image[top:bottom + 1, left:right + 1][inside]
+    else:
+        selected = np.empty((0, 3), dtype=image.dtype)
+
+    if len(selected) == 0:
         center_x = max(0, min(width - 1, int(round(sum(p[0] for p in polygon) / len(polygon)))))
         center_y = max(0, min(height - 1, int(round(sum(p[1] for p in polygon) / len(polygon)))))
-        pixels = [_rgb_pixel(image, center_x, center_y)]
-    return _roof_color(pixels)
+        selected = image[center_y:center_y + 1, center_x]
+    return _roof_color(selected.astype(np.float64, copy=False))
+
+
+# The textured-tile lookup behind roof colours had the same two costs the
+# ground sampler did: an unindexed tiles/textures join re-run every request
+# (~276ms), then a linear scan of its result per building. The camera barely
+# moves between one-second polls, so the join is cached with padding, and the
+# per-building lookup addresses the quadtree directly instead of scanning.
+_TEXTURED_TILE_PAD_M = 2000.0
+_TEXTURED_TILE_TTL_S = 15.0
+_textured_tile_lock = threading.Lock()
+_textured_tile_state: dict[str, Any] = {
+    "bbox": None, "version": None, "at": 0.0, "by_depth": None, "depths": None,
+}
+
+
+def _textured_tile_index(terrain_db, bounds):
+    """Depth-keyed index of texture-backed tiles covering ``bounds``."""
+    # Key the cache to the database file. Connections are per-request, so their
+    # identity is useless, but two different databases must never share an
+    # index. In-memory databases all report an empty path and cannot be told
+    # apart, so they simply do not cache.
+    try:
+        row = terrain_db.execute("PRAGMA database_list").fetchone()
+        db_key = row[2] if row else None
+    except Exception:
+        db_key = None
+    if not db_key:
+        return _load_textured_tile_index(terrain_db, bounds)[:2]
+
+    try:
+        version = terrain_db.execute("PRAGMA data_version").fetchone()[0]
+    except Exception:
+        version = None
+    now = time.monotonic()
+    with _textured_tile_lock:
+        loaded = _textured_tile_state["bbox"]
+        if (
+            loaded is not None
+            and _textured_tile_state.get("db") == db_key
+            and _textured_tile_state["version"] == version
+            and now - _textured_tile_state["at"] < _TEXTURED_TILE_TTL_S
+            and loaded[0] <= bounds[0] and loaded[1] <= bounds[1]
+            and loaded[2] >= bounds[2] and loaded[3] >= bounds[3]
+        ):
+            return _textured_tile_state["by_depth"], _textured_tile_state["depths"]
+
+    by_depth, depths, padded = _load_textured_tile_index(terrain_db, bounds)
+    with _textured_tile_lock:
+        _textured_tile_state.update(
+            bbox=padded, version=version, at=now, db=db_key,
+            by_depth=by_depth, depths=depths,
+        )
+    return by_depth, depths
+
+
+def _load_textured_tile_index(terrain_db, bounds):
+    """Query and index texture-backed tiles; returns (by_depth, depths, bbox)."""
+    padded = (
+        bounds[0] - _TEXTURED_TILE_PAD_M, bounds[1] - _TEXTURED_TILE_PAD_M,
+        bounds[2] + _TEXTURED_TILE_PAD_M, bounds[3] + _TEXTURED_TILE_PAD_M,
+    )
+    rows = [
+        tuple(row) for row in terrain_db.execute(
+            "SELECT t.tile_id,t.depth,t.x_min,t.y_min,t.x_max,t.y_max,"
+            "x.updated_at "
+            "FROM tiles t JOIN textures x ON x.tile_id=t.tile_id "
+            "WHERE t.x_min <= ? AND t.x_max >= ? AND t.y_min <= ? AND t.y_max >= ? "
+            "ORDER BY t.depth DESC",
+            (padded[2], padded[0], padded[3], padded[1]),
+        )
+    ]
+    # Address tiles by their position on the quadtree grid. Real tiles are
+    # always grid-aligned; synthetic ones (tests) need not be, and addressing
+    # them would silently drop colours, so fall back to the original scan.
+    rx_min, ry_min, rx_max, ry_max = GREENLAND_BBOX
+    by_depth: dict[int, dict[tuple[int, int], tuple]] = {}
+    aligned = True
+    for row in rows:
+        depth, x_min, y_min = row[1], row[2], row[3]
+        n_tiles = 1 << depth
+        tile_w = (rx_max - rx_min) / n_tiles
+        tile_h = (ry_max - ry_min) / n_tiles
+        col = round((x_min - rx_min) / tile_w)
+        grid_row = round((y_min - ry_min) / tile_h)
+        if (
+            abs(rx_min + col * tile_w - x_min) > tile_w * 1e-6
+            or abs(ry_min + grid_row * tile_h - y_min) > tile_h * 1e-6
+        ):
+            aligned = False
+            break
+        by_depth.setdefault(depth, {})[(col, grid_row)] = row
+    if aligned:
+        return by_depth, sorted(by_depth, reverse=True), padded
+    return None, rows, padded
+
+
+def _deepest_tile_at(by_depth, depths, x, y):
+    """Deepest texture-backed tile containing the point, or None.
+
+    ``by_depth`` is None when the tile set is not grid-aligned; ``depths`` then
+    carries the depth-ordered rows for a direct scan.
+    """
+    if by_depth is None:
+        for tile in depths:
+            if tile[2] <= x < tile[4] and tile[3] <= y < tile[5]:
+                return tile
+        return None
+    rx_min, ry_min, rx_max, ry_max = GREENLAND_BBOX
+    span_x = rx_max - rx_min
+    span_y = ry_max - ry_min
+    for depth in depths:
+        n_tiles = 1 << depth
+        col = int((x - rx_min) / span_x * n_tiles)
+        row = int((y - ry_min) / span_y * n_tiles)
+        tile = by_depth[depth].get((col, row))
+        # The stored bbox stays authoritative, matching the previous scan.
+        if tile is not None and tile[2] <= x < tile[4] and tile[3] <= y < tile[5]:
+            return tile
+    return None
 
 
 def color_buildings_from_textures(
@@ -205,24 +374,14 @@ def color_buildings_from_textures(
         max(center[0] for center in centers.values()),
         max(center[1] for center in centers.values()),
     )
-    try:
-        tiles = terrain_db.execute(
-            "SELECT t.tile_id,t.depth,t.x_min,t.y_min,t.x_max,t.y_max,x.updated_at "
-            "FROM tiles t JOIN textures x ON x.tile_id=t.tile_id "
-            "WHERE t.x_min <= ? AND t.x_max >= ? AND t.y_min <= ? AND t.y_max >= ? "
-            "ORDER BY t.depth DESC",
-            (query_bounds[2], query_bounds[0], query_bounds[3], query_bounds[1]),
-        ).fetchall()
-    except sqlite3.OperationalError:
-        return
+    by_depth, depths = _textured_tile_index(terrain_db, query_bounds)
 
     assignments: dict[str, tuple] = {}
     for building in buildings:
         cx, cy = centers[building["id"]]
-        for tile in tiles:
-            if tile[2] <= cx < tile[4] and tile[3] <= cy < tile[5]:
-                assignments[building["id"]] = tile
-                break
+        tile = _deepest_tile_at(by_depth, depths, cx, cy)
+        if isinstance(tile, tuple):
+            assignments[building["id"]] = tile
     grouped: dict[str, list[dict[str, Any]]] = {}
     for building in buildings:
         tile = assignments.get(building["id"])
@@ -241,7 +400,10 @@ def color_buildings_from_textures(
                 "SELECT texture FROM textures WHERE tile_id=?", (tile_id,)
             ).fetchone()
             if row:
-                image = Image.open(io.BytesIO(row[0])).convert("RGB")
+                # Decoded once per tile, then sampled per footprint as an array.
+                image = np.asarray(
+                    Image.open(io.BytesIO(row[0])).convert("RGB")
+                )
         tile_bbox = (tile[2], tile[3], tile[4], tile[5])
         for building in group:
             cache_key = (building["id"], tile_id, version)
@@ -263,15 +425,12 @@ def query_roads(
     db: sqlite3.Connection, bbox: tuple[float, float, float, float]
 ) -> list[dict[str, Any]]:
     x_min, y_min, x_max, y_max = bbox
-    try:
-        rows = db.execute(
-            "SELECT id, type, properties FROM assets "
-            "WHERE enabled = 1 AND json_type(properties,'$.path')='array' "
-            "AND min_x <= ? AND max_x >= ? AND min_y <= ? AND max_y >= ?",
-            (x_max, x_min, y_max, y_min),
-        ).fetchall()
-    except sqlite3.OperationalError:
-        return []
+    rows = db.execute(
+        "SELECT id, type, properties FROM assets "
+        "WHERE enabled = 1 AND json_type(properties,'$.path')='array' "
+        "AND min_x <= ? AND max_x >= ? AND min_y <= ? AND max_y >= ?",
+        (x_max, x_min, y_max, y_min),
+    ).fetchall()
     result = []
     for asset_id, source_layer, raw in rows:
         props = _properties(raw)
@@ -539,11 +698,10 @@ def paint_roads(
 
 
 def _metadata(path: Path = DEFAULT_METADATA_PATH) -> dict[str, Any]:
-    try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return {}
-    return value if isinstance(value, dict) else {}
+    value = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(value, dict):
+        raise ValueError(f"asset metadata root must be an object: {path}")
+    return value
 
 
 def get_assets_response(
@@ -562,15 +720,12 @@ def get_assets_response(
     )
     vehicles = []
     structures = []
-    try:
-        rows = db.execute(
-            "SELECT id, type, lat, lon, heading_deg, z, properties, saved_at "
-            "FROM assets WHERE enabled = 1 AND type IN (?,?) "
-            "ORDER BY updated_at DESC, id",
-            (vehicle_type, structure_type),
-        ).fetchall()
-    except sqlite3.OperationalError:
-        rows = []
+    rows = db.execute(
+        "SELECT id, type, lat, lon, heading_deg, z, properties, saved_at "
+        "FROM assets WHERE enabled = 1 AND type IN (?,?) "
+        "ORDER BY updated_at DESC, id",
+        (vehicle_type, structure_type),
+    ).fetchall()
     for asset_id, asset_type, lat, lon, heading, z, raw, saved_at in rows:
         props = _properties(raw)
         if asset_type == vehicle_type:
@@ -599,10 +754,7 @@ def get_assets_response(
         headlights = dict(headlights)
         color = headlights.get("color")
         if isinstance(color, str) and color.startswith("#"):
-            try:
-                headlights["color"] = int(color[1:], 16)
-            except ValueError:
-                pass
+            headlights["color"] = int(color[1:], 16)
         vehicle_definition["headlights"] = headlights
     return {
         "ok": True,
@@ -629,14 +781,11 @@ def _ensure_seed_assets(
     inserted = False
     for seed in seeds:
         if not isinstance(seed, dict):
-            continue
-        try:
-            asset_id = str(seed["id"])
-            lat = float(seed["lat"])
-            lon = float(seed["lon"])
-            heading = float(seed.get("headingDeg", 0))
-        except (KeyError, TypeError, ValueError):
-            continue
+            raise ValueError("asset seed must be an object")
+        asset_id = str(seed["id"])
+        lat = float(seed["lat"])
+        lon = float(seed["lon"])
+        heading = float(seed.get("headingDeg", 0))
         if vehicle:
             props = {"headlightsOn": seed.get("headlightsOn", True)}
             for key in ("terrainDepth", "terrainTileId"):

@@ -4,6 +4,7 @@ import {
   createTerrainHud,
   hudActionLink,
   renderGameClock,
+  setTerrainGotoCollapsed,
   TERRAIN_HUD_LINKS,
   terrainHudHeader,
   tileEvictionHudLine,
@@ -16,6 +17,9 @@ function makeElement() {
     id: '',
     innerHTML: '',
     listeners: new Map(),
+    children: [],
+    appendChild(child) { this.children.push(child); return child; },
+    setAttribute(name, value) { this[name] = value; },
     addEventListener(type, handler) {
       if (!this.listeners.has(type)) this.listeners.set(type, []);
       this.listeners.get(type).push(handler);
@@ -155,4 +159,33 @@ test('terrain HUD owns the classifier operations link', () => {
     hudActionLink('classifierOpsLink', 'classifier ops'),
     /id="classifierOpsLink".*>classifier ops<\/span>/,
   );
+});
+
+test('GOTO form submits a town without being replaced by HUD refreshes', () => {
+  withFakeDom(created => {
+    let requested = '';
+    const result = createTerrainHud({
+      ...noopHudHandlers,
+      gotoTowns: ['Nuuk', 'Ilulissat'],
+      onGotoTown: name => {
+        requested = name;
+        return { ok: true, label: 'Nuuk' };
+      },
+    });
+    result.gotoInput.value = 'Nuuk';
+    const form = created.find(element => element.id === 'terrain-goto-form');
+    form.dispatch('submit', { preventDefault() {}, stopPropagation() {} });
+    assert.equal(requested, 'Nuuk');
+    assert.equal(result.gotoStatus.textContent, 'Travelling to Nuuk');
+    assert.equal(result.gotoStatus.style.display, 'block');
+    assert.ok(result.hud.children.includes(result.hudContent));
+  });
+});
+
+test('GOTO controls follow the regular HUD collapsed state', () => {
+  const gotoPanel = { style: { display: 'block' } };
+  setTerrainGotoCollapsed(gotoPanel, true);
+  assert.equal(gotoPanel.style.display, 'none');
+  setTerrainGotoCollapsed(gotoPanel, false);
+  assert.equal(gotoPanel.style.display, 'block');
 });

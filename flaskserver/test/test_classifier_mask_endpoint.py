@@ -197,8 +197,13 @@ class ClassifierRawMaskEndpointTest(unittest.TestCase):
     def test_missing_when_nothing_exists_at_all(self):
         response = self._get("/api/classifier/0-0-0.png?raw=1&res=8")
 
-        self.assertEqual(response.status_code, 404)
+        # 204, not 404. Never-classified ground is a normal answer, and the
+        # browser writes a console line for every 404 — one per newly visible
+        # tile floods the console during flight, which is a main-thread stall
+        # in its own right. The header stays the machine-readable signal.
+        self.assertEqual(response.status_code, 204)
         self.assertEqual(response.headers.get("X-Classifier-Status"), "missing")
+        self.assertEqual(response.data, b"")
 
     def test_d14_inherits_the_exact_geographic_crop_from_d12(self):
         # Four levels of child offsets would be sixteen tiles; d12 -> d14 is
