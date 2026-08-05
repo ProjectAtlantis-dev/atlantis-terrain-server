@@ -17,6 +17,11 @@ export function createTerrainVectorLayerRuntime({
   // Applies presentation-only changes to an existing mesh. Without it, such a
   // change has to fall through to a full rebuild.
   updateColors = null,
+  fetchRangeM = FETCH_RANGE_M,
+  refetchDistanceM = REFETCH_DISTANCE_M,
+  pollMs = POLL_MS,
+  decodeResponse = response => response.json(),
+  scheduleApply = callback => callback(),
   bootLog = () => {}, onMutated = () => {}, requestRender = () => {},
   fetchImpl = (...args) => fetch(...args),
 }) {
@@ -75,22 +80,23 @@ export function createTerrainVectorLayerRuntime({
   }
 
   async function maybeFetch({ force = false } = {}) {
-    if (fetching || !pipelineState.ready || !pipelineState.frameOffsetReady) return;
+    if (!endpoint || fetching || !pipelineState.ready || !pipelineState.frameOffsetReady) return;
     const queryX = pipelineState.lastFetchX;
     const queryY = pipelineState.lastFetchY;
     if (!Number.isFinite(queryX) || !Number.isFinite(queryY)) return;
     if (!force && lastFetchX !== null
-      && Math.hypot(queryX - lastFetchX, queryY - lastFetchY) < REFETCH_DISTANCE_M) return;
+      && Math.hypot(queryX - lastFetchX, queryY - lastFetchY) < refetchDistanceM) return;
     fetching = true;
     try {
-      const url = `${endpoint}?sx=${queryX}&sy=${queryY}&range=${FETCH_RANGE_M}`
+      const url = `${endpoint}?sx=${queryX}&sy=${queryY}&range=${fetchRangeM}`
         + `&ox=${pipelineState.originX}&oy=${pipelineState.originY}`;
       const response = await fetchImpl(url);
       if (!response.ok) return;
-      const data = await response.json();
+      const data = await decodeResponse(response);
       lastFetchX = queryX;
       lastFetchY = queryY;
-      applyItems(Array.isArray(data[itemsKey]) ? data[itemsKey] : []);
+      const items = Array.isArray(data[itemsKey]) ? data[itemsKey] : [];
+      scheduleApply(() => applyItems(items));
       bootLog(`${logLabel.toLowerCase()}.fetch`, { count: data.count ?? 0, queryX, queryY });
     } catch (error) {
       bootLog(`${logLabel.toLowerCase()}.fetch.error`, { message: error.message }, 'warn');
@@ -101,7 +107,7 @@ export function createTerrainVectorLayerRuntime({
 
   return {
     start() {
-      if (timer == null) timer = setInterval(maybeFetch, POLL_MS);
+      if (timer == null) timer = setInterval(maybeFetch, pollMs);
       return maybeFetch();
     },
     stop() {

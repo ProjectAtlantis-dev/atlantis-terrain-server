@@ -1,16 +1,59 @@
 import * as THREE from 'three';
 
 import { createTerrainVectorLayerRuntime } from './terrain-vector-layer-runtime.js';
+import { decodeTerrainBinaryPayload } from './terrain-binary-payload.js';
 
 // Grey extruded buildings from Asiaq Teknisk Grundkort footprints. Flask
-// reads them from the shared catalog while processing /api/tiles. Rings
-// arrive origin-relative (same ox/oy
-// convention as /api/tiles) with per-vertex surveyed roof elevations; each
+// reads them from the shared catalog through /api/buildings so terrain
+// responses never wait on settlement work. Rings arrive origin-relative
+// (the same ox/oy convention as /api/tiles) with per-vertex surveyed roof elevations; each
 // building is extruded from its ingest-sampled ground up to the real roof
 // outline. The scene is unlit, so wall shading is baked into vertex colors.
 
 const WALL_BASE_SINK_M = 1.5;      // bury the base so slopes don't leave gaps
 const LIGHT_DIR = { x: 0.5, y: -0.85 }; // grid-space sun for wall shading
+const BUILDING_FETCH_RANGE_M = 9000;
+const BUILDING_REFETCH_DISTANCE_M = 500;
+const BUILDING_STABLE_APPLY_MS = 350;
+// Ceiling on how long a resolved set may wait for a still camera.
+const BUILDING_MAX_APPLY_DEFER_MS = 1200;
+
+export function createStableApplyScheduler({
+  readPose,
+  stableMs = BUILDING_STABLE_APPLY_MS,
+  maxDeferMs = BUILDING_MAX_APPLY_DEFER_MS,
+  now = () => performance.now(),
+  schedule = (callback, delay) => setTimeout(callback, delay),
+}) {
+  let generation = 0;
+  return callback => {
+    const currentGeneration = ++generation;
+    let previousPose = readPose();
+    const startedAt = now();
+    let stableSince = startedAt;
+    const check = () => {
+      if (currentGeneration !== generation) return;
+      const pose = readPose();
+      const moved = pose.length !== previousPose.length
+        || pose.some((value, index) => Math.abs(value - previousPose[index]) > 1e-4);
+      if (moved) {
+        previousPose = pose;
+        stableSince = now();
+      }
+      const remaining = stableMs - (now() - stableSince);
+      // Every pose change pushes the stable window back, so continuous flight
+      // deferred the apply indefinitely — the buildings only appeared once the
+      // camera stopped. The deadline caps that: settle if we can, but never
+      // withhold a resolved settlement from a moving camera.
+      if (remaining > 0 && now() - startedAt < maxDeferMs) {
+        schedule(check, Math.min(100, remaining));
+        return;
+      }
+      callback();
+    };
+    schedule(check, Math.min(100, stableMs));
+  };
+}
 
 function shadeForEdge(dx, dy) {
   const length = Math.hypot(dx, dy);
@@ -193,11 +236,20 @@ export function applyBuildingColors(geometry, buildings) {
 
 export function createTerrainBuildingsRuntime({
   terrainRoot, pipelineState, exaggeration = 1, bootLog = () => {},
-  onMutated, requestRender,
+  onMutated, requestRender, fetchImpl,
+  readCameraPose = () => [
+    pipelineState.cameraStereoX ?? 0,
+    pipelineState.cameraStereoY ?? 0,
+  ],
+  scheduleApply = createStableApplyScheduler({ readPose: readCameraPose }),
 }) {
   const layer = createTerrainVectorLayerRuntime({
     terrainRoot, pipelineState,
-    endpoint: null, itemsKey: 'buildings', logLabel: 'Buildings',
+    endpoint: '/api/buildings', itemsKey: 'buildings', logLabel: 'Buildings',
+    fetchRangeM: BUILDING_FETCH_RANGE_M,
+    refetchDistanceM: BUILDING_REFETCH_DISTANCE_M,
+    decodeResponse: async response => decodeTerrainBinaryPayload(await response.arrayBuffer()),
+    scheduleApply,
     // Identity only — colour is applied through updateColors below.
     buildKeyForItem: item => item.id,
     updateColors: applyBuildingColors,
@@ -210,9 +262,13 @@ export function createTerrainBuildingsRuntime({
         }, 'warn'),
       }),
     onMutated, requestRender,
+    ...(fetchImpl == null ? {} : { fetchImpl }),
   });
   return {
+    start: layer.start,
+    stop: layer.stop,
     reconcile: layer.reconcile,
+    refresh: layer.refresh,
     setVisible: layer.setVisible,
     getVisible: layer.getVisible,
     getMesh: layer.getMesh,

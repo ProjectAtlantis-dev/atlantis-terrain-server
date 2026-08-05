@@ -25,7 +25,6 @@ from terrain_config import GREENLAND_BBOX
 
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_ASSETS_DB_PATH = ROOT / "assetserver" / "assets.db"
-DEFAULT_METADATA_PATH = ROOT / "assetserver" / "assets_metadata.json"
 
 ROAD_SUPERSAMPLE = 4
 DEFAULT_LINE_WIDTH_M = 3.0
@@ -76,20 +75,74 @@ def query_asset_by_type(
     qx: float,
     qy: float,
     max_range: float,
+    near_range: float | None = None,
+    far_min_bbox_area: float | None = None,
 ) -> list[dict[str, Any]]:
-    rows = db.execute(
+    """Assets of one type near a point.
+
+    ``near_range``/``far_min_bbox_area`` apply the distance LOD in SQL: beyond
+    the near box, only footprints whose stored bounding box is at least
+    ``far_min_bbox_area`` are returned. The stored bounds are already indexed,
+    so nothing smaller is ever read or JSON-parsed.
+
+    The bounding box is never smaller than the footprint it encloses, so this
+    is a conservative superset of the exact area test the caller applies — it
+    can admit a building the caller then drops, but never drops one the caller
+    would have kept.
+    """
+    sql = (
         "SELECT id, type, properties FROM assets "
         "WHERE type = ? AND enabled = 1 "
-        "AND cx BETWEEN ? AND ? AND cy BETWEEN ? AND ? LIMIT 20000",
-        (
-            asset_type,
-            qx - max_range, qx + max_range,
-            qy - max_range, qy + max_range,
-        ),
-    ).fetchall()
+        "AND cx BETWEEN ? AND ? AND cy BETWEEN ? AND ?"
+    )
+    params: list[Any] = [
+        asset_type,
+        qx - max_range, qx + max_range,
+        qy - max_range, qy + max_range,
+    ]
+    if near_range is not None and far_min_bbox_area is not None:
+        sql += (
+            " AND ((cx BETWEEN ? AND ? AND cy BETWEEN ? AND ?)"
+            " OR (max_x - min_x) * (max_y - min_y) >= ?)"
+        )
+        params += [
+            qx - near_range, qx + near_range,
+            qy - near_range, qy + near_range,
+            far_min_bbox_area,
+        ]
+    sql += " LIMIT 20000"
+    rows = db.execute(sql, params).fetchall()
     return [
         {"id": asset_id, "type": row_type, "properties": _properties(raw)}
         for asset_id, row_type, raw in rows
+    ]
+
+
+def query_asset_bounds_by_type(
+    db: sqlite3.Connection,
+    asset_type: str,
+    qx: float,
+    qy: float,
+    max_range: float,
+) -> list[tuple[float, float, float, float]]:
+    """Stored bounding boxes only — no properties, so no JSON parsing.
+
+    Callers that apply a distance LOD still need every footprint's extent to
+    reconcile overlapping sources, even for the ones they will not draw.
+    """
+    return [
+        (row[0], row[1], row[2], row[3])
+        for row in db.execute(
+            "SELECT min_x, min_y, max_x, max_y FROM assets "
+            "WHERE type = ? AND enabled = 1 "
+            "AND cx BETWEEN ? AND ? AND cy BETWEEN ? AND ? LIMIT 20000",
+            (
+                asset_type,
+                qx - max_range, qx + max_range,
+                qy - max_range, qy + max_range,
+            ),
+        )
+        if None not in row[:4]
     ]
 
 
@@ -697,65 +750,37 @@ def paint_roads(
     return output.getvalue(), painted
 
 
-def _metadata(path: Path = DEFAULT_METADATA_PATH) -> dict[str, Any]:
-    value = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(value, dict):
-        raise ValueError(f"asset metadata root must be an object: {path}")
-    return value
-
-
 def get_assets_response(
-    db: sqlite3.Connection, metadata_path: Path = DEFAULT_METADATA_PATH
+    db: sqlite3.Connection, metadata_path: Path | None = None,
 ) -> dict[str, Any]:
-    metadata = _metadata(metadata_path)
-    vehicle_type = str(metadata.get("vehicle_asset_type") or "").strip()
+    from vehicle_catalog import (
+        DEFAULT_METADATA_PATH, load_vehicle_assets, read_asset_metadata,
+    )
+
+    metadata = read_asset_metadata(metadata_path or DEFAULT_METADATA_PATH)
     structure_type = str(metadata.get("structure_asset_type") or "").strip()
-    if not vehicle_type or not structure_type:
+    if not structure_type:
         raise ValueError("asset metadata must define runtime asset type strings")
-    seeded_structures = _ensure_seed_assets(
-        db, structure_type, metadata.get("seed_structure_instances", []), vehicle=False
+    seeded_structures = _ensure_structure_seeds(
+        db, structure_type, metadata.get("seed_structure_instances", [])
     )
-    seeded_vehicles = _ensure_seed_assets(
-        db, vehicle_type, metadata.get("seed_vehicle_instances", []), vehicle=True
-    )
-    vehicles = []
+    seeded_vehicles, vehicle_definition, vehicles = load_vehicle_assets(db, metadata)
     structures = []
     rows = db.execute(
-        "SELECT id, type, lat, lon, heading_deg, z, properties, saved_at "
-        "FROM assets WHERE enabled = 1 AND type IN (?,?) "
+        "SELECT id, lat, lon, heading_deg, properties "
+        "FROM assets WHERE enabled = 1 AND type = ? "
         "ORDER BY updated_at DESC, id",
-        (vehicle_type, structure_type),
+        (structure_type,),
     ).fetchall()
-    for asset_id, asset_type, lat, lon, heading, z, raw, saved_at in rows:
+    for asset_id, lat, lon, heading, raw in rows:
         props = _properties(raw)
-        if asset_type == vehicle_type:
-            item = {
-                "id": asset_id, "lat": lat, "lon": lon,
-                "headingDeg": heading, "headlightsOn": props.get("headlightsOn", True),
-                "savedAt": saved_at or 0,
-            }
-            if z is not None:
-                item["z"] = z
-            for key in ("terrainDepth", "terrainTileId"):
-                if props.get(key) is not None:
-                    item[key] = props[key]
-            vehicles.append(item)
-        else:
-            item = {
-                "id": asset_id, "lat": lat, "lon": lon,
-                "headingDeg": heading, "scale": props.get("scale", 1),
-            }
-            if props.get("tileId"):
-                item["tileId"] = props["tileId"]
-            structures.append(item)
-    vehicle_definition = dict(metadata.get("vehicle_definition", {}))
-    headlights = vehicle_definition.get("headlights")
-    if isinstance(headlights, dict):
-        headlights = dict(headlights)
-        color = headlights.get("color")
-        if isinstance(color, str) and color.startswith("#"):
-            headlights["color"] = int(color[1:], 16)
-        vehicle_definition["headlights"] = headlights
+        item = {
+            "id": asset_id, "lat": lat, "lon": lon,
+            "headingDeg": heading, "scale": props.get("scale", 1),
+        }
+        if props.get("tileId"):
+            item["tileId"] = props["tileId"]
+        structures.append(item)
     return {
         "ok": True,
         "source": "asset_catalog",
@@ -771,8 +796,8 @@ def get_assets_response(
     }
 
 
-def _ensure_seed_assets(
-    db: sqlite3.Connection, asset_type: str, seeds: Any, *, vehicle: bool
+def _ensure_structure_seeds(
+    db: sqlite3.Connection, asset_type: str, seeds: Any,
 ) -> bool:
     if db.execute("SELECT 1 FROM assets WHERE type=? LIMIT 1", (asset_type,)).fetchone():
         return False
@@ -786,80 +811,16 @@ def _ensure_seed_assets(
         lat = float(seed["lat"])
         lon = float(seed["lon"])
         heading = float(seed.get("headingDeg", 0))
-        if vehicle:
-            props = {"headlightsOn": seed.get("headlightsOn", True)}
-            for key in ("terrainDepth", "terrainTileId"):
-                if seed.get(key) is not None:
-                    props[key] = seed[key]
-            z = seed.get("z")
-            saved_at = time.time()
-        else:
-            props = {"scale": seed.get("scale", 1)}
-            if seed.get("tileId"):
-                props["tileId"] = seed["tileId"]
-            z = None
-            saved_at = None
+        props = {"scale": seed.get("scale", 1)}
+        if seed.get("tileId"):
+            props["tileId"] = seed["tileId"]
         db.execute(
             "INSERT OR IGNORE INTO assets "
             "(id,type,enabled,lat,lon,heading_deg,z,properties,saved_at,updated_at) "
             "VALUES (?,?,1,?,?,?,?,?,?,CURRENT_TIMESTAMP)",
-            (asset_id, asset_type, lat, lon, heading, z, json.dumps(props), saved_at),
+            (asset_id, asset_type, lat, lon, heading, None, json.dumps(props), None),
         )
         inserted = True
     if inserted:
         db.commit()
     return inserted
-
-
-def save_vehicle_state(db: sqlite3.Connection, payload: dict[str, Any]) -> tuple[dict[str, Any], int]:
-    try:
-        lat = float(payload["lat"])
-        lon = float(payload["lon"])
-        heading = float(payload["headingDeg"]) % 360
-    except (KeyError, TypeError, ValueError):
-        return {"error": "invalid vehicle state payload: lat/lon/headingDeg are required"}, 400
-    if not all(math.isfinite(value) for value in (lat, lon, heading)):
-        return {"error": "invalid vehicle state payload: coordinates must be finite"}, 400
-
-    vehicle_type = str(_metadata().get("vehicle_asset_type") or "").strip()
-    if not vehicle_type:
-        return {"error": "asset metadata has no vehicle_asset_type"}, 500
-    row = db.execute(
-        "SELECT id, properties FROM assets WHERE type=? "
-        "ORDER BY enabled DESC, updated_at DESC, id LIMIT 1",
-        (vehicle_type,),
-    ).fetchone()
-    vehicle_id = str(row[0]) if row else "amv-01"
-    props = _properties(row[1]) if row else {"headlightsOn": True}
-    for key in ("terrainDepth", "terrainTileId"):
-        if payload.get(key) is not None:
-            props[key] = payload[key]
-        else:
-            props.pop(key, None)
-    z = payload.get("z")
-    if z is not None:
-        try:
-            z = float(z)
-        except (TypeError, ValueError):
-            return {"error": "invalid vehicle state payload: z must be finite"}, 400
-        if not math.isfinite(z):
-            return {"error": "invalid vehicle state payload: z must be finite"}, 400
-    saved_at = time.time()
-    db.execute(
-        "INSERT INTO assets "
-        "(id,type,enabled,lat,lon,heading_deg,z,properties,saved_at,updated_at) "
-        "VALUES (?,?,1,?,?,?,?,?,?,CURRENT_TIMESTAMP) "
-        "ON CONFLICT(id) DO UPDATE SET type=excluded.type,enabled=1,"
-        "lat=excluded.lat,lon=excluded.lon,"
-        "heading_deg=excluded.heading_deg,z=excluded.z,properties=excluded.properties,"
-        "saved_at=excluded.saved_at,updated_at=CURRENT_TIMESTAMP",
-        (vehicle_id, vehicle_type, lat, lon, heading, z, json.dumps(props), saved_at),
-    )
-    db.commit()
-    state = {"lat": lat, "lon": lon, "headingDeg": heading, "savedAt": saved_at}
-    if z is not None:
-        state["z"] = z
-    for key in ("terrainDepth", "terrainTileId"):
-        if props.get(key) is not None:
-            state[key] = props[key]
-    return {"ok": True, "vehicleId": vehicle_id, "state": state}, 200

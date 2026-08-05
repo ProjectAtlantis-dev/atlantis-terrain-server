@@ -5,6 +5,8 @@ behind ``SqliteSeamCache`` so repair remains usable without a database.
 """
 
 import datetime
+import sqlite3
+
 import numpy as np
 
 from colored_log import get_logger
@@ -30,8 +32,12 @@ CREATE INDEX IF NOT EXISTS terrain_seam_cache_tile_b
 class SqliteSeamCache:
     """Exact primary-key lookup for repaired physical terrain edges."""
 
-    def __init__(self, db):
+    def __init__(self, db, busy_timeout_ms=30000):
         self.db = db
+        # Restored after each best-effort write, so unrelated statements on
+        # this connection keep the patience they were configured with.
+        self._busy_timeout_ms = int(busy_timeout_ms)
+        self.skipped_busy = 0
 
     def get(self, key, sample_count):
         row = self.db.execute(
@@ -58,15 +64,34 @@ class SqliteSeamCache:
         return edge.copy()
 
     def put(self, key, edge):
+        """Best-effort write. A busy database is not an error here.
+
+        This runs inside the interactive tile query, which is otherwise a pure
+        read. WAL lets readers run during a write but still permits only one
+        writer, so with the default 30s busy_timeout this INSERT would queue
+        behind the background mask worker — measured at 4.4s, blocking two
+        camera polls at once. The seam edge is recomputed cheaply on the next
+        request, so skipping the write costs far less than waiting for it.
+        """
         values = np.asarray(edge, dtype=np.float32)
         now = datetime.datetime.now(datetime.timezone.utc).isoformat()
-        self.db.execute(
-            "INSERT INTO terrain_seam_cache "
-            "(tile_a, direction, tile_b, edge, updated_at) VALUES (?, ?, ?, ?, ?) "
-            "ON CONFLICT(tile_a, direction, tile_b) DO UPDATE SET "
-            "edge = excluded.edge, updated_at = excluded.updated_at",
-            (*key, values.tobytes(), now),
-        )
+        try:
+            self.db.execute("PRAGMA busy_timeout=50")
+            self.db.execute(
+                "INSERT INTO terrain_seam_cache "
+                "(tile_a, direction, tile_b, edge, updated_at) VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT(tile_a, direction, tile_b) DO UPDATE SET "
+                "edge = excluded.edge, updated_at = excluded.updated_at",
+                (*key, values.tobytes(), now),
+            )
+            self.skipped_busy = 0
+        except sqlite3.OperationalError as exc:
+            if "locked" not in str(exc) and "busy" not in str(exc):
+                raise
+            self.skipped_busy = getattr(self, "skipped_busy", 0) + 1
+        finally:
+            # Restore the connection's normal patience for everything else.
+            self.db.execute(f"PRAGMA busy_timeout={self._busy_timeout_ms}")
 
 
 def init_seam_cache(db):

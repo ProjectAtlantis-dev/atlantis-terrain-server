@@ -256,3 +256,193 @@ def _tile_bbox_for(depth, col, row):
 
 if __name__ == "__main__":
   unittest.main()
+
+
+class LazyGroundSamplerTest(unittest.TestCase):
+  """Empty terrain must not pay for a ground index it never samples."""
+
+  def test_never_touches_the_database_until_something_samples(self):
+    from buildings_query import LazyGroundSampler
+
+    class ExplodingDb:
+      def execute(self, *args, **kwargs):
+        raise AssertionError("the database must not be touched")
+
+    lazy = LazyGroundSampler(ExplodingDb(), (0.0, 0.0, 1.0, 1.0))
+    self.assertFalse(lazy.built)
+
+  def test_builds_once_and_reuses_it_for_later_samples(self):
+    from buildings_query import LazyGroundSampler
+    import buildings_query
+
+    calls = []
+
+    class FakeSampler:
+      def sample(self, x, y):
+        calls.append((x, y))
+        return 12.5
+
+    original = buildings_query.ground_sampler_for
+    buildings_query.ground_sampler_for = lambda db, bbox: (
+      calls.append("build") or FakeSampler()
+    )
+    try:
+      lazy = LazyGroundSampler(object(), (0.0, 0.0, 1.0, 1.0))
+      self.assertEqual(lazy.sample(1.0, 2.0), 12.5)
+      self.assertEqual(lazy.sample(3.0, 4.0), 12.5)
+    finally:
+      buildings_query.ground_sampler_for = original
+
+    self.assertTrue(lazy.built)
+    # Built once, then reused: one "build" marker, two sample calls.
+    self.assertEqual(calls.count("build"), 1)
+    self.assertEqual([c for c in calls if c != "build"], [(1.0, 2.0), (3.0, 4.0)])
+
+
+class BuildingsResultCacheTest(unittest.TestCase):
+  """Repeated polls from the same spot must not redo the resolve."""
+
+  def setUp(self):
+    import buildings_query
+    self.bq = buildings_query
+    buildings_query.invalidate_buildings_cache()
+    self.calls = []
+
+    # Stand in for the expensive resolve so the test measures caching only.
+    import asset_catalog
+    import gtk50_vector
+    self._saved = (
+      asset_catalog.query_asset_by_type,
+      asset_catalog.query_asset_bounds_by_type,
+      asset_catalog.color_buildings_from_textures,
+      gtk50_vector.query_structures,
+    )
+    asset_catalog.query_asset_by_type = lambda *a, **k: (
+      self.calls.append("resolve") or []
+    )
+    asset_catalog.query_asset_bounds_by_type = lambda *a, **k: []
+    asset_catalog.color_buildings_from_textures = lambda *a, **k: None
+    gtk50_vector.query_structures = lambda *a, **k: []
+
+  def tearDown(self):
+    import asset_catalog
+    import gtk50_vector
+    (asset_catalog.query_asset_by_type,
+     asset_catalog.query_asset_bounds_by_type,
+     asset_catalog.color_buildings_from_textures,
+     gtk50_vector.query_structures) = self._saved
+    self.bq.invalidate_buildings_cache()
+
+  def _call(self, qx, qy, ox=0.0, oy=0.0):
+    return self.bq.buildings_for_tile_query(object(), object(), qx, qy, ox, oy)
+
+  def test_a_small_drift_reuses_the_resolved_set(self):
+    self._call(1_000_000.0, 2_000_000.0)
+    self._call(1_000_060.0, 2_000_000.0)  # same 250m cell
+    self.assertEqual(self.calls.count("resolve"), 1)
+
+  def test_crossing_a_cell_resolves_again(self):
+    self._call(1_000_000.0, 2_000_000.0)
+    self._call(1_000_400.0, 2_000_000.0)
+    self.assertEqual(self.calls.count("resolve"), 2)
+
+  def test_a_changed_origin_never_reuses_rings_resolved_against_the_old_one(self):
+    # Rings are stored relative to ox/oy, so reusing them across an origin
+    # change would place every building at the wrong offset.
+    self._call(1_000_000.0, 2_000_000.0, ox=0.0, oy=0.0)
+    self._call(1_000_000.0, 2_000_000.0, ox=5_000.0, oy=0.0)
+    self.assertEqual(self.calls.count("resolve"), 2)
+
+  def test_the_entry_expires(self):
+    self._call(1_000_000.0, 2_000_000.0)
+    self.bq._result_state["at"] -= self.bq._RESULT_TTL_S + 1
+    self._call(1_000_000.0, 2_000_000.0)
+    self.assertEqual(self.calls.count("resolve"), 2)
+
+
+class DistanceLodTest(unittest.TestCase):
+  def _square(self, cx, cy, side, ident="b"):
+    half = side / 2.0
+    return {
+      "id": ident, "groundZ": 0,
+      "ring": [
+        [cx - half, cy - half, 0.0], [cx + half, cy - half, 0.0],
+        [cx + half, cy + half, 0.0], [cx - half, cy + half, 0.0],
+      ],
+    }
+
+  def test_everything_inside_the_full_detail_radius_is_kept(self):
+    from buildings_query import BUILDING_FULL_DETAIL_RANGE_M, apply_distance_lod
+    near = BUILDING_FULL_DETAIL_RANGE_M - 100.0
+    tiny = self._square(near, 0.0, 4.0)  # 16 m2, far below the far-field floor
+    self.assertEqual(apply_distance_lod([tiny], 0.0, 0.0, 0.0, 0.0), [tiny])
+
+  def test_a_small_footprint_beyond_the_radius_is_dropped(self):
+    from buildings_query import BUILDING_FULL_DETAIL_RANGE_M, apply_distance_lod
+    far = BUILDING_FULL_DETAIL_RANGE_M + 500.0
+    tiny = self._square(far, 0.0, 4.0)
+    self.assertEqual(apply_distance_lod([tiny], 0.0, 0.0, 0.0, 0.0), [])
+
+  def test_a_large_footprint_beyond_the_radius_survives(self):
+    from buildings_query import (
+      BUILDING_FAR_MIN_AREA_M2, BUILDING_FULL_DETAIL_RANGE_M, apply_distance_lod,
+    )
+    far = BUILDING_FULL_DETAIL_RANGE_M + 500.0
+    side = (BUILDING_FAR_MIN_AREA_M2 ** 0.5) + 5.0
+    big = self._square(far, 0.0, side)
+    self.assertEqual(apply_distance_lod([big], 0.0, 0.0, 0.0, 0.0), [big])
+
+  def test_distance_is_measured_from_the_camera_not_the_response_origin(self):
+    from buildings_query import BUILDING_FULL_DETAIL_RANGE_M, apply_distance_lod
+    # Ring sits at the origin, but the origin is far from the camera, so this
+    # building is distant and its 16 m2 footprint must not survive.
+    tiny = self._square(0.0, 0.0, 4.0)
+    far_origin = BUILDING_FULL_DETAIL_RANGE_M + 500.0
+    self.assertEqual(
+      apply_distance_lod([tiny], 0.0, 0.0, far_origin, 0.0), [],
+    )
+
+
+class AsiaqSuppressionSurvivesLodTest(unittest.TestCase):
+  """A culled Asiaq footprint must still suppress its coarse GTK50 twin."""
+
+  def test_a_dropped_small_asiaq_building_still_hides_its_gtk50_twin(self):
+    import asset_catalog
+    import buildings_query
+    import gtk50_vector
+
+    buildings_query.invalidate_buildings_cache()
+    far = buildings_query.BUILDING_FULL_DETAIL_RANGE_M + 500.0
+    # A small Asiaq footprint beyond the LOD radius: the SQL prefilter and the
+    # area cull both drop it, so it never reaches the response...
+    saved = (
+      asset_catalog.query_asset_by_type,
+      asset_catalog.query_asset_bounds_by_type,
+      asset_catalog.color_buildings_from_textures,
+      gtk50_vector.query_structures,
+    )
+    asset_catalog.query_asset_by_type = lambda *a, **k: []
+    # ...but its bounds are still published for suppression.
+    asset_catalog.query_asset_bounds_by_type = lambda *a, **k: [
+      (far - 5.0, -5.0, far + 5.0, 5.0),
+    ]
+    asset_catalog.color_buildings_from_textures = lambda *a, **k: None
+    gtk50_vector.query_structures = lambda *a, **k: [{
+      "id": "gtk50-twin", "groundZ": 0, "_center": (far, 0.0),
+      "ring": [[far - 6, -6, 0], [far + 6, -6, 0], [far + 6, 6, 0]],
+    }]
+    try:
+      result = buildings_query.buildings_for_tile_query(
+        object(), object(), 0.0, 0.0, 0.0, 0.0,
+      )
+    finally:
+      (asset_catalog.query_asset_by_type,
+       asset_catalog.query_asset_bounds_by_type,
+       asset_catalog.color_buildings_from_textures,
+       gtk50_vector.query_structures) = saved
+      buildings_query.invalidate_buildings_cache()
+
+    self.assertEqual(
+      [b["id"] for b in result], [],
+      "the GTK50 twin of a culled Asiaq footprint must not reappear",
+    )

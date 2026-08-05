@@ -4,6 +4,7 @@ import * as THREE from 'three';
 
 import {
   applyBuildingColors,
+  createStableApplyScheduler,
   buildBuildingsGeometry,
   createTerrainBuildingsRuntime,
 } from '../terrain-buildings-runtime.js';
@@ -91,12 +92,12 @@ test('buildBuildingsGeometry reports triangulation failures before skipping', ()
   assert.deepEqual(errors, [['bad building contour', squareBuilding.id]]);
 });
 
-test('runtime reconciles Flask tile-response buildings without an HTTP fetch', () => {
+test('runtime keeps direct reconcile while exposing independent fetch controls', () => {
   let fetches = 0;
   const runtime = createTerrainBuildingsRuntime({
     terrainRoot: { add() {}, remove() {} },
     pipelineState: {
-      originX: 1000, originY: 2000, frameOffsetX: 5, frameOffsetY: -5,
+      ready: false, originX: 1000, originY: 2000, frameOffsetX: 5, frameOffsetY: -5,
     },
     fetchImpl: async () => {
       fetches += 1;
@@ -108,8 +109,45 @@ test('runtime reconciles Flask tile-response buildings without an HTTP fetch', (
 
   assert.ok(runtime.getMesh());
   assert.equal(fetches, 0);
-  assert.equal(runtime.start, undefined);
-  assert.equal(runtime.refresh, undefined);
+  assert.equal(typeof runtime.start, 'function');
+  assert.equal(typeof runtime.refresh, 'function');
+});
+
+test('runtime fetches buildings separately and defers their mesh application', async () => {
+  const ring = new Float32Array(squareBuilding.ring.flat());
+  const headerBytes = new TextEncoder().encode(JSON.stringify({
+    tiles: [], count: 1,
+    buildings: [{ id: squareBuilding.id, groundZ: 10, ringBytes: ring.byteLength }],
+  }));
+  const paddedHeaderLength = headerBytes.length + (-(headerBytes.length + 4) & 3);
+  const buffer = new ArrayBuffer(4 + paddedHeaderLength + ring.byteLength);
+  new DataView(buffer).setUint32(0, paddedHeaderLength, true);
+  new Uint8Array(buffer, 4, headerBytes.length).set(headerBytes);
+  new Uint8Array(buffer, 4 + headerBytes.length, paddedHeaderLength - headerBytes.length).fill(32);
+  new Float32Array(buffer, 4 + paddedHeaderLength).set(ring);
+
+  let requestedUrl = null;
+  let deferredApply = null;
+  const runtime = createTerrainBuildingsRuntime({
+    terrainRoot: { add() {}, remove() {} },
+    pipelineState: {
+      ready: true, frameOffsetReady: true,
+      originX: 1000, originY: 2000, frameOffsetX: 5, frameOffsetY: -5,
+      lastFetchX: 1100, lastFetchY: 2100,
+    },
+    fetchImpl: async url => {
+      requestedUrl = url;
+      return { ok: true, arrayBuffer: async () => buffer };
+    },
+    scheduleApply: callback => { deferredApply = callback; },
+  });
+
+  await runtime.start();
+  runtime.stop();
+  assert.match(requestedUrl, /^\/api\/buildings\?sx=1100&sy=2100&range=9000/);
+  assert.equal(runtime.getMesh(), null);
+  deferredApply();
+  assert.ok(runtime.getMesh());
 });
 
 test('a binary flat ring builds the same geometry as the JSON ring', () => {
@@ -197,4 +235,52 @@ test('a colour update for an unknown building is ignored', () => {
     applyBuildingColors(geometry, [{ id: 'ghost', groundZ: 0, color: [255, 0, 0] }]),
     false,
   );
+});
+
+test('a moving camera still gets its buildings once the deadline passes', () => {
+  let clock = 0;
+  const pending = [];
+  let applied = 0;
+  const scheduleApply = createStableApplyScheduler({
+    // Never still: every poll reports a new position, as in continuous flight.
+    readPose: () => [clock, 0],
+    stableMs: 350,
+    maxDeferMs: 1200,
+    now: () => clock,
+    schedule: (callback, delay) => pending.push({ callback, at: clock + delay }),
+  });
+
+  scheduleApply(() => { applied += 1; });
+  // Run the timer wheel forward well past the deadline, moving throughout.
+  for (let step = 0; step < 40 && applied === 0; step++) {
+    const next = pending.shift();
+    if (!next) break;
+    clock = Math.max(clock + 50, next.at);
+    next.callback();
+  }
+  assert.equal(applied, 1, 'a permanently moving camera must still be served');
+  assert.ok(clock >= 1200, 'and only after the deadline, not immediately');
+});
+
+test('a camera that settles applies on the stable window, not the deadline', () => {
+  let clock = 0;
+  const pending = [];
+  let applied = 0;
+  const scheduleApply = createStableApplyScheduler({
+    readPose: () => [7, 7],           // perfectly still
+    stableMs: 350,
+    maxDeferMs: 1200,
+    now: () => clock,
+    schedule: (callback, delay) => pending.push({ callback, at: clock + delay }),
+  });
+
+  scheduleApply(() => { applied += 1; });
+  for (let step = 0; step < 40 && applied === 0; step++) {
+    const next = pending.shift();
+    if (!next) break;
+    clock = next.at;
+    next.callback();
+  }
+  assert.equal(applied, 1);
+  assert.ok(clock < 1200, 'a still camera must not wait for the deadline');
 });

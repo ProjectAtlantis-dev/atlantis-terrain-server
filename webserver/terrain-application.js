@@ -1476,6 +1476,10 @@ buildingsRuntime = createTerrainBuildingsRuntime({
   pipelineState: terrainPipelineState,
   exaggeration: EXAG,
   bootLog,
+  readCameraPose: () => [
+    camera.position.x, camera.position.y, camera.position.z,
+    controls.yaw, controls.pitch,
+  ],
   onMutated: markSceneMutated,
   requestRender,
 });
@@ -1786,7 +1790,6 @@ function runStreamingMaintenance() {
 
 const terrainFetchEvents = {
   onResponseApplied: requestRender,
-  onBuildings: buildings => buildingsRuntime?.reconcile(buildings),
   onSkip: () => enqueueClientLog('debug', 'fetchTiles.coalesce', {
     reason: 'latest camera position queued', ...getCameraLogSnapshot(),
   }),
@@ -2089,6 +2092,7 @@ terrainPipelineState.ready = true;
 if (!bootFlyToTileId || !flyToTileRuntime.flyToTile(bootFlyToTileId).ok) {
   terrainFetchRuntime.request();
 }
+buildingsRuntime.start();
 vehicleRuntime.loadVehicleState();
 vehicleRuntime.loadVehicleModel();
 

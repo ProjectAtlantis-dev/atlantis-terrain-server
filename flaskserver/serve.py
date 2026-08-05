@@ -179,9 +179,14 @@ def _lod_target_depth(distance, max_range, max_depth, altitude=0.0):
     if altitude > 0.0:
         max_depth = min(
             max_depth,
-            # max_depth is already the settled ceiling from _query_tiles_impl;
-            # holding it here keeps the radial curve from undoing hysteresis.
-            _altitude_depth_cap(altitude, max_depth, previous_depth=max_depth),
+            # Bare rule, no deadband. Hysteresis belongs to the transition
+            # between what the client held and what it should hold next, and
+            # _query_tiles_impl has already applied it against the client's
+            # real previous depth to produce this ceiling. Re-applying it here
+            # with previous_depth=max_depth compares the ceiling against
+            # itself, so any coarsening lands inside the deadband and is
+            # discarded — the altitude cap could never lower anything.
+            _altitude_depth_cap(altitude, max_depth),
         )
     if max_range <= 0:
         return max_depth
