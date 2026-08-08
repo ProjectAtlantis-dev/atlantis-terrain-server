@@ -28,6 +28,18 @@ def _db():
         );
         CREATE TABLE bathymetry (tile_id TEXT PRIMARY KEY, source TEXT);
         CREATE TABLE water_purge_audit (tile_id TEXT PRIMARY KEY);
+        CREATE TABLE terrain_artifact_revisions (
+            revision_id TEXT PRIMARY KEY, source_label TEXT NOT NULL
+        );
+        CREATE TABLE terrain_artifact_inputs (
+            output_revision_id TEXT, input_revision_id TEXT
+        );
+        CREATE TABLE terrain_artifact_current (
+            artifact_kind TEXT, tile_id TEXT, revision_id TEXT
+        );
+        CREATE TABLE terrain_artifact_events (
+            from_revision_id TEXT, to_revision_id TEXT
+        );
         CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT);
         CREATE TABLE soundings (
             source_url TEXT, record_id TEXT, depth_m REAL,
@@ -94,6 +106,22 @@ def _seed(db, *, reverse=False):
     db.execute(
         "INSERT INTO terrain_seam_cache VALUES ('12-1-1','east','12-1-2')"
     )
+    db.executemany(
+        "INSERT INTO terrain_artifact_revisions VALUES (?, ?)",
+        (("provider-rev", "dataforsyningen_metatile4h2"),
+         ("crop-rev", "ancestor_crop")),
+    )
+    db.executemany(
+        "INSERT INTO terrain_artifact_current VALUES ('texture', ?, ?)",
+        (("12-1-1", "provider-rev"), ("13-2-2", "crop-rev")),
+    )
+    db.execute(
+        "INSERT INTO terrain_artifact_inputs VALUES ('crop-rev','provider-rev')"
+    )
+    db.executemany(
+        "INSERT INTO terrain_artifact_events VALUES (NULL, ?)",
+        (("provider-rev",), ("crop-rev",)),
+    )
     db.execute("INSERT INTO metadata VALUES ('schema_version','18')")
     db.execute(
         "INSERT INTO metadata VALUES "
@@ -120,7 +148,9 @@ def _snapshot(db):
             "classifier_tiles", "road_texture_bakes", "cliff_graft_assets",
             "classifier_votes",
             "terrain_seam_cache", "bathymetry", "water_purge_audit",
-            "metadata", "soundings",
+            "terrain_artifact_revisions", "terrain_artifact_inputs",
+            "terrain_artifact_current", "terrain_artifact_events", "metadata",
+            "soundings",
         )
     }
 
@@ -193,6 +223,26 @@ class GlobalDerivedPurgeTests(unittest.TestCase):
             db.execute("SELECT key FROM metadata ORDER BY key").fetchall(),
             [("schema_version",)],
         )
+        self.assertEqual(
+            db.execute("SELECT * FROM terrain_artifact_revisions").fetchall(),
+            [("provider-rev", "dataforsyningen_metatile4h2")],
+        )
+        self.assertEqual(
+            db.execute(
+                "SELECT tile_id,revision_id FROM terrain_artifact_current"
+            ).fetchall(),
+            [("12-1-1", "provider-rev")],
+        )
+        self.assertEqual(
+            db.execute(
+                "SELECT COUNT(*) FROM terrain_artifact_inputs"
+            ).fetchone()[0],
+            0,
+        )
+        self.assertEqual(
+            db.execute("SELECT to_revision_id FROM terrain_artifact_events").fetchall(),
+            [("provider-rev",)],
+        )
 
     def test_second_apply_is_a_noop(self):
         db = _db()
@@ -235,6 +285,16 @@ class GlobalDerivedPurgeTests(unittest.TestCase):
             apply_derived_purge(db)
 
         self.assertEqual(_snapshot(db), before)
+
+    def test_incomplete_artifact_lineage_schema_aborts(self):
+        db = _db()
+        self.addCleanup(db.close)
+        db.execute("DROP TABLE terrain_artifact_events")
+
+        with self.assertRaisesRegex(
+            RuntimeError, "incomplete terrain artifact lineage schema"
+        ):
+            plan_derived_purge(db)
 
 
 if __name__ == "__main__":

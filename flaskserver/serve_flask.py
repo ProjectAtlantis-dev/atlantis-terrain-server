@@ -17,6 +17,7 @@ import time
 import zlib
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
 from logging import FileHandler
 from pathlib import Path
 from typing import Any, cast
@@ -1834,13 +1835,63 @@ _TILES_SLOW_LOG_MS = 300.0
 _GTK50_PREFETCH_RANGE_M = 25000.0
 
 
-@app.get("/api/tiles")
-@app.post("/api/tiles")
-def api_tiles():
-  unavailable = _terrain_unavailable_response()
-  if unavailable is not None:
-    return unavailable
+@dataclass(frozen=True)
+class TileQuery:
+  """Everything the tile answer depends on, already decoded from the wire."""
 
+  qx: float
+  qy: float
+  # Render origin the client wants bboxes rebased against; defaults to qx/qy.
+  ox: float
+  oy: float
+  error: float
+  # Only an untagged viewer request may drive terrain/coastline below the
+  # depth-12 data contract. Bathymetry's synthetic camera sweep exists solely
+  # to acquire solve/carve prerequisites and must never populate d13+ tiles.
+  max_depth: int
+  demand_origin: str
+  max_range: float
+  # LOD uses height above local terrain, not absolute altitude.
+  lod_altitude: float = 0.0
+  # Sent by the client and carried here as part of the request contract; the
+  # traversal below is a heading-independent circle and does not read it.
+  heading: float = 0.0
+  binary_heightmaps: bool = False
+  bathymetry: bool = True
+  # Residency map: tile id -> digest the client already holds and can rebuild
+  # from. Matching tiles ship as metadata only. Measured at 80% of transferred
+  # elevation bytes on a real flight, all of it re-decoded and re-allocated by
+  # the browser once a second.
+  known_digests: dict[str, str] = field(default_factory=dict)
+  # Echoed back from the previous response so the altitude cap has something
+  # to be hysteretic against.
+  previous_depth_cap: int | None = None
+
+
+@dataclass
+class TileResult:
+  """A tile answer, before any particular encoding is chosen."""
+
+  payload: dict
+  # Float32 sample blocks, in ``payload["tiles"]`` order. Only populated for
+  # binary queries; JSON queries carry their samples inside the payload.
+  heightmap_blobs: list[bytes] = field(default_factory=list)
+  stages: list[tuple[str, float]] = field(default_factory=list)
+  # ``perf_counter`` at the last recorded stage, so a caller that encodes the
+  # payload can time that step continuously with the stages above.
+  staged_until: float = 0.0
+
+
+class TileQueryError(RuntimeError):
+  """The LOD traversal failed; the caller decides how to report that."""
+
+
+def collect_tiles(db, query: TileQuery) -> TileResult:
+  """Answer a camera position: the visible tiles plus the demand they schedule.
+
+  Free of Flask so tools, tests, and synthetic sweeps can drive the same
+  traversal and scheduling without standing up a request context.
+  """
   # Stage timings, reported only when a request is slow enough to be worth
   # explaining. Normal flight is ~50ms and logs nothing; the occasional
   # multi-second outlier says where it went instead of leaving us guessing.
@@ -1852,61 +1903,33 @@ def api_tiles():
     _t_stages.append((name, (now - _t_last[0]) * 1000.0))
     _t_last[0] = now
 
-  error = _arg_float("error", 0.0005)
-  # Only an untagged viewer request may drive terrain/coastline below the
-  # depth-12 data contract. Bathymetry's synthetic camera sweep exists solely
-  # to acquire solve/carve prerequisites and must never populate d13+ tiles.
-  max_depth = terrain_request_max_depth(request.args, MAX_TILE_DEPTH)
-  demand_origin = terrain_request_origin(request.args)
-  max_range = _arg_float("range", 16000.0)
+  qx, qy = query.qx, query.qy
+  ox, oy = query.ox, query.oy
+  error = query.error
+  max_depth = query.max_depth
+  demand_origin = query.demand_origin
+  max_range = query.max_range
+  lod_altitude = query.lod_altitude
+  binary_heightmaps = query.binary_heightmaps
+  known_digests = query.known_digests
 
-  if "sx" in request.args and "sy" in request.args:
-    qx = _arg_float("sx", 0.0)
-    qy = _arg_float("sy", 0.0)
-  else:
-    lat = _arg_float("lat", 64.175)
-    lon = _arg_float("lon", -51.7388)
-    qx, qy = _to_stereo(lat, lon)
-
-  log.debug(f"[/api/tiles] qx={qx:.0f} qy={qy:.0f} error={error} maxDepth={max_depth} range={max_range:.0f} params={dict(request.args)}")
-
-  ox = _arg_float("ox", qx)
-  oy = _arg_float("oy", qy)
-  # LOD uses height above local terrain. ``alt`` is retained as a fallback
-  # for older clients, but current clients send the unambiguous ``agl``.
-  lod_altitude = _arg_float("agl", _arg_float("alt", 0.0))
-  heading = _arg_float("heading", 0.0)
-  binary_heightmaps = request.args.get("format") == "binary"
-  # Residency map: tile id -> digest the client already holds and can rebuild
-  # from. Matching tiles ship as metadata only. Measured at 80% of transferred
-  # elevation bytes on a real flight, all of it re-decoded and re-allocated by
-  # the browser once a second.
-  known_digests = {}
-  previous_depth_cap = None
-  if request.method == "POST":
-    body = request.get_json(silent=True) or {}
-    candidate = body.get("known")
-    if isinstance(candidate, dict):
-      known_digests = candidate
-    held = body.get("depthCap")
-    if isinstance(held, int):
-      previous_depth_cap = held
   try:
     tiles, missing = _query_tiles_stereo(
-      _get_db(),
+      db,
       qx,
       qy,
       error_threshold=error,
       max_depth=max_depth,
       max_range=max_range,
       altitude=lod_altitude,
-      previous_depth=previous_depth_cap,
+      previous_depth=query.previous_depth_cap,
       log=lambda msg: log.debug(f"[/api/tiles] {msg}"),
     )
   except Exception as exc:
     log.error(f"[/api/tiles] query FAILED: {type(exc).__name__}: {exc}")
-    return jsonify({"error": f"tile query failed: {type(exc).__name__}: {exc}"}), 500
-
+    raise TileQueryError(
+      f"tile query failed: {type(exc).__name__}: {exc}"
+    ) from exc
 
   _mark("query_tiles")
   # A global derived reset retains origin DEMs, so those tiles do not pass
@@ -1927,7 +1950,7 @@ def api_tiles():
     coastline_targets[target_id] = tuple(_tile_bbox(depth, column, row))
 
   coastline_active, coastline_pending = _schedule_coastline_demand(
-    _get_db(), coastline_targets, camera=(qx, qy),
+    db, coastline_targets, camera=(qx, qy),
   )
   _mark("coastline_sched")
 
@@ -1949,7 +1972,7 @@ def api_tiles():
       check_ids.add(f"{d}-{c}-{r}")
 
   _mark("ancestor_ids")
-  texture_sources = _texture_sources_in(_get_db(), list(check_ids))
+  texture_sources = _texture_sources_in(db, list(check_ids))
   _mark("texture_sources")
   texture_ids = set(texture_sources)
   with _tex_fetching_lock:
@@ -2034,7 +2057,7 @@ def api_tiles():
 
   # Continuously feed free workers. Unstarted work is replaced by every new
   # camera-priority list, so there is neither a wave barrier nor a stale queue.
-  _record_dem_requests(_get_db(), missing, origin=demand_origin)
+  _record_dem_requests(db, missing, origin=demand_origin)
   visible_synthetic = [
     (tile["id"], tile["bbox"])
     for tile in tiles
@@ -2084,10 +2107,8 @@ def api_tiles():
   # depth-12 DEM and authoritative coastline mask exist. The scheduler
   # coalesces eligible fjord/coastal tiles at depth 8 and ignores open ocean.
   bathymetry_submitted = []
-  if request.args.get("bathymetry", "1") != "0":
-    bathymetry_submitted = _bathymetry_demand.schedule(
-      _get_db(), all_tile_ids
-    )
+  if query.bathymetry:
+    bathymetry_submitted = _bathymetry_demand.schedule(db, all_tile_ids)
   bathymetry_status = _bathymetry_demand.status()
   _mark("bathymetry_sched")
 
@@ -2132,31 +2153,104 @@ def api_tiles():
       # hysteretic against; without it every response re-decides from scratch.
       "depthCap": max((t["depth"] for t in tile_data), default=None),
   }
-  if not binary_heightmaps:
-    return jsonify(payload)
+  return TileResult(payload, heightmap_blobs, _t_stages, _t_last[0])
 
-  # [uint32 LE header length][header JSON + pad][float32 tile samples, tile order]
-  #
-  # The header is padded to a 4-byte boundary so the sample block starts
-  # aligned: a browser cannot create a Float32Array view over an unaligned
-  # offset, and copying to realign would give back the win. Trailing spaces
-  # are insignificant whitespace to any JSON parser. Every block is a whole
-  # number of float32s, so each following block stays aligned too.
-  header = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+
+def encode_tiles_binary(result: TileResult) -> bytes:
+  """[uint32 LE header length][header JSON + pad][float32 samples, tile order]
+
+  The header is padded to a 4-byte boundary so the sample block starts
+  aligned: a browser cannot create a Float32Array view over an unaligned
+  offset, and copying to realign would give back the win. Trailing spaces
+  are insignificant whitespace to any JSON parser. Every block is a whole
+  number of float32s, so each following block stays aligned too.
+  """
+  header = json.dumps(result.payload, separators=(",", ":")).encode("utf-8")
   header += b" " * (-(len(header) + 4) % 4)
-  body = b"".join([
-    struct.pack("<I", len(header)), header, *heightmap_blobs,
+  return b"".join([
+    struct.pack("<I", len(header)), header, *result.heightmap_blobs,
   ])
-  _mark("serialize")
-  _total_ms = sum(ms for _, ms in _t_stages)
+
+
+def _tile_query_from_request() -> TileQuery:
+  """Decode a /api/tiles request. The only place that touches ``request``."""
+  if "sx" in request.args and "sy" in request.args:
+    qx = _arg_float("sx", 0.0)
+    qy = _arg_float("sy", 0.0)
+  else:
+    lat = _arg_float("lat", 64.175)
+    lon = _arg_float("lon", -51.7388)
+    qx, qy = _to_stereo(lat, lon)
+
+  known_digests: dict[str, str] = {}
+  previous_depth_cap = None
+  if request.method == "POST":
+    body = request.get_json(silent=True) or {}
+    candidate = body.get("known")
+    if isinstance(candidate, dict):
+      known_digests = candidate
+    held = body.get("depthCap")
+    if isinstance(held, int):
+      previous_depth_cap = held
+
+  return TileQuery(
+    qx=qx,
+    qy=qy,
+    ox=_arg_float("ox", qx),
+    oy=_arg_float("oy", qy),
+    error=_arg_float("error", 0.0005),
+    max_depth=terrain_request_max_depth(request.args, MAX_TILE_DEPTH),
+    demand_origin=terrain_request_origin(request.args),
+    max_range=_arg_float("range", 16000.0),
+    # ``alt`` is retained as a fallback for older clients, but current
+    # clients send the unambiguous ``agl``.
+    lod_altitude=_arg_float("agl", _arg_float("alt", 0.0)),
+    heading=_arg_float("heading", 0.0),
+    binary_heightmaps=request.args.get("format") == "binary",
+    bathymetry=request.args.get("bathymetry", "1") != "0",
+    known_digests=known_digests,
+    previous_depth_cap=previous_depth_cap,
+  )
+
+
+@app.get("/api/tiles")
+@app.post("/api/tiles")
+def api_tiles():
+  unavailable = _terrain_unavailable_response()
+  if unavailable is not None:
+    return unavailable
+
+  query = _tile_query_from_request()
+  log.debug(
+    f"[/api/tiles] qx={query.qx:.0f} qy={query.qy:.0f} error={query.error} "
+    f"maxDepth={query.max_depth} range={query.max_range:.0f} "
+    f"params={dict(request.args)}"
+  )
+
+  try:
+    result = collect_tiles(_get_db(), query)
+  except TileQueryError as exc:
+    return jsonify({"error": str(exc)}), 500
+
+  if not query.binary_heightmaps:
+    return jsonify(result.payload)
+
+  body = encode_tiles_binary(result)
+  sample_bytes = sum(len(b) for b in result.heightmap_blobs)
+  header_bytes = len(body) - sample_bytes - 4
+  stages = [
+    *result.stages,
+    ("serialize", (time.perf_counter() - result.staged_until) * 1000.0),
+  ]
+  _total_ms = sum(ms for _, ms in stages)
   if _total_ms >= _TILES_SLOW_LOG_MS:
     log.warning(
       "[/api/tiles SLOW] total=%.0fms  %s  | tiles=%d reused=%d "
       "header=%.2fMB samples=%.2fMB",
       _total_ms,
-      "  ".join(f"{n}={ms:.0f}" for n, ms in _t_stages if ms >= 1.0),
-      len(tile_data), tile_reused,
-      len(header) / 1e6, sum(len(b) for b in heightmap_blobs) / 1e6,
+      "  ".join(f"{n}={ms:.0f}" for n, ms in stages if ms >= 1.0),
+      len(result.payload["tiles"]), result.payload["tilesReused"],
+      header_bytes / 1e6, sample_bytes / 1e6,
     )
   return app.response_class(
     body,
