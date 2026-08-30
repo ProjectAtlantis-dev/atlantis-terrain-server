@@ -49,6 +49,43 @@ export function buildOpticalWaterGeometry(sourceMesh, {
   }
   if (!hasWaterSample) return null;
 
+  // A fallback terrain tile may be carved by any union of deeper resident
+  // tiles. Its optical-water twin must use the same holes; a full quad here
+  // would reintroduce the exact coplanar LOD overlap removed from the terrain.
+  const clipSignature = sourceMesh.userData?.terrainClipSignature ?? '';
+  const activeSurfaceIndexCount = Number(
+    sourceMesh.userData?.terrainActiveSurfaceIndexCount,
+  );
+  const sourceIndex = sourceMesh.geometry?.getIndex?.();
+  if (
+    clipSignature !== ''
+    && Number.isInteger(activeSurfaceIndexCount)
+    && activeSurfaceIndexCount >= 0
+    && sourceIndex?.count >= activeSurfaceIndexCount
+  ) {
+    if (activeSurfaceIndexCount === 0) return null;
+    const positions = new Float32Array(expectedCount * 3);
+    const uvs = new Float32Array(expectedCount * 2);
+    for (let index = 0; index < expectedCount; index += 1) {
+      positions[index * 3] = sourcePosition.getX(index);
+      positions[index * 3 + 1] = sourcePosition.getY(index);
+      positions[index * 3 + 2] = surfaceZ;
+      uvs[index * 2] = sourceUv.getX(index);
+      uvs[index * 2 + 1] = sourceUv.getY(index);
+    }
+    const IndexArray = sourceIndex.array.constructor;
+    const indices = new IndexArray(activeSurfaceIndexCount);
+    indices.set(sourceIndex.array.subarray(0, activeSurfaceIndexCount));
+    const geometry = new THREE.BufferGeometry();
+    geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+    geometry.setAttribute('uv', new THREE.BufferAttribute(uvs, 2));
+    geometry.setIndex(new THREE.BufferAttribute(indices, 1));
+    geometry.computeVertexNormals();
+    geometry.computeBoundingBox();
+    geometry.computeBoundingSphere();
+    return geometry;
+  }
+
   // A wet tile gets a complete flat twin. Do not clip the fake cover back to
   // the classification mask: a single missing/coarse mask cell over a deep
   // fjord exposes the real floor hundreds of metres below. Ordinary depth
@@ -294,9 +331,14 @@ export function createOpticalWaterSurfaceRuntime({
         ?? source.userData?.heightmapPayload
         ?? null;
       const bbox = source.userData?.bbox ?? null;
+      const clipSignature = source.userData?.terrainClipSignature ?? '';
 
       let entry = opticalByTile.get(tileId);
-      if (entry != null && (entry.payload !== payload || !sameBbox(entry.bbox, bbox))) {
+      if (entry != null && (
+        entry.payload !== payload
+        || entry.clipSignature !== clipSignature
+        || !sameBbox(entry.bbox, bbox)
+      )) {
         remove(tileId, entry);
         totalRebuilds += 1;
         entry = null;
@@ -305,6 +347,7 @@ export function createOpticalWaterSurfaceRuntime({
         const parked = dormantTwins.get(tileId);
         if (parked != null
           && parked.payload === payload
+          && parked.clipSignature === clipSignature
           && sameBbox(parked.bbox, bbox)) {
           dormantTwins.delete(tileId);
           group.add(parked.optical);
@@ -317,10 +360,13 @@ export function createOpticalWaterSurfaceRuntime({
         const waterless = waterlessTiles.get(tileId);
         if (waterless !== undefined
           && waterless.payload === payload
+          && waterless.clipSignature === clipSignature
           && sameBbox(waterless.bbox, bbox)) {
           continue;
         }
-        candidates.push({ source, tileId, payload, bbox, distance: distanceTo(bbox) });
+        candidates.push({
+          source, tileId, payload, bbox, clipSignature, distance: distanceTo(bbox),
+        });
         continue;
       }
       bindTwin(entry, source);
@@ -331,7 +377,9 @@ export function createOpticalWaterSurfaceRuntime({
         (a.distance ?? Number.POSITIVE_INFINITY) - (b.distance ?? Number.POSITIVE_INFINITY)
       ));
     }
-    for (const { source, tileId, payload, bbox, distance } of candidates) {
+    for (const {
+      source, tileId, payload, bbox, clipSignature, distance,
+    } of candidates) {
       if (!canBuild()) {
         deferredBuilds += 1;
         if (distance != null && (deferredNearest == null || distance < deferredNearest)) {
@@ -342,7 +390,7 @@ export function createOpticalWaterSurfaceRuntime({
       built += 1;
       const optical = createOpticalMesh(source);
       if (optical == null) {
-        waterlessTiles.set(tileId, { payload, bbox });
+        waterlessTiles.set(tileId, { payload, bbox, clipSignature });
         continue;
       }
       waterlessTiles.delete(tileId);
@@ -350,7 +398,7 @@ export function createOpticalWaterSurfaceRuntime({
       if (distance != null && (builtFarthest == null || distance > builtFarthest)) {
         builtFarthest = distance;
       }
-      const entry = { optical, payload, bbox };
+      const entry = { optical, payload, bbox, clipSignature };
       opticalByTile.set(tileId, entry);
       group.add(optical);
       bindTwin(entry, source);

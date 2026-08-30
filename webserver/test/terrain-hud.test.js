@@ -2,12 +2,12 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   createTerrainHud,
+  formatCompactLatLon,
   hudActionLink,
   renderGameClock,
   setTerrainGotoCollapsed,
   TERRAIN_HUD_LINKS,
   terrainHudHeader,
-  tileEvictionHudLine,
 } from '../terrain-hud.js';
 
 function makeElement() {
@@ -62,7 +62,7 @@ const noopHudHandlers = Object.fromEntries([
   'onToggleGridlines', 'onToggleRetroMode', 'onToggleBathymetryMap',
   'onToggleClassifierOverlay', 'onToggleWaterOverlay',
   'onToggleHydrographyOverlay', 'onToggleProcgen', 'onToggleRenderBackend',
-  'onToggleRoadDebug', 'onToggleTileEviction', 'onOpenGoogleMaps',
+  'onToggleRoadDebug', 'onOpenGoogleMaps',
   'onStartFastTime', 'onReset', 'onClockAction',
 ].map(name => [name, () => {}]));
 
@@ -134,6 +134,22 @@ test('renderGameClock only rewrites the DOM when the display changes', () => {
   assert.ok(element.innerHTML.includes('×600'));
 });
 
+test('compact lat/lon readout keeps useful precision without HUD diagnostics', () => {
+  assert.equal(formatCompactLatLon(64.1834982, -51.7216009), '64.18350°, -51.72160°');
+});
+
+test('bottom-right flight panel supports a two-line position readout', () => {
+  withFakeDom(() => {
+    const result = createTerrainHud({
+      ...noopHudHandlers,
+      onToggleCollapsed: () => {},
+    });
+    assert.equal(result.alt.id, 'terrain-position-readout');
+    assert.match(result.alt.style.cssText, /white-space:pre-line/);
+    assert.match(result.alt.style.cssText, /text-align:right/);
+  });
+});
+
 test('terrain HUD header exposes its expanded state and dropdown direction', () => {
   const expanded = terrainHudHeader(false);
   assert.match(expanded, /id="hudToggleLink"/);
@@ -145,12 +161,6 @@ test('terrain HUD header exposes its expanded state and dropdown direction', () 
   assert.match(collapsed, /aria-expanded="false"/);
   assert.match(collapsed, /Show HUD details/);
   assert.match(collapsed, /&#9660;/);
-});
-
-test('terrain HUD exposes data eviction as an explicit debug gate', () => {
-  assert.match(tileEvictionHudLine(true), /id="tileEvictionLink"/);
-  assert.match(tileEvictionHudLine(true), />enabled<\/span>/);
-  assert.match(tileEvictionHudLine(false), /data eviction: .*DISABLED/);
 });
 
 test('terrain HUD owns the classifier operations link', () => {

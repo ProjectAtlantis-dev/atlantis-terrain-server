@@ -1,5 +1,6 @@
 import * as THREE from 'three';
 import { detailMaskUrl, tileDepthFromTileId } from './terrain-detail-layer.js';
+import { createClassifierRouteRuntime } from './terrain-classifier-route.js';
 
 // Shared per-tile surface-channel store. One fetch of the server's surface
 // mask (/api/classifier/<id>.png?raw=1: R=rock/dark/shore markers,
@@ -17,10 +18,12 @@ export function createSurfaceFieldStore({
   fetchImpl = (...args) => fetch(...args),
   log = () => {},
   evictionGate = null,
+  classifierRoute = null,
 } = {}) {
   const entries = new Map(); // tileId -> { texture, fields }
   const inFlight = new Map();
   const failed = new Set();
+  const route = classifierRoute ?? createClassifierRouteRuntime({ fetchImpl, log });
 
   function evictOverflow() {
     if (evictionGate?.enabled === false) return;
@@ -121,8 +124,9 @@ export function createSurfaceFieldStore({
     if (failed.has(tileId)) return Promise.resolve(null);
     const inFlightRequest = inFlight.get(tileId);
     if (inFlightRequest) return inFlightRequest;
-    const request = fetchImpl(detailMaskUrl(tileId))
-      .then(response => {
+    const request = route.fetchResponse(detailMaskUrl(tileId), tileId)
+      .then(({ available, response }) => {
+        if (!available || response == null) return null;
         // 204 = no classifier row for this tile or any ancestor. It is a
         // normal answer, so it must not be thrown: an error status would be
         // logged by the browser for every unclassified tile in view.
@@ -188,7 +192,10 @@ export function createSurfaceFieldStore({
     failed.clear();
   }
 
-  return { get, peek, dispose, tileDepthFromTileId };
+  return {
+    get, peek, dispose, tileDepthFromTileId,
+    getTransportStatus: route.getStatus,
+  };
 }
 
 let _sharedStore = null;

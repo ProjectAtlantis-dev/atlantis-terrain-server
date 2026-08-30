@@ -40,7 +40,12 @@ export function createTerrainGpuProfileControl({
       },
     });
     if (!response.ok) {
-      throw new Error(`GPU profile control ${path || 'poll'} failed (${response.status})`);
+      const error = new Error(
+        `GPU profile control ${path || 'poll'} failed (${response.status})`,
+      );
+      error.status = response.status;
+      error.path = path;
+      throw error;
     }
     return response.json();
   }
@@ -167,7 +172,9 @@ export function createTerrainGpuProfileControl({
     try {
       await applyControl(await request());
     } catch (error) {
-      log('gpu-profile.control-error', {
+      const unavailable = error?.status === 404 && error?.path === '';
+      if (unavailable) stopped = true;
+      log(unavailable ? 'gpu-profile.unavailable' : 'gpu-profile.control-error', {
         message: error?.message ?? String(error),
       });
     } finally {

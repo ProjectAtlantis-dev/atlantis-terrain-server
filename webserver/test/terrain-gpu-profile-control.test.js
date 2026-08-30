@@ -171,3 +171,31 @@ test('browser retries a completed result report without re-draining', async () =
   assert.equal(reportAttempts, 2);
   assert.equal(summaryCalls, callsAfterDrain);
 });
+
+test('browser stops polling when the optional GPU profile route is unavailable', async () => {
+  let requests = 0;
+  let scheduled = 0;
+  const logs = [];
+  const control = createTerrainGpuProfileControl({
+    profiler: null,
+    backend: 'webgl',
+    fetchImpl: async () => {
+      requests += 1;
+      return jsonResponse({}, 404);
+    },
+    windowRef: {
+      setTimeout() { scheduled += 1; return scheduled; },
+      clearTimeout() {},
+    },
+    log: (event, details) => logs.push({ event, details }),
+  });
+
+  await control.poll();
+  await control.poll();
+
+  assert.equal(requests, 1);
+  assert.equal(scheduled, 0);
+  assert.equal(logs.length, 1);
+  assert.equal(logs[0].event, 'gpu-profile.unavailable');
+  assert.match(logs[0].details.message, /404/);
+});

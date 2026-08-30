@@ -6,10 +6,14 @@ export function createTerrainClientLogger({
   batchSize = 40,
   maxQueue = 600,
   flushMs = 800,
+  retryBaseMs = 1_000,
+  retryMaxMs = 30_000,
+  failureReportMs = 30_000,
   windowRef = window,
   navigatorRef = navigator,
   fetchImpl = fetch,
   performanceRef = performance,
+  consoleRef = console,
 } = {}) {
   const levelRanks = { debug: 10, info: 20, warn: 30, warning: 30, error: 40, critical: 50 };
   const minLevelRank = levelRanks[minLevel] ?? levelRanks.info;
@@ -18,6 +22,8 @@ export function createTerrainClientLogger({
   const bootStartMs = performanceRef.now();
   let inFlight = false;
   let flushTimer = null;
+  let consecutiveFailures = 0;
+  let lastFailureReportMs = null;
 
   function safeDetails(details) {
     if (details === undefined) return undefined;
@@ -56,6 +62,7 @@ export function createTerrainClientLogger({
       return;
     }
     inFlight = true;
+    let nextFlushDelayMs = 250;
     fetchImpl(endpoint, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -63,19 +70,36 @@ export function createTerrainClientLogger({
       keepalive: true,
     })
       .then(response => {
-        if (!response.ok) throw new Error(`client log status ${response.status}`);
+        if (!response.ok) {
+          const error = new Error(`client log status ${response.status}`);
+          error.status = response.status;
+          throw error;
+        }
+        consecutiveFailures = 0;
+        lastFailureReportMs = null;
       })
       .catch(error => {
-        console.error('[CLIENT LOG] post failed', {
-          endpoint,
-          error: error?.message ?? String(error),
-        });
+        consecutiveFailures += 1;
+        nextFlushDelayMs = Math.min(
+          retryMaxMs,
+          retryBaseMs * (2 ** Math.min(consecutiveFailures - 1, 16)),
+        );
+        const nowMs = performanceRef.now();
+        if (lastFailureReportMs == null || nowMs - lastFailureReportMs >= failureReportMs) {
+          consoleRef.error('[CLIENT LOG] post failed; retrying with backoff', {
+            endpoint,
+            error: error?.message ?? String(error),
+            consecutiveFailures,
+            retryInMs: nextFlushDelayMs,
+          });
+          lastFailureReportMs = nowMs;
+        }
         queue.unshift(...batch);
         trimQueue();
       })
       .finally(() => {
         inFlight = false;
-        if (queue.length > 0) scheduleFlush(250);
+        if (queue.length > 0) scheduleFlush(nextFlushDelayMs);
       });
   }
 
@@ -86,7 +110,7 @@ export function createTerrainClientLogger({
     if (normalized !== undefined) entry.details = normalized;
     queue.push(entry);
     trimQueue();
-    if (queue.length >= batchSize) flush();
+    if (queue.length >= batchSize && consecutiveFailures === 0) flush();
     else scheduleFlush();
   }
 
@@ -135,5 +159,10 @@ export function createTerrainClientLogger({
     enqueueClientLog: enqueue,
     flushClientLogQueue: flush,
     getBootEvents: () => bootEvents.slice(),
+    getTransportStatus: () => ({
+      queueLength: queue.length,
+      inFlight,
+      consecutiveFailures,
+    }),
   };
 }

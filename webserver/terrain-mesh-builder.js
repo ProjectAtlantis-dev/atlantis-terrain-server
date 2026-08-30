@@ -31,6 +31,20 @@ export function terrainTileSamples(tile) {
   return decodeTerrainHeightmap(tile?.heightmap);
 }
 
+/**
+ * Whether this response contains a published water classification for the
+ * effective heightmap. Until it does, the terrain samples are only the DEM's
+ * sign-based fallback and must not replace the water renderer's explicit
+ * no-coverage depth.
+ *
+ * Older terrain servers do not expose this metadata. Treat those tiles as
+ * capture-ready so this readiness contract remains backward compatible.
+ */
+export function terrainTileBathymetryReady(tile) {
+  const maskSource = tile?.dem?.heightmap?.maskSource;
+  return maskSource == null || maskSource !== 'dem_nonpositive_fallback';
+}
+
 export function decodeTerrainHeightmap(base64, decodeBase64 = value => atob(value)) {
   const raw = decodeBase64(base64);
   const bytes = new Uint8Array(raw.length);
@@ -143,6 +157,7 @@ export function updateTerrainMeshHeightmap(mesh, tile) {
   Object.assign(mesh.userData, {
     heightmapPayload: tile.heightmap,
     terrainSource: tile.source,
+    terrainBathymetryReady: terrainTileBathymetryReady(tile),
     terrainWaterMask,
     terrainWaterMaskKey: terrainWaterMaskKey(terrainWaterMask),
   });
@@ -177,6 +192,7 @@ export function createTerrainMeshBuilder({
       tileId: tile.id,
       bbox: tile.bbox,
       terrainSource: tile.source,
+      terrainBathymetryReady: terrainTileBathymetryReady(tile),
       resolution,
       skirtDepth,
       terrainExaggeration: exaggeration,

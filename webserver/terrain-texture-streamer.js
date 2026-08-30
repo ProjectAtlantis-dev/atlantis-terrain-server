@@ -195,6 +195,24 @@ export function createTextureStreamer({
           }
           const ancestorId = response.headers.get('X-Tex-Ancestor');
           const source = response.headers.get('X-Tex-Source') || '';
+          const responseTileId = response.headers.get('X-Tex-Tile');
+          const expectedDigest = tile?.texture?.digest;
+          const responseEtag = response.headers.get('ETag');
+          if (responseTileId && responseTileId !== tileId) {
+            throw new Error(
+              `texture response tile mismatch: expected ${tileId}, got ${responseTileId}`,
+            );
+          }
+          if (
+            !ancestorId
+            && typeof expectedDigest === 'string'
+            && expectedDigest.length > 0
+            && responseEtag !== `"${expectedDigest}"`
+          ) {
+            throw new Error(
+              `texture digest mismatch for ${tileId}: expected ${expectedDigest}, got ${responseEtag ?? 'missing ETag'}`,
+            );
+          }
           return response.blob()
             .then(blob => decodeImage(blob, { imageOrientation: 'flipY' }))
             .then(bitmap => ({ bitmap, ancestorId, source }));

@@ -11,8 +11,8 @@ Usage:
         [--terrain-db terrain.db] [--assets-db ../assetserver/assets.db]
 
 The settlement code (e.g. 0600NUK) is taken from the zip filename. The source
-The UTM zone is read from the source layer's PRJ file (GR96 zones 18N-24N =
-EPSG:3178-3184).
+UTM zone is read from the source layer's PRJ file and mapped to its GR96 EPSG
+code.
 
 Attribution: Contains data from Asiaq, Greenland Survey — Teknisk Grundkort.
 Terms: https://www.asiaq.gl/wp-content/uploads/2026/04/EN_Terms_of_use_for_Asiaq_geodata.pdf
@@ -98,13 +98,11 @@ def read_polygonz_outer_rings(data):
 
 
 def source_epsg_from_prj(prj_text):
-    """GR96 UTM zone NN N -> EPSG:3160+NN (zones 18-24 = 3178-3184)."""
+    """Map a GR96 UTM zone NN N declaration to its EPSG code."""
     match = re.search(r"UTM[_ ]Zone[_ ](\d+)N", prj_text, re.IGNORECASE)
     if not match:
         raise ValueError(f"cannot find UTM zone in .prj: {prj_text[:120]}")
     zone = int(match.group(1))
-    if not 18 <= zone <= 24:
-        raise ValueError(f"unexpected GR96 UTM zone {zone}")
     return 3160 + zone
 
 

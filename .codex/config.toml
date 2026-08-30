@@ -1,0 +1,9 @@
+[mcp_servers.atlantis]
+command = "npx"
+args = ["atlantis-mcp", "--port", "8025"]
+
+[mcp_servers.atlantis.tools.command]
+approval_mode = "approve"
+
+[mcp_servers.atlantis.tools.readme]
+approval_mode = "approve"

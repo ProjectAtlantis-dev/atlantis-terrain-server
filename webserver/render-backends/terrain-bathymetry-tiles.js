@@ -18,7 +18,15 @@ export function prepareTerrainTilesForBathymetry(
       renderOrder: tile.renderOrder,
     };
     restore.push(state);
-    tile.layers.set(TERRAIN_BATHYMETRY_LAYER);
+    if (tile.userData?.terrainBathymetryReady === false) {
+      // A DEM may arrive minutes before its coastline/connectivity mask. Its
+      // provisional sign-based surface can be a near-zero ocean plate. Keep
+      // it out of the depth target so uncovered pixels retain alpha zero and
+      // both water shaders use their deliberate -5 m fallback instead.
+      tile.layers.disable(TERRAIN_BATHYMETRY_LAYER);
+    } else {
+      tile.layers.set(TERRAIN_BATHYMETRY_LAYER);
+    }
     // Parents establish fallback coverage first; finer tiles overwrite them
     // even where the coarse shoreline is geometrically higher.
     tile.renderOrder = address.depth;
@@ -32,4 +40,3 @@ export function prepareTerrainTilesForBathymetry(
     }
   };
 }
-

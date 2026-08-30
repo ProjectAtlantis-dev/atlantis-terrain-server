@@ -8,6 +8,7 @@ import * as THREE from 'three';
 const REFETCH_DISTANCE_M = 5000;
 const FETCH_RANGE_M = 25000;
 const POLL_MS = 2000;
+const RETRY_MAX_MS = 30000;
 
 export function createTerrainVectorLayerRuntime({
   terrainRoot, pipelineState,
@@ -20,6 +21,9 @@ export function createTerrainVectorLayerRuntime({
   fetchRangeM = FETCH_RANGE_M,
   refetchDistanceM = REFETCH_DISTANCE_M,
   pollMs = POLL_MS,
+  retryBaseMs = pollMs,
+  retryMaxMs = RETRY_MAX_MS,
+  now = () => Date.now(),
   decodeResponse = response => response.json(),
   scheduleApply = callback => callback(),
   bootLog = () => {}, onMutated = () => {}, requestRender = () => {},
@@ -32,6 +36,9 @@ export function createTerrainVectorLayerRuntime({
   let lastFetchY = null;
   let lastBuildKey = null;
   let timer = null;
+  let unavailable = false;
+  let consecutiveFailures = 0;
+  let retryAtMs = 0;
 
   function disposeMesh() {
     if (!mesh) return;
@@ -80,7 +87,11 @@ export function createTerrainVectorLayerRuntime({
   }
 
   async function maybeFetch({ force = false } = {}) {
-    if (!endpoint || fetching || !pipelineState.ready || !pipelineState.frameOffsetReady) return;
+    if (
+      !endpoint || unavailable || fetching
+      || !pipelineState.ready || !pipelineState.frameOffsetReady
+      || now() < retryAtMs
+    ) return;
     const queryX = pipelineState.lastFetchX;
     const queryY = pipelineState.lastFetchY;
     if (!Number.isFinite(queryX) || !Number.isFinite(queryY)) return;
@@ -91,15 +102,40 @@ export function createTerrainVectorLayerRuntime({
       const url = `${endpoint}?sx=${queryX}&sy=${queryY}&range=${fetchRangeM}`
         + `&ox=${pipelineState.originX}&oy=${pipelineState.originY}`;
       const response = await fetchImpl(url);
-      if (!response.ok) return;
+      if (!response.ok) {
+        if (response.status === 404) {
+          unavailable = true;
+          bootLog(`${logLabel.toLowerCase()}.unavailable`, {
+            endpoint,
+            status: response.status,
+          }, 'warn');
+          return;
+        }
+        const error = new Error(`${logLabel} request failed (${response.status})`);
+        error.status = response.status;
+        throw error;
+      }
       const data = await decodeResponse(response);
+      consecutiveFailures = 0;
+      retryAtMs = 0;
       lastFetchX = queryX;
       lastFetchY = queryY;
       const items = Array.isArray(data[itemsKey]) ? data[itemsKey] : [];
       scheduleApply(() => applyItems(items));
       bootLog(`${logLabel.toLowerCase()}.fetch`, { count: data.count ?? 0, queryX, queryY });
     } catch (error) {
-      bootLog(`${logLabel.toLowerCase()}.fetch.error`, { message: error.message }, 'warn');
+      consecutiveFailures += 1;
+      const retryInMs = Math.min(
+        retryMaxMs,
+        retryBaseMs * (2 ** Math.min(consecutiveFailures - 1, 16)),
+      );
+      retryAtMs = now() + retryInMs;
+      bootLog(`${logLabel.toLowerCase()}.fetch.error`, {
+        message: error?.message ?? String(error),
+        status: error?.status ?? null,
+        consecutiveFailures,
+        retryInMs,
+      }, 'warn');
     } finally {
       fetching = false;
     }
@@ -124,6 +160,11 @@ export function createTerrainVectorLayerRuntime({
     },
     getVisible: () => visible,
     getMesh: () => mesh,
+    getTransportStatus: () => ({
+      unavailable,
+      consecutiveFailures,
+      retryAtMs,
+    }),
     reconcile(items) {
       if (Array.isArray(items)) applyItems(items);
     },

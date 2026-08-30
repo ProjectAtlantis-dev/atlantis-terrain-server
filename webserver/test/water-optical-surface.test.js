@@ -102,6 +102,40 @@ test('a full-resolution optical twin is only a two-triangle quad', () => {
   );
 });
 
+test('a clipped fallback optical twin reuses the terrain slot instead of covering it', () => {
+  const resolution = 3;
+  const geometry = new THREE.BufferGeometry();
+  const positions = [];
+  const uvs = [];
+  for (let row = 0; row < resolution; row += 1) {
+    for (let column = 0; column < resolution; column += 1) {
+      positions.push(column, row, -100);
+      uvs.push(column / 2, row / 2);
+    }
+  }
+  geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+  geometry.setAttribute('uv', new THREE.Float32BufferAttribute(uvs, 2));
+  // Three active cells; the north-east cell is the higher-resolution slot.
+  geometry.setIndex([
+    0, 1, 3, 1, 4, 3,
+    1, 2, 4, 2, 5, 4,
+    3, 4, 6, 4, 7, 6,
+  ]);
+  const source = new THREE.Mesh(geometry, new THREE.MeshBasicMaterial());
+  Object.assign(source.userData, {
+    resolution,
+    terrainWaterMask: new Uint8Array(9).fill(1),
+    terrainClipSignature: '18:test',
+    terrainActiveSurfaceIndexCount: 18,
+  });
+
+  const optical = buildOpticalWaterGeometry(source);
+
+  assert.equal(optical.getAttribute('position').count, 9);
+  assert.equal(optical.getIndex().count, 18);
+  assert.deepEqual(Array.from(optical.getIndex().array), Array.from(geometry.getIndex().array));
+});
+
 test('optical water owns visual depth only, is non-interactive, and follows waterline', () => {
   const terrainRoot = new THREE.Group();
   const source = terrainTile();

@@ -261,7 +261,7 @@ export function createTerrainBuildingsRuntime({
           message: error?.message ?? String(error),
         }, 'warn'),
       }),
-    onMutated, requestRender,
+    bootLog, onMutated, requestRender,
     ...(fetchImpl == null ? {} : { fetchImpl }),
   });
   return {
@@ -272,5 +272,6 @@ export function createTerrainBuildingsRuntime({
     setVisible: layer.setVisible,
     getVisible: layer.getVisible,
     getMesh: layer.getMesh,
+    getTransportStatus: layer.getTransportStatus,
   };
 }

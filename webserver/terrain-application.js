@@ -25,11 +25,11 @@ import {
   cameraDriftIndicator,
   compassHeading,
   createTerrainHud,
+  formatCompactLatLon,
   hudActionLink,
   renderGameClock,
   setTerrainGotoCollapsed,
   terrainHudHeader,
-  tileEvictionHudLine,
 } from './terrain-hud.js';
 import {
   applyMapDrag,
@@ -41,7 +41,8 @@ import { stepVehicleDrive } from './terrain-vehicle.js';
 import { createTerrainVehicleRuntime } from './terrain-vehicle-runtime.js';
 import { createTileHistory, terrainFogDistance, tileDepthFromId } from './terrain-tile-runtime.js';
 import { createTextureStreamer, rendererTextureAnisotropy } from './terrain-texture-streamer.js';
-import { evaluateTerrainRefetch, summarizeTerrainCamera, terrainCameraCoordinates, terrainCameraGridPosition, terrainCameraStereoPosition } from './terrain-tile-fetch.js';
+import { evaluateTerrainRefetch, summarizeTerrainCamera, terrainCameraCoordinates, terrainCameraGridPosition, terrainCameraStereoPosition, terrainDemandLag, terrainInspectorCameraScenePosition } from './terrain-tile-fetch.js';
+import { summarizeDemandBacklog } from './terrain-demand-backlog.js';
 import { collectTerrainDebugMeshes, createTerrainHoverOutlineController, createTerrainMapGridController, formatTerrainSeamDiagnostic, summarizeTerrainMesh } from './terrain-debug-runtime.js';
 import { createTerrainFetchRuntime } from './terrain-fetch-runtime.js';
 import { classifyDemSource } from './terrain-tile-quality.js';
@@ -98,6 +99,7 @@ import { DEFAULT_PROCGEN_ENABLED, procgenHudLine } from './terrain-procgen-toggl
 import {
   readCameraState, removeCameraState, writeCameraState,
 } from './terrain-camera-storage.js';
+import { createClassifierRouteRuntime } from './terrain-classifier-route.js';
 
 export async function startTerrainApplication({
   backend = 'webgl',
@@ -108,9 +110,13 @@ if (backend !== 'webgl' && backend !== 'webgpu') {
 }
 const USE_WEBGPU_RENDER_BACKEND = backend === 'webgpu';
 const tileEvictionGate = createTileEvictionGate();
+const classifierRoute = createClassifierRouteRuntime({
+  log: (tileId, message) => console.warn(`[CLASSIFIER] ${tileId}: ${message}`),
+});
 const surfaceFieldStore = sharedSurfaceFieldStore({
   log: () => {},
   evictionGate: tileEvictionGate,
+  classifierRoute,
 });
 const backendModule = USE_WEBGPU_RENDER_BACKEND
   ? await import('./render-backends/webgpu-backend.js')
@@ -404,7 +410,6 @@ const {
     onToggleRenderBackend();
   },
   onToggleRoadDebug: () => toggleRoadDebug(),
-  onToggleTileEviction: () => toggleTileEviction(),
   onOpenGoogleMaps: () => openGoogleMapsView(),
   onStartFastTime: () => startFastTime(),
   onReset: () => resetView(),
@@ -1151,6 +1156,7 @@ const REFETCH_DIST = 1000;
 // depth-12 tile width so a vertical descent reveals finer tiles promptly even
 // when the camera has not moved horizontally.
 const REFETCH_ALTITUDE_DELTA = 100;
+const DEMAND_BACKLOG_POLL_MS = 1000;
 const terrainPipelineState = {
   ready: false,
   originX: 0,
@@ -1175,17 +1181,84 @@ const terrainPipelineState = {
   serverTextureStatus: {},
 }; // end terrain pipeline state
 
+let demandBacklogRequest = null;
+let lastDemandBacklogAlertAt = -Infinity;
+let lastDemandBacklogAlertKey = '';
+let lastDemandBacklogError = '';
+let lastDemandBacklogErrorAt = -Infinity;
+
+async function refreshDemandBacklog() {
+  if (demandBacklogRequest) return demandBacklogRequest;
+  demandBacklogRequest = (async () => {
+    try {
+      const response = await fetch('/api/demand-status', {
+        cache: 'no-store',
+        signal: AbortSignal.timeout(2000),
+      });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const payload = await response.json();
+      if (lastDemandBacklogError) {
+        enqueueClientLog('info', 'terrain.backlog.monitor.recovered', {
+          previousError: lastDemandBacklogError,
+        });
+        lastDemandBacklogError = '';
+      }
+      const summary = summarizeDemandBacklog(payload);
+      const now = performance.now();
+      if (summary.severity === 'starved' && (
+        !lastDemandBacklogAlertKey
+        || now - lastDemandBacklogAlertAt >= 30_000
+      )) {
+        lastDemandBacklogAlertAt = now;
+        lastDemandBacklogAlertKey = summary.alertKey;
+        enqueueClientLog('warn', 'terrain.backlog.starved', {
+          text: summary.text,
+          polling: payload.polling,
+          lanes: summary.details,
+        });
+      } else if (summary.severity !== 'starved') {
+        lastDemandBacklogAlertKey = '';
+      }
+    } catch (error) {
+      const message = error?.message ?? String(error);
+      const now = performance.now();
+      if (message !== lastDemandBacklogError
+        || now - lastDemandBacklogErrorAt >= 60_000) {
+        lastDemandBacklogError = message;
+        lastDemandBacklogErrorAt = now;
+        enqueueClientLog('warn', 'terrain.backlog.monitor.failed', { message });
+      }
+    } finally {
+      demandBacklogRequest = null;
+    }
+  })();
+  return demandBacklogRequest;
+}
+
 tileInspectorRuntime = createTerrainTileInspectorRuntime({
   getTiles: () => terrainPipelineState.lastTiles,
   getView: () => {
     if (terrainPipelineState.firstLoad) return null;
     // Tile response bboxes have already been converted from absolute EPSG:3413
     // into the floating-origin scene frame by offsetTerrainPayload(). Keep the
-    // inspector camera in that same frame or every tile lands off-canvas.
-    const cameraSceneX = terrainPipelineState.cameraStereoX
-      - terrainPipelineState.originX + terrainPipelineState.frameOffsetX;
-    const cameraSceneY = terrainPipelineState.cameraStereoY
-      - terrainPipelineState.originY + terrainPipelineState.frameOffsetY;
+    // inspector camera in that same frame or every tile lands off-canvas. The
+    // pipeline camera is the last server-served position, so use the live
+    // rendered-camera grid position here; otherwise the inspector marker
+    // freezes at the old request while the camera keeps moving.
+    const liveGrid = getRenderedTerrainLatLon().grid;
+    const cameraScene = terrainInspectorCameraScenePosition({
+      liveX: liveGrid?.x,
+      liveY: liveGrid?.y,
+      servedX: terrainPipelineState.cameraStereoX,
+      servedY: terrainPipelineState.cameraStereoY,
+      originX: terrainPipelineState.originX,
+      originY: terrainPipelineState.originY,
+      frameOffsetX: terrainPipelineState.frameOffsetX,
+      frameOffsetY: terrainPipelineState.frameOffsetY,
+    });
+    if (!cameraScene) return null;
+    const cameraSceneX = cameraScene.x;
+    const cameraSceneY = cameraScene.y;
     const cosine = Math.cos(controls.yaw);
     const sine = Math.sin(controls.yaw);
     const panX = controls.mapPanEast * cosine - controls.mapPanNorth * sine;
@@ -1408,6 +1481,15 @@ const terrainTileSet = createTerrainTileSet({
   vehicle: vehicleRuntime,
   events: {
     onMutated: markSceneMutated,
+    onResidencyOverlap: overlaps => {
+      const details = {
+        count: overlaps.length,
+        pairs: overlaps.slice(0, 50),
+        truncated: overlaps.length > 50,
+      };
+      console.error('[TERRAIN RESIDENCY OVERLAP]', details);
+      enqueueClientLog('error', 'terrain.residency.overlap', details);
+    },
     // onMaterialApplied fires for every tile on every application pass, not
     // just real changes — the reconciler reapplies constantly. Only actual
     // map swaps may bump the texture version, or the water runtime's
@@ -1430,6 +1512,7 @@ const classifierOverlay = createClassifierOverlay({
   tileSet: terrainTileSet,
   requestRender,
   log: tileLog,
+  classifierRoute,
 });
 let gridlinesActiveBeforeClassifier = null;
 function cycleClassifierOverlay() {
@@ -2391,6 +2474,22 @@ function updateHud() {
   const northM = rel.dot(north);
   const altM = rel.dot(up);
   const exactPosition = getRenderedTerrainLatLon();
+  const cameraGridX = exactPosition.grid?.x
+    ?? terrainPipelineState.cameraStereoX;
+  const cameraGridY = exactPosition.grid?.y
+    ?? terrainPipelineState.cameraStereoY;
+  const demandLag = terrainDemandLag({
+    cameraX: cameraGridX,
+    cameraY: cameraGridY,
+    servedX: terrainPipelineState.lastFetchX,
+    servedY: terrainPipelineState.lastFetchY,
+  });
+  const demandLagColor = demandLag?.distanceM > REFETCH_DIST ? '#fc8' : '#8f8';
+  const terrainDemandLine = terrainPipelineState.firstLoad || !demandLag
+    ? 'terrain EPSG:3413 · waiting for first served position'
+    : `terrain EPSG:3413 · camera ${demandLag.cameraX.toFixed(0)}, ${demandLag.cameraY.toFixed(0)}`
+      + ` · server ${demandLag.servedX.toFixed(0)}, ${demandLag.servedY.toFixed(0)}`
+      + ` · lag <span style="color:${demandLagColor}">${demandLag.distanceM.toFixed(0)}m</span>`;
   const speedKmh = Math.hypot(controls.speed, controls.strafeSpeed) * 3.6;
   const headingForHud = vehicleRuntime.vehicleControlActive ? vehicleRuntime.vehicleHeadingRad : controls.yaw;
   const { degrees: deg, compass } = compassHeading(headingForHud);
@@ -2484,6 +2583,7 @@ function updateHud() {
           : ' · aim: no terrain hit')
       : '',
     `enu: E ${eastM.toFixed(0)}m  N ${northM.toFixed(0)}m  U ${altM.toFixed(0)}m`,
+    terrainDemandLine,
     `speed: ${speedKmh.toFixed(0)} km/h${cameraDriftIndicator(cameraRuntimeState.driftMode)}  heading: ${deg.toFixed(0)}° ${compass}`,
     // hmLine,
     // texLine,
@@ -2494,7 +2594,6 @@ function updateHud() {
     waterOverlayLine,
     hydrographyOverlayLine,
     procgenLine,
-    tileEvictionHudLine(terrainTileSet.evictionEnabled),
     vehicleRuntime.vehicleControlActive
       ? 'W/S drive, A/D steer, mouse orbit camera, Esc exits vehicle control'
       : 'WASD or Arrows move, Q/Z altitude, drag look',
@@ -2527,6 +2626,7 @@ function updateHud() {
     }
   }
   const altText =
+    `${formatCompactLatLon(exactPosition.lat, exactPosition.lon)}\n` +
     `${altM.toFixed(0)}m / ${(altM * 3.28084).toFixed(0)}ft  ${deg.toFixed(0)}° ${compass}` +
     `  FOV ${camera.fov.toFixed(0)}°` +
     (tileInspectorRuntime?.active
@@ -2616,17 +2716,6 @@ function toggleRoadDebug() {
   terrainTileSet.resetTextureApplications();
   terrainTileSet.refreshTextures();
   enqueueClientLog('info', 'roads.debug.toggle', { enabled });
-  updateHud();
-  requestRender();
-  return enabled;
-}
-
-function toggleTileEviction() {
-  const enabled = terrainTileSet.setEvictionEnabled(!terrainTileSet.evictionEnabled);
-  enqueueClientLog('info', 'tile.eviction.toggle', {
-    enabled,
-    suppressed: terrainTileSet.suppressedEvictions,
-  });
   updateHud();
   requestRender();
   return enabled;
@@ -3266,5 +3355,7 @@ function render() {
 }
 
 window.setInterval(runStreamingMaintenance, STREAMING_MAINTENANCE_MS);
+window.setInterval(() => { void refreshDemandBacklog(); }, DEMAND_BACKLOG_POLL_MS);
+void refreshDemandBacklog();
 renderBackend.startRenderLoop();
 }

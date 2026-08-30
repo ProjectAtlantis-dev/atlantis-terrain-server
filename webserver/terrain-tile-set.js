@@ -7,6 +7,7 @@ import {
 } from './terrain-tile-address.js';
 import {
   createTerrainMeshBuilder,
+  terrainTileBathymetryReady,
   updateTerrainMeshHeightmap,
 } from './terrain-mesh-builder.js';
 import { createTerrainGeometryCache } from './terrain-geometry-cache.js';
@@ -22,6 +23,7 @@ import {
 } from './terrain-tile-runtime.js';
 import { createTerrainDetailRuntime } from './terrain-detail-runtime.js';
 import { createTileEvictionGate } from './terrain-tile-eviction.js';
+import { recomputeTerrainResidencyClipping } from './terrain-tile-clipping.js';
 
 function desiredDescendantIds(parentTileId, desiredTileIds) {
   const parent = parseTerrainTileId(parentTileId);
@@ -38,6 +40,29 @@ function desiredDescendantIds(parentTileId, desiredTileIds) {
     descendants.push(id);
   }
   return descendants;
+}
+
+export function terrainResidencyAncestorOverlaps(meshes) {
+  const ids = [...new Set(
+    [...(meshes ?? [])]
+      .filter(mesh => mesh?.isMesh && mesh.userData?.tileId)
+      .map(mesh => mesh.userData.tileId)
+      .filter(tileId => parseTerrainTileId(tileId)),
+  )].sort((a, b) => terrainTileDepth(a) - terrainTileDepth(b) || a.localeCompare(b));
+  const overlaps = [];
+  for (let ancestorIndex = 0; ancestorIndex < ids.length; ancestorIndex += 1) {
+    const ancestorId = ids[ancestorIndex];
+    for (let descendantIndex = ancestorIndex + 1; descendantIndex < ids.length; descendantIndex += 1) {
+      const descendantId = ids[descendantIndex];
+      if (!isTerrainTileAncestor(ancestorId, descendantId)) continue;
+      overlaps.push({
+        ancestorId,
+        descendantId,
+        depthGap: terrainTileDepth(descendantId) - terrainTileDepth(ancestorId),
+      });
+    }
+  }
+  return overlaps;
 }
 
 function hasTerrainCoverage(mesh) {
@@ -500,12 +525,25 @@ export function reconcileTerrainTiles({
     const tileId = mesh.userData?.tileId;
     const nextTile = tileById.get(tileId);
     const previousPayload = mesh.userData?.heightmapPayload;
+    const nextBathymetryReady = terrainTileBathymetryReady(nextTile);
     if (
       !mesh.isMesh
       || !nextTile?.heightmap
       || typeof previousPayload !== 'string'
-      || previousPayload === nextTile.heightmap
     ) continue;
+    if (previousPayload === nextTile.heightmap) {
+      // Water readiness is metadata, not elevation identity. A newly-ready
+      // all-dry mask can legitimately leave the heightmap digest unchanged;
+      // still admit that tile to the next bathymetry capture.
+      if (
+        typeof mesh.userData.terrainBathymetryReady === 'boolean'
+        && mesh.userData.terrainBathymetryReady !== nextBathymetryReady
+      ) {
+        mesh.userData.terrainBathymetryReady = nextBathymetryReady;
+        onMeshAdded(mesh);
+      }
+      continue;
+    }
     refreshCandidates.push({ mesh, tileId, nextTile });
   }
   // A refresh costs about what a rebuild costs, and seam repair changes the
@@ -721,6 +759,7 @@ export function createTerrainTileSet({
   const {
     onMutated = () => {},
     onMaterialApplied = () => {},
+    onResidencyOverlap = () => {},
   } = events;
   const geometryCache = testOverrides.geometryCache ?? createTerrainGeometryCache({
     evictionGate: effectiveEvictionGate,
@@ -764,7 +803,44 @@ export function createTerrainTileSet({
   const residentById = new Map();
   let currentTileIds = new Set();
   let lastTiles = null;
+  let lastResidencyOverlapSignature = '';
+  let lastClippingTopologySignature = '';
+  let lastClippingFailures = [];
+  let nextResidentMeshIdentity = 1;
+  const residentMeshIdentities = new WeakMap();
   const releaseTileDemand = tileId => textureStreamer.releaseTileDemand?.(tileId);
+
+  function notifyTopologyMutated() {
+    const topologySignature = [...residentById.entries()]
+      .map(([tileId, mesh]) => {
+        let identity = residentMeshIdentities.get(mesh);
+        if (identity == null) {
+          identity = nextResidentMeshIdentity;
+          nextResidentMeshIdentity += 1;
+          residentMeshIdentities.set(mesh, identity);
+        }
+        return `${tileId}:${identity}`;
+      })
+      .sort()
+      .join('|');
+    if (topologySignature !== lastClippingTopologySignature) {
+      const result = recomputeTerrainResidencyClipping(residentById.values());
+      lastClippingFailures = result.failedPairs;
+      lastClippingTopologySignature = topologySignature;
+    }
+    onMutated();
+    // Ancestor/descendant residency is intentional fallback only when the
+    // ancestor has been physically carved. Report pairs whose geometry could
+    // not be clipped; those are the actual coplanar overlaps.
+    const overlaps = lastClippingFailures;
+    const signature = overlaps
+      .map(({ ancestorId, descendantId }) => `${ancestorId}>${descendantId}`)
+      .join('|');
+    if (overlaps.length > 0 && signature !== lastResidencyOverlapSignature) {
+      onResidencyOverlap(overlaps);
+    }
+    lastResidencyOverlapSignature = signature;
+  }
 
   function selectVertexColors(mesh, attribute) {
     if (!mesh?.geometry || !attribute) return false;
@@ -861,7 +937,7 @@ export function createTerrainTileSet({
     terrainRoot,
     disposeScatter: disposeTileScatter,
     log,
-    onSceneMutated: onMutated,
+    onSceneMutated: notifyTopologyMutated,
     onReleaseTile: releaseTileDemand,
     releaseStaleTexture: textureStreamer.releaseStaleTexture,
     residentById,
@@ -929,7 +1005,7 @@ export function createTerrainTileSet({
         refreshBudgetMs,
         ...(testOverrides.now == null ? {} : { now: testOverrides.now }),
         prepareUntexturedMesh,
-        onMeshAdded: onMutated,
+        onMeshAdded: notifyTopologyMutated,
         onDiff,
         depthOffsetEnabled,
         completeCoverage,

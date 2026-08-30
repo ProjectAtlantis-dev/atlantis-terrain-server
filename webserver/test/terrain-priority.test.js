@@ -21,10 +21,32 @@ import {
   createTerrainTileSet,
   createTileLifecycle,
   reconcileTerrainTiles,
+  terrainResidencyAncestorOverlaps,
 } from '../terrain-tile-set.js';
+
+test('terrain residency overlap detector reports ancestor-descendant pairs', () => {
+  const mesh = tileId => ({ isMesh: true, userData: { tileId } });
+  assert.deepEqual(
+    terrainResidencyAncestorOverlaps([
+      mesh('9-175-103'),
+      mesh('12-1401-825'),
+      mesh('12-1402-825'),
+      mesh('12-3000-3000'),
+    ]),
+    [
+      { ancestorId: '9-175-103', descendantId: '12-1401-825', depthGap: 3 },
+      { ancestorId: '9-175-103', descendantId: '12-1402-825', depthGap: 3 },
+    ],
+  );
+});
 import { createTerrainMeshBuilder, decodeTerrainHeightmap } from '../terrain-mesh-builder.js';
 import { analyzeTerrainSeams, collectTerrainDebugMeshes, createTerrainHoverOutlineController, createTerrainMapGridController, formatTerrainSeamDiagnostic, summarizeTerrainMesh } from '../terrain-debug-runtime.js';
-import { createTerrainFetchRuntime } from '../terrain-fetch-runtime.js';
+import {
+  createTerrainFetchRuntime,
+  isZeroDepthTerrainTile,
+  retainPendingResidentTerrainTiles,
+  terrainResponseDemandDepth,
+} from '../terrain-fetch-runtime.js';
 import { createTerrainSampleCache } from '../terrain-sample-cache.js';
 import { restoreTerrainCameraState, terrainCameraState } from '../terrain-camera-state.js';
 import { createTerrainClientLogger } from '../terrain-client-logging.js';
@@ -235,6 +257,56 @@ test('shared client logger batches transport and records boot diagnostics', asyn
   assert.ok(listeners.has('error'));
   assert.ok(listeners.has('unhandledrejection'));
   assert.ok(listeners.has('beforeunload'));
+});
+
+test('shared client logger backs off and throttles transport failure reports', async () => {
+  const timers = [];
+  const errors = [];
+  let now = 100;
+  let attempts = 0;
+  const logger = createTerrainClientLogger({
+    sceneMode: 'test-scene',
+    batchSize: 1,
+    retryBaseMs: 1_000,
+    retryMaxMs: 8_000,
+    failureReportMs: 30_000,
+    windowRef: {
+      addEventListener() {},
+      setTimeout(callback, delayMs) {
+        timers.push({ callback, delayMs });
+        return timers.length;
+      },
+    },
+    navigatorRef: {},
+    performanceRef: { now: () => now },
+    consoleRef: { error(...args) { errors.push(args); } },
+    fetchImpl: async () => {
+      attempts += 1;
+      throw new Error('Failed to fetch');
+    },
+  });
+
+  logger.enqueueClientLog('info', 'one');
+  await new Promise(resolve => setImmediate(resolve));
+  const firstRetry = timers.shift();
+  assert.equal(firstRetry.delayMs, 1_000);
+  assert.equal(errors.length, 1);
+  assert.deepEqual(logger.getTransportStatus(), {
+    queueLength: 1,
+    inFlight: false,
+    consecutiveFailures: 1,
+  });
+
+  logger.enqueueClientLog('info', 'two');
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(attempts, 1);
+
+  now = 200;
+  firstRetry.callback();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(timers.shift().delayMs, 2_000);
+  assert.equal(errors.length, 1);
+  assert.equal(logger.getTransportStatus().consecutiveFailures, 2);
 });
 
 test('shared FPS counter excludes idle time from its sample', () => {
@@ -732,11 +804,20 @@ test('terrain response normalization preserves frame and log semantics', () => {
   const data = {
     qx: 1.26, qy: 2.34, ox: 3.45, oy: 4.56,
     tiles: [
-      { id: 'near', bbox: [0, 0, 2, 2], heightmap: 'hm' },
-      { id: 'far', bbox: [10, 10, 12, 12], heightmap: null },
+      {
+        id: 'near', bbox: [0, 0, 2, 2], heightmap: 'hm',
+        texStatus: 'ancestor_fallback', texAncestorId: '10-345-180',
+      },
+      {
+        id: 'far', bbox: [10, 10, 12, 12], heightmap: null,
+        texStatus: 'ready', texAncestorId: '12-1390-722',
+      },
     ],
     missing: [{ id: 'missing', bbox: [2, 2, 3, 3] }],
     downloading: ['x'],
+    waterDependencyBlockedCount: 3,
+    texFetching: 4,
+    texRetryQueue: 2,
   };
   offsetTerrainPayload(data, 100, -20);
   assert.deepEqual(data.tiles[0].bbox, [100, -20, 102, -18]);
@@ -746,9 +827,14 @@ test('terrain response normalization preserves frame and log semantics', () => {
     frameOffsetX: 100, frameOffsetY: -20, frameOffsetReady: true,
   }), {
     status: 200, tiles: 2, withHm: 1, noHm: 1,
-    missing: 1, downloading: 1, qx: 1.3, qy: 2.3, ox: 3.5, oy: 4.6,
+    missing: 1, downloading: 1, waterDependencyBlocked: 3,
+    textureFetching: 4, textureRetryQueue: 2,
+    textureStatusCounts: { ancestor_fallback: 1, ready: 1 },
+    textureResolvedDepthCounts: { 10: 1, 12: 1 },
+    qx: 1.3, qy: 2.3, ox: 3.5, oy: 4.6,
     closestTileId: 'near', closestTileDistM: 0,
     closestTileCx: 101, closestTileCy: -19,
+    closestTexStatus: 'ancestor_fallback', closestTexAncestorId: '10-345-180',
     tileFrameOffsetX: 100, tileFrameOffsetY: -20, tileFrameOffsetReady: true,
   });
 });
@@ -971,6 +1057,47 @@ test('seam repair updates resident geometry in place without texture churn', () 
     refreshRebuilds: 0,
     sceneMeshes: 1,
   });
+});
+
+test('water readiness updates even when the heightmap digest is unchanged', () => {
+  const tileId = '12-1379-766';
+  const mesh = {
+    isMesh: true,
+    userData: {
+      tileId,
+      bbox: [0, 0, 4, 4],
+      heightmapPayload: 'same-heightmap',
+      terrainBathymetryReady: false,
+    },
+    material: { map: null },
+  };
+  let mutations = 0;
+  const result = reconcileTerrainTiles({
+    tiles: [{
+      id: tileId,
+      bbox: mesh.userData.bbox,
+      heightmap: 'same-heightmap',
+      dem: { heightmap: { maskSource: 'ready_water_snapshot' } },
+    }],
+    currentTileIds: new Set([tileId]),
+    deferredTiles: new Map(),
+    terrainRoot: { children: [mesh] },
+    lifecycle: {
+      sweepResidency: () => ({ retired: [], retainedFallbacks: [] }),
+      retire() { assert.fail('unexpected mesh eviction'); },
+    },
+    priorityForTile: () => 0,
+    textureCache: new Map(),
+    materialize() { assert.fail('unexpected texture materialization'); },
+    buildMesh() { assert.fail('unexpected mesh rebuild'); },
+    log() {},
+    onMeshAdded: () => { mutations += 1; },
+  });
+
+  assert.equal(mesh.userData.terrainBathymetryReady, true);
+  assert.equal(mutations, 1);
+  assert.equal(result.refreshedInPlace, 0);
+  assert.equal(result.refreshRebuilds, 0);
 });
 
 test('seam refresh keeps old geometry when the replacement is build-budget deferred', () => {
@@ -1391,6 +1518,7 @@ test('terrain tile set retains parent paint after complete child coverage', () =
   };
   const frames = [];
   const retained = [];
+  const overlapReports = [];
   const parentId = '8-10-10';
   const texture = id => ({
     image: { width: 256, height: 256 },
@@ -1398,6 +1526,10 @@ test('terrain tile set retains parent paint after complete child coverage', () =
     dispose() {},
   });
   const parentTexture = texture(parentId);
+  const buildMesh = createTerrainMeshBuilder({
+    exaggeration: 1,
+    attachScatter() {},
+  });
   const textureStreamer = {
     texCache: new Map([[parentId, parentTexture]]),
     texSource: new Map([[parentId, 'test']]),
@@ -1418,21 +1550,14 @@ test('terrain tile set retains parent paint after complete child coverage', () =
     renderBackend: { kind: 'webgpu', prepareUntexturedTerrain() {} },
     view: { controls: { mapMode: false } },
     log() {},
+    events: {
+      onResidencyOverlap(overlaps) { overlapReports.push(overlaps); },
+    },
     testOverrides: {
       terrainDetail: { apply() {} },
       scheduleFrame: callback => frames.push(callback),
       applicationsPerFrame: 4,
-      buildMesh: tile => ({
-        isMesh: true,
-        children: [],
-        userData: { tileId: tile.id, bbox: tile.bbox },
-        material: {
-          map: null,
-          color: { set() {} },
-          dispose() {},
-        },
-        geometry: { dispose() {} },
-      }),
+      buildMesh,
       priorityForTile: () => 0,
       getVisibilityDistance: () => 1000,
     },
@@ -1441,13 +1566,19 @@ test('terrain tile set retains parent paint after complete child coverage', () =
     id: parentId,
     bbox: [0, 0, 8, 8],
     heightmap: 'parent',
+    resolution: 9,
+    samples: new Float32Array(9 * 9),
   };
   const children = [
-    { id: '9-20-20', bbox: [0, 0, 4, 4], heightmap: 'child' },
-    { id: '9-21-20', bbox: [4, 0, 8, 4], heightmap: 'child' },
-    { id: '9-20-21', bbox: [0, 4, 4, 8], heightmap: 'child' },
-    { id: '9-21-21', bbox: [4, 4, 8, 8], heightmap: 'child' },
+    { id: '9-20-20', bbox: [0, 0, 4, 4], heightmap: 'child-0' },
+    { id: '9-21-20', bbox: [4, 0, 8, 4], heightmap: 'child-1' },
+    { id: '9-20-21', bbox: [0, 4, 4, 8], heightmap: 'child-2' },
+    { id: '9-21-21', bbox: [4, 4, 8, 8], heightmap: 'child-3' },
   ];
+  for (const child of children) {
+    child.resolution = 9;
+    child.samples = new Float32Array(9 * 9);
+  }
 
   tileSet.reconcile([parent], { completeCoverage: true });
   tileSet.reconcile(children);
@@ -1456,6 +1587,7 @@ test('terrain tile set retains parent paint after complete child coverage', () =
 
   assert.deepEqual(retained, [parentId]);
   assert.equal(textureStreamer.texCache.get(parentId), parentTexture);
+  assert.deepEqual(overlapReports, []);
   assert.deepEqual(
     terrainRoot.children.map(mesh => mesh.userData.tileId).sort(),
     children.map(tile => tile.id).sort(),
@@ -1696,6 +1828,108 @@ test('fetch residency survives live sample-cache eviction while the response is 
   assert.deepEqual(advertisedKnown, { '9-168-103': 'deadbeef' });
   assert.equal(sampleCache.take('9-168-103', 'deadbeef'), null);
   assert.deepEqual([...appliedTile.samples], [7]);
+});
+
+test('pending seam dependencies retain an already-resident exact tile', () => {
+  const exact = {
+    id: '12-1500-687',
+    bbox: [0, 0, 1, 1],
+    heightmap: 'old-repaired-digest',
+    samples: Float32Array.from([7]),
+  };
+  const ancestor = {
+    id: '11-750-343',
+    bbox: [0, 0, 2, 2],
+    heightmap: 'ancestor-digest',
+    samples: Float32Array.from([4]),
+  };
+
+  const pending = retainPendingResidentTerrainTiles(
+    [exact],
+    [ancestor],
+    [{ id: exact.id, state: 'fallback', fallbackTileId: ancestor.id }],
+  );
+  assert.deepEqual(pending.retainedIds, [exact.id]);
+  assert.deepEqual(pending.tiles, [ancestor, exact]);
+
+  const movedAway = retainPendingResidentTerrainTiles(
+    [exact], [ancestor], [],
+  );
+  assert.deepEqual(movedAway.retainedIds, []);
+  assert.deepEqual(movedAway.tiles, [ancestor]);
+
+  const repaired = { ...exact, heightmap: 'new-repaired-digest' };
+  const ready = retainPendingResidentTerrainTiles(
+    [exact], [repaired], [{ id: exact.id, state: 'fallback' }],
+  );
+  assert.deepEqual(ready.retainedIds, []);
+  assert.deepEqual(ready.tiles, [repaired]);
+});
+
+test('dependency fallback cannot ratchet desired terrain depth downward', () => {
+  assert.equal(terrainResponseDemandDepth({
+    depthCap: 11,
+    requestedDepthCap: 12,
+  }), 12);
+  assert.equal(terrainResponseDemandDepth({ depthCap: 11 }), 11);
+  assert.equal(terrainResponseDemandDepth({}), null);
+});
+
+test('fetch runtime discards all-zero depth tiles before cache and reconciliation', async () => {
+  assert.equal(isZeroDepthTerrainTile({ samples: Float32Array.from([0, -0, 0]) }), true);
+  assert.equal(isZeroDepthTerrainTile({ samples: Float32Array.from([0, -6, 0]) }), false);
+  const applied = [];
+  const warnings = [];
+  const sampleCache = createTerrainSampleCache();
+  const { runtime } = createTestFetchRuntime({
+    sampleCache,
+    logger: {
+      enqueue(level, phase, details) {
+        if (phase === 'fetchTiles.zero-depth.discarded') {
+          warnings.push({ level, details });
+        }
+      },
+      boot() {},
+    },
+    terrain: {
+      reconcile(tiles) {
+        applied.push(...tiles);
+        return {
+          sceneMeshes: 0, deferred: 0, evictMs: 0, buildMs: 0,
+          refreshMs: 0, refreshed: 0, refreshDeferred: 0,
+          released: 0, geometryCache: {},
+        };
+      },
+      updateTextures() {},
+    },
+    fetchImpl: async () => ({
+      status: 200,
+      json: async () => ({
+        ox: 0, oy: 0, qx: 0, qy: 0,
+        tiles: [
+          {
+            id: '12-1380-749', bbox: [0, 0, 1, 1], resolution: 2,
+            heightmap: 'zero0000', samples: Float32Array.from([0, 0, 0, 0]),
+          },
+          {
+            id: '12-1380-748', bbox: [0, 1, 1, 2], resolution: 2,
+            heightmap: 'water000', samples: Float32Array.from([-6, -6, -6, -6]),
+          },
+        ],
+        missing: [], downloading: [], texFetching: 0,
+      }),
+    }),
+  });
+
+  await runtime.execute({});
+
+  assert.deepEqual(applied.map(tile => tile.id), ['12-1380-748']);
+  assert.equal(sampleCache.take('12-1380-749', 'zero0000'), null);
+  assert.deepEqual([...sampleCache.take('12-1380-748', 'water000')], [-6, -6, -6, -6]);
+  assert.deepEqual(warnings, [{
+    level: 'warn',
+    details: { count: 1, tileIds: ['12-1380-749'], truncated: false },
+  }]);
 });
 
 test('shared fetch runtime bootstraps coarse and never substitutes ASL when AGL is unknown', async () => {
@@ -2762,6 +2996,42 @@ test('shared texture pump caches successful exact texture', async () => {
   assert.equal(completed.tileId, '12-3-4');
   assert.equal(completed.texture.generateMipmaps, true);
   assert.equal(completed.texture.anisotropy, 8);
+});
+
+test('shared texture pump rejects a misattributed exact texture before caching', async () => {
+  const warnings = [];
+  let decoded = 0;
+  const expectedDigest = 'a'.repeat(64);
+  const streamer = createTextureStreamer({
+    log: (tileId, message) => warnings.push([tileId, message]),
+    fetchImpl: async () => ({
+      status: 200,
+      ok: true,
+      headers: {
+        get(name) {
+          if (name === 'X-Tex-Tile') return '12-1380-749';
+          if (name === 'X-Tex-Source') return 'dataforsyningen';
+          if (name === 'ETag') return `"${'b'.repeat(64)}"`;
+          return null;
+        },
+      },
+      blob: async () => ({}),
+    }),
+    decodeImage: async () => { decoded += 1; return { width: 256, height: 256 }; },
+  });
+  const tile = {
+    id: '12-1380-749', bbox: [0, 0, 1, 1],
+    texture: { digest: expectedDigest },
+  };
+  streamer.pump([{ tile }], {
+    isCovered: () => false,
+    onPlaceholder: () => assert.fail('unexpected placeholder'),
+    onTexture: () => assert.fail('mismatched texture must not be applied'),
+  });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(decoded, 0);
+  assert.equal(streamer.texCache.has(tile.id), false);
+  assert.match(warnings.at(-1)[1], /texture digest mismatch/);
 });
 
 test('shared texture pump immediately refills freed concurrency slots', async () => {

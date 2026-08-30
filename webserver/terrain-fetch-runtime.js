@@ -14,6 +14,48 @@ import {
 } from './terrain-binary-payload.js';
 import { createTerrainSampleCache } from './terrain-sample-cache.js';
 
+export function isZeroDepthTerrainTile(tile) {
+  const samples = tile?.samples;
+  if (!(samples instanceof Float32Array) || samples.length === 0) return false;
+  for (const elevation of samples) {
+    if (!Number.isFinite(elevation) || elevation !== 0) return false;
+  }
+  return true;
+}
+
+export function retainPendingResidentTerrainTiles(
+  previousTiles,
+  responseTiles,
+  missingTiles,
+) {
+  const previous = Array.isArray(previousTiles) ? previousTiles : [];
+  const response = Array.isArray(responseTiles) ? responseTiles : [];
+  const missingIds = new Set(
+    (Array.isArray(missingTiles) ? missingTiles : [])
+      .map(item => item?.id ?? item?.tileId)
+      .filter(id => typeof id === 'string' && id.length > 0),
+  );
+  const responseIds = new Set(response.map(tile => tile?.id));
+  const retained = previous.filter(tile => (
+    typeof tile?.id === 'string'
+    && missingIds.has(tile.id)
+    && !responseIds.has(tile.id)
+    && typeof tile.heightmap === 'string'
+    && tile.samples instanceof Float32Array
+  ));
+  return {
+    tiles: retained.length > 0 ? [...response, ...retained] : response,
+    retainedIds: retained.map(tile => tile.id),
+  };
+}
+
+export function terrainResponseDemandDepth(data) {
+  if (Number.isInteger(data?.requestedDepthCap)) {
+    return data.requestedDepthCap;
+  }
+  return Number.isInteger(data?.depthCap) ? data.depthCap : null;
+}
+
 export function createTerrainFetchRuntime({
   state,
   view,
@@ -136,9 +178,10 @@ export function createTerrainFetchRuntime({
       headers: { 'Content-Type': 'application/json' },
       // Residency travels in a body because a footprint's worth of digests is
       // far past a safe query-string length and grows with view range.
-      // depthCap is the ceiling this client is currently rendering. Echoing
-      // it lets the server hold that ceiling through ordinary terrain relief
-      // instead of re-deciding from scratch and swapping the whole tile set.
+      // depthCap is the last desired selection ceiling, not the deepest
+      // dependency-ready fallback currently rendered. Echoing it lets the
+      // server hold camera LOD through ordinary relief and asynchronous seam
+      // dependencies without ratcheting the requested topology downward.
       body: JSON.stringify({
         known: residency.known,
         depthCap: state.depthCap ?? null,
@@ -160,10 +203,7 @@ export function createTerrainFetchRuntime({
     let reusedSamples = 0;
     const unresolved = [];
     for (const tile of Array.isArray(data?.tiles) ? data.tiles : []) {
-      if (tile.samples instanceof Float32Array) {
-        sampleCache.store(tile.id, tile.heightmap, tile.samples);
-        continue;
-      }
+      if (tile.samples instanceof Float32Array) continue;
       if (typeof tile.heightmap !== 'string' || tile.heightmapBytes !== 0) continue;
       const held = residency.take(tile.id, tile.heightmap);
       if (held == null) {
@@ -185,6 +225,36 @@ export function createTerrainFetchRuntime({
     }
     if (!Array.isArray(data?.tiles)) {
       throw new TypeError('terrain tile response is missing a tiles array');
+    }
+    const waterDependencyBlocked = Array.isArray(data.waterDependencyBlocked)
+      ? data.waterDependencyBlocked
+      : [];
+    if (waterDependencyBlocked.length > 0) {
+      logger.enqueue('warn', 'fetchTiles.water-dependency-blocked', {
+        count: waterDependencyBlocked.length,
+        blocks: waterDependencyBlocked.slice(0, 100),
+        truncated: waterDependencyBlocked.length > 100,
+      });
+    }
+    const zeroDepthTileIds = data.tiles
+      .filter(isZeroDepthTerrainTile)
+      .map(tile => tile.id);
+    if (zeroDepthTileIds.length > 0) {
+      const rejected = new Set(zeroDepthTileIds);
+      data.tiles = data.tiles.filter(tile => !rejected.has(tile.id));
+      data.tileCount = data.tiles.length;
+      logger.enqueue('warn', 'fetchTiles.zero-depth.discarded', {
+        count: zeroDepthTileIds.length,
+        tileIds: zeroDepthTileIds.slice(0, 50),
+        truncated: zeroDepthTileIds.length > 50,
+      });
+    }
+    // Only accepted samples enter residency. Otherwise a later digest-only
+    // response could resurrect a rejected zero-depth tile from the local LRU.
+    for (const tile of data.tiles) {
+      if (tile.samples instanceof Float32Array && tile.heightmapBytes !== 0) {
+        sampleCache.store(tile.id, tile.heightmap, tile.samples);
+      }
     }
     // The server may still complete and cache work from an older camera view.
     // The browser's current tile set, rather than the response epoch, owns
@@ -238,6 +308,20 @@ export function createTerrainFetchRuntime({
       });
     }
     offsetTerrainPayload(data, frameOffset.offsetX, frameOffset.offsetY);
+    const pendingRetention = retainPendingResidentTerrainTiles(
+      state.lastTiles,
+      data.tiles,
+      data.missing,
+    );
+    if (pendingRetention.retainedIds.length > 0) {
+      data.tiles = pendingRetention.tiles;
+      data.tileCount = data.tiles.length;
+      logger.enqueue('info', 'fetchTiles.pending-residency.retained', {
+        count: pendingRetention.retainedIds.length,
+        tileIds: pendingRetention.retainedIds.slice(0, 50),
+        truncated: pendingRetention.retainedIds.length > 50,
+      });
+    }
     logger.enqueue('info', 'fetchTiles.response', summarizeTerrainResponse({
       data, status: response.status, cameraX: local.x, cameraY: local.y,
       frameOffsetX: frameOffset.offsetX, frameOffsetY: frameOffset.offsetY,
@@ -266,7 +350,8 @@ export function createTerrainFetchRuntime({
     if (typeof data.buildingsHash === 'string') {
       state.buildingsHash = data.buildingsHash;
     }
-    if (Number.isInteger(data.depthCap)) state.depthCap = data.depthCap;
+    const demandDepth = terrainResponseDemandDepth(data);
+    if (demandDepth !== null) state.depthCap = demandDepth;
     if (Array.isArray(data.buildings)) onBuildings(data.buildings);
 
     const reconcileStartedAt = performance.now();
@@ -291,6 +376,7 @@ export function createTerrainFetchRuntime({
       // tell a genuine depth change from footprint drift, which is the
       // distinction that matters when reading eviction counts.
       depthCap: data.depthCap ?? null,
+      requestedDepthCap: data.requestedDepthCap ?? null,
       tilesReused: data.tilesReused ?? null,
       sampleCache: sampleCache.stats(),
       released: reconciliation.released,

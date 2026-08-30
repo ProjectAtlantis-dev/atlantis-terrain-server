@@ -1,5 +1,6 @@
 import * as THREE from 'three';
 import { terrainTileDepth } from './terrain-tile-address.js';
+import { createClassifierRouteRuntime } from './terrain-classifier-route.js';
 
 // Debug overlay: paint the server's full-resolution classifier decisions
 // straight onto the terrain meshes for inspection in the live 3D view.
@@ -27,12 +28,14 @@ export function createClassifierOverlay({
   fetchImpl = (...args) => fetch(...args),
   setTimeoutImpl = (...args) => setTimeout(...args),
   clearTimeoutImpl = timer => clearTimeout(timer),
+  classifierRoute = null,
 }) {
   let mode = 'off';
   const cache = new Map(); // `${mode}:${tileId}` -> THREE.Texture | 'failed'
   const inFlight = new Set();
   const pendingAttempts = new Map();
   const retryTimers = new Map();
+  const route = classifierRoute ?? createClassifierRouteRuntime({ fetchImpl, log });
 
   function schedulePendingRetry(key, tileId) {
     if (retryTimers.has(key)) return;
@@ -55,8 +58,9 @@ export function createClassifierOverlay({
 
   function load(key, url, tileId) {
     inFlight.add(key);
-    fetchImpl(url)
-      .then(response => {
+    route.fetchResponse(url, tileId)
+      .then(({ available, response }) => {
+        if (!available || response == null) return null;
         if (!response.ok) throw new Error(`http ${response.status}`);
         if (response.headers.get('X-Classifier-Status') === 'pending') {
           schedulePendingRetry(key, tileId);

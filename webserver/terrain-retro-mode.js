@@ -419,6 +419,13 @@ export function createTerrainRetroRuntime({
         proxyRoot.add(proxy);
         proxies.set(tileId, proxy);
       }
+      const activeSurfaceIndices = Number(mesh.userData.terrainActiveSurfaceIndexCount);
+      proxy.geometry.setDrawRange(
+        0,
+        Number.isInteger(activeSurfaceIndices)
+          ? activeSurfaceIndices
+          : retroSurfaceIndexCount(mesh.userData.resolution),
+      );
       mesh.updateMatrix();
       proxy.matrix.copy(mesh.matrix);
       proxy.visible = mesh.visible;

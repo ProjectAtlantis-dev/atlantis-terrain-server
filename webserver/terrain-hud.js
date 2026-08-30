@@ -10,12 +10,6 @@ export function hudActionLink(id, label, color = '#0af') {
     + `cursor:pointer;pointer-events:auto">${label}</span>`;
 }
 
-export function tileEvictionHudLine(enabled) {
-  const state = enabled ? 'enabled' : 'DISABLED';
-  const color = enabled ? '#0af' : '#ff9500';
-  return `data eviction: ${hudActionLink('tileEvictionLink', state, color)}`;
-}
-
 export function setTerrainGotoCollapsed(gotoPanel, collapsed) {
   // Use an explicit display value. The form itself is display:flex, which can
   // override the browser's default [hidden] rule and remain visible.
@@ -43,7 +37,6 @@ export function createTerrainHud({
   onToggleProcgen,
   onToggleRenderBackend,
   onToggleRoadDebug,
-  onToggleTileEviction,
   onOpenGoogleMaps,
   onStartFastTime,
   onReset,
@@ -135,7 +128,6 @@ export function createTerrainHud({
       event.target.id === 'procgenLink' ||
       event.target.id === 'renderBackendLink' ||
       event.target.id === 'roadDebugLink' ||
-      event.target.id === 'tileEvictionLink' ||
       event.target.id === 'googleMaps3dLink' ||
       event.target.id === 'fastTimeLink' ||
       event.target.id === 'resetViewLink' ||
@@ -226,12 +218,6 @@ export function createTerrainHud({
       onToggleRoadDebug();
       return;
     }
-    if (event.target.id === 'tileEvictionLink') {
-      event.stopPropagation();
-      event.preventDefault();
-      onToggleTileEviction();
-      return;
-    }
     if (event.target.id === 'googleMaps3dLink') {
       event.stopPropagation();
       event.preventDefault();
@@ -281,7 +267,6 @@ export function createTerrainHud({
       event.target.id === 'procgenLink' ||
       event.target.id === 'renderBackendLink' ||
       event.target.id === 'roadDebugLink' ||
-      event.target.id === 'tileEvictionLink' ||
       event.target.id === 'googleMaps3dLink' ||
       event.target.id === 'fastTimeLink' || event.target.id === 'resetViewLink' ||
       TERRAIN_HUD_LINKS[event.target.id]
@@ -296,7 +281,9 @@ export function createTerrainHud({
     'background:rgba(0,0,0,0.7)', 'color:#8fd0ff',
     'font:13px/1.35 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace',
     'border-radius:6px', 'pointer-events:none', 'z-index:5',
+    'white-space:pre-line', 'text-align:right',
   ]);
+  alt.id = 'terrain-position-readout';
 
   const gameClock = appendPanel([
     'position:absolute', 'left:12px', 'bottom:12px', 'padding:8px 10px',
@@ -315,6 +302,10 @@ export function createTerrainHud({
   return {
     hud, hudContent, gotoPanel, gotoForm, gotoInput, gotoStatus, alt, gameClock,
   };
+}
+
+export function formatCompactLatLon(lat, lon) {
+  return `${lat.toFixed(5)}°, ${lon.toFixed(5)}°`;
 }
 
 export function compassHeading(headingRad) {

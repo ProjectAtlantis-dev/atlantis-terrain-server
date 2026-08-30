@@ -95,6 +95,17 @@ export function summarizeTerrainResponse({
 }) {
   const tiles = Array.isArray(data?.tiles) ? data.tiles : [];
   const withHm = tiles.filter(tile => tile.heightmap).length;
+  const textureStatusCounts = {};
+  const textureResolvedDepthCounts = {};
+  for (const tile of tiles) {
+    if (typeof tile?.texStatus === 'string') {
+      textureStatusCounts[tile.texStatus] = (textureStatusCounts[tile.texStatus] ?? 0) + 1;
+    }
+    const resolvedDepth = Number.parseInt(String(tile?.texAncestorId ?? '').split('-', 1)[0], 10);
+    if (Number.isInteger(resolvedDepth)) {
+      textureResolvedDepthCounts[resolvedDepth] = (textureResolvedDepthCounts[resolvedDepth] ?? 0) + 1;
+    }
+  }
   let closest = null;
   for (const tile of tiles) {
     if (!Array.isArray(tile?.bbox) || tile.bbox.length !== 4) continue;
@@ -110,12 +121,19 @@ export function summarizeTerrainResponse({
     noHm: tiles.length - withHm,
     missing: data?.missing?.length ?? 0,
     downloading: data?.downloading?.length ?? 0,
+    waterDependencyBlocked: data?.waterDependencyBlockedCount ?? 0,
+    textureFetching: data?.texFetching ?? 0,
+    textureRetryQueue: data?.texRetryQueue ?? 0,
+    textureStatusCounts,
+    textureResolvedDepthCounts,
     qx: rounded(data?.qx), qy: rounded(data?.qy),
     ox: rounded(data?.ox), oy: rounded(data?.oy),
     closestTileId: closest?.tile.id ?? null,
     closestTileDistM: closest ? rounded(closest.distance) : null,
     closestTileCx: closest ? rounded(closest.cx) : null,
     closestTileCy: closest ? rounded(closest.cy) : null,
+    closestTexStatus: closest?.tile.texStatus ?? null,
+    closestTexAncestorId: closest?.tile.texAncestorId ?? null,
     tileFrameOffsetX: rounded(frameOffsetX),
     tileFrameOffsetY: rounded(frameOffsetY),
     tileFrameOffsetReady: frameOffsetReady,
@@ -183,6 +201,34 @@ export function evaluateTerrainRefetch({
     altitudeDelta,
     shouldFetch,
     nextTriggerMs: shouldFetch ? nowMs : lastTriggerMs,
+  };
+}
+
+export function terrainDemandLag({ cameraX, cameraY, servedX, servedY }) {
+  if (![cameraX, cameraY, servedX, servedY].every(Number.isFinite)) return null;
+  const eastM = cameraX - servedX;
+  const northM = cameraY - servedY;
+  return {
+    cameraX,
+    cameraY,
+    servedX,
+    servedY,
+    eastM,
+    northM,
+    distanceM: Math.hypot(eastM, northM),
+  };
+}
+
+export function terrainInspectorCameraScenePosition({
+  liveX, liveY, servedX, servedY, originX, originY, frameOffsetX, frameOffsetY,
+}) {
+  const gridX = Number.isFinite(liveX) ? liveX : servedX;
+  const gridY = Number.isFinite(liveY) ? liveY : servedY;
+  if (![gridX, gridY, originX, originY, frameOffsetX, frameOffsetY]
+    .every(Number.isFinite)) return null;
+  return {
+    x: gridX - originX + frameOffsetX,
+    y: gridY - originY + frameOffsetY,
   };
 }
 

@@ -10,6 +10,9 @@ import {
 import {
   prepareTerrainTilesForBathymetry,
 } from '../render-backends/terrain-bathymetry-tiles.js';
+import {
+  terrainTileBathymetryReady,
+} from '../terrain-mesh-builder.js';
 
 test('cross-backend water calibration has one immutable contract', () => {
   assert.equal(Object.isFrozen(WATER_RENDER_CONTRACT), true);
@@ -86,4 +89,31 @@ test('bathymetry tile ordering and restoration are backend-neutral', () => {
   assert.equal(parent.renderOrder, 40);
   assert.equal(child.renderOrder, 2);
   assert.deepEqual(restored, ['12-20-40', '11-10-20']);
+});
+
+test('provisional water composition preserves no-coverage bathymetry fallback', () => {
+  assert.equal(terrainTileBathymetryReady({}), true);
+  assert.equal(terrainTileBathymetryReady({
+    dem: { heightmap: { maskSource: 'ready_water_snapshot' } },
+  }), true);
+  assert.equal(terrainTileBathymetryReady({
+    dem: { heightmap: { maskSource: 'dem_nonpositive_fallback' } },
+  }), false);
+
+  const provisional = new THREE.Mesh();
+  provisional.userData.tileId = '12-1379-766';
+  provisional.userData.terrainBathymetryReady = false;
+  provisional.layers.enable(2);
+  provisional.layers.enable(TERRAIN_BATHYMETRY_LAYER);
+  provisional.renderOrder = 7;
+
+  const restore = prepareTerrainTilesForBathymetry({ children: [provisional] });
+  assert.equal(provisional.layers.isEnabled(TERRAIN_BATHYMETRY_LAYER), false);
+  assert.equal(provisional.layers.isEnabled(2), true);
+  assert.equal(provisional.renderOrder, 12);
+
+  restore();
+  assert.equal(provisional.layers.isEnabled(TERRAIN_BATHYMETRY_LAYER), true);
+  assert.equal(provisional.layers.isEnabled(2), true);
+  assert.equal(provisional.renderOrder, 7);
 });

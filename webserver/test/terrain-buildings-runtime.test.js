@@ -8,6 +8,7 @@ import {
   buildBuildingsGeometry,
   createTerrainBuildingsRuntime,
 } from '../terrain-buildings-runtime.js';
+import { createTerrainVectorLayerRuntime } from '../terrain-vector-layer-runtime.js';
 
 const squareBuilding = {
   id: '0600NUK_TEST_1',
@@ -148,6 +149,82 @@ test('runtime fetches buildings separately and defers their mesh application', a
   assert.equal(runtime.getMesh(), null);
   deferredApply();
   assert.ok(runtime.getMesh());
+});
+
+test('runtime disables the optional buildings route after a 404', async () => {
+  let fetches = 0;
+  const logs = [];
+  const runtime = createTerrainBuildingsRuntime({
+    terrainRoot: { add() {}, remove() {} },
+    pipelineState: {
+      ready: true, frameOffsetReady: true,
+      originX: 1000, originY: 2000, frameOffsetX: 0, frameOffsetY: 0,
+      lastFetchX: 1100, lastFetchY: 2100,
+    },
+    fetchImpl: async () => {
+      fetches += 1;
+      return { ok: false, status: 404 };
+    },
+    bootLog: (...args) => logs.push(args),
+  });
+
+  await runtime.start();
+  await runtime.refresh();
+  runtime.stop();
+
+  assert.equal(fetches, 1);
+  assert.deepEqual(runtime.getTransportStatus(), {
+    unavailable: true,
+    consecutiveFailures: 0,
+    retryAtMs: 0,
+  });
+  assert.deepEqual(logs, [[
+    'buildings.unavailable',
+    { endpoint: '/api/buildings', status: 404 },
+    'warn',
+  ]]);
+});
+
+test('shared vector runtime backs off transient failures', async () => {
+  let now = 100;
+  let fetches = 0;
+  const logs = [];
+  const runtime = createTerrainVectorLayerRuntime({
+    terrainRoot: { add() {}, remove() {} },
+    pipelineState: {
+      ready: true, frameOffsetReady: true,
+      originX: 1000, originY: 2000, frameOffsetX: 0, frameOffsetY: 0,
+      lastFetchX: 1100, lastFetchY: 2100,
+    },
+    endpoint: '/api/example',
+    itemsKey: 'items',
+    logLabel: 'Example',
+    buildGeometry: () => null,
+    pollMs: 2000,
+    retryMaxMs: 8000,
+    now: () => now,
+    fetchImpl: async () => {
+      fetches += 1;
+      return { ok: false, status: 503 };
+    },
+    bootLog: (...args) => logs.push(args),
+  });
+
+  await runtime.start();
+  now = 2099;
+  await runtime.refresh();
+  assert.equal(fetches, 1);
+  now = 2100;
+  await runtime.refresh();
+  runtime.stop();
+
+  assert.equal(fetches, 2);
+  assert.deepEqual(logs.map(([, details]) => details.retryInMs), [2000, 4000]);
+  assert.deepEqual(runtime.getTransportStatus(), {
+    unavailable: false,
+    consecutiveFailures: 2,
+    retryAtMs: 6100,
+  });
 });
 
 test('a binary flat ring builds the same geometry as the JSON ring', () => {
