@@ -13,6 +13,7 @@ import {
   isTerrainBinaryResponse,
 } from './terrain-binary-payload.js';
 import { createTerrainSampleCache } from './terrain-sample-cache.js';
+import { isTerrainTileAncestor } from './terrain-tile-address.js';
 
 export function isZeroDepthTerrainTile(tile) {
   const samples = tile?.samples;
@@ -36,9 +37,19 @@ export function retainPendingResidentTerrainTiles(
       .filter(id => typeof id === 'string' && id.length > 0),
   );
   const responseIds = new Set(response.map(tile => tile?.id));
+  const overlapsPendingTarget = tileId => {
+    for (const missingId of missingIds) {
+      if (
+        tileId === missingId
+        || isTerrainTileAncestor(tileId, missingId)
+        || isTerrainTileAncestor(missingId, tileId)
+      ) return true;
+    }
+    return false;
+  };
   const retained = previous.filter(tile => (
     typeof tile?.id === 'string'
-    && missingIds.has(tile.id)
+    && overlapsPendingTarget(tile.id)
     && !responseIds.has(tile.id)
     && typeof tile.heightmap === 'string'
     && tile.samples instanceof Float32Array

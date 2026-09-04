@@ -28,28 +28,26 @@ export function createTerrainVehicleRuntime({
   windowImpl = globalThis.window,
 } = {}) {
   // ── Patria AMV vehicle ──────────────────────────────────────────────────
-  const _vehicleSeedInstance = ASSET_VEHICLE_INSTANCES.length > 0 ? ASSET_VEHICLE_INSTANCES[0] : {};
+  if (ASSET_VEHICLE_INSTANCES.length === 0) {
+    throw new Error('asset catalog contains no vehicle instances');
+  }
+  const _vehicleSeedInstance = ASSET_VEHICLE_INSTANCES[0];
   const VEHICLE_MODEL = {
-    url: (typeof VEHICLE_DEFINITION.url === 'string' && VEHICLE_DEFINITION.url.trim() !== '')
-      ? VEHICLE_DEFINITION.url
-      : '/models/patria_amv.glb',
-    lat: Number.isFinite(_vehicleSeedInstance.lat) ? _vehicleSeedInstance.lat : anchorLat,
-    lon: Number.isFinite(_vehicleSeedInstance.lon) ? _vehicleSeedInstance.lon : anchorLon,
-    headingDeg: Number.isFinite(_vehicleSeedInstance.headingDeg) ? _vehicleSeedInstance.headingDeg : 0,
-    z: Number.isFinite(_vehicleSeedInstance.z) ? _vehicleSeedInstance.z : 0,
-    realLengthM: Number.isFinite(VEHICLE_DEFINITION.realLengthM) ? VEHICLE_DEFINITION.realLengthM : 7.7,
+    url: VEHICLE_DEFINITION.url,
+    lat: _vehicleSeedInstance.lat,
+    lon: _vehicleSeedInstance.lon,
+    headingDeg: _vehicleSeedInstance.headingDeg,
+    z: _vehicleSeedInstance.z,
+    realLengthM: VEHICLE_DEFINITION.realLengthM,
     tireDiameterM: paramNumber(
       'vehicleTireDiameterM',
-      Number.isFinite(VEHICLE_DEFINITION.tireDiameterM)
-        ? VEHICLE_DEFINITION.tireDiameterM
-        : 1.27
+      VEHICLE_DEFINITION.tireDiameterM,
     ),
-    altOffsetM: Number.isFinite(VEHICLE_DEFINITION.altOffsetM) ? VEHICLE_DEFINITION.altOffsetM : 0.05,
+    altOffsetM: VEHICLE_DEFINITION.altOffsetM,
   };
   bootLog('assets.loaded', {
     source: startupAssetsResponse.source,
     schemaVersion: startupAssetsResponse.schemaVersion,
-    seeded: startupAssetsResponse.seeded,
     headlightsOn: _vehicleSeedInstance.headlightsOn === true,
     headlightsParams: VEHICLE_HEADLIGHTS != null,
     vehicleCount: ASSET_VEHICLE_INSTANCES.length,

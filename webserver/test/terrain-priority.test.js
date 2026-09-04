@@ -356,17 +356,32 @@ test('terrain AGL samples the deepest resident surface without a triangle raycas
   assert.equal(terrainSurfaceHeightAt([parent], 11, 8), null);
 });
 
-test('startup asset normalization clones valid records and rejects junk', () => {
-  const vehicle = { id: 'v1' };
+test('startup asset normalization requires complete catalog records', () => {
+  const vehicle = {
+    id: 'v1', lat: 64.1, lon: -51.7, headingDeg: 90, z: 12,
+    headlightsOn: true,
+  };
   const normalized = normalizeTerrainStartupAssets({
-    vehicle_definition: { model: 'truck' },
-    vehicle_instances: [vehicle, null, 'bad'],
+    source: 'asset_catalog', schemaVersion: 4,
+    vehicle_definition: {
+      url: '/models/truck.glb', realLengthM: 7, tireDiameterM: 1,
+      altOffsetM: 0.1,
+    },
+    vehicle_instances: [vehicle],
   });
   assert.deepEqual(normalized, {
-    vehicle_definition: { model: 'truck' },
-    vehicle_instances: [{ id: 'v1' }],
+    source: 'asset_catalog', schemaVersion: 4,
+    vehicle_definition: {
+      url: '/models/truck.glb', realLengthM: 7, tireDiameterM: 1,
+      altOffsetM: 0.1,
+    },
+    vehicle_instances: [vehicle],
   });
   assert.notEqual(normalized.vehicle_instances[0], vehicle);
+  assert.throws(
+    () => normalizeTerrainStartupAssets({ source: 'asset_catalog', schemaVersion: 4 }),
+    /vehicle_definition/,
+  );
 });
 
 test('shared startup asset loader preserves metadata and clears timeout', async () => {
@@ -382,8 +397,15 @@ test('shared startup asset loader preserves metadata and clears timeout', async 
       ok: true,
       status: 200,
       json: async () => ({
-        source: 'database', schemaVersion: 9, seeded: true,
-        vehicle_instances: [{ id: 'v1' }],
+        source: 'database', schemaVersion: 9,
+        vehicle_definition: {
+          url: '/models/truck.glb', realLengthM: 7, tireDiameterM: 1,
+          altOffsetM: 0.1,
+        },
+        vehicle_instances: [{
+          id: 'v1', lat: 64.1, lon: -51.7, headingDeg: 90, z: 12,
+          headlightsOn: true,
+        }],
       }),
     }),
   });
@@ -394,21 +416,20 @@ test('shared startup asset loader preserves metadata and clears timeout', async 
   assert.equal(logs[0][1].vehicleCount, 1);
 });
 
-test('shared startup asset loader returns complete defaults on failure', async () => {
-  const previousWarn = console.warn;
-  console.warn = () => {};
+test('shared startup asset loader fails closed', async () => {
+  const previousError = console.error;
+  console.error = () => {};
   try {
-    const result = await loadTerrainStartupAssets({
-      endpoint: '/assets',
-      AbortControllerImpl: undefined,
-      fetchImpl: async () => ({ ok: false, status: 503 }),
-    });
-    assert.deepEqual(result, {
-      source: 'defaults', schemaVersion: 4, seeded: null,
-      vehicle_definition: {}, vehicle_instances: [],
-    });
+    await assert.rejects(
+      loadTerrainStartupAssets({
+        endpoint: '/assets',
+        AbortControllerImpl: undefined,
+        fetchImpl: async () => ({ ok: false, status: 503 }),
+      }),
+      /assets endpoint status 503/,
+    );
   } finally {
-    console.warn = previousWarn;
+    console.error = previousError;
   }
 });
 
@@ -1830,12 +1851,24 @@ test('fetch residency survives live sample-cache eviction while the response is 
   assert.deepEqual([...appliedTile.samples], [7]);
 });
 
-test('pending seam dependencies retain an already-resident exact tile', () => {
+test('pending terrain targets retain overlapping resident coverage across LOD changes', () => {
   const exact = {
     id: '12-1500-687',
     bbox: [0, 0, 1, 1],
     heightmap: 'old-repaired-digest',
     samples: Float32Array.from([7]),
+  };
+  const coarseResident = {
+    id: '10-375-171',
+    bbox: [0, 0, 4, 4],
+    heightmap: 'coarse-resident-digest',
+    samples: Float32Array.from([3]),
+  };
+  const fineResident = {
+    id: '13-3000-1374',
+    bbox: [0, 0, 0.5, 0.5],
+    heightmap: 'fine-resident-digest',
+    samples: Float32Array.from([9]),
   };
   const ancestor = {
     id: '11-750-343',
@@ -1852,8 +1885,24 @@ test('pending seam dependencies retain an already-resident exact tile', () => {
   assert.deepEqual(pending.retainedIds, [exact.id]);
   assert.deepEqual(pending.tiles, [ancestor, exact]);
 
+  const pendingFineTarget = retainPendingResidentTerrainTiles(
+    [coarseResident],
+    [],
+    [{ id: exact.id, state: 'missing' }],
+  );
+  assert.deepEqual(pendingFineTarget.retainedIds, [coarseResident.id]);
+  assert.deepEqual(pendingFineTarget.tiles, [coarseResident]);
+
+  const pendingCoarseTarget = retainPendingResidentTerrainTiles(
+    [fineResident],
+    [],
+    [{ id: coarseResident.id, state: 'missing' }],
+  );
+  assert.deepEqual(pendingCoarseTarget.retainedIds, [fineResident.id]);
+  assert.deepEqual(pendingCoarseTarget.tiles, [fineResident]);
+
   const movedAway = retainPendingResidentTerrainTiles(
-    [exact], [ancestor], [],
+    [exact, coarseResident, fineResident], [ancestor], [],
   );
   assert.deepEqual(movedAway.retainedIds, []);
   assert.deepEqual(movedAway.tiles, [ancestor]);

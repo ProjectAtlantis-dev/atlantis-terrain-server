@@ -71,6 +71,7 @@ import {
   invalidateTerrainCloudHistory,
   registerTerrainCloudTuning,
 } from './terrain-cloud-runtime.js';
+import { createTerrainAtmosphereFrame } from './terrain-atmosphere-frame.js';
 import { createTerrainBuildingsRuntime } from './terrain-buildings-runtime.js';
 import { createTerrainTileMenuRuntime } from './terrain-tile-menu-runtime.js';
 import { createTerrainTileInspectorRuntime } from './terrain-tile-inspector-runtime.js';
@@ -261,9 +262,10 @@ const CLOUD_WIND_RECALIBRATION_DISTANCE_M = 25_000;
 // directions map into Takram's cube-sphere UVs near the current camera.
 const cloudWeatherUvBasis = {
   position: anchorPosition.clone(),
-  east,
-  north,
+  east: east.clone(),
+  north: north.clone(),
 };
+const cloudWindScenePosition = anchorPosition.clone();
 
 // --- View distance constants ---
 const MAX_VIEW_DIST = 50000;       // 50km — camera far, fog, map extents
@@ -921,12 +923,17 @@ function buildTuningControls(ap, ce) {
 function recalibrateCloudWindForCamera() {
   if (
     cloudTuning == null
-    || camera.position.distanceToSquared(cloudWeatherUvBasis.position)
+    || camera.position.distanceToSquared(cloudWindScenePosition)
       < CLOUD_WIND_RECALIBRATION_DISTANCE_M ** 2
   ) {
     return false;
   }
-  cloudWeatherUvBasis.position.copy(camera.position);
+  cloudWindScenePosition.copy(camera.position);
+  if (terrainAtmosphereFrameState != null) {
+    cloudWeatherUvBasis.position.copy(terrainAtmosphereFrameState.ecefSurface);
+    cloudWeatherUvBasis.east.copy(terrainAtmosphereFrameState.ecefEast);
+    cloudWeatherUvBasis.north.copy(terrainAtmosphereFrameState.ecefNorth);
+  }
   cloudTuning.syncDrift();
   return true;
 }
@@ -1355,9 +1362,43 @@ aerialPerspective.albedoScale = 1.0;
 aerialPerspective.shadowRadius = 1.8;
 aerialPerspective.shadowSampleCount = 12;
 
+const terrainAtmosphereFrame = createTerrainAtmosphereFrame({
+  sceneEast: east,
+  sceneNorth: north,
+  sceneUp: up,
+  effects: [cloudsEffect, aerialPerspective],
+});
+const atmosphereSceneSurface = new THREE.Vector3();
+let terrainAtmosphereFrameState = null;
+const ATMOSPHERE_TELEPORT_DISTANCE_M = 10_000;
+
 // Wire up tuning panel now that effects exist
 const sunDirection = new THREE.Vector3();
 let restoreCloudTemporalHistory = null;
+
+function syncTerrainAtmosphereFrame() {
+  // Before the server establishes its exact EPSG frame, the camera and fetch
+  // runtime share the linear local-ENU mapping. Afterwards use the exact grid
+  // inverse. In both cases local altitude is orthometric scene z, so removing
+  // it identifies the rendered sea-level plane that must touch WGS84 HAE=0.
+  const location = terrainPipelineState.frameOffsetReady
+    ? getRenderedTerrainLatLon()
+    : getCameraLatLon();
+  atmosphereSceneSurface
+    .copy(camera.position)
+    .addScaledVector(up, -location.alt);
+  terrainAtmosphereFrameState = terrainAtmosphereFrame.update({
+    latitude: location.lat,
+    longitude: location.lon,
+    sceneSurfacePosition: atmosphereSceneSurface,
+  });
+  if (
+    !USE_WEBGPU_RENDER_BACKEND
+    && terrainAtmosphereFrameState.distanceM >= ATMOSPHERE_TELEPORT_DISTANCE_M
+  ) {
+    restoreCloudTemporalHistory = invalidateTerrainCloudHistory(cloudsEffect);
+  }
+}
 
 function applyDate(date, { force = true } = {}) {
   const dateMs = date.getTime();
@@ -3163,6 +3204,7 @@ function renderFrame() {
   const markMovement = performance.now();
   applyDate(currentDate, { force: false });
   applyCameraOrientation();
+  syncTerrainAtmosphereFrame();
   recalibrateCloudWindForCamera();
   rebuildTerrainDemandForViewDirection();
   const markDemand = performance.now();

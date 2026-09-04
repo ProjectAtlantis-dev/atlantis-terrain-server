@@ -1,23 +1,53 @@
-export function defaultTerrainStartupAssets() {
-  return {
-    vehicle_definition: {},
-    vehicle_instances: [],
-  };
-}
-
 export function normalizeTerrainStartupAssets(payload) {
-  const normalized = defaultTerrainStartupAssets();
-  if (payload == null || typeof payload !== 'object') return normalized;
-
-  if (payload.vehicle_definition != null && typeof payload.vehicle_definition === 'object') {
-    normalized.vehicle_definition = { ...payload.vehicle_definition };
+  if (payload == null || typeof payload !== 'object') {
+    throw new TypeError('asset catalog response must be an object');
   }
-  if (Array.isArray(payload.vehicle_instances)) {
-    normalized.vehicle_instances = payload.vehicle_instances
-      .filter(value => value != null && typeof value === 'object')
-      .map(value => ({ ...value }));
+  if (typeof payload.source !== 'string' || payload.source.trim() === '') {
+    throw new TypeError('asset catalog source must be a non-empty string');
   }
-  return normalized;
+  if (!Number.isInteger(payload.schemaVersion)) {
+    throw new TypeError('asset catalog schemaVersion must be an integer');
+  }
+  const definition = payload.vehicle_definition;
+  if (definition == null || typeof definition !== 'object') {
+    throw new TypeError('asset catalog vehicle_definition must be an object');
+  }
+  for (const key of ['realLengthM', 'tireDiameterM', 'altOffsetM']) {
+    if (!Number.isFinite(definition[key])) {
+      throw new TypeError(`asset catalog vehicle_definition.${key} must be finite`);
+    }
+  }
+  if (typeof definition.url !== 'string' || definition.url.trim() === '') {
+    throw new TypeError('asset catalog vehicle_definition.url must be a non-empty string');
+  }
+  if (!Array.isArray(payload.vehicle_instances) || payload.vehicle_instances.length === 0) {
+    throw new TypeError('asset catalog must contain at least one vehicle instance');
+  }
+  const vehicleInstances = payload.vehicle_instances.map((value, index) => {
+    if (value == null || typeof value !== 'object') {
+      throw new TypeError(`asset catalog vehicle_instances[${index}] must be an object`);
+    }
+    if (typeof value.id !== 'string' || value.id.trim() === '') {
+      throw new TypeError(`asset catalog vehicle_instances[${index}].id must be non-empty`);
+    }
+    for (const key of ['lat', 'lon', 'headingDeg', 'z']) {
+      if (!Number.isFinite(value[key])) {
+        throw new TypeError(`asset catalog vehicle_instances[${index}].${key} must be finite`);
+      }
+    }
+    if (typeof value.headlightsOn !== 'boolean') {
+      throw new TypeError(
+        `asset catalog vehicle_instances[${index}].headlightsOn must be boolean`,
+      );
+    }
+    return { ...value };
+  });
+  return {
+    source: payload.source,
+    schemaVersion: payload.schemaVersion,
+    vehicle_definition: { ...definition },
+    vehicle_instances: vehicleInstances,
+  };
 }
 
 export async function loadTerrainStartupAssets({
@@ -29,12 +59,6 @@ export async function loadTerrainStartupAssets({
   setTimeoutImpl = (...args) => globalThis.setTimeout(...args),
   clearTimeoutImpl = handle => globalThis.clearTimeout(handle),
 } = {}) {
-  const fallback = {
-    source: 'defaults',
-    schemaVersion: 4,
-    seeded: null,
-    ...defaultTerrainStartupAssets(),
-  };
   try {
     const controller = typeof AbortControllerImpl === 'function'
       ? new AbortControllerImpl()
@@ -52,21 +76,14 @@ export async function loadTerrainStartupAssets({
 
     const payload = await response.json();
     const normalized = normalizeTerrainStartupAssets(payload);
-    const source = typeof payload?.source === 'string' ? payload.source : 'metadata';
-    const schemaVersion = Number.isFinite(payload?.schemaVersion) ? payload.schemaVersion : 4;
     bootLog('assets.fetch.ok', {
       endpoint,
       status: response.status,
-      source,
-      schemaVersion,
+      source: normalized.source,
+      schemaVersion: normalized.schemaVersion,
       vehicleCount: normalized.vehicle_instances.length,
     });
-    return {
-      source,
-      schemaVersion,
-      seeded: payload?.seeded ?? null,
-      ...normalized,
-    };
+    return normalized;
   } catch (error) {
     const details = {
       endpoint,
@@ -74,8 +91,8 @@ export async function loadTerrainStartupAssets({
       timedOut: error?.name === 'AbortError',
       error: error?.message ?? String(error),
     };
-    bootLog('assets.fetch.fallback', details, 'warn');
-    console.warn('[ASSETS] startup fallback', details);
-    return fallback;
+    bootLog('assets.fetch.failed', details, 'error');
+    console.error('[ASSETS] startup failed', details);
+    throw error;
   }
 }
