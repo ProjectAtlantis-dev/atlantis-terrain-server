@@ -30,6 +30,22 @@ export function panCoverageNavigation(navigation, deltaX, deltaY) {
   };
 }
 
+export function centerCoverageNavigation({
+  bounds,
+  width,
+  height,
+  navigation,
+  gridX,
+  gridY,
+}) {
+  const currentView = createCoverageView(bounds, width, height, navigation);
+  return panCoverageNavigation(
+    navigation,
+    width / 2 - currentView.x(gridX),
+    height / 2 - currentView.y(gridY),
+  );
+}
+
 export function zoomCoverageNavigation({
   bounds,
   width,

@@ -760,9 +760,51 @@ export function createTerrainTileSet({
     onMutated = () => {},
     onMaterialApplied = () => {},
     onResidencyOverlap = () => {},
+    onClippingDiagnostics = () => {},
   } = events;
+  const pendingClippingDiagnostics = [];
+  const pendingClippingDiagnosticKeys = new Set();
+  let droppedClippingDiagnostics = 0;
+  let clippingDiagnosticsScheduled = false;
+  let clippingTopologyEpoch = 0;
+  const flushClippingDiagnostics = () => {
+    clippingDiagnosticsScheduled = false;
+    if (pendingClippingDiagnostics.length === 0 && droppedClippingDiagnostics === 0) return;
+    const events = pendingClippingDiagnostics.splice(0);
+    const dropped = droppedClippingDiagnostics;
+    droppedClippingDiagnostics = 0;
+    pendingClippingDiagnosticKeys.clear();
+    onClippingDiagnostics({
+      count: events.length + dropped,
+      events,
+      dropped,
+      truncated: dropped > 0,
+    });
+  };
+  const recordClippingDiagnostic = details => {
+    const diagnostic = { topologyEpoch: clippingTopologyEpoch, ...details };
+    const key = [
+      diagnostic.kind,
+      diagnostic.reason ?? '',
+      diagnostic.tileId ?? '',
+      diagnostic.priorSignature ?? diagnostic.clipSignature ?? '',
+      diagnostic.nextSignature ?? '',
+    ].join('|');
+    if (pendingClippingDiagnosticKeys.has(key)) return;
+    pendingClippingDiagnosticKeys.add(key);
+    if (pendingClippingDiagnostics.length < 80) {
+      pendingClippingDiagnostics.push(diagnostic);
+    } else {
+      droppedClippingDiagnostics += 1;
+    }
+    if (!clippingDiagnosticsScheduled) {
+      clippingDiagnosticsScheduled = true;
+      queueMicrotask(flushClippingDiagnostics);
+    }
+  };
   const geometryCache = testOverrides.geometryCache ?? createTerrainGeometryCache({
     evictionGate: effectiveEvictionGate,
+    onDiagnostic: recordClippingDiagnostic,
   });
   const buildMesh = testOverrides.buildMesh ?? createTerrainMeshBuilder({
     exaggeration: terrain.exaggeration,
@@ -824,7 +866,10 @@ export function createTerrainTileSet({
       .sort()
       .join('|');
     if (topologySignature !== lastClippingTopologySignature) {
-      const result = recomputeTerrainResidencyClipping(residentById.values());
+      clippingTopologyEpoch += 1;
+      const result = recomputeTerrainResidencyClipping(residentById.values(), {
+        onDiagnostic: recordClippingDiagnostic,
+      });
       lastClippingFailures = result.failedPairs;
       lastClippingTopologySignature = topologySignature;
     }

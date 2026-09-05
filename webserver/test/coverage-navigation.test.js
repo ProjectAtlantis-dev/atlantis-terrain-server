@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
+  centerCoverageNavigation,
   createCoverageView,
   panCoverageNavigation,
   zoomCoverageNavigation,
@@ -22,6 +23,23 @@ test('coverage pan moves the projected map in screen pixels', () => {
   const after = createCoverageView(bounds, 1000, 700, moved);
   assert.equal(after.x(0) - before.x(0), 42);
   assert.equal(after.y(0) - before.y(0), -19);
+});
+
+test('coverage camera centering preserves zoom and puts the grid point onscreen center', () => {
+  const navigation = { zoom: 5, panX: 42, panY: -19 };
+  const centered = centerCoverageNavigation({
+    bounds,
+    width: 1000,
+    height: 700,
+    navigation,
+    gridX: 73,
+    gridY: -51,
+  });
+  const centeredView = createCoverageView(bounds, 1000, 700, centered);
+
+  assert.equal(centered.zoom, navigation.zoom);
+  assert.ok(Math.abs(centeredView.x(73) - 500) < 1e-9);
+  assert.ok(Math.abs(centeredView.y(-51) - 350) < 1e-9);
 });
 
 test('coverage wheel zoom keeps the map coordinate under the cursor fixed', () => {

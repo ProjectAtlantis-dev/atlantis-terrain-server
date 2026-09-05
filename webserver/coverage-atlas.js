@@ -1,9 +1,13 @@
 import { wgs84ToEpsg3413 } from './terrain-polar-stereo.js';
+import { readCameraState } from './terrain-camera-storage.js';
 import {
+  centerCoverageNavigation,
   createCoverageView,
   panCoverageNavigation,
   zoomCoverageNavigation,
 } from './coverage-navigation.js';
+
+const CAMERA_STORAGE_KEY = 'clouds-cam';
 
 const canvas = document.querySelector('#atlas');
 const context = canvas.getContext('2d');
@@ -12,6 +16,8 @@ const error = document.querySelector('#error');
 const tooltip = document.querySelector('#tooltip');
 const refresh = document.querySelector('#refresh');
 const resetView = document.querySelector('#reset-view');
+const centerCamera = document.querySelector('#center-camera');
+const cameraStatus = document.querySelector('#camera-status');
 
 let inventory = null;
 let outline = null;
@@ -19,6 +25,7 @@ let outlineExtent = null;
 let view = null;
 let navigation = { zoom: 1, panX: 0, panY: 0 };
 let drag = null;
+let cameraPoint = null;
 
 function projectedOutline(geometry) {
   return geometry.coordinates.map(polygon => polygon.map(ring => ring.map(([lon, lat]) => {
@@ -78,6 +85,29 @@ function renderTile(tile) {
   }
 }
 
+function renderCameraPosition() {
+  if (!cameraPoint) return;
+  const x = view.x(cameraPoint.x);
+  const y = view.y(cameraPoint.y);
+  context.save();
+  context.fillStyle = '#57c7ff';
+  context.strokeStyle = '#04121a';
+  context.lineWidth = 2;
+  context.beginPath();
+  context.arc(x, y, 5, 0, Math.PI * 2);
+  context.fill();
+  context.stroke();
+  context.strokeStyle = '#bcecff';
+  context.lineWidth = 1;
+  context.beginPath();
+  context.moveTo(x - 10, y);
+  context.lineTo(x + 10, y);
+  context.moveTo(x, y - 10);
+  context.lineTo(x, y + 10);
+  context.stroke();
+  context.restore();
+}
+
 function render() {
   context.clearRect(0, 0, innerWidth, innerHeight);
   if (!inventory || !outline) return;
@@ -93,6 +123,7 @@ function render() {
   context.strokeStyle = '#8ca1b4';
   context.lineWidth = 1.1;
   context.stroke(land);
+  renderCameraPosition();
 }
 
 function partialReason(tile) {
@@ -184,6 +215,55 @@ function resetNavigation() {
 
 canvas.addEventListener('dblclick', resetNavigation);
 resetView.addEventListener('click', resetNavigation);
+
+async function savedCameraPosition() {
+  let raw = null;
+  try {
+    raw = await readCameraState(CAMERA_STORAGE_KEY);
+  } catch {
+    // Older builds and browsers without IndexedDB may still have the pose in
+    // localStorage, so the atlas keeps the same fallback as the terrain view.
+  }
+  if (raw == null) raw = localStorage.getItem(CAMERA_STORAGE_KEY);
+  if (raw == null) throw new Error('No saved camera position is available yet.');
+  const saved = typeof raw === 'string' ? JSON.parse(raw) : raw;
+  if (!Number.isFinite(saved?.lat) || !Number.isFinite(saved?.lon)) {
+    throw new Error('The saved camera position is invalid.');
+  }
+  const projected = Number.isFinite(saved.gridX) && Number.isFinite(saved.gridY)
+    ? { x: saved.gridX, y: saved.gridY }
+    : wgs84ToEpsg3413(saved.lat, saved.lon);
+  return { ...projected, lat: saved.lat, lon: saved.lon };
+}
+
+async function centerOnCamera() {
+  if (!outlineExtent) {
+    cameraStatus.textContent = 'Coverage map is still loading.';
+    return;
+  }
+  centerCamera.disabled = true;
+  cameraStatus.textContent = 'Reading camera position…';
+  try {
+    cameraPoint = await savedCameraPosition();
+    navigation = centerCoverageNavigation({
+      bounds: outlineExtent,
+      width: innerWidth,
+      height: innerHeight,
+      navigation,
+      gridX: cameraPoint.x,
+      gridY: cameraPoint.y,
+    });
+    tooltip.style.display = 'none';
+    cameraStatus.textContent = `Centered at ${cameraPoint.lat.toFixed(5)}°, ${cameraPoint.lon.toFixed(5)}°`;
+    render();
+  } catch (cameraError) {
+    cameraStatus.textContent = cameraError.message;
+  } finally {
+    centerCamera.disabled = false;
+  }
+}
+
+centerCamera.addEventListener('click', () => { void centerOnCamera(); });
 
 async function load() {
   refresh.disabled = true;

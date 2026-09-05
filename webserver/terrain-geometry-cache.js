@@ -35,6 +35,7 @@ function sameBbox(a, b) {
 export function createTerrainGeometryCache({
   maxEntries = DEFAULT_MAX_ENTRIES,
   evictionGate = null,
+  onDiagnostic = null,
 } = {}) {
   if (!Number.isInteger(maxEntries) || maxEntries < 0) {
     throw new RangeError('maxEntries must be a non-negative integer');
@@ -45,6 +46,8 @@ export function createTerrainGeometryCache({
   let misses = 0;
   let staleDrops = 0;
   let overflowDrops = 0;
+  let clippedParks = 0;
+  let clippedHits = 0;
   const debugRetainedEntries = new Set();
 
   function disposeEntry(entry) {
@@ -96,13 +99,41 @@ export function createTerrainGeometryCache({
 
       // A second mesh for the same tile supersedes whatever was parked.
       drop(data.tileId);
+      const clipSignature = geometry.userData?.terrainClipSignature
+        ?? data.terrainClipSignature
+        ?? '';
+      const clipState = {
+        clipSignature,
+        clippedDescendantIds: [...(data.terrainClippedDescendantIds ?? [])],
+        activeSurfaceIndexCount: data.terrainActiveSurfaceIndexCount ?? null,
+        activeIndexCount: data.terrainActiveIndexCount ?? null,
+        drawRangeCount: geometry.drawRange?.count ?? null,
+        indexCapacity: geometry.getIndex?.()?.array?.length ?? null,
+      };
       entries.set(data.tileId, {
         geometry,
         heightmapPayload: data.heightmapPayload,
         bbox: [...data.bbox],
         resolution: data.resolution,
         skirtDepth: data.skirtDepth,
+        clipState,
       });
+
+      if (clipSignature !== '') {
+        clippedParks += 1;
+        onDiagnostic?.({
+          kind: 'cache-park-clipped',
+          tileId: data.tileId,
+          clipSignature: clipState.clipSignature,
+          activeSurfaceIndexCount: clipState.activeSurfaceIndexCount,
+          activeIndexCount: clipState.activeIndexCount,
+          drawRangeCount: clipState.drawRangeCount,
+          indexCapacity: clipState.indexCapacity,
+          descendantCount: clipState.clippedDescendantIds.length,
+          descendantIds: clipState.clippedDescendantIds.slice(0, 32),
+          descendantsTruncated: clipState.clippedDescendantIds.length > 32,
+        });
+      }
 
       evictOverflow();
       return true;
@@ -129,6 +160,22 @@ export function createTerrainGeometryCache({
       }
       entries.delete(tile.id);
       hits += 1;
+      if (entry.clipState?.clipSignature) {
+        clippedHits += 1;
+        onDiagnostic?.({
+          kind: 'cache-take-clipped',
+          tileId: tile.id,
+          clipSignature: entry.clipState.clipSignature,
+          activeSurfaceIndexCount: entry.clipState.activeSurfaceIndexCount,
+          activeIndexCount: entry.clipState.activeIndexCount,
+          drawRangeCount: entry.clipState.drawRangeCount,
+          indexCapacity: entry.clipState.indexCapacity,
+          descendantCount: entry.clipState.clippedDescendantIds.length,
+          descendantIds: entry.clipState.clippedDescendantIds.slice(0, 32),
+          descendantsTruncated: entry.clipState.clippedDescendantIds.length > 32,
+          payloadMatches: entry.heightmapPayload === tile.heightmap,
+        });
+      }
       return {
         ...entry,
         payloadMatches: entry.heightmapPayload === tile.heightmap,
@@ -150,6 +197,8 @@ export function createTerrainGeometryCache({
         misses,
         staleDrops,
         overflowDrops,
+        clippedParks,
+        clippedHits,
         debugRetained: debugRetainedEntries.size,
         hitRate: hits + misses === 0 ? 0 : hits / (hits + misses),
       };

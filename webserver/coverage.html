@@ -11,7 +11,7 @@
       canvas { display: block; width: 100vw; height: 100vh; cursor: grab; touch-action: none; }
       canvas.dragging { cursor: grabbing; }
       .panel { position: fixed; z-index: 2; padding: 12px 14px; border: 1px solid #24313d; border-radius: 7px; background: rgb(7 12 18 / 92%); box-shadow: 0 8px 30px #0008; }
-      #title { top: 14px; left: 14px; min-width: 330px; }
+      #title { top: 14px; left: 14px; min-width: 370px; }
       #title h1 { margin: 0 0 6px; font-size: 16px; color: #f4f8fb; }
       #summary { color: #9db1c4; font-size: 12px; line-height: 1.55; }
       #legend { right: 14px; top: 14px; font-size: 12px; line-height: 1.8; }
@@ -19,8 +19,11 @@
       .cured { background: #14b86a; }
       .partial { background: #d89018; }
       .nothing { background: #111820; }
+      .camera { border-radius: 50%; background: #57c7ff; }
       .controls { display: flex; gap: 6px; }
-      button { margin-top: 8px; border: 1px solid #35647b; border-radius: 4px; padding: 4px 8px; background: #102a38; color: #dff5ff; font: inherit; cursor: pointer; }
+      button { margin-top: 8px; border: 1px solid #35647b; border-radius: 4px; padding: 4px 8px; background: #102a38; color: #dff5ff; font: inherit; white-space: nowrap; cursor: pointer; }
+      button:disabled { cursor: wait; opacity: 0.65; }
+      #camera-status { min-height: 1.4em; margin-top: 6px; color: #8fc7df; font-size: 11px; }
       #tooltip { display: none; pointer-events: none; white-space: pre; font-size: 12px; line-height: 1.5; }
       #error { color: #ff6767; }
     </style>
@@ -34,12 +37,15 @@
       <div class="controls">
         <button id="refresh" type="button">refresh now</button>
         <button id="reset-view" type="button">reset view</button>
+        <button id="center-camera" type="button">center camera</button>
       </div>
+      <div id="camera-status" role="status"></div>
     </section>
     <section class="panel" id="legend">
       <div><span class="key cured"></span>fully cured at D10</div>
       <div><span class="key partial"></span>partial / provisional</div>
       <div><span class="key nothing"></span>nothing at D10</div>
+      <div><span class="key camera"></span>camera position</div>
       <div>drag pan · wheel zoom · double-click reset</div>
     </section>
     <section class="panel" id="tooltip"></section>

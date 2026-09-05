@@ -192,3 +192,33 @@ test('tracks hit rate across an oscillation', () => {
 test('rejects a negative cap', () => {
   assert.throws(() => createTerrainGeometryCache({ maxEntries: -1 }), RangeError);
 });
+
+test('reports clipped geometry crossing the cache boundary', () => {
+  const diagnostics = [];
+  const cache = createTerrainGeometryCache({
+    onDiagnostic: details => diagnostics.push(details),
+  });
+  const geometry = fakeGeometry();
+  geometry.userData = { terrainClipSignature: '42:abc' };
+  geometry.drawRange = { count: 42 };
+  geometry.getIndex = () => ({ array: new Uint16Array(128) });
+  const mesh = fakeMesh('12-1-1', { geometry });
+  Object.assign(mesh.userData, {
+    terrainClipSignature: '42:abc',
+    terrainClippedDescendantIds: ['13-2-2'],
+    terrainActiveSurfaceIndexCount: 36,
+    terrainActiveIndexCount: 42,
+  });
+
+  assert.equal(cache.park(mesh), true);
+  assert.ok(cache.take(tileFor(mesh)));
+
+  assert.deepEqual(diagnostics.map(event => event.kind), [
+    'cache-park-clipped',
+    'cache-take-clipped',
+  ]);
+  assert.equal(diagnostics[1].clipSignature, '42:abc');
+  assert.deepEqual(diagnostics[1].descendantIds, ['13-2-2']);
+  assert.equal(cache.stats().clippedParks, 1);
+  assert.equal(cache.stats().clippedHits, 1);
+});

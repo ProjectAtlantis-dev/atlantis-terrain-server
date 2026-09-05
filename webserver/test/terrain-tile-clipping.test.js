@@ -70,3 +70,44 @@ test('each resident ancestor is clipped directly by deeper descendants', () => {
   assert.deepEqual(depth11.userData.terrainClippedDescendantIds, ['12-80-80']);
   assert.deepEqual(depth12.userData.terrainClippedDescendantIds, []);
 });
+
+test('reports clip application and complete restoration with index evidence', () => {
+  const parent = tileMesh('9-10-10');
+  const child = tileMesh('11-40-40');
+  const diagnostics = [];
+
+  recomputeTerrainResidencyClipping([parent, child], {
+    onDiagnostic: details => diagnostics.push(details),
+  });
+  recomputeTerrainResidencyClipping([parent], {
+    onDiagnostic: details => diagnostics.push(details),
+  });
+
+  assert.equal(diagnostics.length, 2);
+  assert.equal(diagnostics[0].kind, 'apply');
+  assert.equal(diagnostics[0].tileId, '9-10-10');
+  assert.deepEqual(diagnostics[0].descendantIds, ['11-40-40']);
+  assert.ok(diagnostics[0].activeIndexCount < diagnostics[0].fullIndexCount);
+  assert.equal(diagnostics[1].kind, 'restore');
+  assert.equal(diagnostics[1].priorSignature, diagnostics[0].nextSignature);
+  assert.equal(diagnostics[1].nextSignature, '');
+  assert.equal(diagnostics[1].activeIndexCount, diagnostics[1].fullIndexCount);
+  assert.equal(diagnostics[1].drawRangeAfter, diagnostics[1].fullIndexCount);
+});
+
+test('reports a draw-range mismatch hidden behind an unchanged clip signature', () => {
+  const parent = tileMesh('9-10-10');
+  const child = tileMesh('11-40-40');
+  recomputeTerrainResidencyClipping([parent, child]);
+  parent.geometry.setDrawRange(0, 6);
+  const diagnostics = [];
+
+  recomputeTerrainResidencyClipping([parent, child], {
+    onDiagnostic: details => diagnostics.push(details),
+  });
+
+  assert.equal(diagnostics.length, 1);
+  assert.equal(diagnostics[0].kind, 'state-mismatch');
+  assert.equal(diagnostics[0].reason, 'matching-signature-wrong-draw-range');
+  assert.equal(diagnostics[0].drawRangeBefore, 6);
+});

@@ -95,6 +95,7 @@ import {
   forwardLockLookYawOffset,
   MAX_REALTIME_STEP_SECONDS,
   stepFreeFlightVelocity,
+  stepFreeFlightVerticalVelocity,
   stepForwardLockTurn,
 } from './terrain-realtime-step.js';
 import { DETAIL_FADE_END_M, DETAIL_STRENGTH, setDetailTuning } from './terrain-detail-layer.js';
@@ -301,9 +302,11 @@ const controls = {
   pitch: -0.32,
   bank: 0,
   bankVelocity: 0,
+  forwardLockThrottle: 0,
   lookYawOffset: 0,
   speed: 0,
   strafeSpeed: 0,
+  verticalSpeed: 0,
   dragging: false,
   dragButton: 0,
   mapMode: false,
@@ -1539,6 +1542,14 @@ const terrainTileSet = createTerrainTileSet({
       console.error('[TERRAIN RESIDENCY OVERLAP]', details);
       enqueueClientLog('error', 'terrain.residency.overlap', details);
     },
+    onClippingDiagnostics: details => {
+      const anomalous = details.events.some(event => event.kind === 'state-mismatch');
+      enqueueClientLog(
+        anomalous ? 'error' : 'info',
+        'terrain.clipping.audit',
+        details,
+      );
+    },
     // onMaterialApplied fires for every tile on every application pass, not
     // just real changes — the reconciler reapplies constantly. Only actual
     // map swaps may bump the texture version, or the water runtime's
@@ -1873,6 +1884,7 @@ function needsContinuousRender() {
     hasActiveKeyInput() ||
     Math.abs(controls.speed) > 1e-3 ||
     Math.abs(controls.strafeSpeed) > 1e-3 ||
+    Math.abs(controls.verticalSpeed) > 1e-3 ||
     Math.abs(controls.bank) > 1e-4 ||
     vehicleRuntime.vehicleControlActive ||
     gameClockState.stopGameTimeMs != null ||
@@ -2409,8 +2421,10 @@ function updateMovement(dt) {
   if (vehicleRuntime.vehicleControlActive && !controls.mapMode) {
     controls.speed = 0;
     controls.strafeSpeed = 0;
+    controls.verticalSpeed = 0;
     controls.bank = 0;
     controls.bankVelocity = 0;
+    controls.forwardLockThrottle = 0;
     controls.lookYawOffset = 0;
     cameraRuntimeState.forwardLockCoasting = false;
     if (!vehicleRuntime.vehicleLoaded) {
@@ -2454,6 +2468,7 @@ function updateMovement(dt) {
     leftPressed,
     rightPressed,
     forwardLock: cameraRuntimeState.driftMode,
+    forwardLockThrottle: controls.forwardLockThrottle,
     mapMode: controls.mapMode,
     forwardAcceleration: FORWARD_ACCEL,
     acceleration: ACCEL,
@@ -2467,7 +2482,17 @@ function updateMovement(dt) {
   });
   controls.speed = flightVelocity.speed;
   controls.strafeSpeed = flightVelocity.strafeSpeed;
+  controls.forwardLockThrottle = flightVelocity.forwardLockThrottle;
   if (controls.speed === 0) cameraRuntimeState.forwardLockCoasting = false;
+
+  controls.verticalSpeed = stepFreeFlightVerticalVelocity({
+    verticalSpeed: controls.verticalSpeed,
+    upPressed: Boolean(controls.keys.KeyQ),
+    downPressed: Boolean(controls.keys.KeyZ),
+    forwardLock: cameraRuntimeState.driftMode && !controls.mapMode,
+    maxVerticalSpeed: STRAFE_SPEED * 0.5,
+    dt,
+  });
 
   const turn = stepForwardLockTurn({
     bank: controls.bank,
@@ -2475,6 +2500,7 @@ function updateMovement(dt) {
     leftPressed: bankLeftPressed,
     rightPressed: bankRightPressed,
     active: cameraRuntimeState.driftMode && !controls.mapMode,
+    stationary: controls.speed === 0,
     dt,
   });
   controls.bank = turn.bank;
@@ -2522,11 +2548,8 @@ function updateMovement(dt) {
       move.addScaledVector(movementRight, controls.strafeSpeed * dt);
     }
   }
-  if (controls.keys.KeyQ) {
-    move.addScaledVector(up, STRAFE_SPEED * dt * 0.5);
-  }
-  if (controls.keys.KeyZ) {
-    move.addScaledVector(up, -STRAFE_SPEED * dt * 0.5);
+  if (controls.verticalSpeed !== 0) {
+    move.addScaledVector(up, controls.verticalSpeed * dt);
   }
   if (move.lengthSq() > 0) {
     cameraRuntimeState.lastMoveTime = performance.now();
@@ -2539,6 +2562,7 @@ function updateMovement(dt) {
     camera.position.copy(cameraRuntimeState.lastGoodPosition);
     controls.speed = 0;
     controls.strafeSpeed = 0;
+    controls.verticalSpeed = 0;
   } else {
     cameraRuntimeState.lastGoodPosition.copy(camera.position);
   }
@@ -2741,9 +2765,11 @@ function resetView() {
   controls.pitch = defaultPitch;
   controls.bank = 0;
   controls.bankVelocity = 0;
+  controls.forwardLockThrottle = 0;
   controls.lookYawOffset = 0;
   controls.speed = 0;
   controls.strafeSpeed = 0;
+  controls.verticalSpeed = 0;
   cameraRuntimeState.forwardLockCoasting = false;
   controls.dragging = false;
   controls.dragButton = 0;
@@ -2976,6 +3002,8 @@ installTerrainKeyboardControls({
     if (nextLocked === cameraRuntimeState.driftMode) return;
     cameraRuntimeState.forwardLockCoasting = !nextLocked && Math.abs(controls.speed) > 1e-3;
     cameraRuntimeState.driftMode = nextLocked;
+    controls.forwardLockThrottle = 0;
+    controls.verticalSpeed = 0;
     if (!nextLocked) controls.lookYawOffset = 0;
     // The second tap has already set its movement key. Consume it so enabling
     // does not add thrust and disabling does not add reverse thrust.

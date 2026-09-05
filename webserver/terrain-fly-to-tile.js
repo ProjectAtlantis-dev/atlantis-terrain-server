@@ -171,8 +171,10 @@ export function createTerrainFlyToTileRuntime({
     cameraRuntimeState.forwardLockCoasting = false;
     controls.speed = 0;
     controls.strafeSpeed = 0;
+    controls.verticalSpeed = 0;
     controls.bank = 0;
     controls.bankVelocity = 0;
+    controls.forwardLockThrottle = 0;
     controls.lookYawOffset = 0;
     controls.yaw = 0; // north up, like the tile inspector
     controls.pitch = TOP_DOWN_PITCH_RAD;
@@ -225,8 +227,10 @@ export function createTerrainFlyToTileRuntime({
     cameraRuntimeState.forwardLockCoasting = false;
     controls.speed = 0;
     controls.strafeSpeed = 0;
+    controls.verticalSpeed = 0;
     controls.bank = 0;
     controls.bankVelocity = 0;
+    controls.forwardLockThrottle = 0;
     controls.lookYawOffset = 0;
     controls.yaw = 0;
     controls.pitch = TOP_DOWN_PITCH_RAD;

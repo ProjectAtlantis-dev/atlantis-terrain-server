@@ -104,8 +104,9 @@ function createRuntimeHarness({ raycastGroundAltitude = () => null, mapMode = fa
   const camera = { position: new Vec3(9000, 9000, 9000), fov: 60 };
   const controls = {
     yaw: 2, pitch: 0.5, bank: 0.3, bankVelocity: 0.1,
+    forwardLockThrottle: 0.4,
     lookYawOffset: Math.PI / 2,
-    speed: 100, strafeSpeed: 50,
+    speed: 100, strafeSpeed: 50, verticalSpeed: 20,
     mapMode, mapPanEast: 1500, mapPanNorth: -900, mapZoom: 20000,
   };
   const cameraRuntimeState = {
@@ -151,8 +152,10 @@ test('flyToTile centers the camera over the tile in grid space', () => {
   assert.equal(controls.pitch, -1.4);
   assert.equal(controls.bank, 0);
   assert.equal(controls.bankVelocity, 0);
+  assert.equal(controls.forwardLockThrottle, 0);
   assert.equal(controls.lookYawOffset, 0);
   assert.equal(controls.speed, 0);
+  assert.equal(controls.verticalSpeed, 0);
   assert.equal(cameraRuntimeState.driftMode, false);
   assert.equal(cameraRuntimeState.forwardLockCoasting, false);
   assert.equal(cameraRuntimeState.aglValid, false);

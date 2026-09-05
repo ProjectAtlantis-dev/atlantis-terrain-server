@@ -5,6 +5,7 @@ import {
   advanceRealtimeMovement,
   forwardLockLookYawOffset,
   stepFreeFlightVelocity,
+  stepFreeFlightVerticalVelocity,
   stepForwardLockTurn,
 } from '../terrain-realtime-step.js';
 
@@ -74,6 +75,230 @@ test('forward lock consumes lateral input without creating strafe velocity', () 
 
   assert.equal(step.speed, 300);
   assert.equal(step.strafeSpeed, 0);
+});
+
+test('forward-lock altitude input builds vertical momentum toward a 100 m/s ceiling', () => {
+  const first = stepFreeFlightVerticalVelocity({
+    verticalSpeed: 0,
+    upPressed: true,
+    downPressed: false,
+    forwardLock: true,
+    maxVerticalSpeed: 400,
+    dt: 0.05,
+  });
+  const second = stepFreeFlightVerticalVelocity({
+    verticalSpeed: first,
+    upPressed: true,
+    downPressed: false,
+    forwardLock: true,
+    maxVerticalSpeed: 400,
+    dt: 0.05,
+  });
+  const previousPower = stepFreeFlightVerticalVelocity({
+    verticalSpeed: 0,
+    upPressed: true,
+    downPressed: false,
+    forwardLock: true,
+    maxVerticalSpeed: 400,
+    dt: 0.05,
+    inertiaResponse: 0.75,
+  });
+  const fullUp = stepFreeFlightVerticalVelocity({
+    verticalSpeed: 100,
+    upPressed: true,
+    downPressed: false,
+    forwardLock: true,
+    maxVerticalSpeed: 400,
+    dt: 0.05,
+  });
+  const fullDown = stepFreeFlightVerticalVelocity({
+    verticalSpeed: -100,
+    upPressed: false,
+    downPressed: true,
+    forwardLock: true,
+    maxVerticalSpeed: 400,
+    dt: 0.05,
+  });
+
+  assert.ok(first > 0);
+  assert.ok(first > previousPower);
+  assert.ok(second > first);
+  assert.ok(second < 100);
+  assert.equal(fullUp, 100);
+  assert.equal(fullDown, -100);
+});
+
+test('forward-lock altitude momentum eases out after Q or Z is released', () => {
+  const ascending = stepFreeFlightVerticalVelocity({
+    verticalSpeed: 3,
+    upPressed: false,
+    downPressed: false,
+    forwardLock: true,
+    maxVerticalSpeed: 400,
+    dt: 0.1,
+  });
+  const descending = stepFreeFlightVerticalVelocity({
+    verticalSpeed: -3,
+    upPressed: false,
+    downPressed: false,
+    forwardLock: true,
+    maxVerticalSpeed: 400,
+    dt: 0.1,
+  });
+
+  assert.ok(ascending > 0);
+  assert.ok(ascending < 3);
+  assert.ok(descending < 0);
+  assert.ok(descending > -3);
+});
+
+test('ordinary altitude input keeps its direct full-strength response', () => {
+  assert.equal(stepFreeFlightVerticalVelocity({
+    verticalSpeed: 30,
+    upPressed: true,
+    downPressed: false,
+    forwardLock: false,
+    maxVerticalSpeed: 400,
+    dt: 0.1,
+  }), 400);
+  assert.equal(stepFreeFlightVerticalVelocity({
+    verticalSpeed: -30,
+    upPressed: false,
+    downPressed: false,
+    forwardLock: false,
+    maxVerticalSpeed: 400,
+    dt: 0.1,
+  }), 0);
+});
+
+test('forward-lock forward input ramps up instead of applying full thrust immediately', () => {
+  const first = stepFreeFlightVelocity({
+    speed: 0,
+    strafeSpeed: 0,
+    forwardPressed: true,
+    backPressed: false,
+    leftPressed: false,
+    rightPressed: false,
+    forwardLock: true,
+    forwardLockThrottle: 0,
+    mapMode: false,
+    forwardAcceleration: 300,
+    acceleration: 1200,
+    brake: 800,
+    maxSpeed: 5000,
+    maxStrafeSpeed: 800,
+    dt: 0.05,
+  });
+  const second = stepFreeFlightVelocity({
+    speed: first.speed,
+    strafeSpeed: 0,
+    forwardPressed: true,
+    backPressed: false,
+    leftPressed: false,
+    rightPressed: false,
+    forwardLock: true,
+    forwardLockThrottle: first.forwardLockThrottle,
+    mapMode: false,
+    forwardAcceleration: 300,
+    acceleration: 1200,
+    brake: 800,
+    maxSpeed: 5000,
+    maxStrafeSpeed: 800,
+    dt: 0.05,
+  });
+  const reverse = stepFreeFlightVelocity({
+    speed: 100,
+    strafeSpeed: 0,
+    forwardPressed: false,
+    backPressed: true,
+    leftPressed: false,
+    rightPressed: false,
+    forwardLock: true,
+    forwardLockThrottle: 0,
+    mapMode: false,
+    forwardAcceleration: 300,
+    acceleration: 1200,
+    brake: 800,
+    maxSpeed: 5000,
+    maxStrafeSpeed: 800,
+    dt: 0.05,
+  });
+
+  assert.ok(first.forwardLockThrottle > 0);
+  assert.ok(first.forwardLockThrottle < 1);
+  assert.ok(second.forwardLockThrottle > first.forwardLockThrottle);
+  assert.ok(second.speed - first.speed > first.speed);
+  assert.ok(reverse.forwardLockThrottle < 0);
+  assert.ok(reverse.forwardLockThrottle > -1);
+  assert.ok(reverse.speed < 100);
+  assert.ok(reverse.speed > 60);
+});
+
+test('forward-lock throttle eases out after up or down input is released', () => {
+  const forwardRelease = stepFreeFlightVelocity({
+    speed: 100,
+    strafeSpeed: 0,
+    forwardPressed: false,
+    backPressed: false,
+    leftPressed: false,
+    rightPressed: false,
+    forwardLock: true,
+    forwardLockThrottle: 0.5,
+    mapMode: false,
+    forwardAcceleration: 300,
+    acceleration: 1200,
+    brake: 800,
+    maxSpeed: 5000,
+    maxStrafeSpeed: 800,
+    dt: 0.05,
+  });
+  const reverseRelease = stepFreeFlightVelocity({
+    speed: 100,
+    strafeSpeed: 0,
+    forwardPressed: false,
+    backPressed: false,
+    leftPressed: false,
+    rightPressed: false,
+    forwardLock: true,
+    forwardLockThrottle: -0.5,
+    mapMode: false,
+    forwardAcceleration: 300,
+    acceleration: 1200,
+    brake: 800,
+    maxSpeed: 5000,
+    maxStrafeSpeed: 800,
+    dt: 0.05,
+  });
+
+  assert.ok(forwardRelease.forwardLockThrottle > 0);
+  assert.ok(forwardRelease.forwardLockThrottle < 0.5);
+  assert.ok(forwardRelease.speed > 100);
+  assert.ok(reverseRelease.forwardLockThrottle < 0);
+  assert.ok(reverseRelease.forwardLockThrottle > -0.5);
+  assert.ok(reverseRelease.speed < 100);
+});
+
+test('ordinary flight discards forward-lock throttle and keeps direct input response', () => {
+  const step = stepFreeFlightVelocity({
+    speed: 0,
+    strafeSpeed: 0,
+    forwardPressed: true,
+    backPressed: false,
+    leftPressed: false,
+    rightPressed: false,
+    forwardLock: false,
+    forwardLockThrottle: 0.75,
+    mapMode: false,
+    forwardAcceleration: 300,
+    acceleration: 1200,
+    brake: 800,
+    maxSpeed: 5000,
+    maxStrafeSpeed: 800,
+    dt: 0.1,
+  });
+
+  assert.equal(step.speed, 30);
+  assert.equal(step.forwardLockThrottle, 0);
 });
 
 test('lateral thrusters remain available outside forward lock', () => {
@@ -268,8 +493,39 @@ test('leaving forward lock levels residual bank without steering', () => {
   });
 
   assert.ok(step.bank > 0);
-  assert.ok(step.bank < 0.5);
+  assert.ok(step.bank < 0.4);
   assert.equal(step.yawDelta, 0);
+});
+
+test('disabled forward lock keeps flattening smoothly after the coast stops', () => {
+  const step = stepForwardLockTurn({
+    bank: 0.3,
+    bankVelocity: 0.1,
+    leftPressed: false,
+    rightPressed: false,
+    active: false,
+    stationary: true,
+    dt: 0.05,
+  });
+
+  assert.ok(step.bank > 0);
+  assert.ok(step.bank < 0.3);
+  assert.equal(step.bankVelocity, 0);
+  assert.equal(step.yawDelta, 0);
+});
+
+test('forward-lock camera snaps level when drift stops', () => {
+  const step = stepForwardLockTurn({
+    bank: 0.3,
+    bankVelocity: 0.1,
+    leftPressed: false,
+    rightPressed: true,
+    active: true,
+    stationary: true,
+    dt: 0.05,
+  });
+
+  assert.deepEqual(step, { bank: 0, bankVelocity: 0, yawDelta: 0 });
 });
 
 test('forward-lock banking accelerates into its roll instead of stepping to full roll rate', () => {

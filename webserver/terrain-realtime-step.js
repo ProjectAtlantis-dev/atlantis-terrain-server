@@ -4,8 +4,12 @@ export const FORWARD_LOCK_MAX_BANK_RADIANS = 25 * Math.PI / 180;
 export const FORWARD_LOCK_MAX_TURN_RATE = 0.2;
 export const FORWARD_LOCK_BANK_RESPONSE = 0.5625;
 export const FORWARD_LOCK_BANK_INERTIA_RESPONSE = 4;
+export const FORWARD_LOCK_THROTTLE_INERTIA_RESPONSE = 4;
 export const FORWARD_LOCK_LEVEL_RESPONSE = 0.0375;
+export const FORWARD_LOCK_EXIT_LEVEL_RESPONSE = 0.75;
 export const FORWARD_LOCK_RELEASE_BRAKE_SCALE = 0.125;
+export const FORWARD_LOCK_VERTICAL_MAX_SPEED = 100;
+export const FORWARD_LOCK_VERTICAL_INERTIA_RESPONSE = 1.5;
 
 function bleedVelocity(velocity, brakeStep) {
   if (velocity > 0) return Math.max(velocity - brakeStep, 0);
@@ -18,6 +22,25 @@ export function forwardLockLookYawOffset({ active, leftPressed, rightPressed }) 
   return leftPressed ? Math.PI / 2 : -Math.PI / 2;
 }
 
+export function stepFreeFlightVerticalVelocity({
+  verticalSpeed,
+  upPressed,
+  downPressed,
+  forwardLock,
+  maxVerticalSpeed,
+  dt,
+  forwardLockMaxSpeed = FORWARD_LOCK_VERTICAL_MAX_SPEED,
+  inertiaResponse = FORWARD_LOCK_VERTICAL_INERTIA_RESPONSE,
+}) {
+  const verticalInput = (upPressed ? 1 : 0) - (downPressed ? 1 : 0);
+  if (!forwardLock) return verticalInput * maxVerticalSpeed;
+
+  const targetSpeed = verticalInput * Math.min(maxVerticalSpeed, forwardLockMaxSpeed);
+  const blend = 1 - Math.exp(-inertiaResponse * dt);
+  const nextSpeed = verticalSpeed + (targetSpeed - verticalSpeed) * blend;
+  return Math.abs(nextSpeed) < 1e-5 ? 0 : nextSpeed;
+}
+
 export function stepFreeFlightVelocity({
   speed,
   strafeSpeed,
@@ -26,6 +49,7 @@ export function stepFreeFlightVelocity({
   leftPressed,
   rightPressed,
   forwardLock,
+  forwardLockThrottle = 0,
   mapMode,
   forwardAcceleration,
   acceleration,
@@ -34,6 +58,7 @@ export function stepFreeFlightVelocity({
   maxSpeed,
   maxStrafeSpeed,
   dt,
+  throttleInertiaResponse = FORWARD_LOCK_THROTTLE_INERTIA_RESPONSE,
 }) {
   let nextSpeed = Math.max(-maxSpeed, Math.min(maxSpeed, speed));
   let nextStrafeSpeed = Math.max(
@@ -45,14 +70,36 @@ export function stepFreeFlightVelocity({
   const brakeStep = brake * dt;
   const longitudinalBrakeStep = brakeStep * longitudinalBrakeScale;
 
-  if (forwardPressed) {
-    nextSpeed = Math.min(nextSpeed + forwardAccelerationStep, maxSpeed);
-  } else if (backPressed) {
-    nextSpeed = nextSpeed > 0
-      ? Math.max(nextSpeed - brakeStep, 0)
-      : Math.max(nextSpeed - accelerationStep, -maxSpeed);
-  } else if (!forwardLock) {
-    nextSpeed = bleedVelocity(nextSpeed, longitudinalBrakeStep);
+  let nextForwardLockThrottle = 0;
+  if (forwardLock) {
+    const targetThrottle = (forwardPressed ? 1 : 0) - (backPressed ? 1 : 0);
+    const throttleBlend = 1 - Math.exp(-throttleInertiaResponse * dt);
+    nextForwardLockThrottle = forwardLockThrottle
+      + (targetThrottle - forwardLockThrottle) * throttleBlend;
+    if (Math.abs(nextForwardLockThrottle) < 1e-5) nextForwardLockThrottle = 0;
+
+    if (nextForwardLockThrottle > 0) {
+      nextSpeed = Math.min(
+        nextSpeed + forwardAccelerationStep * nextForwardLockThrottle,
+        maxSpeed,
+      );
+    } else if (nextForwardLockThrottle < 0) {
+      const reverseStep = nextSpeed > 0 ? brakeStep : accelerationStep;
+      nextSpeed = Math.max(
+        nextSpeed + reverseStep * nextForwardLockThrottle,
+        nextSpeed > 0 ? 0 : -maxSpeed,
+      );
+    }
+  } else {
+    if (forwardPressed) {
+      nextSpeed = Math.min(nextSpeed + forwardAccelerationStep, maxSpeed);
+    } else if (backPressed) {
+      nextSpeed = nextSpeed > 0
+        ? Math.max(nextSpeed - brakeStep, 0)
+        : Math.max(nextSpeed - accelerationStep, -maxSpeed);
+    } else {
+      nextSpeed = bleedVelocity(nextSpeed, longitudinalBrakeStep);
+    }
   }
 
   if (mapMode) {
@@ -75,7 +122,11 @@ export function stepFreeFlightVelocity({
     nextStrafeSpeed = bleedVelocity(nextStrafeSpeed, brakeStep);
   }
 
-  return { speed: nextSpeed, strafeSpeed: nextStrafeSpeed };
+  return {
+    speed: nextSpeed,
+    strafeSpeed: nextStrafeSpeed,
+    forwardLockThrottle: nextForwardLockThrottle,
+  };
 }
 
 /**
@@ -92,13 +143,20 @@ export function stepForwardLockTurn({
   leftPressed,
   rightPressed,
   active,
+  stationary = false,
   dt,
   maxBank = FORWARD_LOCK_MAX_BANK_RADIANS,
   maxTurnRate = FORWARD_LOCK_MAX_TURN_RATE,
   bankResponse = FORWARD_LOCK_BANK_RESPONSE,
   bankInertiaResponse = FORWARD_LOCK_BANK_INERTIA_RESPONSE,
   levelResponse = FORWARD_LOCK_LEVEL_RESPONSE,
+  exitLevelResponse = FORWARD_LOCK_EXIT_LEVEL_RESPONSE,
 }) {
+  // A stopped forward-locked camera has no coordinated turn to sustain. Once
+  // lock is disabled, however, keep easing out residual roll past the end of
+  // the coast rather than snapping the last tilted frame level.
+  if (stationary && active) return { bank: 0, bankVelocity: 0, yawDelta: 0 };
+
   const turnInput = active
     ? (rightPressed ? 1 : 0) - (leftPressed ? 1 : 0)
     : 0;
@@ -106,7 +164,8 @@ export function stepForwardLockTurn({
   let nextBankVelocity;
   let nextBank;
   if (turnInput === 0) {
-    const blend = 1 - Math.exp(-levelResponse * dt);
+    const flattenResponse = active ? levelResponse : exitLevelResponse;
+    const blend = 1 - Math.exp(-flattenResponse * dt);
     nextBank = bank + (targetBank - bank) * blend;
     nextBankVelocity = 0;
   } else {
