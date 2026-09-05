@@ -1,6 +1,7 @@
 export const TERRAIN_HUD_LINKS = Object.freeze({
   debugLogLink: '/client_log.html',
   classifierOpsLink: '/classifier.html',
+  coverageAtlasLink: '/coverage.html',
 });
 
 // The HUD action list is one link per line: stacked keeps the panel narrow,
@@ -317,7 +318,7 @@ export function compassHeading(headingRad) {
 export function cameraDriftIndicator(active) {
   if (!active) return '';
   return ' <span id="cameraDriftIndicator"'
-    + ' title="Camera keeps its forward velocity. Double-tap W or ↑ to disable."'
+    + ' title="Camera keeps its forward velocity; A/D bank into coordinated turns. Double-tap S or ↓ to disable."'
     + ' style="display:inline-block;padding:0 5px;border:1px solid #ffb020;'
     + 'border-radius:4px;background:#7a4300;color:#fff1bd;font-weight:700">'
     + 'FORWARD LOCK</span>';

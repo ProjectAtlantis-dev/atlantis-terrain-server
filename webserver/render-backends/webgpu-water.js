@@ -535,6 +535,15 @@ export function createWebGPUWater({
     // The surface sits at local z = 0, so column depth is just -seabed.
     const bathySample = bathyAt(pxy);
     const seabed = bathySample.r;
+    const surfaceWaterCoverage = mix(
+      float(1.0),
+      smoothstep(
+        WATER_RENDER_CONTRACT.waterCoverageSeabedStartM,
+        WATER_RENDER_CONTRACT.waterCoverageSeabedEndM,
+        seabed,
+      ).oneMinus(),
+      bathySample.a,
+    );
     const colDepth = seabed.negate().clamp(0.0, 60.0);
     const northCliffReflection = northCliffReflectionKeep(pxy, bathySample);
     // Luminance is a poor darkness proxy for blue fjord water because it
@@ -899,7 +908,12 @@ export function createWebGPUWater({
     );
 
     // no in-shader haze: scene fogNode + the aerial perspective pass own that
-    const composed = vec4(accum.mul(uRadiance), alpha.clamp(0.0, 1.0));
+    // Exact zero in a covered terrain capture is clipped land/unknown, not
+    // shallow water. Mask premultiplied radiance and alpha together.
+    const composed = vec4(
+      accum.mul(uRadiance).mul(surfaceWaterCoverage),
+      alpha.mul(surfaceWaterCoverage).clamp(0.0, 1.0),
+    );
     const paint = vec4(
       vFetch,
       vHeight.abs().div(2.0).clamp(0.0, 1.0),

@@ -144,15 +144,18 @@ export function installTerrainPointerControls({
 export function installTerrainKeyboardControls({
   controls,
   isVehicleActive,
-  onForwardDoubleTap,
+  onForwardLockChange,
   onEscapeVehicle,
   onToggleMap,
   onFlyToTile = () => {},
   onToggleHeadlights,
   onChanged = () => {},
-  doubleTapMs = 300,
+  doubleTapMs = 450,
+  now = () => performance.now(),
+  windowTarget = window,
 }) {
   let lastForwardTapTime = 0;
+  let lastBackTapTime = 0;
   const onKeyDown = event => {
     const tag = event.target?.tagName;
     if (tag === 'TEXTAREA' || tag === 'INPUT') return;
@@ -160,12 +163,21 @@ export function installTerrainKeyboardControls({
     onChanged();
 
     if ((event.code === 'KeyW' || event.code === 'ArrowUp') && !event.repeat) {
-      const now = performance.now();
-      if (now - lastForwardTapTime < doubleTapMs) {
-        onForwardDoubleTap();
+      const tapTime = now();
+      if (tapTime - lastForwardTapTime < doubleTapMs) {
+        onForwardLockChange(true);
         lastForwardTapTime = 0;
       } else {
-        lastForwardTapTime = now;
+        lastForwardTapTime = tapTime;
+      }
+    }
+    if ((event.code === 'KeyS' || event.code === 'ArrowDown') && !event.repeat) {
+      const tapTime = now();
+      if (tapTime - lastBackTapTime < doubleTapMs) {
+        onForwardLockChange(false);
+        lastBackTapTime = 0;
+      } else {
+        lastBackTapTime = tapTime;
       }
     }
     if (event.repeat) return;
@@ -187,10 +199,10 @@ export function installTerrainKeyboardControls({
     controls.keys[event.code] = false;
     onChanged();
   };
-  window.addEventListener('keydown', onKeyDown);
-  window.addEventListener('keyup', onKeyUp);
+  windowTarget.addEventListener('keydown', onKeyDown);
+  windowTarget.addEventListener('keyup', onKeyUp);
   return () => {
-    window.removeEventListener('keydown', onKeyDown);
-    window.removeEventListener('keyup', onKeyUp);
+    windowTarget.removeEventListener('keydown', onKeyDown);
+    windowTarget.removeEventListener('keyup', onKeyUp);
   };
 }

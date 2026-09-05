@@ -41,7 +41,7 @@ test('G, P, and C are unassigned keys', () => {
   const dispose = installTerrainKeyboardControls({
     controls: { keys: {} },
     isVehicleActive: () => false,
-    onForwardDoubleTap: noop,
+    onForwardLockChange: noop,
     onEscapeVehicle: noop,
     onToggleMap: noop,
     onOpenGoogleMaps: () => { opens += 1; },
@@ -77,7 +77,7 @@ test('H and R remain unassigned to tile inspector and road debug', () => {
   const dispose = installTerrainKeyboardControls({
     controls: { keys: {} },
     isVehicleActive: () => false,
-    onForwardDoubleTap: noop,
+    onForwardLockChange: noop,
     onEscapeVehicle: noop,
     onToggleMap: noop,
     onToggleRoadDebug: () => { roadToggles += 1; },
@@ -96,4 +96,3 @@ test('H and R remain unassigned to tile inspector and road debug', () => {
     globalThis.window = previousWindow;
   }
 });
-

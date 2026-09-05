@@ -402,6 +402,15 @@ const WATER_FRAGMENT = /* glsl */ `
     // The surface sits at local z = 0, so column depth is just -seabed.
     vec4 bathySample = bathyAt(pxy);
     float seabed = bathySample.r;
+    float surfaceWaterCoverage = mix(
+      1.0,
+      1.0 - smoothstep(
+        ${WATER_RENDER_CONTRACT.waterCoverageSeabedStartM.toFixed(2)},
+        ${WATER_RENDER_CONTRACT.waterCoverageSeabedEndM.toFixed(2)},
+        seabed
+      ),
+      bathySample.a
+    );
     float colDepth = clamp(-seabed, 0.0, 60.0);
     float northCliffReflection = northCliffReflectionKeep(pxy, bathySample);
     // Luminance is a poor darkness proxy for blue fjord water because it
@@ -755,7 +764,13 @@ const WATER_FRAGMENT = /* glsl */ `
     accum += shoreSunGlint * shoreSparkle * uGlintStrength * 2.4;
 
     // no in-shader haze: scene fog + the aerial perspective pass own that
-    gl_FragColor = vec4(accum * uRadiance, clamp(a, 0.0, 1.0));
+    // Terrain coverage owns the shoreline. In particular, exact zero is the
+    // server's clipped-land sentinel, not shallow water. Mask both radiance
+    // and premultiplied alpha or glint remains visible over the zero plate.
+    gl_FragColor = vec4(
+      accum * uRadiance * surfaceWaterCoverage,
+      clamp(a * surfaceWaterCoverage, 0.0, 1.0)
+    );
     #include <fog_fragment>
   }
 `;

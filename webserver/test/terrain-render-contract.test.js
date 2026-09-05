@@ -17,6 +17,8 @@ import {
 test('cross-backend water calibration has one immutable contract', () => {
   assert.equal(Object.isFrozen(WATER_RENDER_CONTRACT), true);
   assert.deepEqual(WATER_RENDER_CONTRACT, {
+    waterCoverageSeabedStartM: -1.25,
+    waterCoverageSeabedEndM: -0.75,
     fetchFractionScale: 3,
     shoreFoamDistanceStartM: 700,
     shoreFoamDistanceEndM: 2800,
@@ -31,6 +33,18 @@ test('cross-backend water calibration has one immutable contract', () => {
     crestFilterStartM: 450,
     crestFilterEndM: 2200,
   });
+});
+
+test('water surfaces mask the covered zero-metre land sentinel on both backends', () => {
+  for (const backend of ['webgl-water.js', 'webgpu-water.js']) {
+    const source = readFileSync(
+      new URL(`../render-backends/${backend}`, import.meta.url),
+      'utf8',
+    );
+    assert.match(source, /surfaceWaterCoverage/);
+    assert.match(source, /waterCoverageSeabedStartM/);
+    assert.match(source, /waterCoverageSeabedEndM/);
+  }
 });
 
 test('water backends do not retain the retired local bathymetry constant', () => {

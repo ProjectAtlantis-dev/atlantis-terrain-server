@@ -168,8 +168,12 @@ export function createTerrainFlyToTileRuntime({
     const viewAlt = tileViewAltitude(target.sizeM, camera.fov);
     exitVehicle();
     cameraRuntimeState.driftMode = false;
+    cameraRuntimeState.forwardLockCoasting = false;
     controls.speed = 0;
     controls.strafeSpeed = 0;
+    controls.bank = 0;
+    controls.bankVelocity = 0;
+    controls.lookYawOffset = 0;
     controls.yaw = 0; // north up, like the tile inspector
     controls.pitch = TOP_DOWN_PITCH_RAD;
     placeCamera(target.eastM, target.northM, viewAlt);
@@ -218,8 +222,12 @@ export function createTerrainFlyToTileRuntime({
     });
     exitVehicle();
     cameraRuntimeState.driftMode = false;
+    cameraRuntimeState.forwardLockCoasting = false;
     controls.speed = 0;
     controls.strafeSpeed = 0;
+    controls.bank = 0;
+    controls.bankVelocity = 0;
+    controls.lookYawOffset = 0;
     controls.yaw = 0;
     controls.pitch = TOP_DOWN_PITCH_RAD;
     placeCamera(target.eastM, target.northM, LOCATION_VIEW_ALT_M);

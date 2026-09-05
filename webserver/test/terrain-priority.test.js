@@ -2740,7 +2740,7 @@ test('HUD renders a visible camera forward-lock indicator only while drifting', 
   const active = cameraDriftIndicator(true);
   assert.match(active, /cameraDriftIndicator/);
   assert.match(active, /FORWARD LOCK/);
-  assert.match(active, /Double-tap W or ↑ to disable/);
+  assert.match(active, /Double-tap S or ↓ to disable/);
 });
 
 test('shared map pan respects map yaw', () => {

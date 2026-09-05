@@ -4,6 +4,7 @@ import assert from 'node:assert/strict';
 import {
   clampFreeFlightAltitude,
   createRefocusPointerGuard,
+  installTerrainKeyboardControls,
   installTerrainPointerControls,
   MAX_FREE_FLIGHT_ALTITUDE_M,
 } from '../terrain-controls.js';
@@ -90,4 +91,32 @@ test('a keyboard refocus does not consume a later click after the grace period',
   release();
 
   assert.equal(guard.consume(), false);
+});
+
+test('double-tap forward enables lock and double-tap back disables it', () => {
+  const windowTarget = eventTarget();
+  const tapTimes = [1000, 1200, 2000, 2200];
+  const lockChanges = [];
+  const dispose = installTerrainKeyboardControls({
+    controls: { keys: {} },
+    windowTarget,
+    now: () => tapTimes.shift(),
+    isVehicleActive: () => false,
+    onForwardLockChange: locked => lockChanges.push(locked),
+    onEscapeVehicle() {},
+    onToggleMap() {},
+    onToggleHeadlights() {},
+  });
+
+  for (let index = 0; index < 2; index += 1) {
+    windowTarget.emit('keydown', { code: 'KeyW', repeat: false });
+    windowTarget.emit('keyup', { code: 'KeyW' });
+  }
+  for (let index = 0; index < 2; index += 1) {
+    windowTarget.emit('keydown', { code: 'KeyS', repeat: false });
+    windowTarget.emit('keyup', { code: 'KeyS' });
+  }
+
+  assert.deepEqual(lockChanges, [true, false]);
+  dispose();
 });

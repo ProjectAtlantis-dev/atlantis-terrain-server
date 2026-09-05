@@ -103,11 +103,14 @@ function createRuntimeHarness({ raycastGroundAltitude = () => null, mapMode = fa
   const scheduled = [];
   const camera = { position: new Vec3(9000, 9000, 9000), fov: 60 };
   const controls = {
-    yaw: 2, pitch: 0.5, speed: 100, strafeSpeed: 50,
+    yaw: 2, pitch: 0.5, bank: 0.3, bankVelocity: 0.1,
+    lookYawOffset: Math.PI / 2,
+    speed: 100, strafeSpeed: 50,
     mapMode, mapPanEast: 1500, mapPanNorth: -900, mapZoom: 20000,
   };
   const cameraRuntimeState = {
-    agl: 8, aglValid: true, driftMode: true, lastGoodPosition: new Vec3(),
+    agl: 8, aglValid: true, driftMode: true, forwardLockCoasting: true,
+    lastGoodPosition: new Vec3(),
   };
   const runtime = createTerrainFlyToTileRuntime({
     camera,
@@ -146,8 +149,12 @@ test('flyToTile centers the camera over the tile in grid space', () => {
   assert.equal(camera.position.z, result.viewAlt);
   assert.equal(controls.yaw, 0);
   assert.equal(controls.pitch, -1.4);
+  assert.equal(controls.bank, 0);
+  assert.equal(controls.bankVelocity, 0);
+  assert.equal(controls.lookYawOffset, 0);
   assert.equal(controls.speed, 0);
   assert.equal(cameraRuntimeState.driftMode, false);
+  assert.equal(cameraRuntimeState.forwardLockCoasting, false);
   assert.equal(cameraRuntimeState.aglValid, false);
   assert.equal(cameraRuntimeState.lastGoodPosition.distanceToSquared(camera.position), 0);
   assert.equal(calls.exitVehicle, 1);
@@ -247,7 +254,7 @@ test('T key clears its pressed state and asks for a tile', async () => {
     const dispose = installTerrainKeyboardControls({
       controls,
       isVehicleActive: () => false,
-      onForwardDoubleTap: () => {},
+      onForwardLockChange: () => {},
       onEscapeVehicle: () => {},
       onToggleMap: () => {},
       onFlyToTile: () => { flyRequests += 1; },

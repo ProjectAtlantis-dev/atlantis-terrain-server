@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Greenland terrain cure atlas</title>
+    <style>
+      :root { color-scheme: dark; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+      * { box-sizing: border-box; }
+      body { margin: 0; overflow: hidden; background: #05080c; color: #dbe5f1; }
+      canvas { display: block; width: 100vw; height: 100vh; cursor: grab; touch-action: none; }
+      canvas.dragging { cursor: grabbing; }
+      .panel { position: fixed; z-index: 2; padding: 12px 14px; border: 1px solid #24313d; border-radius: 7px; background: rgb(7 12 18 / 92%); box-shadow: 0 8px 30px #0008; }
+      #title { top: 14px; left: 14px; min-width: 330px; }
+      #title h1 { margin: 0 0 6px; font-size: 16px; color: #f4f8fb; }
+      #summary { color: #9db1c4; font-size: 12px; line-height: 1.55; }
+      #legend { right: 14px; top: 14px; font-size: 12px; line-height: 1.8; }
+      .key { display: inline-block; width: 11px; height: 11px; margin-right: 7px; border: 1px solid #ffffff35; vertical-align: -1px; }
+      .cured { background: #14b86a; }
+      .partial { background: #d89018; }
+      .nothing { background: #111820; }
+      .controls { display: flex; gap: 6px; }
+      button { margin-top: 8px; border: 1px solid #35647b; border-radius: 4px; padding: 4px 8px; background: #102a38; color: #dff5ff; font: inherit; cursor: pointer; }
+      #tooltip { display: none; pointer-events: none; white-space: pre; font-size: 12px; line-height: 1.5; }
+      #error { color: #ff6767; }
+    </style>
+  </head>
+  <body>
+    <canvas id="atlas"></canvas>
+    <section class="panel" id="title">
+      <h1>Greenland terrain cure atlas</h1>
+      <div id="summary">Loading database inventory…</div>
+      <div id="error"></div>
+      <div class="controls">
+        <button id="refresh" type="button">refresh now</button>
+        <button id="reset-view" type="button">reset view</button>
+      </div>
+    </section>
+    <section class="panel" id="legend">
+      <div><span class="key cured"></span>fully cured at D10</div>
+      <div><span class="key partial"></span>partial / provisional</div>
+      <div><span class="key nothing"></span>nothing at D10</div>
+      <div>drag pan · wheel zoom · double-click reset</div>
+    </section>
+    <section class="panel" id="tooltip"></section>
+    <script type="module" src="/coverage-atlas.js"></script>
+  </body>
+</html>

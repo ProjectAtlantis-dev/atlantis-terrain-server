@@ -45,6 +45,38 @@ export function terrainTileBathymetryReady(tile) {
   return maskSource == null || maskSource !== 'dem_nonpositive_fallback';
 }
 
+function terrainTileWaterMetadata(tile) {
+  const heightmap = tile?.dem?.heightmap;
+  const water = tile?.dem?.water;
+  return {
+    terrainMaskSource: heightmap?.maskSource ?? null,
+    terrainPublishedWaterCount: Number.isInteger(heightmap?.waterCount)
+      ? heightmap.waterCount
+      : null,
+    terrainBathymetryFound: typeof heightmap?.bathymetryFound === 'boolean'
+      ? heightmap.bathymetryFound
+      : null,
+    terrainBathymetryVertices: Number.isInteger(heightmap?.bathymetryVertices)
+      ? heightmap.bathymetryVertices
+      : null,
+    terrainVerticalDatum: heightmap?.verticalDatum ?? tile?.dem?.verticalDatum ?? null,
+    terrainWaterStatus: water != null ? {
+      coastline: water.coastline ?? 'unknown',
+      coastlineWaterCount: Number.isInteger(water.coastlineWaterCount)
+        ? water.coastlineWaterCount
+        : null,
+      hydrography: water.hydrography ?? 'unknown',
+      hydrographyWaterCount: Number.isInteger(water.hydrographyWaterCount)
+        ? water.hydrographyWaterCount
+        : null,
+      tidalConnectivity: water.tidalConnectivity ?? 'unknown',
+      tidalConnectivityWaterCount: Number.isInteger(water.tidalConnectivityWaterCount)
+        ? water.tidalConnectivityWaterCount
+        : null,
+    } : null,
+  };
+}
+
 export function decodeTerrainHeightmap(base64, decodeBase64 = value => atob(value)) {
   const raw = decodeBase64(base64);
   const bytes = new Uint8Array(raw.length);
@@ -152,7 +184,10 @@ export function updateTerrainMeshHeightmap(mesh, tile) {
   mesh.geometry.computeBoundingBox?.();
   mesh.geometry.computeBoundingSphere?.();
   const terrainWaterMask = Uint8Array.from(heightmap, elevation => (
-    Number.isFinite(elevation) && elevation <= 0 ? 1 : 0
+    // Ready coastline composition deliberately clips rejected nonpositive
+    // DEM samples to exactly zero. Those samples are land/unknown, not water;
+    // accepted water is guaranteed below zero by the seafloor drop.
+    Number.isFinite(elevation) && elevation < 0 ? 1 : 0
   ));
   Object.assign(mesh.userData, {
     heightmapPayload: tile.heightmap,
@@ -160,6 +195,7 @@ export function updateTerrainMeshHeightmap(mesh, tile) {
     terrainBathymetryReady: terrainTileBathymetryReady(tile),
     terrainWaterMask,
     terrainWaterMaskKey: terrainWaterMaskKey(terrainWaterMask),
+    ...terrainTileWaterMetadata(tile),
   });
   return true;
 }
@@ -202,7 +238,7 @@ export function createTerrainMeshBuilder({
       // a shallow optical-only surface while true bathymetry stays untouched.
       ...(() => {
         const terrainWaterMask = Uint8Array.from(heightmap, elevation => (
-          Number.isFinite(elevation) && elevation <= 0 ? 1 : 0
+          Number.isFinite(elevation) && elevation < 0 ? 1 : 0
         ));
         return {
           terrainWaterMask,
@@ -215,6 +251,7 @@ export function createTerrainMeshBuilder({
       // replace stale geometry without requiring a page refresh.
       heightmapPayload: tile.heightmap,
       terrainColorAttribute: geometry.getAttribute('color'),
+      ...terrainTileWaterMetadata(tile),
     });
     // A revived grid carries the elevations it was parked with. Rewriting them
     // in place restores this response's seam repair without paying for index

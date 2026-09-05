@@ -43,7 +43,7 @@ import { createTileHistory, terrainFogDistance, tileDepthFromId } from './terrai
 import { createTextureStreamer, rendererTextureAnisotropy } from './terrain-texture-streamer.js';
 import { evaluateTerrainRefetch, summarizeTerrainCamera, terrainCameraCoordinates, terrainCameraGridPosition, terrainCameraStereoPosition, terrainDemandLag, terrainInspectorCameraScenePosition } from './terrain-tile-fetch.js';
 import { summarizeDemandBacklog } from './terrain-demand-backlog.js';
-import { collectTerrainDebugMeshes, createTerrainHoverOutlineController, createTerrainMapGridController, formatTerrainSeamDiagnostic, summarizeTerrainMesh } from './terrain-debug-runtime.js';
+import { collectTerrainDebugMeshes, createTerrainHoverOutlineController, createTerrainMapGridController, formatTerrainSeamDiagnostic, summarizeTerrainMesh, terrainMeshWaterDiagnostics } from './terrain-debug-runtime.js';
 import { createTerrainFetchRuntime } from './terrain-fetch-runtime.js';
 import { classifyDemSource } from './terrain-tile-quality.js';
 import { createTerrainTileSet } from './terrain-tile-set.js';
@@ -91,8 +91,11 @@ import {
 } from './terrain-game-clock.js';
 import {
   advanceRealtimeMovement,
+  FORWARD_LOCK_RELEASE_BRAKE_SCALE,
+  forwardLockLookYawOffset,
   MAX_REALTIME_STEP_SECONDS,
   stepFreeFlightVelocity,
+  stepForwardLockTurn,
 } from './terrain-realtime-step.js';
 import { DETAIL_FADE_END_M, DETAIL_STRENGTH, setDetailTuning } from './terrain-detail-layer.js';
 import { terrainAglFromSurface, terrainSurfaceHeightAt } from './terrain-agl.js';
@@ -296,6 +299,9 @@ const MAX_MAP_ZOOM = 100000;
 const controls = {
   yaw: 0,
   pitch: -0.32,
+  bank: 0,
+  bankVelocity: 0,
+  lookYawOffset: 0,
   speed: 0,
   strafeSpeed: 0,
   dragging: false,
@@ -318,6 +324,7 @@ function getTerrainViewHeading() {
   );
 }
 const BASE_ACCEL = 1200;
+const BASE_FORWARD_ACCEL = 300;
 const BASE_BRAKE = 800;
 const BASE_MAX_SPEED = 5000;
 const BASE_STRAFE_SPEED = 800;
@@ -338,6 +345,7 @@ const cameraRuntimeState = {
   lastGoodPosition: camera.position.clone(),
   lastMoveTime: performance.now(),
   driftMode: false,
+  forwardLockCoasting: false,
 };
 const initialForward = anchorPosition.clone().sub(camera.position).normalize();
 const defaultYaw = Math.atan2(-initialForward.dot(east), initialForward.dot(north));
@@ -1865,6 +1873,7 @@ function needsContinuousRender() {
     hasActiveKeyInput() ||
     Math.abs(controls.speed) > 1e-3 ||
     Math.abs(controls.strafeSpeed) > 1e-3 ||
+    Math.abs(controls.bank) > 1e-4 ||
     vehicleRuntime.vehicleControlActive ||
     gameClockState.stopGameTimeMs != null ||
     // Animated water must hold the loop open on backends that actually idle
@@ -2281,12 +2290,13 @@ gpuProfileControl.start();
 
 function applyCameraOrientation() {
   const cp = Math.cos(controls.pitch);
+  const viewYaw = controls.yaw + controls.lookYawOffset;
   const direction = new THREE.Vector3()
-    .addScaledVector(east, -Math.sin(controls.yaw) * cp)
-    .addScaledVector(north, Math.cos(controls.yaw) * cp)
+    .addScaledVector(east, -Math.sin(viewYaw) * cp)
+    .addScaledVector(north, Math.cos(viewYaw) * cp)
     .addScaledVector(up, Math.sin(controls.pitch))
     .normalize();
-  camera.up.copy(up);
+  camera.up.copy(up).applyAxisAngle(direction, controls.bank);
   camera.lookAt(camera.position.clone().add(direction));
 }
 
@@ -2391,10 +2401,18 @@ function updateMovement(dt) {
   const backPressed = isPressed('KeyS', 'ArrowDown');
   const leftPressed = isPressed('KeyA', 'ArrowLeft');
   const rightPressed = isPressed('KeyD', 'ArrowRight');
+  const bankLeftPressed = Boolean(controls.keys.KeyA);
+  const bankRightPressed = Boolean(controls.keys.KeyD);
+  const lookLeftPressed = Boolean(controls.keys.ArrowLeft);
+  const lookRightPressed = Boolean(controls.keys.ArrowRight);
 
   if (vehicleRuntime.vehicleControlActive && !controls.mapMode) {
     controls.speed = 0;
     controls.strafeSpeed = 0;
+    controls.bank = 0;
+    controls.bankVelocity = 0;
+    controls.lookYawOffset = 0;
+    cameraRuntimeState.forwardLockCoasting = false;
     if (!vehicleRuntime.vehicleLoaded) {
       vehicleRuntime.setVehicleControlActive(false, 'vehicle-unloaded');
       return;
@@ -2423,6 +2441,7 @@ function updateMovement(dt) {
 
   const sf = aglSpeedFactor();
   const ACCEL = BASE_ACCEL * sf;
+  const FORWARD_ACCEL = BASE_FORWARD_ACCEL * sf;
   const BRAKE = BASE_BRAKE * sf;
   const MAX_SPEED = BASE_MAX_SPEED * sf;
   const STRAFE_SPEED = BASE_STRAFE_SPEED * sf;
@@ -2436,14 +2455,36 @@ function updateMovement(dt) {
     rightPressed,
     forwardLock: cameraRuntimeState.driftMode,
     mapMode: controls.mapMode,
+    forwardAcceleration: FORWARD_ACCEL,
     acceleration: ACCEL,
     brake: BRAKE,
+    longitudinalBrakeScale: cameraRuntimeState.forwardLockCoasting
+      ? FORWARD_LOCK_RELEASE_BRAKE_SCALE
+      : 1,
     maxSpeed: MAX_SPEED,
     maxStrafeSpeed: STRAFE_SPEED,
     dt,
   });
   controls.speed = flightVelocity.speed;
   controls.strafeSpeed = flightVelocity.strafeSpeed;
+  if (controls.speed === 0) cameraRuntimeState.forwardLockCoasting = false;
+
+  const turn = stepForwardLockTurn({
+    bank: controls.bank,
+    bankVelocity: controls.bankVelocity,
+    leftPressed: bankLeftPressed,
+    rightPressed: bankRightPressed,
+    active: cameraRuntimeState.driftMode && !controls.mapMode,
+    dt,
+  });
+  controls.bank = turn.bank;
+  controls.bankVelocity = turn.bankVelocity;
+  controls.yaw += turn.yawDelta;
+  controls.lookYawOffset = forwardLockLookYawOffset({
+    active: cameraRuntimeState.driftMode && !controls.mapMode,
+    leftPressed: lookLeftPressed,
+    rightPressed: lookRightPressed,
+  });
 
   if (controls.mapMode) {
     updateMapCamera();
@@ -2456,13 +2497,12 @@ function updateMovement(dt) {
     }
   } else {
     applyCameraOrientation();
-    camera.getWorldDirection(movementForward);
-    movementForward.addScaledVector(up, -movementForward.dot(up));
-    if (movementForward.lengthSq() < 1e-9) {
-      movementForward.copy(north);
-    } else {
-      movementForward.normalize();
-    }
+    // Forward-lock glance input rotates only the camera. Travel continues on
+    // the aircraft heading stored in controls.yaw.
+    movementForward.set(0, 0, 0)
+      .addScaledVector(east, -Math.sin(controls.yaw))
+      .addScaledVector(north, Math.cos(controls.yaw))
+      .normalize();
   }
   movementRight.crossVectors(movementForward, up).normalize();
 
@@ -2637,7 +2677,9 @@ function updateHud() {
     procgenLine,
     vehicleRuntime.vehicleControlActive
       ? 'W/S drive, A/D steer, mouse orbit camera, Esc exits vehicle control'
-      : 'WASD or Arrows move, Q/Z altitude, drag look',
+      : cameraRuntimeState.driftMode
+        ? 'W/S speed, A/D bank and turn, ←/→ glance, Q/Z altitude'
+        : 'WASD or Arrows move, Q/Z altitude, drag look',
     'map: left-drag rotate, right-drag pan, wheel zoom',
     `${hudActionLink('mapModeLink', controls.mapMode && !controls.seamMode && !tileInspectorRuntime?.active ? '3D view' : 'map mode')} (M)`,
     hudActionLink('seamModeLink', controls.seamMode ? '3D view' : 'seam view'),
@@ -2648,6 +2690,7 @@ function updateHud() {
     hudActionLink('resetViewLink', 'reset'),
     hudActionLink('debugLogLink', 'debug log'),
     hudActionLink('classifierOpsLink', 'classifier ops'),
+    hudActionLink('coverageAtlasLink', 'coverage atlas'),
   ];
   const hudHtml = (hudCollapsed ? hudRows.slice(0, 1) : hudRows).join('<br>');
   // Rewriting innerHTML every rendered frame forces a DOM parse + relayout
@@ -2696,8 +2739,12 @@ function resetView() {
   for (const k of Object.keys(tuningState)) delete tuningState[k];
   controls.yaw = defaultYaw;
   controls.pitch = defaultPitch;
+  controls.bank = 0;
+  controls.bankVelocity = 0;
+  controls.lookYawOffset = 0;
   controls.speed = 0;
   controls.strafeSpeed = 0;
+  cameraRuntimeState.forwardLockCoasting = false;
   controls.dragging = false;
   controls.dragButton = 0;
   controls.mapMode = false;
@@ -2810,6 +2857,8 @@ function toggleTileInspector() {
   controls.seamMode = transition.seamMode;
   if (transition.tileInspectorActive) {
     cameraRuntimeState.driftMode = false;
+    cameraRuntimeState.forwardLockCoasting = false;
+    controls.lookYawOffset = 0;
     controls.strafeSpeed = 0;
     vehicleRuntime.setVehicleControlActive(false, 'inspector-mode');
     controls.mapPanEast = 0;
@@ -2835,6 +2884,8 @@ function toggleMapMode() {
   controls.seamMode = transition.seamMode;
   tileInspectorRuntime.setPresentation('hidden');
   cameraRuntimeState.driftMode = false;
+  cameraRuntimeState.forwardLockCoasting = false;
+  controls.lookYawOffset = 0;
   controls.strafeSpeed = 0;
   if (controls.mapMode) {
     vehicleRuntime.setVehicleControlActive(false, 'map-mode');
@@ -2864,6 +2915,8 @@ function toggleSeamMode() {
   controls.seamMode = transition.seamMode;
   tileInspectorRuntime.setPresentation('hidden');
   cameraRuntimeState.driftMode = false;
+  cameraRuntimeState.forwardLockCoasting = false;
+  controls.lookYawOffset = 0;
   controls.strafeSpeed = 0;
   if (controls.mapMode) {
     vehicleRuntime.setVehicleControlActive(false, 'seam-mode');
@@ -2919,8 +2972,17 @@ function toggleHydrographyOverlay() {
 installTerrainKeyboardControls({
   controls,
   isVehicleActive: () => vehicleRuntime.vehicleControlActive,
-  onForwardDoubleTap: () => {
-    cameraRuntimeState.driftMode = !cameraRuntimeState.driftMode;
+  onForwardLockChange: nextLocked => {
+    if (nextLocked === cameraRuntimeState.driftMode) return;
+    cameraRuntimeState.forwardLockCoasting = !nextLocked && Math.abs(controls.speed) > 1e-3;
+    cameraRuntimeState.driftMode = nextLocked;
+    if (!nextLocked) controls.lookYawOffset = 0;
+    // The second tap has already set its movement key. Consume it so enabling
+    // does not add thrust and disabling does not add reverse thrust.
+    controls.keys.KeyW = false;
+    controls.keys.ArrowUp = false;
+    controls.keys.KeyS = false;
+    controls.keys.ArrowDown = false;
     console.log(`[drift] ${cameraRuntimeState.driftMode ? 'ON' : 'OFF'}`);
     updateHud();
     requestRender();
@@ -3082,12 +3144,57 @@ renderer.domElement.addEventListener('mousemove', event => {
       ? '<span style="color:#22c55e">measured</span>'
       : `<span style="color:#f59e0b">${demQuality.kind}</span>`;
   const matHex = info.color !== '-' ? info.color : '#ffffff';
+  const localHitPoint = mesh.worldToLocal(hits[0].point.clone());
+  const waterDiagnostic = terrainMeshWaterDiagnostics(mesh, {
+    localPoint: localHitPoint,
+    waterline: waterParams.waterline ?? 0,
+  });
+  const waterStatus = waterDiagnostic.waterStatus;
+  const formatWaterState = (state, count) => (
+    Number.isInteger(count) ? `${state} (${count}px)` : state
+  );
+  const waterStatusLine = waterStatus == null
+    ? 'water inputs: legacy / unavailable'
+    : `water inputs: coast ${formatWaterState(waterStatus.coastline, waterStatus.coastlineWaterCount)} · hydro ${formatWaterState(waterStatus.hydrography, waterStatus.hydrographyWaterCount)} · conn ${formatWaterState(waterStatus.tidalConnectivity, waterStatus.tidalConnectivityWaterCount)}`;
+  const formatMetres = value => Number.isFinite(value) ? `${value.toFixed(2)}m` : 'unknown';
+  const publishedWater = Number.isInteger(waterDiagnostic.publishedWaterCount)
+    ? waterDiagnostic.publishedWaterCount
+    : '?';
+  const renderedWater = Number.isInteger(waterDiagnostic.renderedWaterCount)
+    ? waterDiagnostic.renderedWaterCount
+    : '?';
+  const zeroPlate = waterDiagnostic.surface?.zeroCount ?? 0;
+  const zeroWarning = zeroPlate > 0
+    ? ` · <b style="color:#ff1744">zero plate ${zeroPlate}</b>`
+    : '';
+  const pointCollision = waterDiagnostic.pointElevation === 0
+    && waterDiagnostic.waterSeparation > 0;
+  const pointWarning = pointCollision
+    ? ' · <b style="color:#ff1744">WATER COLLISION</b>'
+    : '';
+  const bathymetryLabel = waterDiagnostic.bathymetryFound === false
+    ? '<b style="color:#f59e0b">missing → −5m fallback expected</b>'
+    : waterDiagnostic.bathymetryFound === true
+      ? `ready (${waterDiagnostic.bathymetryVertices ?? '?'} vertices)`
+      : 'unknown';
   const seamRows = controls.seamMode ? mapGridController.diagnosticsForTile(info.tileId) : [];
   const badSeams = seamRows.filter(seam => seam.severity === 'bad').length;
   const warningSeams = seamRows.filter(seam => seam.severity === 'warning').length;
   tileInfoEl.innerHTML = [
     `<b style="color:${matHex}">${info.tileId}</b>`,
     `DEM: ${info.terrainSource || 'none'} · ${demLabel}`,
+    gridlines3dHover ? `datum: ${waterDiagnostic.verticalDatum || 'unknown'}` : null,
+    gridlines3dHover ? waterStatusLine : null,
+    gridlines3dHover
+      ? `water mask: ${waterDiagnostic.maskSource || 'unknown'} · published ${publishedWater} · rendered ${renderedWater}`
+      : null,
+    gridlines3dHover ? `bathymetry: ${bathymetryLabel}` : null,
+    gridlines3dHover
+      ? `cursor terrain: ${formatMetres(waterDiagnostic.pointElevation)} · waterline: ${formatMetres(waterDiagnostic.waterline)} · separation: ${formatMetres(waterDiagnostic.waterSeparation)}${pointWarning}`
+      : null,
+    gridlines3dHover && waterDiagnostic.surface
+      ? `tile terrain: ${formatMetres(waterDiagnostic.surface.minimum)}…${formatMetres(waterDiagnostic.surface.maximum)}${zeroWarning}`
+      : null,
     `tex: ${info.hasTexture ? 'YES' : 'NO'} ${info.textureSize}  source: ${srcLabel}`,
     controls.seamMode
       ? `<b>shared edges: ${seamRows.length} · <span style="color:#ff1744">${badSeams} bad</span> · <span style="color:#f59e0b">${warningSeams} inspect</span></b>`

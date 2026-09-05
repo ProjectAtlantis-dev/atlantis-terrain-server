@@ -21,6 +21,86 @@ export function summarizeTerrainMesh(mesh) {
   };
 }
 
+const surfaceStatsCache = new WeakMap();
+
+export function terrainMeshSurfaceStats(mesh) {
+  const resolution = Number(mesh?.userData?.resolution);
+  const position = mesh?.geometry?.getAttribute?.('position');
+  if (!Number.isInteger(resolution) || resolution < 2 || !position) return null;
+  const count = resolution * resolution;
+  if (position.count < count) return null;
+  const exaggeration = Number.isFinite(Number(mesh.userData?.terrainExaggeration))
+    && Math.abs(Number(mesh.userData.terrainExaggeration)) > 1e-9
+    ? Number(mesh.userData.terrainExaggeration)
+    : 1;
+  const cached = surfaceStatsCache.get(mesh);
+  if (
+    cached?.position === position
+    && cached.version === position.version
+    && cached.exaggeration === exaggeration
+  ) return cached.value;
+
+  let minimum = Infinity;
+  let maximum = -Infinity;
+  let zeroCount = 0;
+  let negativeCount = 0;
+  let finiteCount = 0;
+  for (let index = 0; index < count; index += 1) {
+    const elevation = position.getZ(index) / exaggeration;
+    if (!Number.isFinite(elevation)) continue;
+    finiteCount += 1;
+    minimum = Math.min(minimum, elevation);
+    maximum = Math.max(maximum, elevation);
+    if (elevation === 0) zeroCount += 1;
+    if (elevation < 0) negativeCount += 1;
+  }
+  const value = {
+    finiteCount,
+    minimum: finiteCount > 0 ? minimum : null,
+    maximum: finiteCount > 0 ? maximum : null,
+    zeroCount,
+    negativeCount,
+  };
+  surfaceStatsCache.set(mesh, {
+    position,
+    version: position.version,
+    exaggeration,
+    value,
+  });
+  return value;
+}
+
+export function terrainMeshWaterDiagnostics(mesh, {
+  localPoint = null,
+  waterline = 0,
+} = {}) {
+  const exaggeration = Number.isFinite(Number(mesh?.userData?.terrainExaggeration))
+    && Math.abs(Number(mesh.userData.terrainExaggeration)) > 1e-9
+    ? Number(mesh.userData.terrainExaggeration)
+    : 1;
+  const pointElevation = Number.isFinite(localPoint?.z)
+    ? Number(localPoint.z) / exaggeration
+    : null;
+  const renderedWaterCount = mesh?.userData?.terrainWaterMask instanceof Uint8Array
+    ? mesh.userData.terrainWaterMask.reduce((total, value) => total + (value ? 1 : 0), 0)
+    : null;
+  return {
+    maskSource: mesh?.userData?.terrainMaskSource ?? null,
+    publishedWaterCount: mesh?.userData?.terrainPublishedWaterCount ?? null,
+    renderedWaterCount,
+    bathymetryFound: mesh?.userData?.terrainBathymetryFound ?? null,
+    bathymetryVertices: mesh?.userData?.terrainBathymetryVertices ?? null,
+    verticalDatum: mesh?.userData?.terrainVerticalDatum ?? null,
+    waterStatus: mesh?.userData?.terrainWaterStatus ?? null,
+    pointElevation,
+    waterline: Number.isFinite(Number(waterline)) ? Number(waterline) : 0,
+    waterSeparation: pointElevation == null
+      ? null
+      : Number(waterline) - pointElevation,
+    surface: terrainMeshSurfaceStats(mesh),
+  };
+}
+
 function disposeMaterial(material) {
   if (Array.isArray(material)) {
     for (const value of material) value?.dispose?.();

@@ -165,6 +165,7 @@ test('terrain HUD header exposes its expanded state and dropdown direction', () 
 
 test('terrain HUD owns the classifier operations link', () => {
   assert.equal(TERRAIN_HUD_LINKS.classifierOpsLink, '/classifier.html');
+  assert.equal(TERRAIN_HUD_LINKS.coverageAtlasLink, '/coverage.html');
   assert.match(
     hudActionLink('classifierOpsLink', 'classifier ops'),
     /id="classifierOpsLink".*>classifier ops<\/span>/,
