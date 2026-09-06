@@ -5,6 +5,8 @@ import {
   centerCoverageNavigation,
   createCoverageView,
   panCoverageNavigation,
+  parseCoverageNavigationSnapshot,
+  serializeCoverageNavigationSnapshot,
   zoomCoverageNavigation,
 } from '../coverage-navigation.js';
 
@@ -73,4 +75,19 @@ test('coverage zoom is bounded at useful navigation limits', () => {
   });
   assert.equal(minimum.zoom, 0.5);
   assert.equal(maximum.zoom, 64);
+});
+
+test('coverage navigation snapshots round-trip zoom and camera position', () => {
+  const navigation = { zoom: 7.5, panX: -238.25, panY: 91.75 };
+  assert.deepEqual(
+    parseCoverageNavigationSnapshot(serializeCoverageNavigationSnapshot(navigation)),
+    navigation,
+  );
+});
+
+test('coverage navigation snapshots reject corrupt and unsafe values', () => {
+  assert.equal(parseCoverageNavigationSnapshot('{broken'), null);
+  assert.equal(parseCoverageNavigationSnapshot({ zoom: 0, panX: 0, panY: 0 }), null);
+  assert.equal(parseCoverageNavigationSnapshot({ zoom: 1, panX: Infinity, panY: 0 }), null);
+  assert.equal(serializeCoverageNavigationSnapshot({ zoom: 65, panX: 0, panY: 0 }), null);
 });

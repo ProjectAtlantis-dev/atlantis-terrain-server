@@ -49,6 +49,10 @@ function terrainTileWaterMetadata(tile) {
   const heightmap = tile?.dem?.heightmap;
   const water = tile?.dem?.water;
   return {
+    terrainProvenance: tile?.provenance
+      ?? tile?.metadata?.provenance
+      ?? tile?.dem?.provenance
+      ?? null,
     terrainMaskSource: heightmap?.maskSource ?? null,
     terrainPublishedWaterCount: Number.isInteger(heightmap?.waterCount)
       ? heightmap.waterCount

@@ -1,10 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { Matrix4, Vector3 } from 'three';
+import { Matrix4, PerspectiveCamera, Vector2, Vector3 } from 'three';
 import { Ellipsoid, Geodetic, radians } from '@takram/three-geospatial';
 
 import { createTerrainAtmosphereFrame } from '../terrain-atmosphere-frame.js';
 import { approximateLatLonToLocalMeters } from '../terrain-local-coordinates.js';
+import { projectSunDirectionToUv, sunFlareElevationVisibility } from '../terrain-sun-flare-effect.js';
 
 const NUUK = { latitude: 64.1835, longitude: -51.7216 };
 const PAAMIUT = { latitude: 61.99402, longitude: -49.66776 };
@@ -129,4 +130,43 @@ test('moving atmosphere frame rejects incomplete geodetic state', () => {
     () => frame.update({ latitude: NaN, longitude: -49, sceneSurfacePosition: anchor }),
     /latitude must be finite/,
   );
+});
+
+test('flare projection and water lighting follow the rendered sun after travelling across Greenland', () => {
+  const { anchor, east, north, up, frame } = createFixture();
+  const camera = new PerspectiveCamera(60, 1.8, 1, 1e7);
+  camera.up.copy(up);
+  const elevation = 25 * Math.PI / 180;
+  const expectedSceneSun = north.clone().multiplyScalar(Math.cos(elevation))
+    .addScaledVector(up, Math.sin(elevation));
+  const sceneSun = new Vector3();
+  const uv = new Vector2();
+  for (const location of [NUUK, PAAMIUT, { latitude: 60.57, longitude: -44.25 }]) {
+    const local = approximateLatLonToLocalMeters({
+      lat: location.latitude, lon: location.longitude,
+      anchorLat: NUUK.latitude, anchorLon: NUUK.longitude,
+    });
+    const surface = anchor.clone().addScaledVector(east, local.eastM)
+      .addScaledVector(north, local.northM);
+    const state = frame.update({ ...location, sceneSurfacePosition: surface });
+    const ecefSun = state.ecefNorth.clone().multiplyScalar(Math.cos(elevation))
+      .addScaledVector(state.ecefUp, Math.sin(elevation));
+    assert.equal(frame.toSceneDirection(ecefSun, sceneSun), sceneSun);
+    expectVectorClose(sceneSun, expectedSceneSun);
+    expectVectorClose(sceneSun.clone().transformDirection(state.worldToECEFMatrix), ecefSun);
+    camera.position.copy(surface).addScaledVector(up, 100);
+    camera.lookAt(camera.position.clone().addScaledVector(sceneSun, 1000));
+    camera.updateMatrixWorld(true);
+    assert.equal(projectSunDirectionToUv(camera, sceneSun, uv), true);
+    assert.ok(uv.distanceTo(new Vector2(0.5, 0.5)) < 1e-9);
+    assert.equal(sunFlareElevationVisibility(sceneSun, up), 1);
+    // These are the ENU components consumed by the water glint/shadow mask.
+    assert.ok(Math.abs(sceneSun.dot(east)) < 1e-9);
+    assert.ok(Math.abs(sceneSun.dot(up) - Math.sin(elevation)) < 1e-9);
+    if (location !== NUUK) {
+      projectSunDirectionToUv(camera, ecefSun, uv);
+      // The old direction misses the tiny HDR sun disk, so sourceGate = 0.
+      assert.ok(uv.distanceTo(new Vector2(0.5, 0.5)) > 0.02);
+    }
+  }
 });

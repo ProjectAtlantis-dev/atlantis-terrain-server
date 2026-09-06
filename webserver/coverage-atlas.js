@@ -1,13 +1,17 @@
 import { wgs84ToEpsg3413 } from './terrain-polar-stereo.js';
 import { readCameraState } from './terrain-camera-storage.js';
+import { createCoverageResource, mergeCoverageInventory } from './coverage-cache.js';
 import {
   centerCoverageNavigation,
   createCoverageView,
   panCoverageNavigation,
+  parseCoverageNavigationSnapshot,
+  serializeCoverageNavigationSnapshot,
   zoomCoverageNavigation,
 } from './coverage-navigation.js';
 
 const CAMERA_STORAGE_KEY = 'clouds-cam';
+const NAVIGATION_STORAGE_KEY = 'terrain-coverage-navigation-v1';
 
 const canvas = document.querySelector('#atlas');
 const context = canvas.getContext('2d');
@@ -21,11 +25,40 @@ const cameraStatus = document.querySelector('#camera-status');
 
 let inventory = null;
 let outline = null;
+let availableCoastline = null;
 let outlineExtent = null;
 let view = null;
-let navigation = { zoom: 1, panX: 0, panY: 0 };
+let navigation = (() => {
+  try {
+    return parseCoverageNavigationSnapshot(
+      localStorage.getItem(NAVIGATION_STORAGE_KEY),
+    ) ?? { zoom: 1, panX: 0, panY: 0 };
+  } catch {
+    return { zoom: 1, panX: 0, panY: 0 };
+  }
+})();
 let drag = null;
 let cameraPoint = null;
+let navigationSaveTimer = null;
+
+function saveNavigation() {
+  if (navigationSaveTimer != null) {
+    clearTimeout(navigationSaveTimer);
+    navigationSaveTimer = null;
+  }
+  const snapshot = serializeCoverageNavigationSnapshot(navigation);
+  if (snapshot == null) return;
+  try {
+    localStorage.setItem(NAVIGATION_STORAGE_KEY, snapshot);
+  } catch {
+    // Private browsing and hardened storage settings must not break the atlas.
+  }
+}
+
+function scheduleNavigationSave() {
+  if (navigationSaveTimer != null) clearTimeout(navigationSaveTimer);
+  navigationSaveTimer = setTimeout(saveNavigation, 150);
+}
 
 function projectedOutline(geometry) {
   return geometry.coordinates.map(polygon => polygon.map(ring => ring.map(([lon, lat]) => {
@@ -62,6 +95,17 @@ function outlinePath(polygons) {
       });
       path.closePath();
     }
+  }
+  return path;
+}
+
+function coastlinePath(lines) {
+  const path = new Path2D();
+  for (const line of lines ?? []) {
+    line.forEach(([x, y], index) => {
+      if (index === 0) path.moveTo(view.x(x), view.y(y));
+      else path.lineTo(view.x(x), view.y(y));
+    });
   }
   return path;
 }
@@ -115,14 +159,19 @@ function render() {
   const land = outlinePath(outline);
   context.fillStyle = '#111820';
   context.fill(land, 'evenodd');
-  context.save();
-  context.clip(land, 'evenodd');
+  // Natural Earth is context only. It is intentionally not a coverage mask:
+  // the cure inventory and locally acquired GTK50 data are more authoritative
+  // than this deliberately coarse bundled outline.
   inventory.tiles.filter(tile => tile.depth < inventory.cureDepth).forEach(renderTile);
   inventory.tiles.filter(tile => tile.depth === inventory.cureDepth).forEach(renderTile);
-  context.restore();
   context.strokeStyle = '#8ca1b4';
   context.lineWidth = 1.1;
   context.stroke(land);
+  if (availableCoastline?.lines?.length > 0) {
+    context.strokeStyle = '#d6eef7';
+    context.lineWidth = 0.8;
+    context.stroke(coastlinePath(availableCoastline.lines));
+  }
   renderCameraPosition();
 }
 
@@ -175,6 +224,7 @@ canvas.addEventListener('pointermove', event => {
     drag.x = event.clientX;
     drag.y = event.clientY;
     render();
+    scheduleNavigationSave();
     return;
   }
   updateTooltip(event);
@@ -184,6 +234,7 @@ function finishDrag(event) {
   if (drag?.pointerId !== event.pointerId) return;
   drag = null;
   canvas.classList.remove('dragging');
+  saveNavigation();
 }
 
 canvas.addEventListener('pointerup', finishDrag);
@@ -205,12 +256,14 @@ canvas.addEventListener('wheel', event => {
   });
   tooltip.style.display = 'none';
   render();
+  scheduleNavigationSave();
 }, { passive: false });
 
 function resetNavigation() {
   navigation = { zoom: 1, panX: 0, panY: 0 };
   tooltip.style.display = 'none';
   render();
+  saveNavigation();
 }
 
 canvas.addEventListener('dblclick', resetNavigation);
@@ -256,6 +309,7 @@ async function centerOnCamera() {
     tooltip.style.display = 'none';
     cameraStatus.textContent = `Centered at ${cameraPoint.lat.toFixed(5)}°, ${cameraPoint.lon.toFixed(5)}°`;
     render();
+    saveNavigation();
   } catch (cameraError) {
     cameraStatus.textContent = cameraError.message;
   } finally {
@@ -265,32 +319,82 @@ async function centerOnCamera() {
 
 centerCamera.addEventListener('click', () => { void centerOnCamera(); });
 
-async function load() {
-  refresh.disabled = true;
-  error.textContent = '';
+async function restoreCameraMarker() {
   try {
-    const [coverageResponse, outlineResponse] = await Promise.all([
-      fetch('/api/coverage/cure.json', { cache: 'no-store' }),
-      fetch('/greenland-outline.json'),
-    ]);
-    if (!coverageResponse.ok) throw new Error(`coverage endpoint status ${coverageResponse.status}`);
-    if (!outlineResponse.ok) throw new Error(`outline status ${outlineResponse.status}`);
-    inventory = await coverageResponse.json();
-    const outlineDocument = await outlineResponse.json();
-    outline = projectedOutline(outlineDocument.geometry);
-    outlineExtent = outlineBounds(outline);
-    const { cured, partial, coarse } = inventory.summary;
-    summary.textContent = `${cured.toLocaleString()} cured D10 · ${partial.toLocaleString()} partial D10 · ${coarse.toLocaleString()} coarse tiles\n${inventory.definition}`;
+    cameraPoint = await savedCameraPosition();
     render();
-  } catch (loadError) {
-    error.textContent = loadError.message;
-  } finally {
-    refresh.disabled = false;
+  } catch {
+    // A missing terrain-camera snapshot simply leaves the marker hidden.
+    cameraPoint = null;
   }
 }
 
-refresh.addEventListener('click', load);
+let showingSavedCoverage = false;
+
+function updateCoverage() {
+  if (inventory) {
+    const { cured, partial, coarse } = inventory.summary;
+    const coastlineSummary = availableCoastline
+      ? ` · ${availableCoastline.blocks.length.toLocaleString()} GTK50 coastline blocks`
+      : '';
+    const savedSummary = showingSavedCoverage ? ' · saved coverage' : '';
+    summary.textContent = `${cured.toLocaleString()} cured D10 · ${partial.toLocaleString()} partial D10 · ${coarse.toLocaleString()} coarse tiles${coastlineSummary}${savedSummary}\n${inventory.definition}`;
+  }
+  render();
+}
+
+const coverageResource = createCoverageResource({
+  url: '/api/coverage/cure.json',
+  merge: mergeCoverageInventory,
+  onData(data, { cached }) {
+    inventory = data;
+    showingSavedCoverage = cached;
+    updateCoverage();
+  },
+});
+const outlineResource = createCoverageResource({
+  url: '/greenland-outline.json',
+  maxAge: 24 * 60 * 60_000,
+  onData(data) {
+    outline = projectedOutline(data.geometry);
+    outlineExtent = outlineBounds(outline);
+    updateCoverage();
+  },
+});
+const coastlineResource = createCoverageResource({
+  url: '/api/coverage/coastline.json',
+  maxAge: 60 * 60_000,
+  onData(data) {
+    availableCoastline = data;
+    updateCoverage();
+  },
+});
+
+let loading = null;
+function load({ force = false } = {}) {
+  if (loading) return loading;
+  refresh.disabled = true;
+  error.textContent = '';
+  // Each resource renders as soon as it is available. Coastline downloads and
+  // background revalidation must not hold up the saved inventory.
+  loading = Promise.allSettled([
+    coverageResource.load({ force }),
+    outlineResource.load({ force }),
+    coastlineResource.load({ force }),
+  ]).then(([coverageResult, outlineResult]) => {
+    const failed = [coverageResult, outlineResult].find(result => result.status === 'rejected');
+    if (failed) error.textContent = failed.reason.message;
+  }).finally(() => {
+    refresh.disabled = false;
+    loading = null;
+  });
+  return loading;
+}
+
+refresh.addEventListener('click', () => { void load({ force: true }); });
 window.addEventListener('resize', resize);
+window.addEventListener('beforeunload', saveNavigation);
 resize();
+void restoreCameraMarker();
 load();
 setInterval(load, 30_000);

@@ -39,6 +39,7 @@ export function createTerrainVectorLayerRuntime({
   let unavailable = false;
   let consecutiveFailures = 0;
   let retryAtMs = 0;
+  let serverPending = false;
 
   function disposeMesh() {
     if (!mesh) return;
@@ -95,7 +96,7 @@ export function createTerrainVectorLayerRuntime({
     const queryX = pipelineState.lastFetchX;
     const queryY = pipelineState.lastFetchY;
     if (!Number.isFinite(queryX) || !Number.isFinite(queryY)) return;
-    if (!force && lastFetchX !== null
+    if (!force && !serverPending && lastFetchX !== null
       && Math.hypot(queryX - lastFetchX, queryY - lastFetchY) < refetchDistanceM) return;
     fetching = true;
     try {
@@ -116,6 +117,7 @@ export function createTerrainVectorLayerRuntime({
         throw error;
       }
       const data = await decodeResponse(response);
+      serverPending = data.shouldPoll === true;
       consecutiveFailures = 0;
       retryAtMs = 0;
       lastFetchX = queryX;

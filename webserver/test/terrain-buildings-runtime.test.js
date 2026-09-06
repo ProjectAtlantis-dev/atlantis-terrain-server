@@ -185,6 +185,48 @@ test('runtime disables the optional buildings route after a 404', async () => {
   ]]);
 });
 
+test('a stationary camera polls loading buildings until the server publishes them', async t => {
+  let poll;
+  t.mock.method(globalThis, 'setInterval', callback => { poll = callback; return 1; });
+  t.mock.method(globalThis, 'clearInterval', () => {});
+  let fetches = 0;
+  const runtime = createTerrainBuildingsRuntime({
+    terrainRoot: { add() {}, remove() {} },
+    pipelineState: {
+      ready: true, frameOffsetReady: true,
+      originX: 1000, originY: 2000, frameOffsetX: 0, frameOffsetY: 0,
+      lastFetchX: 1100, lastFetchY: 2100,
+    },
+    scheduleApply: callback => callback(),
+    fetchImpl: async () => {
+      fetches += 1;
+      const loading = fetches === 1;
+      const header = new TextEncoder().encode(JSON.stringify({
+        tiles: [], buildings: loading ? [] : [squareBuilding],
+        count: loading ? 0 : 1, shouldPoll: loading,
+        buildingsStatus: loading ? 'loading' : 'ready',
+      }));
+      const padded = header.length + (-(header.length + 4) & 3);
+      const buffer = new ArrayBuffer(4 + padded);
+      new DataView(buffer).setUint32(0, padded, true);
+      new Uint8Array(buffer, 4).fill(32);
+      new Uint8Array(buffer, 4, header.length).set(header);
+      return { ok: true, arrayBuffer: async () => buffer };
+    },
+  });
+  try {
+    await runtime.start();
+    assert.equal(runtime.getMesh(), null);
+    await poll();
+    assert.equal(fetches, 2);
+    assert.ok(runtime.getMesh(), 'the buildings arrive without moving the camera');
+    await poll();
+    assert.equal(fetches, 2, 'a completed view returns to distance-based fetching');
+  } finally {
+    runtime.stop();
+  }
+});
+
 test('shared vector runtime backs off transient failures', async () => {
   let now = 100;
   let fetches = 0;

@@ -38,6 +38,7 @@ import {
   vec4,
 } from 'three/tsl';
 import { WebGPUWaterSimulation } from './webgpu-water-sim.js';
+import { createWebGPUWaterSunShadow } from './webgpu-water-sun-shadow.js';
 import { prepareTerrainTilesForBathymetry } from './terrain-bathymetry-tiles.js';
 import {
   TERRAIN_BATHYMETRY_LAYER,
@@ -170,7 +171,7 @@ function fbm(p) {
   return value;
 }
 
-function skyColor(dir, sunDir, horizonWarm, horizonCool, zenithCol, sunCol, cloud) {
+function skyColor(dir, sunDir, horizonWarm, horizonCool, zenithCol, sunCol, cloud, sunVisibility) {
   const t = dir.z.clamp(0.0, 1.0);
   // warm horizon only near the sun's azimuth; the opposite sky stays cool
   const dh = normalize(dir.xy.add(vec2(1e-5, 0.0)));
@@ -182,9 +183,9 @@ function skyColor(dir, sunDir, horizonWarm, horizonCool, zenithCol, sunCol, clou
   const horizonCol = mix(horizonCool, horizonWarm, sunward);
   const col = mix(horizonCol, zenithCol, t.pow(0.48));
   const sd = dir.dot(sunDir).max(0.0);
-  // sun disk + circumsolar haze; cloud diffuses the disk away
+  // Occlude the direct disk, while retaining light scattered by the sky.
   return col.add(sunCol.mul(
-    sd.pow(1500.0).mul(55.0).add(sd.pow(18.0).mul(0.10)).mul(cloud.oneMinus())
+    sd.pow(1500.0).mul(55.0).mul(sunVisibility).add(sd.pow(18.0).mul(0.10)).mul(cloud.oneMinus())
       .add(sd.pow(3.0).mul(0.035)),
   ));
 }
@@ -250,6 +251,7 @@ export function createWebGPUWater({
   const uOpacity = uniform(0).setName('waterOpacity');
   const uReflect = uniform(0.4).setName('waterReflect');
   const uGlintStrength = uniform(1).setName('waterGlintStrength');
+  const uSunShadowReady = uniform(0).setName('waterSunShadowReady');
   const uShoreFoamDepth = uniform(3.5).setName('waterShoreFoamDepth');
   const uShoreFoamStrength = uniform(0.7).setName('waterShoreFoamStrength');
   const uBathyCenter = uniform(new Vector2()).setName('waterBathyCenter');
@@ -292,6 +294,10 @@ export function createWebGPUWater({
     stencilBuffer: false,
   });
   const texBathy = texture(bathyTarget.texture);
+  const sunShadow = createWebGPUWaterSunShadow(renderer, {
+    texBathy, uBathyExtent, uSunDir, uWaterline,
+  });
+  const texSunShadow = texture(sunShadow.texture);
 
   // --- bathymetry access + local wave damping (shared vertex/fragment) ------
 
@@ -530,6 +536,11 @@ export function createWebGPUWater({
     const d = float(vDist);
     const V = normalize(uCameraLocal.sub(vPlanePos));
     const L = vec3(uSunDir);
+    const shadowUv = pxy.sub(uBathyCenter).div(uBathyExtent).add(0.5);
+    const shadowEdge = shadowUv.x.sub(0.5).abs().max(shadowUv.y.sub(0.5).abs());
+    // Unknown terrain stays open; soften the finite capture boundary.
+    const shadowCoverage = uSunShadowReady.mul(smoothstep(0.45, 0.5, shadowEdge).oneMinus());
+    const sunVisibility = mix(float(1), texSunShadow.sample(shadowUv).r, shadowCoverage).toVar();
 
     // ---- water column depth from the bathymetry capture -------------------
     // The surface sits at local z = 0, so column depth is just -seabed.
@@ -684,7 +695,7 @@ export function createWebGPUWater({
     // shading vanishes at distance and waves read as smooth mounds
     const Rr = normalize(mix(R, vec3(0.0, 0.0, 1.0), rough.mul(0.25)));
     const skyRefl = skyColor(
-      Rr, L, uHorizonColor, uHorizonCool, uZenithColor, uSunColor.mul(0.4), uCloud,
+      Rr, L, uHorizonColor, uHorizonCool, uZenithColor, uSunColor.mul(0.4), uCloud, sunVisibility,
     );
 
     // The analytic dome has no horizon occlusion and its daylight anti-sun
@@ -840,11 +851,10 @@ export function createWebGPUWater({
     let accum = body.mul(uOpacity).add(reflectedRadiance.mul(refl));
 
     // sun glint: pure added light
-    // Cliff occlusion is absent from the analytic sun model. The satellite
-    // image already contains the desired shadowed-water colour, so use its
-    // darkness as the cheap local occlusion proxy for direct sun glint.
+    // The cached terrain mask follows the live sun; imagery and cliff
+    // reflection gates continue to preserve the baked coastal shading.
     accum = accum.add(
-      spec.mul(bottomReflection).mul(northCliffReflection).mul(uGlintStrength),
+      spec.mul(sunVisibility).mul(bottomReflection).mul(northCliffReflection).mul(uGlintStrength),
     );
 
     // Shore-break sparkle. Shoreline proximity is the only hard gate; wave
@@ -1179,8 +1189,13 @@ export function createWebGPUWater({
       }
       uBathyCenter.value.set(centerXY.x, centerXY.y);
       uBathyExtent.value = bathyExtent;
+      sunShadow.invalidate();
       logCapturePixels();
       return stats;
+    },
+
+    updateSunShadow() {
+      if (sunShadow.update()) uSunShadowReady.value = 1;
     },
 
     get bathyExtent() { return bathyExtent; },
@@ -1190,6 +1205,7 @@ export function createWebGPUWater({
     dispose() {
       bathyCamera.parent?.remove(bathyCamera);
       bathyTarget.dispose();
+      sunShadow.dispose();
       bathyMaterial.dispose();
       dummyMap.dispose();
       placeholder.dispose();

@@ -3,8 +3,8 @@ import * as THREE from 'three';
 import { createTerrainVectorLayerRuntime } from './terrain-vector-layer-runtime.js';
 import { decodeTerrainBinaryPayload } from './terrain-binary-payload.js';
 
-// Grey extruded buildings from Asiaq Teknisk Grundkort footprints. Flask
-// reads them from the shared catalog through /api/buildings so terrain
+// Grey extruded buildings from Asiaq Teknisk Grundkort footprints. The MCP
+// terrain server reads its catalog through /api/buildings so terrain
 // responses never wait on settlement work. Rings arrive origin-relative
 // (the same ox/oy convention as /api/tiles) with per-vertex surveyed roof elevations; each
 // building is extruded from its ingest-sampled ground up to the real roof

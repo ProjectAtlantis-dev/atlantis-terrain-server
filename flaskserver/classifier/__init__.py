@@ -1,1 +1,0 @@
-"""Terrain classification helpers."""

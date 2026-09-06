@@ -1,5 +1,6 @@
 import * as THREE from 'three';
 import { WebGLWaterSimulation } from './webgl-water-sim.js';
+import { createWebGLWaterSunShadow } from './webgl-water-sun-shadow.js';
 import { prepareTerrainTilesForBathymetry } from './terrain-bathymetry-tiles.js';
 import {
   TERRAIN_BATHYMETRY_LAYER,
@@ -27,7 +28,7 @@ import {
 //     the post passes is the seabed, 5 m below the surface — negligible.
 
 const SKY_GLSL = /* glsl */ `
-  vec3 skyColor(vec3 dir, vec3 sunDir, vec3 horizonWarm, vec3 horizonCool, vec3 zenithCol, vec3 sunCol, float cloud) {
+  vec3 skyColor(vec3 dir, vec3 sunDir, vec3 horizonWarm, vec3 horizonCool, vec3 zenithCol, vec3 sunCol, float cloud, float sunVisibility) {
     float t = clamp(dir.z, 0.0, 1.0);
     // warm horizon only near the sun's azimuth; the opposite sky stays cool
     vec2 dh = normalize(dir.xy + vec2(1e-5, 0.0));
@@ -39,8 +40,8 @@ const SKY_GLSL = /* glsl */ `
     vec3 horizonCol = mix(horizonCool, horizonWarm, sunward);
     vec3 col = mix(horizonCol, zenithCol, pow(t, 0.48));
     float sd = max(dot(dir, sunDir), 0.0);
-    // sun disk + circumsolar haze; cloud diffuses the disk away
-    col += sunCol * ((pow(sd, 1500.0) * 55.0 + pow(sd, 18.0) * 0.10) * (1.0 - cloud)
+    // Occlude the direct disk, while retaining light scattered by the sky.
+    col += sunCol * ((pow(sd, 1500.0) * 55.0 * sunVisibility + pow(sd, 18.0) * 0.10) * (1.0 - cloud)
                      + pow(sd, 3.0) * 0.035);
     return col;
   }
@@ -234,6 +235,8 @@ const WATER_FRAGMENT = /* glsl */ `
                                // palette against this pipeline's AGX exposure
   uniform float uOpacity;      // base veil opacity of the surface body
   uniform float uReflect;      // sky-reflection gain (fjord walls occlude sky)
+  uniform sampler2D uSunShadow;
+  uniform float uSunShadowReady;
   uniform float uGlintStrength; // direct-sun glitter gain
   uniform float uShoreFoamDepth;
   uniform float uShoreFoamStrength;
@@ -397,6 +400,11 @@ const WATER_FRAGMENT = /* glsl */ `
     float d = vDist;
     vec3 V = normalize(uCameraLocal - vPlanePos);
     vec3 L = uSunDir;
+    vec2 shadowUv = (pxy - uBathyCenter) / uBathyExtent + 0.5;
+    float shadowEdge = max(abs(shadowUv.x - 0.5), abs(shadowUv.y - 0.5));
+    // Unknown terrain stays open; soften the finite capture boundary.
+    float shadowCoverage = uSunShadowReady * (1.0 - smoothstep(0.45, 0.5, shadowEdge));
+    float sunVisibility = mix(1.0, texture2D(uSunShadow, shadowUv).r, shadowCoverage);
 
     // ---- water column depth from the bathymetry capture -------------------
     // The surface sits at local z = 0, so column depth is just -seabed.
@@ -547,7 +555,7 @@ const WATER_FRAGMENT = /* glsl */ `
     // shading vanishes at distance and waves read as smooth mounds
     vec3 Rr = normalize(mix(R, vec3(0.0, 0.0, 1.0), rough * 0.25));
     vec3 skyRefl = skyColor(Rr, L, uHorizonColor, uHorizonCool, uZenithColor,
-                            uSunColor * 0.4, uCloud);
+                            uSunColor * 0.4, uCloud, sunVisibility);
 
     // The analytic dome has no horizon occlusion and its daylight anti-sun
     // side is still bright enough to bleach the satellite water colour.
@@ -705,10 +713,9 @@ const WATER_FRAGMENT = /* glsl */ `
     vec3 accum = body * uOpacity + reflectedRadiance * refl;
 
     // sun glint: pure added light
-    // Cliff occlusion is absent from the analytic sun model. The satellite
-    // image already contains the desired shadowed-water colour, so use its
-    // darkness as the cheap local occlusion proxy for direct sun glint.
-    accum += spec * bottomReflection * northCliffReflection * uGlintStrength;
+    // The cached terrain mask follows the live sun; imagery and cliff
+    // reflection gates continue to preserve the baked coastal shading.
+    accum += spec * sunVisibility * bottomReflection * northCliffReflection * uGlintStrength;
 
     // Shore-break sparkle. Shoreline proximity is the only hard gate; wave
     // direction and face activity are soft biases because coarse bathymetry
@@ -813,6 +820,8 @@ export function createWebGLWater({
     uOpacity: { value: 0 },
     uReflect: { value: 0.4 },
     uGlintStrength: { value: 1 },
+    uSunShadow: { value: null },
+    uSunShadowReady: { value: 0 },
     uShoreFoamDepth: { value: 3.5 },
     uShoreFoamStrength: { value: 0.7 },
     uBathy: { value: null },
@@ -851,6 +860,8 @@ export function createWebGLWater({
     stencilBuffer: false,
   });
   uniforms.uBathy.value = bathyTarget.texture;
+  const sunShadow = createWebGLWaterSunShadow(renderer, uniforms);
+  uniforms.uSunShadow.value = sunShadow.texture;
   const BATHY_CAM_H = 10000;
   const bathyCamera = new THREE.OrthographicCamera(
     -bathyExtent / 2, bathyExtent / 2,
@@ -1020,6 +1031,7 @@ export function createWebGLWater({
       }
       uniforms.uBathyCenter.value.set(centerXY.x, centerXY.y);
       uniforms.uBathyExtent.value = bathyExtent;
+      sunShadow.invalidate();
       stats.prepareMs = Number(prepareMs.toFixed(1));
       stats.totalMs = Number((performance.now() - captureStartedAt).toFixed(1));
       stats.restoreMs = Number(
@@ -1028,11 +1040,16 @@ export function createWebGLWater({
       return stats;
     },
 
+    updateSunShadow() {
+      if (sunShadow.update()) uniforms.uSunShadowReady.value = 1;
+    },
+
     get bathyExtent() { return bathyExtent; },
 
     dispose() {
       bathyCamera.parent?.remove(bathyCamera);
       bathyTarget.dispose();
+      sunShadow.dispose();
       bathyMaterial.dispose();
       sim.dispose();
       material.dispose();

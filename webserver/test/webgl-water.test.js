@@ -88,12 +88,14 @@ test('bathymetry recaptures on movement, settled texture changes, and the lazy b
   performance.now = () => nowMs;
   try {
     const captures = [];
+    const phases = [];
     let textureVersion = 0;
     const water = {
       mesh: new THREE.Mesh(),
       setWind() {},
-      update() {},
-      captureBathymetry({ centerXY }) { captures.push(centerXY.clone()); },
+      update() { phases.push('update'); },
+      captureBathymetry({ centerXY }) { captures.push(centerXY.clone()); phases.push('capture'); },
+      updateSunShadow() { phases.push('shadow'); },
       bathyExtent: 30000,
       dispose() {},
     };
@@ -113,10 +115,13 @@ test('bathymetry recaptures on movement, settled texture changes, and the lazy b
 
     step(16);
     assert.equal(captures.length, 1); // initial capture
+    assert.deepEqual(phases, ['update', 'capture', 'shadow']);
+    phases.length = 0;
 
     textureVersion += 1;
     step(16);
     assert.equal(captures.length, 1); // texture change is debounced
+    assert.deepEqual(phases, ['update', 'shadow']);
 
     step(2100);
     assert.equal(captures.length, 2); // settled texture change recaptures

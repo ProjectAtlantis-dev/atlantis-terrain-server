@@ -1,6 +1,27 @@
 const MIN_ZOOM = 0.5;
 const MAX_ZOOM = 64;
 
+export function parseCoverageNavigationSnapshot(raw) {
+  try {
+    const value = typeof raw === 'string' ? JSON.parse(raw) : raw;
+    if (
+      !Number.isFinite(value?.zoom)
+      || !Number.isFinite(value?.panX)
+      || !Number.isFinite(value?.panY)
+      || value.zoom < MIN_ZOOM
+      || value.zoom > MAX_ZOOM
+    ) return null;
+    return { zoom: value.zoom, panX: value.panX, panY: value.panY };
+  } catch {
+    return null;
+  }
+}
+
+export function serializeCoverageNavigationSnapshot(navigation) {
+  const normalized = parseCoverageNavigationSnapshot(navigation);
+  return normalized == null ? null : JSON.stringify(normalized);
+}
+
 export function createCoverageView(bounds, width, height, navigation, margin = 55) {
   const availableWidth = Math.max(1, width - margin * 2);
   const availableHeight = Math.max(1, height - margin * 2);

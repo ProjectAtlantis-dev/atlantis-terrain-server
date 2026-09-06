@@ -11,6 +11,7 @@ export function collectTerrainDebugMeshes(root, target = []) {
 
 export function summarizeTerrainMesh(mesh) {
   const image = mesh.material?.map?.image;
+  const provenance = mesh.userData?.terrainProvenance;
   return {
     tileId: mesh.userData?.tileId ?? '?',
     hasTexture: Boolean(mesh.material?.map),
@@ -18,6 +19,7 @@ export function summarizeTerrainMesh(mesh) {
     color: mesh.material?.color != null ? `#${mesh.material.color.getHexString()}` : '-',
     bbox: mesh.userData?.bbox,
     terrainSource: mesh.userData?.terrainSource ?? null,
+    ...(provenance ? { provenance } : {}),
   };
 }
 

@@ -50,6 +50,7 @@ import { createTerrainTileSet } from './terrain-tile-set.js';
 import { createTileEvictionGate } from './terrain-tile-eviction.js';
 import { createClassifierOverlay } from './terrain-classifier-overlay.js';
 import { createTerrainGridlinesRuntime } from './terrain-gridlines-runtime.js';
+import { createTerrainCureStatusRuntime } from './terrain-cure-status.js';
 import { createTerrainRetroRuntime } from './terrain-retro-mode.js';
 import {
   bathymetrySoundingTooltipHtml,
@@ -978,7 +979,7 @@ const appliedTileTextures = new WeakMap();
 const waterRuntime = createWaterRuntime({
   backend: renderBackend, scene, terrainRoot,
   anchorPosition, east, north, up,
-  getSunDirection: () => sunDirection,
+  getSunDirection: () => sceneSunDirection,
   getTextureVersion: () => terrainTextureVersion,
   log: (event, details) => enqueueClientLog('info', event, details),
   params: waterParams,
@@ -1385,6 +1386,9 @@ const ATMOSPHERE_TELEPORT_DISTANCE_M = 10_000;
 
 // Wire up tuning panel now that effects exist
 const sunDirection = new THREE.Vector3();
+// Astronomy/Takram use ECEF; scene lighting and flare projection use the
+// floating terrain frame. These diverge when travelling away from Nuuk.
+const sceneSunDirection = new THREE.Vector3();
 let restoreCloudTemporalHistory = null;
 
 function syncTerrainAtmosphereFrame() {
@@ -1403,6 +1407,12 @@ function syncTerrainAtmosphereFrame() {
     longitude: location.lon,
     sceneSurfacePosition: atmosphereSceneSurface,
   });
+  if (USE_WEBGPU_RENDER_BACKEND) {
+    // The current WebGPU atmosphere still uses an identity world-to-ECEF.
+    sceneSunDirection.copy(sunDirection);
+  } else {
+    terrainAtmosphereFrame.toSceneDirection(sunDirection, sceneSunDirection);
+  }
   if (
     !USE_WEBGPU_RENDER_BACKEND
     && terrainAtmosphereFrameState.distanceM >= ATMOSPHERE_TELEPORT_DISTANCE_M
@@ -1484,7 +1494,7 @@ createTerrainAtmosphereTextureRuntime({
 
 renderBackend.configureScenePipeline({
   scene, camera, normalPass, cloudsEffect, aerialPerspective,
-  sunDirection, up,
+  sunDirection: sceneSunDirection, up,
   date: gameClockState.renderedDate,
 });
 
@@ -1597,6 +1607,13 @@ const gridlinesRuntime = createTerrainGridlinesRuntime({
   onChanged: () => {
     updateHud();
     requestRender();
+  },
+});
+const cureStatusRuntime = createTerrainCureStatusRuntime({
+  onError: error => {
+    enqueueClientLog('warn', 'terrain.cure-status.failed', {
+      message: error?.message ?? String(error),
+    });
   },
 });
 // Retro mode renders its own scene of proxy meshes that share the live tiles'
@@ -2962,7 +2979,8 @@ function toggleSeamMode() {
 
 function toggleGridlines() {
   if (controls.mapMode) return;
-  gridlinesRuntime.toggle();
+  const active = gridlinesRuntime.toggle();
+  if (active) void cureStatusRuntime.load();
 }
 
 function toggleBathymetryMap() {
@@ -3166,6 +3184,15 @@ renderer.domElement.addEventListener('mousemove', event => {
   const src = texSource.get(info.tileId) || 'none';
   const srcLabel = `<span style="color:#f80">${src || 'no texture'}</span>`;
   const demQuality = classifyDemSource(info.terrainSource);
+  const provenance = info.provenance || {};
+  const provenanceDate = (value, rangeEnd = null) => {
+    if (!value && !rangeEnd) return 'unknown';
+    if (value && rangeEnd && value !== rangeEnd) return `${value}…${rangeEnd}`;
+    return value || rangeEnd || 'unknown';
+  };
+  const provenanceLine = gridlines3dHover
+    ? `dates: tex ${provenanceDate(provenance.textureDate ?? provenance.texture?.date, provenance.textureDateEnd ?? provenance.texture?.dateEnd)} · DEM ${provenanceDate(provenance.heightmapDate ?? provenance.dem?.date ?? provenance.heightmap?.date, provenance.heightmapDateEnd ?? provenance.dem?.dateEnd ?? provenance.heightmap?.dateEnd)} · coast ${provenanceDate(provenance.coastlineDate ?? provenance.coastline?.date, provenance.coastlineDateEnd ?? provenance.coastline?.dateEnd)}`
+    : null;
   const demLabel = demQuality.synthetic
     ? '<b style="color:#ff1744">SYNTHETIC / UPSCALED</b>'
     : demQuality.kind === 'measured'
@@ -3208,10 +3235,37 @@ renderer.domElement.addEventListener('mousemove', event => {
   const seamRows = controls.seamMode ? mapGridController.diagnosticsForTile(info.tileId) : [];
   const badSeams = seamRows.filter(seam => seam.severity === 'bad').length;
   const warningSeams = seamRows.filter(seam => seam.severity === 'warning').length;
+  const cureStatus = gridlines3dHover ? cureStatusRuntime.statusFor(info.tileId) : null;
+  const cureStatusLine = (() => {
+    if (!cureStatus) return null;
+    if (cureStatus.state === 'loading') return 'cure: loading…';
+    if (cureStatus.state === 'error') {
+      return '<span style="color:#ff1744">cure: unavailable</span>';
+    }
+    if (cureStatus.state === 'coarse') {
+      return `<span style="color:#f59e0b">cure: coarse tile (target D${cureStatus.cureDepth})</span>`;
+    }
+    if (cureStatus.state === 'uncached') {
+      return `<span style="color:#f59e0b">cure: no D${cureStatus.cureDepth} inventory tile</span>`;
+    }
+    if (cureStatus.state === 'cured') {
+      return `<b style="color:#22c55e">cure: FULLY CURED (${cureStatus.cureTileId})</b>`;
+    }
+    if (cureStatus.state === 'partial') {
+      const missing = [
+        cureStatus.dem ? null : 'DEM',
+        cureStatus.coastline ? null : 'coastline',
+      ].filter(Boolean).join(' + ');
+      return `<b style="color:#f59e0b">cure: PARTIAL (${cureStatus.cureTileId})${missing ? ` · missing ${missing}` : ''}</b>`;
+    }
+    return 'cure: unavailable';
+  })();
   tileInfoEl.innerHTML = [
     `<b style="color:${matHex}">${info.tileId}</b>`,
     `DEM: ${info.terrainSource || 'none'} · ${demLabel}`,
     gridlines3dHover ? `datum: ${waterDiagnostic.verticalDatum || 'unknown'}` : null,
+    provenanceLine,
+    cureStatusLine,
     gridlines3dHover ? waterStatusLine : null,
     gridlines3dHover
       ? `water mask: ${waterDiagnostic.maskSource || 'unknown'} · published ${publishedWater} · rendered ${renderedWater}`

@@ -115,5 +115,13 @@ export function createTerrainAtmosphereFrame({
     return result.copy(worldPosition).applyMatrix4(worldToECEF);
   }
 
-  return { update, toECEF };
+  function toSceneDirection(ecefDirection, result = new Vector3()) {
+    requireVector('ecefDirection', ecefDirection);
+    if (!initialized) throw new Error('terrain atmosphere frame has not been initialized');
+    // Directions only rotate: the floating origin translation must not
+    // affect the apparent sun direction or its elevation above scene up.
+    return result.copy(ecefDirection).transformDirection(ellipsoidMatrix);
+  }
+
+  return { update, toECEF, toSceneDirection };
 }

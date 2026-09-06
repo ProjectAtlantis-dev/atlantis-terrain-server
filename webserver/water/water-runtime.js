@@ -155,8 +155,8 @@ export function createWaterRuntime({
       waterline,
     );
 
-    const sunEcef = getSunDirection();
-    sunLocal.set(sunEcef.dot(east), sunEcef.dot(north), sunEcef.dot(up)).normalize();
+    const sunScene = getSunDirection();
+    sunLocal.set(sunScene.dot(east), sunScene.dot(north), sunScene.dot(up)).normalize();
     const sunElevationDeg = THREE.MathUtils.radToDeg(
       Math.asin(THREE.MathUtils.clamp(sunLocal.z, -1, 1)),
     );
@@ -210,6 +210,9 @@ export function createWaterRuntime({
         });
       }
     }
+    // Update after capture so a recentered height field and its shadow mask
+    // become visible together, with at most one shadow pass per frame.
+    water.updateSunShadow?.();
     timings.capture = performance.now() - captureStartedAt;
     return timings;
   }

@@ -45,7 +45,7 @@ export function createTerrainBackend({
   let cloudsEffectRef = null;
   let aerialPerspectiveRef = null;
   let takramCloudsEnabled = true;
-  // HDR lens flare (sun disk + water glint). Created here, before the
+  // HDR lens flare from the sun disk. Created here, before the
   // composer, so the tuning UI can bind to it ahead of pipeline configure.
   const lensFlare = new TerrainSunFlareEffect();
   let demandRendering = null;
@@ -173,8 +173,8 @@ export function createTerrainBackend({
         atmospherePass.recompile();
       }
       // Lens flare runs on the HDR frame AFTER sky/clouds (so the sun disk
-      // exists in the buffer) and BEFORE tone mapping. It thresholds bright
-      // pixels, so it flares the sun itself and any HDR water glint alike.
+      // exists in the buffer) and BEFORE tone mapping. The source is sampled
+      // at the sun's projected position in the current scene frame.
       const finalPass = gpuProfiler.wrapPass(new EffectPass(
         camera,
         lensFlare,
