@@ -14,18 +14,25 @@ if (storedBackend === 'webgpu' && backend !== 'webgpu') {
   localStorage.setItem(TERRAIN_RENDER_BACKEND_STORAGE_KEY, backend);
 }
 
-await startTerrainApplication({
-  backend,
-  onToggleRenderBackend() {
-    const nextBackend = alternateTerrainRenderBackend(backend);
-    if (nextBackend === 'webgpu' && !WEBGPU_BACKEND_ENABLED) {
-      return;
-    }
-    if (nextBackend === 'webgpu' && !webgpuAvailable) {
-      window.alert('WebGPU is not available in this browser.');
-      return;
-    }
-    localStorage.setItem(TERRAIN_RENDER_BACKEND_STORAGE_KEY, nextBackend);
-    window.location.reload();
-  },
-});
+try {
+  await startTerrainApplication({
+    backend,
+    onToggleRenderBackend() {
+      const nextBackend = alternateTerrainRenderBackend(backend);
+      if (nextBackend === 'webgpu' && !WEBGPU_BACKEND_ENABLED) {
+        return;
+      }
+      if (nextBackend === 'webgpu' && !webgpuAvailable) {
+        window.alert('WebGPU is not available in this browser.');
+        return;
+      }
+      localStorage.setItem(TERRAIN_RENDER_BACKEND_STORAGE_KEY, nextBackend);
+      window.location.reload();
+    },
+  });
+} catch (error) {
+  document.getElementById('startup-error').hidden = false;
+  document.getElementById('startup-error-detail').textContent =
+    error?.message ?? String(error);
+  console.error('[TERRAIN] application startup failed', error);
+}

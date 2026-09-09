@@ -9,13 +9,54 @@
       body {
         margin: 0;
         overflow: hidden;
+        background: #05080c;
       }
       canvas {
         display: block;
       }
+      #startup-error {
+        position: fixed;
+        inset: 0;
+        z-index: 1000;
+        display: grid;
+        place-items: center;
+        padding: 24px;
+        box-sizing: border-box;
+        color: #e7edf5;
+        background: #080d13;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        text-align: center;
+      }
+      #startup-error[hidden] {
+        display: none;
+      }
+      #startup-error > div {
+        max-width: 520px;
+        padding: 28px 32px;
+        border: 1px solid #405367;
+        border-radius: 10px;
+        background: rgba(5, 10, 16, 0.92);
+      }
+      #startup-error h1 {
+        margin: 0 0 12px;
+        color: #ffb45e;
+        font-size: 20px;
+      }
+      #startup-error p {
+        margin: 0;
+        color: #b8c5d3;
+        font-size: 14px;
+        line-height: 1.6;
+      }
     </style>
   </head>
   <body>
+    <div id="startup-error" role="alert" hidden>
+      <div>
+        <h1>Startup failed</h1>
+        <p id="startup-error-detail"></p>
+      </div>
+    </div>
     <script type="module" src="/main.js"></script>
   </body>
 </html>
