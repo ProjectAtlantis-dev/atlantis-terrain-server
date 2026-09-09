@@ -72,7 +72,20 @@ export async function loadTerrainStartupAssets({
     }).finally(() => {
       if (timeoutHandle != null) clearTimeoutImpl(timeoutHandle);
     });
-    if (!response.ok) throw new Error(`assets endpoint status ${response.status}`);
+    if (!response.ok) {
+      let serverMessage = '';
+      if (typeof response.json === 'function') {
+        try {
+          const errorPayload = await response.json();
+          serverMessage = typeof errorPayload?.message === 'string'
+            ? `: ${errorPayload.message}`
+            : '';
+        } catch (_) {
+          // A proxy failure may not have a JSON response body.
+        }
+      }
+      throw new Error(`GET ${endpoint} failed (HTTP ${response.status})${serverMessage}`);
+    }
 
     const payload = await response.json();
     const normalized = normalizeTerrainStartupAssets(payload);
@@ -93,6 +106,7 @@ export async function loadTerrainStartupAssets({
     };
     bootLog('assets.fetch.failed', details, 'error');
     console.error('[ASSETS] startup failed', details);
-    throw error;
+    if (error?.message?.startsWith(`GET ${endpoint} failed`)) throw error;
+    throw new Error(`GET ${endpoint} failed: ${details.error}`, { cause: error });
   }
 }

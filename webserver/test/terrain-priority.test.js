@@ -424,9 +424,13 @@ test('shared startup asset loader fails closed', async () => {
       loadTerrainStartupAssets({
         endpoint: '/assets',
         AbortControllerImpl: undefined,
-        fetchImpl: async () => ({ ok: false, status: 503 }),
+        fetchImpl: async () => ({
+          ok: false,
+          status: 503,
+          json: async () => ({ message: 'local asset catalog is missing' }),
+        }),
       }),
-      /assets endpoint status 503/,
+      /GET \/assets failed \(HTTP 503\): local asset catalog is missing/,
     );
   } finally {
     console.error = previousError;

@@ -182,15 +182,6 @@ const ASSETS_ENDPOINT = '/api/assets';
 const ASSETS_FETCH_TIMEOUT_MS = 1500;
 const VEHICLE_SAVE_FETCH_TIMEOUT_MS = 1500;
 const VEHICLE_SAVE_FAILURE_COOLDOWN_MS = 15000;
-const {
-  bootEvents, bootLog, enqueueClientLog, flushClientLogQueue,
-} = createTerrainClientLogger({ sceneMode: 'clouds-terrain-managed-flask-ux-wip' });
-bootLog('script.start', {
-  href: window.location.href,
-  userAgent: navigator.userAgent
-});
-// Force immediate flush so we know the log pipeline is alive.
-flushClientLogQueue();
 
 // Use summer daytime in Nuuk so textured ground is clearly visible.
 const referenceDate = new Date('2025-07-01T12:00:00Z');
@@ -242,8 +233,22 @@ const anchorLat = DEFAULT_LOCATION.lat;
 const startupAssetsResponse = await loadTerrainStartupAssets({
   endpoint: ASSETS_ENDPOINT,
   timeoutMs: ASSETS_FETCH_TIMEOUT_MS,
-  bootLog,
 });
+const {
+  bootEvents, bootLog, enqueueClientLog, flushClientLogQueue,
+} = createTerrainClientLogger({ sceneMode: 'clouds-terrain-managed-flask-ux-wip' });
+bootLog('script.start', {
+  href: window.location.href,
+  userAgent: navigator.userAgent
+});
+bootLog('assets.fetch.ok', {
+  endpoint: ASSETS_ENDPOINT,
+  source: startupAssetsResponse.source,
+  schemaVersion: startupAssetsResponse.schemaVersion,
+  vehicleCount: startupAssetsResponse.vehicle_instances.length,
+});
+// Force immediate flush only after the required startup request succeeds.
+flushClientLogQueue();
 const VEHICLE_DEFINITION = startupAssetsResponse.vehicle_definition;
 const VEHICLE_HEADLIGHTS = (
   VEHICLE_DEFINITION.headlights != null &&
