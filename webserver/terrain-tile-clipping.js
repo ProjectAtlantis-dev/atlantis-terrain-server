@@ -37,12 +37,24 @@ function appendSkirtSegment(indices, start, segment, outwardWinding) {
 }
 
 function maskSignature(mask, activeSurfaceIndexCount) {
-  let hash = 0x811c9dc5;
-  for (let index = 0; index < mask.length; index += 1) {
-    hash ^= mask[index];
-    hash = Math.imul(hash, 0x01000193);
+  // This key decides whether to reuse actual triangles, including the water
+  // twin's geometry. Equal-area quadtree masks frequently collided under the
+  // old 32-bit hash, leaving holes from children that were no longer resident.
+  // Alternating run lengths, starting with uncovered cells, encode the exact
+  // mask and stay compact for the rectangular footprints produced by LOD.
+  const runs = [];
+  let value = 0;
+  let length = 0;
+  for (const cell of mask) {
+    if (cell !== value) {
+      runs.push(length.toString(36));
+      value = cell;
+      length = 0;
+    }
+    length += 1;
   }
-  return `${activeSurfaceIndexCount}:${(hash >>> 0).toString(16)}`;
+  runs.push(length.toString(36));
+  return `${activeSurfaceIndexCount}:r1:${runs.join('.')}`;
 }
 
 function activeSkirtIndexCount(covered, cells) {

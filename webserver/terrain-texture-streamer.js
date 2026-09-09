@@ -224,6 +224,9 @@ export function createTextureStreamer({
           texRetryAtMs.delete(tileId);
           log(tileId, `fetch -> ${bitmap.width}x${bitmap.height}${ancestorId ? ` ANCESTOR=${ancestorId}` : ''} src=${source}`);
           const texture = new THREE.Texture(bitmap);
+          // Keep provenance with the displayed image, including temporary
+          // crops which deliberately never enter the exact-texture cache.
+          texture.userData.terrainImagery = { tileId, source, ancestorId };
           texture.flipY = false;
           texture.colorSpace = THREE.SRGBColorSpace;
           configureTerrainTexture(texture);

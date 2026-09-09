@@ -2,6 +2,8 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { createTerrainMeshBuilder } from '../terrain-mesh-builder.js';
+import { createTerrainGeometryCache } from '../terrain-geometry-cache.js';
+import { buildOpticalWaterGeometry } from '../water/water-optical-surface.js';
 import {
   recomputeTerrainResidencyClipping,
 } from '../terrain-tile-clipping.js';
@@ -18,6 +20,78 @@ function tileMesh(id, resolution = 9) {
     samples: new Float32Array(resolution * resolution),
   });
 }
+
+function quarterDescendants(bits) {
+  return Array.from({ length: 16 }, (_, index) => (
+    bits & (1 << index)
+      ? tileMesh(`11-${40 + index % 4}-${40 + Math.floor(index / 4)}`, 65)
+      : null
+  )).filter(Boolean);
+}
+
+function assertSurfaceCoverage(mesh, cutouts) {
+  const cells = new Uint8Array(64 * 64);
+  const indices = mesh.geometry.getIndex().array;
+  for (let offset = 0; offset < mesh.userData.terrainActiveSurfaceIndexCount; offset += 6) {
+    const a = indices[offset];
+    const row = Math.floor(a / 65);
+    const column = a % 65;
+    assert.deepEqual(Array.from(indices.subarray(offset, offset + 6)), [
+      a, a + 1, a + 65, a + 1, a + 66, a + 65,
+    ]);
+    cells[row * 64 + column] += 1;
+  }
+  let wrongCells = 0;
+  for (let row = 0; row < 64; row += 1) {
+    for (let column = 0; column < 64; column += 1) {
+      const quarter = Math.floor(row / 16) * 4 + Math.floor(column / 16);
+      const expected = cutouts & (1 << quarter) ? 0 : 1;
+      if (cells[row * 64 + column] !== expected) wrongCells += 1;
+    }
+  }
+  assert.equal(wrongCells, 0, `${wrongCells} surface cells have missing or overlapping coverage`);
+}
+
+test('equal-area child changes replace the actual triangles despite the old hash collision', () => {
+  const parent = tileMesh('9-10-10', 65);
+  // These disjoint four-child arrangements both hashed to 18432:cabe21c5
+  // on the production 65-vertex grid, including the same skirt index count.
+  recomputeTerrainResidencyClipping([parent, ...quarterDescendants(105)]);
+  assertSurfaceCoverage(parent, 105);
+  const previousSignature = parent.userData.terrainClipSignature;
+  const previousDrawCount = parent.geometry.drawRange.count;
+  recomputeTerrainResidencyClipping([parent, ...quarterDescendants(150)]);
+  assertSurfaceCoverage(parent, 150);
+  assert.notEqual(parent.userData.terrainClipSignature, previousSignature);
+  assert.equal(parent.geometry.drawRange.count, previousDrawCount);
+
+  // Water consumers key their own geometry by the same signature.
+  parent.userData.terrainWaterMask.fill(1);
+  const optical = buildOpticalWaterGeometry(parent);
+  assert.deepEqual(Array.from(optical.getIndex().array), Array.from(
+    parent.geometry.getIndex().array.subarray(0, parent.userData.terrainActiveSurfaceIndexCount),
+  ));
+  optical.dispose();
+
+  recomputeTerrainResidencyClipping([parent]);
+  assertSurfaceCoverage(parent, 0);
+});
+
+test('revived clipped geometry takes the current child footprints instead of cached holes', () => {
+  const cache = createTerrainGeometryCache();
+  const build = createTerrainMeshBuilder({ exaggeration: 1, attachScatter() {}, geometryCache: cache });
+  const tile = {
+    id: '9-10-10', bbox: [0, 0, 64, 64], resolution: 65,
+    heightmap: 'measured', samples: new Float32Array(65 * 65).fill(100),
+  };
+  const original = build(tile);
+  recomputeTerrainResidencyClipping([original, ...quarterDescendants(105)]);
+  assert.equal(cache.park(original), true);
+  const revived = build(tile);
+  assert.equal(revived.geometry, original.geometry);
+  recomputeTerrainResidencyClipping([revived, ...quarterDescendants(150)]);
+  assertSurfaceCoverage(revived, 150);
+});
 
 test('mixed skipped-depth descendants carve a parent as an order-independent union', () => {
   const parent = tileMesh('9-10-10');

@@ -1,6 +1,7 @@
-const CACHE_NAME = 'terrain-coverage-v1';
+const CACHE_NAME = 'terrain-coverage-v2';
 
 async function readSnapshot(url) {
+  await globalThis.caches?.delete('terrain-coverage-v1');
   const cache = await globalThis.caches?.open(CACHE_NAME);
   const response = await cache?.match(url);
   return response ? response.json() : null;
@@ -20,7 +21,8 @@ export function mergeCoverageInventory(previous, incoming) {
     throw new Error('Invalid coverage inventory');
   }
   const tiles = new Map(incoming.tiles.map(tile => [tile.tile, tile]));
-  if (previous?.cureDepth === incoming.cureDepth) {
+  if (previous?.cureDepth === incoming.cureDepth
+    && previous?.cureVersion === incoming.cureVersion) {
     for (const tile of previous.tiles) {
       if (tile.status === 'cured' && tiles.get(tile.tile)?.status !== 'cured') {
         tiles.set(tile.tile, tile);

@@ -180,6 +180,7 @@ function partialReason(tile) {
   const missing = [];
   if (!tile.dem) missing.push('DEM');
   if (!tile.coastline) missing.push('coastline cure');
+  if (!tile.texture) missing.push(`exact D${inventory.cureDepth} texture`);
   return missing.length ? `missing ${missing.join(' + ')}` : 'provisional';
 }
 
@@ -334,11 +335,15 @@ let showingSavedCoverage = false;
 function updateCoverage() {
   if (inventory) {
     const { cured, partial, coarse } = inventory.summary;
+    const depthLabel = `D${inventory.cureDepth}`;
+    for (const label of document.querySelectorAll('[data-cure-depth]')) {
+      label.textContent = depthLabel;
+    }
     const coastlineSummary = availableCoastline
       ? ` · ${availableCoastline.blocks.length.toLocaleString()} GTK50 coastline blocks`
       : '';
     const savedSummary = showingSavedCoverage ? ' · saved coverage' : '';
-    summary.textContent = `${cured.toLocaleString()} cured D10 · ${partial.toLocaleString()} partial D10 · ${coarse.toLocaleString()} coarse tiles${coastlineSummary}${savedSummary}\n${inventory.definition}`;
+    summary.textContent = `${cured.toLocaleString()} cured ${depthLabel} · ${partial.toLocaleString()} partial ${depthLabel} · ${coarse.toLocaleString()} coarse tiles${coastlineSummary}${savedSummary}\n${inventory.definition}`;
   }
   render();
 }

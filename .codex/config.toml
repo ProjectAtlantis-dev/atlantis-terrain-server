@@ -1,9 +1,9 @@
-[mcp_servers.atlantis]
+[mcp_servers.lobster]
 command = "npx"
 args = ["atlantis-mcp", "--port", "8025"]
 
-[mcp_servers.atlantis.tools.command]
+[mcp_servers.lobster.tools.command]
 approval_mode = "approve"
 
-[mcp_servers.atlantis.tools.readme]
+[mcp_servers.lobster.tools.readme]
 approval_mode = "approve"

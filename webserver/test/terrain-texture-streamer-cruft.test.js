@@ -3,6 +3,65 @@ import test from 'node:test';
 
 import { createTextureStreamer } from '../terrain-texture-streamer.js';
 import { createTileEvictionGate } from '../terrain-tile-eviction.js';
+import { summarizeTerrainMesh } from '../terrain-debug-runtime.js';
+
+test('displayed imagery reports its ancestor until an exact texture replaces it', async () => {
+  const tile = { id: '12-1970-27' };
+  let exact = false;
+  let time = 0;
+  const streamer = createTextureStreamer({
+    log() {},
+    now: () => time,
+    queueMicrotaskImpl() {},
+    scheduleRetryWake() {},
+    fetchImpl: async () => ({
+      ok: true,
+      status: 200,
+      headers: new Headers({
+        'X-Tex-Tile': tile.id,
+        'X-Tex-Source': 'dataforsyningen',
+        ...(!exact ? { 'X-Tex-Ancestor': '9-246-3' } : {}),
+      }),
+      blob: async () => new Blob(),
+    }),
+    decodeImage: async () => ({ width: 256, height: 256 }),
+  });
+  const mesh = { userData: { tileId: tile.id }, material: {} };
+  const placeholder = await new Promise(resolve => streamer.pump([{ tile }], {
+    isCovered: () => false,
+    onPlaceholder: resolve,
+    onTexture: () => assert.fail('ancestor imagery entered exact cache'),
+  }));
+  mesh.material.map = placeholder.texture;
+  const fallback = summarizeTerrainMesh(mesh);
+  assert.equal(fallback.textureSource, 'dataforsyningen');
+  assert.equal(fallback.textureAncestorId, '9-246-3');
+  assert.equal(fallback.textureUpscale, 8);
+  assert.equal(streamer.texCache.has(tile.id), false);
+
+  // Classifier overlays must continue reporting the underlying imagery.
+  mesh.userData.terrainBaseTexture = placeholder.texture;
+  mesh.material.map = { image: { width: 256, height: 256 } };
+  assert.equal(summarizeTerrainMesh(mesh).textureAncestorId, '9-246-3');
+
+  exact = true;
+  time = 100_000;
+  const native = await new Promise(resolve => streamer.pump([{ tile }], {
+    isCovered: () => false,
+    onPlaceholder: () => assert.fail('exact imagery treated as an ancestor'),
+    onTexture: resolve,
+  }));
+  mesh.material.map = native.texture;
+  mesh.userData.terrainBaseTexture = native.texture;
+  const ready = summarizeTerrainMesh(mesh);
+  assert.equal(ready.textureSource, 'dataforsyningen');
+  assert.equal(ready.textureAncestorId, null);
+  assert.equal(ready.textureUpscale, 1);
+  assert.equal(streamer.texCache.get(tile.id), native.texture);
+  streamer.abortAll();
+  placeholder.texture.dispose();
+  native.texture.dispose();
+});
 
 function seedRequestState(streamer, tileId, texture) {
   let aborts = 0;

@@ -21,13 +21,13 @@ test('terrain cure status reports exact inventory evidence and reuses fresh data
       return {
         ok: true,
         json: async () => ({
-          cureDepth: 10,
+          cureDepth: 11,
           tiles: [{
-            tile: '10-479-16',
+            tile: '11-958-32',
             status: 'partial',
             dem: true,
-            coastline: false,
-            texture: 'dataforsyningen',
+            coastline: true,
+            texture: null,
           }],
         }),
       };
@@ -37,11 +37,11 @@ test('terrain cure status reports exact inventory evidence and reuses fresh data
   await runtime.load();
   assert.deepEqual(runtime.statusFor('12-1917-64'), {
     state: 'partial',
-    cureDepth: 10,
-    cureTileId: '10-479-16',
+    cureDepth: 11,
+    cureTileId: '11-958-32',
     dem: true,
-    coastline: false,
-    texture: 'dataforsyningen',
+    coastline: true,
+    texture: null,
   });
   await runtime.load();
   assert.equal(requests, 1);

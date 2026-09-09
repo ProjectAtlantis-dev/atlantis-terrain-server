@@ -3181,8 +3181,11 @@ renderer.domElement.addEventListener('mousemove', event => {
       return `${row.tileId} ${rsrc || (row.hasTexture ? 'tex' : 'noTex')}`;
     });
 
-  const src = texSource.get(info.tileId) || 'none';
+  const src = info.textureSource || texSource.get(info.tileId) || 'none';
   const srcLabel = `<span style="color:#f80">${src || 'no texture'}</span>`;
+  const imageryFallbackLine = info.textureAncestorId
+    ? `<b style="color:#ff1744">imagery: LOW RESOLUTION · ancestor ${info.textureAncestorId} · ${info.textureUpscale}× enlarged · temporary</b>`
+    : null;
   const demQuality = classifyDemSource(info.terrainSource);
   const provenance = info.provenance || {};
   const provenanceDate = (value, rangeEnd = null) => {
@@ -3255,6 +3258,7 @@ renderer.domElement.addEventListener('mousemove', event => {
       const missing = [
         cureStatus.dem ? null : 'DEM',
         cureStatus.coastline ? null : 'coastline',
+        cureStatus.texture ? null : `exact D${cureStatus.cureDepth} texture`,
       ].filter(Boolean).join(' + ');
       return `<b style="color:#f59e0b">cure: PARTIAL (${cureStatus.cureTileId})${missing ? ` · missing ${missing}` : ''}</b>`;
     }
@@ -3278,6 +3282,7 @@ renderer.domElement.addEventListener('mousemove', event => {
       ? `tile terrain: ${formatMetres(waterDiagnostic.surface.minimum)}…${formatMetres(waterDiagnostic.surface.maximum)}${zeroWarning}`
       : null,
     `tex: ${info.hasTexture ? 'YES' : 'NO'} ${info.textureSize}  source: ${srcLabel}`,
+    imageryFallbackLine,
     controls.seamMode
       ? `<b>shared edges: ${seamRows.length} · <span style="color:#ff1744">${badSeams} bad</span> · <span style="color:#f59e0b">${warningSeams} inspect</span></b>`
       : null,

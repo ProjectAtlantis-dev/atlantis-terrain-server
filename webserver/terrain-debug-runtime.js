@@ -12,6 +12,10 @@ export function collectTerrainDebugMeshes(root, target = []) {
 export function summarizeTerrainMesh(mesh) {
   const image = mesh.material?.map?.image;
   const provenance = mesh.userData?.terrainProvenance;
+  const baseTexture = mesh.userData?.terrainBaseTexture ?? mesh.material?.map;
+  const imagery = baseTexture?.userData?.terrainImagery;
+  const ancestorDepth = terrainTileDepth(imagery?.ancestorId);
+  const tileDepth = terrainTileDepth(mesh.userData?.tileId);
   return {
     tileId: mesh.userData?.tileId ?? '?',
     hasTexture: Boolean(mesh.material?.map),
@@ -19,6 +23,13 @@ export function summarizeTerrainMesh(mesh) {
     color: mesh.material?.color != null ? `#${mesh.material.color.getHexString()}` : '-',
     bbox: mesh.userData?.bbox,
     terrainSource: mesh.userData?.terrainSource ?? null,
+    ...(imagery ? {
+      textureSource: imagery.source,
+      textureAncestorId: imagery.ancestorId,
+      textureUpscale: ancestorDepth >= 0 && tileDepth > ancestorDepth
+        ? 2 ** (tileDepth - ancestorDepth)
+        : 1,
+    } : {}),
     ...(provenance ? { provenance } : {}),
   };
 }

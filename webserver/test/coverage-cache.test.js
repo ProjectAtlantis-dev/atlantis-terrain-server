@@ -2,8 +2,8 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { createCoverageResource, mergeCoverageInventory } from '../coverage-cache.js';
 
-const cured = { tile: '10-479-16', depth: 10, status: 'cured', dem: true, coastline: true };
-const inventory = tiles => ({ cureDepth: 10, tiles });
+const cured = { tile: '10-479-16', depth: 10, status: 'cured', dem: true, coastline: true, texture: 'dataforsyningen' };
+const inventory = tiles => ({ cureDepth: 10, cureVersion: 2, tiles });
 const response = data => ({ ok: true, json: async () => data });
 
 test('cures survive missing or provisional rows while new cures and partial updates arrive', () => {
@@ -144,4 +144,17 @@ test('invalid saved inventory is replaced and invalid network responses are neve
   valid = false;
   await assert.rejects(resource.load({ force: true }), /Invalid coverage inventory/);
   assert.equal(writes, 1);
+});
+
+
+test('the texture requirement invalidates old cures at the same depth', () => {
+  const oldTile = { tile: '11-975-9', depth: 11, status: 'cured', dem: true, coastline: true, texture: null };
+  const previous = { cureDepth: 11, tiles: [oldTile] };
+  const incoming = {
+    cureDepth: 11, cureVersion: 2,
+    tiles: [{ ...oldTile, status: 'partial' }],
+  };
+  const merged = mergeCoverageInventory(previous, incoming);
+  assert.equal(merged.tiles[0].status, 'partial');
+  assert.deepEqual(merged.summary, { cured: 0, partial: 1, coarse: 0 });
 });
