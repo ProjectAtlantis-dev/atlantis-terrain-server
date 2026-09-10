@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$SCRIPT_DIR"
+
+TAKRAM_REVISION=ab3d1cf54cfe2bd3d79ffd2ee872d801050b6c64
+TAKRAM_URL=https://github.com/takram-design-engineering/three-geospatial.git
+
+for command in git node npm; do
+  if ! command -v "$command" >/dev/null 2>&1; then
+    echo "Missing prerequisite: $command. Install Git and Node.js (including npm), then retry." >&2
+    exit 1
+  fi
+done
+
+if [[ -e three-geospatial ]]; then
+  if [[ ! -e three-geospatial/.git ]] ||
+    [[ "$(git -C three-geospatial rev-parse HEAD)" != "$TAKRAM_REVISION" ]]; then
+    echo "three-geospatial must be a checkout of $TAKRAM_REVISION. Move the existing folder aside and retry setup." >&2
+    exit 1
+  fi
+else
+  # Fetch only the pinned history. Git LFS assets are not needed by Vite:
+  # the application loads atmosphere LUTs from upstream at runtime.
+  checkout_dir="$(mktemp -d "$SCRIPT_DIR/.takram-setup.XXXXXX")"
+  echo "Installing Takram $TAKRAM_REVISION"
+  git init -q "$checkout_dir"
+  git -C "$checkout_dir" remote add origin "$TAKRAM_URL"
+  git -C "$checkout_dir" fetch --depth=1 origin "$TAKRAM_REVISION"
+  GIT_LFS_SKIP_SMUDGE=1 git -C "$checkout_dir" checkout --detach FETCH_HEAD
+  mv "$checkout_dir" "$SCRIPT_DIR/three-geospatial"
+fi
+
+for package in atmosphere clouds core effects; do
+  if [[ ! -f "three-geospatial/packages/$package/src/index.ts" ]]; then
+    echo "Takram checkout is incomplete: packages/$package/src/index.ts is missing." >&2
+    exit 1
+  fi
+done
+
+echo "Installing npm dependencies from package-lock.json"
+npm ci --no-audit --no-fund
+echo "Checking the pinned Takram cloud shader compatibility"
+node --test --test-name-pattern='cloud history invalidation seeds every temporal-upscale phase' test/terrain-priority.test.js
+echo "Setup complete."

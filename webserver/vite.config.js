@@ -69,6 +69,23 @@ export default defineConfig({
         target: flaskProxyTarget,
         agent: flaskProxyAgent,
         proxyTimeout: 30_000,
+        configure(proxy) {
+          proxy.on('error', (error, req, res) => {
+            const refused = error.code === 'ECONNREFUSED'
+              || error.errors?.some(cause => cause.code === 'ECONNREFUSED');
+            if (!refused) return;
+
+            const message = `Terrain server unavailable at ${flaskProxyTarget}. Start Terrain Server.`;
+            // Vite logs this error after our handler. Include the diagnosis in
+            // that log, and return it to the viewer's startup error display.
+            error.message = message;
+            error.stack = `${message}\n${error.stack || 'ECONNREFUSED'}`;
+            if (res && 'writeHead' in res && !res.headersSent && !res.writableEnded) {
+              res.writeHead(502, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ error: 'terrain_server_unreachable', message }));
+            }
+          });
+        },
       },
     }
   }

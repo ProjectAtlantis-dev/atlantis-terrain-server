@@ -41,11 +41,7 @@ DATAFORSYNINGEN_FTP_PASS=your-account-password
 Set up the frontend and its pinned three-geospatial source checkout:
 
 ```bash
-cd webserver
-git clone https://github.com/takram-design-engineering/three-geospatial.git
-git -C three-geospatial checkout ab3d1cf5
-npm install
-cd ..
+./webserver/setup
 ```
 
 Run the backend and frontend in separate terminals from the repository root:
@@ -57,6 +53,11 @@ Run the backend and frontend in separate terminals from the repository root:
 ```bash
 ./webserver/runViteServer
 ```
+
+The frontend launcher also runs setup automatically, so the separate frontend
+setup step is optional. It fetches the pinned Takram source when absent and
+installs npm dependencies from the lockfile. See [webserver/README.md](webserver/README.md)
+for standalone clone instructions and backend configuration.
 
 Open <http://localhost:5173/>. Vite proxies browser API requests to Flask on port 5180. The launch scripts write logs alongside themselves.
 

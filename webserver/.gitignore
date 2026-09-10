@@ -1,0 +1,11 @@
+node_modules/
+dist/
+dist-ssr/
+three-geospatial/
+.takram-setup.*/
+public/segmentation-results/
+*.log
+*.local
+.env
+.env.*
+.DS_Store

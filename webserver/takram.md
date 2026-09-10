@@ -24,3 +24,36 @@ Four separate procedural texture generators (`LocalWeather`, `CloudShape`, `Clou
 ## 5. No R3F, no problem
 
 Takram's library ships with R3F (React Three Fiber) wrappers, but the actual 3D code underneath is plain Three.js. R3F only helps with postprocessing wiring (effect pass setup, event listener plumbing) — it does nothing for loading meshes, textures, heightmaps, or any of the real 3D work. Not worth the dependency. We use an unmodified clone of `three-geospatial/` pinned to commit `ab3d1cf5` and point Vite aliases at the source to skip the React dependencies in the npm builds. Pain points 1–4 above are just the manual postprocessing plumbing we took on instead.
+
+## 6. Cloud history reset after sun changes
+
+`terrain-cloud-runtime.js` installs a runtime shader patch through
+`installTerrainCloudHistoryReset()`. Takram's temporal upscaler ignores
+`temporalAlpha` for 15 of its 16 Bayer phases. Merely resetting that alpha leaves
+pixels accumulated under different sun directions, producing grid ghosts.
+Our patch makes the next resolve fill every history pixel from the current
+low-resolution frame. It depends on exact anchors in the pinned
+`packages/clouds/src/shaders/cloudsResolve.frag`.
+
+This patch is part of the tracked Atlantis code, not an edit inside the ignored
+Takram checkout. Setup runs the existing regression test against the downloaded
+shader and fails if the patch no longer installs correctly.
+
+## Reproducing the working WebGL integration
+
+Run `./setup` or `./runViteServer`. Both retain commit
+`ab3d1cf54cfe2bd3d79ffd2ee872d801050b6c64`; they do not select upstream latest.
+The required fixes remain in these tracked files:
+
+- `render-backends/webgl-backend.js`: combined clouds/atmosphere effect pass.
+- `terrain-atmosphere-textures.js`: EXR cache and loader fallback handling.
+- `terrain-cloud-runtime.js`: composition events, procedural textures, history
+  reset patch, cloud sampling parameters, and wind projection handling.
+- `terrain-atmosphere-frame.js`: moving geospatial frame synchronization.
+- `vite.config.js`: imports from the pinned Takram source checkout.
+
+During the bootstrap audit, all four downloaded source trees matched the
+existing working checkout byte for byte, and the fresh clone passed the build
+and all 436 tests. This establishes source and test reproducibility; it is not
+a new visual verification of the rendered scene. No assumption about upstream
+fixing these issues is needed or made.
